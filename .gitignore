@@ -25,3 +25,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+
+fe\.playwright-mcp
