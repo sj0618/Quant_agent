@@ -1,0 +1,27 @@
+# omx
+fe/.omx
+
+# Node
+node_modules/
+fe/dist/
+fe/.cache/
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,48 @@
+name: Deploy to SSH Server
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: fe/package-lock.json
+
+      - name: Install dependencies
+        working-directory: fe
+        run: npm ci
+
+      - name: Build
+        working-directory: fe
+        run: npm run build
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p 30233 quant-agent.kro.kr >> ~/.ssh/known_hosts
+
+      - name: Create deploy directory on server
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            "mkdir -p ~/mvp_sp1/quant-proj"
+
+      - name: Deploy via rsync
+        run: |
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/id_rsa -p 30233" \
+            fe/dist/ \
+            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
