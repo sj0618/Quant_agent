@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ai_graph.schemas import L4Evidence, SignalDecision as InvestmentSignalDecision
 
 SignalAction = Literal["BUY", "SELL", "HOLD", "WATCH", "FILTERED_OUT"]
+StateMapping: TypeAlias = Mapping[str, object]
 
 
 class ConditionOperator(str, Enum):
@@ -23,7 +25,7 @@ class ConditionOperator(str, Enum):
 
 
 class SignalCondition(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ConfigDict = ConfigDict(extra="forbid")
 
     left: str
     operator: ConditionOperator
@@ -43,7 +45,7 @@ class SignalCondition(BaseModel):
 
 
 class SignalStrategy(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ConfigDict = ConfigDict(extra="forbid")
 
     strategy_id: str
     entry_rules: list[SignalCondition]
@@ -54,7 +56,7 @@ class SignalStrategy(BaseModel):
 
 
 class CandidateSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ConfigDict = ConfigDict(extra="forbid")
 
     snapshot_id: str
     top_k_stocks: list[str] = Field(default_factory=list)
@@ -62,7 +64,7 @@ class CandidateSnapshot(BaseModel):
 
 
 class MarketSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ConfigDict = ConfigDict(extra="forbid")
 
     ticker: str
     timestamp: datetime
@@ -70,7 +72,7 @@ class MarketSnapshot(BaseModel):
 
 
 class SignalResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config: ConfigDict = ConfigDict(extra="forbid")
 
     trace_id: str
     debug_ref: str
@@ -85,10 +87,10 @@ class SignalResult(BaseModel):
 
 
 def generate_signal(
-    strategy: SignalStrategy | dict[str, Any],
-    market: MarketSnapshot | dict[str, Any],
+    strategy: SignalStrategy | StateMapping,
+    market: MarketSnapshot | StateMapping,
     *,
-    candidate_snapshot: CandidateSnapshot | dict[str, Any] | None = None,
+    candidate_snapshot: CandidateSnapshot | StateMapping | None = None,
     has_position: bool = False,
     trace_id: str | None = None,
 ) -> SignalResult:
@@ -167,33 +169,27 @@ def generate_signal(
     )
 
 
-def signal_node(state: dict[str, Any]) -> dict[str, Any]:
-    if "market_snapshot" in state and "candidate_snapshot" in state:
-        result = generate_signal(
-            state["strategy_spec"],
-            state["market_snapshot"],
-            candidate_snapshot=state.get("candidate_snapshot"),
-            has_position=bool(state.get("has_position", False)),
-            trace_id=state.get("trace_id"),
+def signal_node(state: StateMapping) -> dict[str, object]:
+    strategy = state.get("strategy_spec")
+    market = state.get("market_snapshot")
+    if not isinstance(strategy, (SignalStrategy, Mapping)):
+        raise ValueError("state.strategy_spec must be a SignalStrategy or mapping")
+    if not isinstance(market, (MarketSnapshot, Mapping)):
+        raise ValueError("state.market_snapshot must be a MarketSnapshot or mapping")
+    candidate_snapshot = state.get("candidate_snapshot")
+    if candidate_snapshot is not None and not isinstance(
+        candidate_snapshot, (CandidateSnapshot, Mapping)
+    ):
+        raise ValueError(
+            "state.candidate_snapshot must be a CandidateSnapshot, mapping, or None"
         )
-        investment_signal = build_investment_signal(
-            state.get("backtest", {}),
-            trace_id=state.get("trace_id"),
-            l4_evidence=state.get("l4_evidence"),
-        )
-    else:
-        result = _result(
-            state.get("trace_id", _trace_id(str(state))),
-            state["strategy_spec"]["strategy_id"],
-            "KOSPI200",
-            "WATCH",
-            ["no single-ticker market snapshot supplied"],
-        )
-        investment_signal = build_investment_signal(
-            state.get("backtest", {}),
-            trace_id=state.get("trace_id"),
-            l4_evidence=state.get("l4_evidence"),
-        )
+    result = generate_signal(
+        strategy,
+        market,
+        candidate_snapshot=candidate_snapshot,
+        has_position=bool(state.get("has_position", False)),
+        trace_id=_optional_str(state.get("trace_id")),
+    )
     return {
         "signal": result.model_dump(),
         "investment_signal": investment_signal.model_dump(),
@@ -261,7 +257,7 @@ def default_l4_evidence(trace_id: str) -> list[dict[str, Any]]:
 
 
 def _coerce_candidate(
-    value: CandidateSnapshot | dict[str, Any] | None,
+    value: CandidateSnapshot | StateMapping | None,
 ) -> CandidateSnapshot | None:
     if value is None:
         return None
@@ -290,8 +286,12 @@ def _matches(rule: SignalCondition, metrics: dict[str, float]) -> bool:
         return False
     left = float(metrics[rule.left])
     if rule.operator == ConditionOperator.BETWEEN:
-        low, high = rule.right  # type: ignore[misc]
+        if not isinstance(rule.right, list):
+            raise ValueError("between requires numeric bounds")
+        low, high = rule.right
         return float(low) <= left <= float(high)
+    if not isinstance(rule.right, (int, float)):
+        raise ValueError("scalar operators require numeric right")
     right = float(rule.right)
     if rule.operator == ConditionOperator.LT:
         return left < right
@@ -335,6 +335,10 @@ def _result(
 
 def _describe(rule: SignalCondition) -> str:
     return f"{rule.left} {rule.operator.value} {rule.right}"
+
+
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
 
 
 def _trace_id(value: str) -> str:
