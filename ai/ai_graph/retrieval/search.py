@@ -8,7 +8,7 @@ from typing import Iterable, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 DEFAULT_CORPUS_DIR = Path(__file__).resolve().parent
-DOCUMENT_GLOB = "l*.md"
+DOCUMENT_GLOB = "**/*.md"
 TOKEN_PATTERN = re.compile(r"[0-9A-Za-z가-힣_]+")
 MIN_QUERY_TOKEN_LENGTH = 2
 SNIPPET_RADIUS = 90
@@ -67,6 +67,8 @@ def load_markdown_corpus(corpus_dir: Path | None = None) -> list[RetrievalDocume
     documents: list[RetrievalDocument] = []
     for path in sorted(root.glob(DOCUMENT_GLOB)):
         if not path.is_file():
+            continue
+        if not path.stem.startswith("l"):
             continue
         text = path.read_text(encoding="utf-8")
         documents.append(_parse_markdown_document(path, text))

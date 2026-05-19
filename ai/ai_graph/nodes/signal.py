@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ai_graph.schemas import L4Evidence, SignalDecision as InvestmentSignalDecision
+
 SignalAction = Literal["BUY", "SELL", "HOLD", "WATCH", "FILTERED_OUT"]
 
 
@@ -166,18 +168,96 @@ def generate_signal(
 
 
 def signal_node(state: dict[str, Any]) -> dict[str, Any]:
-    result = generate_signal(
-        state["strategy_spec"],
-        state["market_snapshot"],
-        candidate_snapshot=state.get("candidate_snapshot"),
-        has_position=bool(state.get("has_position", False)),
-        trace_id=state.get("trace_id"),
-    )
+    if "market_snapshot" in state and "candidate_snapshot" in state:
+        result = generate_signal(
+            state["strategy_spec"],
+            state["market_snapshot"],
+            candidate_snapshot=state.get("candidate_snapshot"),
+            has_position=bool(state.get("has_position", False)),
+            trace_id=state.get("trace_id"),
+        )
+        investment_signal = build_investment_signal(
+            state.get("backtest", {}),
+            trace_id=state.get("trace_id"),
+            l4_evidence=state.get("l4_evidence"),
+        )
+    else:
+        result = _result(
+            state.get("trace_id", _trace_id(str(state))),
+            state["strategy_spec"]["strategy_id"],
+            "KOSPI200",
+            "WATCH",
+            ["no single-ticker market snapshot supplied"],
+        )
+        investment_signal = build_investment_signal(
+            state.get("backtest", {}),
+            trace_id=state.get("trace_id"),
+            l4_evidence=state.get("l4_evidence"),
+        )
     return {
         "signal": result.model_dump(),
+        "investment_signal": investment_signal.model_dump(),
         "trace_id": result.trace_id,
         "debug_ref": result.debug_ref,
     }
+
+
+def build_investment_signal(
+    backtest: dict[str, Any], *, trace_id: str | None = None, l4_evidence: list[dict[str, Any]] | None = None
+) -> InvestmentSignalDecision:
+    selected = backtest.get("selected_candidate") or {}
+    metrics = selected.get("metrics") or {}
+    sharpe = float(metrics.get("sharpe_ratio", 0.0))
+    drawdown = float(metrics.get("max_drawdown", 0.0))
+    bull_case = [
+        "Loop3 selected the highest Sharpe candidate.",
+        f"Selected Sharpe ratio is {sharpe:.2f}.",
+    ]
+    bear_case = [
+        "Hankyung consensus buy-opinion decrease is a required production adapter.",
+        "KIS foreign net-selling N-day cumulative flow is a required production adapter.",
+        "English IB report search is optional in MVP and disabled by default.",
+    ]
+    if drawdown < -0.12:
+        action = "DROP"
+        confidence = 0.64
+        judge_reason = "Bear case dominates because drawdown is beyond the MVP tolerance."
+    elif sharpe >= 1.2:
+        action = "BUY"
+        confidence = 0.82
+        judge_reason = "Bull case dominates after A/B fixture backtest."
+    else:
+        action = "HOLD"
+        confidence = 0.68
+        judge_reason = "Evidence is usable but not strong enough for BUY."
+    evidence = [
+        L4Evidence.model_validate(item)
+        for item in (l4_evidence or default_l4_evidence(trace_id or "trace"))
+    ]
+    return InvestmentSignalDecision(
+        action=action,
+        confidence=confidence,
+        bull_case=bull_case,
+        bear_case=bear_case,
+        judge_reason=judge_reason,
+        l4_evidence=evidence,
+    )
+
+
+def default_l4_evidence(trace_id: str) -> list[dict[str, Any]]:
+    published = datetime(2026, 5, 19, 9, 0, 0)
+    retrieved = datetime(2026, 5, 19, 9, 1, 0)
+    return [
+        {
+            "publisher": "QuantAgent fixture",
+            "published_at": published,
+            "retrieved_at": retrieved,
+            "freshness_days": 0,
+            "dedupe_group": f"{trace_id}:fixture:l4",
+            "access_status": "fixture",
+            "quality_note": "MVP fixture evidence until production adapters are connected.",
+        }
+    ]
 
 
 def _coerce_candidate(

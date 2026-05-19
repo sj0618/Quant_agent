@@ -1,30 +1,66 @@
 # QuantAgent AI MVP
 
-이 디렉터리는 QuantAgent AI/LLM MVP의 mock/fixture 기반 실행 표면이다.
-현재 구현은 외부 LLM 키, 증권 API, 네트워크 호출 없이 worker-3 범위의
-백테스트 코드 생성, AST 검증, 백테스트 실행, 리스크 판단, 리포트 생성을
-검증한다.
+이 디렉터리는 QuantAgent AI/LLM MVP의 fixture/mock 기반 실행 표면이다.
+외부 LLM 키, 증권 API, 네트워크 호출 없이 자연어 전략 분석부터 최종
+API envelope 생성까지 e2e 테스트가 동작한다.
 
-## Worker-3 범위
-
-| 영역 | 파일 | 계약 |
-|---|---|---|
-| 백테스트 코드 생성 | `nodes/backtest_code.py` | `LLMClient` 인터페이스와 `MockLLMClient` 기본값으로 fixture 코드를 생성한다. |
-| 코드 보안 | `security/ast_validator.py` | `build_signals(prices)` 진입점과 allowlist import만 허용한다. |
-| 백테스트 | `nodes/backtest.py` | 검증된 코드를 제한된 builtins로 실행하고 기본 3회 루프 지표를 만든다. |
-| 리스크 | `risk_manager.py` | 최대 낙폭과 승률 기준으로 승인 여부와 포지션 크기를 산출한다. |
-| 리포트 | `report.py` | FE 공개 payload에서 `internal_payload`를 제외하고 `trace_id`/`debug_ref`를 유지한다. |
-
-## 검증
+## 실행
 
 ```bash
-PYTHONPATH=ai python3 -m pytest ai/tests
-PYTHONPATH=ai python3 -m compileall ai
+cd ai
+python3 -m pytest
+python3 -m ruff check .
 ```
 
-## 보안/운영 원칙
+```bash
+cd ai
+python3 - <<'PY'
+from ai_graph import run_analysis
 
-- 기본 경로는 fixture/mock 전용이며 외부 자격증명을 요구하지 않는다.
-- LLM 응답 코드는 실행 전 `validate_backtest_code`로 검사한다.
-- `internal_payload`는 내부 추적용이며 정상 FE 응답에는 포함하지 않는다.
-- JSON/Pydantic 상태가 canonical이며 Markdown prompt는 렌더/가이드 전용이다.
+result = run_analysis("RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어")
+print(result.model_dump(mode="json"))
+PY
+```
+
+## 구현 범위
+
+| 영역 | 주요 파일 | 계약 |
+|---|---|---|
+| 9-node graph | `ai_graph/graph.py` | Supervisor, Ambiguity, Data, Research, BacktestCode, Backtest, Signal, Risk Manager, Report 순서 |
+| 공통 schema | `ai_graph/schemas.py`, `state.py` | StrategySpec, APIEnvelope, L4 evidence, polling stage, dual output |
+| Job/polling | `ai_graph/jobs.py` | `interpreting`, `code_generation`, `backtest`, `debate`, `finalizing` 상태 |
+| Retrieval | `ai_graph/retrieval/**` | L1 전략 KB, L2 지표 KB, Retrieve-then-Smooth 후보 카드 |
+| Code security | `ai_graph/security/ast_validator.py` | allowlist import와 금지 함수/모듈 차단 |
+| Backtest | `ai_graph/nodes/backtest_code.py`, `backtest.py` | A/B StrategySpec와 Loop3 후보 중 Sharpe 최고 선택 |
+| Signal | `ai_graph/nodes/signal.py` | BUY/HOLD/DROP, Bull/Bear/Judge, L4 evidence fixture |
+| Risk | `ai_graph/nodes/risk_manager.py` | KOSPI -5%, FX 2%, VKOSPI 30 룰 |
+| Report | `ai_graph/nodes/report.py` | web_projection과 email_projection 동시 생성 |
+| API contract | `docs/ai-api-contract.md` | FE/BE envelope와 debug_ref 경계 |
+
+## Mock/Fixture 경계
+
+| Mock | 실제 연동 필요 |
+|---|---|
+| `MockBacktestCodeLLM` | OpenAI/Azure OpenAI LLM client |
+| local markdown KB | 운영용 벡터/검색 인덱스 |
+| mock A/B metrics | 실가격 백테스트 엔진 |
+| fixture L4 evidence | 한경컨센서스, KIS 외국인 순매도, optional 영문 IB 검색 |
+| in-memory debug/job store | DB/queue 기반 job store |
+
+## Open Questions for Sprint 0
+
+| 주제 | 합의 필요 |
+|---|---|
+| API path | `/analysis-jobs`의 실제 BE route와 auth 방식 |
+| Storage | `internal_payload`/`debug_ref` 저장소와 retention |
+| Data | KOSPI200 구성 종목, 수정주가, 거래정지/상폐 guard 출처 |
+| LLM | AOAI deployment, retry, JSON mode, 비용/timeout 정책 |
+| Risk | macro fixture를 대체할 실시간 KOSPI/FX/VKOSPI feed |
+
+## TODO 우선순위
+
+1. FastAPI/BE adapter에서 `InMemoryAnalysisJobStore`를 영속 job store로 교체.
+2. 실제 market data adapter와 백테스트 엔진 연결.
+3. AOAI `LLMClient` 구현과 prompt/schema contract test 추가.
+4. L1/L2 KB를 파일 fixture에서 검색 인덱스로 승격.
+5. FE와 envelope field freeze 후 contract test를 공유.

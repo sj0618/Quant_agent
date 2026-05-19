@@ -1,4 +1,5 @@
 from security.ast_validator import validate_backtest_code
+from ai_graph.security.ast_validator import validate_backtest_code as validate_graph_backtest_code
 
 
 SAFE_CODE = """def build_signals(prices):
@@ -37,3 +38,30 @@ def test_requires_build_signals_function() -> None:
 
     assert not result.ok
     assert any(violation.code == "function.missing" for violation in result.violations)
+
+
+def test_graph_validator_blocks_required_forbidden_surface() -> None:
+    blocked_cases = [
+        "import subprocess\ndef build_signals(prices):\n    return []\n",
+        "import sys\ndef build_signals(prices):\n    return []\n",
+        "import importlib\ndef build_signals(prices):\n    return []\n",
+        "def build_signals(prices):\n    open('x')\n    return []\n",
+        "def build_signals(prices):\n    getattr(prices, 'x')\n    return []\n",
+        "def build_signals(prices):\n    setattr(prices, 'x', 1)\n    return []\n",
+        "def build_signals(prices):\n    __import__('os')\n    return []\n",
+        "def build_signals(prices):\n    exec('1')\n    return []\n",
+    ]
+
+    for source in blocked_cases:
+        assert not validate_graph_backtest_code(source).ok
+
+
+def test_graph_validator_allows_declared_modules() -> None:
+    source = """import math
+from datetime import datetime
+def build_signals(prices):
+    math.sqrt(4)
+    datetime.now()
+    return [{"date": row["date"], "action": "HOLD", "price": float(row["close"])} for row in prices]
+"""
+    assert validate_graph_backtest_code(source).ok
