@@ -1,278 +1,237 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-SCHEMA_VERSION = "1.0.0"
-DEFAULT_CANDIDATE_SNAPSHOT_ID = "mock-candidate-snapshot-krx-001"
+SCHEMA_VERSION = "ai-mvp.v1"
 
 
-class ScenarioCode(str, Enum):
-    READY = "READY"
-    C1_INPUT_AMBIGUOUS = "C1_INPUT_AMBIGUOUS"
-    C2_TERM_UNKNOWN = "C2_TERM_UNKNOWN"
-    C4_CONFLICTING = "C4_CONFLICTING"
-    C5_INFEASIBLE = "C5_INFEASIBLE"
+class LogicMode(str, Enum):
+    ALL = "all"
+    ANY = "any"
 
 
-class NodeName(str, Enum):
-    SUPERVISOR = "supervisor"
-    AMBIGUITY = "ambiguity"
-    DATA = "data"
-    RESEARCH = "research"
-    BACKTEST_CODE = "backtest_code"
-    BACKTEST = "backtest"
-    SIGNAL = "signal"
-    RISK_MANAGER = "risk_manager"
-    REPORT = "report"
-
-
-class JobStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-
-
-class SignalAction(str, Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-    HOLD = "HOLD"
-    WATCH = "WATCH"
-    FILTERED_OUT = "FILTERED_OUT"
-
-
-class RiskSeverity(str, Enum):
-    LOW = "LOW"
-    MEDIUM = "MEDIUM"
-    HIGH = "HIGH"
-
-
-class L4Evidence(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    source: str
-    title: str
-    published_at: datetime | None = None
-    summary: str
-    confidence: float = Field(ge=0.0, le=1.0)
+class ConditionOperator(str, Enum):
+    LT = "lt"
+    LTE = "lte"
+    GT = "gt"
+    GTE = "gte"
+    EQ = "eq"
+    NE = "ne"
+    BETWEEN = "between"
+    CROSS_ABOVE = "cross_above"
+    CROSS_BELOW = "cross_below"
 
 
 class Condition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    id: str
-    label: str
-    metric: str
-    operator: Literal["<", "<=", ">", ">=", "=", "increasing", "decreasing"]
-    value: str
-    unit: str | None = None
+    left: str = Field(min_length=1)
+    operator: ConditionOperator
+    right: float | str | list[float]
+    description: str | None = None
+
+    @model_validator(mode="after")
+    def validate_right_shape(self) -> "Condition":
+        if self.operator == ConditionOperator.BETWEEN:
+            if not isinstance(self.right, list) or len(self.right) != 2:
+                raise ValueError("between requires [low, high]")
+            if float(self.right[0]) > float(self.right[1]):
+                raise ValueError("between lower bound must be <= upper bound")
+        elif self.operator in {ConditionOperator.CROSS_ABOVE, ConditionOperator.CROSS_BELOW}:
+            if not isinstance(self.right, str):
+                raise ValueError("cross operators require a metric name")
+        elif not isinstance(self.right, (int, float)):
+            raise ValueError("scalar operators require a numeric right side")
+        return self
 
 
-class CandidateSnapshot(BaseModel):
+class AmbiguityCode(str, Enum):
+    READY = "READY"
+    INPUT_AMBIGUOUS = "C1_INPUT_AMBIGUOUS"
+    TERM_UNKNOWN = "C2_TERM_UNKNOWN"
+    CONFLICTING = "C4_CONFLICTING"
+    INFEASIBLE = "C5_INFEASIBLE"
+
+
+class EnvelopeStatus(str, Enum):
+    READY = "ready"
+    NEED_CLARIFICATION = "need_clarification"
+    REJECTED = "rejected"
+    FAILED = "failed"
+
+
+class Stage(str, Enum):
+    INTERPRETING = "interpreting"
+    CODE_GENERATION = "code_generation"
+    BACKTEST = "backtest"
+    DEBATE = "debate"
+    FINALIZING = "finalizing"
+
+
+class StageStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class StrategyCandidateCard(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    snapshot_id: str = DEFAULT_CANDIDATE_SNAPSHOT_ID
-    tickers: list[str] = Field(min_length=1)
-    effective_from: datetime
+    strategy_id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    key_conditions: list[str] = Field(min_length=1, max_length=5)
+    confidence: float = Field(ge=0.0, le=1.0)
 
 
 class StrategySpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    strategy_id: str
-    name: str
-    summary: str
-    universe: str = "KRX equities"
-    entry_rules: list[Condition] = Field(min_length=1)
-    exit_rules: list[Condition] = Field(default_factory=list)
-    entry_logic: Literal["ALL", "ANY"] = "ALL"
-    exit_logic: Literal["ALL", "ANY"] = "ANY"
-    candidate_snapshot: CandidateSnapshot
+    strategy_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    universe: str = Field(min_length=1)
+    market: str = Field(min_length=1)
+    timeframe: str = Field(min_length=1)
+    entry_conditions: list[Condition] = Field(min_length=1)
+    exit_conditions: list[Condition] = Field(default_factory=list)
+    indicators: list[str] = Field(default_factory=list)
+    risk_constraints: dict[str, float | int | str | bool] = Field(default_factory=dict)
+    assumptions: list[str] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
 
-    @model_validator(mode="after")
-    def normalize_strategy_id(self) -> "StrategySpec":
-        self.strategy_id = self.strategy_id.strip().lower().replace(" ", "_")
-        return self
+    @field_validator("strategy_id")
+    @classmethod
+    def normalize_strategy_id(cls, value: str) -> str:
+        return value.strip().lower().replace(" ", "_")
 
 
-class MarketSnapshot(BaseModel):
+class L4Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    ticker: str
-    timestamp: datetime
-    metrics: dict[str, float]
-    previous_metrics: dict[str, float] = Field(default_factory=dict)
+    publisher: str = Field(min_length=1)
+    published_at: datetime
+    retrieved_at: datetime
+    freshness_days: int = Field(ge=0)
+    dedupe_group: str = Field(min_length=1)
+    access_status: Literal["available", "fixture", "unavailable"]
+    quality_note: str = Field(min_length=1)
 
 
-class CandidateStock(BaseModel):
+class BacktestMetrics(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    ticker: str
-    name: str
-    sector: str
-    lastPrice: float
-    dayChangeRate: float
-    hasPosition: bool = False
-    inCandidateSnapshot: bool = True
-    marketSnapshot: MarketSnapshot
+    sharpe_ratio: float
+    max_drawdown: float
+    win_rate: float = Field(ge=0.0, le=1.0)
+    total_return: float
+    in_sample_sharpe: float
+    out_sample_sharpe: float
+    degradation: float
 
 
-class BacktestMetric(BaseModel):
+class CodeCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    label: Literal["Total Return", "Sharpe", "MDD", "Win Rate"]
-    value: str
-    detail: str
-    tone: Literal["positive", "neutral", "warning"]
+    candidate_id: str = Field(min_length=1)
+    variant: Literal["A", "B"]
+    code: str = Field(min_length=1)
+    validation_ok: bool
+    violations: list[str] = Field(default_factory=list)
+    metrics: BacktestMetrics | None = None
 
 
-class BacktestPoint(BaseModel):
+class ABBacktestResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    date: str
-    strategy: float
-    benchmark: float
+    strategy_a: StrategySpec
+    strategy_b: StrategySpec
+    candidates: list[CodeCandidate] = Field(min_length=1)
+    selected_candidate: CodeCandidate
+    metrics_by_variant: dict[str, BacktestMetrics]
 
 
-class BacktestResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    metrics: list[BacktestMetric] = Field(min_length=1)
-    series: list[BacktestPoint] = Field(min_length=1)
+SignalAction = Literal["BUY", "HOLD", "DROP"]
 
 
 class SignalDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    strategy_id: str
-    ticker: str
     action: SignalAction
     confidence: float = Field(ge=0.0, le=1.0)
-    reasons: list[str] = Field(default_factory=list)
-    generatedBy: Literal["Signal Judge"] = "Signal Judge"
+    bull_case: list[str] = Field(default_factory=list)
+    bear_case: list[str] = Field(default_factory=list)
+    judge_reason: str = Field(min_length=1)
+    l4_evidence: list[L4Evidence] = Field(default_factory=list)
 
 
-class RiskWarning(BaseModel):
+class RiskAdjustment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    id: str
-    ticker: str
-    severity: RiskSeverity
-    reason: str
-    source: str
-    evidence: list[str] = Field(default_factory=list)
-    report_note: str
+    before: SignalAction
+    after: SignalAction
+    rule: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
 
 
-class ReportSection(BaseModel):
+class RiskDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    id: str
-    title: str
-    summary: str
-    signalJudgeNote: str | None = None
-    riskManagerNote: str | None = None
+    signal: SignalDecision
+    adjustments: list[RiskAdjustment] = Field(default_factory=list)
 
 
-class ScenarioOption(BaseModel):
+class ReportProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    strategy_id: str
-    title: str
-    description: str
-    keyConditions: list[str]
+    title: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    sections: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class TermDefinition(BaseModel):
+class ReportBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    term: str
-    definition: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    matchedSources: list[str]
-    requiresConfirmation: bool
-    mappedStrategyId: str
-
-
-class ConflictExplanation(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str
-    conflictPoints: list[str]
-    alternatives: list[ScenarioOption]
-
-
-class InfeasibleExplanation(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str
-    reason: str
-    supportedScope: str
-    examples: list[str]
-
-
-class ScenarioPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scenario: ScenarioCode
-    assistantMessage: str
-    strategy_id: str | None = None
-    options: list[ScenarioOption] | None = None
-    termDefinition: TermDefinition | None = None
-    conflict: ConflictExplanation | None = None
-    infeasible: InfeasibleExplanation | None = None
-
-
-class WorkspacePayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    activeStrategy: StrategySpec
-    candidates: list[CandidateStock]
-    signalDecisions: list[SignalDecision]
-    riskWarnings: list[RiskWarning]
-    reportPreview: list[ReportSection]
-    backtestMetrics: list[BacktestMetric]
-    backtestSeries: list[BacktestPoint]
-
-
-class PublicRunPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scenario: ScenarioPayload
-    workspace: WorkspacePayload | None = None
-
-
-class JobRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    job_id: str
-    status: JobStatus
-    trace_id: str
-    debug_ref: str
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    result: PublicRunPayload | None = None
-    error: str | None = None
-
-
-class NodeTrace(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    node: NodeName
-    status: Literal["ok", "skipped"]
-    detail: str
+    web_projection: ReportProjection
+    email_projection: ReportProjection
+    risk_adjustments: list[RiskAdjustment] = Field(default_factory=list)
 
 
 class InternalPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    llm_provider: str
-    node_trace: list[NodeTrace] = Field(default_factory=list)
-    evidence: list[L4Evidence] = Field(default_factory=list)
-    backtest_code_ref: str | None = None
-    raw_llm: dict[str, Any] = Field(default_factory=dict)
+    trace_id: str = Field(min_length=1)
+    node_outputs: dict[str, Any] = Field(default_factory=dict)
+    retrieval_hits: list[dict[str, Any]] = Field(default_factory=list)
+    llm_prompts: list[str] = Field(default_factory=list)
+    validation: dict[str, Any] = Field(default_factory=dict)
+    backtest_artifacts: dict[str, Any] = Field(default_factory=dict)
+    risk_events: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class UserPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    headline: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    next_actions: list[str] = Field(default_factory=list)
+    candidate_cards: list[StrategyCandidateCard] = Field(default_factory=list)
+    report: ReportBundle | None = None
+
+
+class APIEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: EnvelopeStatus
+    trace_id: str = Field(min_length=1)
+    schema_version: str = SCHEMA_VERSION
+    user_payload: UserPayload
+    strategy_spec: StrategySpec | None = None
+    debug_ref: str = Field(min_length=1)
+    retryable: bool

@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Literal
+from typing import Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 DEFAULT_CORPUS_DIR = Path(__file__).resolve().parent
-DOCUMENT_GLOB = "l*.md"
-TOKEN_PATTERN: re.Pattern[str] = re.compile(r"[0-9A-Za-z가-힣_]+")
+DOCUMENT_GLOB = "**/*.md"
+TOKEN_PATTERN = re.compile(r"[0-9A-Za-z가-힣_]+")
 MIN_QUERY_TOKEN_LENGTH = 2
 SNIPPET_RADIUS = 90
 
@@ -18,7 +17,7 @@ RetrievalLevel = Literal["L1", "L2"]
 
 
 class RetrievalDocument(BaseModel):
-    model_config: ConfigDict = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     document_id: str
     level: RetrievalLevel
@@ -36,7 +35,7 @@ class RetrievalDocument(BaseModel):
 
 
 class RetrievalHit(BaseModel):
-    model_config: ConfigDict = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     document_id: str
     level: RetrievalLevel
@@ -47,7 +46,7 @@ class RetrievalHit(BaseModel):
 
 
 class RetrievalResponse(BaseModel):
-    model_config: ConfigDict = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     query: str
     hits: list[RetrievalHit]

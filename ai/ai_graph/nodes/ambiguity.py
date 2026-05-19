@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from hashlib import sha256
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -35,7 +34,7 @@ REJECTION_TERMS = ("가상화폐", "crypto", "선물", "옵션", "fx", "외환")
 
 
 class AmbiguityResult(BaseModel):
-    model_config: ConfigDict = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     trace_id: str
     debug_ref: str
@@ -103,18 +102,14 @@ def classify_ambiguity(
     )
 
 
-def ambiguity_node(state: Mapping[str, object]) -> dict[str, object]:
+def ambiguity_node(state: dict[str, Any]) -> dict[str, Any]:
     query = str(state.get("user_query") or state.get("query") or "")
-    result = classify_ambiguity(query, trace_id=_optional_str(state.get("trace_id")))
+    result = classify_ambiguity(query, trace_id=state.get("trace_id"))
     return {
         "ambiguity": result.model_dump(),
         "trace_id": result.trace_id,
         "debug_ref": result.debug_ref,
     }
-
-
-def _optional_str(value: object) -> str | None:
-    return value if isinstance(value, str) else None
 
 
 def _trace_id(value: str) -> str:

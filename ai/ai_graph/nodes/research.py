@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from hashlib import sha256
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,7 +13,6 @@ DEFAULT_TOP_K = 5
 class LLMClient(Protocol):
     def complete(self, prompt: str) -> str:
         """Return a deterministic completion for the supplied prompt."""
-        ...
 
 
 class MockResearchLLM:
@@ -25,7 +23,7 @@ class MockResearchLLM:
 
 
 class ResearchEvidence(BaseModel):
-    model_config: ConfigDict = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     evidence_id: str
     level: str
@@ -36,7 +34,7 @@ class ResearchEvidence(BaseModel):
 
 
 class ResearchSummary(BaseModel):
-    model_config: ConfigDict = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     trace_id: str
     debug_ref: str
@@ -72,11 +70,9 @@ def build_research_summary(
     )
 
 
-def research_node(state: Mapping[str, object]) -> dict[str, object]:
+def research_node(state: dict[str, Any]) -> dict[str, Any]:
     query = str(state.get("user_query") or state.get("query") or "")
-    result = build_research_summary(
-        query, trace_id=_optional_str(state.get("trace_id"))
-    )
+    result = build_research_summary(query, trace_id=state.get("trace_id"))
     return {
         "research": result.model_dump(),
         "trace_id": result.trace_id,
@@ -108,10 +104,6 @@ def _candidate_tickers(query: str) -> list[str]:
     if "sk" in lowered or "하이닉스" in lowered:
         tickers.append("000660")
     return tickers
-
-
-def _optional_str(value: object) -> str | None:
-    return value if isinstance(value, str) else None
 
 
 def _trace_id(value: str) -> str:
