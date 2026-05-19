@@ -94,7 +94,9 @@ def search_retrieval_corpus(
         for document in corpus
         if (scored_document := _score_document(document, query_tokens)).score > 0
     ]
-    scored.sort(key=lambda item: (-item.score, item.document.level, item.document.document_id))
+    scored.sort(
+        key=lambda item: (-item.score, item.document.level, item.document.document_id)
+    )
 
     hits = [
         RetrievalHit(
@@ -137,7 +139,9 @@ def _first_heading(text: str) -> str | None:
     return None
 
 
-def _score_document(document: RetrievalDocument, query_tokens: set[str]) -> _ScoredDocument:
+def _score_document(
+    document: RetrievalDocument, query_tokens: set[str]
+) -> _ScoredDocument:
     haystack = document.body.lower()
     title = document.title.lower()
     score = 0.0
@@ -154,7 +158,9 @@ def _score_document(document: RetrievalDocument, query_tokens: set[str]) -> _Sco
             first_match_index = index
 
     if first_match_index is None:
-        return _ScoredDocument(document=document, score=0.0, snippet=document.body[:SNIPPET_RADIUS])
+        return _ScoredDocument(
+            document=document, score=0.0, snippet=document.body[:SNIPPET_RADIUS]
+        )
     return _ScoredDocument(
         document=document,
         score=score,

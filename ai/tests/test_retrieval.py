@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from ai_graph.retrieval.search import RetrievalDocument, load_markdown_corpus, search_retrieval_corpus
+from ai_graph.retrieval.search import (
+    RetrievalDocument,
+    load_markdown_corpus,
+    search_retrieval_corpus,
+)
 
 
 def test_loads_l1_l2_fixture_corpus_without_network():

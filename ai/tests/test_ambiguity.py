@@ -5,7 +5,9 @@ from ai_graph.nodes.ambiguity import AmbiguityResult, ambiguity_node, classify_a
 
 
 def test_concrete_krx_strategy_is_confirmed():
-    result = classify_ambiguity("KRX 반도체 후보 상위 20개에서 RSI 30 이하 매수, 중립 위험")
+    result = classify_ambiguity(
+        "KRX 반도체 후보 상위 20개에서 RSI 30 이하 매수, 중립 위험"
+    )
 
     assert result.status == "confirmed"
     assert result.is_ambiguous is False
@@ -32,7 +34,9 @@ def test_unsupported_asset_class_is_rejected():
 
 
 def test_ambiguity_node_preserves_trace_id():
-    output = ambiguity_node({"trace_id": "trace-1", "user_query": "KRX 반도체 RSI 매수 중립 위험 상위 후보"})
+    output = ambiguity_node(
+        {"trace_id": "trace-1", "user_query": "KRX 반도체 RSI 매수 중립 위험 상위 후보"}
+    )
 
     assert output["trace_id"] == "trace-1"
     assert output["ambiguity"]["debug_ref"] == "ambiguity:trace-1"

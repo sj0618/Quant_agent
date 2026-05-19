@@ -90,10 +90,20 @@ def generate_signal(
     has_position: bool = False,
     trace_id: str | None = None,
 ) -> SignalResult:
-    spec = strategy if isinstance(strategy, SignalStrategy) else SignalStrategy.model_validate(strategy)
-    market_snapshot = market if isinstance(market, MarketSnapshot) else MarketSnapshot.model_validate(market)
+    spec = (
+        strategy
+        if isinstance(strategy, SignalStrategy)
+        else SignalStrategy.model_validate(strategy)
+    )
+    market_snapshot = (
+        market
+        if isinstance(market, MarketSnapshot)
+        else MarketSnapshot.model_validate(market)
+    )
     candidate = _coerce_candidate(candidate_snapshot)
-    trace = trace_id or _trace_id(f"{spec.strategy_id}:{market_snapshot.ticker}:{market_snapshot.timestamp.isoformat()}")
+    trace = trace_id or _trace_id(
+        f"{spec.strategy_id}:{market_snapshot.ticker}:{market_snapshot.timestamp.isoformat()}"
+    )
 
     if spec.use_candidate_filter:
         if candidate is None:
@@ -110,12 +120,19 @@ def generate_signal(
                 spec.strategy_id,
                 market_snapshot.ticker,
                 "FILTERED_OUT",
-                candidate.reason_trace.get(market_snapshot.ticker, ["ticker not in research candidate universe"]),
+                candidate.reason_trace.get(
+                    market_snapshot.ticker,
+                    ["ticker not in research candidate universe"],
+                ),
                 candidate_snapshot_id=candidate.snapshot_id,
             )
 
-    entry_matches = _matching_rules(spec.entry_rules, spec.entry_logic, market_snapshot.metrics)
-    exit_matches = _matching_rules(spec.exit_rules, spec.exit_logic, market_snapshot.metrics)
+    entry_matches = _matching_rules(
+        spec.entry_rules, spec.entry_logic, market_snapshot.metrics
+    )
+    exit_matches = _matching_rules(
+        spec.exit_rules, spec.exit_logic, market_snapshot.metrics
+    )
     candidate_snapshot_id = candidate.snapshot_id if candidate else None
 
     if has_position and exit_matches:
@@ -156,19 +173,33 @@ def signal_node(state: dict[str, Any]) -> dict[str, Any]:
         has_position=bool(state.get("has_position", False)),
         trace_id=state.get("trace_id"),
     )
-    return {"signal": result.model_dump(), "trace_id": result.trace_id, "debug_ref": result.debug_ref}
+    return {
+        "signal": result.model_dump(),
+        "trace_id": result.trace_id,
+        "debug_ref": result.debug_ref,
+    }
 
 
-def _coerce_candidate(value: CandidateSnapshot | dict[str, Any] | None) -> CandidateSnapshot | None:
+def _coerce_candidate(
+    value: CandidateSnapshot | dict[str, Any] | None,
+) -> CandidateSnapshot | None:
     if value is None:
         return None
-    return value if isinstance(value, CandidateSnapshot) else CandidateSnapshot.model_validate(value)
+    return (
+        value
+        if isinstance(value, CandidateSnapshot)
+        else CandidateSnapshot.model_validate(value)
+    )
 
 
-def _matching_rules(rules: list[SignalCondition], logic: str, metrics: dict[str, float]) -> list[str]:
+def _matching_rules(
+    rules: list[SignalCondition], logic: str, metrics: dict[str, float]
+) -> list[str]:
     if not rules:
         return []
-    matches = [rule.description or _describe(rule) for rule in rules if _matches(rule, metrics)]
+    matches = [
+        rule.description or _describe(rule) for rule in rules if _matches(rule, metrics)
+    ]
     if logic == "all" and len(matches) != len(rules):
         return []
     return matches

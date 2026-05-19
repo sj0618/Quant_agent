@@ -73,7 +73,11 @@ def build_research_summary(
 def research_node(state: dict[str, Any]) -> dict[str, Any]:
     query = str(state.get("user_query") or state.get("query") or "")
     result = build_research_summary(query, trace_id=state.get("trace_id"))
-    return {"research": result.model_dump(), "trace_id": result.trace_id, "debug_ref": result.debug_ref}
+    return {
+        "research": result.model_dump(),
+        "trace_id": result.trace_id,
+        "debug_ref": result.debug_ref,
+    }
 
 
 def _format_prompt(query: str, hits: list[RetrievalHit]) -> str:

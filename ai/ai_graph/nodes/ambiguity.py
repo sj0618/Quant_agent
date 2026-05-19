@@ -56,7 +56,9 @@ class AmbiguityResult(BaseModel):
         return normalized
 
 
-def classify_ambiguity(user_query: str, *, trace_id: str | None = None) -> AmbiguityResult:
+def classify_ambiguity(
+    user_query: str, *, trace_id: str | None = None
+) -> AmbiguityResult:
     normalized_query = " ".join(user_query.strip().split())
     if not normalized_query:
         raise ValueError("user_query must not be empty")
@@ -103,7 +105,11 @@ def classify_ambiguity(user_query: str, *, trace_id: str | None = None) -> Ambig
 def ambiguity_node(state: dict[str, Any]) -> dict[str, Any]:
     query = str(state.get("user_query") or state.get("query") or "")
     result = classify_ambiguity(query, trace_id=state.get("trace_id"))
-    return {"ambiguity": result.model_dump(), "trace_id": result.trace_id, "debug_ref": result.debug_ref}
+    return {
+        "ambiguity": result.model_dump(),
+        "trace_id": result.trace_id,
+        "debug_ref": result.debug_ref,
+    }
 
 
 def _trace_id(value: str) -> str:
