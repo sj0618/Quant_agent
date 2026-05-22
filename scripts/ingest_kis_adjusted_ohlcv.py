@@ -541,7 +541,7 @@ def fetch_and_collect(
     pending_rows: list[dict[str, Any]],
     summary: dict[str, Any],
     request_sleep_seconds: float,
-) -> None:
+) -> bool:
     completed = False
     try:
         rows, request_count = fetch_adjusted_rows_recursive(kis_client, ticker, window)
