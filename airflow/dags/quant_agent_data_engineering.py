@@ -9,6 +9,9 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 import json
 import os
+from pathlib import Path
+import subprocess
+import sys
 
 try:  # pragma: no cover - Airflow is an orchestration runtime dependency.
     from airflow.decorators import dag, task
@@ -20,6 +23,15 @@ except ImportError:  # pragma: no cover
 DEFAULT_DAILY_SCHEDULE = os.getenv("QUANT_AIRFLOW_DAILY_SCHEDULE", "30 18 * * 1-5")
 DEFAULT_BACKFILL_SCHEDULE = os.getenv("QUANT_AIRFLOW_BACKFILL_SCHEDULE", None)
 DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE", "2026-01-01T00:00:00"))
+DEFAULT_TA_WARMUP_DAYS = int(os.getenv("QUANT_AIRFLOW_TA_WARMUP_DAYS", "365"))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+KIS_ADJUSTED_INGEST_SCRIPT = Path(
+    os.getenv("QUANT_AIRFLOW_KIS_ADJUSTED_INGEST_SCRIPT", str(REPO_ROOT / "scripts" / "ingest_kis_adjusted_ohlcv.py"))
+)
+TA_PIPELINE_SCRIPT = Path(
+    os.getenv("QUANT_AIRFLOW_TA_PIPELINE_SCRIPT", str(REPO_ROOT / "scripts" / "compute_technical_indicators_pipeline.py"))
+)
+PYTHON_EXECUTABLE = os.getenv("QUANT_AIRFLOW_PYTHON", sys.executable)
 
 
 def _symbols_from_env() -> tuple[str, ...]:
@@ -60,15 +72,20 @@ if dag and task:  # pragma: no branch
 
         @task(task_id="compute_ta_indicators_daily")
         def compute_ta_indicators_daily(logical_date: str | None = None) -> dict:
-            from quant_agent.data.indicators.service import TechnicalIndicatorService
-
             target_date = _target_date(logical_date)
-            counts = TechnicalIndicatorService().compute_and_store(
-                start_date=target_date,
-                end_date=target_date,
-                symbols=list(_symbols_from_env()) or None,
+            start_date = _warmup_start_date(target_date)
+            return _run_python_script(
+                TA_PIPELINE_SCRIPT,
+                _technical_indicator_args(start_date=start_date, end_date=target_date),
             )
-            return {"stored_rows": counts}
+
+        @task(task_id="ingest_kis_adjusted_ohlcv_daily")
+        def ingest_kis_adjusted_ohlcv_daily(logical_date: str | None = None) -> dict:
+            target_date = _target_date(logical_date)
+            return _run_python_script(
+                KIS_ADJUSTED_INGEST_SCRIPT,
+                _kis_adjusted_ingest_args(start_date=target_date, end_date=target_date),
+            )
 
         @task(task_id="ingest_bok_daily")
         def ingest_bok_daily(logical_date: str | None = None) -> dict:
@@ -118,11 +135,13 @@ if dag and task:  # pragma: no branch
             return {"written": written}
 
         ingested = ingest_ohlcv_daily()
+        kis_adjusted = ingest_kis_adjusted_ohlcv_daily()
         computed = compute_ta_indicators_daily()
         bok = ingest_bok_daily()
         dart = ingest_dart_corp_codes_daily()
         seibro = ingest_seibro_reports_daily()
-        ingested >> [computed, bok, seibro]
+        ingested >> [kis_adjusted, bok, seibro]
+        kis_adjusted >> computed
         # DART corp-code refresh is independent and intentionally has no upstream dependency.
 
     @dag(
@@ -178,6 +197,65 @@ def _json_env(name: str, default):
     if not raw:
         return default
     return json.loads(raw)
+
+
+def _warmup_start_date(target_date: date) -> date:
+    return target_date - timedelta(days=DEFAULT_TA_WARMUP_DAYS)
+
+
+def _kis_adjusted_ingest_args(*, start_date: date, end_date: date) -> list[str]:
+    args = [
+        "--start-date",
+        start_date.isoformat(),
+        "--end-date",
+        end_date.isoformat(),
+    ]
+    symbols = _symbols_from_env()
+    if symbols:
+        args.extend(["--tickers", ",".join(symbols)])
+    return args
+
+
+def _technical_indicator_args(*, start_date: date, end_date: date) -> list[str]:
+    args = [
+        "--start-date",
+        start_date.isoformat(),
+        "--end-date",
+        end_date.isoformat(),
+        "--input-price-source",
+        "kis-adjusted",
+    ]
+    symbols = _symbols_from_env()
+    if symbols:
+        args.extend(["--tickers", ",".join(symbols)])
+    return args
+
+
+def _run_python_script(script_path: Path, args: list[str]) -> dict:
+    command = [PYTHON_EXECUTABLE, str(script_path), *args]
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{script_path.name} failed with exit code {completed.returncode}: "
+            f"{_tail(completed.stderr or completed.stdout)}"
+        )
+    return {
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": _tail(completed.stdout),
+        "stderr": _tail(completed.stderr),
+    }
+
+
+def _tail(text: str, limit: int = 4000) -> str:
+    return text[-limit:] if len(text) > limit else text
 
 
 def _skip(message: str) -> None:
