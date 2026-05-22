@@ -36,10 +36,13 @@ from quant_agent.data.sources.kis import KisOhlcvClient, normalize_kis_daily_pri
 
 KIS_ADJUSTED_TABLE = "feature.kis_adjusted_ohlcv_daily"
 KIS_SOURCE_ID = "KIS"
+KIS_ADJUSTED_CURSOR_DATASET = "kis_adjusted_ohlcv_daily"
+KIS_ADJUSTED_COMPLETED_WINDOW_CURSOR_PREFIX = "completed_window"
 DEFAULT_REQUEST_WINDOW_DAYS = 120
 DEFAULT_REQUEST_SLEEP_SECONDS = 0.25
 DEFAULT_FLUSH_ROWS = 10_000
 DEFAULT_TOKEN_RETRY_WAIT_SECONDS = 65
+DEFAULT_INCREMENTAL_LOOKBACK_DAYS = 0
 
 
 @dataclass(frozen=True)
@@ -159,8 +162,25 @@ COMMIT;
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest KIS official adjusted OHLCV into TimescaleDB.")
-    parser.add_argument("--start-date", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--end-date", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--start-date", default=None, help="YYYY-MM-DD. Required unless --daily-incremental is set.")
+    parser.add_argument("--end-date", default=None, help="YYYY-MM-DD. Required unless --daily-incremental is set.")
+    parser.add_argument(
+        "--daily-incremental",
+        action="store_true",
+        help="Select the latest core OHLCV trade date on or before --as-of-date.",
+    )
+    parser.add_argument("--as-of-date", default=None, help="YYYY-MM-DD upper bound for --daily-incremental.")
+    parser.add_argument(
+        "--incremental-lookback-days",
+        type=int,
+        default=DEFAULT_INCREMENTAL_LOOKBACK_DAYS,
+        help="Calendar-day warmup lookback before the selected daily incremental end date.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Resume safely by skipping ticker/date windows already complete in DB state.",
+    )
     parser.add_argument("--tickers", default="", help="Optional comma-separated ticker subset.")
     parser.add_argument("--limit-tickers", type=int, default=None, help="Optional deterministic ticker limit.")
     parser.add_argument("--request-window-days", type=int, default=DEFAULT_REQUEST_WINDOW_DAYS)
@@ -177,14 +197,12 @@ def main() -> int:
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
-    start_date = date.fromisoformat(args.start_date)
-    end_date = date.fromisoformat(args.end_date)
-    if end_date < start_date:
-        raise ValueError("--end-date must be greater than or equal to --start-date.")
     if args.request_window_days < 1:
         raise ValueError("--request-window-days must be >= 1.")
     if args.flush_rows < 1:
         raise ValueError("--flush-rows must be >= 1.")
+    if args.incremental_lookback_days < 0:
+        raise ValueError("--incremental-lookback-days must be >= 0.")
 
     db_config = DatabaseConfig.from_env()
     if args.db_container:
@@ -194,6 +212,9 @@ def main() -> int:
 
     run_id = str(uuid4())
     ensure_tables(db)
+    start_date, end_date = resolve_requested_date_window(db, args)
+    if end_date < start_date:
+        raise ValueError("--end-date must be greater than or equal to --start-date.")
     start_run(db, run_id, args, start_date, end_date)
 
     summary: dict[str, Any] = {
@@ -204,42 +225,59 @@ def main() -> int:
         "request_window_days": args.request_window_days,
         "request_sleep_seconds": args.request_sleep_seconds,
         "workers": args.workers,
+        "daily_incremental": args.daily_incremental,
+        "incremental_lookback_days": args.incremental_lookback_days,
+        "skip_existing": args.skip_existing,
         "tickers": 0,
         "requests": 0,
         "rows": 0,
+        "skipped_windows": 0,
         "failed_windows": [],
     }
 
     pending_rows: list[dict[str, Any]] = []
+    pending_completed_windows: list[tuple[str, FetchWindow]] = []
     try:
         tickers = select_tickers(db, start_date, end_date, args.tickers, args.limit_tickers)
         summary["tickers"] = len(tickers)
+        jobs = iter_resumable_fetch_jobs(
+            db=db,
+            tickers=tickers,
+            start_date=start_date,
+            end_date=end_date,
+            window_days=args.request_window_days,
+            skip_existing=args.skip_existing,
+            summary=summary,
+        )
         if args.workers == 1:
-            for ticker, window in iter_fetch_jobs(tickers, start_date, end_date, args.request_window_days):
+            for ticker, window in jobs:
                 if args.max_requests is not None and summary["requests"] >= args.max_requests:
-                    flush_rows(db, pending_rows, run_id, summary)
+                    flush_rows(db, pending_rows, run_id, summary, pending_completed_windows)
                     finish_run(db, run_id, "partial_success", None)
                     write_output(args.output, summary)
                     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
                     return 0
-                fetch_and_collect(kis_client, ticker, window, pending_rows, summary, args.request_sleep_seconds)
+                completed = fetch_and_collect(kis_client, ticker, window, pending_rows, summary, args.request_sleep_seconds)
+                if completed:
+                    pending_completed_windows.append((ticker, window))
                 if len(pending_rows) >= args.flush_rows:
-                    flush_rows(db, pending_rows, run_id, summary)
+                    flush_rows(db, pending_rows, run_id, summary, pending_completed_windows)
         else:
             issue_token_with_retry(kis_client)
             run_parallel_fetches(
                 kis_client=kis_client,
-                jobs=iter_fetch_jobs(tickers, start_date, end_date, args.request_window_days),
+                jobs=jobs,
                 pending_rows=pending_rows,
+                pending_completed_windows=pending_completed_windows,
                 summary=summary,
                 max_requests=args.max_requests,
                 workers=args.workers,
                 request_sleep_seconds=args.request_sleep_seconds,
-                flush=lambda: flush_rows(db, pending_rows, run_id, summary),
+                flush=lambda: flush_rows(db, pending_rows, run_id, summary, pending_completed_windows),
                 flush_threshold=args.flush_rows,
             )
 
-        flush_rows(db, pending_rows, run_id, summary)
+        flush_rows(db, pending_rows, run_id, summary, pending_completed_windows)
         finish_run(db, run_id, "success" if not summary["failed_windows"] else "partial_success", None)
     except Exception as exc:
         finish_run(db, run_id, "failed", str(exc))
@@ -261,6 +299,15 @@ def ensure_tables(db: DockerPsqlClient) -> None:
           base_url_key = EXCLUDED.base_url_key,
           version = EXCLUDED.version,
           updated_at = now();
+
+        CREATE TABLE IF NOT EXISTS meta.ingestion_cursor (
+          source_id TEXT NOT NULL REFERENCES meta.data_source(source_id),
+          dataset TEXT NOT NULL,
+          cursor_key TEXT NOT NULL,
+          cursor_value TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (source_id, dataset, cursor_key)
+        );
 
         CREATE TABLE IF NOT EXISTS {KIS_ADJUSTED_TABLE} (
           "time" DATE NOT NULL,
@@ -294,6 +341,10 @@ def start_run(db: DockerPsqlClient, run_id: str, args: argparse.Namespace, start
         "limit_tickers": args.limit_tickers,
         "request_window_days": args.request_window_days,
         "request_sleep_seconds": args.request_sleep_seconds,
+        "daily_incremental": args.daily_incremental,
+        "as_of_date": args.as_of_date,
+        "incremental_lookback_days": args.incremental_lookback_days,
+        "skip_existing": args.skip_existing,
         "table": KIS_ADJUSTED_TABLE,
         "fid_org_adj_prc": "0",
         "adjusted_price_method": "kis_official_adjusted",
@@ -347,6 +398,47 @@ def select_tickers(
     return [normalize_ticker(row["ticker"]) for row in rows]
 
 
+def resolve_requested_date_window(db: DockerPsqlClient, args: argparse.Namespace) -> tuple[date, date]:
+    if args.daily_incremental:
+        if args.start_date or args.end_date:
+            raise ValueError("--daily-incremental cannot be combined with --start-date or --end-date.")
+        as_of_date = date.fromisoformat(args.as_of_date) if args.as_of_date else date.today()
+        return select_daily_incremental_window(db, as_of_date, args.incremental_lookback_days)
+
+    if not args.start_date or not args.end_date:
+        raise ValueError("--start-date and --end-date are required unless --daily-incremental is set.")
+    return date.fromisoformat(args.start_date), date.fromisoformat(args.end_date)
+
+
+def select_daily_incremental_window(
+    db: DockerPsqlClient,
+    as_of_date: date,
+    incremental_lookback_days: int,
+) -> tuple[date, date]:
+    latest_trade_date = select_latest_core_trade_date(db, as_of_date)
+    return resolve_daily_incremental_window(latest_trade_date, incremental_lookback_days)
+
+
+def select_latest_core_trade_date(db: DockerPsqlClient, as_of_date: date) -> date:
+    rows = db.fetch_csv(
+        f"""
+        SELECT MAX(o.trade_date)::text AS trade_date
+          FROM core.ohlcv_daily o
+         WHERE o.trade_date <= DATE {sql_literal(as_of_date.isoformat())}
+        """
+    )
+    raw_trade_date = rows[0].get("trade_date") if rows else None
+    if not raw_trade_date:
+        raise ValueError(f"No core OHLCV trade date found on or before {as_of_date.isoformat()}.")
+    return date.fromisoformat(str(raw_trade_date))
+
+
+def resolve_daily_incremental_window(latest_trade_date: date, incremental_lookback_days: int) -> tuple[date, date]:
+    if incremental_lookback_days < 0:
+        raise ValueError("incremental_lookback_days must be >= 0.")
+    return latest_trade_date - timedelta(days=incremental_lookback_days), latest_trade_date
+
+
 def iter_windows(start_date: date, end_date: date, window_days: int) -> Iterable[FetchWindow]:
     current = start_date
     while current <= end_date:
@@ -366,6 +458,82 @@ def iter_fetch_jobs(
             yield ticker, window
 
 
+def iter_resumable_fetch_jobs(
+    *,
+    db: DockerPsqlClient,
+    tickers: list[str],
+    start_date: date,
+    end_date: date,
+    window_days: int,
+    skip_existing: bool,
+    summary: dict[str, Any],
+) -> Iterable[tuple[str, FetchWindow]]:
+    for ticker, window in iter_fetch_jobs(tickers, start_date, end_date, window_days):
+        if skip_existing and window_is_complete(db, ticker, window):
+            summary["skipped_windows"] += 1
+            continue
+        yield ticker, window
+
+
+def window_is_complete(db: DockerPsqlClient, ticker: str, window: FetchWindow) -> bool:
+    return parse_window_completion(db.fetch_csv(build_window_completion_query(ticker, window)))
+
+
+def build_window_completion_query(ticker: str, window: FetchWindow) -> str:
+    normalized_ticker = normalize_ticker(ticker)
+    cursor_key = completed_window_cursor_key(normalized_ticker, window)
+    return f"""
+        WITH expected AS (
+            SELECT COUNT(*)::int AS expected_count
+              FROM core.ohlcv_daily o
+              JOIN core.symbol_master sm ON sm.symbol_id = o.symbol_id
+             WHERE sm.symbol = {sql_literal(normalized_ticker)}
+               AND o.trade_date BETWEEN DATE {sql_literal(window.start_date.isoformat())}
+                                    AND DATE {sql_literal(window.end_date.isoformat())}
+        ),
+        observed AS (
+            SELECT COUNT(DISTINCT k."time")::int AS observed_count
+              FROM {KIS_ADJUSTED_TABLE} k
+             WHERE k.ticker = {sql_literal(normalized_ticker)}
+               AND k."time" BETWEEN DATE {sql_literal(window.start_date.isoformat())}
+                                AND DATE {sql_literal(window.end_date.isoformat())}
+        ),
+        cursor_state AS (
+            SELECT EXISTS (
+                SELECT 1
+                  FROM meta.ingestion_cursor
+                 WHERE source_id = {sql_literal(KIS_SOURCE_ID)}
+                   AND dataset = {sql_literal(KIS_ADJUSTED_CURSOR_DATASET)}
+                   AND cursor_key = {sql_literal(cursor_key)}
+            ) AS cursor_complete
+        )
+        SELECT
+            expected.expected_count,
+            observed.observed_count,
+            cursor_state.cursor_complete,
+            (
+                expected.expected_count = 0
+                OR observed.observed_count >= expected.expected_count
+                OR cursor_state.cursor_complete
+            ) AS complete
+          FROM expected, observed, cursor_state
+        """
+
+
+def parse_window_completion(rows: list[dict[str, Any]]) -> bool:
+    if not rows:
+        return False
+    return parse_sql_bool(rows[0].get("complete"))
+
+
+def parse_sql_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "t", "true", "y", "yes"}
+
+
 def fetch_and_collect(
     kis_client: KisOhlcvClient,
     ticker: str,
@@ -374,10 +542,12 @@ def fetch_and_collect(
     summary: dict[str, Any],
     request_sleep_seconds: float,
 ) -> None:
+    completed = False
     try:
         rows, request_count = fetch_adjusted_rows_recursive(kis_client, ticker, window)
         summary["requests"] += request_count
         pending_rows.extend(rows)
+        completed = bool(rows)
         if request_sleep_seconds > 0:
             time.sleep(request_sleep_seconds)
     except Exception as exc:  # noqa: BLE001 - keep full run moving and report failed windows
@@ -389,6 +559,7 @@ def fetch_and_collect(
                 "error": str(exc)[:500],
             }
         )
+    return completed
 
 
 def fetch_adjusted_rows_recursive(
@@ -415,6 +586,7 @@ def run_parallel_fetches(
     kis_client: KisOhlcvClient,
     jobs: Iterable[tuple[str, FetchWindow]],
     pending_rows: list[dict[str, Any]],
+    pending_completed_windows: list[tuple[str, FetchWindow]],
     summary: dict[str, Any],
     max_requests: int | None,
     workers: int,
@@ -446,6 +618,8 @@ def run_parallel_fetches(
                 if error is None and rows is not None:
                     summary["requests"] += request_count
                     pending_rows.extend(rows)
+                    if rows:
+                        pending_completed_windows.append((ticker, window))
                 else:
                     summary["failed_windows"].append(
                         {
@@ -540,12 +714,58 @@ def payload_to_adjusted_rows(payload: dict[str, Any], ticker: str) -> list[dict[
     return rows
 
 
-def flush_rows(db: DockerPsqlClient, rows: list[dict[str, Any]], run_id: str, summary: dict[str, Any]) -> None:
-    if not rows:
+def flush_rows(
+    db: DockerPsqlClient,
+    rows: list[dict[str, Any]],
+    run_id: str,
+    summary: dict[str, Any],
+    completed_windows: list[tuple[str, FetchWindow]] | None = None,
+) -> None:
+    if not rows and not completed_windows:
         return
-    db.copy_adjusted_rows(rows, run_id)
-    summary["rows"] += len(rows)
-    rows.clear()
+    if rows:
+        db.copy_adjusted_rows(rows, run_id)
+        summary["rows"] += len(rows)
+        rows.clear()
+    if completed_windows:
+        upsert_completed_windows(db, completed_windows, run_id)
+        completed_windows.clear()
+
+
+def upsert_completed_windows(db: DockerPsqlClient, completed_windows: list[tuple[str, FetchWindow]], run_id: str) -> None:
+    sql = build_completed_window_cursor_upsert(completed_windows, run_id)
+    if sql:
+        db.execute(sql)
+
+
+def build_completed_window_cursor_upsert(completed_windows: list[tuple[str, FetchWindow]], run_id: str) -> str:
+    if not completed_windows:
+        return ""
+    values = []
+    for ticker, window in completed_windows:
+        normalized_ticker = normalize_ticker(ticker)
+        cursor_key = completed_window_cursor_key(normalized_ticker, window)
+        cursor_value = {
+            "ticker": normalized_ticker,
+            "start_date": window.start_date.isoformat(),
+            "end_date": window.end_date.isoformat(),
+            "run_id": run_id,
+        }
+        values.append(
+            "("
+            f"{sql_literal(KIS_SOURCE_ID)}, "
+            f"{sql_literal(KIS_ADJUSTED_CURSOR_DATASET)}, "
+            f"{sql_literal(cursor_key)}, "
+            f"{sql_literal(json.dumps(cursor_value, ensure_ascii=False, separators=(',', ':')))}"
+            ")"
+        )
+    return f"""
+        INSERT INTO meta.ingestion_cursor (source_id, dataset, cursor_key, cursor_value)
+        VALUES {", ".join(values)}
+        ON CONFLICT (source_id, dataset, cursor_key) DO UPDATE SET
+          cursor_value = EXCLUDED.cursor_value,
+          updated_at = now();
+        """
 
 
 def write_output(path: str | None, summary: dict[str, Any]) -> None:
@@ -559,6 +779,17 @@ def write_output(path: str | None, summary: dict[str, Any]) -> None:
 def normalize_ticker(value: Any) -> str:
     text = str(value).strip()
     return text.zfill(6) if text.isdigit() and len(text) <= 6 else text
+
+
+def completed_window_cursor_key(ticker: str, window: FetchWindow) -> str:
+    return (
+        f"{KIS_ADJUSTED_COMPLETED_WINDOW_CURSOR_PREFIX}:"
+        f"{normalize_ticker(ticker)}:{window.start_date.isoformat()}:{window.end_date.isoformat()}"
+    )
+
+
+def sql_literal(value: Any) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 if __name__ == "__main__":
