@@ -49,6 +49,13 @@ class AirflowDagImportTests(unittest.TestCase):
         self.assertEqual(args[args.index("--start-date") + 1], start_date.isoformat())
         self.assertEqual(args[args.index("--end-date") + 1], "2026-05-21")
 
+    def test_daily_dag_orders_kis_adjusted_before_ta(self):
+        source = Path("airflow/dags/quant_agent_data_engineering.py").read_text(encoding="utf-8")
+
+        self.assertIn("kis_adjusted = ingest_kis_adjusted_ohlcv_daily()", source)
+        self.assertIn("kis_adjusted >> computed", source)
+        self.assertNotIn("ingested >> [computed", source)
+
 
 def _load_dag_module(module_name: str = "quant_agent_data_engineering_dag"):
     path = Path("airflow/dags/quant_agent_data_engineering.py")
