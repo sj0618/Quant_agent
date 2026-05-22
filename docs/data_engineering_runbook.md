@@ -15,6 +15,8 @@
 | OpenDART corp code | `python scripts/ingest_external_data.py --job dart-corp-codes --db-mode docker` |
 | OpenDART financial | `python scripts/ingest_external_data.py --job dart-financial --symbol 005930 --corp-code <corp_code> --business-year 2025 --report-code 11011 --db-mode docker` |
 | SEIBro reports | `python scripts/ingest_external_data.py --job seibro-reports --seibro-endpoint <approved_endpoint> --as-of-date 2026-05-15 --db-mode docker` |
+| KIS official adjusted full + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode full --start-date 2016-05-20 --end-date 2026-05-20 --resume` |
+| KIS official adjusted daily incremental + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode daily-incremental --target-date 2026-05-21 --resume` |
 
 ## 환경변수
 
@@ -46,6 +48,19 @@ SELECT category, count(*) FROM feature.ta_indicator_definition GROUP BY category
 SELECT * FROM mart.symbol_feature_frame_asof WHERE symbol = '005930' ORDER BY as_of_date DESC LIMIT 5;
 SELECT * FROM mart.bok_macro_asof ORDER BY effective_date DESC LIMIT 5;
 ```
+
+## KIS official adjusted OHLCV + TA 운영
+
+`scripts/run_kis_adjusted_full_pipeline.py`는 `.env` 파일을 로드하지 않고, 이미 프로세스 환경에 주입된 KIS/DB 자격증명만 사용한다. 운영자는 장기 backfill과 일일 증분을 같은 wrapper로 실행한다.
+
+| 실행 유형 | 권장 명령 | 산출물 |
+|---|---|---|
+| 장기 full/backfill | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode full --start-date 2016-05-20 --end-date <YYYY-MM-DD> --resume` | `.omx/artifacts/kis-adjusted-full.json`, `.omx/artifacts/technical-indicators-kis-adjusted-full.json` |
+| 일일 증분 | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode daily-incremental --target-date <YYYY-MM-DD> --resume` | `.omx/artifacts/kis-adjusted-daily-<YYYY-MM-DD>.json`, `.omx/artifacts/technical-indicators-kis-adjusted-daily-<YYYY-MM-DD>.json` |
+
+Resume 규칙은 JSON summary 기준이다. `--resume` 사용 시 요청 기간(`start_date`, `end_date`)이 일치하고 실패 목록(`failed_windows`, `failed_tickers`)이 비어 있는 단계만 건너뛴다. 예를 들어 KIS 적재 summary가 성공이고 TA summary가 없으면 KIS는 스킵하고 TA부터 재개한다. 실패 window/ticker가 남아 있거나 기간이 다르면 해당 단계는 다시 실행한다.
+
+wrapper 내부 검증은 KIS 적재 후 `failed_windows`가 비어 있을 때만 TA recomputation으로 진행한다. KIS 실패가 남으면 TA 이전에 중단하고 `stopped_before_ta` summary를 출력한다.
 
 ## Airflow
 
