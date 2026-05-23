@@ -4,7 +4,8 @@ This wrapper intentionally runs the expensive steps sequentially:
 1. collect KIS official adjusted OHLCV into ``feature.kis_adjusted_ohlcv_daily``;
 2. recompute canonical adjusted OHLCV and all five TA category tables from that
    official adjusted input;
-3. run local regression tests.
+3. run data quality checks for KIS/KRX consistency and OHLCV anomalies;
+4. run local regression tests.
 
 It does not load ``.env`` files; credentials must already be present in the
 process environment.
@@ -32,6 +33,7 @@ DEFAULT_ARTIFACT_DIR = ".omx/artifacts"
 SUMMARY_FAILURE_KEYS = {
     "kis": ("failed_windows",),
     "ta": ("failed_tickers",),
+    "qa": (),
 }
 
 
@@ -71,6 +73,7 @@ def run_pipeline(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     kis_output = artifact_dir / f"kis-adjusted-{artifact_label}.json"
     ta_output = artifact_dir / f"technical-indicators-kis-adjusted-{artifact_label}.json"
+    qa_output = artifact_dir / f"data-quality-kis-adjusted-{artifact_label}.json"
     python_executable = resolve_python_executable()
 
     if args.resume and summary_is_successful(kis_output, start_date, end_date, SUMMARY_FAILURE_KEYS["kis"]):
@@ -130,6 +133,27 @@ def run_pipeline(
             "TA recomputation from KIS official adjusted OHLCV",
         )
 
+    if args.resume and summary_is_successful(qa_output, start_date, end_date, SUMMARY_FAILURE_KEYS["qa"]):
+        print(json.dumps({"step": "Data quality checks for KIS adjusted pipeline", "status": "skipped_resume", "output": str(qa_output)}, ensure_ascii=False))
+    else:
+        run_step_func(
+            [
+                str(python_executable),
+                "scripts/run_data_quality_checks.py",
+                "--db-mode",
+                "docker",
+                "--start-date",
+                start_date,
+                "--end-date",
+                end_date,
+                "--checks",
+                "all",
+                "--output",
+                str(qa_output),
+            ],
+            "Data quality checks for KIS adjusted pipeline",
+        )
+
     run_step_func(
         [
             str(python_executable),
@@ -138,7 +162,11 @@ def run_pipeline(
             "scripts/ingest_kis_adjusted_ohlcv.py",
             "scripts/compute_technical_indicators_pipeline.py",
             "scripts/run_kis_adjusted_full_pipeline.py",
+            "scripts/run_data_quality_checks.py",
+            "scripts/refresh_symbol_metadata.py",
             "quant_agent/data/config.py",
+            "quant_agent/data/quality.py",
+            "quant_agent/data/repository.py",
             "quant_agent/data/sources/kis.py",
         ],
         "py_compile",
@@ -151,6 +179,7 @@ def run_pipeline(
                 "status": "success",
                 "kis_output": str(kis_output),
                 "ta_output": str(ta_output),
+                "qa_output": str(qa_output),
             },
             ensure_ascii=False,
             indent=2,

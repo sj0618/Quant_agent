@@ -16,12 +16,14 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import csv
 from dataclasses import dataclass
 from datetime import date, timedelta
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+from threading import Lock
 import time
 from typing import Any, Iterable
 from uuid import uuid4
@@ -31,6 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from quant_agent.data.config import DatabaseConfig, KisConfig  # noqa: E402
+from quant_agent.data.models import ApiRequestLog  # noqa: E402
 from quant_agent.data.sources.kis import KisOhlcvClient, normalize_kis_daily_price  # noqa: E402
 
 
@@ -43,6 +46,7 @@ DEFAULT_REQUEST_SLEEP_SECONDS = 0.25
 DEFAULT_FLUSH_ROWS = 10_000
 DEFAULT_TOKEN_RETRY_WAIT_SECONDS = 65
 DEFAULT_INCREMENTAL_LOOKBACK_DAYS = 0
+KIS_ADJUSTED_TRANSFORM_VERSION = "kis-adjusted-normalize-v1"
 
 
 @dataclass(frozen=True)
@@ -155,9 +159,48 @@ ON CONFLICT ("time", ticker) DO UPDATE SET
   quality_flags = EXCLUDED.quality_flags,
   run_id = EXCLUDED.run_id,
   updated_at = now();
+INSERT INTO meta.lineage_event
+  (target_table, target_key, source_table, source_key, run_id, transform_version, metadata_jsonb)
+SELECT
+  {sql_literal(KIS_ADJUSTED_TABLE)},
+  ticker || ':' || "time"::text,
+  'kis_api.inquire_daily_itemchartprice',
+  ticker || ':' || "time"::text || ':fid_org_adj_prc=0',
+  run_id,
+  {sql_literal(KIS_ADJUSTED_TRANSFORM_VERSION)},
+  jsonb_build_object(
+    'stage', 'kis_adjusted_ingestion',
+    'adjusted_price_method', 'kis_official_adjusted',
+    'fid_org_adj_prc', '0'
+  )
+FROM tmp_kis_adjusted_ohlcv;
 COMMIT;
 """
         self.execute(sql)
+
+    def copy_api_request_logs(self, events: list[ApiRequestLog], run_id: str) -> None:
+        if not events:
+            return
+        values = []
+        for event in events:
+            values.append(
+                "("
+                f"{sql_literal(run_id)}, {sql_literal(event.source_id)}, {sql_literal(event.endpoint_key)}, "
+                f"{sql_literal(stable_hash(event.request))}, {sql_literal(event.success)}, {sql_literal(event.status_code)}, "
+                f"{sql_literal(event.elapsed_ms)}, {sql_literal(event.retry_count)}, "
+                f"{sql_literal(stable_hash(event.response) if event.response is not None else None)}, "
+                f"{sql_literal(truncate(event.error_message, 4000))}, {jsonb_literal(event.metadata)}, "
+                f"{sql_literal(event.request_started_at.isoformat())}"
+                ")"
+            )
+        self.execute(
+            f"""
+            INSERT INTO meta.api_request_log
+              (run_id, source_id, endpoint_key, request_hash, success, status_code,
+               elapsed_ms, retry_count, response_hash, error_message, metadata_jsonb, request_started_at)
+            VALUES {", ".join(values)};
+            """
+        )
 
 
 def main() -> int:
@@ -211,6 +254,14 @@ def main() -> int:
     kis_client = KisOhlcvClient(KisConfig.from_env())
 
     run_id = str(uuid4())
+    pending_api_logs: list[ApiRequestLog] = []
+    api_log_lock = Lock()
+
+    def observe_api_request(event: ApiRequestLog) -> None:
+        with api_log_lock:
+            pending_api_logs.append(event)
+
+    kis_client.set_request_observer(observe_api_request)
     ensure_tables(db)
     start_date, end_date = resolve_requested_date_window(db, args)
     if end_date < start_date:
@@ -231,6 +282,7 @@ def main() -> int:
         "tickers": 0,
         "requests": 0,
         "rows": 0,
+        "api_request_logs": 0,
         "skipped_windows": 0,
         "failed_windows": [],
     }
@@ -252,7 +304,7 @@ def main() -> int:
         if args.workers == 1:
             for ticker, window in jobs:
                 if args.max_requests is not None and summary["requests"] >= args.max_requests:
-                    flush_rows(db, pending_rows, run_id, summary, pending_completed_windows)
+                    flush_rows(db, pending_rows, run_id, summary, pending_completed_windows, pending_api_logs, api_log_lock)
                     finish_run(db, run_id, "partial_success", None)
                     write_output(args.output, summary)
                     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
@@ -261,7 +313,7 @@ def main() -> int:
                 if completed:
                     pending_completed_windows.append((ticker, window))
                 if len(pending_rows) >= args.flush_rows:
-                    flush_rows(db, pending_rows, run_id, summary, pending_completed_windows)
+                    flush_rows(db, pending_rows, run_id, summary, pending_completed_windows, pending_api_logs, api_log_lock)
         else:
             issue_token_with_retry(kis_client)
             run_parallel_fetches(
@@ -273,13 +325,22 @@ def main() -> int:
                 max_requests=args.max_requests,
                 workers=args.workers,
                 request_sleep_seconds=args.request_sleep_seconds,
-                flush=lambda: flush_rows(db, pending_rows, run_id, summary, pending_completed_windows),
+                flush=lambda: flush_rows(
+                    db,
+                    pending_rows,
+                    run_id,
+                    summary,
+                    pending_completed_windows,
+                    pending_api_logs,
+                    api_log_lock,
+                ),
                 flush_threshold=args.flush_rows,
             )
 
-        flush_rows(db, pending_rows, run_id, summary, pending_completed_windows)
+        flush_rows(db, pending_rows, run_id, summary, pending_completed_windows, pending_api_logs, api_log_lock)
         finish_run(db, run_id, "success" if not summary["failed_windows"] else "partial_success", None)
     except Exception as exc:
+        flush_api_request_logs(db, pending_api_logs, run_id, summary, api_log_lock)
         finish_run(db, run_id, "failed", str(exc))
         raise
 
@@ -308,6 +369,32 @@ def ensure_tables(db: DockerPsqlClient) -> None:
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (source_id, dataset, cursor_key)
         );
+
+        CREATE TABLE IF NOT EXISTS meta.api_request_log (
+          request_id BIGSERIAL PRIMARY KEY,
+          run_id UUID REFERENCES meta.ingestion_run(run_id),
+          source_id TEXT REFERENCES meta.data_source(source_id),
+          endpoint_key TEXT NOT NULL,
+          request_hash TEXT NOT NULL,
+          success BOOLEAN NOT NULL DEFAULT FALSE,
+          status_code INTEGER,
+          elapsed_ms INTEGER,
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          response_hash TEXT,
+          error_message TEXT,
+          metadata_jsonb JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+          request_started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        ALTER TABLE meta.api_request_log ADD COLUMN IF NOT EXISTS success BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE meta.api_request_log ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE meta.api_request_log ADD COLUMN IF NOT EXISTS error_message TEXT;
+        ALTER TABLE meta.api_request_log ADD COLUMN IF NOT EXISTS metadata_jsonb JSONB NOT NULL DEFAULT '{{}}'::jsonb;
+        ALTER TABLE meta.api_request_log ADD COLUMN IF NOT EXISTS request_started_at TIMESTAMPTZ NOT NULL DEFAULT now();
+        CREATE INDEX IF NOT EXISTS idx_api_request_log_run_source_created
+          ON meta.api_request_log (run_id, source_id, created_at DESC);
+
+        ALTER TABLE meta.lineage_event ADD COLUMN IF NOT EXISTS metadata_jsonb JSONB NOT NULL DEFAULT '{{}}'::jsonb;
 
         CREATE TABLE IF NOT EXISTS {KIS_ADJUSTED_TABLE} (
           "time" DATE NOT NULL,
@@ -720,9 +807,12 @@ def flush_rows(
     run_id: str,
     summary: dict[str, Any],
     completed_windows: list[tuple[str, FetchWindow]] | None = None,
+    api_logs: list[ApiRequestLog] | None = None,
+    api_log_lock: Lock | None = None,
 ) -> None:
-    if not rows and not completed_windows:
+    if not rows and not completed_windows and not api_logs:
         return
+    flush_api_request_logs(db, api_logs, run_id, summary, api_log_lock)
     if rows:
         db.copy_adjusted_rows(rows, run_id)
         summary["rows"] += len(rows)
@@ -730,6 +820,28 @@ def flush_rows(
     if completed_windows:
         upsert_completed_windows(db, completed_windows, run_id)
         completed_windows.clear()
+
+
+def flush_api_request_logs(
+    db: DockerPsqlClient,
+    api_logs: list[ApiRequestLog] | None,
+    run_id: str,
+    summary: dict[str, Any],
+    api_log_lock: Lock | None = None,
+) -> None:
+    if not api_logs:
+        return
+    if api_log_lock is None:
+        drained = list(api_logs)
+        api_logs.clear()
+    else:
+        with api_log_lock:
+            drained = list(api_logs)
+            api_logs.clear()
+    if not drained:
+        return
+    db.copy_api_request_logs(drained, run_id)
+    summary["api_request_logs"] = summary.get("api_request_logs", 0) + len(drained)
 
 
 def upsert_completed_windows(db: DockerPsqlClient, completed_windows: list[tuple[str, FetchWindow]], run_id: str) -> None:
@@ -788,8 +900,29 @@ def completed_window_cursor_key(ticker: str, window: FetchWindow) -> str:
     )
 
 
+def stable_hash(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def truncate(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    return value[:limit]
+
+
 def sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def jsonb_literal(value: Any) -> str:
+    return f"{sql_literal(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))}::jsonb"
 
 
 if __name__ == "__main__":

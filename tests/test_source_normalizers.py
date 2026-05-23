@@ -19,6 +19,8 @@ class SourceNormalizerTests(unittest.TestCase):
                     "TDD_LWPRC": "69,500",
                     "TDD_CLSPRC": "70,500",
                     "ACC_TRDVOL": "1234567",
+                    "MKT_NM": "KOSPI",
+                    "LIST_SHRS": "5969782550",
                 }
             ]
         }
@@ -27,6 +29,7 @@ class SourceNormalizerTests(unittest.TestCase):
         self.assertEqual(bars[0].symbol, "005930")
         self.assertEqual(bars[0].trade_date, date(2026, 5, 15))
         self.assertEqual(bars[0].close, Decimal("70500"))
+        self.assertEqual(bars[0].raw["MKT_NM"], "KOSPI")
 
     def test_normalize_kis_daily_price(self):
         payload = {

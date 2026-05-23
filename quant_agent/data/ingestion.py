@@ -53,6 +53,8 @@ class OhlcvIngestionService:
         total_written = 0
         total_raw_written = 0
         all_issues = []
+        if source == "KIS":
+            self.kis_client.set_request_observer(lambda event: self.repository.store_api_request_log(event, run_id))
         try:
             for chunk_start, chunk_end in chunk_date_range(
                 request.start_date,
@@ -73,7 +75,7 @@ class OhlcvIngestionService:
                         cursor_value=max(bar.trade_date for bar in bars).isoformat(),
                     )
 
-            self.repository.refresh_ohlcv_quality(
+            self.repository.run_ohlcv_quality_framework(
                 run_id=run_id,
                 source_id=source,
                 start_date=request.start_date,
@@ -84,6 +86,9 @@ class OhlcvIngestionService:
         except Exception as exc:
             self.repository.finish_ingestion_run(run_id, status="failed", error_message=str(exc))
             raise
+        finally:
+            if source == "KIS":
+                self.kis_client.set_request_observer(None)
 
         return OhlcvIngestionResult(
             run_id=run_id,

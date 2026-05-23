@@ -44,6 +44,17 @@ class KisAdjustedPipelineWrapperTests(unittest.TestCase):
                         ),
                         encoding="utf-8",
                     )
+                if label == "Data quality checks for KIS adjusted pipeline":
+                    (artifact_dir / "data-quality-kis-adjusted-daily-2026-05-21.json").write_text(
+                        json.dumps(
+                            {
+                                "start_date": "2026-05-21",
+                                "end_date": "2026-05-21",
+                                "status": "success",
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
 
             args = wrapper.parse_args(
                 [
@@ -63,7 +74,12 @@ class KisAdjustedPipelineWrapperTests(unittest.TestCase):
         self.assertNotIn("KIS official adjusted OHLCV ingestion", labels)
         self.assertEqual(
             labels,
-            ["TA recomputation from KIS official adjusted OHLCV", "py_compile", "pytest"],
+            [
+                "TA recomputation from KIS official adjusted OHLCV",
+                "Data quality checks for KIS adjusted pipeline",
+                "py_compile",
+                "pytest",
+            ],
         )
 
     def test_resume_does_not_skip_failed_kis_summary(self):
@@ -102,6 +118,17 @@ class KisAdjustedPipelineWrapperTests(unittest.TestCase):
                                 "start_date": "2026-05-21",
                                 "end_date": "2026-05-21",
                                 "failed_tickers": [],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                if label == "Data quality checks for KIS adjusted pipeline":
+                    (artifact_dir / "data-quality-kis-adjusted-daily-2026-05-21.json").write_text(
+                        json.dumps(
+                            {
+                                "start_date": "2026-05-21",
+                                "end_date": "2026-05-21",
+                                "status": "success",
                             }
                         ),
                         encoding="utf-8",

@@ -47,6 +47,9 @@ DEFAULT_RELIST_GAP_DAYS = 30
 DEFAULT_WORKER_RESERVE = 1
 TA_SOURCE_ID = "TA"
 TA_TRANSFORM_VERSION = "pandas-ta-talib-v1"
+ADJUSTED_OHLCV_TRANSFORM_VERSION = "adjusted-ohlcv-v1"
+MART_FEATURE_VIEW = "mart.kis_adjusted_feature_frame_asof"
+CANONICAL_SYMBOL_FEATURE_VIEW = "mart.symbol_feature_frame_asof"
 
 CATEGORY_TABLES = {
     "Trend": "feature.ta_trend_ticker_daily",
@@ -187,6 +190,17 @@ ON CONFLICT ("time", ticker) DO UPDATE SET
   quality_flags = EXCLUDED.quality_flags,
   run_id = EXCLUDED.run_id,
   updated_at = now();
+INSERT INTO meta.lineage_event
+  (target_table, target_key, source_table, source_key, run_id, transform_version, metadata_jsonb)
+SELECT
+  {sql_literal(table)},
+  ticker || ':' || "time"::text,
+  {sql_literal(ADJUSTED_OHLCV_TABLE)},
+  base_ticker || ':' || "time"::text,
+  run_id,
+  {sql_literal(TA_TRANSFORM_VERSION)},
+  jsonb_build_object('stage', 'ta_indicator_compute', 'target_table', {sql_literal(table)})
+FROM tmp_ta_rows;
 COMMIT;
 """
         self.execute(sql)
@@ -278,6 +292,25 @@ ON CONFLICT ("time", ticker) DO UPDATE SET
   quality_flags = EXCLUDED.quality_flags,
   run_id = EXCLUDED.run_id,
   updated_at = now();
+INSERT INTO meta.lineage_event
+  (target_table, target_key, source_table, source_key, run_id, transform_version, metadata_jsonb)
+SELECT
+  {sql_literal(ADJUSTED_OHLCV_TABLE)},
+  ticker || ':' || "time"::text,
+  CASE
+    WHEN quality_flags->>'adjusted_price_method' = 'kis_official_adjusted'
+    THEN 'feature.kis_adjusted_ohlcv_daily'
+    ELSE 'core.ohlcv_daily'
+  END,
+  base_ticker || ':' || "time"::text,
+  run_id,
+  {sql_literal(ADJUSTED_OHLCV_TRANSFORM_VERSION)},
+  jsonb_build_object(
+    'stage', 'adjusted_ohlcv_build',
+    'adjusted_price_method', quality_flags->>'adjusted_price_method',
+    'segment_id', segment_id
+  )
+FROM tmp_adjusted_ohlcv;
 COMMIT;
 """
         self.execute(sql)
@@ -339,6 +372,7 @@ def main() -> int:
         "ticker_batch_size": args.ticker_batch_size,
         "input_price_source": args.input_price_source,
         "adjusted_ohlcv_table": ADJUSTED_OHLCV_TABLE,
+        "mart_feature_view": MART_FEATURE_VIEW,
         "adjusted_ohlcv_rows": 0,
         "stored_rows": {category: 0 for category in CATEGORY_TABLES},
         "processed_tickers": 0,
@@ -399,6 +433,7 @@ def main() -> int:
             pending_adjusted_rows.clear()
 
         if not args.dry_run:
+            record_mart_lineage(client, run_id, start_date, end_date)
             finish_run(client, run_id, "success", None)
     except Exception as exc:
         if not args.dry_run:
@@ -499,6 +534,8 @@ def ensure_feature_tables(client: DockerPsqlClient) -> None:
     client.execute(
         """
         CREATE SCHEMA IF NOT EXISTS feature;
+        CREATE SCHEMA IF NOT EXISTS mart;
+        ALTER TABLE meta.lineage_event ADD COLUMN IF NOT EXISTS metadata_jsonb JSONB NOT NULL DEFAULT '{{}}'::jsonb;
         INSERT INTO meta.data_source (source_id, name, base_url_key, version, is_primary)
         VALUES ('TA', 'Pandas-TA/TA-Lib technical indicator transform', 'TA_TRANSFORM_VERSION', 'pandas-ta-talib-v1', FALSE)
         ON CONFLICT (source_id) DO UPDATE SET
@@ -508,6 +545,7 @@ def ensure_feature_tables(client: DockerPsqlClient) -> None:
         """
         + adjusted_table_statement
         + "\n".join(table_statements)
+        + mart_feature_view_sql()
     )
 
 
@@ -549,6 +587,76 @@ def finish_run(client: DockerPsqlClient, run_id: str, status: str, error: str | 
         UPDATE meta.ingestion_run
            SET status = '{status}', ended_at = now(), error_message = {error_sql}
          WHERE run_id = '{run_id}';
+        """
+    )
+
+
+def mart_feature_view_sql() -> str:
+    return f"""
+        DROP VIEW IF EXISTS {MART_FEATURE_VIEW};
+        DROP VIEW IF EXISTS {CANONICAL_SYMBOL_FEATURE_VIEW};
+
+        CREATE OR REPLACE VIEW {CANONICAL_SYMBOL_FEATURE_VIEW} AS
+        SELECT
+            a."time" AS as_of_date,
+            sm.symbol,
+            sm.name,
+            sm.market_segment,
+            sm.listing_status,
+            sm.listed_at,
+            sm.delisted_at,
+            a.ticker,
+            a.base_ticker,
+            a.segment_id,
+            a.adj_open AS open,
+            a.adj_high AS high,
+            a.adj_low AS low,
+            a.adj_close AS close,
+            a.adj_volume AS volume,
+            a.quality_flags AS adjusted_ohlcv_quality_flags,
+            tt.values_jsonb AS trend_values,
+            tm.values_jsonb AS momentum_values,
+            tv.values_jsonb AS volatility_values,
+            tvol.values_jsonb AS volume_values,
+            tp.values_jsonb AS pattern_values,
+            a.run_id AS adjusted_ohlcv_run_id
+        FROM {ADJUSTED_OHLCV_TABLE} a
+        JOIN core.symbol_master sm ON sm.symbol = a.base_ticker
+        LEFT JOIN {CATEGORY_TABLES["Trend"]} tt
+               ON tt.ticker = a.ticker AND tt."time" = a."time"
+        LEFT JOIN {CATEGORY_TABLES["Momentum"]} tm
+               ON tm.ticker = a.ticker AND tm."time" = a."time"
+        LEFT JOIN {CATEGORY_TABLES["Volatility"]} tv
+               ON tv.ticker = a.ticker AND tv."time" = a."time"
+        LEFT JOIN {CATEGORY_TABLES["Volume"]} tvol
+               ON tvol.ticker = a.ticker AND tvol."time" = a."time"
+        LEFT JOIN {CATEGORY_TABLES["Pattern"]} tp
+               ON tp.ticker = a.ticker AND tp."time" = a."time";
+
+        CREATE OR REPLACE VIEW {MART_FEATURE_VIEW} AS
+        SELECT *
+          FROM {CANONICAL_SYMBOL_FEATURE_VIEW}
+         WHERE adjusted_ohlcv_quality_flags->>'adjusted_price_method' = 'kis_official_adjusted';
+        """
+
+
+def record_mart_lineage(client: DockerPsqlClient, run_id: str, start_date: date, end_date: date) -> None:
+    client.execute(
+        f"""
+        INSERT INTO meta.lineage_event
+          (target_table, target_key, source_table, source_key, run_id, transform_version, metadata_jsonb)
+        SELECT
+          {sql_literal(MART_FEATURE_VIEW)},
+          ticker || ':' || "time"::text,
+          {sql_literal(ADJUSTED_OHLCV_TABLE)},
+          ticker || ':' || "time"::text,
+          {sql_literal(run_id)},
+          'mart-view-lineage-v1',
+          jsonb_build_object('stage', 'mart_feature_view', 'view_type', 'logical_view')
+          FROM {ADJUSTED_OHLCV_TABLE}
+         WHERE "time" BETWEEN DATE {sql_literal(start_date.isoformat())}
+                          AND DATE {sql_literal(end_date.isoformat())}
+           AND run_id = {sql_literal(run_id)};
         """
     )
 
@@ -1033,6 +1141,16 @@ def scalar_to_json(value: Any) -> float | int | str | bool | None:
     except (TypeError, ValueError):
         return str(value)
     return converted if math.isfinite(converted) else None
+
+
+def sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def chunked(items: list[str], size: int) -> Iterable[list[str]]:

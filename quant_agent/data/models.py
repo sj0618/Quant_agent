@@ -43,6 +43,31 @@ class DataQualityIssue:
 
 
 @dataclass(frozen=True)
+class ApiRequestLog:
+    source_id: str
+    endpoint_key: str
+    request: dict[str, Any]
+    success: bool
+    status_code: int | None
+    elapsed_ms: int
+    retry_count: int
+    response: dict[str, Any] | None = None
+    error_message: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    request_started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(frozen=True)
+class LineageEvent:
+    target_table: str
+    target_key: str
+    source_table: str
+    source_key: str
+    transform_version: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class IngestionRun:
     run_id: UUID
     dag_id: str

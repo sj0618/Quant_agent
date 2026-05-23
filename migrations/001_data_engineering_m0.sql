@@ -46,9 +46,14 @@ CREATE TABLE IF NOT EXISTS meta.api_request_log (
     source_id TEXT REFERENCES meta.data_source(source_id),
     endpoint_key TEXT NOT NULL,
     request_hash TEXT NOT NULL,
+    success BOOLEAN NOT NULL DEFAULT FALSE,
     status_code INTEGER,
     elapsed_ms INTEGER,
+    retry_count INTEGER NOT NULL DEFAULT 0,
     response_hash TEXT,
+    error_message TEXT,
+    metadata_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb,
+    request_started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -72,6 +77,7 @@ CREATE TABLE IF NOT EXISTS meta.lineage_event (
     source_key TEXT NOT NULL,
     run_id UUID REFERENCES meta.ingestion_run(run_id),
     transform_version TEXT NOT NULL,
+    metadata_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -124,7 +130,12 @@ CREATE TABLE IF NOT EXISTS core.symbol_master (
     symbol TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     market TEXT,
+    market_segment TEXT,
     security_type TEXT,
+    listing_status TEXT NOT NULL DEFAULT 'listed',
+    listed_at DATE,
+    delisted_at DATE,
+    metadata_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -135,9 +146,22 @@ CREATE TABLE IF NOT EXISTS core.symbol_listing_history (
     valid_to DATE,
     market TEXT,
     listing_status TEXT NOT NULL,
+    event_type TEXT NOT NULL DEFAULT 'listed',
     source_id TEXT REFERENCES meta.data_source(source_id),
     run_id UUID REFERENCES meta.ingestion_run(run_id),
+    metadata_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb,
     PRIMARY KEY (symbol_id, valid_from)
+);
+
+CREATE TABLE IF NOT EXISTS core.symbol_name_history (
+    symbol_id BIGINT NOT NULL REFERENCES core.symbol_master(symbol_id),
+    valid_from DATE NOT NULL,
+    valid_to DATE,
+    name TEXT NOT NULL,
+    source_id TEXT REFERENCES meta.data_source(source_id),
+    run_id UUID REFERENCES meta.ingestion_run(run_id),
+    metadata_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (symbol_id, valid_from, name)
 );
 
 CREATE TABLE IF NOT EXISTS core.trading_calendar (
@@ -305,7 +329,11 @@ JOIN core.symbol_master sm ON sm.symbol_id = q.symbol_id;
 CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_symbol_date ON core.ohlcv_daily (symbol_id, trade_date DESC);
 CREATE INDEX IF NOT EXISTS idx_raw_ohlcv_payload ON raw.ohlcv_response USING GIN (payload_jsonb);
 CREATE INDEX IF NOT EXISTS idx_dq_issue_dataset ON meta.data_quality_issue (dataset, severity, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_request_log_run_source_created ON meta.api_request_log (run_id, source_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_lineage_event_target ON meta.lineage_event (target_table, target_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_symbol_master_market_status ON core.symbol_master (market_segment, listing_status);
+CREATE INDEX IF NOT EXISTS idx_symbol_listing_history_symbol_validity ON core.symbol_listing_history (symbol_id, valid_from DESC, valid_to);
+CREATE INDEX IF NOT EXISTS idx_symbol_name_history_symbol_validity ON core.symbol_name_history (symbol_id, valid_from DESC, valid_to);
 CREATE INDEX IF NOT EXISTS idx_seibro_report_symbol_date ON feature.seibro_report_summary (symbol_id, report_date DESC);
 CREATE INDEX IF NOT EXISTS idx_bok_macro_series_date ON feature.bok_macro_daily (series_id, effective_date DESC);
 CREATE INDEX IF NOT EXISTS idx_dart_financial_symbol_period ON feature.dart_financial_quarterly (symbol_id, period_end DESC);
-

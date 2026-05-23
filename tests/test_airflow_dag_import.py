@@ -76,7 +76,26 @@ class AirflowDagImportTests(unittest.TestCase):
 
         self.assertIn("kis_adjusted = ingest_kis_adjusted_ohlcv_daily()", source)
         self.assertIn("kis_adjusted >> computed", source)
+        self.assertIn("symbol_metadata = refresh_symbol_metadata_daily()", source)
+        self.assertIn("ingested >> [symbol_metadata, kis_adjusted", source)
+        self.assertIn("computed >> qa", source)
         self.assertNotIn("ingested >> [computed", source)
+
+    def test_data_quality_args_cover_all_checks(self):
+        module = _load_dag_module("quant_agent_data_engineering_dag_qa_args")
+
+        args = module._data_quality_args(start_date=date(2026, 5, 1), end_date=date(2026, 5, 21))
+
+        self.assertEqual(args[args.index("--start-date") + 1], "2026-05-01")
+        self.assertEqual(args[args.index("--end-date") + 1], "2026-05-21")
+        self.assertEqual(args[args.index("--checks") + 1], "all")
+
+    def test_symbol_metadata_args_use_target_date(self):
+        module = _load_dag_module("quant_agent_data_engineering_dag_symbol_metadata_args")
+
+        args = module._symbol_metadata_args(as_of_date=date(2026, 5, 21))
+
+        self.assertEqual(args, ["--as-of-date", "2026-05-21"])
 
 
 def _load_dag_module(module_name: str = "quant_agent_data_engineering_dag"):

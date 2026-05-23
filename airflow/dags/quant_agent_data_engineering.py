@@ -31,6 +31,12 @@ KIS_ADJUSTED_INGEST_SCRIPT = Path(
 TA_PIPELINE_SCRIPT = Path(
     os.getenv("QUANT_AIRFLOW_TA_PIPELINE_SCRIPT", str(REPO_ROOT / "scripts" / "compute_technical_indicators_pipeline.py"))
 )
+QA_CHECK_SCRIPT = Path(
+    os.getenv("QUANT_AIRFLOW_QA_CHECK_SCRIPT", str(REPO_ROOT / "scripts" / "run_data_quality_checks.py"))
+)
+SYMBOL_METADATA_SCRIPT = Path(
+    os.getenv("QUANT_AIRFLOW_SYMBOL_METADATA_SCRIPT", str(REPO_ROOT / "scripts" / "refresh_symbol_metadata.py"))
+)
 PYTHON_EXECUTABLE = os.getenv("QUANT_AIRFLOW_PYTHON", sys.executable)
 
 
@@ -87,6 +93,23 @@ if dag and task:  # pragma: no branch
                 _kis_adjusted_ingest_args(start_date=target_date, end_date=target_date),
             )
 
+        @task(task_id="refresh_symbol_metadata_daily")
+        def refresh_symbol_metadata_daily(logical_date: str | None = None) -> dict:
+            target_date = _target_date(logical_date)
+            return _run_python_script(
+                SYMBOL_METADATA_SCRIPT,
+                _symbol_metadata_args(as_of_date=target_date),
+            )
+
+        @task(task_id="run_data_quality_checks_daily")
+        def run_data_quality_checks_daily(logical_date: str | None = None) -> dict:
+            target_date = _target_date(logical_date)
+            start_date = _warmup_start_date(target_date)
+            return _run_python_script(
+                QA_CHECK_SCRIPT,
+                _data_quality_args(start_date=start_date, end_date=target_date),
+            )
+
         @task(task_id="ingest_bok_daily")
         def ingest_bok_daily(logical_date: str | None = None) -> dict:
             from quant_agent.data.external import ExternalDataIngestionService
@@ -135,13 +158,17 @@ if dag and task:  # pragma: no branch
             return {"written": written}
 
         ingested = ingest_ohlcv_daily()
+        symbol_metadata = refresh_symbol_metadata_daily()
         kis_adjusted = ingest_kis_adjusted_ohlcv_daily()
         computed = compute_ta_indicators_daily()
+        qa = run_data_quality_checks_daily()
         bok = ingest_bok_daily()
         dart = ingest_dart_corp_codes_daily()
         seibro = ingest_seibro_reports_daily()
-        ingested >> [kis_adjusted, bok, seibro]
+        ingested >> [symbol_metadata, kis_adjusted, bok, seibro]
+        symbol_metadata >> qa
         kis_adjusted >> computed
+        computed >> qa
         # DART corp-code refresh is independent and intentionally has no upstream dependency.
 
     @dag(
@@ -229,6 +256,24 @@ def _technical_indicator_args(*, start_date: date, end_date: date) -> list[str]:
     if symbols:
         args.extend(["--tickers", ",".join(symbols)])
     return args
+
+
+def _data_quality_args(*, start_date: date, end_date: date) -> list[str]:
+    return [
+        "--start-date",
+        start_date.isoformat(),
+        "--end-date",
+        end_date.isoformat(),
+        "--checks",
+        "all",
+    ]
+
+
+def _symbol_metadata_args(*, as_of_date: date) -> list[str]:
+    return [
+        "--as-of-date",
+        as_of_date.isoformat(),
+    ]
 
 
 def _run_python_script(script_path: Path, args: list[str]) -> dict:

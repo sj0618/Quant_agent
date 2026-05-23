@@ -12,8 +12,8 @@ from uuid import UUID, uuid4
 
 from quant_agent.data.config import DatabaseConfig
 from quant_agent.data.db import SqlExecutor, jsonb_literal, make_executor, sql_literal
-from quant_agent.data.models import DataQualityIssue, OhlcvBar, RawSourcePayload
-from quant_agent.data.quality import duplicate_keys, is_tradable_ohlcv, ohlcv_quality_flags
+from quant_agent.data.models import ApiRequestLog, DataQualityIssue, LineageEvent, OhlcvBar, RawSourcePayload
+from quant_agent.data.quality import OhlcvQualityConfig, duplicate_keys, is_tradable_ohlcv, ohlcv_quality_flags
 
 
 DATA_SOURCES = {
@@ -23,6 +23,7 @@ DATA_SOURCES = {
     "BOK": ("Bank of Korea ECOS", "BOK_BASE_URL", False),
     "DART": ("OpenDART Financial Supervisory Service", "DART_BASE_URL", False),
     "TA": ("TA-Lib technical indicator transform", "TA_TRANSFORM_VERSION", False),
+    "QA": ("Quant-Agent data quality checks", "QA_RULE_VERSION", False),
 }
 
 
@@ -82,6 +83,34 @@ class DataRepository:
                    status = {sql_literal(status)},
                    error_message = {sql_literal(error_message)}
              WHERE run_id = {sql_literal(run_id)};
+            """
+        )
+
+    def store_api_request_log(self, event: ApiRequestLog, run_id: UUID) -> None:
+        self.store_api_request_logs([event], run_id)
+
+    def store_api_request_logs(self, events: list[ApiRequestLog], run_id: UUID) -> None:
+        if not events:
+            return
+        rows = ", ".join(_api_request_log_row(event, run_id) for event in events)
+        self.executor.execute_script(
+            f"""
+            INSERT INTO meta.api_request_log
+              (run_id, source_id, endpoint_key, request_hash, success, status_code,
+               elapsed_ms, retry_count, response_hash, error_message, metadata_jsonb, request_started_at)
+            VALUES {rows};
+            """
+        )
+
+    def store_lineage_events(self, events: list[LineageEvent], run_id: UUID) -> None:
+        if not events:
+            return
+        rows = ", ".join(_lineage_event_row(event, run_id) for event in events)
+        self.executor.execute_script(
+            f"""
+            INSERT INTO meta.lineage_event
+              (target_table, target_key, source_table, source_key, run_id, transform_version, metadata_jsonb)
+            VALUES {rows};
             """
         )
 
@@ -183,16 +212,34 @@ class DataRepository:
             symbol_by_code[bar.symbol] = bar
 
         symbol_rows = []
+        lifecycle_rows = []
+        name_history_rows = []
         calendar_dates: set[date] = set()
         ohlcv_rows = []
         lineage_rows = []
         issue_rows = []
 
         for bar in symbol_by_code.values():
+            market_segment = _infer_market_segment(bar.raw)
             symbol_rows.append(
                 "("
                 f"{sql_literal(bar.symbol)}, {sql_literal(bar.name or bar.symbol)}, "
-                f"{sql_literal(_infer_market(bar.raw))}, {sql_literal(_infer_security_type(bar.raw))}"
+                f"{sql_literal(market_segment)}, {sql_literal(market_segment)}, "
+                f"{sql_literal(_infer_security_type(bar.raw))}, {sql_literal('listed')}, "
+                f"{sql_literal(bar.trade_date)}, NULL, {jsonb_literal(_symbol_metadata(bar.raw))}"
+                ")"
+            )
+            lifecycle_rows.append(
+                "("
+                f"{sql_literal(bar.symbol)}, {sql_literal(bar.trade_date)}, {sql_literal(market_segment)}, "
+                f"{sql_literal('listed')}, {sql_literal('listed')}, {sql_literal(source_id)}, "
+                f"{sql_literal(run_id)}, {jsonb_literal(_symbol_metadata(bar.raw))}"
+                ")"
+            )
+            name_history_rows.append(
+                "("
+                f"{sql_literal(bar.symbol)}, {sql_literal(bar.trade_date)}, {sql_literal(bar.name or bar.symbol)}, "
+                f"{sql_literal(source_id)}, {sql_literal(run_id)}, {jsonb_literal(_symbol_metadata(bar.raw))}"
                 ")"
             )
 
@@ -246,14 +293,22 @@ class DataRepository:
         script_parts = [
             "BEGIN;",
             f"""
-            INSERT INTO core.symbol_master (symbol, name, market, security_type)
+            INSERT INTO core.symbol_master
+              (symbol, name, market, market_segment, security_type, listing_status, listed_at, delisted_at, metadata_jsonb)
             VALUES {", ".join(symbol_rows)}
             ON CONFLICT (symbol) DO UPDATE SET
               name = COALESCE(NULLIF(EXCLUDED.name, ''), core.symbol_master.name),
               market = COALESCE(EXCLUDED.market, core.symbol_master.market),
+              market_segment = COALESCE(EXCLUDED.market_segment, core.symbol_master.market_segment),
               security_type = COALESCE(EXCLUDED.security_type, core.symbol_master.security_type),
+              listing_status = EXCLUDED.listing_status,
+              listed_at = COALESCE(LEAST(core.symbol_master.listed_at, EXCLUDED.listed_at), EXCLUDED.listed_at, core.symbol_master.listed_at),
+              delisted_at = NULL,
+              metadata_jsonb = core.symbol_master.metadata_jsonb || EXCLUDED.metadata_jsonb,
               updated_at = now();
             """,
+            _symbol_lifecycle_sql(lifecycle_rows),
+            _symbol_name_history_sql(name_history_rows),
             f"""
             INSERT INTO core.trading_calendar (market, trade_date, is_open, source_id, run_id)
             VALUES {", ".join(calendar_rows)}
@@ -295,6 +350,180 @@ class DataRepository:
         script_parts.append("COMMIT;")
         self.executor.execute_script("\n".join(script_parts))
         return len(deduped_bars), issues
+
+    def refresh_symbol_lifecycle(self, *, run_id: UUID, as_of_date: date, source_id: str = "KRX") -> None:
+        self.executor.execute_script(
+            f"""
+            WITH observations AS (
+                SELECT o.symbol_id,
+                       o.trade_date,
+                       sm.market_segment,
+                       sm.name
+                  FROM core.ohlcv_daily o
+                  JOIN core.symbol_master sm ON sm.symbol_id = o.symbol_id
+                 WHERE o.source_id = {sql_literal(source_id)}
+                   AND o.trade_date <= {sql_literal(as_of_date)}
+            ),
+            first_seen AS (
+                SELECT symbol_id,
+                       MIN(trade_date) AS listed_at,
+                       MAX(trade_date) AS last_seen_at
+                  FROM observations
+                 GROUP BY symbol_id
+            )
+            UPDATE core.symbol_master sm
+               SET listed_at = COALESCE(sm.listed_at, f.listed_at),
+                   delisted_at = CASE WHEN f.last_seen_at = {sql_literal(as_of_date)} THEN NULL ELSE sm.delisted_at END,
+                   updated_at = now()
+              FROM first_seen f
+             WHERE sm.symbol_id = f.symbol_id;
+
+            WITH observations AS (
+                SELECT o.symbol_id,
+                       o.trade_date,
+                       sm.market_segment,
+                       LAG(o.trade_date) OVER (PARTITION BY o.symbol_id ORDER BY o.trade_date) AS previous_trade_date
+                  FROM core.ohlcv_daily o
+                  JOIN core.symbol_master sm ON sm.symbol_id = o.symbol_id
+                 WHERE o.source_id = {sql_literal(source_id)}
+                   AND o.trade_date <= {sql_literal(as_of_date)}
+            ),
+            segmented AS (
+                SELECT *,
+                       SUM(
+                           CASE
+                             WHEN previous_trade_date IS NULL OR trade_date - previous_trade_date > 30 THEN 1
+                             ELSE 0
+                           END
+                       ) OVER (PARTITION BY symbol_id ORDER BY trade_date) AS segment_id
+                  FROM observations
+            ),
+            listing_segments AS (
+                SELECT symbol_id,
+                       MIN(trade_date) AS valid_from,
+                       CASE WHEN MAX(trade_date) < {sql_literal(as_of_date)} THEN MAX(trade_date) ELSE NULL::date END AS valid_to,
+                       MAX(market_segment) AS market,
+                       segment_id
+                  FROM segmented
+                 GROUP BY symbol_id, segment_id
+            )
+            INSERT INTO core.symbol_listing_history
+              (symbol_id, valid_from, valid_to, market, listing_status, event_type, source_id, run_id, metadata_jsonb)
+            SELECT symbol_id,
+                   valid_from,
+                   valid_to,
+                   market,
+                   'listed',
+                   CASE WHEN segment_id = 1 THEN 'listed' ELSE 'relisted' END,
+                   {sql_literal(source_id)},
+                   {sql_literal(run_id)},
+                   jsonb_build_object('derived_from', 'core.ohlcv_daily', 'segment_id', segment_id)
+              FROM listing_segments
+            ON CONFLICT (symbol_id, valid_from) DO UPDATE SET
+              valid_to = EXCLUDED.valid_to,
+              market = COALESCE(EXCLUDED.market, core.symbol_listing_history.market),
+              listing_status = EXCLUDED.listing_status,
+              event_type = EXCLUDED.event_type,
+              source_id = EXCLUDED.source_id,
+              run_id = EXCLUDED.run_id,
+              metadata_jsonb = core.symbol_listing_history.metadata_jsonb || EXCLUDED.metadata_jsonb;
+
+            WITH first_seen AS (
+                SELECT o.symbol_id,
+                       MIN(o.trade_date) AS valid_from
+                  FROM core.ohlcv_daily o
+                 WHERE o.source_id = {sql_literal(source_id)}
+                   AND o.trade_date <= {sql_literal(as_of_date)}
+                 GROUP BY o.symbol_id
+            )
+            INSERT INTO core.symbol_name_history
+              (symbol_id, valid_from, valid_to, name, source_id, run_id, metadata_jsonb)
+            SELECT sm.symbol_id,
+                   f.valid_from,
+                   NULL,
+                   sm.name,
+                   {sql_literal(source_id)},
+                   {sql_literal(run_id)},
+                   jsonb_build_object('derived_from', 'core.symbol_master')
+              FROM core.symbol_master sm
+              JOIN first_seen f ON f.symbol_id = sm.symbol_id
+            ON CONFLICT (symbol_id, valid_from, name) DO UPDATE SET
+              source_id = EXCLUDED.source_id,
+              run_id = EXCLUDED.run_id,
+              metadata_jsonb = core.symbol_name_history.metadata_jsonb || EXCLUDED.metadata_jsonb;
+
+            WITH observed AS (
+                SELECT DISTINCT symbol_id
+                  FROM core.ohlcv_daily
+                 WHERE source_id = {sql_literal(source_id)}
+                   AND trade_date = {sql_literal(as_of_date)}
+            ),
+            delisted AS (
+                SELECT sm.symbol_id
+                  FROM core.symbol_master sm
+                 WHERE sm.listing_status = 'listed'
+                   AND sm.symbol_id NOT IN (SELECT symbol_id FROM observed)
+                   AND EXISTS (
+                       SELECT 1
+                         FROM core.ohlcv_daily o
+                        WHERE o.symbol_id = sm.symbol_id
+                          AND o.source_id = {sql_literal(source_id)}
+                          AND o.trade_date < {sql_literal(as_of_date)}
+                   )
+            )
+            UPDATE core.symbol_master sm
+               SET listing_status = 'delisted',
+                   delisted_at = {sql_literal(as_of_date)},
+                   updated_at = now()
+              FROM delisted d
+             WHERE sm.symbol_id = d.symbol_id;
+
+            WITH observed AS (
+                SELECT DISTINCT symbol_id
+                  FROM core.ohlcv_daily
+                 WHERE source_id = {sql_literal(source_id)}
+                   AND trade_date = {sql_literal(as_of_date)}
+            )
+            UPDATE core.symbol_master sm
+               SET listing_status = 'listed',
+                   delisted_at = NULL,
+                   listed_at = COALESCE(sm.listed_at, {sql_literal(as_of_date)}),
+                   updated_at = now()
+              FROM observed o
+             WHERE sm.symbol_id = o.symbol_id
+               AND sm.listing_status <> 'listed';
+
+            WITH observed AS (
+                SELECT DISTINCT symbol_id
+                  FROM core.ohlcv_daily
+                 WHERE source_id = {sql_literal(source_id)}
+                   AND trade_date = {sql_literal(as_of_date)}
+            )
+            UPDATE core.symbol_listing_history h
+               SET valid_to = {sql_literal(as_of_date)}
+             WHERE h.valid_to IS NULL
+               AND h.listing_status = 'listed'
+               AND h.symbol_id NOT IN (SELECT symbol_id FROM observed);
+
+            WITH delisted AS (
+                SELECT sm.symbol_id, sm.market_segment
+                  FROM core.symbol_master sm
+                 WHERE sm.listing_status = 'delisted'
+                   AND sm.delisted_at = {sql_literal(as_of_date)}
+            )
+            INSERT INTO core.symbol_listing_history
+              (symbol_id, valid_from, valid_to, market, listing_status, event_type, source_id, run_id, metadata_jsonb)
+            SELECT symbol_id, {sql_literal(as_of_date)}, NULL, market_segment, 'delisted', 'delisted',
+                   {sql_literal(source_id)}, {sql_literal(run_id)}, '{{}}'::jsonb
+              FROM delisted
+            ON CONFLICT (symbol_id, valid_from) DO UPDATE SET
+              listing_status = EXCLUDED.listing_status,
+              event_type = EXCLUDED.event_type,
+              source_id = EXCLUDED.source_id,
+              run_id = EXCLUDED.run_id,
+              metadata_jsonb = core.symbol_listing_history.metadata_jsonb || EXCLUDED.metadata_jsonb;
+            """
+        )
 
     def refresh_ohlcv_quality(
         self,
@@ -352,6 +581,205 @@ class DataRepository:
                  WHERE as_of_date = {sql_literal(end_date)}
                    AND coverage_ratio < {sql_literal(min_coverage)}
               );
+            """
+        )
+
+    def run_ohlcv_quality_framework(
+        self,
+        *,
+        run_id: UUID,
+        source_id: str,
+        start_date: date,
+        end_date: date,
+        min_coverage: float,
+        config: OhlcvQualityConfig | None = None,
+    ) -> None:
+        quality_config = config or OhlcvQualityConfig()
+        self.refresh_ohlcv_quality(
+            run_id=run_id,
+            source_id=source_id,
+            start_date=start_date,
+            end_date=end_date,
+            min_coverage=min_coverage,
+        )
+        self.executor.execute_script(
+            f"""
+            WITH expected_dates AS (
+                SELECT trade_date
+                  FROM core.trading_calendar
+                 WHERE market = 'KRX'
+                   AND is_open = TRUE
+                   AND trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+                UNION
+                SELECT DISTINCT trade_date
+                  FROM core.ohlcv_daily
+                 WHERE source_id = {sql_literal(source_id)}
+                   AND trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+            ),
+            scoped_symbols AS (
+                SELECT DISTINCT o.symbol_id, sm.symbol
+                  FROM core.ohlcv_daily o
+                  JOIN core.symbol_master sm ON sm.symbol_id = o.symbol_id
+                 WHERE o.source_id = {sql_literal(source_id)}
+                   AND o.trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+            ),
+            missing_symbol_dates AS (
+                SELECT s.symbol, e.trade_date
+                  FROM scoped_symbols s
+                 CROSS JOIN expected_dates e
+                  LEFT JOIN core.ohlcv_daily o
+                    ON o.symbol_id = s.symbol_id
+                   AND o.trade_date = e.trade_date
+                   AND o.source_id = {sql_literal(source_id)}
+                 WHERE o.symbol_id IS NULL
+            )
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, symbol, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'core.ohlcv_daily', symbol, trade_date,
+                   'warning', 'MISSING_SYMBOL_DATE',
+                   'Expected trading date is missing for symbol.'
+              FROM missing_symbol_dates;
+
+            WITH ordered AS (
+                SELECT sm.symbol,
+                       o.symbol_id,
+                       o.trade_date,
+                       o.close,
+                       CASE
+                         WHEN o.close IS NOT NULL
+                          AND o.close = LAG(o.close) OVER (PARTITION BY o.symbol_id ORDER BY o.trade_date)
+                         THEN 0
+                         ELSE 1
+                       END AS break_flag
+                  FROM core.ohlcv_daily o
+                  JOIN core.symbol_master sm ON sm.symbol_id = o.symbol_id
+                 WHERE o.source_id = {sql_literal(source_id)}
+                   AND o.trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+            ),
+            grouped AS (
+                SELECT *,
+                       SUM(break_flag) OVER (PARTITION BY symbol_id ORDER BY trade_date) AS stale_group
+                  FROM ordered
+            ),
+            stale AS (
+                SELECT symbol,
+                       trade_date,
+                       COUNT(*) OVER (PARTITION BY symbol_id, stale_group) AS stale_days
+                  FROM grouped
+                 WHERE close IS NOT NULL
+            )
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, symbol, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'core.ohlcv_daily', symbol, trade_date,
+                   'warning', 'STALE_PRICE',
+                   'Close price unchanged for at least '
+                   || {sql_literal(quality_config.stale_price_days)}
+                   || ' consecutive observations.'
+              FROM stale
+             WHERE stale_days >= {sql_literal(quality_config.stale_price_days)};
+
+            WITH volume_baseline AS (
+                SELECT symbol_id,
+                       percentile_cont(0.5) WITHIN GROUP (ORDER BY volume) AS median_volume,
+                       COUNT(*)::int AS sample_count
+                  FROM core.ohlcv_daily
+                 WHERE source_id = {sql_literal(source_id)}
+                   AND trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+                   AND volume > 0
+                 GROUP BY symbol_id
+            ),
+            anomalous AS (
+                SELECT sm.symbol,
+                       o.trade_date,
+                       o.volume,
+                       b.median_volume,
+                       CASE
+                         WHEN o.volume >= b.median_volume * {sql_literal(quality_config.volume_anomaly_multiplier)}
+                         THEN 'HIGH_VOLUME_ANOMALY'
+                         ELSE 'LOW_VOLUME_ANOMALY'
+                       END AS rule_code
+                  FROM core.ohlcv_daily o
+                  JOIN core.symbol_master sm ON sm.symbol_id = o.symbol_id
+                  JOIN volume_baseline b ON b.symbol_id = o.symbol_id
+                 WHERE o.source_id = {sql_literal(source_id)}
+                   AND o.trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+                   AND b.sample_count >= {sql_literal(quality_config.min_volume_sample_count)}
+                   AND b.median_volume > 0
+                   AND o.volume > 0
+                   AND (
+                        o.volume >= b.median_volume * {sql_literal(quality_config.volume_anomaly_multiplier)}
+                     OR o.volume <= b.median_volume / {sql_literal(quality_config.volume_anomaly_multiplier)}
+                   )
+            )
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, symbol, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'core.ohlcv_daily', symbol, trade_date,
+                   'warning', rule_code,
+                   'Volume differs materially from the symbol median baseline.'
+              FROM anomalous;
+            """
+        )
+
+    def run_kis_krx_consistency_checks(
+        self,
+        *,
+        run_id: UUID,
+        start_date: date,
+        end_date: date,
+        config: OhlcvQualityConfig | None = None,
+    ) -> None:
+        quality_config = config or OhlcvQualityConfig()
+        self.executor.execute_script(
+            f"""
+            WITH krx AS (
+                SELECT sm.symbol,
+                       o.trade_date,
+                       o.close AS krx_close
+                  FROM core.ohlcv_daily o
+                  JOIN core.symbol_master sm ON sm.symbol_id = o.symbol_id
+                 WHERE o.source_id = 'KRX'
+                   AND o.trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+            ),
+            kis AS (
+                SELECT ticker AS symbol,
+                       "time" AS trade_date,
+                       adj_close AS kis_adj_close
+                  FROM feature.kis_adjusted_ohlcv_daily
+                 WHERE "time" BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+            ),
+            compared AS (
+                SELECT COALESCE(kis.symbol, krx.symbol) AS symbol,
+                       COALESCE(kis.trade_date, krx.trade_date) AS trade_date,
+                       kis.kis_adj_close,
+                       krx.krx_close
+                  FROM kis
+                  FULL OUTER JOIN krx
+                    ON krx.symbol = kis.symbol
+                   AND krx.trade_date = kis.trade_date
+            ),
+            issues AS (
+                SELECT symbol,
+                       trade_date,
+                       CASE
+                         WHEN kis_adj_close IS NULL THEN 'KRX_MISSING_KIS_ADJUSTED'
+                         WHEN krx_close IS NULL THEN 'KIS_MISSING_KRX_REFERENCE'
+                         ELSE 'KIS_KRX_CLOSE_MISMATCH'
+                       END AS rule_code
+                  FROM compared
+                 WHERE kis_adj_close IS NULL
+                    OR krx_close IS NULL
+                    OR (
+                        krx_close <> 0
+                    AND ABS(kis_adj_close - krx_close) / ABS(krx_close)
+                        > {sql_literal(quality_config.price_mismatch_tolerance_ratio)}
+                    )
+            )
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, symbol, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.kis_adjusted_ohlcv_daily', symbol, trade_date,
+                   'warning', rule_code,
+                   'KIS adjusted data and KRX source data consistency check failed.'
+              FROM issues;
             """
         )
 
@@ -583,6 +1011,135 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _symbol_lifecycle_sql(rows: list[str]) -> str:
+    if not rows:
+        return ""
+    return f"""
+        WITH incoming(symbol, valid_from, market, listing_status, event_type, source_id, run_id, metadata_jsonb) AS (
+            VALUES {", ".join(rows)}
+        ),
+        resolved AS (
+            SELECT sm.symbol_id,
+                   i.valid_from::date AS valid_from,
+                   i.market,
+                   i.listing_status,
+                   i.event_type,
+                   i.source_id,
+                   i.run_id::uuid AS run_id,
+                   i.metadata_jsonb::jsonb AS metadata_jsonb
+              FROM incoming i
+              JOIN core.symbol_master sm ON sm.symbol = i.symbol
+        ),
+        closed AS (
+            UPDATE core.symbol_listing_history h
+               SET valid_to = r.valid_from - 1
+              FROM resolved r
+             WHERE h.symbol_id = r.symbol_id
+               AND h.valid_to IS NULL
+               AND (
+                    h.market IS DISTINCT FROM r.market
+                 OR h.listing_status IS DISTINCT FROM r.listing_status
+               )
+             RETURNING h.symbol_id
+        )
+        INSERT INTO core.symbol_listing_history
+          (symbol_id, valid_from, valid_to, market, listing_status, event_type, source_id, run_id, metadata_jsonb)
+        SELECT r.symbol_id, r.valid_from, NULL, r.market, r.listing_status, r.event_type,
+               r.source_id, r.run_id, r.metadata_jsonb
+          FROM resolved r
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM core.symbol_listing_history h
+              WHERE h.symbol_id = r.symbol_id
+                AND h.valid_to IS NULL
+                AND h.market IS NOT DISTINCT FROM r.market
+                AND h.listing_status IS NOT DISTINCT FROM r.listing_status
+         )
+        ON CONFLICT (symbol_id, valid_from) DO UPDATE SET
+          market = EXCLUDED.market,
+          listing_status = EXCLUDED.listing_status,
+          event_type = EXCLUDED.event_type,
+          source_id = EXCLUDED.source_id,
+          run_id = EXCLUDED.run_id,
+          metadata_jsonb = core.symbol_listing_history.metadata_jsonb || EXCLUDED.metadata_jsonb;
+        """
+
+
+def _symbol_name_history_sql(rows: list[str]) -> str:
+    if not rows:
+        return ""
+    return f"""
+        WITH incoming(symbol, valid_from, name, source_id, run_id, metadata_jsonb) AS (
+            VALUES {", ".join(rows)}
+        ),
+        resolved AS (
+            SELECT sm.symbol_id,
+                   i.valid_from::date AS valid_from,
+                   NULLIF(i.name, '') AS name,
+                   i.source_id,
+                   i.run_id::uuid AS run_id,
+                   i.metadata_jsonb::jsonb AS metadata_jsonb
+              FROM incoming i
+              JOIN core.symbol_master sm ON sm.symbol = i.symbol
+             WHERE NULLIF(i.name, '') IS NOT NULL
+        ),
+        closed AS (
+            UPDATE core.symbol_name_history h
+               SET valid_to = r.valid_from - 1
+              FROM resolved r
+             WHERE h.symbol_id = r.symbol_id
+               AND h.valid_to IS NULL
+               AND h.name IS DISTINCT FROM r.name
+             RETURNING h.symbol_id
+        )
+        INSERT INTO core.symbol_name_history
+          (symbol_id, valid_from, valid_to, name, source_id, run_id, metadata_jsonb)
+        SELECT r.symbol_id, r.valid_from, NULL, r.name, r.source_id, r.run_id, r.metadata_jsonb
+          FROM resolved r
+         WHERE NOT EXISTS (
+             SELECT 1
+               FROM core.symbol_name_history h
+              WHERE h.symbol_id = r.symbol_id
+                AND h.valid_to IS NULL
+                AND h.name = r.name
+         )
+        ON CONFLICT (symbol_id, valid_from, name) DO UPDATE SET
+          source_id = EXCLUDED.source_id,
+          run_id = EXCLUDED.run_id,
+          metadata_jsonb = core.symbol_name_history.metadata_jsonb || EXCLUDED.metadata_jsonb;
+        """
+
+
+def _api_request_log_row(event: ApiRequestLog, run_id: UUID) -> str:
+    request_hash = _stable_hash(event.request)
+    response_hash = _stable_hash(event.response) if event.response is not None else None
+    return (
+        "("
+        f"{sql_literal(run_id)}, {sql_literal(event.source_id)}, {sql_literal(event.endpoint_key)}, "
+        f"{sql_literal(request_hash)}, {sql_literal(event.success)}, {sql_literal(event.status_code)}, "
+        f"{sql_literal(event.elapsed_ms)}, {sql_literal(event.retry_count)}, {sql_literal(response_hash)}, "
+        f"{sql_literal(_truncate(event.error_message, 4000))}, {jsonb_literal(event.metadata)}, "
+        f"{sql_literal(event.request_started_at.isoformat())}"
+        ")"
+    )
+
+
+def _lineage_event_row(event: LineageEvent, run_id: UUID) -> str:
+    return (
+        "("
+        f"{sql_literal(event.target_table)}, {sql_literal(event.target_key)}, "
+        f"{sql_literal(event.source_table)}, {sql_literal(event.source_key)}, "
+        f"{sql_literal(run_id)}, {sql_literal(event.transform_version)}, {jsonb_literal(event.metadata)}"
+        ")"
+    )
+
+
+def _truncate(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    return value[:limit]
+
+
 def _infer_market(raw: dict[str, Any]) -> str | None:
     for key in ("MKT_NM", "mkt_nm", "market"):
         value = raw.get(key)
@@ -591,12 +1148,45 @@ def _infer_market(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _infer_market_segment(raw: dict[str, Any]) -> str | None:
+    raw_market = _infer_market(raw)
+    if not raw_market:
+        return None
+    normalized = str(raw_market).strip().upper().replace(" ", "")
+    aliases = {
+        "KOSPI": "KOSPI",
+        "유가증권": "KOSPI",
+        "STK": "KOSPI",
+        "KOSDAQ": "KOSDAQ",
+        "코스닥": "KOSDAQ",
+        "KSQ": "KOSDAQ",
+        "KONEX": "KONEX",
+        "코넥스": "KONEX",
+        "KNX": "KONEX",
+    }
+    return aliases.get(normalized, str(raw_market).strip())
+
+
 def _infer_security_type(raw: dict[str, Any]) -> str | None:
     for key in ("SECUGRP_NM", "isu_abbrv", "security_type"):
         value = raw.get(key)
         if value:
             return str(value)
     return None
+
+
+def _symbol_metadata(raw: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "MKT_NM",
+        "SECT_TP_NM",
+        "LIST_SHRS",
+        "MKTCAP",
+        "ISU_ABBRV",
+        "ISU_NM",
+        "isu_abbrv",
+        "market",
+    )
+    return {key: raw[key] for key in keys if raw.get(key) not in (None, "")}
 
 
 def _dq_issue_row(issue: DataQualityIssue, run_id: UUID) -> str:
