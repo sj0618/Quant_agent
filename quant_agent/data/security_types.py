@@ -6,13 +6,14 @@ import re
 from typing import Any, Mapping
 
 
-COMMON_STOCK = "common_stock"
-PREFERRED_STOCK = "preferred_stock"
-SPAC = "spac"
-REIT = "reit"
-ETF = "etf"
-ETN = "etn"
-OTHER = "other"
+COMMON_STOCK = "보통주"
+PREFERRED_STOCK = "우선주"
+SPAC = "SPAC"
+REIT = "리츠(REITs)"
+ETF = "ETF"
+ETN = "ETN"
+INFRASTRUCTURE_FUND = "인프라펀드"
+OTHER = "기타"
 
 CANONICAL_SECURITY_TYPES = {
     COMMON_STOCK,
@@ -21,6 +22,7 @@ CANONICAL_SECURITY_TYPES = {
     REIT,
     ETF,
     ETN,
+    INFRASTRUCTURE_FUND,
     OTHER,
 }
 
@@ -66,18 +68,24 @@ _CANONICAL_ALIASES = {
     "REIT": REIT,
     "REITS": REIT,
     "리츠": REIT,
+    "리츠(REITS)": REIT,
     "부동산투자회사": REIT,
     "ETF": ETF,
     "상장지수펀드": ETF,
     "상장지수집합투자기구": ETF,
     "ETN": ETN,
     "상장지수증권": ETN,
+    "INFRASTRUCTURE_FUND": INFRASTRUCTURE_FUND,
+    "INFRASTRUCTUREFUND": INFRASTRUCTURE_FUND,
+    "인프라펀드": INFRASTRUCTURE_FUND,
     "OTHER": OTHER,
     "기타": OTHER,
 }
 
 _PREFERRED_NAME_RE = re.compile(r"(?:우선주|[0-9]*우(?:B|C)?(?:\(전환\))?)$")
 _PREFERRED_SYMBOL_RE = re.compile(r"^\d{5}[57KLM]$")
+_INFRASTRUCTURE_FUND_SYMBOLS = {"088980", "415640"}
+_INFRASTRUCTURE_FUND_NAMES = {"맥쿼리인프라", "KB발해인프라"}
 
 
 def classify_security_type(
@@ -98,7 +106,7 @@ def classify_security_type(
     raw = raw or {}
     explicit_type = _first_text(raw, _SECURITY_TYPE_KEYS)
     explicit_canonical = _canonical_security_type(explicit_type)
-    if explicit_canonical in {PREFERRED_STOCK, SPAC, REIT, ETF, ETN, OTHER}:
+    if explicit_canonical in {PREFERRED_STOCK, SPAC, REIT, ETF, ETN, INFRASTRUCTURE_FUND, OTHER}:
         return explicit_canonical
 
     metadata_text = _metadata_text(raw, explicit_type)
@@ -119,12 +127,10 @@ def classify_security_type(
         return ETF
     if _contains_any(metadata_text, ("스팩", "기업인수목적")) or "SPAC" in upper_metadata or "스팩" in compact_name or "SPAC" in upper_name:
         return SPAC
-    if (
-        "REIT" in upper_metadata
-        or "부동산투자회사" in metadata_text
-        or ("리츠" in compact_name and "메리츠" not in compact_name)
-    ):
+    if "REIT" in upper_metadata or "부동산투자회사" in metadata_text or _looks_like_reit_name(compact_name):
         return REIT
+    if _looks_like_infrastructure_fund(symbol=symbol, compact_name=compact_name):
+        return INFRASTRUCTURE_FUND
     if (
         _contains_any(metadata_text, ("우선주", "종류주"))
         or _PREFERRED_NAME_RE.search(compact_name) is not None
@@ -183,3 +189,16 @@ def _looks_like_preferred_symbol(symbol: str | None) -> bool:
     if not symbol:
         return False
     return _PREFERRED_SYMBOL_RE.fullmatch(symbol.strip().upper()) is not None
+
+
+def _looks_like_reit_name(compact_name: str) -> bool:
+    if not compact_name:
+        return False
+    if "메리츠" in compact_name or compact_name.startswith("블리츠"):
+        return False
+    return compact_name.endswith("리츠") or compact_name.startswith("이리츠")
+
+
+def _looks_like_infrastructure_fund(*, symbol: str | None, compact_name: str) -> bool:
+    normalized_symbol = (symbol or "").strip().upper()
+    return normalized_symbol in _INFRASTRUCTURE_FUND_SYMBOLS or compact_name in _INFRASTRUCTURE_FUND_NAMES

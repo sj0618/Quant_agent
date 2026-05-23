@@ -53,8 +53,9 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("chk_symbol_master_security_type", sql)
         self.assertIn("CREATE OR REPLACE VIEW meta.view_common_stock_universe", sql)
         self.assertIn("market_segment IN ('KOSPI', 'KOSDAQ')", sql)
-        self.assertIn("security_type = 'common_stock'", sql)
+        self.assertIn("security_type = '보통주'", sql)
         self.assertIn("listing_status = 'listed'", sql)
+        self.assertIn("'인프라펀드'", sql)
 
 
 if __name__ == "__main__":

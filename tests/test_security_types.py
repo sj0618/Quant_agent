@@ -4,6 +4,7 @@ from quant_agent.data.security_types import (
     COMMON_STOCK,
     ETN,
     ETF,
+    INFRASTRUCTURE_FUND,
     PREFERRED_STOCK,
     REIT,
     SPAC,
@@ -48,6 +49,19 @@ class SecurityTypeClassificationTests(unittest.TestCase):
             classify_security_type({"MKT_NM": "KOSPI"}, symbol="000060", name="메리츠화재", market_segment="KOSPI"),
             COMMON_STOCK,
         )
+        self.assertEqual(
+            classify_security_type({"MKT_NM": "KOSDAQ"}, symbol="369370", name="블리츠웨이엔터테인먼트", market_segment="KOSDAQ"),
+            COMMON_STOCK,
+        )
+
+    def test_infrastructure_funds_are_not_common_stock_universe_members(self):
+        cases = [("088980", "맥쿼리인프라"), ("415640", "KB발해인프라")]
+        for symbol, name in cases:
+            with self.subTest(symbol=symbol, name=name):
+                self.assertEqual(
+                    classify_security_type({"MKT_NM": "KOSPI"}, symbol=symbol, name=name, market_segment="KOSPI"),
+                    INFRASTRUCTURE_FUND,
+                )
 
 
 if __name__ == "__main__":

@@ -61,8 +61,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             SELECT COUNT(*)::int AS invalid_count
               FROM meta.view_common_stock_universe
              WHERE market_segment NOT IN ('KOSPI', 'KOSDAQ')
-                OR security_type <> 'common_stock'
+                OR security_type <> '보통주'
                 OR listing_status <> 'listed'
+            """
+        )[0]["invalid_count"],
+        "unexpected_security_type_count": executor.fetch_json(
+            """
+            SELECT COUNT(*)::int AS invalid_count
+              FROM core.symbol_master
+             WHERE security_type NOT IN ('보통주', '우선주', 'SPAC', '리츠(REITs)', 'ETF', 'ETN', '인프라펀드', '기타')
             """
         )[0]["invalid_count"],
     }
@@ -71,9 +78,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise RuntimeError(f"security_type still has NULL rows: {summary['null_security_type_count']}")
     if summary["invalid_common_stock_universe_count"] != 0:
         raise RuntimeError(
-            "meta.view_common_stock_universe contains rows outside KOSPI/KOSDAQ common_stock: "
+            "meta.view_common_stock_universe contains rows outside listed KOSPI/KOSDAQ 보통주: "
             f"{summary['invalid_common_stock_universe_count']}"
         )
+    if summary["unexpected_security_type_count"] != 0:
+        raise RuntimeError(f"security_type contains unexpected labels: {summary['unexpected_security_type_count']}")
 
     text = json.dumps(summary, ensure_ascii=False, indent=2)
     print(text)
