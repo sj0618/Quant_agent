@@ -45,6 +45,17 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("feature.ta_trend_ticker_daily", sql)
         self.assertIn("feature.adjusted_ohlcv_daily", sql)
 
+    def test_symbol_security_type_migration_classifies_and_exposes_common_stock_universe(self):
+        sql = Path("migrations/006_symbol_security_type_classification.sql").read_text(encoding="utf-8")
+        self.assertIn("CREATE OR REPLACE FUNCTION meta.classify_krx_security_type", sql)
+        self.assertIn("UPDATE core.symbol_master", sql)
+        self.assertIn("ALTER COLUMN security_type SET NOT NULL", sql)
+        self.assertIn("chk_symbol_master_security_type", sql)
+        self.assertIn("CREATE OR REPLACE VIEW meta.view_common_stock_universe", sql)
+        self.assertIn("market_segment IN ('KOSPI', 'KOSDAQ')", sql)
+        self.assertIn("security_type = 'common_stock'", sql)
+        self.assertIn("listing_status = 'listed'", sql)
+
 
 if __name__ == "__main__":
     unittest.main()
