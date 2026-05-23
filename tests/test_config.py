@@ -1,8 +1,12 @@
+import ast
 from datetime import date
 import os
+from pathlib import Path
 import unittest
 
 from quant_agent.data.config import BokConfig, DartConfig, DatabaseConfig, KisConfig, KrxConfig, PilotConfig, SeibroConfig
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ConfigTests(unittest.TestCase):
@@ -57,6 +61,24 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(BokConfig.from_env().is_configured)
             self.assertTrue(DartConfig.from_env().is_configured)
             self.assertTrue(SeibroConfig.from_env().collection_approved)
+
+
+class EntrypointSecurityTests(unittest.TestCase):
+    def test_main_does_not_load_dotenv(self):
+        tree = ast.parse((PROJECT_ROOT / "main.py").read_text(encoding="utf-8"))
+        forbidden_calls = []
+        forbidden_imports = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "dotenv":
+                forbidden_imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.Import):
+                forbidden_imports.extend(alias.name for alias in node.names if alias.name == "dotenv")
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "load_dotenv":
+                forbidden_calls.append(node.func.id)
+
+        self.assertEqual(forbidden_imports, [])
+        self.assertEqual(forbidden_calls, [])
 
 
 class EnvGuard:

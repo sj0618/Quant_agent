@@ -1,10 +1,7 @@
 import os
 import re
 from openai import AzureOpenAI
-from dotenv import load_dotenv
 from validator import CodeValidator
-
-load_dotenv()
 
 class StrategyOrchestrator:
     def __init__(self):
