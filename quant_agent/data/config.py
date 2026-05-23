@@ -39,6 +39,17 @@ DEFAULT_OHLCV_BATCH_DAYS = 1
 DEFAULT_OHLCV_BACKFILL_YEARS = 10
 DEFAULT_TA_TRANSFORM_VERSION = "ta-lib-0.6.8"
 DEFAULT_SEIBRO_BASE_URL = "https://openplatform.seibro.or.kr"
+DEFAULT_SEIBRO_WEB_BASE_URL = "https://seibro.or.kr"
+DEFAULT_SEIBRO_ANALYST_REPORT_PAGE_PATH = (
+    "/websquare/control.jsp?w2xPath=/IPORTAL/user/company/BIP_CNTS01019V.xml&menuNo=16"
+)
+DEFAULT_SEIBRO_ANALYST_REPORT_API_PATH = "/websquare/engine/proworks/callServletService.jsp"
+DEFAULT_SEIBRO_ANALYST_REPORT_ACTION = "entrAnalysisSummaryReportPList"
+DEFAULT_SEIBRO_ANALYST_REPORT_TASK = "ksd.safe.bip.cnts.Company.process.EntrAnalysisPTask"
+DEFAULT_SEIBRO_ANALYST_REPORT_PAGE_SIZE = 500
+DEFAULT_SEIBRO_ANALYST_REPORT_CHUNK_MONTHS = 1
+DEFAULT_SEIBRO_REQUEST_SLEEP_MIN_SECONDS = 1.0
+DEFAULT_SEIBRO_REQUEST_SLEEP_MAX_SECONDS = 3.0
 DEFAULT_BOK_BASE_URL = "https://ecos.bok.or.kr/api"
 DEFAULT_DART_BASE_URL = "https://opendart.fss.or.kr/api"
 
@@ -230,6 +241,15 @@ class TaConfig:
 @dataclass(frozen=True)
 class SeibroConfig:
     base_url: str
+    web_base_url: str
+    analyst_report_page_path: str
+    analyst_report_api_path: str
+    analyst_report_action: str
+    analyst_report_task: str
+    analyst_report_page_size: int
+    analyst_report_chunk_months: int
+    request_sleep_min_seconds: float
+    request_sleep_max_seconds: float
     api_key: str | None
     collection_approved: bool
     request_timeout_seconds: int
@@ -239,6 +259,35 @@ class SeibroConfig:
     def from_env(cls) -> "SeibroConfig":
         return cls(
             base_url=(_env("SEIBRO_BASE_URL", DEFAULT_SEIBRO_BASE_URL) or DEFAULT_SEIBRO_BASE_URL).rstrip("/"),
+            web_base_url=(
+                _env("SEIBRO_WEB_BASE_URL", DEFAULT_SEIBRO_WEB_BASE_URL) or DEFAULT_SEIBRO_WEB_BASE_URL
+            ).rstrip("/"),
+            analyst_report_page_path=_env(
+                "SEIBRO_ANALYST_REPORT_PAGE_PATH", DEFAULT_SEIBRO_ANALYST_REPORT_PAGE_PATH
+            )
+            or DEFAULT_SEIBRO_ANALYST_REPORT_PAGE_PATH,
+            analyst_report_api_path=_env(
+                "SEIBRO_ANALYST_REPORT_API_PATH", DEFAULT_SEIBRO_ANALYST_REPORT_API_PATH
+            )
+            or DEFAULT_SEIBRO_ANALYST_REPORT_API_PATH,
+            analyst_report_action=_env(
+                "SEIBRO_ANALYST_REPORT_ACTION", DEFAULT_SEIBRO_ANALYST_REPORT_ACTION
+            )
+            or DEFAULT_SEIBRO_ANALYST_REPORT_ACTION,
+            analyst_report_task=_env("SEIBRO_ANALYST_REPORT_TASK", DEFAULT_SEIBRO_ANALYST_REPORT_TASK)
+            or DEFAULT_SEIBRO_ANALYST_REPORT_TASK,
+            analyst_report_page_size=_env_int(
+                "SEIBRO_ANALYST_REPORT_PAGE_SIZE", DEFAULT_SEIBRO_ANALYST_REPORT_PAGE_SIZE
+            ),
+            analyst_report_chunk_months=_env_int(
+                "SEIBRO_ANALYST_REPORT_CHUNK_MONTHS", DEFAULT_SEIBRO_ANALYST_REPORT_CHUNK_MONTHS
+            ),
+            request_sleep_min_seconds=_env_float(
+                "SEIBRO_REQUEST_SLEEP_MIN_SECONDS", DEFAULT_SEIBRO_REQUEST_SLEEP_MIN_SECONDS
+            ),
+            request_sleep_max_seconds=_env_float(
+                "SEIBRO_REQUEST_SLEEP_MAX_SECONDS", DEFAULT_SEIBRO_REQUEST_SLEEP_MAX_SECONDS
+            ),
             api_key=_env("SEIBRO_API_KEY"),
             collection_approved=(_env("SEIBRO_COLLECTION_APPROVED", "false") or "false").lower() == "true",
             request_timeout_seconds=_env_int("API_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS),

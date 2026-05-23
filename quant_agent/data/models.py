@@ -33,6 +33,21 @@ class RawSourcePayload:
 
 
 @dataclass(frozen=True)
+class AnalystReportSummary:
+    report_date: date
+    ticker: str
+    company_name: str
+    summary: str
+    opinion: str | None
+    target_price: Decimal | None
+    close_price: Decimal | None
+    institution: str
+    author: str
+    source_payload_hash: str
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class DataQualityIssue:
     dataset: str
     severity: str

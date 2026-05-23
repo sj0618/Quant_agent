@@ -103,6 +103,24 @@ CREATE TABLE IF NOT EXISTS raw.seibro_report_response (
     UNIQUE (query_window, payload_hash)
 );
 
+CREATE TABLE IF NOT EXISTS raw.analyst_report_summary (
+    report_date DATE NOT NULL,
+    ticker TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    opinion TEXT,
+    target_price NUMERIC(20, 6),
+    close_price NUMERIC(20, 6),
+    institution TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '',
+    source_payload_hash TEXT NOT NULL,
+    raw_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb,
+    run_id UUID REFERENCES meta.ingestion_run(run_id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (report_date, ticker, institution, author)
+);
+
 CREATE TABLE IF NOT EXISTS raw.bok_response (
     raw_id BIGSERIAL PRIMARY KEY,
     stat_code TEXT NOT NULL,
@@ -328,6 +346,10 @@ JOIN core.symbol_master sm ON sm.symbol_id = q.symbol_id;
 
 CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_symbol_date ON core.ohlcv_daily (symbol_id, trade_date DESC);
 CREATE INDEX IF NOT EXISTS idx_raw_ohlcv_payload ON raw.ohlcv_response USING GIN (payload_jsonb);
+CREATE INDEX IF NOT EXISTS idx_raw_analyst_report_summary_ticker_date
+    ON raw.analyst_report_summary (ticker, report_date DESC);
+CREATE INDEX IF NOT EXISTS idx_raw_analyst_report_summary_payload
+    ON raw.analyst_report_summary USING GIN (raw_jsonb);
 CREATE INDEX IF NOT EXISTS idx_dq_issue_dataset ON meta.data_quality_issue (dataset, severity, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_api_request_log_run_source_created ON meta.api_request_log (run_id, source_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_lineage_event_target ON meta.lineage_event (target_table, target_key, created_at DESC);

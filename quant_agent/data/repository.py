@@ -12,7 +12,14 @@ from uuid import UUID, uuid4
 
 from quant_agent.data.config import DatabaseConfig
 from quant_agent.data.db import SqlExecutor, jsonb_literal, make_executor, sql_literal
-from quant_agent.data.models import ApiRequestLog, DataQualityIssue, LineageEvent, OhlcvBar, RawSourcePayload
+from quant_agent.data.models import (
+    AnalystReportSummary,
+    ApiRequestLog,
+    DataQualityIssue,
+    LineageEvent,
+    OhlcvBar,
+    RawSourcePayload,
+)
 from quant_agent.data.quality import OhlcvQualityConfig, duplicate_keys, is_tradable_ohlcv, ohlcv_quality_flags
 
 
@@ -25,6 +32,32 @@ DATA_SOURCES = {
     "TA": ("TA-Lib technical indicator transform", "TA_TRANSFORM_VERSION", False),
     "QA": ("Quant-Agent data quality checks", "QA_RULE_VERSION", False),
 }
+
+
+ANALYST_REPORT_SUMMARY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS raw.analyst_report_summary (
+    report_date DATE NOT NULL,
+    ticker TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    opinion TEXT,
+    target_price NUMERIC(20, 6),
+    close_price NUMERIC(20, 6),
+    institution TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '',
+    source_payload_hash TEXT NOT NULL,
+    raw_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb,
+    run_id UUID REFERENCES meta.ingestion_run(run_id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (report_date, ticker, institution, author)
+);
+
+CREATE INDEX IF NOT EXISTS idx_raw_analyst_report_summary_ticker_date
+    ON raw.analyst_report_summary (ticker, report_date DESC);
+CREATE INDEX IF NOT EXISTS idx_raw_analyst_report_summary_payload
+    ON raw.analyst_report_summary USING GIN (raw_jsonb);
+"""
 
 
 class DataRepository:
@@ -113,6 +146,9 @@ class DataRepository:
             VALUES {rows};
             """
         )
+
+    def ensure_analyst_report_summary_table(self) -> None:
+        self.executor.execute_script(ANALYST_REPORT_SUMMARY_TABLE_SQL)
 
     def store_raw_payloads(self, raw_payloads: list[RawSourcePayload], run_id: UUID) -> int:
         if not raw_payloads:
@@ -921,6 +957,60 @@ class DataRepository:
                 """
             )
         return len(rows)
+
+    def upsert_analyst_report_summaries(self, rows: list[AnalystReportSummary], run_id: UUID) -> int:
+        if not rows:
+            return 0
+        deduped = {
+            (row.report_date, row.ticker, row.institution, row.author): row
+            for row in rows
+            if row.ticker and row.summary
+        }
+        if not deduped:
+            return 0
+        values = []
+        for row in deduped.values():
+            values.append(
+                "("
+                f"{sql_literal(row.report_date)}, {sql_literal(row.ticker)}, {sql_literal(row.company_name)}, "
+                f"{sql_literal(row.summary)}, {sql_literal(row.opinion)}, {sql_literal(row.target_price)}, "
+                f"{sql_literal(row.close_price)}, {sql_literal(row.institution)}, {sql_literal(row.author)}, "
+                f"{sql_literal(row.source_payload_hash)}, {jsonb_literal(row.raw)}, {sql_literal(run_id)}"
+                ")"
+            )
+        self.executor.execute_script(
+            f"""
+            INSERT INTO raw.analyst_report_summary
+              (report_date, ticker, company_name, summary, opinion, target_price, close_price,
+               institution, author, source_payload_hash, raw_jsonb, run_id)
+            VALUES {", ".join(values)}
+            ON CONFLICT (report_date, ticker, institution, author) DO UPDATE SET
+              company_name = EXCLUDED.company_name,
+              summary = EXCLUDED.summary,
+              opinion = EXCLUDED.opinion,
+              target_price = EXCLUDED.target_price,
+              close_price = EXCLUDED.close_price,
+              source_payload_hash = EXCLUDED.source_payload_hash,
+              raw_jsonb = EXCLUDED.raw_jsonb,
+              run_id = EXCLUDED.run_id,
+              updated_at = now();
+            """
+        )
+        return len(deduped)
+
+    def count_analyst_report_summaries(
+        self, *, start_date: date, end_date: date, run_id: UUID | None = None
+    ) -> int:
+        run_filter = f"AND run_id = {sql_literal(run_id)}" if run_id else ""
+        rows = self.executor.fetch_json(
+            f"""
+            SELECT COUNT(*)::int AS row_count
+              FROM raw.analyst_report_summary
+             WHERE report_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+             {run_filter}
+            """
+        )
+        return int(rows[0]["row_count"]) if rows else 0
 
     def refresh_seibro_universe(self, *, as_of_date: date, min_score: float, min_reports: int, run_id: UUID) -> None:
         self.executor.execute_script(

@@ -15,6 +15,7 @@
 | OpenDART corp code | `python scripts/ingest_external_data.py --job dart-corp-codes --db-mode docker` |
 | OpenDART financial | `python scripts/ingest_external_data.py --job dart-financial --symbol 005930 --corp-code <corp_code> --business-year 2025 --report-code 11011 --db-mode docker` |
 | SEIBro reports | `python scripts/ingest_external_data.py --job seibro-reports --seibro-endpoint <approved_endpoint> --as-of-date 2026-05-15 --db-mode docker` |
+| SEIBro analyst report summary backfill | `python scripts/backfill_seibro_analyst_reports.py --start-date 2016-05-20 --end-date 2026-05-20 --chunk-months 1 --db-mode docker` |
 | KIS official adjusted full + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode full --start-date 2016-05-20 --end-date 2026-05-20 --resume` |
 | KIS official adjusted daily incremental + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode daily-incremental --target-date 2026-05-21 --resume` |
 
@@ -28,7 +29,7 @@
 | KIS | `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_TRADING_ENV` |
 | BOK | `BOK_API_KEY`, 선택: `BOK_BASE_URL` |
 | OpenDART | `DART_API_KEY` 또는 `OPENDART_API_KEY` |
-| SEIBro | `SEIBRO_COLLECTION_APPROVED=true`, `SEIBRO_REPORT_ENDPOINT`, 선택: `SEIBRO_API_KEY` |
+| SEIBro | `SEIBRO_COLLECTION_APPROVED=true`, `SEIBRO_REPORT_ENDPOINT`, 선택: `SEIBRO_API_KEY`; 분석리포트 WebSquare 수집 선택: `SEIBRO_WEB_BASE_URL`, `SEIBRO_ANALYST_REPORT_*`, `SEIBRO_REQUEST_SLEEP_*` |
 | Airflow | `BOK_DAILY_SERIES_JSON`, `DART_REFRESH_CORP_CODES`, `SEIBRO_REPORT_PARAMS_JSON`, `QUANT_AIRFLOW_DAILY_SCHEDULE` |
 
 ## 적재 계층
