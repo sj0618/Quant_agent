@@ -21,6 +21,7 @@ from quant_agent.data.models import (
     RawSourcePayload,
 )
 from quant_agent.data.quality import OhlcvQualityConfig, duplicate_keys, is_tradable_ohlcv, ohlcv_quality_flags
+from quant_agent.data.security_types import classify_security_type
 
 
 DATA_SOURCES = {
@@ -1258,23 +1259,32 @@ def _infer_market_segment(raw: dict[str, Any]) -> str | None:
 
 
 def _infer_security_type(raw: dict[str, Any]) -> str | None:
-    for key in ("SECUGRP_NM", "isu_abbrv", "security_type"):
-        value = raw.get(key)
-        if value:
-            return str(value)
-    return None
+    name_value = raw.get("ISU_NM") or raw.get("isu_nm") or raw.get("ISU_ABBRV") or raw.get("isu_abbrv")
+    name = str(name_value or "").strip() or None
+    return classify_security_type(
+        raw,
+        name=name,
+        market_segment=_infer_market_segment(raw),
+    )
 
 
 def _symbol_metadata(raw: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "MKT_NM",
         "SECT_TP_NM",
+        "SECUGRP_NM",
+        "MKT_TP_NM",
         "LIST_SHRS",
         "MKTCAP",
         "ISU_ABBRV",
         "ISU_NM",
+        "secugrp_nm",
+        "sect_tp_nm",
+        "mkt_tp_nm",
         "isu_abbrv",
+        "isu_nm",
         "market",
+        "security_type",
     )
     return {key: raw[key] for key in keys if raw.get(key) not in (None, "")}
 
