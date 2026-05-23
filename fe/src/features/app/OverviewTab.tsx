@@ -1,0 +1,133 @@
+import { Badge } from "../../components/common/Badge";
+import { Card } from "../../components/common/Card";
+import type { AppOverview } from "../../types/quantagent";
+import { PerformanceChart } from "./PerformanceChart";
+import { SignalCard } from "./SignalCard";
+
+interface OverviewTabProps {
+  overview: AppOverview;
+}
+
+export function OverviewTab({ overview }: OverviewTabProps) {
+  const featuredCandidates = overview.candidates.slice(0, 4);
+
+  return (
+    <div className="workspace-content">
+      <Card className="strategy-strip">
+        <div>
+          <div className="eyebrow-row">
+            <Badge variant="dark">ACTIVE</Badge>
+            <span>STRATEGY</span>
+          </div>
+          <strong>반도체 모멘텀 + 기관 매수 회귀</strong>
+        </div>
+        <dl>
+          <div>
+            <dt>유니버스</dt>
+            <dd>{overview.strategy.universe}</dd>
+          </div>
+          <div>
+            <dt>매수 조건</dt>
+            <dd>{overview.strategy.buy_condition}</dd>
+          </div>
+          <div>
+            <dt>매도 조건</dt>
+            <dd>{overview.strategy.drop_condition}</dd>
+          </div>
+        </dl>
+        <div className="strategy-strip__actions">
+          <button type="button">전략 수정</button>
+          <button type="button">비활성화</button>
+        </div>
+      </Card>
+
+      <section className="summary-grid">
+        {[
+          { label: "오늘의 권장도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "평균 7.2 대비 상승" },
+          { label: "활성 신호", value: `${overview.passCount}건`, delta: undefined, caption: `BUY ${overview.buyCount} · HOLD ${overview.holdCount} · DROP ${overview.dropCount}` },
+          { label: "30일 누적 수익률", value: "+8.4%", delta: "+1.2pp", caption: "KOSPI200 +3.1% 대비 알파" },
+          { label: "Sharpe (Walk-forward)", value: "1.42", delta: undefined, caption: "원본 1.11 대비 개선본" },
+        ].map((item) => (
+          <Card className="summary-card" key={item.label}>
+            <div>
+              <span>{item.label}</span>
+              {item.delta ? <Badge variant="positive">{item.delta}</Badge> : null}
+            </div>
+            <strong>{item.value}</strong>
+            <p>{item.caption}</p>
+          </Card>
+        ))}
+      </section>
+
+      <div className="overview-grid">
+        <Card className="candidate-table" padded={false}>
+          <div className="card-head">
+            <div>
+              <strong>오늘의 추천 종목</strong>
+              <p>2026.04.18 · 4건</p>
+            </div>
+            <div className="filter-row">
+              <Badge variant="dark">ALL 4</Badge>
+              <Badge signal="BUY">BUY 2</Badge>
+              <Badge signal="HOLD">HOLD 1</Badge>
+              <Badge signal="DROP">DROP 1</Badge>
+            </div>
+          </div>
+          {featuredCandidates.map((candidate) => (
+            <SignalCard candidate={candidate} compact key={candidate.id} />
+          ))}
+          <div className="card-foot">신호는 매일 08:00 자동 갱신됩니다 <a href="/app?tab=trading">전체 종목 정보 보기 →</a></div>
+        </Card>
+
+        <Card className="recent-reports" padded={false}>
+          <div className="card-head">
+            <div>
+              <strong>최근 리포트</strong>
+              <p>최근 7일</p>
+            </div>
+          </div>
+          {overview.recentReports.map((report) => (
+            <a className="recent-report-row" href={`/reports/${report.id}`} key={report.id}>
+              <span>
+                <strong>{report.date.replace("2026.", "")}</strong>
+                <small>{report.weekday}</small>
+              </span>
+              <span className="recent-report-row__signals">
+                {report.signals.BUY ? <Badge signal="BUY">BUY {report.signals.BUY}</Badge> : null}
+                {report.signals.HOLD ? <Badge signal="HOLD">HOLD {report.signals.HOLD}</Badge> : null}
+                {report.signals.DROP ? <Badge signal="DROP">DROP {report.signals.DROP}</Badge> : null}
+              </span>
+              <strong>{report.recommendationScore}</strong>
+            </a>
+          ))}
+          <div className="card-foot"><a href="/reports">전체 리포트 보기 →</a></div>
+        </Card>
+      </div>
+
+      <Card className="chart-card" padded={false}>
+        <div className="card-head">
+          <div>
+            <strong>누적 수익률</strong>
+            <p>총자산 기준 · 거래비용 반영</p>
+          </div>
+          <div className="legend-row">
+            <span><i className="line line--strategy" />내 전략</span>
+            <span><i className="line line--benchmark" />KOSPI200</span>
+            <Badge variant="soft">1Y</Badge>
+          </div>
+        </div>
+        <div className="chart-card__numbers">
+          <div>
+            <span>현재 자산</span>
+            <strong>₩ 1,084,200</strong>
+            <em>+8.42%</em>
+          </div>
+          <div><span>초기 자산 (1y)</span><strong>₩ 1,000,000</strong></div>
+          <div><span>벤치마크 대비 알파</span><strong>+5.32%p</strong></div>
+          <div><span>최대 낙폭</span><strong>-4.82%</strong></div>
+        </div>
+        <PerformanceChart points={overview.performance.equityCurve.slice(-5)} />
+      </Card>
+    </div>
+  );
+}

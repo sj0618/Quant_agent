@@ -1,28 +1,42 @@
-# QuantAgent FE MVP
+# QuantAgent FE HI-FI 구현
 
-`/app` Workspace MVP입니다. 실제 Backend/API/DB/omx 스키마 없이 mock service layer로만 동작합니다.
+Figma MCP에서 확인한 순수 `HI-FI ·` 프레임 기준의 React + TypeScript + Vite 프론트엔드입니다.
+
+## 구현 route
+
+| Route | 기준 Figma frame |
+|---|---|
+| `/` | `HI-FI · 07 — / 랜딩` |
+| `/app` | `HI-FI · 08 — /app · 전체 탭`, `HI-FI · 09 — /app · 매매종목 정보 탭`, `HI-FI · 10 — /app · 수익률 탭` |
+| `/reports` | `HI-FI · 14 — /reports 리포트 목록` |
+| `/reports/:id` | `HI-FI · 11 — /reports/:id 리포트 상세` |
 
 ## 실행
 
 ```bash
 npm install
 npm run dev
+npm run build
 ```
 
-브라우저에서 `http://localhost:5173/app`을 엽니다.
+## Mock API
+
+`src/api/quantAgentClient.ts`에서 다음 mock client를 제공합니다.
+
+- `getLandingSample()`
+- `getAppOverview()`
+- `getTradingCandidates()`
+- `getPerformanceSummary()`
+- `getReports()`
+- `getReportById()`
+- `getAnalysisJobStatus()`
+
+AI envelope는 `status`, `trace_id`, `schema_version`, `user_payload`, `strategy_spec`, `debug_ref`, `retryable` 필드를 유지합니다. `internal_payload`는 화면에 노출하지 않습니다.
 
 ## 검증
 
 ```bash
-npm run typecheck
-npm run build
-npm test
+npm run test
 ```
 
-## Mock API 교체 지점
-
-- `src/services/mockQuantAgentApi.ts`
-- `src/types/quantagent.ts`
-- `src/data/mockQuantAgentData.ts`
-
-UI 컴포넌트는 mock data를 직접 import하지 않고 service function을 통해 workspace payload를 받도록 구성했습니다.
+`npm run test`는 `tsc -b --pretty false`와 `vite build`를 순차 실행합니다.

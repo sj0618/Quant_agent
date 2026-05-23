@@ -1,6 +1,6 @@
 {
-  "last_turn_at": "2026-05-15T15:12:41.221Z",
-  "turn_count": 3,
-  "last_progress_at": "2026-05-15T15:12:41.221Z",
-  "last_agent_output": "## 결론\n\n수정 완료했습니다. 로컬 서버는 그대로 실행 중이며 주소는 동일합니다.\n\n```text\nhttp://127.0.0.1:5173/app\n```\n\n## 수정 내용\n\n| 문"
+  "last_turn_at": "2026-05-23T12:31:32.502Z",
+  "turn_count": 1,
+  "last_progress_at": "2026-05-23T12:31:32.502Z",
+  "last_agent_output": "완료했습니다. 단, Figma MCP 확인 결과 **문자 그대로 `HI-FI |` prefix는 없었고**, 실제 프레임 prefix는 **`HI-FI ·`**였습니다. 그래서 요"
 }

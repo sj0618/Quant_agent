@@ -1,13 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="QuantAgent">
-  <defs>
-    <linearGradient id="qa" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#2563eb" />
-      <stop offset="1" stop-color="#0f172a" />
-    </linearGradient>
-  </defs>
-  <rect width="64" height="64" rx="18" fill="url(#qa)" />
-  <path
-    d="M20 42V22h9.4c6.6 0 10.8 4 10.8 10.1 0 2.8-.9 5.1-2.6 6.8l4.3 4.8h-6.6l-2.2-2.5c-1.1.5-2.4.8-3.8.8H20Zm5.6-4.9h3.5c3.4 0 5.4-1.9 5.4-5s-2-5-5.4-5h-3.5v10Z"
-    fill="#fff"
-  />
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="64" height="64" rx="14" fill="#0F172A"/>
+  <path d="M18 42V22H25.5C31.5 22 35 25.8 35 31.9C35 38.1 31.5 42 25.5 42H18Z" fill="white"/>
+  <path d="M40 42L31 22H37.4L43.1 35.7L48.7 22H55L46 42H40Z" fill="#7394F4"/>
 </svg>

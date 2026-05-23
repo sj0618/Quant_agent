@@ -1,5 +1,7 @@
 # omx
 fe/.omx
+.omx
+.claude
 
 # Node
 node_modules/

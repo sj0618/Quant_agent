@@ -1,5 +1,5 @@
 {
-  "name": "quantagent-fe-mvp",
+  "name": "quantagent-fe-hi-fi",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -12,8 +12,7 @@
   },
   "dependencies": {
     "react": "^19.2.6",
-    "react-dom": "^19.2.6",
-    "recharts": "^3.8.1"
+    "react-dom": "^19.2.6"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^6.0.1",
