@@ -359,6 +359,117 @@
 | 상태 | 정상 조회 가능함. |
 | 컬럼 | `as_of_date date`, `symbol text`, `name text`, `market_segment text`, `listing_status text`, `listed_at date`, `delisted_at date`, `ticker text`, `base_ticker text`, `segment_id integer`, `open numeric`, `high numeric`, `low numeric`, `close numeric`, `volume numeric`, `adjusted_ohlcv_quality_flags jsonb`, `trend_values jsonb`, `momentum_values jsonb`, `volatility_values jsonb`, `volume_values jsonb`, `pattern_values jsonb`, `adjusted_ohlcv_run_id uuid` |
 
+### `mart.symbol_feature_frame_asof` vs `mart.kis_adjusted_feature_frame_asof`
+
+| 항목 | `mart.symbol_feature_frame_asof` | `mart.kis_adjusted_feature_frame_asof` |
+|---|---|---|
+| 관계 | 원본 통합 view | `mart.symbol_feature_frame_asof`의 부분집합 |
+| 가격 소스 | `feature.adjusted_ohlcv_daily` 전체 | KIS 공식 수정주가 행만 |
+| 필터 | 없음 | `adjusted_ohlcv_quality_flags->>'adjusted_price_method' = 'kis_official_adjusted'` |
+| 포함 가능 보정 방식 | `kis_official_adjusted`, `close_ratio_back_adjustment` 등 | `kis_official_adjusted`만 |
+| 권장 사용처 | 커버리지 진단, fallback 보정 데이터 확인, 백엔드 종목 상세 | 일반 백테스트/팩터 엔진 1순위 입력 |
+
+실제 view 정의상 `mart.kis_adjusted_feature_frame_asof`는 아래와 같은 필터 view다.
+
+```sql
+CREATE OR REPLACE VIEW mart.kis_adjusted_feature_frame_asof AS
+SELECT *
+FROM mart.symbol_feature_frame_asof
+WHERE adjusted_ohlcv_quality_flags->>'adjusted_price_method' = 'kis_official_adjusted';
+```
+
+#### 보통주 포함 여부
+
+두 view는 **보통주 전용 view가 아니다.** `core.symbol_master.security_type`을 직접 필터링하지 않기 때문에 보통주 외에 우선주, SPAC, 리츠(REITs), 인프라펀드가 함께 포함될 수 있다.
+
+최근 구간(`as_of_date >= '2026-05-01'`) 기준 로컬 DB 확인 결과:
+
+| view | 보통주 | 우선주 | SPAC | 리츠(REITs) | 인프라펀드 |
+|---|---:|---:|---:|---:|---:|
+| `mart.symbol_feature_frame_asof` | 2,825 | 143 | 231 | 25 | 2 |
+| `mart.kis_adjusted_feature_frame_asof` | 2,556 | 116 | 76 | 25 | 2 |
+
+기존 view에서 보통주만 직접 조회하려면 반드시 `core.symbol_master`와 조인해서 `security_type = '보통주'` 조건을 추가한다.
+
+```sql
+SELECT f.*
+FROM mart.kis_adjusted_feature_frame_asof f
+JOIN core.symbol_master sm
+  ON sm.symbol = f.symbol
+WHERE sm.security_type = '보통주';
+```
+
+### `mart.common_stock_feature_frame_asof`
+
+| 항목 | 내용 |
+|---|---|
+| 용도 | MVP 백테스트 기본 feature frame. `mart.kis_adjusted_feature_frame_asof`에서 보통주만 남긴 view. |
+| 포함 universe | **보통주만 포함** |
+| 가격 소스 | KIS 공식 수정주가(`adjusted_price_method = 'kis_official_adjusted'`) |
+| 상태 | 서버 DB에 추가 예정/추가 후 백테스트 기본 조회 대상. |
+| 컬럼 | `mart.kis_adjusted_feature_frame_asof`와 동일 |
+
+권장 view 정의:
+
+```sql
+CREATE OR REPLACE VIEW mart.common_stock_feature_frame_asof AS
+SELECT f.*
+FROM mart.kis_adjusted_feature_frame_asof f
+JOIN core.symbol_master sm
+  ON sm.symbol = f.symbol
+WHERE sm.security_type = '보통주'
+  AND (sm.listed_at IS NULL OR f.as_of_date >= sm.listed_at)
+  AND (sm.delisted_at IS NULL OR f.as_of_date <= sm.delisted_at);
+```
+
+MVP 백테스트/팩터 엔진은 기본적으로 이 view를 사용한다.
+
+```sql
+SELECT *
+FROM mart.common_stock_feature_frame_asof
+WHERE as_of_date BETWEEN DATE '2020-01-01' AND DATE '2024-12-31';
+```
+
+### `mart.common_stock_universe_asof`
+
+| 항목 | 내용 |
+|---|---|
+| 용도 | MVP 날짜별 투자 가능 보통주 universe view. |
+| 포함 universe | **보통주만 포함** |
+| 가격 소스 | `mart.kis_adjusted_feature_frame_asof`에 존재하는 날짜/종목만 universe로 인정 |
+| 상태 | 서버 DB에 추가 후 universe 조회 기본 대상. |
+| 컬럼 | `as_of_date date`, `symbol_id bigint`, `symbol text`, `name text`, `market_segment text`, `security_type text`, `listing_status text`, `listed_at date`, `delisted_at date` |
+
+권장 view 정의:
+
+```sql
+CREATE OR REPLACE VIEW mart.common_stock_universe_asof AS
+SELECT DISTINCT
+    f.as_of_date,
+    sm.symbol_id,
+    f.symbol,
+    sm.name,
+    sm.market_segment,
+    sm.security_type,
+    sm.listing_status,
+    sm.listed_at,
+    sm.delisted_at
+FROM mart.kis_adjusted_feature_frame_asof f
+JOIN core.symbol_master sm
+  ON sm.symbol = f.symbol
+WHERE sm.security_type = '보통주'
+  AND (sm.listed_at IS NULL OR f.as_of_date >= sm.listed_at)
+  AND (sm.delisted_at IS NULL OR f.as_of_date <= sm.delisted_at);
+```
+
+보통주 universe만 필요하면 이 view를 조회한다.
+
+```sql
+SELECT *
+FROM mart.common_stock_universe_asof
+WHERE as_of_date = DATE '2026-05-20';
+```
+
 ### `mart.full_universe_asof`
 
 | 항목 | 내용 |
