@@ -29,4 +29,5 @@ export const appConfig = {
   authApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AUTH_API_BASE_URL),
   reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL),
   strategyApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_STRATEGY_API_BASE_URL),
+  testLoginEnabled: import.meta.env.DEV || import.meta.env.VITE_ENABLE_TEST_LOGIN === "1",
 } as const;
