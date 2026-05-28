@@ -1,5 +1,6 @@
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
+import { ROUTES } from "../../config/routes";
 import type { AppOverview } from "../../types/quantagent";
 import { PerformanceChart } from "./PerformanceChart";
 import { SignalCard } from "./SignalCard";
@@ -10,6 +11,15 @@ interface OverviewTabProps {
 
 export function OverviewTab({ overview }: OverviewTabProps) {
   const featuredCandidates = overview.candidates.slice(0, 4);
+  const strategyName = overview.strategy.name ?? "활성 전략";
+  const handleDeactivate = () => {
+    const confirmed = window.confirm("현재 전략을 비활성화하시겠습니까?");
+    if (!confirmed) {
+      return;
+    }
+    window.localStorage.setItem("quantagent.strategy-status.v1", "inactive");
+    window.location.assign(ROUTES.strategyEdit("active"));
+  };
 
   return (
     <div className="workspace-content">
@@ -19,7 +29,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
             <Badge variant="dark">ACTIVE</Badge>
             <span>STRATEGY</span>
           </div>
-          <strong>반도체 모멘텀 + 기관 매수 회귀</strong>
+          <strong>{strategyName}</strong>
         </div>
         <dl>
           <div>
@@ -36,8 +46,8 @@ export function OverviewTab({ overview }: OverviewTabProps) {
           </div>
         </dl>
         <div className="strategy-strip__actions">
-          <button type="button">전략 수정</button>
-          <button type="button">비활성화</button>
+          <button onClick={() => window.location.assign(ROUTES.strategyEdit("active"))} type="button">전략 수정</button>
+          <button onClick={handleDeactivate} type="button">비활성화</button>
         </div>
       </Card>
 
@@ -76,7 +86,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
           {featuredCandidates.map((candidate) => (
             <SignalCard candidate={candidate} compact key={candidate.id} />
           ))}
-          <div className="card-foot">신호는 매일 08:00 자동 갱신됩니다 <a href="/app?tab=trading">전체 종목 정보 보기 →</a></div>
+          <div className="card-foot">신호는 매일 08:00 자동 갱신됩니다 <a href={`${ROUTES.app}?tab=trading`}>전체 종목 정보 보기 →</a></div>
         </Card>
 
         <Card className="recent-reports" padded={false}>
@@ -87,7 +97,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
             </div>
           </div>
           {overview.recentReports.map((report) => (
-            <a className="recent-report-row" href={`/reports/${report.id}`} key={report.id}>
+            <a className="recent-report-row" href={ROUTES.reportDetail(report.id)} key={report.id}>
               <span>
                 <strong>{report.date.replace("2026.", "")}</strong>
                 <small>{report.weekday}</small>
@@ -100,7 +110,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
               <strong>{report.recommendationScore}</strong>
             </a>
           ))}
-          <div className="card-foot"><a href="/reports">전체 리포트 보기 →</a></div>
+          <div className="card-foot"><a href={ROUTES.reports}>전체 리포트 보기 →</a></div>
         </Card>
       </div>
 

@@ -1,0 +1,34 @@
+export const ROUTES = {
+  home: "/",
+  app: "/app",
+  login: "/login",
+  authCallback: "/auth/google/callback",
+  reports: "/reports",
+  me: "/me",
+  notifications: "/me/notifications",
+  search: "/search",
+  terms: "/terms",
+  privacy: "/privacy",
+  disclaimer: "/disclaimer",
+  unsubscribe: "/unsubscribe",
+  strategyNew: "/app/strategies/new",
+  strategyPrefix: "/app/strategies/",
+  strategyEdit: (id: string) => `/app/strategies/${encodeURIComponent(id)}/edit`,
+  reportDetail: (id: string) => `/reports/${encodeURIComponent(id)}`,
+} as const;
+
+export function withReturnTo(route: string, returnTo: string) {
+  const params = new URLSearchParams({ returnTo });
+  return `${route}?${params.toString()}`;
+}
+
+export function getCurrentPathWithSearch() {
+  return `${window.location.pathname}${window.location.search}${window.location.hash}`;
+}
+
+export function sanitizeReturnTo(value: string | null) {
+  if (!value || !value.startsWith("/") || value.startsWith("//")) {
+    return ROUTES.app;
+  }
+  return value;
+}

@@ -1,0 +1,32 @@
+export const AUTH_ENDPOINTS = {
+  googleStart: "/auth/google/start",
+  googleCallback: "/auth/google/callback",
+  logout: "/auth/logout",
+} as const;
+
+export const REPORT_ACTION_ENDPOINTS = {
+  resend: (id: string) => `/reports/${encodeURIComponent(id)}/resend`,
+} as const;
+
+export const STRATEGY_ENDPOINTS = {
+  create: "/strategies",
+  update: (id: string) => `/strategies/${encodeURIComponent(id)}`,
+  run: (id: string) => `/strategies/${encodeURIComponent(id)}/analysis-runs`,
+} as const;
+
+export const AI_ENDPOINTS = {
+  apiStatus: "/api-status",
+  analysisJobs: "/analysis-jobs",
+  analysisJob: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}`,
+} as const;
+
+function trimTrailingSlash(value: string | undefined) {
+  return value ? value.replace(/\/+$/, "") : "";
+}
+
+export const appConfig = {
+  aiApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AI_API_BASE_URL),
+  authApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AUTH_API_BASE_URL),
+  reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL),
+  strategyApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_STRATEGY_API_BASE_URL),
+} as const;

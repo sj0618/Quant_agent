@@ -3,6 +3,7 @@ from __future__ import annotations
 from hashlib import sha256
 from typing import Any
 
+from ai_graph.data_sources import load_pipeline_data_from_env
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.nodes.backtest import backtest_node
 from ai_graph.nodes.backtest_code import backtest_code_node
@@ -122,10 +123,21 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
 def data_node(state: QuantAgentState) -> dict[str, Any]:
     retrieval = search_retrieval_corpus(state["user_query"], top_k=5)
     cards = strategy_candidate_cards(state["user_query"], retrieval.hits)
-    return {
+    pipeline_data = load_pipeline_data_from_env(state["user_query"], state["trace_id"])
+    output: dict[str, Any] = {
         "retrieval": retrieval.model_dump(),
-        "data": {"candidate_cards": [card.model_dump() for card in cards]},
+        "data": {
+            "candidate_cards": [card.model_dump() for card in cards],
+            "pipeline_data_source": pipeline_data.metadata,
+        },
     }
+    if pipeline_data.price_rows:
+        output["price_rows"] = pipeline_data.price_rows
+    if pipeline_data.metadata.get("source") == "postgres" or pipeline_data.l4_evidence:
+        output["l4_evidence"] = pipeline_data.l4_evidence
+    if pipeline_data.macro_snapshot:
+        output["macro_snapshot"] = pipeline_data.macro_snapshot
+    return output
 
 
 def research_node(state: QuantAgentState) -> dict[str, Any]:
@@ -269,6 +281,7 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
         "node_sequence": list(NODE_SEQUENCE),
         "schema_validation": "pydantic",
         "langgraph_optional": True,
+        "pipeline_data_source": state.get("data", {}).get("pipeline_data_source", {}),
     }
     return InternalPayload(
         trace_id=state["trace_id"],

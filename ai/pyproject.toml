@@ -1,5 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantagent-ai"
+version = "0.1.0"
+description = "QuantAgent AI graph and local API surface"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "psycopg[binary]>=3.2",
+  "pydantic>=2.0",
+  "uvicorn[standard]>=0.30",
+]
+
+[tool.setuptools.packages.find]
+include = ["ai_graph*"]
+
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", "../backtest_module"]
 testpaths = ["tests"]
 
 [tool.ruff]

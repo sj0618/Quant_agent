@@ -155,6 +155,7 @@ class ABBacktestResult(BaseModel):
     candidates: list[CodeCandidate] = Field(min_length=1)
     selected_candidate: CodeCandidate
     metrics_by_variant: dict[str, BacktestMetrics]
+    engine_summaries_by_candidate: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 SignalAction = Literal["BUY", "HOLD", "DROP"]

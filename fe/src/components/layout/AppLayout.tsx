@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { TopBar } from "./TopBar";
 
 interface AppLayoutProps {
-  active: "workspace" | "reports";
+  active: "workspace" | "reports" | "profile" | "search";
   children: ReactNode;
 }
 

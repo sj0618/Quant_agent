@@ -1,20 +1,47 @@
+import { useState, type FormEvent } from "react";
 import type { ChatMessage, StrategySpec } from "../../types/quantagent";
 import { Button } from "../../components/common/Button";
+import { ROUTES } from "../../config/routes";
 
 interface StrategyInputPanelProps {
   strategy: StrategySpec;
   messages: ChatMessage[];
+  onAnalyze?: (query: string) => Promise<void>;
 }
 
-export function StrategyInputPanel({ strategy, messages }: StrategyInputPanelProps) {
+export function StrategyInputPanel({ strategy, messages, onAnalyze }: StrategyInputPanelProps) {
+  const [draft, setDraft] = useState(strategy.natural_language_strategy);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSubmitError(null);
+
+    if (!onAnalyze) {
+      const params = new URLSearchParams({ draft });
+      window.location.assign(`${ROUTES.strategyNew}?${params.toString()}`);
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      await onAnalyze(draft);
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : "AI 분석 요청에 실패했습니다.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <aside className="chat-panel">
       <div className="chat-panel__head">
         <div>
           <strong>전략 채팅</strong>
-          <p>활성 전략: 반도체 모멘텀 + 기관 매수</p>
+          <p>활성 전략: {strategy.name ?? strategy.natural_language_strategy}</p>
         </div>
-        <Button variant="ghost">+ 새 대화</Button>
+        <Button onClick={() => window.location.assign(ROUTES.strategyNew)} variant="ghost">+ 새 대화</Button>
       </div>
       <div className="chat-panel__stream">
         {messages.map((message) => (
@@ -34,17 +61,24 @@ export function StrategyInputPanel({ strategy, messages }: StrategyInputPanelPro
                 ))}
               </div>
             ) : null}
-            {message.sender === "agent" ? <button type="button">대시보드에서 결과 보기 →</button> : null}
+            {message.sender === "agent" ? <button onClick={() => window.location.assign(ROUTES.app)} type="button">대시보드에서 결과 보기 →</button> : null}
           </article>
         ))}
       </div>
-      <div className="chat-panel__input">
+      <form className="chat-panel__input" onSubmit={handleSubmit}>
         <div className="chat-panel__inputbox">
-          <span>{strategy.natural_language_strategy || "전략을 자연어로 입력하세요"}</span>
-          <button type="button">↑</button>
+          <input
+            aria-label="자연어 전략"
+            disabled={submitting}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder="전략을 자연어로 입력하세요"
+            value={draft}
+          />
+          <button disabled={submitting} type="submit">{submitting ? "…" : "↑"}</button>
         </div>
+        {submitError ? <small className="chat-panel__error">{submitError}</small> : null}
         <small>거래비용 0.015% / 0.23% / 0.1% 반영 · KOSPI200 현물만 지원</small>
-      </div>
+      </form>
     </aside>
   );
 }

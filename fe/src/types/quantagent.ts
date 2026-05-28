@@ -1,5 +1,9 @@
 export type AIEnvelopeStatus = "ready" | "need_clarification" | "rejected" | "failed";
 
+export type AIJobStage = "interpreting" | "code_generation" | "backtest" | "debate" | "finalizing";
+
+export type AIJobStageStatus = "queued" | "running" | "succeeded" | "failed";
+
 export type AnalysisStage =
   | "strategy_parse"
   | "data_collect"
@@ -10,11 +14,13 @@ export type AnalysisStage =
 
 export type StageStatus = "ready" | "running" | "done" | "blocked" | "failed";
 
+export type WorkspaceAnalysisStatus = AIEnvelopeStatus | "running";
+
 export type SignalType = "BUY" | "HOLD" | "DROP";
 
 export type Tone = "positive" | "warning" | "negative" | "neutral" | "info";
 
-export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec> {
+export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec | null> {
   status: AIEnvelopeStatus;
   trace_id: string;
   schema_version: string;
@@ -25,6 +31,7 @@ export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec
 }
 
 export interface StrategySpec {
+  name?: string;
   natural_language_strategy: string;
   universe: string;
   sector: string;
@@ -35,9 +42,83 @@ export interface StrategySpec {
   constraints: string[];
 }
 
+export interface AICondition {
+  left: string;
+  operator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne" | "between" | "cross_above" | "cross_below";
+  right: number | string | number[];
+  description?: string | null;
+}
+
+export interface AIStrategySpec {
+  strategy_id: string;
+  name: string;
+  universe: string;
+  market: string;
+  timeframe: string;
+  entry_conditions: AICondition[];
+  exit_conditions: AICondition[];
+  indicators: string[];
+  risk_constraints: Record<string, number | string | boolean>;
+  assumptions: string[];
+  source_refs: string[];
+  confidence: number;
+}
+
+export interface StrategyCandidateCard {
+  strategy_id: string;
+  title: string;
+  summary: string;
+  key_conditions: string[];
+  confidence: number;
+}
+
+export interface AIReportProjection {
+  title: string;
+  summary: string;
+  sections: Array<Record<string, unknown>>;
+}
+
+export interface AIRiskAdjustment {
+  before: SignalType;
+  after: SignalType;
+  rule: string;
+  reason: string;
+}
+
+export interface AIReportBundle {
+  web_projection: AIReportProjection;
+  email_projection: AIReportProjection;
+  risk_adjustments: AIRiskAdjustment[];
+}
+
+export interface AIUserPayload {
+  headline: string;
+  message: string;
+  next_actions: string[];
+  candidate_cards: StrategyCandidateCard[];
+  report: AIReportBundle | null;
+}
+
+export interface AIStageProgress {
+  stage: AIJobStage;
+  status: AIJobStageStatus;
+  updated_at: string;
+  message?: string | null;
+}
+
+export interface AnalysisJob {
+  job_id: string;
+  trace_id: string;
+  query: string;
+  created_at: string;
+  updated_at: string;
+  stages: AIStageProgress[];
+  result: AIEnvelope<AIUserPayload, AIStrategySpec | null> | null;
+}
+
 export interface AnalysisJobStatus {
   trace_id: string;
-  status: AIEnvelopeStatus;
+  status: WorkspaceAnalysisStatus;
   stages: Array<{
     stage: AnalysisStage;
     status: StageStatus;
@@ -134,7 +215,7 @@ export interface AppOverview {
   candidates: TradingCandidate[];
   performance: PerformanceSummary;
   recentReports: ReportSummary[];
-  envelope: AIEnvelope<{ active_tab: "overview" }>;
+  envelope: AIEnvelope<{ active_tab: "overview" } | AIUserPayload, StrategySpec | AIStrategySpec | null>;
   jobStatus: AnalysisJobStatus;
 }
 

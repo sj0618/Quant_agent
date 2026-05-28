@@ -230,10 +230,8 @@ def build_investment_signal(
         action = "HOLD"
         confidence = 0.68
         judge_reason = "Evidence is usable but not strong enough for BUY."
-    evidence = [
-        L4Evidence.model_validate(item)
-        for item in (l4_evidence or default_l4_evidence(trace_id or "trace"))
-    ]
+    evidence_items = default_l4_evidence(trace_id or "trace") if l4_evidence is None else l4_evidence
+    evidence = [L4Evidence.model_validate(item) for item in evidence_items]
     return InvestmentSignalDecision(
         action=action,
         confidence=confidence,

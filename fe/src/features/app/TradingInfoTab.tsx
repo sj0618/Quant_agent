@@ -1,5 +1,6 @@
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
+import { ROUTES } from "../../config/routes";
 import type { TradingCandidate } from "../../types/quantagent";
 import { SignalCard } from "./SignalCard";
 
@@ -39,7 +40,7 @@ export function TradingInfoTab({ candidates }: TradingInfoTabProps) {
         <span>신호는 매일 08:00 자동 갱신됩니다</span>
         <span>·</span>
         <span>출처: KIS API · DART · 한경컨센서스 · 에이전틱 서치</span>
-        <a href="/reports/2026-04-18">리포트로 보기 →</a>
+        <a href={ROUTES.reportDetail("2026-04-18")}>리포트로 보기 →</a>
       </Card>
     </div>
   );

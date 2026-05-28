@@ -1,62 +1,18 @@
 from __future__ import annotations
 
-from typing import Protocol
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from pydantic import BaseModel, ConfigDict, Field
-
-from ai_graph.schemas import BacktestMetrics, CodeCandidate, StrategySpec
+from ai_graph.llm import LLMClient, LLMClientError, create_llm_client
+from ai_graph.llm.mock import MOCK_BACKTEST_CODE_CANDIDATES, MockBacktestCodeLLM
+from ai_graph.llm.prompts import BacktestCodeLLMOutput, build_backtest_code_json_request
+from ai_graph.schemas import CodeCandidate, StrategySpec
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
-SAFE_RSI_CODE = '''def build_signals(prices):
-    signals = []
-    for row in prices:
-        rsi = float(row.get("rsi", 50))
-        if rsi <= 30:
-            action = "BUY"
-        elif rsi >= 70:
-            action = "SELL"
-        else:
-            action = "HOLD"
-        signals.append({"date": row["date"], "action": action, "price": float(row["close"])})
-    return signals
-'''
-
-CONSERVATIVE_RSI_CODE = '''def build_signals(prices):
-    signals = []
-    for row in prices:
-        rsi = float(row.get("rsi", 50))
-        action = "BUY" if rsi <= 28 else "SELL" if rsi >= 72 else "HOLD"
-        signals.append({"date": row["date"], "action": action, "price": float(row["close"])})
-    return signals
-'''
-
-SMOOTHED_RSI_CODE = '''def build_signals(prices):
-    signals = []
-    previous_rsi = 50.0
-    for row in prices:
-        rsi = float(row.get("rsi", previous_rsi))
-        smoothed = (previous_rsi + rsi) / 2
-        if smoothed <= 32:
-            action = "BUY"
-        elif smoothed >= 68:
-            action = "SELL"
-        else:
-            action = "HOLD"
-        signals.append({"date": row["date"], "action": action, "price": float(row["close"])})
-        previous_rsi = rsi
-    return signals
-'''
-
-
-class LLMClient(Protocol):
-    def generate_backtest_candidates(self, strategy: StrategySpec, variant: str) -> list[str]:
-        """Return three generated Python code candidates for a StrategySpec variant."""
-
-
-class MockBacktestCodeLLM:
-    def generate_backtest_candidates(self, strategy: StrategySpec, variant: str) -> list[str]:
-        return [SAFE_RSI_CODE, CONSERVATIVE_RSI_CODE, SMOOTHED_RSI_CODE]
+MOCK_BACKTEST_CODE_LLM = MockBacktestCodeLLM()
+SAFE_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[0]
+CONSERVATIVE_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[1]
+SMOOTHED_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[2]
 
 
 class Loop3Request(BaseModel):
@@ -73,17 +29,17 @@ class Loop3Result(BaseModel):
     variant: str
     candidates: list[CodeCandidate] = Field(min_length=3, max_length=3)
     selected_candidate: CodeCandidate
+    fallback_reasons: list[str] = Field(default_factory=list)
 
 
 def generate_loop3_candidates(
     request: Loop3Request, *, llm_client: LLMClient | None = None
 ) -> Loop3Result:
-    client = llm_client or MockBacktestCodeLLM()
-    raw_codes = client.generate_backtest_candidates(request.strategy, request.variant)
+    client = llm_client or create_llm_client()
+    output = _generate_backtest_code_output(client, request)
     candidates: list[CodeCandidate] = []
-    for index, code in enumerate(raw_codes[:3], start=1):
+    for index, code in enumerate(output.candidates[:3], start=1):
         validation = validate_backtest_code(code)
-        metrics = mock_candidate_metrics(request.variant, index) if validation.ok else None
         candidates.append(
             CodeCandidate(
                 candidate_id=f"{request.variant}{index}",
@@ -91,7 +47,7 @@ def generate_loop3_candidates(
                 code=code,
                 validation_ok=validation.ok,
                 violations=[violation.message for violation in validation.violations],
-                metrics=metrics,
+                metrics=None,
             )
         )
     if len(candidates) != 3:
@@ -99,13 +55,20 @@ def generate_loop3_candidates(
     valid_candidates = [candidate for candidate in candidates if candidate.validation_ok]
     if not valid_candidates:
         raise ValueError("all generated candidates failed AST validation")
-    selected = max(valid_candidates, key=lambda candidate: candidate.metrics.sharpe_ratio)  # type: ignore[union-attr]
-    return Loop3Result(variant=request.variant, candidates=candidates, selected_candidate=selected)
+    selected = valid_candidates[0]
+    return Loop3Result(
+        variant=request.variant,
+        candidates=candidates,
+        selected_candidate=selected,
+        fallback_reasons=output.fallback_reasons,
+    )
 
 
 def backtest_code_node(state: dict) -> dict:
     strategy_a = StrategySpec.model_validate(state["strategy_spec"])
-    strategy_b = StrategySpec.model_validate(state.get("improved_strategy_spec") or state["strategy_spec"])
+    strategy_b = StrategySpec.model_validate(
+        state.get("improved_strategy_spec") or state["strategy_spec"]
+    )
     result_a = generate_loop3_candidates(
         Loop3Request(strategy=strategy_a, variant="A", trace_id=state["trace_id"])
     )
@@ -113,24 +76,27 @@ def backtest_code_node(state: dict) -> dict:
         Loop3Request(strategy=strategy_b, variant="B", trace_id=state["trace_id"])
     )
     candidates = result_a.candidates + result_b.candidates
-    selected = max(candidates, key=lambda candidate: candidate.metrics.sharpe_ratio)  # type: ignore[union-attr]
+    selected = next(candidate for candidate in candidates if candidate.validation_ok)
     return {
         "backtest_code": {
             "candidates": [candidate.model_dump() for candidate in candidates],
             "selected_candidate": selected.model_dump(),
+            "fallback_reasons": result_a.fallback_reasons + result_b.fallback_reasons,
         }
     }
 
 
-def mock_candidate_metrics(variant: str, index: int) -> BacktestMetrics:
-    base = 0.85 if variant == "A" else 1.0
-    sharpe = base + (index * 0.17)
-    return BacktestMetrics(
-        sharpe_ratio=round(sharpe, 3),
-        max_drawdown=round(-0.08 + (index * 0.005), 3),
-        win_rate=round(0.49 + (index * 0.04), 3),
-        total_return=round(0.08 + (index * 0.025), 3),
-        in_sample_sharpe=round(sharpe + 0.08, 3),
-        out_sample_sharpe=round(sharpe - 0.06, 3),
-        degradation=round(0.06 / (sharpe + 0.08), 3),
-    )
+def _generate_backtest_code_output(
+    client: LLMClient, request: Loop3Request
+) -> BacktestCodeLLMOutput:
+    try:
+        llm_request = build_backtest_code_json_request(request.strategy, request.variant)
+        raw_output = client.generate_json(llm_request)
+        return BacktestCodeLLMOutput.model_validate(raw_output)
+    except (LLMClientError, ValidationError) as exc:
+        return BacktestCodeLLMOutput(
+            candidates=MOCK_BACKTEST_CODE_LLM.generate_backtest_candidates(
+                request.strategy, request.variant
+            ),
+            fallback_reasons=[f"{type(exc).__name__}: {exc}"],
+        )

@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
-import type { PerformanceSummary } from "../../types/quantagent";
+import { downloadPerformanceCsv } from "../../api/reportActionsClient";
+import type { EquityPoint, PerformanceSummary } from "../../types/quantagent";
 import { MetricCard } from "./MetricCard";
 import { PerformanceChart } from "./PerformanceChart";
 
@@ -9,6 +11,12 @@ interface PerformanceTabProps {
 }
 
 export function PerformanceTab({ performance }: PerformanceTabProps) {
+  const [mode, setMode] = useState<"improved" | "original" | "ab">("improved");
+  const [range, setRange] = useState<"1Y" | "5Y" | "10Y">("10Y");
+  const points = range === "1Y" ? performance.equityCurve.slice(-2) : range === "5Y" ? performance.equityCurve.slice(-4) : performance.equityCurve;
+  const series: Array<keyof Pick<EquityPoint, "strategy" | "original" | "benchmark">> =
+    mode === "improved" ? ["benchmark", "strategy"] : mode === "original" ? ["benchmark", "original"] : ["benchmark", "original", "strategy"];
+
   return (
     <div className="workspace-content">
       <Card className="list-head">
@@ -17,11 +25,11 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
           <p>{performance.period}</p>
         </div>
         <div className="segmented">
-          <button className="is-active" type="button">AI 개선본</button>
-          <button type="button">원본 전략</button>
-          <button type="button">A/B 동시 보기</button>
+          <button className={mode === "improved" ? "is-active" : ""} onClick={() => setMode("improved")} type="button">AI 개선본</button>
+          <button className={mode === "original" ? "is-active" : ""} onClick={() => setMode("original")} type="button">원본 전략</button>
+          <button className={mode === "ab" ? "is-active" : ""} onClick={() => setMode("ab")} type="button">A/B 동시 보기</button>
         </div>
-        <button className="export-button" type="button">CSV</button>
+        <button className="export-button" onClick={() => downloadPerformanceCsv(performance)} type="button">CSV</button>
       </Card>
 
       <section className="metric-grid">
@@ -37,13 +45,17 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
             <p>Walk-forward · IS 18M 학습 + OOS 3M 검증 반복</p>
           </div>
           <div className="legend-row">
-            <span><i className="line line--strategy" />AI 개선본 (분할)</span>
-            <span><i className="line line--original" />원본 (일괄)</span>
+            {mode !== "original" ? <span><i className="line line--strategy" />AI 개선본 (분할)</span> : null}
+            {mode !== "improved" ? <span><i className="line line--original" />원본 (일괄)</span> : null}
             <span><i className="line line--benchmark" />KOSPI200</span>
-            <Badge variant="soft">10Y</Badge>
+            {(["1Y", "5Y", "10Y"] as const).map((item) => (
+              <button className={range === item ? "is-active" : ""} key={item} onClick={() => setRange(item)} type="button">
+                {item}
+              </button>
+            ))}
           </div>
         </div>
-        <PerformanceChart height={300} mode="full" points={performance.equityCurve} />
+        <PerformanceChart height={300} mode="full" points={points} series={series} />
         <div className="disclaimer"><Badge variant="dark">신뢰구간</Badge>{performance.disclaimer}</div>
       </Card>
 

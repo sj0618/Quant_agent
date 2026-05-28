@@ -8,7 +8,7 @@ from ai_graph.nodes.research import (
     build_research_summary,
     research_node,
 )
-from ai_graph.nodes.signal import SignalCondition, generate_signal, signal_node
+from ai_graph.nodes.signal import SignalCondition, build_investment_signal, generate_signal, signal_node
 
 
 def make_strategy():
@@ -89,6 +89,16 @@ def test_signal_node_public_contract_excludes_raw_internal_payload():
     assert output["trace_id"] == "trace-2"
     assert output["signal"]["debug_ref"] == "signal:trace-2"
     assert "internal_payload" not in output["signal"]
+
+
+def test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence():
+    decision = build_investment_signal(
+        {"selected_candidate": {"metrics": {"sharpe_ratio": 1.4, "max_drawdown": -0.03}}},
+        trace_id="trace-empty-evidence",
+        l4_evidence=[],
+    )
+
+    assert decision.l4_evidence == []
 
 
 def test_signal_condition_validates_between_shape():
