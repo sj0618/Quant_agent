@@ -25,7 +25,17 @@ API_ENVELOPE_FIELDS = {
     "debug_ref",
     "retryable",
 }
-USER_PAYLOAD_FIELDS = {"headline", "message", "next_actions", "candidate_cards", "report"}
+USER_PAYLOAD_FIELDS = {
+    "headline",
+    "message",
+    "next_actions",
+    "candidate_cards",
+    "report",
+    "performance",
+    "question",
+    "options",
+    "recommended",
+}
 REPORT_FIELDS = {"web_projection", "email_projection", "risk_adjustments"}
 PROJECTION_FIELDS = {"title", "summary", "sections"}
 
@@ -45,6 +55,8 @@ def test_analysis_job_and_api_envelope_public_fields_are_frozen() -> None:
     assert set(job["stages"][0]) == STAGE_FIELDS
     assert set(result) == API_ENVELOPE_FIELDS
     assert set(user_payload) == USER_PAYLOAD_FIELDS
+    assert user_payload["performance"]["selected_candidate_id"]
+    assert set(user_payload["performance"]["metrics_by_variant"]) == {"A", "B"}
     assert set(report) == REPORT_FIELDS
     assert set(report["web_projection"]) == PROJECTION_FIELDS
     assert set(report["email_projection"]) == PROJECTION_FIELDS

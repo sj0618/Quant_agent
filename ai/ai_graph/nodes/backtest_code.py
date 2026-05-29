@@ -37,8 +37,35 @@ def generate_loop3_candidates(
 ) -> Loop3Result:
     client = llm_client or create_llm_client()
     output = _generate_backtest_code_output(client, request)
+    candidates = _validate_candidates(request, output.candidates)
+    valid_candidates = [candidate for candidate in candidates if candidate.validation_ok]
+    if not valid_candidates:
+        output = BacktestCodeLLMOutput(
+            candidates=MOCK_BACKTEST_CODE_LLM.generate_backtest_candidates(
+                request.strategy, request.variant
+            ),
+            fallback_reasons=[
+                "all generated candidates failed AST validation",
+                *_candidate_violation_summaries(candidates),
+                *output.fallback_reasons,
+            ],
+        )
+        candidates = _validate_candidates(request, output.candidates)
+        valid_candidates = [candidate for candidate in candidates if candidate.validation_ok]
+        if not valid_candidates:
+            raise ValueError("safe fallback candidates failed AST validation")
+    selected = valid_candidates[0]
+    return Loop3Result(
+        variant=request.variant,
+        candidates=candidates,
+        selected_candidate=selected,
+        fallback_reasons=output.fallback_reasons,
+    )
+
+
+def _validate_candidates(request: Loop3Request, code_candidates: list[str]) -> list[CodeCandidate]:
     candidates: list[CodeCandidate] = []
-    for index, code in enumerate(output.candidates[:3], start=1):
+    for index, code in enumerate(code_candidates[:3], start=1):
         validation = validate_backtest_code(code)
         candidates.append(
             CodeCandidate(
@@ -52,16 +79,15 @@ def generate_loop3_candidates(
         )
     if len(candidates) != 3:
         raise ValueError("Loop3 requires exactly three candidates")
-    valid_candidates = [candidate for candidate in candidates if candidate.validation_ok]
-    if not valid_candidates:
-        raise ValueError("all generated candidates failed AST validation")
-    selected = valid_candidates[0]
-    return Loop3Result(
-        variant=request.variant,
-        candidates=candidates,
-        selected_candidate=selected,
-        fallback_reasons=output.fallback_reasons,
-    )
+    return candidates
+
+
+def _candidate_violation_summaries(candidates: list[CodeCandidate]) -> list[str]:
+    return [
+        f"{candidate.candidate_id}: {'; '.join(candidate.violations)}"
+        for candidate in candidates
+        if candidate.violations
+    ]
 
 
 def backtest_code_node(state: dict) -> dict:

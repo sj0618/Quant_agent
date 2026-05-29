@@ -17,6 +17,18 @@ class InvalidSchemaLLMClient:
         return {"candidates": ["def build_signals(prices):\n    return []\n"]}
 
 
+class UnsafeCodeLLMClient:
+    def generate_json(self, request: LLMJsonRequest) -> dict:
+        return {
+            "candidates": [
+                "import os\ndef build_signals(prices):\n    return []\n",
+                "def helper(prices):\n    return []\n",
+                "class Strategy:\n    pass\n",
+            ],
+            "fallback_reasons": [],
+        }
+
+
 def test_strategy_spec_contract_preserves_rsi_buy_sell_semantics() -> None:
     envelope = run_analysis(QUERY, trace_id="trace-strategy-contract")
 
@@ -60,6 +72,20 @@ def test_backtest_code_schema_validation_failure_records_fallback_reason() -> No
     assert len(result.candidates) == 3
     assert result.fallback_reasons
     assert "ValidationError" in result.fallback_reasons[0]
+
+
+def test_backtest_code_ast_validation_failure_uses_safe_fallback_candidates() -> None:
+    envelope = run_analysis(QUERY, trace_id="trace-ast-fallback")
+    spec = StrategySpec.model_validate(envelope.strategy_spec)
+
+    result = generate_loop3_candidates(
+        Loop3Request(strategy=spec, variant="A", trace_id="trace-ast-fallback"),
+        llm_client=UnsafeCodeLLMClient(),
+    )
+
+    assert len(result.candidates) == 3
+    assert all(candidate.validation_ok for candidate in result.candidates)
+    assert "all generated candidates failed AST validation" in result.fallback_reasons
 
 
 def test_backtest_code_fallback_reason_is_available_in_internal_payload_only() -> None:

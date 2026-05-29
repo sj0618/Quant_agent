@@ -41,7 +41,7 @@ export function SearchPage() {
             kind: "strategy",
             title: "활성 전략",
             description: data.overview.strategy.natural_language_strategy,
-            href: ROUTES.strategyEdit("active"),
+            href: ROUTES.app,
             meta: data.overview.strategy.universe,
           },
         ]

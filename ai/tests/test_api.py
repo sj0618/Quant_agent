@@ -57,7 +57,7 @@ def test_api_status_exposes_data_source_without_dsn_value(monkeypatch) -> None:
     assert data_source["configured"] is True
     assert data_source["dsn_env"] == "AI_DATABASE_DSN"
     assert "secret" not in str(data_source)
-    assert data_source["price_source"] == "mart.kis_adjusted_feature_frame_asof"
+    assert data_source["price_source"] == "feature.kis_adjusted_ohlcv_daily"
     assert response.json()["job_store"]["active_mode"] == "memory"
     assert "secret" not in str(response.json()["job_store"])
 
@@ -111,6 +111,11 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert created_job["result"]["status"] == "ready"
     assert "internal_payload" not in created_job["result"]
     assert {stage["status"] for stage in created_job["stages"]} == {"succeeded"}
+    performance = created_job["result"]["user_payload"]["performance"]
+    assert performance["selected_candidate_id"]
+    assert set(performance["metrics_by_variant"]) == {"A", "B"}
+    assert performance["metrics_by_variant"][performance["selected_variant"]]["total_return"] > 0
+    assert performance["equity_curve_by_variant"][performance["selected_variant"]][-1]["cumulative_return"] > 0
 
     poll_response = client.get(f"{ANALYSIS_JOBS_PATH}/{created_job['job_id']}")
 

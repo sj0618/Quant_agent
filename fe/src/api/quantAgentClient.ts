@@ -3,6 +3,9 @@ import { appOverview, analysisJobStatus, performanceSummary, tradingCandidates }
 import { landingSample } from "../mocks/landing.mock";
 import { reportDetails, reportSummaries } from "../mocks/reports.mock";
 import type {
+  ABComparisonRow,
+  AIBacktestMetrics,
+  AIBacktestPerformance,
   AICondition,
   AIEnvelopeStatus,
   AIJobStage,
@@ -14,7 +17,9 @@ import type {
   AnalysisJobStatus,
   AnalysisStage,
   AppOverview,
+  BacktestMetric,
   ChatMessage,
+  EquityPoint,
   LandingSample,
   PerformanceSummary,
   ReportDetail,
@@ -32,8 +37,15 @@ const RECENT_REPORT_LIMIT = 4;
 const SCORE_SCALE = 10;
 const PERCENT_SCALE = 100;
 const TRACE_PREVIEW_LENGTH = 8;
+const PERCENT_DISPLAY_DIGITS = 2;
+const DECIMAL_DISPLAY_DIGITS = 2;
+const BASELINE_RETURN_PERCENT = 0;
 const STORAGE_KEY_LATEST_ANALYSIS_JOB = "quantagent.latest-analysis-job.v1";
 const AI_REPORT_ID_PREFIX = "ai-job:";
+const VARIANT_LABELS: Record<"A" | "B", string> = {
+  A: "원본 전략",
+  B: "AI 개선본",
+};
 const TIMEFRAME_LABELS: Record<string, string> = {
   daily: "매일 분석",
   weekly: "매주 분석",
@@ -101,6 +113,10 @@ export function saveLatestAnalysisJob(job: AnalysisJob) {
   window.localStorage.setItem(STORAGE_KEY_LATEST_ANALYSIS_JOB, JSON.stringify(job));
 }
 
+export function clearLatestAnalysisJob() {
+  window.localStorage.removeItem(STORAGE_KEY_LATEST_ANALYSIS_JOB);
+}
+
 export function getLatestAnalysisJob(): AnalysisJob | null {
   return readLatestAnalysisJob();
 }
@@ -163,6 +179,7 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
   const recentReports = reportSummary
     ? [reportSummary, ...base.recentReports.filter((report) => report.id !== reportSummary.id)].slice(0, RECENT_REPORT_LIMIT)
     : base.recentReports;
+  const performance = buildPerformanceSummaryFromAnalysisJob(job, base.performance);
 
   return {
     ...base,
@@ -170,7 +187,8 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
     recommendationScore: result?.strategy_spec ? formatScore(result.strategy_spec.confidence) : base.recommendationScore,
     recommendationDelta: result ? formatStatusDelta(result.status) : base.recommendationDelta,
     latestRunLabel: `최신 분석 · ${formatDateTime(job.updated_at)}`,
-    chatMessages: buildAnalysisChatMessages(job),
+    chatMessages: mergeChatMessages(base.chatMessages, buildAnalysisChatMessages(job)),
+    performance,
     recentReports,
     envelope: result ?? base.envelope,
     jobStatus: buildWorkspaceJobStatus(job),
@@ -185,6 +203,14 @@ export async function getAppOverview(): Promise<AppOverview> {
   const overview = await respond({ ...appOverview, recentReports: reportSummaries.slice(0, RECENT_REPORT_LIMIT) });
   const latestJob = await refreshLatestAnalysisJob();
   return latestJob ? mergeAnalysisJobIntoOverview(overview, latestJob) : overview;
+}
+
+export function getWorkspaceTemplate(): Promise<AppOverview> {
+  return respond({
+    ...appOverview,
+    chatMessages: [],
+    recentReports: [],
+  });
 }
 
 export function getTradingCandidates(): Promise<TradingCandidate[]> {
@@ -277,7 +303,16 @@ function buildAnalysisChatMessages(job: AnalysisJob): ChatMessage[] {
   const payload = job.result?.user_payload;
   const status = job.result?.status ?? "running";
   const statusLabel = formatEnvelopeStatus(status);
-  const candidateCount = payload?.candidate_cards.length ?? 0;
+  const visibleCandidateCards = status === "need_clarification" ? payload?.candidate_cards : undefined;
+  const candidateCount = visibleCandidateCards?.length ?? 0;
+  const clarification =
+    payload?.question && payload.options?.length
+      ? {
+          question: payload.question,
+          options: payload.options,
+          recommended: payload.recommended,
+        }
+      : undefined;
 
   return [
     {
@@ -305,8 +340,21 @@ function buildAnalysisChatMessages(job: AnalysisJob): ChatMessage[] {
         { label: "후보", value: `${candidateCount}` },
         { label: "Trace", value: job.trace_id.slice(0, TRACE_PREVIEW_LENGTH) },
       ],
+      candidateCards: visibleCandidateCards,
+      clarification,
     },
   ];
+}
+
+function mergeChatMessages(base: ChatMessage[], next: ChatMessage[]) {
+  const seen = new Set<string>();
+  return [...base, ...next].filter((message) => {
+    if (seen.has(message.id)) {
+      return false;
+    }
+    seen.add(message.id);
+    return true;
+  });
 }
 
 function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | null {
@@ -344,6 +392,7 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
   if (!result || !report || !summary || !fallback) {
     return null;
   }
+  const performance = buildPerformanceSummaryFromAnalysisJob(job, performanceSummary);
 
   return {
     ...summary,
@@ -359,9 +408,136 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
     signalAxes: fallback.signalAxes,
     riskManagerOverride: report.risk_adjustments.length ? describeRiskAdjustments(report.risk_adjustments) : "Risk Manager 변경 없음",
     conclusion: report.web_projection.summary,
-    performance: fallback.performance,
+    performance: { metrics: performance.metrics, disclaimer: performance.disclaimer },
     costNotes: result.user_payload.next_actions,
   };
+}
+
+function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: PerformanceSummary): PerformanceSummary {
+  const aiPerformance = job.result?.user_payload.performance;
+  const selectedMetrics = aiPerformance ? metricsForSelectedVariant(aiPerformance) : null;
+  if (!aiPerformance || !selectedMetrics) {
+    return fallback;
+  }
+
+  const selectedLabel = VARIANT_LABELS[aiPerformance.selected_variant];
+  const equityCurve = buildAIEquityCurve(aiPerformance);
+  const comparison = buildAIComparisonRows(aiPerformance.metrics_by_variant.A, aiPerformance.metrics_by_variant.B);
+
+  return {
+    ...fallback,
+    headline: "AI 전략 검증 결과",
+    period: `BacktestCode Loop3 · ${selectedLabel} 선택 · ${formatDateTime(job.updated_at)}`,
+    benchmarkLabel: "검증 기준선",
+    metrics: buildAIMetricCards(selectedMetrics, aiPerformance),
+    equityCurve: equityCurve.length ? equityCurve : fallback.equityCurve,
+    comparison: comparison.length ? comparison : fallback.comparison,
+    disclaimer:
+      `내 전략/원본 전략은 AI 백테스트 엔진 산출값입니다. 선택 후보 ${aiPerformance.selected_candidate_id}, ` +
+      "벤치마크 데이터가 없는 검증 응답은 0% 기준선과 함께 표시합니다.",
+  };
+}
+
+function metricsForSelectedVariant(performance: AIBacktestPerformance): AIBacktestMetrics | null {
+  return performance.metrics_by_variant[performance.selected_variant] ?? null;
+}
+
+function buildAIMetricCards(selected: AIBacktestMetrics, performance: AIBacktestPerformance): BacktestMetric[] {
+  const counterpartVariant = performance.selected_variant === "A" ? "B" : "A";
+  const counterpart = performance.metrics_by_variant[counterpartVariant];
+  const counterpartLabel = VARIANT_LABELS[counterpartVariant];
+
+  return [
+    {
+      key: "sharpe",
+      label: "Sharpe Ratio",
+      value: formatDecimal(selected.sharpe_ratio),
+      delta: counterpart ? `${counterpartLabel} ${formatDecimal(counterpart.sharpe_ratio)}` : undefined,
+      tone: counterpart ? toneForMetricDelta(selected.sharpe_ratio - counterpart.sharpe_ratio) : "neutral",
+      caption: "AI 전략 검증에서 선택된 후보 기준입니다.",
+    },
+    {
+      key: "mdd",
+      label: "Max Drawdown",
+      value: formatPercent(selected.max_drawdown),
+      delta: counterpart ? `${counterpartLabel} ${formatPercent(counterpart.max_drawdown)}` : undefined,
+      tone: counterpart ? toneForMetricDelta(selected.max_drawdown - counterpart.max_drawdown) : "neutral",
+      caption: "누적 자산 곡선 기준 최대 낙폭입니다.",
+    },
+    {
+      key: "winRate",
+      label: "Win Rate",
+      value: formatPercent(selected.win_rate),
+      delta: counterpart ? formatSignedPercentPoint(selected.win_rate - counterpart.win_rate) : undefined,
+      tone: counterpart ? toneForMetricDelta(selected.win_rate - counterpart.win_rate) : "neutral",
+      caption: "체결 거래 중 수익 거래 비율입니다.",
+    },
+    {
+      key: "totalReturn",
+      label: "Total Return",
+      value: formatPercent(selected.total_return),
+      delta: counterpart ? formatSignedPercentPoint(selected.total_return - counterpart.total_return) : undefined,
+      tone: counterpart ? toneForMetricDelta(selected.total_return - counterpart.total_return) : "neutral",
+      caption: "거래비용 반영 후 검증 기간 누적 수익률입니다.",
+    },
+  ];
+}
+
+function buildAIComparisonRows(original: AIBacktestMetrics | undefined, improved: AIBacktestMetrics | undefined): ABComparisonRow[] {
+  if (!original || !improved) {
+    return [];
+  }
+
+  return [
+    {
+      metric: "Sharpe",
+      original: formatDecimal(original.sharpe_ratio),
+      improved: formatDecimal(improved.sharpe_ratio),
+      delta: formatSignedDecimal(improved.sharpe_ratio - original.sharpe_ratio),
+      tone: toneForMetricDelta(improved.sharpe_ratio - original.sharpe_ratio),
+    },
+    {
+      metric: "MDD",
+      original: formatPercent(original.max_drawdown),
+      improved: formatPercent(improved.max_drawdown),
+      delta: formatSignedPercentPoint(improved.max_drawdown - original.max_drawdown),
+      tone: toneForMetricDelta(improved.max_drawdown - original.max_drawdown),
+    },
+    {
+      metric: "Win Rate",
+      original: formatPercent(original.win_rate),
+      improved: formatPercent(improved.win_rate),
+      delta: formatSignedPercentPoint(improved.win_rate - original.win_rate),
+      tone: toneForMetricDelta(improved.win_rate - original.win_rate),
+    },
+    {
+      metric: "Total Return",
+      original: formatPercent(original.total_return),
+      improved: formatPercent(improved.total_return),
+      delta: formatSignedPercentPoint(improved.total_return - original.total_return),
+      tone: toneForMetricDelta(improved.total_return - original.total_return),
+    },
+  ];
+}
+
+function buildAIEquityCurve(performance: AIBacktestPerformance): EquityPoint[] {
+  const selectedCurve = performance.equity_curve_by_variant[performance.selected_variant] ?? [];
+  const originalCurve = performance.equity_curve_by_variant.A ?? [];
+  const sourceCurve = selectedCurve.length ? selectedCurve : originalCurve;
+  if (!sourceCurve.length) {
+    return [];
+  }
+
+  const originalByDate = new Map(originalCurve.map((point) => [point.date, point]));
+  return sourceCurve.map((point, index) => {
+    const originalPoint = originalByDate.get(point.date) ?? originalCurve[index] ?? point;
+    return {
+      date: formatEquityPointLabel(point.date),
+      strategy: ratioToPercent(point.cumulative_return),
+      original: ratioToPercent(originalPoint.cumulative_return),
+      benchmark: BASELINE_RETURN_PERCENT,
+    };
+  });
 }
 
 function extractSignalAction(report: AIReportBundle): SignalType | null {
@@ -401,6 +577,52 @@ function isSignalType(value: unknown): value is SignalType {
 function formatScore(confidence: number) {
   const normalized = Math.round(confidence * SCORE_SCALE * SCORE_SCALE) / SCORE_SCALE;
   return `${normalized.toFixed(1)} / ${SCORE_SCALE}`;
+}
+
+function ratioToPercent(value: number) {
+  return Number((value * PERCENT_SCALE).toFixed(PERCENT_DISPLAY_DIGITS));
+}
+
+function formatPercent(value: number) {
+  const percent = ratioToPercent(value);
+  const prefix = percent > 0 ? "+" : "";
+  return `${prefix}${percent.toFixed(PERCENT_DISPLAY_DIGITS)}%`;
+}
+
+function formatSignedPercentPoint(value: number) {
+  const percent = ratioToPercent(value);
+  const prefix = percent >= 0 ? "+" : "";
+  return `${prefix}${percent.toFixed(PERCENT_DISPLAY_DIGITS)}%p`;
+}
+
+function formatDecimal(value: number) {
+  return value.toFixed(DECIMAL_DISPLAY_DIGITS);
+}
+
+function formatSignedDecimal(value: number) {
+  const prefix = value >= 0 ? "+" : "";
+  return `${prefix}${value.toFixed(DECIMAL_DISPLAY_DIGITS)}`;
+}
+
+function toneForMetricDelta(value: number): Tone {
+  if (value > 0) {
+    return "positive";
+  }
+  if (value < 0) {
+    return "negative";
+  }
+  return "neutral";
+}
+
+function formatEquityPointLabel(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(APP_LOCALE, {
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
 }
 
 function formatStatusDelta(status: AIEnvelopeStatus) {

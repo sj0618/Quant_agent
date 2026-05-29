@@ -14,6 +14,7 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
   const [mode, setMode] = useState<"improved" | "original" | "ab">("improved");
   const [range, setRange] = useState<"1Y" | "5Y" | "10Y">("10Y");
   const points = range === "1Y" ? performance.equityCurve.slice(-2) : range === "5Y" ? performance.equityCurve.slice(-4) : performance.equityCurve;
+  const benchmarkLabel = performance.benchmarkLabel ?? "KOSPI200";
   const series: Array<keyof Pick<EquityPoint, "strategy" | "original" | "benchmark">> =
     mode === "improved" ? ["benchmark", "strategy"] : mode === "original" ? ["benchmark", "original"] : ["benchmark", "original", "strategy"];
 
@@ -25,7 +26,7 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
           <p>{performance.period}</p>
         </div>
         <div className="segmented">
-          <button className={mode === "improved" ? "is-active" : ""} onClick={() => setMode("improved")} type="button">AI 개선본</button>
+          <button className={mode === "improved" ? "is-active" : ""} onClick={() => setMode("improved")} type="button">선택 후보</button>
           <button className={mode === "original" ? "is-active" : ""} onClick={() => setMode("original")} type="button">원본 전략</button>
           <button className={mode === "ab" ? "is-active" : ""} onClick={() => setMode("ab")} type="button">A/B 동시 보기</button>
         </div>
@@ -41,13 +42,13 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
       <Card className="chart-card chart-card--large" padded={false}>
         <div className="card-head">
           <div>
-            <strong>누적 수익률 (10년)</strong>
-            <p>Walk-forward · IS 18M 학습 + OOS 3M 검증 반복</p>
+            <strong>누적 수익률</strong>
+            <p>{performance.period}</p>
           </div>
           <div className="legend-row">
-            {mode !== "original" ? <span><i className="line line--strategy" />AI 개선본 (분할)</span> : null}
+            {mode !== "original" ? <span><i className="line line--strategy" />선택 후보</span> : null}
             {mode !== "improved" ? <span><i className="line line--original" />원본 (일괄)</span> : null}
-            <span><i className="line line--benchmark" />KOSPI200</span>
+            <span><i className="line line--benchmark" />{benchmarkLabel}</span>
             {(["1Y", "5Y", "10Y"] as const).map((item) => (
               <button className={range === item ? "is-active" : ""} key={item} onClick={() => setRange(item)} type="button">
                 {item}

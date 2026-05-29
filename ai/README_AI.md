@@ -17,7 +17,7 @@ cd ai
 python3 -m pip install -e .
 AI_API_HOST=127.0.0.1
 AI_API_PORT=8000
-python3 -m uvicorn ai_graph.api:app --host "$AI_API_HOST" --port "$AI_API_PORT" --reload
+python3 -m uvicorn ai_graph.api:app --host "127.0.0.1" --port "8000" --reload
 ```
 
 Swagger UI는 `http://$AI_API_HOST:$AI_API_PORT/docs`, OpenAPI JSON은

@@ -33,8 +33,8 @@ export function PerformanceChart({ points, height = 240, mode = "compact", serie
         <circle cx={WIDTH - PADDING} cy={height * 0.18} r="7" className="performance-chart__point" />
       </svg>
       <div className="performance-chart__axis">
-        {points.map((point) => (
-          <span key={point.date}>{point.date}</span>
+        {points.map((point, index) => (
+          <span key={`${point.date}-${index}`}>{point.date}</span>
         ))}
       </div>
     </div>

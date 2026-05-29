@@ -26,6 +26,14 @@ def test_search_returns_ranked_research_and_signal_hits():
     assert {hit.level for hit in response.hits} == {"L1", "L2"}
 
 
+def test_strategy_prompt_playbook_covers_value_and_breakout_queries():
+    value_response = search_retrieval_corpus("저PER 고ROE 부채비율 100% 가치주", top_k=3)
+    breakout_response = search_retrieval_corpus("52주 신고가 거래량 150% 모멘텀", top_k=3)
+
+    assert any(hit.document_id == "l1_screening_strategy_playbook" for hit in value_response.hits)
+    assert any(hit.document_id == "l2_screening_indicator_mapping" for hit in breakout_response.hits)
+
+
 def test_retrieval_document_rejects_extra_fields():
     with pytest.raises(ValidationError):
         RetrievalDocument(

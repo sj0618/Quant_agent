@@ -8,7 +8,6 @@ import { ProfilePage } from "./pages/ProfilePage";
 import { ReportDetailPage } from "./pages/ReportDetailPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { SearchPage } from "./pages/SearchPage";
-import { StrategyFormPage } from "./pages/StrategyFormPage";
 import { UnsubscribePage } from "./pages/UnsubscribePage";
 import { getCurrentSession } from "./api/authClient";
 import { ROUTES, getCurrentPathWithSearch, sanitizeReturnTo } from "./config/routes";
@@ -63,15 +62,6 @@ export default function App() {
 
   if (isProtectedRoute(path) && !session) {
     return <AuthRequiredPage returnTo={getCurrentPathWithSearch()} />;
-  }
-
-  if (path === ROUTES.strategyNew) {
-    return <StrategyFormPage mode="new" />;
-  }
-
-  if (path.startsWith(ROUTES.strategyPrefix) && path.endsWith("/edit")) {
-    const strategyId = decodeURIComponent(path.replace(ROUTES.strategyPrefix, "").replace("/edit", ""));
-    return <StrategyFormPage mode="edit" strategyId={strategyId} />;
   }
 
   if (path === ROUTES.app) {

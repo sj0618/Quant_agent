@@ -88,6 +88,22 @@ class StrategyCandidateCard(BaseModel):
     summary: str = Field(min_length=1)
     key_conditions: list[str] = Field(min_length=1, max_length=5)
     confidence: float = Field(ge=0.0, le=1.0)
+    reason: str | None = None
+
+
+class ClarificationOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class ClarificationPrompt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1)
+    options: list[ClarificationOption] = Field(default_factory=list, max_length=3)
+    recommended: int | None = Field(default=None, ge=0, le=2)
 
 
 class StrategySpec(BaseModel):
@@ -136,6 +152,13 @@ class BacktestMetrics(BaseModel):
     degradation: float
 
 
+class BacktestEquityPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date: str = Field(min_length=1)
+    cumulative_return: float
+
+
 class CodeCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -155,6 +178,7 @@ class ABBacktestResult(BaseModel):
     candidates: list[CodeCandidate] = Field(min_length=1)
     selected_candidate: CodeCandidate
     metrics_by_variant: dict[str, BacktestMetrics]
+    equity_curve_by_variant: dict[str, list[BacktestEquityPoint]]
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
@@ -204,6 +228,15 @@ class ReportBundle(BaseModel):
     risk_adjustments: list[RiskAdjustment] = Field(default_factory=list)
 
 
+class BacktestPerformance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selected_variant: Literal["A", "B"]
+    selected_candidate_id: str = Field(min_length=1)
+    metrics_by_variant: dict[str, BacktestMetrics]
+    equity_curve_by_variant: dict[str, list[BacktestEquityPoint]]
+
+
 class InternalPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -224,6 +257,10 @@ class UserPayload(BaseModel):
     next_actions: list[str] = Field(default_factory=list)
     candidate_cards: list[StrategyCandidateCard] = Field(default_factory=list)
     report: ReportBundle | None = None
+    performance: BacktestPerformance | None = None
+    question: str | None = None
+    options: list[ClarificationOption] = Field(default_factory=list, max_length=3)
+    recommended: int | None = Field(default=None, ge=0, le=2)
 
 
 class APIEnvelope(BaseModel):

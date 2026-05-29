@@ -14,7 +14,7 @@ from ai_graph.data_sources.db import (
     AI_DATABASE_DSN_ENV,
     BOK_MACRO_VIEW,
     DataSourceConfig,
-    KIS_FEATURE_FRAME_VIEW,
+    KIS_ADJUSTED_OHLCV_TABLE,
     UNIVERSE_VIEW,
 )
 from ai_graph.graph import run_analysis
@@ -224,7 +224,7 @@ def _data_source_status() -> DataSourceStatus:
     return DataSourceStatus(
         configured=config.database_dsn is not None,
         dsn_env=AI_DATABASE_DSN_ENV,
-        price_source=KIS_FEATURE_FRAME_VIEW,
+        price_source=KIS_ADJUSTED_OHLCV_TABLE,
         universe_source=UNIVERSE_VIEW,
         l4_evidence_source=ANALYST_REPORT_TABLE,
         macro_source=BOK_MACRO_VIEW,

@@ -70,6 +70,12 @@ export interface StrategyCandidateCard {
   summary: string;
   key_conditions: string[];
   confidence: number;
+  reason?: string | null;
+}
+
+export interface AIClarificationOption {
+  label: string;
+  reason: string;
 }
 
 export interface AIReportProjection {
@@ -91,12 +97,38 @@ export interface AIReportBundle {
   risk_adjustments: AIRiskAdjustment[];
 }
 
+export interface AIBacktestMetrics {
+  sharpe_ratio: number;
+  max_drawdown: number;
+  win_rate: number;
+  total_return: number;
+  in_sample_sharpe: number;
+  out_sample_sharpe: number;
+  degradation: number;
+}
+
+export interface AIBacktestEquityPoint {
+  date: string;
+  cumulative_return: number;
+}
+
+export interface AIBacktestPerformance {
+  selected_variant: "A" | "B";
+  selected_candidate_id: string;
+  metrics_by_variant: Record<"A" | "B", AIBacktestMetrics>;
+  equity_curve_by_variant: Record<"A" | "B", AIBacktestEquityPoint[]>;
+}
+
 export interface AIUserPayload {
   headline: string;
   message: string;
   next_actions: string[];
   candidate_cards: StrategyCandidateCard[];
   report: AIReportBundle | null;
+  performance?: AIBacktestPerformance | null;
+  question?: string | null;
+  options?: AIClarificationOption[];
+  recommended?: number | null;
 }
 
 export interface AIStageProgress {
@@ -185,6 +217,7 @@ export interface MacroEvent {
 export interface PerformanceSummary {
   headline: string;
   period: string;
+  benchmarkLabel?: string;
   metrics: BacktestMetric[];
   equityCurve: EquityPoint[];
   comparison: ABComparisonRow[];
@@ -199,6 +232,20 @@ export interface ChatMessage {
   time: string;
   body: string;
   stats?: Array<{ label: string; value: string }>;
+  candidateCards?: StrategyCandidateCard[];
+  clarification?: {
+    question: string;
+    options: AIClarificationOption[];
+    recommended?: number | null;
+  };
+}
+
+export interface ChatConversationPreview {
+  id: string;
+  title: string;
+  updatedAt: string;
+  status: WorkspaceAnalysisStatus;
+  messages: ChatMessage[];
 }
 
 export interface AppOverview {

@@ -25,6 +25,7 @@ TRADING_DAYS_PER_YEAR = 252
 METRIC_ROUND_DIGITS = 6
 MIN_RETURNS_FOR_SPLIT = 4
 BACKTEST_SPLIT_FRACTION = 0.5
+PUBLIC_EQUITY_CURVE_POINTS = 12
 GENERATED_SIGNAL_METRIC = "generated_signal"
 BUY_SIGNAL_VALUE = 1.0
 SELL_SIGNAL_VALUE = -1.0
@@ -144,6 +145,7 @@ def run_ab_backtest(
     rows = _price_rows(price_rows)
     enriched_candidates: list[CodeCandidate] = []
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
+    equity_curves_by_candidate: dict[str, list[dict[str, Any]]] = {}
 
     for candidate in candidates:
         if not candidate.validation_ok:
@@ -155,6 +157,7 @@ def run_ab_backtest(
         enriched_candidate = candidate.model_copy(update={"metrics": metrics})
         enriched_candidates.append(enriched_candidate)
         engine_summaries_by_candidate[candidate.candidate_id] = dict(engine_result.summary)
+        equity_curves_by_candidate[candidate.candidate_id] = _public_equity_curve(engine_result)
 
     valid_candidates = [
         candidate
@@ -166,6 +169,7 @@ def run_ab_backtest(
 
     selected = max(valid_candidates, key=_candidate_rank)
     metrics_by_variant: dict[str, BacktestMetrics] = {}
+    equity_curve_by_variant: dict[str, list[dict[str, Any]]] = {}
     for variant in ("A", "B"):
         variant_candidates = [
             candidate for candidate in valid_candidates if candidate.variant == variant
@@ -174,6 +178,7 @@ def run_ab_backtest(
             raise ValueError(f"variant {variant} has no backtested candidate")
         best = max(variant_candidates, key=_candidate_rank)
         metrics_by_variant[variant] = _candidate_metrics(best)
+        equity_curve_by_variant[variant] = equity_curves_by_candidate[best.candidate_id]
 
     return ABBacktestResult(
         strategy_a=strategy_a,
@@ -181,6 +186,7 @@ def run_ab_backtest(
         candidates=enriched_candidates,
         selected_candidate=selected,
         metrics_by_variant=metrics_by_variant,
+        equity_curve_by_variant=equity_curve_by_variant,
         engine_summaries_by_candidate=engine_summaries_by_candidate,
     )
 
@@ -239,7 +245,17 @@ def _execute_candidate_code(
     raw_signals = build_signals([dict(row) for row in price_rows])
     if not isinstance(raw_signals, Sequence):
         raise ValueError(f"candidate {candidate.candidate_id} must return a signal sequence")
-    return [GeneratedSignal.model_validate(signal) for signal in raw_signals]
+    return [_generated_signal_from_raw(signal) for signal in raw_signals]
+
+
+def _generated_signal_from_raw(signal: object) -> GeneratedSignal:
+    if isinstance(signal, Mapping):
+        normalized = dict(signal)
+        action = normalized.get("action")
+        if isinstance(action, str):
+            normalized["action"] = action.upper()
+        return GeneratedSignal.model_validate(normalized)
+    return GeneratedSignal.model_validate(signal)
 
 
 def _engine_market_rows(
@@ -373,6 +389,39 @@ def _metrics_from_engine_result(engine_result) -> BacktestMetrics:
     )
 
 
+def _public_equity_curve(engine_result) -> list[dict[str, Any]]:
+    summary = engine_result.summary
+    initial_capital = _summary_float(summary, "initial_capital")
+    if initial_capital == 0:
+        return []
+
+    sampled_points = _sample_points(engine_result.equity_curve, PUBLIC_EQUITY_CURVE_POINTS)
+    return [
+        {
+            "date": str(point.date),
+            "cumulative_return": round(
+                (float(point.total_equity) / initial_capital) - 1,
+                METRIC_ROUND_DIGITS,
+            ),
+        }
+        for point in sampled_points
+    ]
+
+
+def _sample_points(points: Sequence[Any], max_points: int) -> list[Any]:
+    if len(points) <= max_points:
+        return list(points)
+
+    last_index = len(points) - 1
+    step = last_index / (max_points - 1)
+    indices = sorted({round(index * step) for index in range(max_points)})
+    if indices[0] != 0:
+        indices.insert(0, 0)
+    if indices[-1] != last_index:
+        indices.append(last_index)
+    return [points[index] for index in indices]
+
+
 def _split_sharpes(daily_returns: list[float]) -> tuple[float, float]:
     if len(daily_returns) < MIN_RETURNS_FOR_SPLIT:
         full_sample = _sharpe_like(daily_returns)
@@ -420,18 +469,23 @@ def _safe_builtins() -> dict[str, Any]:
     return {
         "__import__": _safe_import,
         "abs": abs,
+        "all": all,
+        "any": any,
         "bool": bool,
         "dict": dict,
         "enumerate": enumerate,
         "float": float,
         "int": int,
+        "isinstance": isinstance,
         "len": len,
         "list": list,
         "max": max,
         "min": min,
         "range": range,
         "round": round,
+        "sorted": sorted,
         "sum": sum,
+        "zip": zip,
     }
 
 

@@ -11,9 +11,6 @@ export const ROUTES = {
   privacy: "/privacy",
   disclaimer: "/disclaimer",
   unsubscribe: "/unsubscribe",
-  strategyNew: "/app/strategies/new",
-  strategyPrefix: "/app/strategies/",
-  strategyEdit: (id: string) => `/app/strategies/${encodeURIComponent(id)}/edit`,
   reportDetail: (id: string) => `/reports/${encodeURIComponent(id)}`,
 } as const;
 

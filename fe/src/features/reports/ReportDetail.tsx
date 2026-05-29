@@ -120,7 +120,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
           </div>
           <div className="report-cta-row">
             <a href={ROUTES.app}>워크스페이스에서 상세 보기 →</a>
-            <a href={ROUTES.strategyEdit("active")}>전략 수정하기</a>
+            <a href={ROUTES.app}>채팅으로 전략 수정</a>
           </div>
         </Section>
 

@@ -137,7 +137,7 @@ systems resolve them through `debug_ref`.
 | Payload | Audience | Fields |
 |---|---|---|
 | `internal_payload` | QA/logging | `trace_id`, `node_outputs`, `retrieval_hits`, `llm_prompts`, `validation`, `backtest_artifacts`, `risk_events` |
-| `user_payload` | FE | `headline`, `message`, `next_actions`; optional candidate cards/report |
+| `user_payload` | FE | `headline`, `message`, `next_actions`; optional candidate cards/report/performance and clarification cards |
 
 ## Public Report Fields
 
@@ -149,12 +149,15 @@ systems resolve them through `debug_ref`.
 | `query` | yes | `strategies.description_nl` |
 | `result.user_payload.candidate_cards` | yes | `agentic_search_cache` or candidate analysis cache |
 | `result.user_payload.message` | yes | `llm_analyses` summary |
+| `result.user_payload.question/options/recommended` | yes | FE clarification card state |
 | `result.user_payload.report.risk_adjustments` | yes | `trade_signals.rationale_md` or risk audit log |
+| `result.user_payload.performance` | yes | `backtest_runs`/`backtest_metrics` |
 | `result.debug_ref` | limited | internal trace key for `llm_analyses`/debug records |
 
-Future DB writers should map `backtest_artifacts` from internal payload to
-`backtest_runs`/`backtest_metrics`, and final signal/rationale to
-`trade_signals`. This AI task does not create or mutate those DB tables.
+Future DB writers should map `backtest_artifacts` from internal payload and the
+public `performance` summary to `backtest_runs`/`backtest_metrics`, and final
+signal/rationale to `trade_signals`. This AI task does not create or mutate
+those DB tables.
 
 ## StrategySpec
 

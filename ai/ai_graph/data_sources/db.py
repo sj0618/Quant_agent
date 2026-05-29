@@ -18,12 +18,19 @@ AI_DB_CONNECT_TIMEOUT_SECONDS_ENV = "AI_DB_CONNECT_TIMEOUT_SECONDS"
 AI_DB_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_STATEMENT_TIMEOUT_MS"
 
 DEFAULT_BACKTEST_TICKER = "005930"
-DEFAULT_BACKTEST_LOOKBACK_DAYS = 252
+TRADING_DAYS_PER_YEAR = 252
+DEFAULT_BACKTEST_LOOKBACK_YEARS = 10
+DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * DEFAULT_BACKTEST_LOOKBACK_YEARS
 DEFAULT_L4_EVIDENCE_LIMIT = 5
 DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 5
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 10_000
+POSTGRES_TIMEOUT_UNIT = "ms"
+BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 3
+RSI_OVERSOLD_THRESHOLD = 30.0
 
 KIS_FEATURE_FRAME_VIEW = "mart.kis_adjusted_feature_frame_asof"
+KIS_ADJUSTED_OHLCV_TABLE = "feature.kis_adjusted_ohlcv_daily"
+TA_MOMENTUM_TICKER_TABLE = "feature.ta_momentum_ticker_daily"
 UNIVERSE_VIEW = "meta.view_common_stock_universe"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
@@ -80,13 +87,15 @@ class PostgresPipelineDataSource:
 
     def load(self, query: str, trace_id: str) -> PipelineDataBundle:
         with self._connect() as conn:
-            conn.execute("SET LOCAL statement_timeout = %s", [self.config.statement_timeout_ms])
+            self._set_statement_timeout(conn)
             ticker = self._resolve_ticker(conn, query)
-            price_rows = self._fetch_price_rows(conn, ticker)
-            if not price_rows:
-                raise ValueError(f"{KIS_FEATURE_FRAME_VIEW} returned no price rows for {ticker}")
-            l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
             universe = self._fetch_universe_status(conn, ticker)
+            price_rows, effective_lookback_days = self._fetch_price_rows(
+                conn, ticker, universe, query
+            )
+            if not price_rows:
+                raise ValueError(f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}")
+            l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
 
         return PipelineDataBundle(
@@ -95,8 +104,10 @@ class PostgresPipelineDataSource:
             metadata={
                 "source": "postgres",
                 "ticker": ticker,
-                "price_source": KIS_FEATURE_FRAME_VIEW,
+                "price_source": KIS_ADJUSTED_OHLCV_TABLE,
+                "indicator_sources": [TA_MOMENTUM_TICKER_TABLE],
                 "price_rows": len(price_rows),
+                "backtest_lookback_days": effective_lookback_days,
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_rows": len(l4_evidence),
                 "universe_source": UNIVERSE_VIEW,
@@ -106,7 +117,7 @@ class PostgresPipelineDataSource:
             },
         )
 
-    def _connect(self):
+    def _connect(self) -> Any:
         import psycopg
         from psycopg.rows import dict_row
 
@@ -115,6 +126,10 @@ class PostgresPipelineDataSource:
             connect_timeout=self.config.connect_timeout_seconds,
             row_factory=dict_row,
         )
+
+    def _set_statement_timeout(self, conn: Any) -> None:
+        timeout_value = f"{self.config.statement_timeout_ms}{POSTGRES_TIMEOUT_UNIT}"
+        _ = conn.execute("SELECT set_config('statement_timeout', %s, true)", [timeout_value])
 
     def _resolve_ticker(self, conn: Any, query: str) -> str:
         explicit_ticker = TICKER_PATTERN.search(query)
@@ -137,38 +152,74 @@ class PostgresPipelineDataSource:
                 return symbol.zfill(6)
         return self.config.default_ticker
 
-    def _fetch_price_rows(self, conn: Any, ticker: str) -> list[dict[str, Any]]:
+    def _fetch_price_rows(
+        self, conn: Any, ticker: str, universe: Mapping[str, Any], query: str
+    ) -> tuple[list[dict[str, Any]], int]:
+        lookback_days = self.config.backtest_lookback_days
+        price_rows = self._fetch_price_rows_for_lookback(conn, ticker, universe, lookback_days)
+        if (
+            _query_requires_rsi_oversold(query)
+            and lookback_days < DEFAULT_BACKTEST_LOOKBACK_DAYS
+            and not _has_rsi_oversold_entry(price_rows)
+        ):
+            lookback_days = DEFAULT_BACKTEST_LOOKBACK_DAYS
+            price_rows = self._fetch_price_rows_for_lookback(conn, ticker, universe, lookback_days)
+        return price_rows, lookback_days
+
+    def _fetch_price_rows_for_lookback(
+        self, conn: Any, ticker: str, universe: Mapping[str, Any], lookback_days: int
+    ) -> list[dict[str, Any]]:
+        calendar_lookback_days = (
+            lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
+        )
         rows = conn.execute(
             """
-            WITH recent AS (
-                SELECT
-                    as_of_date,
-                    ticker,
-                    name,
-                    market_segment,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume,
-                    trend_values,
-                    momentum_values,
-                    volatility_values,
-                    volume_values,
-                    pattern_values
-                FROM mart.kis_adjusted_feature_frame_asof
-                WHERE ticker = %s
-                  AND (listing_status IS NULL OR listing_status = 'LISTED')
-                ORDER BY as_of_date DESC
-                LIMIT %s
-            )
-            SELECT *
-            FROM recent
-            ORDER BY as_of_date ASC
+            SELECT
+                time AS as_of_date,
+                ticker,
+                adj_open AS open,
+                adj_high AS high,
+                adj_low AS low,
+                adj_close AS close,
+                adj_volume AS volume,
+                quality_flags AS adjusted_ohlcv_quality_flags
+            FROM feature.kis_adjusted_ohlcv_daily
+            WHERE ticker = %s
+              AND time >= CURRENT_DATE - make_interval(days => %s)
+            ORDER BY time DESC
+            LIMIT %s
             """,
-            [ticker, self.config.backtest_lookback_days],
+            [ticker, calendar_lookback_days, lookback_days],
         ).fetchall()
-        return [_price_row_from_feature_frame_record(row) for row in rows]
+        momentum_by_date = self._fetch_momentum_values_by_date(
+            conn, ticker, calendar_lookback_days, lookback_days
+        )
+        return [
+            _price_row_from_feature_frame_record(
+                _feature_frame_row_from_sources(row, momentum_by_date, universe)
+            )
+            for row in reversed(rows)
+        ]
+
+    def _fetch_momentum_values_by_date(
+        self, conn: Any, ticker: str, calendar_lookback_days: int, lookback_days: int
+    ) -> dict[date, Mapping[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT time, values_jsonb
+            FROM feature.ta_momentum_ticker_daily
+            WHERE ticker = %s
+              AND time >= CURRENT_DATE - make_interval(days => %s)
+            ORDER BY time DESC
+            LIMIT %s
+            """,
+            [ticker, calendar_lookback_days, lookback_days],
+        ).fetchall()
+        values_by_date: dict[date, Mapping[str, Any]] = {}
+        for row in rows:
+            values = row.get("values_jsonb")
+            values_by_date[_date_value(row["time"])] = values if isinstance(values, Mapping) else {}
+        return values_by_date
 
     def _fetch_l4_evidence(self, conn: Any, ticker: str, trace_id: str) -> list[dict[str, Any]]:
         rows = conn.execute(
@@ -239,6 +290,8 @@ def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle
                 "reason": f"{AI_DATABASE_DSN_ENV} is not set.",
                 "available_db_objects": [
                     KIS_FEATURE_FRAME_VIEW,
+                    KIS_ADJUSTED_OHLCV_TABLE,
+                    TA_MOMENTUM_TICKER_TABLE,
                     UNIVERSE_VIEW,
                     ANALYST_REPORT_TABLE,
                 ],
@@ -265,6 +318,25 @@ def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, An
     if rsi is not None:
         price_row["rsi"] = rsi
     return price_row
+
+
+def _feature_frame_row_from_sources(
+    row: Mapping[str, Any],
+    momentum_by_date: Mapping[date, Mapping[str, Any]],
+    universe: Mapping[str, Any],
+) -> dict[str, Any]:
+    trade_date = _date_value(row["as_of_date"])
+    return {
+        **dict(row),
+        "as_of_date": trade_date,
+        "name": universe.get("name") or "",
+        "market_segment": universe.get("market_segment") or "KRX",
+        "trend_values": {},
+        "momentum_values": momentum_by_date.get(trade_date, {}),
+        "volatility_values": {},
+        "volume_values": {},
+        "pattern_values": {},
+    }
 
 
 def _l4_evidence_from_report(row: Mapping[str, Any], trace_id: str) -> dict[str, Any]:
@@ -325,6 +397,20 @@ def _find_metric_value(
         if parsed is not None:
             return parsed
     return None
+
+
+def _query_requires_rsi_oversold(query: str) -> bool:
+    lowered = query.lower()
+    return "rsi" in lowered and ("30" in lowered or "과매도" in query)
+
+
+def _has_rsi_oversold_entry(price_rows: list[dict[str, Any]]) -> bool:
+    for row in price_rows:
+        for key in RSI_KEYS:
+            value = _optional_float_value(row.get(_metric_key(key)))
+            if value is not None and value <= RSI_OVERSOLD_THRESHOLD:
+                return True
+    return False
 
 
 def _metric_key(value: str) -> str:
