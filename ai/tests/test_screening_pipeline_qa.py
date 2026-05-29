@@ -11,8 +11,21 @@ from screening_pipeline_test_support import (
 )
 
 
-def test_bollinger_lower_reentry_qa_detects_rsi_only_semantic_drift() -> None:
+def test_bollinger_lower_reentry_qa_passes_when_required_slots_survive() -> None:
     envelope = run_analysis(BOLLINGER_LOWER_REENTRY_PROMPT, trace_id="screen-bollinger-lower")
+
+    verdict = evaluate_bollinger_lower_reentry(envelope)
+
+    assert envelope.status == EnvelopeStatus.READY
+    assert verdict["verdict"] == "pass"
+    assert verdict["failure_cause"] is None
+    assert any("bollinger" in indicator for indicator in verdict["semantic_slots"]["indicator"])
+    assert "lower_band_reentry" in verdict["semantic_slots"]["event"]
+    assert "close" in verdict["semantic_slots"]["price_basis"]
+
+
+def test_bollinger_lower_reentry_qa_detects_rsi_only_semantic_drift() -> None:
+    envelope = run_analysis("RSI 과매도 반등 KOSPI200 종목을 찾아줘", trace_id="screen-rsi-only")
 
     verdict = evaluate_bollinger_lower_reentry(envelope)
 
