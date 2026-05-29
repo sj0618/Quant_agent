@@ -215,7 +215,9 @@ def test_failed_analysis_job_returns_error_contract() -> None:
     assert response.status_code == 201
     failed_job = response.json()
     assert failed_job["result"]["status"] == "failed"
-    assert failed_job["result"]["user_payload"]["message"].startswith("runner failed")
+    assert failed_job["result"]["failure_cause"]["subcause"] == "unknown"
+    assert "runner failed" not in failed_job["result"]["user_payload"]["message"]
+    assert failed_job["result"]["debug_ref"].startswith("job-error:")
     assert failed_job["stages"][-1]["status"] == "failed"
 
 

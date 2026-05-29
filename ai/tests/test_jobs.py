@@ -72,7 +72,9 @@ def test_in_memory_job_store_failure_contract_includes_error_envelope() -> None:
     assert failed.fallback_reasons == ["fixture fallback"]
     assert failed.result is not None
     assert failed.result.status == EnvelopeStatus.FAILED
-    assert failed.result.user_payload.message == "execution failed"
+    assert failed.result.failure_cause is not None
+    assert failed.result.failure_cause.subcause == "unknown"
+    assert failed.result.user_payload.message != "execution failed"
 
 
 def test_job_store_factory_defaults_to_memory_without_env() -> None:
