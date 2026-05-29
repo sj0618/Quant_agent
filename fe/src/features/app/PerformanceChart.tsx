@@ -4,6 +4,7 @@ interface PerformanceChartProps {
   points: EquityPoint[];
   height?: number;
   mode?: "compact" | "full";
+  series?: Array<keyof Pick<EquityPoint, "strategy" | "original" | "benchmark">>;
 }
 
 const WIDTH = 960;
@@ -19,21 +20,21 @@ function buildPolyline(points: EquityPoint[], key: keyof Pick<EquityPoint, "stra
   return points.map((point, index) => `${PADDING + index * xStep},${scaleY(Number(point[key]))}`).join(" ");
 }
 
-export function PerformanceChart({ points, height = 240, mode = "compact" }: PerformanceChartProps) {
+export function PerformanceChart({ points, height = 240, mode = "compact", series = ["benchmark", "original", "strategy"] }: PerformanceChartProps) {
   return (
     <div className={`performance-chart performance-chart--${mode}`}>
       <svg aria-label="누적 수익률 차트" preserveAspectRatio="none" viewBox={`0 0 ${WIDTH} ${height}`}>
         {[0.25, 0.5, 0.75].map((ratio) => (
           <line className="performance-chart__grid" key={ratio} x1={PADDING} x2={WIDTH - PADDING} y1={height * ratio} y2={height * ratio} />
         ))}
-        <polyline className="performance-chart__line performance-chart__line--benchmark" points={buildPolyline(points, "benchmark", height)} />
-        <polyline className="performance-chart__line performance-chart__line--original" points={buildPolyline(points, "original", height)} />
-        <polyline className="performance-chart__line performance-chart__line--strategy" points={buildPolyline(points, "strategy", height)} />
+        {series.includes("benchmark") ? <polyline className="performance-chart__line performance-chart__line--benchmark" points={buildPolyline(points, "benchmark", height)} /> : null}
+        {series.includes("original") ? <polyline className="performance-chart__line performance-chart__line--original" points={buildPolyline(points, "original", height)} /> : null}
+        {series.includes("strategy") ? <polyline className="performance-chart__line performance-chart__line--strategy" points={buildPolyline(points, "strategy", height)} /> : null}
         <circle cx={WIDTH - PADDING} cy={height * 0.18} r="7" className="performance-chart__point" />
       </svg>
       <div className="performance-chart__axis">
-        {points.map((point) => (
-          <span key={point.date}>{point.date}</span>
+        {points.map((point, index) => (
+          <span key={`${point.date}-${index}`}>{point.date}</span>
         ))}
       </div>
     </div>

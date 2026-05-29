@@ -14,7 +14,6 @@ from backtest_module.backtest import (
     TalibIndicatorConfig,
     build_sample_spec,
     build_sample_talib_spec,
-    compute_talib_metrics_for_bars,
     required_metric_names,
     run_backtest,
     talib_function_catalog,

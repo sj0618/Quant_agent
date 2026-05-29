@@ -1,5 +1,6 @@
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
+import { ROUTES } from "../../config/routes";
 import type { AppOverview } from "../../types/quantagent";
 import { PerformanceChart } from "./PerformanceChart";
 import { SignalCard } from "./SignalCard";
@@ -8,8 +9,22 @@ interface OverviewTabProps {
   overview: AppOverview;
 }
 
+const CHART_INITIAL_ASSET = 1_000_000;
+const PERCENT_SCALE = 100;
+const PERCENT_DIGITS = 2;
+
 export function OverviewTab({ overview }: OverviewTabProps) {
   const featuredCandidates = overview.candidates.slice(0, 4);
+  const strategyName = overview.strategy.name ?? "활성 전략";
+  const totalReturnMetric = metricByKey(overview, "totalReturn");
+  const sharpeMetric = metricByKey(overview, "sharpe");
+  const maxDrawdownMetric = metricByKey(overview, "mdd");
+  const chartPoints = overview.performance.equityCurve.slice(-5);
+  const latestPoint = chartPoints[chartPoints.length - 1];
+  const strategyReturn = latestPoint?.strategy ?? 0;
+  const benchmarkReturn = latestPoint?.benchmark ?? 0;
+  const currentAsset = CHART_INITIAL_ASSET * (1 + strategyReturn / PERCENT_SCALE);
+  const benchmarkLabel = overview.performance.benchmarkLabel ?? "KOSPI200";
 
   return (
     <div className="workspace-content">
@@ -19,7 +34,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
             <Badge variant="dark">ACTIVE</Badge>
             <span>STRATEGY</span>
           </div>
-          <strong>반도체 모멘텀 + 기관 매수 회귀</strong>
+          <strong>{strategyName}</strong>
         </div>
         <dl>
           <div>
@@ -35,18 +50,24 @@ export function OverviewTab({ overview }: OverviewTabProps) {
             <dd>{overview.strategy.drop_condition}</dd>
           </div>
         </dl>
-        <div className="strategy-strip__actions">
-          <button type="button">전략 수정</button>
-          <button type="button">비활성화</button>
-        </div>
       </Card>
 
       <section className="summary-grid">
         {[
           { label: "오늘의 권장도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "평균 7.2 대비 상승" },
           { label: "활성 신호", value: `${overview.passCount}건`, delta: undefined, caption: `BUY ${overview.buyCount} · HOLD ${overview.holdCount} · DROP ${overview.dropCount}` },
-          { label: "30일 누적 수익률", value: "+8.4%", delta: "+1.2pp", caption: "KOSPI200 +3.1% 대비 알파" },
-          { label: "Sharpe (Walk-forward)", value: "1.42", delta: undefined, caption: "원본 1.11 대비 개선본" },
+          {
+            label: "검증 누적 수익률",
+            value: totalReturnMetric?.value ?? formatPercentValue(strategyReturn),
+            delta: totalReturnMetric?.delta,
+            caption: totalReturnMetric?.caption ?? `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`,
+          },
+          {
+            label: "Sharpe (Walk-forward)",
+            value: sharpeMetric?.value ?? "-",
+            delta: sharpeMetric?.delta,
+            caption: sharpeMetric?.caption ?? "AI 전략 검증 결과",
+          },
         ].map((item) => (
           <Card className="summary-card" key={item.label}>
             <div>
@@ -76,7 +97,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
           {featuredCandidates.map((candidate) => (
             <SignalCard candidate={candidate} compact key={candidate.id} />
           ))}
-          <div className="card-foot">신호는 매일 08:00 자동 갱신됩니다 <a href="/app?tab=trading">전체 종목 정보 보기 →</a></div>
+          <div className="card-foot">신호는 매일 08:00 자동 갱신됩니다 <a href={`${ROUTES.app}?tab=trading`}>전체 종목 정보 보기 →</a></div>
         </Card>
 
         <Card className="recent-reports" padded={false}>
@@ -87,7 +108,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
             </div>
           </div>
           {overview.recentReports.map((report) => (
-            <a className="recent-report-row" href={`/reports/${report.id}`} key={report.id}>
+            <a className="recent-report-row" href={ROUTES.reportDetail(report.id)} key={report.id}>
               <span>
                 <strong>{report.date.replace("2026.", "")}</strong>
                 <small>{report.weekday}</small>
@@ -100,7 +121,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
               <strong>{report.recommendationScore}</strong>
             </a>
           ))}
-          <div className="card-foot"><a href="/reports">전체 리포트 보기 →</a></div>
+          <div className="card-foot"><a href={ROUTES.reports}>전체 리포트 보기 →</a></div>
         </Card>
       </div>
 
@@ -112,22 +133,44 @@ export function OverviewTab({ overview }: OverviewTabProps) {
           </div>
           <div className="legend-row">
             <span><i className="line line--strategy" />내 전략</span>
-            <span><i className="line line--benchmark" />KOSPI200</span>
+            <span><i className="line line--benchmark" />{benchmarkLabel}</span>
             <Badge variant="soft">1Y</Badge>
           </div>
         </div>
         <div className="chart-card__numbers">
           <div>
             <span>현재 자산</span>
-            <strong>₩ 1,084,200</strong>
-            <em>+8.42%</em>
+            <strong>{formatCurrency(currentAsset)}</strong>
+            <em>{formatPercentValue(strategyReturn)}</em>
           </div>
-          <div><span>초기 자산 (1y)</span><strong>₩ 1,000,000</strong></div>
-          <div><span>벤치마크 대비 알파</span><strong>+5.32%p</strong></div>
-          <div><span>최대 낙폭</span><strong>-4.82%</strong></div>
+          <div><span>초기 자산</span><strong>{formatCurrency(CHART_INITIAL_ASSET)}</strong></div>
+          <div><span>{benchmarkLabel} 대비</span><strong>{formatPercentPoint(strategyReturn - benchmarkReturn)}</strong></div>
+          <div><span>최대 낙폭</span><strong>{maxDrawdownMetric?.value ?? "-"}</strong></div>
         </div>
-        <PerformanceChart points={overview.performance.equityCurve.slice(-5)} />
+        <PerformanceChart points={chartPoints} />
       </Card>
     </div>
   );
+}
+
+function metricByKey(overview: AppOverview, key: string) {
+  return overview.performance.metrics.find((metric) => metric.key === key);
+}
+
+function formatCurrency(value: number) {
+  return new Intl.NumberFormat("ko-KR", {
+    style: "currency",
+    currency: "KRW",
+    maximumFractionDigits: 0,
+  }).format(value);
+}
+
+function formatPercentValue(value: number) {
+  const prefix = value > 0 ? "+" : "";
+  return `${prefix}${value.toFixed(PERCENT_DIGITS)}%`;
+}
+
+function formatPercentPoint(value: number) {
+  const prefix = value >= 0 ? "+" : "";
+  return `${prefix}${value.toFixed(PERCENT_DIGITS)}%p`;
 }

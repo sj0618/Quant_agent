@@ -8,6 +8,7 @@ import type {
 } from "../types/quantagent";
 
 export const activeStrategySpec: StrategySpec = {
+  name: "반도체 모멘텀 + 기관 매수 회귀",
   natural_language_strategy: "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
   universe: "KOSPI200 · 반도체",
   sector: "반도체",

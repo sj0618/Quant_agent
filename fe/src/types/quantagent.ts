@@ -1,5 +1,9 @@
 export type AIEnvelopeStatus = "ready" | "need_clarification" | "rejected" | "failed";
 
+export type AIJobStage = "interpreting" | "code_generation" | "backtest" | "debate" | "finalizing";
+
+export type AIJobStageStatus = "queued" | "running" | "succeeded" | "failed";
+
 export type AnalysisStage =
   | "strategy_parse"
   | "data_collect"
@@ -10,11 +14,13 @@ export type AnalysisStage =
 
 export type StageStatus = "ready" | "running" | "done" | "blocked" | "failed";
 
+export type WorkspaceAnalysisStatus = AIEnvelopeStatus | "running";
+
 export type SignalType = "BUY" | "HOLD" | "DROP";
 
 export type Tone = "positive" | "warning" | "negative" | "neutral" | "info";
 
-export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec> {
+export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec | null> {
   status: AIEnvelopeStatus;
   trace_id: string;
   schema_version: string;
@@ -25,6 +31,7 @@ export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec
 }
 
 export interface StrategySpec {
+  name?: string;
   natural_language_strategy: string;
   universe: string;
   sector: string;
@@ -35,9 +42,115 @@ export interface StrategySpec {
   constraints: string[];
 }
 
+export interface AICondition {
+  left: string;
+  operator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne" | "between" | "cross_above" | "cross_below";
+  right: number | string | number[];
+  description?: string | null;
+}
+
+export interface AIStrategySpec {
+  strategy_id: string;
+  name: string;
+  universe: string;
+  market: string;
+  timeframe: string;
+  entry_conditions: AICondition[];
+  exit_conditions: AICondition[];
+  indicators: string[];
+  risk_constraints: Record<string, number | string | boolean>;
+  assumptions: string[];
+  source_refs: string[];
+  confidence: number;
+}
+
+export interface StrategyCandidateCard {
+  strategy_id: string;
+  title: string;
+  summary: string;
+  key_conditions: string[];
+  confidence: number;
+  reason?: string | null;
+}
+
+export interface AIClarificationOption {
+  label: string;
+  reason: string;
+}
+
+export interface AIReportProjection {
+  title: string;
+  summary: string;
+  sections: Array<Record<string, unknown>>;
+}
+
+export interface AIRiskAdjustment {
+  before: SignalType;
+  after: SignalType;
+  rule: string;
+  reason: string;
+}
+
+export interface AIReportBundle {
+  web_projection: AIReportProjection;
+  email_projection: AIReportProjection;
+  risk_adjustments: AIRiskAdjustment[];
+}
+
+export interface AIBacktestMetrics {
+  sharpe_ratio: number;
+  max_drawdown: number;
+  win_rate: number;
+  total_return: number;
+  in_sample_sharpe: number;
+  out_sample_sharpe: number;
+  degradation: number;
+}
+
+export interface AIBacktestEquityPoint {
+  date: string;
+  cumulative_return: number;
+}
+
+export interface AIBacktestPerformance {
+  selected_variant: "A" | "B";
+  selected_candidate_id: string;
+  metrics_by_variant: Record<"A" | "B", AIBacktestMetrics>;
+  equity_curve_by_variant: Record<"A" | "B", AIBacktestEquityPoint[]>;
+}
+
+export interface AIUserPayload {
+  headline: string;
+  message: string;
+  next_actions: string[];
+  candidate_cards: StrategyCandidateCard[];
+  report: AIReportBundle | null;
+  performance?: AIBacktestPerformance | null;
+  question?: string | null;
+  options?: AIClarificationOption[];
+  recommended?: number | null;
+}
+
+export interface AIStageProgress {
+  stage: AIJobStage;
+  status: AIJobStageStatus;
+  updated_at: string;
+  message?: string | null;
+}
+
+export interface AnalysisJob {
+  job_id: string;
+  trace_id: string;
+  query: string;
+  created_at: string;
+  updated_at: string;
+  stages: AIStageProgress[];
+  result: AIEnvelope<AIUserPayload, AIStrategySpec | null> | null;
+}
+
 export interface AnalysisJobStatus {
   trace_id: string;
-  status: AIEnvelopeStatus;
+  status: WorkspaceAnalysisStatus;
   stages: Array<{
     stage: AnalysisStage;
     status: StageStatus;
@@ -104,6 +217,7 @@ export interface MacroEvent {
 export interface PerformanceSummary {
   headline: string;
   period: string;
+  benchmarkLabel?: string;
   metrics: BacktestMetric[];
   equityCurve: EquityPoint[];
   comparison: ABComparisonRow[];
@@ -118,6 +232,20 @@ export interface ChatMessage {
   time: string;
   body: string;
   stats?: Array<{ label: string; value: string }>;
+  candidateCards?: StrategyCandidateCard[];
+  clarification?: {
+    question: string;
+    options: AIClarificationOption[];
+    recommended?: number | null;
+  };
+}
+
+export interface ChatConversationPreview {
+  id: string;
+  title: string;
+  updatedAt: string;
+  status: WorkspaceAnalysisStatus;
+  messages: ChatMessage[];
 }
 
 export interface AppOverview {
@@ -134,7 +262,7 @@ export interface AppOverview {
   candidates: TradingCandidate[];
   performance: PerformanceSummary;
   recentReports: ReportSummary[];
-  envelope: AIEnvelope<{ active_tab: "overview" }>;
+  envelope: AIEnvelope<{ active_tab: "overview" } | AIUserPayload, StrategySpec | AIStrategySpec | null>;
   jobStatus: AnalysisJobStatus;
 }
 

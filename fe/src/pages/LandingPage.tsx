@@ -1,13 +1,17 @@
+import { useState } from "react";
 import { AsyncState } from "../components/common/AsyncState";
 import { Badge } from "../components/common/Badge";
 import { Button } from "../components/common/Button";
 import { Card } from "../components/common/Card";
 import { Footer } from "../components/layout/Footer";
 import { getLandingSample } from "../api/quantAgentClient";
+import { ROUTES, withReturnTo } from "../config/routes";
 import { useAsyncData } from "../hooks/useAsyncData";
 
 export function LandingPage() {
   const { data, loading, error } = useAsyncData(getLandingSample, []);
+  const [openFaqIndex, setOpenFaqIndex] = useState(0);
+  const loginHref = withReturnTo(ROUTES.login, ROUTES.app);
 
   if (loading) {
     return <AsyncState title="랜딩 데이터를 불러오는 중입니다" tone="loading" />;
@@ -20,7 +24,7 @@ export function LandingPage() {
   return (
     <main className="landing-page">
       <nav className="landing-nav">
-        <a className="brand" href="/">
+        <a className="brand" href={ROUTES.home}>
           <span className="brand__mark" />
           <span>QuantAgent</span>
         </a>
@@ -31,8 +35,8 @@ export function LandingPage() {
           <a href="#faq">FAQ</a>
         </div>
         <div>
-          <a href="/app">로그인</a>
-          <Button onClick={() => window.location.assign("/app")} variant="dark">Google로 시작</Button>
+          <a href={loginHref}>로그인</a>
+          <Button onClick={() => window.location.assign(loginHref)} variant="dark">Google로 시작</Button>
         </div>
       </nav>
 
@@ -48,8 +52,8 @@ export function LandingPage() {
           KOSPI200 추천 종목을 보내드립니다.
         </p>
         <div className="hero__actions">
-          <Button onClick={() => window.location.assign("/app")} variant="primary">Google 계정으로 시작하기 →</Button>
-          <Button onClick={() => window.location.assign("/reports/2026-04-18")} variant="ghost">▷ 샘플 리포트 보기</Button>
+          <Button onClick={() => window.location.assign(loginHref)} variant="primary">Google 계정으로 시작하기 →</Button>
+          <Button onClick={() => window.location.assign(ROUTES.reportDetail("2026-04-18"))} variant="ghost">▷ 샘플 리포트 보기</Button>
         </div>
         <small>무료 · 가입 30초 · 신용카드 등록 없음</small>
         <div className="hero__stats">
@@ -103,7 +107,7 @@ export function LandingPage() {
               </span>
             ))}
           </div>
-          <a href="/reports/2026-04-18">샘플 리포트 자세히 보기 →</a>
+          <a href={ROUTES.reportDetail("2026-04-18")}>샘플 리포트 자세히 보기 →</a>
         </Card>
       </section>
 
@@ -148,10 +152,17 @@ export function LandingPage() {
           {data.faqs.map((faq, index) => (
             <Card key={faq.question} padded={false}>
               <div className="faq-question">
-                <strong>{faq.question}</strong>
-                <span>{index === 0 ? "−" : "+"}</span>
+                <button
+                  aria-controls={`faq-answer-${index}`}
+                  aria-expanded={openFaqIndex === index}
+                  onClick={() => setOpenFaqIndex((current) => (current === index ? -1 : index))}
+                  type="button"
+                >
+                  <strong>{faq.question}</strong>
+                  <span>{openFaqIndex === index ? "−" : "+"}</span>
+                </button>
               </div>
-              {faq.answer ? <p>{faq.answer}</p> : null}
+              {openFaqIndex === index ? <p id={`faq-answer-${index}`}>{faq.answer}</p> : null}
             </Card>
           ))}
         </div>
@@ -164,7 +175,7 @@ export function LandingPage() {
           데이터 기반 추천을 받아보세요
         </h2>
         <p>가입은 Google 로그인 30초로 끝. 신용카드도, 자산 정보도 필요 없습니다.</p>
-        <Button onClick={() => window.location.assign("/app")} variant="primary">Google 계정으로 시작하기 →</Button>
+        <Button onClick={() => window.location.assign(loginHref)} variant="primary">Google 계정으로 시작하기 →</Button>
       </section>
       <Footer />
     </main>

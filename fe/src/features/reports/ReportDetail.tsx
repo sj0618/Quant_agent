@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
+import { ROUTES } from "../../config/routes";
 import type { ReportDetail as ReportDetailType, SignalType } from "../../types/quantagent";
 import { SignalCard } from "../app/SignalCard";
 
@@ -118,8 +119,8 @@ export function ReportDetail({ report }: ReportDetailProps) {
             <span>환율 변동성이 확대되는 구간입니다. 추가 매수는 분할 진입을 권장합니다.</span>
           </div>
           <div className="report-cta-row">
-            <a href="/app">워크스페이스에서 상세 보기 →</a>
-            <button type="button">전략 수정하기</button>
+            <a href={ROUTES.app}>워크스페이스에서 상세 보기 →</a>
+            <a href={ROUTES.app}>채팅으로 전략 수정</a>
           </div>
         </Section>
 
@@ -131,8 +132,8 @@ export function ReportDetail({ report }: ReportDetailProps) {
             ))}
           </ul>
           <div>
-            <a href="/">수신 거부</a>
-            <a href="/">수신 정책</a>
+            <a href={ROUTES.unsubscribe}>수신 거부</a>
+            <a href={ROUTES.notifications}>수신 정책</a>
             <span>© 2026 QuantAgent</span>
           </div>
         </section>
