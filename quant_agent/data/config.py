@@ -327,7 +327,7 @@ class DartConfig:
     def from_env(cls) -> "DartConfig":
         return cls(
             base_url=(_env("DART_BASE_URL", DEFAULT_DART_BASE_URL) or DEFAULT_DART_BASE_URL).rstrip("/"),
-            api_key=_env("DART_API_KEY") or _env("OPENDART_API_KEY"),
+            api_key=_env("DART_API_KEY") or _env("OPENDART_API_KEY") or _env("FSS_API_KEY"),
             request_timeout_seconds=_env_int("API_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS),
             retry=RetryConfig.from_env(),
         )

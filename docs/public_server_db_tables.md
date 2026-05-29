@@ -20,6 +20,8 @@
 
 | 목적 | 우선 객체 | 상태 |
 |---|---|---|
+| MVP 보통주 백테스트 입력 | `mart.common_stock_feature_frame_asof` | 공용 서버 DB에 생성 완료. |
+| 날짜별 보통주 universe | `mart.common_stock_universe_asof` | 공용 서버 DB에 생성 완료. |
 | 수정주가 백테스트 입력 | `mart.kis_adjusted_feature_frame_asof` | 정상 조회 가능함. |
 | 일반 조정 OHLCV 백테스트 입력 | `mart.symbol_feature_frame_asof` | 정상 조회 가능함. |
 | 투자 가능 universe | `mart.full_universe_asof` | 정상 조회 가능함. |
@@ -406,29 +408,10 @@ WHERE sm.security_type = '보통주';
 | 용도 | MVP 백테스트 기본 feature frame. `mart.kis_adjusted_feature_frame_asof`에서 보통주만 남긴 view. |
 | 포함 universe | **보통주만 포함** |
 | 가격 소스 | KIS 공식 수정주가(`adjusted_price_method = 'kis_official_adjusted'`) |
-| 상태 | 서버 DB에 추가 예정/추가 후 백테스트 기본 조회 대상. |
+| 상태 | 공용 서버 DB에 생성 완료. MVP 백테스트 기본 조회 대상. |
 | 컬럼 | `mart.kis_adjusted_feature_frame_asof`와 동일 |
 
-권장 view 정의:
-
-```sql
-CREATE OR REPLACE VIEW mart.common_stock_feature_frame_asof AS
-SELECT f.*
-FROM mart.kis_adjusted_feature_frame_asof f
-JOIN core.symbol_master sm
-  ON sm.symbol = f.symbol
-WHERE sm.security_type = '보통주'
-  AND (sm.listed_at IS NULL OR f.as_of_date >= sm.listed_at)
-  AND (sm.delisted_at IS NULL OR f.as_of_date <= sm.delisted_at);
-```
-
 MVP 백테스트/팩터 엔진은 기본적으로 이 view를 사용한다.
-
-```sql
-SELECT *
-FROM mart.common_stock_feature_frame_asof
-WHERE as_of_date BETWEEN DATE '2020-01-01' AND DATE '2024-12-31';
-```
 
 ### `mart.common_stock_universe_asof`
 
@@ -437,38 +420,10 @@ WHERE as_of_date BETWEEN DATE '2020-01-01' AND DATE '2024-12-31';
 | 용도 | MVP 날짜별 투자 가능 보통주 universe view. |
 | 포함 universe | **보통주만 포함** |
 | 가격 소스 | `mart.kis_adjusted_feature_frame_asof`에 존재하는 날짜/종목만 universe로 인정 |
-| 상태 | 서버 DB에 추가 후 universe 조회 기본 대상. |
+| 상태 | 공용 서버 DB에 생성 완료. 보통주 universe 조회 기본 대상. |
 | 컬럼 | `as_of_date date`, `symbol_id bigint`, `symbol text`, `name text`, `market_segment text`, `security_type text`, `listing_status text`, `listed_at date`, `delisted_at date` |
 
-권장 view 정의:
-
-```sql
-CREATE OR REPLACE VIEW mart.common_stock_universe_asof AS
-SELECT DISTINCT
-    f.as_of_date,
-    sm.symbol_id,
-    f.symbol,
-    sm.name,
-    sm.market_segment,
-    sm.security_type,
-    sm.listing_status,
-    sm.listed_at,
-    sm.delisted_at
-FROM mart.kis_adjusted_feature_frame_asof f
-JOIN core.symbol_master sm
-  ON sm.symbol = f.symbol
-WHERE sm.security_type = '보통주'
-  AND (sm.listed_at IS NULL OR f.as_of_date >= sm.listed_at)
-  AND (sm.delisted_at IS NULL OR f.as_of_date <= sm.delisted_at);
-```
-
 보통주 universe만 필요하면 이 view를 조회한다.
-
-```sql
-SELECT *
-FROM mart.common_stock_universe_asof
-WHERE as_of_date = DATE '2026-05-20';
-```
 
 ### `mart.full_universe_asof`
 

@@ -20,13 +20,32 @@ except ImportError:  # pragma: no cover
     task = None
 
 
-DEFAULT_DAILY_SCHEDULE = os.getenv("QUANT_AIRFLOW_DAILY_SCHEDULE", "30 18 * * 1-5")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_airflow_dotenv() -> None:
+    if os.getenv("QUANT_AIRFLOW_LOAD_DOTENV", "true").lower() in {"0", "false", "no", "off"}:
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # pragma: no cover - python-dotenv is a runtime dependency in this repo.
+        return
+    dotenv_path = Path(os.getenv("QUANT_AIRFLOW_DOTENV_PATH", str(REPO_ROOT / ".env")))
+    load_dotenv(dotenv_path=dotenv_path, override=False)
+
+
+_load_airflow_dotenv()
+
+DEFAULT_DAILY_SCHEDULE = os.getenv("QUANT_AIRFLOW_DAILY_SCHEDULE", "0 4 * * *")
 DEFAULT_BACKFILL_SCHEDULE = os.getenv("QUANT_AIRFLOW_BACKFILL_SCHEDULE", None)
 DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE", "2026-01-01T00:00:00"))
 DEFAULT_TA_WARMUP_DAYS = int(os.getenv("QUANT_AIRFLOW_TA_WARMUP_DAYS", "365"))
-REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_EXTERNAL_LOOKBACK_DAYS = int(os.getenv("QUANT_AIRFLOW_EXTERNAL_LOOKBACK_DAYS", "7"))
 KIS_ADJUSTED_INGEST_SCRIPT = Path(
     os.getenv("QUANT_AIRFLOW_KIS_ADJUSTED_INGEST_SCRIPT", str(REPO_ROOT / "scripts" / "ingest_kis_adjusted_ohlcv.py"))
+)
+DART_BOK_INGEST_SCRIPT = Path(
+    os.getenv("QUANT_AIRFLOW_DART_BOK_INGEST_SCRIPT", str(REPO_ROOT / "scripts" / "ingest_dart_bok_history.py"))
 )
 TA_PIPELINE_SCRIPT = Path(
     os.getenv("QUANT_AIRFLOW_TA_PIPELINE_SCRIPT", str(REPO_ROOT / "scripts" / "compute_technical_indicators_pipeline.py"))
@@ -53,7 +72,7 @@ if dag and task:  # pragma: no branch
         start_date=DEFAULT_START_DATE,
         catchup=False,
         max_active_runs=1,
-        default_args={"retries": int(os.getenv("QUANT_AIRFLOW_RETRIES", "2")), "retry_delay": timedelta(minutes=5)},
+        default_args={"retries": int(os.getenv("QUANT_AIRFLOW_RETRIES", "3")), "retry_delay": timedelta(minutes=5)},
         tags=["quant-agent", "data-engineering"],
     )
     def daily_data_engineering():
@@ -112,32 +131,29 @@ if dag and task:  # pragma: no branch
 
         @task(task_id="ingest_bok_daily")
         def ingest_bok_daily(logical_date: str | None = None) -> dict:
-            from quant_agent.data.external import ExternalDataIngestionService
-
-            series_configs = _json_env("BOK_DAILY_SERIES_JSON", [])
-            if not series_configs:
+            if not (os.getenv("BOK_DAILY_SERIES_JSON") or os.getenv("BOK_SERIES_JSON")):
                 _skip("BOK_DAILY_SERIES_JSON is not configured.")
             target_date = _target_date(logical_date)
-            period = target_date.strftime("%Y%m%d")
-            service = ExternalDataIngestionService()
-            written = 0
-            for config in series_configs:
-                written += service.ingest_bok_series(
-                    stat_code=config["stat_code"],
-                    cycle=config.get("cycle", "D"),
-                    start_period=config.get("start_period", period),
-                    end_period=config.get("end_period", period),
-                    item_code1=config.get("item_code1", "?"),
-                )
-            return {"written": written}
+            return _run_python_script(
+                DART_BOK_INGEST_SCRIPT,
+                _dart_bok_ingest_args(
+                    source="bok",
+                    start_date=_external_ingest_start_date(target_date),
+                    end_date=target_date,
+                ),
+            )
 
-        @task(task_id="ingest_dart_corp_codes_daily")
-        def ingest_dart_corp_codes_daily() -> dict:
-            from quant_agent.data.external import ExternalDataIngestionService
-
-            if os.getenv("DART_REFRESH_CORP_CODES", "false").lower() != "true":
-                _skip("DART_REFRESH_CORP_CODES is not true.")
-            return {"written": ExternalDataIngestionService().ingest_dart_corp_codes()}
+        @task(task_id="ingest_dart_financials_daily")
+        def ingest_dart_financials_daily(logical_date: str | None = None) -> dict:
+            target_date = _target_date(logical_date)
+            return _run_python_script(
+                DART_BOK_INGEST_SCRIPT,
+                _dart_bok_ingest_args(
+                    source="dart",
+                    start_date=_external_ingest_start_date(target_date),
+                    end_date=target_date,
+                ),
+            )
 
         @task(task_id="ingest_seibro_reports_daily")
         def ingest_seibro_reports_daily(logical_date: str | None = None) -> dict:
@@ -163,13 +179,13 @@ if dag and task:  # pragma: no branch
         computed = compute_ta_indicators_daily()
         qa = run_data_quality_checks_daily()
         bok = ingest_bok_daily()
-        dart = ingest_dart_corp_codes_daily()
+        dart = ingest_dart_financials_daily()
         seibro = ingest_seibro_reports_daily()
         ingested >> [symbol_metadata, kis_adjusted, bok, seibro]
         symbol_metadata >> qa
+        symbol_metadata >> dart
         kis_adjusted >> computed
         computed >> qa
-        # DART corp-code refresh is independent and intentionally has no upstream dependency.
 
     @dag(
         dag_id="quant_agent_backfill_ohlcv_10y",
@@ -178,7 +194,7 @@ if dag and task:  # pragma: no branch
         start_date=DEFAULT_START_DATE,
         catchup=False,
         max_active_runs=1,
-        default_args={"retries": int(os.getenv("QUANT_AIRFLOW_RETRIES", "2")), "retry_delay": timedelta(minutes=10)},
+        default_args={"retries": int(os.getenv("QUANT_AIRFLOW_RETRIES", "3")), "retry_delay": timedelta(minutes=10)},
         tags=["quant-agent", "data-engineering", "backfill"],
     )
     def backfill_ohlcv_10y():
@@ -230,6 +246,10 @@ def _warmup_start_date(target_date: date) -> date:
     return target_date - timedelta(days=DEFAULT_TA_WARMUP_DAYS)
 
 
+def _external_ingest_start_date(target_date: date) -> date:
+    return target_date - timedelta(days=DEFAULT_EXTERNAL_LOOKBACK_DAYS)
+
+
 def _kis_adjusted_ingest_args(*, start_date: date, end_date: date) -> list[str]:
     args = [
         "--start-date",
@@ -274,6 +294,26 @@ def _symbol_metadata_args(*, as_of_date: date) -> list[str]:
         "--as-of-date",
         as_of_date.isoformat(),
     ]
+
+
+def _dart_bok_ingest_args(*, source: str, start_date: date, end_date: date) -> list[str]:
+    args = [
+        "--scope",
+        "custom",
+        "--sources",
+        source,
+        "--start-date",
+        start_date.isoformat(),
+        "--end-date",
+        end_date.isoformat(),
+        "--dag-id",
+        "quant_agent_daily_data_engineering",
+    ]
+    if source == "dart":
+        args.extend(["--dart-period-mode", os.getenv("DART_DAILY_PERIOD_MODE", "filing-window")])
+        if os.getenv("DART_REFRESH_CORP_CODES", "true").lower() not in {"0", "false", "no", "off"}:
+            args.append("--dart-refresh-corp-codes")
+    return args
 
 
 def _run_python_script(script_path: Path, args: list[str]) -> dict:

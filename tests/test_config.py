@@ -62,6 +62,12 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(DartConfig.from_env().is_configured)
             self.assertTrue(SeibroConfig.from_env().collection_approved)
 
+    def test_dart_config_accepts_fss_api_key_alias(self):
+        with EnvGuard({"FSS_API_KEY": "fss"}):
+            config = DartConfig.from_env()
+        self.assertTrue(config.is_configured)
+        self.assertEqual(config.api_key, "fss")
+
 
 class EntrypointSecurityTests(unittest.TestCase):
     def test_main_does_not_load_dotenv(self):

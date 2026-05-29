@@ -22,7 +22,7 @@ class OpenDartClient:
 
     def fetch_corp_codes(self) -> bytes:
         if not self.config.is_configured:
-            raise SourceConfigurationError("DART_API_KEY or OPENDART_API_KEY is required for OpenDART ingestion.")
+            raise SourceConfigurationError("DART_API_KEY, OPENDART_API_KEY, or FSS_API_KEY is required for OpenDART ingestion.")
 
         def request_bytes() -> bytes:
             import requests
@@ -46,7 +46,7 @@ class OpenDartClient:
         fs_div: str = "CFS",
     ) -> RawSourcePayload:
         if not self.config.is_configured:
-            raise SourceConfigurationError("DART_API_KEY or OPENDART_API_KEY is required for OpenDART ingestion.")
+            raise SourceConfigurationError("DART_API_KEY, OPENDART_API_KEY, or FSS_API_KEY is required for OpenDART ingestion.")
         params = {
             "crtfc_key": self.config.api_key,
             "corp_code": corp_code,
