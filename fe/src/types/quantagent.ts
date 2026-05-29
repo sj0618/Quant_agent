@@ -1,5 +1,71 @@
 export type AIEnvelopeStatus = "ready" | "need_clarification" | "rejected" | "failed";
 
+export type AISourceType = "internal_db" | "krx" | "dart" | "aoai_web_search" | "analyst_evidence" | "none";
+export type AIFreshnessStatus = "fresh" | "stale" | "unknown" | "not_time_sensitive";
+
+export interface AISemanticSlots {
+  indicator: string[];
+  threshold: string[];
+  lookback: string[];
+  horizon: string[];
+  price_basis: string[];
+  event: string[];
+  action: string[];
+  universe?: string | null;
+  slot_evidence_refs: string[];
+  missing_slots: string[];
+  contradictions: string[];
+  confidence: number;
+  parse_status: "ready" | "needs_clarification" | "failed";
+  extraction_method: "deterministic_rules" | "json_schema_llm";
+  schema_validation_status: "valid" | "invalid";
+}
+
+export interface AIDataRequirement {
+  family: string;
+  required: boolean;
+  availability: "available" | "derivable" | "partial" | "unavailable" | "outside_owner" | "not_required";
+  owner: "ai_graph" | "data_source_config" | "product_data_gap" | "outside_owner" | "unknown";
+  preferred_source: AISourceType;
+  fallback_sources: AISourceType[];
+  freshness_requirement: string;
+  source_confidence_floor: number;
+  proxy_allowed: boolean;
+  proxy_used: boolean;
+  proxy_disclosure?: Record<string, string> | null;
+  evidence_ref: string;
+}
+
+export interface AISourceUsage {
+  source_type: AISourceType;
+  query: string;
+  retrieved_at: string;
+  source_refs: string[];
+  freshness_status: AIFreshnessStatus;
+  confidence: number;
+  fallback_used: boolean;
+  evidence_refs: string[];
+}
+
+export interface AIFailureDiagnostic {
+  category: string;
+  subcause: string;
+  failure_stage: string;
+  owner: "ai_graph" | "data_source_config" | "fe_state" | "outside_owner" | "product_data_gap" | "unknown";
+  retryable: boolean;
+  safe_message: string;
+  evidence_refs: string[];
+}
+
+export interface AIEvidenceRef {
+  ref_id: string;
+  source_type: AISourceType;
+  stage: string;
+  retrieved_at: string;
+  sanitized_summary: string;
+  confidence: number;
+}
+
 export type AIJobStage = "interpreting" | "code_generation" | "backtest" | "debate" | "finalizing";
 
 export type AIJobStageStatus = "queued" | "running" | "succeeded" | "failed";
@@ -28,6 +94,13 @@ export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec
   strategy_spec: TStrategySpec;
   debug_ref: string;
   retryable: boolean;
+  semantic_slots?: AISemanticSlots | null;
+  data_requirements?: AIDataRequirement[];
+  source_usage?: AISourceUsage[];
+  freshness_status?: AIFreshnessStatus | null;
+  proxy_disclosure?: Record<string, string> | null;
+  failure_cause?: AIFailureDiagnostic | null;
+  evidence_refs?: AIEvidenceRef[];
 }
 
 export interface StrategySpec {

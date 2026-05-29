@@ -10,6 +10,136 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 SCHEMA_VERSION = "ai-mvp.v1"
 
 
+
+
+SemanticParseStatus = Literal["ready", "needs_clarification", "failed"]
+SourceType = Literal["internal_db", "krx", "dart", "aoai_web_search", "analyst_evidence", "none"]
+FreshnessStatus = Literal["fresh", "stale", "unknown", "not_time_sensitive"]
+FailureCategory = Literal[
+    "infrastructure_failure",
+    "semantic_failure",
+    "data_gap",
+    "clarification_failure",
+    "ui_failure",
+    "debug_failure",
+    "unknown_failure",
+]
+FailureSubcause = Literal[
+    "db_connect_timeout",
+    "db_statement_timeout",
+    "semantic_drift",
+    "missing_data_policy_gap",
+    "clarification_quality_gap",
+    "ui_state_stale",
+    "contract_shape_error",
+    "debug_unavailable",
+    "krx_api_error",
+    "dart_api_error",
+    "websearch_unavailable",
+    "source_mapping_gap",
+    "disclosure_mapping_gap",
+    "freshness_gap",
+    "external_source_rate_limited",
+    "parser_low_confidence",
+    "source_conflict",
+    "data_required",
+    "outside_owner",
+    "product_data_gap",
+    "unknown",
+]
+
+
+class EvidenceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref_id: str = Field(min_length=1)
+    source_type: SourceType
+    stage: str = Field(min_length=1)
+    retrieved_at: datetime
+    sanitized_summary: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class SemanticSlots(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    indicator: list[str] = Field(default_factory=list)
+    threshold: list[str] = Field(default_factory=list)
+    lookback: list[str] = Field(default_factory=list)
+    horizon: list[str] = Field(default_factory=list)
+    price_basis: list[str] = Field(default_factory=list)
+    event: list[str] = Field(default_factory=list)
+    action: list[str] = Field(default_factory=list)
+    universe: str | None = None
+    slot_evidence_refs: list[str] = Field(default_factory=list)
+    missing_slots: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
+    parse_status: SemanticParseStatus
+    extraction_method: Literal["deterministic_rules", "json_schema_llm"] = "deterministic_rules"
+    schema_validation_status: Literal["valid", "invalid"] = "valid"
+
+
+class DataRequirement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    family: Literal[
+        "ohlcv_ta",
+        "fundamentals",
+        "consensus_guidance",
+        "ownership_flow",
+        "short_interest",
+        "macro_fx_rates_commodities",
+        "event",
+        "disclosure",
+        "universe",
+        "analyst_evidence",
+    ]
+    required: bool = True
+    availability: Literal["available", "derivable", "partial", "unavailable", "outside_owner", "not_required"]
+    owner: Literal["ai_graph", "data_source_config", "product_data_gap", "outside_owner", "unknown"]
+    preferred_source: SourceType
+    fallback_sources: list[SourceType] = Field(default_factory=list)
+    freshness_requirement: Literal[
+        "same_trading_day",
+        "latest_filing",
+        "recent_news",
+        "report_period",
+        "as_of_date",
+        "not_time_sensitive",
+    ]
+    source_confidence_floor: float = Field(default=0.0, ge=0.0, le=1.0)
+    proxy_allowed: bool = False
+    proxy_used: bool = False
+    proxy_disclosure: dict[str, str] | None = None
+    evidence_ref: str = Field(min_length=1)
+
+
+class SourceUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_type: SourceType
+    query: str = Field(min_length=1)
+    retrieved_at: datetime
+    source_refs: list[str] = Field(default_factory=list)
+    freshness_status: FreshnessStatus
+    confidence: float = Field(ge=0.0, le=1.0)
+    fallback_used: bool = False
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class FailureDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: FailureCategory
+    subcause: FailureSubcause
+    failure_stage: str = Field(min_length=1)
+    owner: Literal["ai_graph", "data_source_config", "fe_state", "outside_owner", "product_data_gap", "unknown"]
+    retryable: bool
+    safe_message: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
 class LogicMode(str, Enum):
     ALL = "all"
     ANY = "any"
@@ -276,3 +406,10 @@ class APIEnvelope(BaseModel):
     strategy_spec: StrategySpec | None = None
     debug_ref: str = Field(min_length=1)
     retryable: bool
+    semantic_slots: SemanticSlots | None = None
+    data_requirements: list[DataRequirement] = Field(default_factory=list)
+    source_usage: list[SourceUsage] = Field(default_factory=list)
+    freshness_status: FreshnessStatus | None = None
+    proxy_disclosure: dict[str, str] | None = None
+    failure_cause: FailureDiagnostic | None = None
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list)
