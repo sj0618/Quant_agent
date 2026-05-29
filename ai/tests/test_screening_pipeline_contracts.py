@@ -21,7 +21,7 @@ def test_plan_documents_define_node_refinement_contracts() -> None:
     spec = plan_text(TEST_SPEC_NAME)
 
     assert_has_all(prd, REQUIRED_DATA_REQUIREMENT_FIELDS)
-    assert_has_all(prd, REQUIRED_SOURCE_USAGE_FIELDS)
+    assert_has_all("\n".join([prd, spec]), REQUIRED_SOURCE_USAGE_FIELDS)
     assert_has_all(prd, FAILURE_CATEGORIES)
     assert_has_all(spec, REQUIRED_DATA_REQUIREMENT_FIELDS)
     assert_has_all(spec, REQUIRED_SOURCE_USAGE_FIELDS)

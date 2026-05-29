@@ -76,7 +76,7 @@ ALLOWED_SOURCE_TYPES = {
     "analyst_evidence",
     "manual_or_future_provider",
 }
-BOLLINGER_LOWER_REENTRY_PROMPT = "볼린저 밴드 하단을 이탈했다가 종가가 하단 밴드 위로 재진입한 KOSPI200 종목을 찾아줘"
+BOLLINGER_LOWER_REENTRY_PROMPT = "볼린저 밴드 하단을 이탈했다가 종가가 하단 밴드 위로 재진입하며 반등한 KOSPI200 종목을 찾아줘"
 
 
 def _candidate_plan_roots() -> list[Path]:
