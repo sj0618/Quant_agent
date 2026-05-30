@@ -74,34 +74,55 @@ jobs:
             cd "$APP_DIR/fe"
             npm ci
 
-            stop_from_pidfile() {
-              local pid_file="$1"
-              if [ ! -f "$pid_file" ]; then
-                return 0
-              fi
+            stop_listeners_on_port() {
+              local port="$1"
 
-              local pid
-              pid="$(cat "$pid_file" 2>/dev/null || true)"
-              if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                kill "$pid" 2>/dev/null || true
-                for _ in $(seq 1 10); do
-                  if ! kill -0 "$pid" 2>/dev/null; then
-                    break
+              find_listener_pids_on_port() {
+                local target_port="$1"
+                ss -H -ltnp "sport = :$target_port" 2>/dev/null \
+                  | grep -oE 'pid=[0-9]+' \
+                  | cut -d= -f2 \
+                  | sort -u \
+                  || true
+              }
+
+              for attempt in $(seq 1 5); do
+                local pids
+                pids="$(find_listener_pids_on_port "$port")"
+
+                if [ -z "$pids" ]; then
+                  echo "No listener found on port $port"
+                  return 0
+                fi
+
+                echo "Stopping listener(s) on port $port, attempt $attempt: $pids"
+                for pid in $pids; do
+                  kill "$pid" 2>/dev/null || true
+                done
+
+                for _ in $(seq 1 5); do
+                  if [ -z "$(find_listener_pids_on_port "$port")" ]; then
+                    return 0
                   fi
                   sleep 1
                 done
-                if kill -0 "$pid" 2>/dev/null; then
+
+                pids="$(find_listener_pids_on_port "$port")"
+                echo "Force stopping listener(s) on port $port: $pids"
+                for pid in $pids; do
                   kill -9 "$pid" 2>/dev/null || true
-                fi
-              fi
-              rm -f "$pid_file"
+                done
+                sleep 1
+              done
+
+              echo "Port $port is still occupied after stop attempts"
+              ss -H -ltnp "sport = :$port" 2>/dev/null || true
+              return 1
             }
 
-            stop_from_pidfile "$RUN_DIR/ai.pid"
-            stop_from_pidfile "$RUN_DIR/fe.pid"
-            pkill -f "uvicorn ai_graph.api:app.*--port 8000" 2>/dev/null || true
-            pkill -f "vite.*--port 5173" 2>/dev/null || true
-            pkill -f "node .*vite.*5173" 2>/dev/null || true
+            stop_listeners_on_port 8000
+            stop_listeners_on_port 5173
+            rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/fe.pid"
 
             cd "$APP_DIR/ai"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn ai_graph.api:app \
@@ -121,7 +142,7 @@ jobs:
               local url="$2"
               local log_file="$3"
               for _ in $(seq 1 30); do
-                if curl -fsS "$url" >/dev/null; then
+                if curl -fsS "$url" >/dev/null 2>&1; then
                   echo "$name is ready: $url"
                   return 0
                 fi
