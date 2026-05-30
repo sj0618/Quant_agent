@@ -170,16 +170,19 @@ class CodeCandidate(BaseModel):
     metrics: BacktestMetrics | None = None
 
 
-class ABBacktestResult(BaseModel):
+class CandidateBacktestResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategy_a: StrategySpec
-    strategy_b: StrategySpec
     candidates: list[CodeCandidate] = Field(min_length=1)
     selected_candidate: CodeCandidate
-    metrics_by_variant: dict[str, BacktestMetrics]
-    equity_curve_by_variant: dict[str, list[BacktestEquityPoint]]
+    equity_curve: list[BacktestEquityPoint]
+    engine_summary: dict[str, Any] = Field(default_factory=dict)
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    objective_scores_by_candidate: dict[str, float] = Field(default_factory=dict)
+    backtest_payload: dict[str, Any] = Field(default_factory=dict)
+    feature_coverage: dict[str, Any] = Field(default_factory=dict)
+    fallback_reasons: list[str] = Field(default_factory=list)
 
 
 SignalAction = Literal["BUY", "HOLD", "DROP"]
@@ -231,10 +234,10 @@ class ReportBundle(BaseModel):
 class BacktestPerformance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    selected_variant: Literal["A", "B"]
     selected_candidate_id: str = Field(min_length=1)
-    metrics_by_variant: dict[str, BacktestMetrics]
-    equity_curve_by_variant: dict[str, list[BacktestEquityPoint]]
+    metrics: BacktestMetrics
+    equity_curve: list[BacktestEquityPoint]
+    engine_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class InternalPayload(BaseModel):

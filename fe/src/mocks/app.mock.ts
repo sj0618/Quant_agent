@@ -219,8 +219,8 @@ export const performanceSummary: PerformanceSummary = {
   headline: "백테스트 결과",
   period: "Walk-forward · IS 18M / OOS 3M · 2016.01 ~ 2026.03",
   metrics: [
-    { key: "sharpe", label: "Sharpe Ratio", value: "1.42", delta: "원본 1.11", tone: "positive", caption: "Walk-forward 평균. 1.5 이상이 우수." },
-    { key: "mdd", label: "Max Drawdown", value: "-9.4%", delta: "원본 -12.1%", tone: "negative", caption: "감내 가능한 수준. 시장 평균 -15% 대비 양호." },
+    { key: "sharpe", label: "Sharpe Ratio", value: "1.42", delta: "기준선 1.11", tone: "positive", caption: "Walk-forward 평균. 1.5 이상이 우수." },
+    { key: "mdd", label: "Max Drawdown", value: "-9.4%", delta: "기준선 -12.1%", tone: "negative", caption: "감내 가능한 수준. 시장 평균 -15% 대비 양호." },
     { key: "winRate", label: "Win Rate", value: "58.2%", delta: "+3.4pp", tone: "positive", caption: "수익 거래 비율. 10년 누적 1,247 거래." },
     { key: "totalReturn", label: "Total Return (10y)", value: "+92.4%", delta: "CAGR 6.8%", tone: "positive", caption: "거래비용 반영. KOSPI200 동기간 +54.3%." },
   ],
@@ -233,11 +233,11 @@ export const performanceSummary: PerformanceSummary = {
     { date: "2026", strategy: 92.4, original: 70.1, benchmark: 54.3 },
   ],
   comparison: [
-    { metric: "Sharpe", original: "1.11", improved: "1.42", delta: "+0.31", tone: "positive" },
-    { metric: "MDD", original: "-12.1%", improved: "-9.4%", delta: "+2.7%p", tone: "positive" },
-    { metric: "Win Rate", original: "54.8%", improved: "58.2%", delta: "+3.4%p", tone: "positive" },
-    { metric: "CAGR", original: "5.2%", improved: "6.8%", delta: "+1.6%p", tone: "positive" },
-    { metric: "거래 횟수", original: "1,158회", improved: "1,247회", delta: "+89회", tone: "positive" },
+    { metric: "Sharpe", value: "1.42", context: "리스크 대비 수익", assessment: "양호", tone: "positive" },
+    { metric: "MDD", value: "-9.4%", context: "최대 낙폭", assessment: "방어 양호", tone: "positive" },
+    { metric: "Win Rate", value: "58.2%", context: "수익 거래 비율", assessment: "양호", tone: "positive" },
+    { metric: "Total Return", value: "+92.4%", context: "10년 누적", assessment: "초과수익", tone: "positive" },
+    { metric: "Trades", value: "1,247회", context: "엔진 요약", assessment: "거래 충분", tone: "positive" },
   ],
   macroEvents: [
     { date: "20.03", label: "코로나19 패닉, KOSPI -33%", impact: "+α", tone: "positive" },

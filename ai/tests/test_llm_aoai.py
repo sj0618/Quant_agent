@@ -84,6 +84,41 @@ def test_llm_factory_selects_aoai_when_env_is_configured() -> None:
     assert isinstance(client, AOAIResponsesClient)
 
 
+def test_llm_factory_uses_role_model_override_with_global_endpoint_and_key() -> None:
+    client = create_llm_client(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": (
+                "https://example.test/openai/responses?api-version=2025-04-01-preview"
+            ),
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "fallback-model",
+            "AI_LLM_RESEARCH_JUDGE_MODEL": "research-judge-model",
+        },
+        role="RESEARCH_JUDGE",
+    )
+
+    assert isinstance(client, AOAIResponsesClient)
+    assert client.model == "research-judge-model"
+
+
+def test_llm_factory_falls_back_to_global_model_without_role_override() -> None:
+    client = create_llm_client(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": (
+                "https://example.test/openai/responses?api-version=2025-04-01-preview"
+            ),
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "fallback-model",
+        },
+        role="REPORT_JUDGE",
+    )
+
+    assert isinstance(client, AOAIResponsesClient)
+    assert client.model == "fallback-model"
+
+
 def test_llm_factory_requires_all_aoai_env_values() -> None:
     with pytest.raises(LLMProviderConfigError):
         create_llm_client({"AI_LLM_PROVIDER": "aoai"})

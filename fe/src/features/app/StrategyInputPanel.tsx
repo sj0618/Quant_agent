@@ -127,7 +127,7 @@ export function StrategyInputPanel({
               <small>{message.time}</small>
             </div>
             <p>{message.body}</p>
-            {message.clarification ? (
+            {message.clarification && !message.candidateCards?.length ? (
               <div className="chat-message__clarification">
                 <strong>{message.clarification.question}</strong>
                 <div>

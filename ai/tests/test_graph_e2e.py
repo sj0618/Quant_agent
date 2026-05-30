@@ -29,10 +29,35 @@ def test_ambiguous_value_request_returns_cards() -> None:
 
     assert envelope.status == "need_clarification"
     assert len(envelope.user_payload.candidate_cards) == 3
+    assert envelope.user_payload.candidate_cards[0].strategy_id == "value_quality"
+    assert {card.strategy_id for card in envelope.user_payload.candidate_cards} <= {
+        "value_quality",
+        "dividend_defensive",
+        "reasonable_growth",
+    }
     assert envelope.user_payload.question
     assert len(envelope.user_payload.options) == 3
     assert envelope.user_payload.recommended == 0
     assert envelope.retryable is True
+
+
+def test_clarification_cards_stay_related_to_prompt_family() -> None:
+    dividend = run_analysis("배당주 찾아줘", trace_id="trace-dividend-clarification")
+    growth = run_analysis("성장주 찾아줘", trace_id="trace-growth-clarification")
+
+    assert dividend.status == "need_clarification"
+    assert dividend.user_payload.candidate_cards[0].strategy_id == "dividend_defensive"
+    assert all(
+        "배당" in card.title or "인컴" in card.title or "방어" in card.title
+        for card in dividend.user_payload.candidate_cards
+    )
+
+    assert growth.status == "need_clarification"
+    assert growth.user_payload.candidate_cards[0].strategy_id == "quality_growth"
+    assert all(
+        "성장" in card.title or "퀄리티" in card.title
+        for card in growth.user_payload.candidate_cards
+    )
 
 
 def test_dividend_candidate_selection_does_not_loop_back_to_clarification() -> None:
@@ -40,8 +65,9 @@ def test_dividend_candidate_selection_does_not_loop_back_to_clarification() -> N
         "배당수익률이 4% 이상이고 최근 5년 배당 삭감이 없으며 부채비율이 낮은 배당주를 찾아줘.",
         trace_id="trace-dividend-c1",
     )
-    assert first.status == "need_clarification"
-    assert any(card.strategy_id == "dividend_defensive" for card in first.user_payload.candidate_cards)
+    assert first.status == "ready"
+    assert first.strategy_spec is not None
+    assert first.strategy_spec.strategy_id == "dividend_defensive_a"
 
     selected = run_analysis(
         "후보 확정: strategy_id=dividend_defensive; 배당 방어주. 배당수익률·재무 안정성을 우선하고 "

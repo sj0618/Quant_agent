@@ -7,7 +7,7 @@ from typing import ClassVar, Literal
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
@@ -28,6 +28,7 @@ from ai_graph.jobs import (
     run_job_sync,
 )
 from ai_graph.schemas import SCHEMA_VERSION
+from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
 
 
 API_TITLE = "QuantAgent AI API"
@@ -39,6 +40,10 @@ HEALTH_PATH = "/health"
 API_STATUS_PATH = "/api-status"
 ANALYSIS_JOBS_PATH = "/analysis-jobs"
 ANALYSIS_JOB_DETAIL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}"
+SPEC_STRATEGY_PARSE_PATH = "/api/strategies/parse"
+SPEC_ANALYSIS_JOB_DETAIL_PATH = "/api/analysis-jobs/{job_id}"
+SPEC_BACKTEST_DETAIL_PATH = "/api/backtests/{strategy_id}"
+SPEC_REPORT_DETAIL_PATH = "/api/reports/{report_id}"
 AI_CORS_ALLOW_ORIGINS_ENV = "AI_CORS_ALLOW_ORIGINS"
 CORS_ALLOW_METHODS = ["GET", "POST", "OPTIONS"]
 CORS_ALLOW_HEADERS = ["Authorization", "Content-Type"]
@@ -60,6 +65,28 @@ class CreateAnalysisJobRequest(BaseModel):
     )
 
     query: str = Field(min_length=1)
+
+
+class ParseStrategyRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    natural_language: str | None = Field(default=None, min_length=1)
+    query: str | None = Field(default=None, min_length=1)
+    market: str | None = None
+    universe: str | None = None
+    strategy_id: str | None = None
+    selected_clarification_option_id: str | None = None
+    client_request_id: str | None = None
+
+    @model_validator(mode="after")
+    def require_query_text(self) -> "ParseStrategyRequest":
+        if not self.request_text:
+            raise ValueError("natural_language or query is required")
+        return self
+
+    @property
+    def request_text(self) -> str:
+        return (self.natural_language or self.query or "").strip()
 
 
 class HealthResponse(BaseModel):
@@ -168,6 +195,20 @@ def create_app(
         job = store.create_job(request.query)
         return run_job_sync(store, job.job_id, analysis_runner)
 
+    @app.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        response_model=AnalysisJob,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Spec Compatibility"],
+    )
+    def parse_strategy(request: ParseStrategyRequest) -> AnalysisJob:
+        job = store.create_job(
+            request.request_text,
+            strategy_id=request.strategy_id,
+            run_id=request.client_request_id,
+        )
+        return run_job_sync(store, job.job_id, analysis_runner)
+
     @app.get(
         ANALYSIS_JOB_DETAIL_PATH,
         response_model=AnalysisJob,
@@ -181,6 +222,44 @@ def create_app(
                 detail="analysis job not found",
             )
         return job
+
+    @app.get(
+        SPEC_ANALYSIS_JOB_DETAIL_PATH,
+        response_model=AnalysisJob,
+        tags=["Spec Compatibility"],
+    )
+    def get_spec_analysis_job(job_id: str) -> AnalysisJob:
+        return get_analysis_job(job_id)
+
+    @app.get(
+        SPEC_BACKTEST_DETAIL_PATH,
+        response_model=APIEnvelope,
+        tags=["Spec Compatibility"],
+    )
+    def get_backtest(strategy_id: str) -> APIEnvelope:
+        job = _find_job_by_strategy(store, strategy_id)
+        if job and job.result and job.result.user_payload.performance is not None:
+            return job.result
+        return _not_found_envelope(
+            resource_type="backtest",
+            resource_id=strategy_id,
+            message="No completed analysis job with backtest performance was found.",
+        )
+
+    @app.get(
+        SPEC_REPORT_DETAIL_PATH,
+        response_model=APIEnvelope,
+        tags=["Spec Compatibility"],
+    )
+    def get_report(report_id: str) -> APIEnvelope:
+        job = store.get_job(report_id) or _find_job_by_trace_or_debug_ref(store, report_id)
+        if job and job.result and job.result.user_payload.report is not None:
+            return job.result
+        return _not_found_envelope(
+            resource_type="report",
+            resource_id=report_id,
+            message="No completed analysis job with report projection was found.",
+        )
 
     return app
 
@@ -210,6 +289,30 @@ def _endpoint_statuses() -> list[EndpointStatus]:
             path=ANALYSIS_JOB_DETAIL_PATH,
             state="job_store",
             summary="Read an analysis job from the configured job store.",
+        ),
+        EndpointStatus(
+            method="POST",
+            path=SPEC_STRATEGY_PARSE_PATH,
+            state="local_sync",
+            summary="Compatibility adapter for POST /api/strategies/parse.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=SPEC_ANALYSIS_JOB_DETAIL_PATH,
+            state="job_store",
+            summary="Compatibility adapter for polling analysis jobs.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=SPEC_BACKTEST_DETAIL_PATH,
+            state="job_store",
+            summary="MVP adapter returning the latest matching job envelope with backtest performance.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=SPEC_REPORT_DETAIL_PATH,
+            state="job_store",
+            summary="MVP adapter returning the latest matching job envelope with report projection.",
         ),
     ]
 
@@ -256,6 +359,48 @@ def _job_store_status(runtime: JobStoreRuntime) -> JobStoreStatus:
         dsn_configured=runtime.dsn_configured,
         fallback=runtime.fallback,
         fallback_reason=runtime.fallback_reason,
+    )
+
+
+def _find_job_by_strategy(store: AnalysisJobStore, strategy_id: str) -> AnalysisJob | None:
+    normalized = strategy_id.strip().lower()
+    for job in reversed(store.list_jobs()):
+        if not job.result or not job.result.strategy_spec:
+            continue
+        result_strategy_id = job.result.strategy_spec.strategy_id
+        if result_strategy_id == normalized or result_strategy_id.startswith(normalized):
+            return job
+    return None
+
+
+def _find_job_by_trace_or_debug_ref(store: AnalysisJobStore, value: str) -> AnalysisJob | None:
+    normalized = value.strip()
+    for job in reversed(store.list_jobs()):
+        if job.job_id == normalized or job.trace_id == normalized:
+            return job
+        if job.result and job.result.debug_ref == normalized:
+            return job
+    return None
+
+
+def _not_found_envelope(
+    *,
+    resource_type: str,
+    resource_id: str,
+    message: str,
+) -> APIEnvelope:
+    trace_id = f"not-found-{resource_type}"
+    return APIEnvelope(
+        status=EnvelopeStatus.FAILED,
+        trace_id=trace_id,
+        user_payload=UserPayload(
+            headline=f"{resource_type} not found",
+            message=f"{message} resource_id={resource_id}",
+            next_actions=["Run POST /api/strategies/parse first.", "Poll the returned analysis job."],
+        ),
+        strategy_spec=None,
+        debug_ref=f"not_found:{resource_type}:{resource_id}",
+        retryable=True,
     )
 
 

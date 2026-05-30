@@ -25,6 +25,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
   const benchmarkReturn = latestPoint?.benchmark ?? 0;
   const currentAsset = CHART_INITIAL_ASSET * (1 + strategyReturn / PERCENT_SCALE);
   const benchmarkLabel = overview.performance.benchmarkLabel ?? "KOSPI200";
+  const hasBenchmarkSeries = chartPoints.some((point) => point.benchmark !== 0);
 
   return (
     <div className="workspace-content">
@@ -133,7 +134,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
           </div>
           <div className="legend-row">
             <span><i className="line line--strategy" />내 전략</span>
-            <span><i className="line line--benchmark" />{benchmarkLabel}</span>
+            {hasBenchmarkSeries ? <span><i className="line line--benchmark" />{benchmarkLabel}</span> : null}
             <Badge variant="soft">1Y</Badge>
           </div>
         </div>
@@ -144,10 +145,10 @@ export function OverviewTab({ overview }: OverviewTabProps) {
             <em>{formatPercentValue(strategyReturn)}</em>
           </div>
           <div><span>초기 자산</span><strong>{formatCurrency(CHART_INITIAL_ASSET)}</strong></div>
-          <div><span>{benchmarkLabel} 대비</span><strong>{formatPercentPoint(strategyReturn - benchmarkReturn)}</strong></div>
+          {hasBenchmarkSeries ? <div><span>{benchmarkLabel} 대비</span><strong>{formatPercentPoint(strategyReturn - benchmarkReturn)}</strong></div> : null}
           <div><span>최대 낙폭</span><strong>{maxDrawdownMetric?.value ?? "-"}</strong></div>
         </div>
-        <PerformanceChart points={chartPoints} />
+        <PerformanceChart points={chartPoints} series={hasBenchmarkSeries ? ["benchmark", "strategy"] : ["strategy"]} />
       </Card>
     </div>
   );

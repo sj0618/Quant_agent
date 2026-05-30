@@ -49,8 +49,21 @@ AI_LLM_PROVIDER=aoai
 AI_AOAI_RESPONSES_URL='https://<resource>.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview'
 AI_AOAI_API_KEY='<secret>'
 AI_AOAI_MODEL='<deployment-or-model-name>'
+AI_LLM_RESEARCH_BULL_MODEL='<mini-deployment>'
+AI_LLM_RESEARCH_BEAR_MODEL='<mini-deployment>'
+AI_LLM_RESEARCH_JUDGE_MODEL='<judge-deployment>'
+AI_LLM_BACKTEST_CODE_MODEL='<code-deployment>'
+AI_LLM_SIGNAL_BULL_MODEL='<mini-deployment>'
+AI_LLM_SIGNAL_BEAR_MODEL='<mini-deployment>'
+AI_LLM_SIGNAL_JUDGE_MODEL='<judge-deployment>'
+AI_LLM_REPORT_BULL_MODEL='<mini-deployment>'
+AI_LLM_REPORT_BEAR_MODEL='<mini-deployment>'
+AI_LLM_REPORT_JUDGE_MODEL='<judge-deployment>'
 python3 -m uvicorn ai_graph.api:app --host "$AI_API_HOST" --port "$AI_API_PORT" --reload
 ```
+
+전체 예시는 `ai/.env.example`을 기준으로 한다. role별 model env가 비어 있으면
+`AI_AOAI_MODEL`을 fallback으로 사용한다.
 
 실제 AOAI 네트워크 smoke test는 기본 pytest에서 제외된다.
 
@@ -78,17 +91,17 @@ PY
 | 영역 | 주요 파일 | 계약 |
 |---|---|---|
 | 9-node graph | `ai_graph/graph.py` | Supervisor, Ambiguity, Data, Research, BacktestCode, Backtest, Signal, Risk Manager, Report 순서 |
-| Swagger/API | `ai_graph/api.py` | `/docs`, `/openapi.json`, `/health`, `/api-status`, `/analysis-jobs` |
-| DB data source | `ai_graph/data_sources/db.py` | `mart.kis_adjusted_feature_frame_asof`, `meta.view_common_stock_universe`, `raw.analyst_report_summary` |
-| LLM provider | `ai_graph/llm/**` | env 기반 `mock`/`aoai` 선택, AOAI Responses JSON parsing |
+| Swagger/API | `ai_graph/api.py` | `/docs`, `/openapi.json`, `/health`, `/api-status`, `/analysis-jobs`, `/api/strategies/parse`, `/api/backtests/{strategy_id}`, `/api/reports/{id}` |
+| DB data source | `ai_graph/data_sources/db.py` | `feature.kis_adjusted_ohlcv_daily`, `feature.ta_*_ticker_daily`, `meta.view_common_stock_universe`, `raw.analyst_report_summary` |
+| LLM provider | `ai_graph/llm/**` | env 기반 `mock`/`aoai` 선택, role별 AOAI deployment override, AOAI Responses JSON parsing |
 | 공통 schema | `ai_graph/schemas.py`, `state.py` | StrategySpec, APIEnvelope, L4 evidence, polling stage, dual output |
 | Job/polling | `ai_graph/jobs.py` | `interpreting`, `code_generation`, `backtest`, `debate`, `finalizing` 상태 |
-| Retrieval | `ai_graph/retrieval/**` | L1 전략 KB, L2 지표 KB, Retrieve-then-Smooth 후보 카드 |
+| Retrieval | `ai_graph/retrieval/**` | L1 50+ 전략 KB, L2 150+ 지표 KB, Retrieve-then-Smooth 후보 카드 |
 | Code security | `ai_graph/security/ast_validator.py` | allowlist import와 금지 함수/모듈 차단 |
 | Backtest | `ai_graph/nodes/backtest_code.py`, `backtest.py` | Loop3 후보 신호를 `backtest_module` 엔진으로 실행하고 A/B 성과 최고 후보 선택 |
-| Signal | `ai_graph/nodes/signal.py` | BUY/HOLD/DROP, Bull/Bear/Judge, L4 evidence fixture |
+| Signal | `ai_graph/nodes/signal.py` | BUY/HOLD/DROP, role별 Bull/Bear/Judge fallback, L4 evidence fixture/SEIBro raw |
 | Risk | `ai_graph/nodes/risk_manager.py` | KOSPI -5%, FX 2%, VKOSPI 30 룰 |
-| Report | `ai_graph/nodes/report.py` | web_projection과 email_projection 동시 생성 |
+| Report | `ai_graph/nodes/report.py` | web_projection과 email_projection 동시 생성, 데이터 가용성/스크리닝 후보 섹션 |
 | API contract | `docs/ai-api-contract.md` | FE/BE envelope와 debug_ref 경계 |
 
 ## Mock/Fixture 경계
@@ -97,7 +110,7 @@ PY
 |---|---|
 | `AI_LLM_PROVIDER=mock` | `AI_LLM_PROVIDER=aoai` + AOAI Responses env |
 | local markdown KB | 운영용 벡터/검색 인덱스 |
-| fixture price rows | `mart.kis_adjusted_feature_frame_asof` 기반 KIS 수정주가/TA feature |
+| fixture price rows | 공용 DB `feature.kis_adjusted_ohlcv_daily` + `feature.ta_*_ticker_daily` 기반 가격/TA screening |
 | fixture L4 evidence | `raw.analyst_report_summary` 기반 SEIBro raw evidence |
 | in-memory debug/job store | DB/queue 기반 job store |
 
@@ -115,6 +128,7 @@ PY
 
 1. FastAPI adapter의 `InMemoryAnalysisJobStore`를 영속 job store로 교체.
 2. L1/L2 KB를 파일 fixture에서 검색 인덱스로 승격.
+3. OpenDART/BOK/SEIBro feature mart 적재 후 proxy 조건을 실제 재무/거시/컨센서스 필터로 교체.
 
 ## 완료된 항목
 

@@ -1,4 +1,4 @@
-# 공용 서버 DB 테이블/뷰 전체 현황 (시장 데이터 관련)
+# 공용 서버 DB 테이블/뷰 전체 현황
 
 작성일: 2026-05-25  
 대상 DB: 공용 서버 PostgreSQL/TimescaleDB `quant_agent`  

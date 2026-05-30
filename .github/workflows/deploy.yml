@@ -1,6 +1,7 @@
 name: Deploy to SSH Server
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -50,3 +51,81 @@ jobs:
             -e "ssh -i ~/.ssh/id_rsa -p 30233" \
             ./ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
+
+      - name: Install and restart development servers
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+            set -euo pipefail
+
+            APP_DIR="$HOME/mvp_sp1/quant-proj"
+            RUN_DIR="$APP_DIR/.run"
+            mkdir -p "$RUN_DIR"
+
+            python3 -m venv "$APP_DIR/ai/.venv"
+            "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip
+            "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/ai"
+
+            cd "$APP_DIR/fe"
+            npm ci
+
+            stop_from_pidfile() {
+              local pid_file="$1"
+              if [ ! -f "$pid_file" ]; then
+                return 0
+              fi
+
+              local pid
+              pid="$(cat "$pid_file" 2>/dev/null || true)"
+              if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                for _ in $(seq 1 10); do
+                  if ! kill -0 "$pid" 2>/dev/null; then
+                    break
+                  fi
+                  sleep 1
+                done
+                if kill -0 "$pid" 2>/dev/null; then
+                  kill -9 "$pid" 2>/dev/null || true
+                fi
+              fi
+              rm -f "$pid_file"
+            }
+
+            stop_from_pidfile "$RUN_DIR/ai.pid"
+            stop_from_pidfile "$RUN_DIR/fe.pid"
+            pkill -f "uvicorn ai_graph.api:app.*--port 8000" 2>/dev/null || true
+            pkill -f "vite.*--port 5173" 2>/dev/null || true
+            pkill -f "node .*vite.*5173" 2>/dev/null || true
+
+            cd "$APP_DIR/ai"
+            nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn ai_graph.api:app \
+              --host 0.0.0.0 \
+              --port 8000 \
+              --reload \
+              > "$RUN_DIR/ai.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/ai.pid"
+
+            cd "$APP_DIR/fe"
+            nohup npm run dev -- --port 5173 \
+              > "$RUN_DIR/fe.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/fe.pid"
+
+            wait_for_url() {
+              local name="$1"
+              local url="$2"
+              local log_file="$3"
+              for _ in $(seq 1 30); do
+                if curl -fsS "$url" >/dev/null; then
+                  echo "$name is ready: $url"
+                  return 0
+                fi
+                sleep 2
+              done
+              echo "$name did not become ready: $url"
+              tail -n 80 "$log_file" || true
+              return 1
+            }
+
+            wait_for_url "AI API" "http://127.0.0.1:8000/health" "$RUN_DIR/ai.log"
+            wait_for_url "FE dev server" "http://127.0.0.1:5173/app" "$RUN_DIR/fe.log"
+          REMOTE

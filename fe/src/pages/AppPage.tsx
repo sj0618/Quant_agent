@@ -5,6 +5,7 @@ import { AppLayout } from "../components/layout/AppLayout";
 import {
   clearLatestAnalysisJob,
   createAnalysisJob,
+  getAnalysisJob,
   getWorkspaceTemplate,
   mergeAnalysisJobIntoOverview,
   saveLatestAnalysisJob,
@@ -14,7 +15,7 @@ import { PerformanceTab } from "../features/app/PerformanceTab";
 import { StrategyInputPanel } from "../features/app/StrategyInputPanel";
 import { TradingInfoTab } from "../features/app/TradingInfoTab";
 import { useAsyncData } from "../hooks/useAsyncData";
-import type { AnalysisJob, AppOverview, ChatConversationPreview, WorkspaceAnalysisStatus } from "../types/quantagent";
+import type { AIJobStage, AIJobStageStatus, AnalysisJob, AppOverview, ChatConversationPreview, WorkspaceAnalysisStatus } from "../types/quantagent";
 
 type WorkspaceTab = "overview" | "trading" | "performance";
 
@@ -25,6 +26,18 @@ const TAB_ITEMS: Array<TabItem<WorkspaceTab>> = [
 ];
 const CONVERSATION_HISTORY_STORAGE_KEY = "quantagent.chat-conversations.v1";
 const CONVERSATION_HISTORY_LIMIT = 8;
+const ANALYSIS_JOB_POLL_INTERVAL_MS = 2000;
+const PROGRESS_TICK_INTERVAL_MS = 250;
+const CLIENT_PROGRESS_DURATION_MS = 90_000;
+const CLIENT_PROGRESS_START_PERCENT = 6;
+const CLIENT_PROGRESS_MAX_PERCENT = 92;
+const WORKSPACE_PROGRESS_STEPS: Array<{ stage: AIJobStage; label: string }> = [
+  { stage: "interpreting", label: "전략 해석 중" },
+  { stage: "code_generation", label: "코드 생성 중" },
+  { stage: "backtest", label: "백테스트 실행 중" },
+  { stage: "debate", label: "정반 토론 중" },
+  { stage: "finalizing", label: "최종 결정 중" },
+];
 
 interface WorkspaceConversation {
   id: string;
@@ -32,6 +45,18 @@ interface WorkspaceConversation {
   createdAt: string;
   updatedAt: string;
   jobs: AnalysisJob[];
+}
+
+interface PendingAnalysis {
+  query: string;
+  startedAt: number;
+}
+
+interface WorkspaceProgress {
+  query: string;
+  percent: number;
+  activeLabel: string;
+  steps: Array<{ label: string; status: AIJobStageStatus }>;
 }
 
 function getInitialTab(): WorkspaceTab {
@@ -96,7 +121,39 @@ function conversationPreview(conversation: WorkspaceConversation, template: AppO
   };
 }
 
-function WorkspaceEmptyState({ hasConversation }: { hasConversation: boolean }) {
+function WorkspaceEmptyState({ hasConversation, progress }: { hasConversation: boolean; progress?: WorkspaceProgress | null }) {
+  if (progress) {
+    return (
+      <section className="workspace-empty workspace-empty--progress">
+        <div className="workspace-progress">
+          <div className="workspace-progress__head">
+            <span>ANALYSIS JOB</span>
+            <strong>{progress.activeLabel}</strong>
+            <p>{progress.query}</p>
+          </div>
+          <div
+            className="workspace-progress__bar"
+            aria-label="분석 진행률"
+            aria-valuemax={100}
+            aria-valuemin={0}
+            aria-valuenow={progress.percent}
+            role="progressbar"
+          >
+            <span style={{ width: `${progress.percent}%` }} />
+          </div>
+          <ol className="workspace-progress__steps">
+            {progress.steps.map((step) => (
+              <li className={`workspace-progress__step is-${step.status}`} key={step.label}>
+                <span />
+                <strong>{step.label}</strong>
+              </li>
+            ))}
+          </ol>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section className="workspace-empty">
       <strong>{hasConversation ? "전략 후보를 선택해 주세요" : "전략 채팅으로 시작해 주세요"}</strong>
@@ -114,10 +171,59 @@ export function AppPage() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>(getInitialTab);
   const [analysisJobs, setAnalysisJobs] = useState<AnalysisJob[]>([]);
   const [conversationHistory, setConversationHistory] = useState<WorkspaceConversation[]>(readConversationHistory);
+  const [pendingAnalysis, setPendingAnalysis] = useState<PendingAnalysis | null>(null);
+  const [progressNow, setProgressNow] = useState(Date.now());
 
   useEffect(() => {
     writeConversationHistory(conversationHistory);
   }, [conversationHistory]);
+
+  useEffect(() => {
+    const hasRunningJob = analysisJobs.some((job) => !job.result);
+    if (!pendingAnalysis && !hasRunningJob) {
+      return undefined;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setProgressNow(Date.now());
+    }, PROGRESS_TICK_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [analysisJobs, pendingAnalysis]);
+
+  useEffect(() => {
+    const pollingJobs = analysisJobs.filter((job) => !job.result);
+    if (!pollingJobs.length) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const timeoutId = window.setTimeout(async () => {
+      const refreshedJobs = await Promise.all(
+        pollingJobs.map(async (job) => {
+          try {
+            return await getAnalysisJob(job.job_id);
+          } catch (error) {
+            console.warn("AI 분석 job 진행률 갱신에 실패했습니다.", error);
+            return job;
+          }
+        }),
+      );
+
+      if (cancelled) {
+        return;
+      }
+
+      setAnalysisJobs((jobs) =>
+        jobs.map((job) => refreshedJobs.find((refreshedJob) => refreshedJob.job_id === job.job_id) ?? job),
+      );
+    }, ANALYSIS_JOB_POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [analysisJobs]);
 
   const handleTabChange = (tab: WorkspaceTab) => {
     const url = new URL(window.location.href);
@@ -145,6 +251,8 @@ export function AppPage() {
   const hasCurrentConversation = analysisJobs.length > 0;
   const canRenderWorkspace = hasWorkspaceResult(analysisJobs);
   const historyPreviews = conversationHistory.map((conversation) => conversationPreview(conversation, data));
+  const runningJob = [...analysisJobs].reverse().find((job) => !job.result);
+  const workspaceProgress = buildWorkspaceProgress({ job: runningJob, pendingAnalysis, now: progressNow });
 
   const handleNewConversation = () => {
     if (analysisJobs.length) {
@@ -152,6 +260,7 @@ export function AppPage() {
     }
     clearLatestAnalysisJob();
     setAnalysisJobs([]);
+    setPendingAnalysis(null);
     setActiveTab("overview");
   };
 
@@ -180,8 +289,15 @@ export function AppPage() {
           messages={hasCurrentConversation ? overview.chatMessages : []}
           onNewConversation={handleNewConversation}
           onAnalyze={async (query) => {
-            const job = await createAnalysisJob(query);
-            setAnalysisJobs((jobs) => [...jobs, job]);
+            const pending = { query, startedAt: Date.now() };
+            setPendingAnalysis(pending);
+            setProgressNow(pending.startedAt);
+            try {
+              const job = await createAnalysisJob(query);
+              setAnalysisJobs((jobs) => [...jobs, job]);
+            } finally {
+              setPendingAnalysis(null);
+            }
           }}
           onRestoreConversation={handleRestoreConversation}
           strategy={overview.strategy}
@@ -205,10 +321,79 @@ export function AppPage() {
               {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
             </>
           ) : (
-            <WorkspaceEmptyState hasConversation={hasCurrentConversation} />
+            <WorkspaceEmptyState hasConversation={hasCurrentConversation} progress={workspaceProgress} />
           )}
         </main>
       </div>
     </AppLayout>
   );
+}
+
+function buildWorkspaceProgress({
+  job,
+  pendingAnalysis,
+  now,
+}: {
+  job?: AnalysisJob;
+  pendingAnalysis: PendingAnalysis | null;
+  now: number;
+}): WorkspaceProgress | null {
+  if (job) {
+    const steps = WORKSPACE_PROGRESS_STEPS.map(({ stage, label }) => ({
+      label,
+      status: job.stages.find((step) => step.stage === stage)?.status ?? "queued",
+    }));
+    const percent = Math.max(progressPercentFromSteps(steps), progressPercentFromElapsed(new Date(job.created_at).getTime(), now));
+
+    return {
+      query: job.query,
+      percent,
+      activeLabel: activeProgressLabel(steps),
+      steps,
+    };
+  }
+
+  if (!pendingAnalysis) {
+    return null;
+  }
+
+  const percent = progressPercentFromElapsed(pendingAnalysis.startedAt, now);
+  const steps = WORKSPACE_PROGRESS_STEPS.map(({ label }, index) => ({
+    label,
+    status: clientStageStatus(index, percent),
+  }));
+
+  return {
+    query: pendingAnalysis.query,
+    percent,
+    activeLabel: activeProgressLabel(steps),
+    steps,
+  };
+}
+
+function progressPercentFromElapsed(startedAt: number, now: number) {
+  const elapsedRatio = Math.max(0, Math.min(1, (now - startedAt) / CLIENT_PROGRESS_DURATION_MS));
+  const easedRatio = 1 - (1 - elapsedRatio) ** 2;
+  return Math.round(CLIENT_PROGRESS_START_PERCENT + easedRatio * (CLIENT_PROGRESS_MAX_PERCENT - CLIENT_PROGRESS_START_PERCENT));
+}
+
+function progressPercentFromSteps(steps: WorkspaceProgress["steps"]) {
+  const completed = steps.filter((step) => step.status === "succeeded").length;
+  const hasRunning = steps.some((step) => step.status === "running");
+  return Math.min(CLIENT_PROGRESS_MAX_PERCENT, completed * 20 + (hasRunning ? 10 : 0));
+}
+
+function clientStageStatus(index: number, percent: number): AIJobStageStatus {
+  const activeIndex = Math.min(WORKSPACE_PROGRESS_STEPS.length - 1, Math.floor(percent / 20));
+  if (index < activeIndex) {
+    return "succeeded";
+  }
+  if (index === activeIndex) {
+    return "running";
+  }
+  return "queued";
+}
+
+function activeProgressLabel(steps: WorkspaceProgress["steps"]) {
+  return steps.find((step) => step.status === "running")?.label ?? steps.find((step) => step.status === "queued")?.label ?? "최종 결정 중";
 }

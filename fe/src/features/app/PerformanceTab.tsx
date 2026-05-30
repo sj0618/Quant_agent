@@ -11,12 +11,17 @@ interface PerformanceTabProps {
 }
 
 export function PerformanceTab({ performance }: PerformanceTabProps) {
-  const [mode, setMode] = useState<"improved" | "original" | "ab">("improved");
+  const [mode, setMode] = useState<"selected" | "baseline" | "combined">("selected");
   const [range, setRange] = useState<"1Y" | "5Y" | "10Y">("10Y");
   const points = range === "1Y" ? performance.equityCurve.slice(-2) : range === "5Y" ? performance.equityCurve.slice(-4) : performance.equityCurve;
   const benchmarkLabel = performance.benchmarkLabel ?? "KOSPI200";
+  const hasBenchmarkSeries = points.some((point) => point.benchmark !== 0);
   const series: Array<keyof Pick<EquityPoint, "strategy" | "original" | "benchmark">> =
-    mode === "improved" ? ["benchmark", "strategy"] : mode === "original" ? ["benchmark", "original"] : ["benchmark", "original", "strategy"];
+    [
+      ...(hasBenchmarkSeries ? ["benchmark" as const] : []),
+      ...(mode !== "baseline" ? ["strategy" as const] : []),
+      ...(mode !== "selected" ? ["original" as const] : []),
+    ];
 
   return (
     <div className="workspace-content">
@@ -26,9 +31,9 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
           <p>{performance.period}</p>
         </div>
         <div className="segmented">
-          <button className={mode === "improved" ? "is-active" : ""} onClick={() => setMode("improved")} type="button">선택 후보</button>
-          <button className={mode === "original" ? "is-active" : ""} onClick={() => setMode("original")} type="button">원본 전략</button>
-          <button className={mode === "ab" ? "is-active" : ""} onClick={() => setMode("ab")} type="button">A/B 동시 보기</button>
+          <button className={mode === "selected" ? "is-active" : ""} onClick={() => setMode("selected")} type="button">선택 후보</button>
+          <button className={mode === "baseline" ? "is-active" : ""} onClick={() => setMode("baseline")} type="button">기준선</button>
+          <button className={mode === "combined" ? "is-active" : ""} onClick={() => setMode("combined")} type="button">동시 보기</button>
         </div>
         <button className="export-button" onClick={() => downloadPerformanceCsv(performance)} type="button">CSV</button>
       </Card>
@@ -46,9 +51,9 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
             <p>{performance.period}</p>
           </div>
           <div className="legend-row">
-            {mode !== "original" ? <span><i className="line line--strategy" />선택 후보</span> : null}
-            {mode !== "improved" ? <span><i className="line line--original" />원본 (일괄)</span> : null}
-            <span><i className="line line--benchmark" />{benchmarkLabel}</span>
+            {mode !== "baseline" ? <span><i className="line line--strategy" />선택 후보</span> : null}
+            {mode !== "selected" ? <span><i className="line line--original" />기준선</span> : null}
+            {hasBenchmarkSeries ? <span><i className="line line--benchmark" />{benchmarkLabel}</span> : null}
             {(["1Y", "5Y", "10Y"] as const).map((item) => (
               <button className={range === item ? "is-active" : ""} key={item} onClick={() => setRange(item)} type="button">
                 {item}
@@ -63,25 +68,25 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
       <div className="performance-bottom">
         <Card padded={false}>
           <div className="card-head">
-            <strong>원본 vs AI 개선본</strong>
-            <p>BacktestCode Loop3 최고 Sharpe 선택</p>
+            <strong>선택 후보 성능 요약</strong>
+            <p>후보 코드 백테스트 objective score 기준</p>
           </div>
           <table className="comparison-table">
             <thead>
               <tr>
                 <th>지표</th>
-                <th>원본</th>
-                <th>AI 개선본</th>
-                <th>개선</th>
+                <th>값</th>
+                <th>보조 정보</th>
+                <th>판단</th>
               </tr>
             </thead>
             <tbody>
               {performance.comparison.map((row) => (
                 <tr key={row.metric}>
                   <td>{row.metric}</td>
-                  <td>{row.original}</td>
-                  <td><strong>{row.improved}</strong></td>
-                  <td><em className="is-positive">{row.delta}</em></td>
+                  <td><strong>{row.value}</strong></td>
+                  <td>{row.context}</td>
+                  <td><em className={`is-${row.tone}`}>{row.assessment}</em></td>
                 </tr>
               ))}
             </tbody>

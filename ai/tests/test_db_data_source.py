@@ -141,6 +141,95 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
     )
 
 
+def test_postgres_data_source_broad_screening_uses_screening_candidates() -> None:
+    class Result:
+        def __init__(
+            self,
+            *,
+            rows: list[dict[str, object]] | None = None,
+            row: dict[str, object] | None = None,
+        ) -> None:
+            self.rows = rows or []
+            self.row = row
+
+        def fetchall(self) -> list[dict[str, object]]:
+            return self.rows
+
+        def fetchone(self) -> dict[str, object] | None:
+            return self.row
+
+    class ScreeningConnection:
+        def __enter__(self) -> "ScreeningConnection":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def execute(self, query: str, params: list[object] | None = None) -> Result:
+            if "FROM scored" in query:
+                return Result(
+                    rows=[
+                        {
+                            "time": date(2026, 5, 20),
+                            "ticker": "000660",
+                            "name": "SK하이닉스",
+                            "market_segment": "KOSPI",
+                            "close": Decimal("200000"),
+                            "volume_ratio_20": Decimal("1.8"),
+                            "relative_strength_20d": Decimal("0.05"),
+                            "relative_strength_60d": Decimal("0.1"),
+                            "technical_score": Decimal("7"),
+                            "high_252": Decimal("200000"),
+                            "sma20": Decimal("180000"),
+                            "sma200": Decimal("150000"),
+                        }
+                    ]
+                )
+            if "feature.kis_adjusted_ohlcv_daily" in query:
+                return Result(
+                    rows=[
+                        {
+                            "as_of_date": date(2026, 5, 20),
+                            "ticker": "000660",
+                            "open": Decimal("190000"),
+                            "high": Decimal("201000"),
+                            "low": Decimal("189000"),
+                            "close": Decimal("200000"),
+                            "volume": Decimal("1000000"),
+                        }
+                    ]
+                )
+            if "feature.ta_momentum_ticker_daily" in query:
+                return Result(rows=[])
+            if "raw.analyst_report_summary" in query:
+                return Result(rows=[])
+            if "meta.view_common_stock_universe" in query:
+                return Result(
+                    row={
+                        "symbol": "000660",
+                        "name": "SK하이닉스",
+                        "market_segment": "KOSPI",
+                        "listing_status": "LISTED",
+                    }
+                )
+            if "mart.bok_macro_asof" in query:
+                return Result(row={"row_count": 0, "latest_effective_date": None})
+            return Result()
+
+    class ScreeningDataSource(PostgresPipelineDataSource):
+        def _connect(self) -> ScreeningConnection:
+            return ScreeningConnection()
+
+    source = ScreeningDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+
+    bundle = source.load("최근 52주 신고가 거래량 150% 종목을 찾아줘", "trace-screening")
+
+    assert bundle.metadata["ticker"] == "000660"
+    assert bundle.screening_candidates[0]["ticker"] == "000660"
+    assert "거래량 20일 평균 대비 150% 이상" in bundle.screening_candidates[0]["matched_rules"]
+    assert bundle.data_availability["price_ta"] == "available"
+
+
 @pytest.mark.skipif(
     not os.environ.get(AI_DATABASE_DSN_ENV),
     reason=f"{AI_DATABASE_DSN_ENV} is required for common-server DB integration test.",

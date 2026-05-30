@@ -22,9 +22,9 @@ export const landingSample: LandingSample = {
     },
     {
       label: "STEP 3",
-      title: "백테스트 + A/B",
-      description: "10년 시계열로 walk-forward 검증. 원본 vs AI 개선본 비교.",
-      example: ["Sharpe 1.11 → 1.42", "MDD -9.4% · Win Rate 58%"],
+      title: "후보 코드 백테스트",
+      description: "10년 시계열로 후보 코드를 검증하고 objective score 기준으로 선택합니다.",
+      example: ["선택 후보 Sharpe 1.42", "MDD -9.4% · Win Rate 58%"],
     },
     {
       label: "STEP 4",
