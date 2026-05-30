@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QuantAgent App</title>
+  <link rel="stylesheet" href="/static/auth/styles.css">
+</head>
+<body data-page="app">
+  <main class="card" aria-labelledby="app-title">
+    <p class="eyebrow">QuantAgent</p>
+    <h1 id="app-title">내 계정</h1>
+    <section id="profile" class="profile" aria-live="polite">세션 확인 중...</section>
+    <p id="app-error" class="error" role="alert" hidden></p>
+    <button id="logout" class="secondary" type="button">Logout</button>
+  </main>
+  <script src="/static/auth/auth.js" defer></script>
+</body>
+</html>

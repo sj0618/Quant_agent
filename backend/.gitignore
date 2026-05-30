@@ -1,0 +1,9 @@
+# Local backend artifacts
+.env
+.env.*
+backend_old_*.zip
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+
