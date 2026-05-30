@@ -26,7 +26,7 @@ export function downloadReportsCsv(reports: ReportSummary[]) {
 }
 
 export function downloadPerformanceCsv(performance: PerformanceSummary) {
-  const header = ["date", "strategy", "original", "benchmark"];
+  const header = ["date", "selected_candidate", "baseline", "benchmark"];
   const rows = performance.equityCurve.map((point) => [point.date, point.strategy, point.original, point.benchmark]);
   const csv = [header, ...rows].map((row) => row.map(toCsvValue).join(",")).join("\n");
   downloadTextFile("quantagent-performance.csv", csv, "text/csv;charset=utf-8");

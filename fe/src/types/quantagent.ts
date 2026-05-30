@@ -113,10 +113,10 @@ export interface AIBacktestEquityPoint {
 }
 
 export interface AIBacktestPerformance {
-  selected_variant: "A" | "B";
   selected_candidate_id: string;
-  metrics_by_variant: Record<"A" | "B", AIBacktestMetrics>;
-  equity_curve_by_variant: Record<"A" | "B", AIBacktestEquityPoint[]>;
+  metrics: AIBacktestMetrics;
+  equity_curve: AIBacktestEquityPoint[];
+  engine_summary?: Record<string, unknown>;
 }
 
 export interface AIUserPayload {
@@ -199,11 +199,11 @@ export interface EquityPoint {
   benchmark: number;
 }
 
-export interface ABComparisonRow {
+export interface PerformanceComparisonRow {
   metric: string;
-  original: string;
-  improved: string;
-  delta: string;
+  value: string;
+  context: string;
+  assessment: string;
   tone: Tone;
 }
 
@@ -220,7 +220,7 @@ export interface PerformanceSummary {
   benchmarkLabel?: string;
   metrics: BacktestMetric[];
   equityCurve: EquityPoint[];
-  comparison: ABComparisonRow[];
+  comparison: PerformanceComparisonRow[];
   macroEvents: MacroEvent[];
   disclaimer: string;
 }

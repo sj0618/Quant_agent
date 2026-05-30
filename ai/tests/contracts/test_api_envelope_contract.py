@@ -56,7 +56,9 @@ def test_analysis_job_and_api_envelope_public_fields_are_frozen() -> None:
     assert set(result) == API_ENVELOPE_FIELDS
     assert set(user_payload) == USER_PAYLOAD_FIELDS
     assert user_payload["performance"]["selected_candidate_id"]
-    assert set(user_payload["performance"]["metrics_by_variant"]) == {"A", "B"}
+    assert "metrics" in user_payload["performance"]
+    assert "equity_curve" in user_payload["performance"]
+    assert "metrics_by_variant" not in user_payload["performance"]
     assert set(report) == REPORT_FIELDS
     assert set(report["web_projection"]) == PROJECTION_FIELDS
     assert set(report["email_projection"]) == PROJECTION_FIELDS

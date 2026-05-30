@@ -5,13 +5,15 @@ import statistics
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import date
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_graph.schemas import ABBacktestResult, BacktestMetrics, CodeCandidate
+from ai_graph.schemas import BacktestMetrics, CandidateBacktestResult, CodeCandidate
 from ai_graph.schemas import StrategySpec as AIStrategySpec
+from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
@@ -26,6 +28,9 @@ METRIC_ROUND_DIGITS = 6
 MIN_RETURNS_FOR_SPLIT = 4
 BACKTEST_SPLIT_FRACTION = 0.5
 PUBLIC_EQUITY_CURVE_POINTS = 12
+MIN_OBJECTIVE_TRADES = 5
+MIN_OBJECTIVE_SHARPE = 1.0
+MAX_OBJECTIVE_DRAWDOWN = -0.10
 GENERATED_SIGNAL_METRIC = "generated_signal"
 BUY_SIGNAL_VALUE = 1.0
 SELL_SIGNAL_VALUE = -1.0
@@ -52,7 +57,7 @@ DEFAULT_BACKTEST_PRICE_ROWS: tuple[dict[str, object], ...] = (
         "high": 103.0,
         "low": 101.0,
         "close": 102.0,
-        "volume": DEFAULT_FIXTURE_VOLUME,
+        "volume": DEFAULT_FIXTURE_VOLUME * 1.6,
         "rsi": 50.0,
     },
     {
@@ -128,17 +133,19 @@ class GeneratedSignal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     date: str = Field(min_length=1)
+    ticker: str | None = None
     action: str = Field(pattern="^(BUY|SELL|HOLD)$")
     price: float = Field(gt=0.0)
 
 
-def run_ab_backtest(
+def run_candidate_backtest(
     strategy_a: AIStrategySpec,
-    strategy_b: AIStrategySpec,
     candidates: list[CodeCandidate],
     *,
     price_rows: Sequence[Mapping[str, Any]] | None = None,
-) -> ABBacktestResult:
+    feature_coverage: Mapping[str, Any] | None = None,
+    fallback_reasons: Sequence[str] | None = None,
+) -> CandidateBacktestResult:
     if not candidates:
         raise ValueError("at least one candidate is required")
 
@@ -146,18 +153,39 @@ def run_ab_backtest(
     enriched_candidates: list[CodeCandidate] = []
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
     equity_curves_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    objective_scores_by_candidate: dict[str, float] = {}
 
     for candidate in candidates:
         if not candidate.validation_ok:
             enriched_candidates.append(candidate)
             continue
-        strategy = strategy_a if candidate.variant == "A" else strategy_b
-        engine_result = _run_candidate_backtest(strategy, candidate, rows)
+        try:
+            engine_result = _run_candidate_backtest(strategy_a, candidate, rows)
+        except Exception as exc:
+            enriched_candidates.append(
+                candidate.model_copy(
+                    update={
+                        "validation_ok": False,
+                        "violations": [*candidate.violations, f"engine backtest failed: {exc}"],
+                    }
+                )
+            )
+            continue
         metrics = _metrics_from_engine_result(engine_result)
         enriched_candidate = candidate.model_copy(update={"metrics": metrics})
         enriched_candidates.append(enriched_candidate)
-        engine_summaries_by_candidate[candidate.candidate_id] = dict(engine_result.summary)
+        engine_summary = dict(engine_result.summary)
+        engine_summary["buy_signal_count"] = _signal_action_count(engine_result, "BUY")
+        engine_summary["sell_signal_count"] = _signal_action_count(engine_result, "SELL")
+        engine_summary["effective_trade_count"] = max(
+            _summary_float_default(engine_summary, "trade_count", 0.0),
+            _summary_float_default(engine_summary, "buy_signal_count", 0.0),
+        )
+        engine_summaries_by_candidate[candidate.candidate_id] = engine_summary
         equity_curves_by_candidate[candidate.candidate_id] = _public_equity_curve(engine_result)
+        objective_scores_by_candidate[candidate.candidate_id] = _objective_score(
+            metrics, engine_summary, rows
+        )
 
     valid_candidates = [
         candidate
@@ -167,48 +195,66 @@ def run_ab_backtest(
     if not valid_candidates:
         raise ValueError("at least one candidate must pass validation and engine backtest")
 
-    selected = max(valid_candidates, key=_candidate_rank)
-    metrics_by_variant: dict[str, BacktestMetrics] = {}
-    equity_curve_by_variant: dict[str, list[dict[str, Any]]] = {}
-    for variant in ("A", "B"):
-        variant_candidates = [
-            candidate for candidate in valid_candidates if candidate.variant == variant
-        ]
-        if not variant_candidates:
-            raise ValueError(f"variant {variant} has no backtested candidate")
-        best = max(variant_candidates, key=_candidate_rank)
-        metrics_by_variant[variant] = _candidate_metrics(best)
-        equity_curve_by_variant[variant] = equity_curves_by_candidate[best.candidate_id]
+    selected = max(
+        valid_candidates,
+        key=lambda candidate: (
+            objective_scores_by_candidate.get(candidate.candidate_id, float("-inf")),
+            *_candidate_rank(candidate),
+        ),
+    )
 
-    return ABBacktestResult(
+    return CandidateBacktestResult(
         strategy_a=strategy_a,
-        strategy_b=strategy_b,
         candidates=enriched_candidates,
         selected_candidate=selected,
-        metrics_by_variant=metrics_by_variant,
-        equity_curve_by_variant=equity_curve_by_variant,
+        equity_curve=equity_curves_by_candidate[selected.candidate_id],
+        engine_summary=engine_summaries_by_candidate[selected.candidate_id],
         engine_summaries_by_candidate=engine_summaries_by_candidate,
+        objective_scores_by_candidate=objective_scores_by_candidate,
+        backtest_payload=_backtest_payload(strategy_a, rows),
+        feature_coverage=dict(feature_coverage or {}),
+        fallback_reasons=list(fallback_reasons or ()),
     )
 
 
 def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
     strategy_a = AIStrategySpec.model_validate(state["strategy_spec"])
-    strategy_b = AIStrategySpec.model_validate(
-        state.get("improved_strategy_spec") or state["strategy_spec"]
-    )
     candidates = [
         CodeCandidate.model_validate(candidate)
         for candidate in state["backtest_code"]["candidates"]
     ]
-    result = run_ab_backtest(
+    result = run_candidate_backtest(
         strategy_a,
-        strategy_b,
         candidates,
         price_rows=state["price_rows"] if "price_rows" in state else state.get("market_prices"),
+        feature_coverage=state.get("backtest_code", {}).get("feature_mapping", {}),
+        fallback_reasons=state.get("backtest_code", {}).get("fallback_reasons", []),
     )
+    all_candidates = candidates
+    fallback_reasons = list(state.get("backtest_code", {}).get("fallback_reasons", []))
+    for iteration in range(1, 3):
+        if _passes_objective_floor(result):
+            break
+        improved = generate_self_improvement_candidates(
+            strategy_a,
+            state.get("backtest_code", {}).get("code_plan", {}),
+            start_index=len(all_candidates) + 1,
+            iteration=iteration,
+        )
+        all_candidates = [*all_candidates, *improved]
+        fallback_reasons.append(
+            f"self-improvement iteration {iteration}: generated {len(improved)} threshold-adjusted candidates"
+        )
+        next_result = run_candidate_backtest(
+            strategy_a,
+            all_candidates,
+            price_rows=state["price_rows"] if "price_rows" in state else state.get("market_prices"),
+            feature_coverage=state.get("backtest_code", {}).get("feature_mapping", {}),
+            fallback_reasons=fallback_reasons,
+        )
+        if _selected_objective_score(next_result) >= _selected_objective_score(result):
+            result = next_result
     return {"backtest": result.model_dump()}
-
-
 def _run_candidate_backtest(
     strategy: AIStrategySpec,
     candidate: CodeCandidate,
@@ -254,6 +300,9 @@ def _generated_signal_from_raw(signal: object) -> GeneratedSignal:
         action = normalized.get("action")
         if isinstance(action, str):
             normalized["action"] = action.upper()
+        ticker = normalized.get("ticker")
+        if ticker is not None:
+            normalized["ticker"] = str(ticker).zfill(6)
         return GeneratedSignal.model_validate(normalized)
     return GeneratedSignal.model_validate(signal)
 
@@ -296,21 +345,38 @@ def _engine_market_rows(
             metric_row[str(key)] = float(value)
         metric_rows.append(metric_row)
 
-    if len(tickers) != 1:
-        raise ValueError("generated-code backtest currently supports one ticker per price row set")
     return ohlcv_rows, metric_rows
 
 
 def _merge_generated_signals(
     metric_rows: list[dict[str, object]], generated_signals: list[GeneratedSignal]
 ) -> list[dict[str, object]]:
-    metrics_by_date = {str(row["date"]): row for row in metric_rows}
+    metrics_by_key = {
+        (str(row["date"]), str(row["ticker"]).zfill(6)): row for row in metric_rows
+    }
+    tickers_by_date: dict[str, list[str]] = {}
+    for row in metric_rows:
+        tickers_by_date.setdefault(str(row["date"]), []).append(str(row["ticker"]).zfill(6))
     for signal in generated_signals:
-        if signal.date not in metrics_by_date:
-            raise ValueError(f"generated signal date {signal.date} is not present in price rows")
-        metrics_by_date[signal.date][GENERATED_SIGNAL_METRIC] = SIGNAL_METRIC_VALUES[
-            signal.action
-        ]
+        if signal.ticker is None:
+            tickers_for_date = tickers_by_date.get(signal.date, [])
+            if not tickers_for_date:
+                raise ValueError(f"generated signal date {signal.date} is not present in price rows")
+            if len(tickers_for_date) > 1:
+                raise ValueError(
+                    f"generated signal date {signal.date} is ambiguous without ticker"
+                )
+            for ticker in tickers_for_date:
+                metrics_by_key[(signal.date, ticker)][GENERATED_SIGNAL_METRIC] = (
+                    SIGNAL_METRIC_VALUES[signal.action]
+                )
+            continue
+        key = (signal.date, signal.ticker)
+        if key not in metrics_by_key:
+            raise ValueError(
+                f"generated signal {signal.date}/{signal.ticker} is not present in price rows"
+            )
+        metrics_by_key[key][GENERATED_SIGNAL_METRIC] = SIGNAL_METRIC_VALUES[signal.action]
     for row in metric_rows:
         row.setdefault(GENERATED_SIGNAL_METRIC, HOLD_SIGNAL_VALUE)
     return metric_rows
@@ -459,6 +525,121 @@ def _candidate_metrics(candidate: CodeCandidate) -> BacktestMetrics:
     return candidate.metrics
 
 
+def _signal_action_count(engine_result: Any, action: str) -> int:
+    return sum(
+        1
+        for signal in getattr(engine_result, "signals", [])
+        if str(getattr(signal, "action", "")).upper().endswith(action)
+    )
+
+
+def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
+    metrics = _candidate_metrics(result.selected_candidate)
+    trade_count = _summary_float_default(result.engine_summary, "effective_trade_count", 0.0)
+    benchmark_return = _summary_float_default(
+        result.backtest_payload, "benchmark_return", 0.0
+    )
+    return (
+        trade_count >= MIN_OBJECTIVE_TRADES
+        and metrics.sharpe_ratio >= MIN_OBJECTIVE_SHARPE
+        and metrics.max_drawdown >= MAX_OBJECTIVE_DRAWDOWN
+        and metrics.total_return > benchmark_return
+    )
+
+
+def _selected_objective_score(result: CandidateBacktestResult) -> float:
+    return result.objective_scores_by_candidate.get(
+        result.selected_candidate.candidate_id, float("-inf")
+    )
+
+
+def _objective_score(
+    metrics: BacktestMetrics,
+    engine_summary: Mapping[str, Any],
+    price_rows: Sequence[Mapping[str, Any]],
+) -> float:
+    trade_count = _summary_float_default(engine_summary, "effective_trade_count", 0.0)
+    benchmark_return = _benchmark_return(price_rows)
+    calmar = _calmar_ratio(metrics.total_return, metrics.max_drawdown)
+    profit_factor = _profit_factor(engine_summary)
+    turnover_penalty = min(1.0, trade_count / max(1.0, len(price_rows)))
+    score = (
+        1.00 * metrics.sharpe_ratio
+        + 0.05 * calmar
+        + 0.03 * profit_factor
+        + 0.02 * metrics.total_return
+        - 0.08 * turnover_penalty
+        - 0.10 * metrics.degradation
+    )
+    if trade_count < MIN_OBJECTIVE_TRADES:
+        score -= (MIN_OBJECTIVE_TRADES - trade_count) * 0.05
+    if metrics.max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
+        score -= abs(metrics.max_drawdown - MAX_OBJECTIVE_DRAWDOWN) * 2
+    if metrics.sharpe_ratio < MIN_OBJECTIVE_SHARPE:
+        score -= (MIN_OBJECTIVE_SHARPE - metrics.sharpe_ratio) * 0.25
+    if metrics.total_return <= benchmark_return:
+        score -= abs(benchmark_return - metrics.total_return) + 0.05
+    return round(score, METRIC_ROUND_DIGITS)
+
+
+def _calmar_ratio(total_return: float, max_drawdown: float) -> float:
+    drawdown = abs(max_drawdown)
+    if drawdown == 0:
+        return 0.0
+    return total_return / drawdown
+
+
+def _profit_factor(engine_summary: Mapping[str, Any]) -> float:
+    if "profit_factor" in engine_summary:
+        return _summary_float_default(engine_summary, "profit_factor", 0.0)
+    win_rate = _summary_float_default(engine_summary, "win_rate", 0.0)
+    if win_rate <= 0:
+        return 0.0
+    if win_rate >= 1:
+        return 2.0
+    return min(3.0, win_rate / max(1.0 - win_rate, 0.01))
+
+
+def _benchmark_return(price_rows: Sequence[Mapping[str, Any]]) -> float:
+    if len(price_rows) < 2:
+        return 0.0
+    rows_by_ticker: dict[str, list[Mapping[str, Any]]] = {}
+    for row in price_rows:
+        ticker = str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
+        rows_by_ticker.setdefault(ticker, []).append(row)
+    returns: list[float] = []
+    for ticker, rows in rows_by_ticker.items():
+        sorted_rows = sorted(rows, key=lambda item: str(item["date"]))
+        if len(sorted_rows) < 2:
+            continue
+        first = _finite_float(sorted_rows[0]["close"], f"{ticker}_benchmark_first_close")
+        last = _finite_float(sorted_rows[-1]["close"], f"{ticker}_benchmark_last_close")
+        if first:
+            returns.append(last / first - 1)
+    if not returns:
+        return 0.0
+    return sum(returns) / len(returns)
+
+
+def _backtest_payload(
+    strategy: AIStrategySpec, rows: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    tickers = sorted({str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6) for row in rows})
+    payload = {
+        "strategy_id": strategy.strategy_id,
+        "market": strategy.market,
+        "universe": strategy.universe,
+        "selected_universe": {"name": strategy.universe, "tickers": tickers},
+        "tickers": tickers,
+        "price_rows": len(rows),
+        "first_date": str(rows[0].get("date")) if rows else None,
+        "last_date": str(rows[-1].get("date")) if rows else None,
+        "benchmark_return": round(_benchmark_return(rows), METRIC_ROUND_DIGITS),
+    }
+    fingerprint = repr(sorted(payload.items())).encode("utf-8")
+    return {**payload, "payload_hash": sha256(fingerprint).hexdigest()[:16]}
+
+
 def _price_rows(
     rows: Sequence[Mapping[str, Any]] | None,
 ) -> Sequence[Mapping[str, Any]]:
@@ -526,6 +707,12 @@ def _optional_positive_float(
 def _summary_float(summary: Mapping[str, Any], key: str) -> float:
     if key not in summary:
         raise ValueError(f"engine summary missing {key}")
+    return _finite_float(summary[key], key)
+
+
+def _summary_float_default(summary: Mapping[str, Any], key: str, default: float) -> float:
+    if key not in summary:
+        return default
     return _finite_float(summary[key], key)
 
 

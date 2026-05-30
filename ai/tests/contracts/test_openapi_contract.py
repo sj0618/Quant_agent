@@ -6,6 +6,7 @@ from ai_graph.api import (
     API_STATUS_PATH,
     HEALTH_PATH,
     OPENAPI_URL,
+    SPEC_STRATEGY_PARSE_PATH,
     create_app,
 )
 from ai_graph.jobs import InMemoryAnalysisJobStore
@@ -24,6 +25,9 @@ def test_openapi_contract_keeps_core_routes_and_components() -> None:
     assert API_STATUS_PATH in schema["paths"]
     assert ANALYSIS_JOBS_PATH in schema["paths"]
     assert ANALYSIS_JOB_DETAIL_PATH in schema["paths"]
+    assert SPEC_STRATEGY_PARSE_PATH in schema["paths"]
+    assert "/api/backtests/{strategy_id}" in schema["paths"]
+    assert "/api/reports/{report_id}" in schema["paths"]
     assert "APIEnvelope" in components
     assert "AnalysisJob" in components
     assert "ReportBundle" in components

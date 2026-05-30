@@ -57,7 +57,7 @@ def test_backtest_code_prompt_declares_expected_json_schema() -> None:
     assert request.schema_name == "backtest_code_candidates.v1"
     assert "candidates" in schema["properties"]
     assert schema["properties"]["candidates"]["minItems"] == 3
-    assert schema["properties"]["candidates"]["maxItems"] == 3
+    assert schema["properties"]["candidates"]["maxItems"] == 12
 
 
 def test_backtest_code_schema_validation_failure_records_fallback_reason() -> None:
@@ -69,7 +69,7 @@ def test_backtest_code_schema_validation_failure_records_fallback_reason() -> No
         llm_client=InvalidSchemaLLMClient(),
     )
 
-    assert len(result.candidates) == 3
+    assert len(result.candidates) >= 6
     assert result.fallback_reasons
     assert "ValidationError" in result.fallback_reasons[0]
 
@@ -83,9 +83,9 @@ def test_backtest_code_ast_validation_failure_uses_safe_fallback_candidates() ->
         llm_client=UnsafeCodeLLMClient(),
     )
 
-    assert len(result.candidates) == 3
-    assert all(candidate.validation_ok for candidate in result.candidates)
-    assert "all generated candidates failed AST validation" in result.fallback_reasons
+    assert len(result.candidates) >= 6
+    assert sum(candidate.validation_ok for candidate in result.candidates) >= 6
+    assert any("import 'os' is not allowed" in reason or "build_signals" in reason for reason in result.fallback_reasons)
 
 
 def test_backtest_code_fallback_reason_is_available_in_internal_payload_only() -> None:

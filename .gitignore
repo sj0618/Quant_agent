@@ -2,7 +2,7 @@
 fe/.omx/
 .omx
 .claude
-omx.zip
+.playwright-mcp/
 
 # Node
 node_modules/

@@ -6,6 +6,7 @@ from typing import Any
 
 from ai_graph.data_sources import load_pipeline_data_from_env
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
+from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
 from ai_graph.nodes.backtest import backtest_node
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
@@ -14,9 +15,9 @@ from ai_graph.nodes.signal import signal_node
 from ai_graph.retrieval.search import search_retrieval_corpus
 from ai_graph.schemas import (
     AmbiguityCode,
-    ABBacktestResult,
     APIEnvelope,
     BacktestPerformance,
+    CandidateBacktestResult,
     ClarificationOption,
     Condition,
     EnvelopeStatus,
@@ -144,6 +145,8 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         "data": {
             "candidate_cards": [card.model_dump() for card in cards],
             "pipeline_data_source": pipeline_data.metadata,
+            "screening_candidates": pipeline_data.screening_candidates,
+            "data_availability": pipeline_data.data_availability,
         },
     }
     if pipeline_data.price_rows:
@@ -157,17 +160,22 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
 
 def research_node(state: QuantAgentState) -> dict[str, Any]:
     strategy_a = build_strategy_spec(state["user_query"], variant="A", retrieval=state["retrieval"])
-    strategy_b = build_strategy_spec(state["user_query"], variant="B", retrieval=state["retrieval"])
-    strategy_b = strategy_b.model_copy(
+    debate = build_research_debate(state, strategy_a)
+    original_strategy = strategy_a
+    strategy_a = strategy_a.model_copy(
         update={
-            "name": f"{strategy_b.name} AI 개선본",
-            "assumptions": [*strategy_b.assumptions, "L1/L2 검색 결과로 RSI 기준을 명시화함"],
-            "confidence": min(strategy_b.confidence + 0.05, 0.95),
+            "assumptions": [
+                *strategy_a.assumptions,
+                "L1/L2 검색 결과와 Research Judge 검토로 조건을 명시화함",
+                debate["judge"]["summary"],
+            ],
+            "confidence": min(strategy_a.confidence + 0.03, 0.95),
         }
     )
     return {
+        "original_strategy_spec": original_strategy.model_dump(),
         "strategy_spec": strategy_a.model_dump(),
-        "improved_strategy_spec": strategy_b.model_dump(),
+        "research_debate": debate,
     }
 
 
@@ -181,8 +189,13 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
     if status == EnvelopeStatus.READY:
         payload = {
             "headline": "전략 분석이 완료되었습니다.",
-            "message": "StrategySpec, A/B 백테스트, 신호, 리스크, 리포트를 생성했습니다.",
-            "next_actions": ["web_projection 확인", "email_projection 예약", "실거래 전 데이터 어댑터 연결"],
+            "message": "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다.",
+            "next_actions": [
+                "web_projection 확인",
+                "email_projection 예약",
+                "실거래 전 데이터 어댑터 연결",
+                *_availability_next_actions(state.get("data", {}).get("data_availability", {})),
+            ],
             "candidate_cards": cards,
             "report": report,
             "performance": build_public_backtest_performance(state.get("backtest")),
@@ -226,6 +239,8 @@ def classify_query(query: str) -> AmbiguityCode:
         return AmbiguityCode.CONFLICTING
     if _is_candidate_selection_query(query):
         return AmbiguityCode.READY
+    if _is_specific_supported_screening_query(query):
+        return AmbiguityCode.READY
     if _needs_query_smoothing(query):
         return AmbiguityCode.INPUT_AMBIGUOUS
     if _is_supported_technical_query(query):
@@ -239,6 +254,141 @@ def classify_query(query: str) -> AmbiguityCode:
 
 def strategy_candidate_cards(query: str, hits: list[Any]) -> list[StrategyCandidateCard]:
     lowered = query.lower()
+    if any(term in query for term in ("EPS", "컨센서스", "어닝", "가이던스", "실적 발표")):
+        return [
+            StrategyCandidateCard(
+                strategy_id="earnings_momentum",
+                title="실적 모멘텀",
+                summary="컨센서스 상향·어닝 서프라이즈 조건을 기술적 신고가/상대강도 proxy로 검증합니다.",
+                key_conditions=["EPS 상향", "20일 신고가", "상대강도", "거래량"],
+                confidence=0.7,
+                reason="실적 데이터가 부족한 구간도 가격 신고가와 거래량으로 모멘텀 검증이 가능합니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="breakout_volume_momentum",
+                title="거래량 돌파 모멘텀",
+                summary="신고가 또는 박스권 상단 돌파와 20일 평균 대비 거래량 증가를 결합합니다.",
+                key_conditions=["신고가", "거래량", "20일선", "상대강도"],
+                confidence=0.67,
+                reason="실적 모멘텀의 시장 반응을 OHLCV로 대체 검증합니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="relative_strength_leader",
+                title="상대강도 주도주",
+                summary="시장보다 강한 1개월·3개월 수익률을 우선합니다.",
+                key_conditions=["1개월 RS", "3개월 RS", "50일선"],
+                confidence=0.63,
+                reason="컨센서스 확인 전에도 주가 반응이 강한 후보를 좁힙니다.",
+            ),
+        ]
+    if any(term in query for term in ("기관", "외국인", "공매도", "숏커버링", "갭", "수급")):
+        return [
+            StrategyCandidateCard(
+                strategy_id="flow_accumulation",
+                title="수급 모멘텀",
+                summary="기관·외국인 순매수 또는 수급 이벤트를 거래량·양봉·20일선 proxy로 검증합니다.",
+                key_conditions=["순매수", "거래량", "양봉", "20일선"],
+                confidence=0.66,
+                reason="수급 원천 데이터가 없으면 가격·거래량 반응으로 1차 후보를 만듭니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="short_covering_proxy",
+                title="숏커버링 proxy",
+                summary="공매도 잔고 조건은 거래량 증가와 양봉 돌파로 대체 검증합니다.",
+                key_conditions=["공매도", "거래량 증가", "양봉 돌파"],
+                confidence=0.6,
+                reason="공매도 데이터 연결 전에도 커버링성 가격 반응을 볼 수 있습니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="breakout_volume_momentum",
+                title="거래량 돌파 모멘텀",
+                summary="수급이 가격 돌파로 이어졌는지 확인합니다.",
+                key_conditions=["신고가", "거래량", "상대강도"],
+                confidence=0.58,
+                reason="수급 이벤트의 후행 확인 조건입니다.",
+            ),
+        ]
+    if any(term in query for term in ("볼린저", "밴드", "변동성")):
+        return [
+            StrategyCandidateCard(
+                strategy_id="bollinger_squeeze_breakout",
+                title="볼린저 스퀴즈 돌파",
+                summary="밴드 폭 축소 후 상단 돌파, 또는 하단 이탈 후 재진입을 봅니다.",
+                key_conditions=["밴드폭 축소", "상단 돌파", "재진입", "저변동성"],
+                confidence=0.76,
+                reason="입력의 변동성 축소/밴드 조건과 직접 매칭됩니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="rsi_rebound",
+                title="RSI 과매도 반등",
+                summary="하단 이탈 뒤 반등 여부를 RSI 회복으로 보조 확인합니다.",
+                key_conditions=["RSI <= 30", "RSI 회복", "거래량"],
+                confidence=0.68,
+                reason="밴드 재진입과 같은 평균회귀 후보입니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="breakout_volume_momentum",
+                title="거래량 돌파 모멘텀",
+                summary="스퀴즈 이후 상단 돌파를 거래량으로 확인합니다.",
+                key_conditions=["상단 돌파", "거래량", "20일선"],
+                confidence=0.64,
+                reason="스퀴즈 돌파의 확인 후보입니다.",
+            ),
+        ]
+    if "배당" in query or any(term in query for term in ("리츠", "유틸리티", "금리")):
+        return [
+            StrategyCandidateCard(
+                strategy_id="dividend_defensive",
+                title="배당 방어주",
+                summary="배당수익률·재무 안정성과 200일선 회복 여부를 함께 봅니다.",
+                key_conditions=["배당수익률", "부채비율", "배당 삭감 없음", "200일선"],
+                confidence=0.72,
+                reason="입력의 배당/인컴 성격과 가장 직접적으로 연결됩니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="low_vol_defensive",
+                title="저변동 배당 방어주",
+                summary="저변동성·배당·상대강도를 결합해 방어주 후보를 좁힙니다.",
+                key_conditions=["저변동성", "배당", "상대강도", "20일선"],
+                confidence=0.68,
+                reason="방어주 문맥이면 변동성 필터를 함께 적용합니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="rate_sensitive_income",
+                title="금리 민감 인컴주",
+                summary="리츠·유틸리티·배당주의 금리 하락기 강세를 기술 신호로 확인합니다.",
+                key_conditions=["금리", "인컴", "50일선", "상대강도"],
+                confidence=0.62,
+                reason="금리 하락기 문맥의 대체 후보입니다.",
+            ),
+        ]
+    if any(term in query for term in ("성장주", "성장률", "영업이익률", "퀄리티", "매출")):
+        return [
+            StrategyCandidateCard(
+                strategy_id="quality_growth",
+                title="퀄리티 성장주",
+                summary="수익성·ROE·매출 성장률 조건을 50일선 추세 proxy로 검증합니다.",
+                key_conditions=["ROE", "영업이익률", "매출 성장률", "50일선"],
+                confidence=0.7,
+                reason="성장성과 수익성 조건을 모두 포함합니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="reasonable_growth",
+                title="합리적 성장주",
+                summary="ROE·매출 성장률·PER 업종 비교를 결합한 GARP 후보입니다.",
+                key_conditions=["ROE", "매출 성장률", "PER 업종 이하", "50일선"],
+                confidence=0.68,
+                reason="성장성과 밸류에이션을 동시에 요구할 때 적합합니다.",
+            ),
+            StrategyCandidateCard(
+                strategy_id="growth_momentum",
+                title="성장 모멘텀",
+                summary="성장률 상위 후보 중 50일선 위 추세가 살아 있는 종목을 봅니다.",
+                key_conditions=["성장률", "업종 상위", "50일선", "상대강도"],
+                confidence=0.64,
+                reason="성장 조건의 시장 반응을 가격 추세로 확인합니다.",
+            ),
+        ]
     if any(term in lowered or term in query for term in ("per", "pbr", "roe", "저평가", "가치", "부채", "순현금", "배당", "fcf")):
         return [
             StrategyCandidateCard(
@@ -499,6 +649,53 @@ def _is_supported_technical_query(query: str) -> bool:
     return any(term in lowered or term in query for term in technical_terms)
 
 
+def _is_specific_supported_screening_query(query: str) -> bool:
+    if _is_supported_technical_query(query):
+        return True
+    lowered = query.lower()
+    condition_terms = (
+        "per",
+        "pbr",
+        "roe",
+        "eps",
+        "fcf",
+        "부채비율",
+        "영업이익",
+        "영업이익률",
+        "roe",
+        "매출",
+        "성장률",
+        "배당수익률",
+        "배당 삭감",
+        "순현금",
+        "자사주",
+        "컨센서스",
+        "어닝",
+        "가이던스",
+        "기관",
+        "외국인",
+        "공매도",
+        "금리",
+        "환율",
+        "원달러",
+        "원자재",
+        "마진",
+        "재고",
+        "업종 평균",
+        "고점",
+        "하락",
+        "조정",
+        "과매도",
+        "우량주",
+        "리츠",
+        "유틸리티",
+        "기술적 상승",
+    )
+    matched = sum(1 for term in condition_terms if term in lowered or term in query)
+    has_numeric_or_rank = any(token in lowered or token in query for token in ("%", "이상", "이하", "상위", "연속", "최근", "3개월", "4분기", "5거래일", "양호", "개선", "상향", "하락", "조정", "현재"))
+    return matched >= 2 and has_numeric_or_rank
+
+
 def _has_known_strategy_term(query: str) -> bool:
     known_terms = ("눌림목", "숏커버링", "방어주", "주도주", "스퀴즈", "과매도")
     return any(term in query for term in known_terms)
@@ -514,6 +711,7 @@ def _needs_query_smoothing(query: str) -> bool:
         "fcf",
         "저평가",
         "가치",
+        "성장주",
         "컨센서스",
         "배당",
         "부채",
@@ -577,6 +775,65 @@ def build_strategy_spec(query: str, *, variant: str, retrieval: dict[str, Any]) 
     )
 
 
+def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> dict[str, Any]:
+    context = {
+        "query": state.get("user_query"),
+        "strategy": strategy.model_dump(),
+        "retrieval_hits": state.get("retrieval", {}).get("hits", []),
+        "data_availability": state.get("data", {}).get("data_availability", {}),
+        "screening_candidate_count": len(state.get("data", {}).get("screening_candidates", [])),
+    }
+    bull = generate_role_debate(
+        role="RESEARCH_BULL",
+        task="Collect only supportive evidence for the strategy specification.",
+        context=context,
+        fallback=RoleDebatePayload(
+            role="RESEARCH_BULL",
+            summary="가격/거래량/TA 조건은 공용 DB로 즉시 검증 가능하며 전략 후보의 실행 가능성이 높습니다.",
+            evidence=["L1/L2 retrieval matched the strategy intent.", "OHLCV/TA data source is available when AI_DATABASE_DSN is configured."],
+            concerns=[],
+            recommendation="proceed",
+            confidence=0.72,
+        ),
+    )
+    bear = generate_role_debate(
+        role="RESEARCH_BEAR",
+        task="Collect only limitations and missing-data risks for the strategy specification.",
+        context=context,
+        fallback=RoleDebatePayload(
+            role="RESEARCH_BEAR",
+            summary="재무·컨센서스·공시·실시간 뉴스 조건은 현재 DB 상태에 따라 proxy 또는 availability 표시가 필요합니다.",
+            evidence=[],
+            concerns=["OpenDART feature mart is empty.", "BOK macro mart is pilot-only.", "Agentic web search is not connected in MVP."],
+            recommendation="proceed_with_proxy_disclosure",
+            confidence=0.7,
+        ),
+    )
+    judge = generate_role_debate(
+        role="RESEARCH_JUDGE",
+        task="Judge source sufficiency and produce the final StrategySpec decision.",
+        context={**context, "bull": bull.model_dump(), "bear": bear.model_dump()},
+        fallback=RoleDebatePayload(
+            role="RESEARCH_JUDGE",
+            summary="기술 조건은 ready로 진행하고, 미적재 데이터 조건은 proxy와 data_availability에 명시합니다.",
+            evidence=["Role-separated research completed with deterministic fallback when AOAI is unavailable."],
+            concerns=bear.concerns,
+            recommendation="ready",
+            confidence=0.74,
+            validation_results={
+                "source_sufficiency": "partial",
+                "source_diversity": "local_db_only",
+                "proxy_disclosure": "required",
+            },
+        ),
+    )
+    return {
+        "bull": bull.model_dump(),
+        "bear": bear.model_dump(),
+        "judge": judge.model_dump(),
+    }
+
+
 def _strategy_profile(query: str) -> dict[str, Any]:
     lowered = query.lower()
     if "dividend_defensive" in lowered or "배당 방어주" in query:
@@ -633,6 +890,373 @@ def _strategy_profile(query: str) -> dict[str, Any]:
             "assumptions": ["성장성과 밸류에이션을 결합한 GARP 후보로 확정"],
             "confidence": 0.72,
         }
+    if any(term in query for term in ("순현금", "자사주", "PBR 1배")):
+        return {
+            "strategy_id": "asset_value_catalyst",
+            "name": "KOSPI200 자산가치 촉매",
+            "entry_conditions": [
+                Condition(left="pbr", operator="lte", right=1, description="PBR 1배 이하"),
+                Condition(left="net_cash", operator="gte", right=1, description="순현금 보유"),
+                Condition(left="buyback_notice", operator="eq", right=1, description="자사주 매입 공시"),
+                Condition(left="close_above_sma_20", operator="eq", right=1, description="20일선 위 기술 확인"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+            ],
+            "indicators": ["PBR", "net_cash", "buyback_notice", "SMA20"],
+            "assumptions": ["공시/재무 조건은 후보 필터, OHLCV 기반 추세 회복은 백테스트 proxy로 사용"],
+            "confidence": 0.69,
+        }
+    if any(term in lowered or term in query for term in ("저per", "per", "pbr", "저평가", "가치주")):
+        return {
+            "strategy_id": "value_quality",
+            "name": "KOSPI200 저평가 퀄리티",
+            "entry_conditions": [
+                Condition(left="per_percentile", operator="lte", right=0.4, description="PER 업종/시장 하위권"),
+                Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
+                Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
+                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+            ],
+            "exit_conditions": [
+                Condition(left="relative_strength_20d", operator="lt", right=0, description="단기 상대강도 약화")
+            ],
+            "indicators": ["PER", "ROE", "debt_ratio", "relative_strength_20d"],
+            "assumptions": ["재무 조건은 후보 필터, OHLCV 기반 상대강도는 검증 proxy로 사용"],
+            "confidence": 0.75,
+        }
+    if any(term in query for term in ("저변동성", "방어주")) and "배당" in query:
+        return {
+            "strategy_id": "low_vol_defensive",
+            "name": "KOSPI200 저변동 배당 방어주",
+            "entry_conditions": [
+                Condition(left="realized_volatility_20d", operator="lte", right=0.25, description="20일 변동성 낮음"),
+                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 시장 대비 우위"),
+                Condition(left="dividend_yield", operator="gte", right=0.04, description="배당수익률 양호"),
+                Condition(left="close_above_sma_20", operator="eq", right=1, description="20일선 위"),
+            ],
+            "exit_conditions": [
+                Condition(left="relative_strength_20d", operator="lt", right=0, description="상대강도 약화")
+            ],
+            "indicators": ["realized_volatility_20d", "relative_strength_20d", "dividend_yield", "SMA20"],
+            "assumptions": ["방어주 성격은 저변동성과 배당 조건, 진입 타이밍은 OHLCV proxy로 검증"],
+            "confidence": 0.7,
+        }
+    if any(term in query for term in ("금리", "리츠", "유틸리티")):
+        return {
+            "strategy_id": "rate_sensitive_income",
+            "name": "KOSPI200 금리 민감 인컴주",
+            "entry_conditions": [
+                Condition(left="rate_down_proxy", operator="eq", right=1, description="금리 하락기 강세 업종 후보"),
+                Condition(left="dividend_yield", operator="gte", right=0.04, description="배당 또는 인컴 성격"),
+                Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위 기술 상승"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+            ],
+            "indicators": ["rate_down_proxy", "dividend_yield", "SMA50"],
+            "assumptions": ["금리 민감도와 업종 분류는 후보 필터, 현재 검증은 추세 proxy로 수행"],
+            "confidence": 0.66,
+        }
+    if "배당" in query:
+        return {
+            "strategy_id": "dividend_defensive",
+            "name": "KOSPI200 배당 방어주",
+            "entry_conditions": [
+                Condition(left="dividend_yield", operator="gte", right=0.04, description="배당수익률 4% 이상"),
+                Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
+                Condition(left="dividend_cut_5y", operator="eq", right=0, description="최근 5년 배당 삭감 없음"),
+                Condition(left="close_above_sma_200", operator="eq", right=1, description="200일선 위 기술 확인"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈")
+            ],
+            "indicators": ["dividend_yield", "debt_ratio", "dividend_cut_5y", "SMA200"],
+            "assumptions": [
+                "배당수익률과 부채비율은 L1/L2에서 재무 안정성 필터로 해석",
+                "배당 삭감 이력 데이터가 없으면 후보 확정 후 기술 proxy 백테스트로 검증",
+            ],
+            "confidence": 0.73,
+        }
+    if any(term in query for term in ("원달러", "환율", "수출주")):
+        return {
+            "strategy_id": "fx_exporter_revision",
+            "name": "KOSPI200 환율 수혜 이익상향",
+            "entry_conditions": [
+                Condition(left="fx_benefit_proxy", operator="eq", right=1, description="환율 상승 수혜 업종 후보"),
+                Condition(left="earnings_revision_3m", operator="gte", right=0, description="이익 전망 상향"),
+                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+            ],
+            "exit_conditions": [
+                Condition(left="relative_strength_20d", operator="lt", right=0, description="상대강도 약화")
+            ],
+            "indicators": ["fx_benefit_proxy", "earnings_revision_3m", "relative_strength_20d"],
+            "assumptions": ["환율 수혜와 이익 전망은 후보 필터, OHLCV 상대강도는 검증 proxy로 사용"],
+            "confidence": 0.65,
+        }
+    if any(term in query for term in ("원자재", "마진 개선", "화학", "운송", "소비재")):
+        return {
+            "strategy_id": "margin_improvement",
+            "name": "KOSPI200 원가하락 마진 개선",
+            "entry_conditions": [
+                Condition(left="input_cost_tailwind_proxy", operator="eq", right=1, description="원자재 가격 하락 수혜 후보"),
+                Condition(left="operating_margin_improving", operator="eq", right=1, description="영업이익률 개선"),
+                Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+            ],
+            "indicators": ["input_cost_tailwind_proxy", "operating_margin", "SMA50"],
+            "assumptions": ["원자재/업종 민감도는 후보 필터, 기술 추세는 검증 proxy로 사용"],
+            "confidence": 0.64,
+        }
+    if any(term in query for term in ("매출총이익률", "재고자산", "재고")):
+        return {
+            "strategy_id": "margin_inventory_quality",
+            "name": "KOSPI200 마진·재고 퀄리티",
+            "entry_conditions": [
+                Condition(left="gross_margin_streak", operator="gte", right=3, description="매출총이익률 3개 분기 개선"),
+                Condition(left="inventory_growth_vs_sales", operator="lte", right=1, description="재고 증가율이 매출 증가율 이하"),
+                Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+            ],
+            "indicators": ["gross_margin", "inventory_growth", "sales_growth", "SMA50"],
+            "assumptions": ["분기 재무 품질 조건은 후보 필터, 가격 추세로 타이밍을 검증"],
+            "confidence": 0.68,
+        }
+    if any(term in lowered or term in query for term in ("fcf", "현금흐름", "현금흐름이 안정")):
+        return {
+            "strategy_id": "fcf_recovery",
+            "name": "KOSPI200 FCF 회복주",
+            "entry_conditions": [
+                Condition(left="fcf_yield", operator="gte", right=0.05, description="FCF 수익률 양호"),
+                Condition(left="cashflow_stability", operator="eq", right=1, description="현금흐름 안정"),
+                Condition(left="close_above_sma_200", operator="eq", right=1, description="200일선 위 회복"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_200", operator="eq", right=1, description="200일선 재이탈")
+            ],
+            "indicators": ["FCF_yield", "cashflow_stability", "SMA200"],
+            "assumptions": ["현금흐름 조건은 후보 필터, 200일선 회복은 기술 proxy로 검증"],
+            "confidence": 0.69,
+        }
+    if "4분기" in query or ("영업이익" in query and "60일 고점" in query):
+        return {
+            "strategy_id": "operating_profit_pullback",
+            "name": "KOSPI200 이익성장 조정주",
+            "entry_conditions": [
+                Condition(left="operating_profit_growth_streak", operator="gte", right=4, description="4분기 연속 영업이익 증가"),
+                Condition(left="drawdown_60d", operator="lte", right=-0.1, description="60일 고점 대비 10% 이상 조정"),
+                Condition(left="relative_strength_60d", operator="gte", right=0, description="중기 상대강도 유지"),
+            ],
+            "exit_conditions": [
+                Condition(left="relative_strength_60d", operator="lt", right=0, description="중기 상대강도 훼손")
+            ],
+            "indicators": ["operating_profit_growth", "drawdown_60d", "relative_strength_60d"],
+            "assumptions": ["분기 이익 조건은 후보 필터, 조정 폭과 상대강도는 OHLCV proxy로 검증"],
+            "confidence": 0.68,
+        }
+    if any(term in query for term in ("어닝", "가이던스", "EPS", "컨센서스", "실적 발표")):
+        if any(term in query for term in ("60거래일", "20% 이상 하락", "과매도 우량주")):
+            return {
+                "strategy_id": "oversold_quality",
+                "name": "KOSPI200 과매도 우량주",
+                "entry_conditions": [
+                    Condition(left="drawdown_60d", operator="lte", right=-0.2, description="60일 고점 대비 20% 이상 하락"),
+                    Condition(left="earnings_revision_3m", operator="gte", right=0, description="실적 컨센서스 유지"),
+                    Condition(left="rsi", operator="lte", right=35, description="과매도권"),
+                ],
+                "exit_conditions": [
+                    Condition(left="rsi", operator="gte", right=60, description="반등 과열 전 청산")
+                ],
+                "indicators": ["drawdown_60d", "earnings_revision_3m", "RSI"],
+                "assumptions": ["컨센서스 유지 조건은 후보 필터, 낙폭과 RSI는 OHLCV proxy로 검증"],
+                "confidence": 0.69,
+            }
+        if "어닝" in query or "가이던스" in query or "실적 발표" in query:
+            strategy_id = "earnings_surprise_guidance"
+            name = "KOSPI200 어닝 서프라이즈 가이던스"
+        else:
+            strategy_id = "earnings_momentum"
+            name = "KOSPI200 실적 모멘텀"
+        return {
+            "strategy_id": strategy_id,
+            "name": name,
+            "entry_conditions": [
+                Condition(left="earnings_revision_3m", operator="gte", right=0, description="최근 3개월 이익 전망 상향"),
+                Condition(left="breakout_high", operator="eq", right=1, description="20일 신고가 또는 상단 돌파"),
+                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+            ],
+            "exit_conditions": [
+                Condition(left="relative_strength_20d", operator="lt", right=0, description="상대강도 약화")
+            ],
+            "indicators": ["earnings_revision_3m", "rolling_high", "relative_strength_20d"],
+            "assumptions": ["실적/가이던스 조건은 후보 필터, 신고가와 상대강도는 검증 proxy로 사용"],
+            "confidence": 0.72,
+        }
+    if any(term in query for term in ("기관", "외국인")):
+        return {
+            "strategy_id": "flow_accumulation",
+            "name": "KOSPI200 기관·외국인 수급 모멘텀",
+            "entry_conditions": [
+                Condition(left="net_buy_streak_5d", operator="gte", right=5, description="기관·외국인 5거래일 순매수"),
+                Condition(left="close_above_sma_20", operator="eq", right=1, description="주가 20일선 위"),
+                Condition(left="volume_ratio_20", operator="gte", right=1, description="거래량 확인"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+            ],
+            "indicators": ["net_buy_streak_5d", "SMA20", "volume_ratio_20"],
+            "assumptions": ["수급 데이터가 없으면 거래량과 20일선 proxy로 검증"],
+            "confidence": 0.66,
+        }
+    if "공매도" in query or "숏커버링" in query:
+        return {
+            "strategy_id": "short_covering_proxy",
+            "name": "KOSPI200 숏커버링 proxy",
+            "entry_conditions": [
+                Condition(left="short_balance_high", operator="eq", right=1, description="공매도 잔고 높은 후보"),
+                Condition(left="volume_ratio_20", operator="gte", right=1.5, description="거래량 증가"),
+                Condition(left="bullish_breakout", operator="eq", right=1, description="양봉 돌파"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+            ],
+            "indicators": ["short_balance", "volume_ratio_20", "bullish_breakout"],
+            "assumptions": ["공매도 잔고는 후보 필터, 거래량·양봉 돌파는 백테스트 proxy로 사용"],
+            "confidence": 0.62,
+        }
+    if "갭" in query or "수급" in query:
+        return {
+            "strategy_id": "gap_hold_momentum",
+            "name": "KOSPI200 갭 유지 수급 모멘텀",
+            "entry_conditions": [
+                Condition(left="gap_up", operator="eq", right=1, description="최근 갭 상승"),
+                Condition(left="gap_unfilled", operator="eq", right=1, description="갭 미충족 횡보"),
+                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+            ],
+            "exit_conditions": [
+                Condition(left="gap_filled", operator="eq", right=1, description="갭 메움")
+            ],
+            "indicators": ["gap_up", "gap_unfilled", "relative_strength_20d"],
+            "assumptions": ["갭 유지 여부는 OHLCV 패턴으로 검증"],
+            "confidence": 0.67,
+        }
+    if any(term in query for term in ("볼린저", "밴드", "변동성")):
+        return {
+            "strategy_id": "bollinger_squeeze_breakout",
+            "name": "KOSPI200 볼린저 스퀴즈 돌파",
+            "entry_conditions": [
+                Condition(left="bb_width_percentile", operator="lte", right=0.25, description="밴드 폭 축소"),
+                Condition(left="bollinger_breakout", operator="eq", right=1, description="상단 돌파 또는 밴드 재진입"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_middle_band", operator="eq", right=1, description="중심선 이탈")
+            ],
+            "indicators": ["Bollinger Bands", "realized_volatility"],
+            "assumptions": ["상단 돌파와 하단 재진입은 입력 문맥에 따라 L2에서 분기"],
+            "confidence": 0.74,
+        }
+    if "200일" in query and "rsi" in lowered:
+        return {
+            "strategy_id": "trend_rsi_volume_pullback",
+            "name": "KOSPI200 추세 내 RSI 눌림목",
+            "entry_conditions": [
+                Condition(left="close_above_sma_200", operator="eq", right=1, description="200일선 위 상승추세"),
+                Condition(left="rsi", operator="lte", right=40, description="RSI 40 이하 눌림"),
+                Condition(left="volume_ratio_20", operator="gte", right=1, description="거래량 20일 평균 이상"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+            ],
+            "indicators": ["SMA200", "RSI", "volume_ratio_20"],
+            "assumptions": ["장기 추세는 200일선, 단기 눌림은 RSI와 거래량으로 검증"],
+            "confidence": 0.76,
+        }
+    if "1개월" in query and "6개월" in query:
+        return {
+            "strategy_id": "midterm_pullback",
+            "name": "KOSPI200 중기 상승추세 눌림목",
+            "entry_conditions": [
+                Condition(left="relative_strength_20d", operator="lt", right=0, description="최근 1개월 시장 대비 약세"),
+                Condition(left="relative_strength_120d", operator="gte", right=0, description="6개월 시장 대비 강세"),
+                Condition(left="close_above_sma_200", operator="eq", right=1, description="장기 추세 유지"),
+            ],
+            "exit_conditions": [
+                Condition(left="relative_strength_120d", operator="lt", right=0, description="중기 상대강도 훼손")
+            ],
+            "indicators": ["relative_strength_20d", "relative_strength_120d", "SMA200"],
+            "assumptions": ["중기 추세와 단기 조정의 조합을 OHLCV proxy로 검증"],
+            "confidence": 0.72,
+        }
+    if "120일" in query and "20일선" in query:
+        return {
+            "strategy_id": "breakout_pullback",
+            "name": "KOSPI200 신고가 돌파 후 되돌림",
+            "entry_conditions": [
+                Condition(left="breakout_high", operator="eq", right=1, description="120일 신고가 돌파 이력"),
+                Condition(left="pullback_to_sma_20", operator="eq", right=1, description="20일선까지 되돌림"),
+                Condition(left="relative_strength_60d", operator="gte", right=0, description="중기 상대강도 유지"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+            ],
+            "indicators": ["rolling_high", "SMA20", "relative_strength_60d"],
+            "assumptions": ["신고가 이후 눌림목을 추세 지속 proxy로 검증"],
+            "confidence": 0.74,
+        }
+    if "돌파 대기" in query or "횡보" in query:
+        return {
+            "strategy_id": "breakout_setup",
+            "name": "KOSPI200 돌파 대기",
+            "entry_conditions": [
+                Condition(left="near_recent_high", operator="eq", right=1, description="최근 신고가 근처"),
+                Condition(left="volume_dry_up", operator="eq", right=1, description="거래량 감소 횡보"),
+                Condition(left="turnover_sufficient", operator="eq", right=1, description="거래대금 충분"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+            ],
+            "indicators": ["near_recent_high", "volume_dry_up", "turnover"],
+            "assumptions": ["거래대금과 횡보 압축은 OHLCV proxy로 검증"],
+            "confidence": 0.68,
+        }
+    if any(term in query for term in ("영업이익률", "영업이익", "매출 성장률", "퀄리티 성장", "성장주")):
+        if "ROE 15%" in query or "합리적 성장주" in query or "PER" in query:
+            return {
+                "strategy_id": "reasonable_growth",
+                "name": "KOSPI200 합리적 성장주",
+                "entry_conditions": [
+                    Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
+                    Condition(left="sales_growth", operator="gte", right=0.1, description="매출 성장률 10% 이상"),
+                    Condition(left="per_vs_industry", operator="lte", right=1, description="PER 업종 평균 이하"),
+                    Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위"),
+                ],
+                "exit_conditions": [
+                    Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+                ],
+                "indicators": ["ROE", "sales_growth", "PER", "SMA50"],
+                "assumptions": ["성장성과 밸류에이션을 결합한 GARP 후보로 확정"],
+                "confidence": 0.72,
+            }
+        strategy_id = "quality_growth" if "ROE" in query or "업종 평균" in query else "growth_momentum"
+        return {
+            "strategy_id": strategy_id,
+            "name": "KOSPI200 퀄리티 성장주" if strategy_id == "quality_growth" else "KOSPI200 성장 모멘텀",
+            "entry_conditions": [
+                Condition(left="sales_growth", operator="gte", right=0.2 if "20%" in query else 0.1, description="매출 성장률 양호"),
+                Condition(left="operating_margin_improving", operator="eq", right=1, description="영업이익률 개선"),
+                Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
+                Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위"),
+            ],
+            "exit_conditions": [
+                Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+            ],
+            "indicators": ["sales_growth", "operating_margin", "debt_ratio", "SMA50"],
+            "assumptions": ["성장·수익성 조건은 후보 필터, 추세는 OHLCV proxy로 검증"],
+            "confidence": 0.7,
+        }
     if "rsi" in lowered or "과매도" in query or "반등" in query:
         return {
             "strategy_id": "rsi_rebound",
@@ -654,11 +1278,13 @@ def _strategy_profile(query: str) -> dict[str, Any]:
             "entry_conditions": [
                 Condition(left="breakout_high", operator="eq", right=1, description="신고가 또는 상단 돌파"),
                 Condition(left="volume_ratio_20", operator="gte", right=1.5, description="20일 평균 대비 거래량 150% 이상"),
+                Condition(left="close_above_sma_20", operator="eq", right=1, description="종가가 20일선 위"),
+                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
             ],
             "exit_conditions": [
                 Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
             ],
-            "indicators": ["rolling_high", "volume_ratio_20", "SMA20"],
+            "indicators": ["rolling_high", "volume_ratio_20", "SMA20", "relative_strength_20d"],
             "assumptions": ["신고가 기간은 입력의 52주/120일/20일 표현에 맞춰 L2에서 선택"],
             "confidence": 0.8,
         }
@@ -729,11 +1355,15 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
             "ambiguity",
             "data",
             "strategy_spec",
+            "original_strategy_spec",
+            "research_debate",
             "backtest_code",
             "backtest",
             "signal",
+            "signal_debate",
             "investment_signal",
             "risk",
+            "report_debate",
             "report",
         )
         if key in state
@@ -743,6 +1373,7 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
         "schema_validation": "pydantic",
         "langgraph_optional": True,
         "pipeline_data_source": state.get("data", {}).get("pipeline_data_source", {}),
+        "data_availability": state.get("data", {}).get("data_availability", {}),
     }
     return InternalPayload(
         trace_id=state["trace_id"],
@@ -761,12 +1392,14 @@ def build_public_backtest_performance(
     if not backtest:
         return None
 
-    result = ABBacktestResult.model_validate(backtest)
+    result = CandidateBacktestResult.model_validate(backtest)
+    if result.selected_candidate.metrics is None:
+        return None
     return BacktestPerformance(
-        selected_variant=result.selected_candidate.variant,
         selected_candidate_id=result.selected_candidate.candidate_id,
-        metrics_by_variant=result.metrics_by_variant,
-        equity_curve_by_variant=result.equity_curve_by_variant,
+        metrics=result.selected_candidate.metrics,
+        equity_curve=result.equity_curve,
+        engine_summary=result.engine_summary,
     )
 
 
@@ -786,6 +1419,15 @@ def _ambiguity_reason(category: AmbiguityCode) -> str:
         AmbiguityCode.CONFLICTING: "낮은 변동성과 단기 급등 목표가 서로 충돌합니다.",
         AmbiguityCode.INFEASIBLE: "옵션/선물/가상자산은 AI MVP 지원 범위 밖입니다.",
     }[category]
+
+
+def _availability_next_actions(data_availability: Mapping[str, Any]) -> list[str]:
+    if not data_availability:
+        return []
+    proxy_items = data_availability.get("proxy_used")
+    if isinstance(proxy_items, list) and proxy_items:
+        return ["재무/공시/뉴스 조건은 proxy 여부 확인"]
+    return []
 
 
 def _route_after_data(state: QuantAgentState) -> str:

@@ -8,6 +8,7 @@ from ai_graph.api import (
     DOCS_URL,
     HEALTH_PATH,
     OPENAPI_URL,
+    SPEC_STRATEGY_PARSE_PATH,
     create_app,
 )
 from ai_graph.jobs import InMemoryAnalysisJobStore
@@ -44,6 +45,10 @@ def test_swagger_openapi_lists_current_api_surface() -> None:
     assert API_STATUS_PATH in paths
     assert ANALYSIS_JOBS_PATH in paths
     assert ANALYSIS_JOB_DETAIL_PATH in paths
+    assert SPEC_STRATEGY_PARSE_PATH in paths
+    assert "/api/analysis-jobs/{job_id}" in paths
+    assert "/api/backtests/{strategy_id}" in paths
+    assert "/api/reports/{report_id}" in paths
 
 
 def test_api_status_exposes_data_source_without_dsn_value(monkeypatch) -> None:
@@ -113,9 +118,10 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert {stage["status"] for stage in created_job["stages"]} == {"succeeded"}
     performance = created_job["result"]["user_payload"]["performance"]
     assert performance["selected_candidate_id"]
-    assert set(performance["metrics_by_variant"]) == {"A", "B"}
-    assert performance["metrics_by_variant"][performance["selected_variant"]]["total_return"] > 0
-    assert performance["equity_curve_by_variant"][performance["selected_variant"]][-1]["cumulative_return"] > 0
+    assert "metrics_by_variant" not in performance
+    assert "selected_variant" not in performance
+    assert performance["metrics"]["total_return"] > 0
+    assert performance["equity_curve"][-1]["cumulative_return"] > 0
 
     poll_response = client.get(f"{ANALYSIS_JOBS_PATH}/{created_job['job_id']}")
 
@@ -123,6 +129,50 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     polled_job = poll_response.json()
     assert polled_job["job_id"] == created_job["job_id"]
     assert polled_job["trace_id"] == created_job["trace_id"]
+
+
+def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adapters() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    create_response = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={
+            "natural_language": "최근 52주 신고가를 돌파했고 거래량이 20일 평균 대비 150% 이상 증가한 종목을 찾아줘.",
+            "market": "KR",
+            "universe": "KOSPI200",
+            "client_request_id": "client-1",
+        },
+    )
+
+    assert create_response.status_code == 201
+    created_job = create_response.json()
+    assert created_job["result"]["status"] == "ready"
+
+    poll_response = client.get(f"/api/analysis-jobs/{created_job['job_id']}")
+    assert poll_response.status_code == 200
+    assert poll_response.json()["job_id"] == created_job["job_id"]
+
+    backtest_response = client.get("/api/backtests/breakout_volume_momentum")
+    assert backtest_response.status_code == 200
+    assert backtest_response.json()["status"] == "ready"
+    assert backtest_response.json()["user_payload"]["performance"]["selected_candidate_id"]
+
+    report_response = client.get(f"/api/reports/{created_job['job_id']}")
+    assert report_response.status_code == 200
+    assert report_response.json()["status"] == "ready"
+    assert report_response.json()["user_payload"]["report"]["web_projection"]["sections"]
+
+
+def test_spec_resource_adapters_return_failed_envelope_instead_of_404() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    backtest_response = client.get("/api/backtests/missing")
+    report_response = client.get("/api/reports/missing")
+
+    assert backtest_response.status_code == 200
+    assert backtest_response.json()["status"] == "failed"
+    assert report_response.status_code == 200
+    assert report_response.json()["status"] == "failed"
 
 
 def test_analysis_job_route_uses_injected_store_and_preserves_polling_contract() -> None:

@@ -3,7 +3,6 @@ import { appOverview, analysisJobStatus, performanceSummary, tradingCandidates }
 import { landingSample } from "../mocks/landing.mock";
 import { reportDetails, reportSummaries } from "../mocks/reports.mock";
 import type {
-  ABComparisonRow,
   AIBacktestMetrics,
   AIBacktestPerformance,
   AICondition,
@@ -22,6 +21,7 @@ import type {
   EquityPoint,
   LandingSample,
   PerformanceSummary,
+  PerformanceComparisonRow,
   ReportDetail,
   ReportSummary,
   SignalType,
@@ -40,23 +40,20 @@ const TRACE_PREVIEW_LENGTH = 8;
 const PERCENT_DISPLAY_DIGITS = 2;
 const DECIMAL_DISPLAY_DIGITS = 2;
 const BASELINE_RETURN_PERCENT = 0;
+const AI_REQUEST_TIMEOUT_MS = 45_000;
 const STORAGE_KEY_LATEST_ANALYSIS_JOB = "quantagent.latest-analysis-job.v1";
 const AI_REPORT_ID_PREFIX = "ai-job:";
-const VARIANT_LABELS: Record<"A" | "B", string> = {
-  A: "원본 전략",
-  B: "AI 개선본",
-};
 const TIMEFRAME_LABELS: Record<string, string> = {
   daily: "매일 분석",
   weekly: "매주 분석",
   monthly: "매월 분석",
 };
 const STAGE_LABELS: Record<AIJobStage, string> = {
-  interpreting: "전략 해석",
-  code_generation: "코드 후보 생성",
-  backtest: "백테스트",
-  debate: "신호·리스크 검토",
-  finalizing: "리포트 생성",
+  interpreting: "전략 해석 중",
+  code_generation: "코드 생성 중",
+  backtest: "백테스트 실행 중",
+  debate: "정반 토론 중",
+  finalizing: "최종 결정 중",
 };
 const WORKSPACE_STAGE_BY_AI_STAGE: Record<AIJobStage, AnalysisStage> = {
   interpreting: "strategy_parse",
@@ -94,6 +91,25 @@ function assertOk(response: Response) {
   }
 }
 
+async function fetchAI(path: string, init: RequestInit = {}) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(`${requireAiApiBaseUrl()}${path}`, {
+      ...init,
+      credentials: init.credentials ?? "include",
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("AI 분석 요청 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
 function readLatestAnalysisJob(): AnalysisJob | null {
   const raw = window.localStorage.getItem(STORAGE_KEY_LATEST_ANALYSIS_JOB);
   if (!raw) {
@@ -127,9 +143,8 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
     throw new Error("분석할 자연어 전략을 입력하세요.");
   }
 
-  const response = await fetch(`${requireAiApiBaseUrl()}${AI_ENDPOINTS.analysisJobs}`, {
+  const response = await fetchAI(AI_ENDPOINTS.analysisJobs, {
     method: "POST",
-    credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query: trimmedQuery }),
   });
@@ -141,9 +156,7 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
 }
 
 export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
-  const response = await fetch(`${requireAiApiBaseUrl()}${AI_ENDPOINTS.analysisJob(jobId)}`, {
-    credentials: "include",
-  });
+  const response = await fetchAI(AI_ENDPOINTS.analysisJob(jobId));
   assertOk(response);
 
   const job = (await response.json()) as AnalysisJob;
@@ -415,129 +428,120 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
 
 function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: PerformanceSummary): PerformanceSummary {
   const aiPerformance = job.result?.user_payload.performance;
-  const selectedMetrics = aiPerformance ? metricsForSelectedVariant(aiPerformance) : null;
+  const selectedMetrics = aiPerformance?.metrics ?? null;
   if (!aiPerformance || !selectedMetrics) {
     return fallback;
   }
 
-  const selectedLabel = VARIANT_LABELS[aiPerformance.selected_variant];
   const equityCurve = buildAIEquityCurve(aiPerformance);
-  const comparison = buildAIComparisonRows(aiPerformance.metrics_by_variant.A, aiPerformance.metrics_by_variant.B);
+  const comparison = buildAIComparisonRows(selectedMetrics, aiPerformance.engine_summary);
 
   return {
     ...fallback,
     headline: "AI 전략 검증 결과",
-    period: `BacktestCode Loop3 · ${selectedLabel} 선택 · ${formatDateTime(job.updated_at)}`,
+    period: `후보 코드 백테스트 · ${aiPerformance.selected_candidate_id} 선택 · ${formatDateTime(job.updated_at)}`,
     benchmarkLabel: "검증 기준선",
-    metrics: buildAIMetricCards(selectedMetrics, aiPerformance),
+    metrics: buildAIMetricCards(selectedMetrics, aiPerformance.engine_summary),
     equityCurve: equityCurve.length ? equityCurve : fallback.equityCurve,
     comparison: comparison.length ? comparison : fallback.comparison,
     disclaimer:
-      `내 전략/원본 전략은 AI 백테스트 엔진 산출값입니다. 선택 후보 ${aiPerformance.selected_candidate_id}, ` +
+      `AI 백테스트 엔진이 후보 코드 중 ${aiPerformance.selected_candidate_id}를 선택했습니다. ` +
       "벤치마크 데이터가 없는 검증 응답은 0% 기준선과 함께 표시합니다.",
   };
 }
 
-function metricsForSelectedVariant(performance: AIBacktestPerformance): AIBacktestMetrics | null {
-  return performance.metrics_by_variant[performance.selected_variant] ?? null;
-}
-
-function buildAIMetricCards(selected: AIBacktestMetrics, performance: AIBacktestPerformance): BacktestMetric[] {
-  const counterpartVariant = performance.selected_variant === "A" ? "B" : "A";
-  const counterpart = performance.metrics_by_variant[counterpartVariant];
-  const counterpartLabel = VARIANT_LABELS[counterpartVariant];
-
+function buildAIMetricCards(selected: AIBacktestMetrics, engineSummary?: Record<string, unknown>): BacktestMetric[] {
+  const tradeCount = numberFromRecord(engineSummary, "effective_trade_count") ?? numberFromRecord(engineSummary, "trade_count");
+  const openPositions = numberFromRecord(engineSummary, "open_positions");
   return [
     {
       key: "sharpe",
       label: "Sharpe Ratio",
       value: formatDecimal(selected.sharpe_ratio),
-      delta: counterpart ? `${counterpartLabel} ${formatDecimal(counterpart.sharpe_ratio)}` : undefined,
-      tone: counterpart ? toneForMetricDelta(selected.sharpe_ratio - counterpart.sharpe_ratio) : "neutral",
+      delta: tradeCount !== null ? `거래 ${formatDecimal(tradeCount, 0)}회` : undefined,
+      tone: selected.sharpe_ratio >= 1 ? "positive" : selected.sharpe_ratio >= 0.5 ? "neutral" : "negative",
       caption: "AI 전략 검증에서 선택된 후보 기준입니다.",
     },
     {
       key: "mdd",
       label: "Max Drawdown",
       value: formatPercent(selected.max_drawdown),
-      delta: counterpart ? `${counterpartLabel} ${formatPercent(counterpart.max_drawdown)}` : undefined,
-      tone: counterpart ? toneForMetricDelta(selected.max_drawdown - counterpart.max_drawdown) : "neutral",
+      delta: openPositions !== null ? `오픈 포지션 ${formatDecimal(openPositions, 0)}` : undefined,
+      tone: selected.max_drawdown >= -0.1 ? "positive" : selected.max_drawdown >= -0.2 ? "neutral" : "negative",
       caption: "누적 자산 곡선 기준 최대 낙폭입니다.",
     },
     {
       key: "winRate",
       label: "Win Rate",
       value: formatPercent(selected.win_rate),
-      delta: counterpart ? formatSignedPercentPoint(selected.win_rate - counterpart.win_rate) : undefined,
-      tone: counterpart ? toneForMetricDelta(selected.win_rate - counterpart.win_rate) : "neutral",
+      tone: selected.win_rate >= 0.5 ? "positive" : selected.win_rate >= 0.4 ? "neutral" : "negative",
       caption: "체결 거래 중 수익 거래 비율입니다.",
     },
     {
       key: "totalReturn",
       label: "Total Return",
       value: formatPercent(selected.total_return),
-      delta: counterpart ? formatSignedPercentPoint(selected.total_return - counterpart.total_return) : undefined,
-      tone: counterpart ? toneForMetricDelta(selected.total_return - counterpart.total_return) : "neutral",
+      delta: formatSignedPercentPoint(selected.total_return),
+      tone: toneForMetricDelta(selected.total_return),
       caption: "거래비용 반영 후 검증 기간 누적 수익률입니다.",
     },
   ];
 }
 
-function buildAIComparisonRows(original: AIBacktestMetrics | undefined, improved: AIBacktestMetrics | undefined): ABComparisonRow[] {
-  if (!original || !improved) {
-    return [];
-  }
-
+function buildAIComparisonRows(selected: AIBacktestMetrics, engineSummary?: Record<string, unknown>): PerformanceComparisonRow[] {
+  const tradeCount = numberFromRecord(engineSummary, "effective_trade_count") ?? numberFromRecord(engineSummary, "trade_count");
+  const closedTradeCount = numberFromRecord(engineSummary, "trade_count");
+  const buySignalCount = numberFromRecord(engineSummary, "buy_signal_count");
+  const signalCount = numberFromRecord(engineSummary, "signal_count");
+  const openPositions = numberFromRecord(engineSummary, "open_positions");
   return [
     {
       metric: "Sharpe",
-      original: formatDecimal(original.sharpe_ratio),
-      improved: formatDecimal(improved.sharpe_ratio),
-      delta: formatSignedDecimal(improved.sharpe_ratio - original.sharpe_ratio),
-      tone: toneForMetricDelta(improved.sharpe_ratio - original.sharpe_ratio),
+      value: formatDecimal(selected.sharpe_ratio),
+      context: "리스크 대비 수익",
+      assessment: selected.sharpe_ratio >= 1 ? "양호" : "개선 필요",
+      tone: selected.sharpe_ratio >= 1 ? "positive" : selected.sharpe_ratio >= 0.5 ? "neutral" : "negative",
     },
     {
       metric: "MDD",
-      original: formatPercent(original.max_drawdown),
-      improved: formatPercent(improved.max_drawdown),
-      delta: formatSignedPercentPoint(improved.max_drawdown - original.max_drawdown),
-      tone: toneForMetricDelta(improved.max_drawdown - original.max_drawdown),
+      value: formatPercent(selected.max_drawdown),
+      context: "최대 낙폭",
+      assessment: selected.max_drawdown >= -0.1 ? "방어 양호" : "리스크 확인",
+      tone: selected.max_drawdown >= -0.1 ? "positive" : "negative",
     },
     {
-      metric: "Win Rate",
-      original: formatPercent(original.win_rate),
-      improved: formatPercent(improved.win_rate),
-      delta: formatSignedPercentPoint(improved.win_rate - original.win_rate),
-      tone: toneForMetricDelta(improved.win_rate - original.win_rate),
+      metric: "Entries",
+      value: tradeCount !== null ? `${formatDecimal(tradeCount, 0)}회` : "-",
+      context: [
+        buySignalCount !== null ? `진입 ${formatDecimal(buySignalCount, 0)}건` : null,
+        closedTradeCount !== null ? `청산 ${formatDecimal(closedTradeCount, 0)}건` : null,
+        signalCount !== null ? `신호 ${formatDecimal(signalCount, 0)}건` : null,
+      ].filter(Boolean).join(" · ") || "엔진 요약",
+      assessment: tradeCount !== null && tradeCount > 0 ? "거래 발생" : "거래 부족",
+      tone: tradeCount !== null && tradeCount > 0 ? "positive" : "neutral",
     },
     {
-      metric: "Total Return",
-      original: formatPercent(original.total_return),
-      improved: formatPercent(improved.total_return),
-      delta: formatSignedPercentPoint(improved.total_return - original.total_return),
-      tone: toneForMetricDelta(improved.total_return - original.total_return),
+      metric: "Open Positions",
+      value: openPositions !== null ? `${formatDecimal(openPositions, 0)}건` : "-",
+      context: `누적 수익률 ${formatPercent(selected.total_return)}`,
+      assessment: openPositions === 0 ? "청산 완료" : "보유 중",
+      tone: toneForMetricDelta(selected.total_return),
     },
   ];
 }
 
 function buildAIEquityCurve(performance: AIBacktestPerformance): EquityPoint[] {
-  const selectedCurve = performance.equity_curve_by_variant[performance.selected_variant] ?? [];
-  const originalCurve = performance.equity_curve_by_variant.A ?? [];
-  const sourceCurve = selectedCurve.length ? selectedCurve : originalCurve;
+  const sourceCurve = performance.equity_curve ?? [];
   if (!sourceCurve.length) {
     return [];
   }
 
-  const originalByDate = new Map(originalCurve.map((point) => [point.date, point]));
-  return sourceCurve.map((point, index) => {
-    const originalPoint = originalByDate.get(point.date) ?? originalCurve[index] ?? point;
-    return {
-      date: formatEquityPointLabel(point.date),
-      strategy: ratioToPercent(point.cumulative_return),
-      original: ratioToPercent(originalPoint.cumulative_return),
-      benchmark: BASELINE_RETURN_PERCENT,
-    };
-  });
+  return sourceCurve.map((point) => ({
+    date: formatEquityPointLabel(point.date),
+    strategy: ratioToPercent(point.cumulative_return),
+    original: BASELINE_RETURN_PERCENT,
+    benchmark: BASELINE_RETURN_PERCENT,
+  }));
 }
 
 function extractSignalAction(report: AIReportBundle): SignalType | null {
@@ -570,6 +574,14 @@ function stringFromRecord(record: Record<string, unknown>, key: string) {
   return typeof value === "string" ? value : null;
 }
 
+function numberFromRecord(record: Record<string, unknown> | undefined, key: string) {
+  if (!record) {
+    return null;
+  }
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function isSignalType(value: unknown): value is SignalType {
   return value === "BUY" || value === "HOLD" || value === "DROP";
 }
@@ -595,8 +607,8 @@ function formatSignedPercentPoint(value: number) {
   return `${prefix}${percent.toFixed(PERCENT_DISPLAY_DIGITS)}%p`;
 }
 
-function formatDecimal(value: number) {
-  return value.toFixed(DECIMAL_DISPLAY_DIGITS);
+function formatDecimal(value: number, digits = DECIMAL_DISPLAY_DIGITS) {
+  return value.toFixed(digits);
 }
 
 function formatSignedDecimal(value: number) {

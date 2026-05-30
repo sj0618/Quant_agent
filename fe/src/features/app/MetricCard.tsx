@@ -13,7 +13,6 @@ export function MetricCard({ metric }: MetricCardProps) {
         {metric.delta ? <Badge variant={metric.tone}>{metric.delta}</Badge> : null}
       </div>
       <strong>{metric.value}</strong>
-      <div className="metric-card__spark" />
       <p>{metric.caption}</p>
     </article>
   );

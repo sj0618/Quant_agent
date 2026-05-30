@@ -29,7 +29,7 @@
 | P1 | 전략 관리 | `/app/strategies/new`, `/app/strategies/:id/edit` | 새 대화, 전략 수정, 비활성화 버튼만 존재 | 전략 생성/수정 폼, 비활성화 확인, 분석 실행 상태, 결과 화면 연결 |
 | P2 | 전역 검색 | `/search` 또는 command palette | 검색 pill만 표시 | 전략/종목/리포트 검색, 키보드 단축키, 검색 결과 empty/loading/error |
 | P2 | 정책/수신거부 | `/terms`, `/privacy`, `/disclaimer`, `/unsubscribe` | Footer/리포트 하단 텍스트 또는 홈 링크 | 약관/개인정보/면책 문서 페이지, 이메일 수신거부 처리 |
-| P2 | 성과 탭 세부 동작 | `/app?tab=performance` 유지 | 원본 전략/A-B/CSV 버튼이 정적 | 원본/AI 개선본/동시보기 전환, CSV export, 차트 범위 옵션 |
+| P2 | 성과 탭 세부 동작 | `/app?tab=performance` 유지 | 선택 후보/기준선/CSV 버튼이 정적 | 선택 후보/기준선/동시보기 전환, CSV export, 차트 범위 옵션 |
 | P3 | FAQ 상호작용 | `/` 유지 | FAQ 첫 항목만 펼쳐진 정적 UI | 아코디언 토글, 전체 답변 데이터, 접근성 상태 |
 
 ## 초기 근거
