@@ -36,8 +36,23 @@ class AuthSessionStore:
     def csrf_key(self, session_id: str) -> str:
         return f"{self.prefix}:csrf:{session_id}"
 
-    async def store_oauth_state(self, *, state: str, nonce: str, return_to: str) -> None:
+    async def store_oauth_state(
+        self,
+        *,
+        state: str,
+        nonce: str,
+        return_to: str,
+        redirect_uri: str | None = None,
+        flow_mode: str | None = None,
+        transaction_token_hash: str | None = None,
+    ) -> None:
         payload = {"nonce": nonce, "return_to": return_to}
+        if redirect_uri is not None:
+            payload["redirect_uri"] = redirect_uri
+        if flow_mode is not None:
+            payload["flow_mode"] = flow_mode
+        if transaction_token_hash is not None:
+            payload["transaction_token_hash"] = transaction_token_hash
         await self._set_json(self.state_key(state), payload, ttl_seconds=self.settings.auth_state_ttl_seconds)
 
     async def consume_oauth_state(self, state: str) -> dict[str, Any]:

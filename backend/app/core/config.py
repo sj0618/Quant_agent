@@ -19,6 +19,9 @@ _PLACEHOLDER_MARKERS = (
 )
 _PRODUCTION_ENVS = {"prod", "production"}
 _ALLOWED_SAMESITE = {"lax", "strict", "none"}
+_ALLOWED_PDF_TEMP_PERSISTENCE = {"db", "manifest"}
+_MAX_HANKYUNG_CRAWL_PAGES = 10
+_MAX_HANKYUNG_CRAWL_REPORTS = 200
 
 
 def _split_csv(raw: str | None) -> list[str]:
@@ -68,7 +71,67 @@ class Settings(BaseSettings):
     auth_csrf_ttl_seconds: int = Field(default=3600, alias="AUTH_CSRF_TTL_SECONDS", ge=300)
     auth_csrf_required: bool = Field(default=False, alias="AUTH_CSRF_REQUIRED")
 
-    @field_validator("database_url", "redis_url", "google_client_secret", mode="before")
+    pdf_temp_ingest_enabled: bool = Field(default=False, alias="PDF_TEMP_INGEST_ENABLED")
+    pdf_temp_storage_dir: str = Field(default="var/pdf-temp/storage", alias="PDF_TEMP_STORAGE_DIR")
+    pdf_temp_seed_dir: str = Field(default="var/pdf-temp/seeds", alias="PDF_TEMP_SEED_DIR")
+    pdf_temp_manifest_path: str = Field(default="var/pdf-temp/manifest.json", alias="PDF_TEMP_MANIFEST_PATH")
+    pdf_temp_persistence: str = Field(default="db", alias="PDF_TEMP_PERSISTENCE")
+    pdf_temp_seed_registry_json: str = Field(default="[]", alias="PDF_TEMP_SEED_REGISTRY_JSON")
+    pdf_temp_max_bytes: int = Field(default=20 * 1024 * 1024, alias="PDF_TEMP_MAX_BYTES", ge=1024)
+    pdf_temp_url_allowed_hosts: str = Field(default="", alias="PDF_TEMP_URL_ALLOWED_HOSTS")
+    pdf_temp_http_user_agent: str = Field(
+        default="Mozilla/5.0 (compatible; QuantAgentPDFTemp/0.1)",
+        alias="PDF_TEMP_HTTP_USER_AGENT",
+    )
+    pdf_temp_url_timeout_seconds: float = Field(default=10.0, alias="PDF_TEMP_URL_TIMEOUT_SECONDS", gt=0)
+    pdf_temp_url_max_redirects: int = Field(default=3, alias="PDF_TEMP_URL_MAX_REDIRECTS", ge=0, le=10)
+    pdf_temp_min_text_chars: int = Field(default=20, alias="PDF_TEMP_MIN_TEXT_CHARS", ge=0)
+    pdf_temp_max_seed_batch_size: int = Field(default=3, alias="PDF_TEMP_MAX_SEED_BATCH_SIZE", ge=1, le=10)
+
+    hankyung_consensus_crawler_enabled: bool = Field(default=False, alias="HANKYUNG_CONSENSUS_CRAWLER_ENABLED")
+    hankyung_consensus_api_base_url: str = Field(
+        default="https://markets.hankyung.com",
+        alias="HANKYUNG_CONSENSUS_API_BASE_URL",
+    )
+    hankyung_consensus_api_bearer_token: SecretStr | None = Field(
+        default=None,
+        alias="HANKYUNG_CONSENSUS_API_BEARER_TOKEN",
+    )
+    hankyung_consensus_auth_header: SecretStr | None = Field(
+        default=None,
+        alias="HANKYUNG_CONSENSUS_AUTH_HEADER",
+    )
+    hankyung_consensus_crawl_max_pages: int = Field(
+        default=1,
+        alias="HANKYUNG_CONSENSUS_CRAWL_MAX_PAGES",
+        ge=1,
+        le=_MAX_HANKYUNG_CRAWL_PAGES,
+    )
+    hankyung_consensus_crawl_max_reports: int = Field(
+        default=50,
+        alias="HANKYUNG_CONSENSUS_CRAWL_MAX_REPORTS",
+        ge=1,
+        le=_MAX_HANKYUNG_CRAWL_REPORTS,
+    )
+    hankyung_consensus_crawl_timeout_seconds: float = Field(
+        default=10.0,
+        alias="HANKYUNG_CONSENSUS_CRAWL_TIMEOUT_SECONDS",
+        gt=0,
+        le=60,
+    )
+    hankyung_consensus_crawl_user_agent: str = Field(
+        default="Mozilla/5.0 (compatible; QuantAgentHankyungConsensusCrawler/0.1)",
+        alias="HANKYUNG_CONSENSUS_CRAWL_USER_AGENT",
+    )
+
+    @field_validator(
+        "database_url",
+        "redis_url",
+        "google_client_secret",
+        "hankyung_consensus_api_bearer_token",
+        "hankyung_consensus_auth_header",
+        mode="before",
+    )
     @classmethod
     def reject_placeholder_secrets(cls, value: Any) -> Any:
         if value is None:
@@ -113,9 +176,44 @@ class Settings(BaseSettings):
     @field_validator("auth_session_cookie_name")
     @classmethod
     def validate_cookie_name(cls, value: str) -> str:
-        if not re.fullmatch(r"[A-Za-z0-9_\-]{3,64}", value):
+        if not re.match(r"^[A-Za-z0-9_\-]{3,64}$", value):
             raise ValueError("AUTH_SESSION_COOKIE_NAME must be a simple cookie token")
         return value
+
+    @field_validator("pdf_temp_storage_dir", "pdf_temp_seed_dir", "pdf_temp_manifest_path")
+    @classmethod
+    def validate_pdf_temp_paths(cls, value: str) -> str:
+        raw = value.strip()
+        if not raw:
+            raise ValueError("PDF temp paths must be non-empty")
+        return raw
+
+    @field_validator("pdf_temp_persistence")
+    @classmethod
+    def validate_pdf_temp_persistence(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in _ALLOWED_PDF_TEMP_PERSISTENCE:
+            raise ValueError("PDF_TEMP_PERSISTENCE must be db or manifest")
+        return normalized
+
+    @field_validator("hankyung_consensus_api_base_url")
+    @classmethod
+    def validate_hankyung_consensus_api_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("HANKYUNG_CONSENSUS_API_BASE_URL must be an absolute http(s) URL")
+        if (parsed.hostname or "").lower() == "consensus.hankyung.com":
+            raise ValueError("consensus.hankyung.com is not allowed as a metadata crawl source")
+        return normalized
+
+    @field_validator("hankyung_consensus_crawl_user_agent")
+    @classmethod
+    def validate_hankyung_consensus_crawl_user_agent(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("HANKYUNG_CONSENSUS_CRAWL_USER_AGENT must be non-empty")
+        return normalized
 
     @field_validator("auth_cookie_samesite")
     @classmethod
@@ -194,6 +292,22 @@ class Settings(BaseSettings):
     def allowed_hosts(self) -> list[str]:
         return _split_csv(self.auth_allowed_hosts)
 
+    @property
+    def pdf_temp_allowed_hosts(self) -> list[str]:
+        return _split_csv(self.pdf_temp_url_allowed_hosts)
+
+    @property
+    def hankyung_consensus_api_bearer_token_value(self) -> str | None:
+        if self.hankyung_consensus_api_bearer_token is None:
+            return None
+        return self.hankyung_consensus_api_bearer_token.get_secret_value()
+
+    @property
+    def hankyung_consensus_auth_header_value(self) -> str | None:
+        if self.hankyung_consensus_auth_header is None:
+            return None
+        return self.hankyung_consensus_auth_header.get_secret_value()
+
     def safe_summary(self) -> dict[str, object]:
         return {
             "app_env": self.app_env,
@@ -212,6 +326,30 @@ class Settings(BaseSettings):
             "auth_cookie_domain": self.auth_cookie_domain,
             "auth_cookie_path": self.auth_cookie_path,
             "auth_csrf_required": self.auth_csrf_required,
+            "pdf_temp_ingest_enabled": self.pdf_temp_ingest_enabled,
+            "pdf_temp_storage_dir": "<configured>" if self.pdf_temp_storage_dir else None,
+            "pdf_temp_seed_dir": "<configured>" if self.pdf_temp_seed_dir else None,
+            "pdf_temp_manifest_path": "<configured>" if self.pdf_temp_manifest_path else None,
+            "pdf_temp_persistence": self.pdf_temp_persistence,
+            "pdf_temp_max_bytes": self.pdf_temp_max_bytes,
+            "pdf_temp_url_allowed_hosts": self.pdf_temp_allowed_hosts,
+            "pdf_temp_http_user_agent": "<configured>" if self.pdf_temp_http_user_agent else None,
+            "pdf_temp_url_timeout_seconds": self.pdf_temp_url_timeout_seconds,
+            "pdf_temp_url_max_redirects": self.pdf_temp_url_max_redirects,
+            "pdf_temp_min_text_chars": self.pdf_temp_min_text_chars,
+            "pdf_temp_max_seed_batch_size": self.pdf_temp_max_seed_batch_size,
+            "hankyung_consensus_crawler_enabled": self.hankyung_consensus_crawler_enabled,
+            "hankyung_consensus_api_base_url": self.hankyung_consensus_api_base_url,
+            "hankyung_consensus_api_bearer_token": "<configured>"
+            if self.hankyung_consensus_api_bearer_token
+            else None,
+            "hankyung_consensus_auth_header": "<configured>" if self.hankyung_consensus_auth_header else None,
+            "hankyung_consensus_crawl_max_pages": self.hankyung_consensus_crawl_max_pages,
+            "hankyung_consensus_crawl_max_reports": self.hankyung_consensus_crawl_max_reports,
+            "hankyung_consensus_crawl_timeout_seconds": self.hankyung_consensus_crawl_timeout_seconds,
+            "hankyung_consensus_crawl_user_agent": "<configured>"
+            if self.hankyung_consensus_crawl_user_agent
+            else None,
         }
 
     def __repr__(self) -> str:  # pragma: no cover

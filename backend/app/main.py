@@ -4,10 +4,10 @@ from contextlib import asynccontextmanager
 
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import auth, health, pages
+from app.api.routes import auth, health, pages, reports_pdf_temp
 from app.core.config import ConfigurationError, load_settings
 from app.core.errors import AppError, register_exception_handlers
 from app.db.session import create_db_engine, dispose_db_engine
@@ -37,6 +37,30 @@ async def close_redis_client(client) -> None:
         result = close()
         if hasattr(result, "__await__"):
             await result
+
+
+def _allowed_cors_origin(origin: str | None, settings) -> str | None:
+    if not origin or settings is None:
+        return None
+    allowed = {item.lower().rstrip("/") for item in getattr(settings, "allowed_origins", [])}
+    normalized = origin.lower().rstrip("/")
+    return origin if normalized in allowed else None
+
+
+def _install_credentialed_cors_middleware(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def credentialed_cors(request: Request, call_next):  # noqa: ANN001
+        is_preflight = request.method == "OPTIONS" and bool(request.headers.get("access-control-request-method"))
+        response = Response(status_code=204) if is_preflight else await call_next(request)
+        origin = _allowed_cors_origin(request.headers.get("origin"), getattr(request.app.state, "settings", None))
+        if origin is not None:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type,X-CSRF-Token"
+            vary = response.headers.get("Vary")
+            response.headers["Vary"] = "Origin" if not vary else f"{vary}, Origin"
+        return response
 
 
 @asynccontextmanager
@@ -70,10 +94,12 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     register_exception_handlers(app)
+    _install_credentialed_cors_middleware(app)
     static_dir = Path(__file__).resolve().parent / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(reports_pdf_temp.router)
     app.include_router(pages.router)
     return app
 

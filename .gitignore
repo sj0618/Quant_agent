@@ -3,6 +3,8 @@ fe/.omx/
 .omx
 .claude
 .playwright-mcp/
+omx.zip
+backend/var/
 
 # Node
 node_modules/

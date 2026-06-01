@@ -11,10 +11,16 @@ from starlette.responses import Response
 
 from app.core.errors import AppError, register_exception_handlers
 from app.core.security import (
+    OAUTH_TRANSACTION_COOKIE_NAME,
     clear_session_cookie,
+    clear_oauth_transaction_cookie,
     csrf_token_required,
+    hash_oauth_transaction_token,
+    oauth_transaction_token_matches,
     sanitize_return_to,
     set_session_cookie,
+    set_oauth_transaction_cookie,
+    validate_oauth_redirect_uri,
     validate_unsafe_request_origin,
 )
 from app.services.google_oauth import build_google_authorization_url, validate_google_claims
@@ -59,6 +65,46 @@ def test_sanitize_return_to_allows_local_path_and_default():
     assert sanitize_return_to("/app?tab=profile") == "/app?tab=profile"
 
 
+def test_validate_oauth_redirect_uri_accepts_configured_backend_and_fe_origin():
+    settings = valid_settings(AUTH_ALLOWED_ORIGINS="https://fe.example.co.kr")
+    assert validate_oauth_redirect_uri(settings.google_redirect_uri, settings) == settings.google_redirect_uri
+    assert (
+        validate_oauth_redirect_uri("https://fe.example.co.kr/auth/google/callback", settings)
+        == "https://fe.example.co.kr/auth/google/callback"
+    )
+
+
+def test_validate_oauth_redirect_uri_accepts_localhost_http_in_local_env():
+    settings = valid_settings(
+        APP_ENV="local",
+        GOOGLE_REDIRECT_URI="http://localhost:8000/auth/google/callback",
+        AUTH_ALLOWED_ORIGINS="http://localhost:5173",
+    )
+    assert (
+        validate_oauth_redirect_uri("http://localhost:5173/auth/google/callback", settings)
+        == "http://localhost:5173/auth/google/callback"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://evil.example/auth/google/callback",
+        "https://fe.example.co.kr/wrong/callback",
+        "https://fe.example.co.kr/auth/google/callback?next=/app",
+        "https://fe.example.co.kr/auth/google/callback#fragment",
+        "https://user:pass@fe.example.co.kr/auth/google/callback",
+        "javascript:alert(1)",
+        "//fe.example.co.kr/auth/google/callback",
+    ],
+)
+def test_validate_oauth_redirect_uri_rejects_untrusted_or_malformed_values(value: str):
+    settings = valid_settings(AUTH_ALLOWED_ORIGINS="https://fe.example.co.kr")
+    with pytest.raises(AppError) as exc:
+        validate_oauth_redirect_uri(value, settings)
+    assert exc.value.code == "invalid_redirect_uri"
+
+
 def test_cookie_helpers_set_and_clear_secure_httponly_cookie():
     settings = valid_settings(AUTH_SESSION_COOKIE_NAME="qa_session", AUTH_COOKIE_SAMESITE="lax")
     response = Response()
@@ -74,6 +120,31 @@ def test_cookie_helpers_set_and_clear_secure_httponly_cookie():
     clear_header = response.headers["set-cookie"]
     assert "qa_session=" in clear_header
     assert "Max-Age=0" in clear_header
+
+
+def test_oauth_transaction_cookie_helpers_set_short_lived_httponly_cookie():
+    settings = valid_settings(AUTH_STATE_TTL_SECONDS=300)
+    response = Response()
+    set_oauth_transaction_cookie(response, settings, "transaction-token")
+    header = response.headers["set-cookie"]
+    assert f"{OAUTH_TRANSACTION_COOKIE_NAME}=transaction-token" in header
+    assert "HttpOnly" in header
+    assert "Path=/auth/google" in header
+    assert "Max-Age=300" in header
+
+    response = Response()
+    clear_oauth_transaction_cookie(response, settings)
+    clear_header = response.headers["set-cookie"]
+    assert f"{OAUTH_TRANSACTION_COOKIE_NAME}=" in clear_header
+    assert "Max-Age=0" in clear_header
+    assert "Path=/auth/google" in clear_header
+
+
+def test_oauth_transaction_hash_compares_without_storing_plain_token():
+    digest = hash_oauth_transaction_token("transaction-token")
+    assert digest != "transaction-token"
+    assert oauth_transaction_token_matches("transaction-token", digest) is True
+    assert oauth_transaction_token_matches("wrong-token", digest) is False
 
 
 def test_validate_unsafe_request_origin_requires_allowed_origin():
@@ -113,6 +184,28 @@ async def test_session_store_oauth_state_is_single_use_and_ttl_backed():
 
 
 @pytest.mark.asyncio
+async def test_session_store_oauth_state_round_trips_json_flow_metadata():
+    settings = valid_settings(AUTH_STATE_TTL_SECONDS=120)
+    redis = FakeRedis()
+    store = AuthSessionStore(redis, settings)
+    await store.store_oauth_state(
+        state="state-1",
+        nonce="nonce-1",
+        return_to="/app",
+        redirect_uri="https://fe.example.co.kr/auth/google/callback",
+        flow_mode="json",
+        transaction_token_hash="transaction-hash",
+    )
+    assert await store.consume_oauth_state("state-1") == {
+        "nonce": "nonce-1",
+        "return_to": "/app",
+        "redirect_uri": "https://fe.example.co.kr/auth/google/callback",
+        "flow_mode": "json",
+        "transaction_token_hash": "transaction-hash",
+    }
+
+
+@pytest.mark.asyncio
 async def test_session_store_session_and_csrf_are_redis_backed():
     settings = valid_settings(AUTH_SESSION_TTL_SECONDS=900, AUTH_CSRF_TTL_SECONDS=600)
     redis = FakeRedis()
@@ -145,6 +238,18 @@ def test_google_authorization_url_contains_oidc_state_and_nonce():
     assert params["scope"] == ["openid email profile"]
     assert params["state"] == ["state-1"]
     assert params["nonce"] == ["nonce-1"]
+
+
+def test_google_authorization_url_accepts_validated_redirect_uri_override():
+    settings = valid_settings(AUTH_ALLOWED_ORIGINS="https://fe.example.co.kr")
+    url = build_google_authorization_url(
+        settings,
+        state="state-1",
+        nonce="nonce-1",
+        redirect_uri="https://fe.example.co.kr/auth/google/callback",
+    )
+    params = parse_qs(urlsplit(url).query)
+    assert params["redirect_uri"] == ["https://fe.example.co.kr/auth/google/callback"]
 
 
 def valid_claims(settings, **overrides):

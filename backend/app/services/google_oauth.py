@@ -25,10 +25,10 @@ class GoogleIdentity:
     picture: str | None = None
 
 
-def build_google_authorization_url(settings: Settings, *, state: str, nonce: str) -> str:
+def build_google_authorization_url(settings: Settings, *, state: str, nonce: str, redirect_uri: str | None = None) -> str:
     params = {
         "client_id": settings.google_client_id,
-        "redirect_uri": settings.google_redirect_uri,
+        "redirect_uri": redirect_uri or settings.google_redirect_uri,
         "response_type": "code",
         "scope": "openid email profile",
         "state": state,
@@ -38,12 +38,18 @@ def build_google_authorization_url(settings: Settings, *, state: str, nonce: str
     return f"{GOOGLE_AUTHORIZATION_ENDPOINT}?{urlencode(params)}"
 
 
-async def exchange_authorization_code(settings: Settings, *, code: str, client: httpx.AsyncClient | None = None) -> dict[str, Any]:
+async def exchange_authorization_code(
+    settings: Settings,
+    *,
+    code: str,
+    redirect_uri: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
     payload = {
         "code": code,
         "client_id": settings.google_client_id,
         "client_secret": settings.google_client_secret_value,
-        "redirect_uri": settings.google_redirect_uri,
+        "redirect_uri": redirect_uri or settings.google_redirect_uri,
         "grant_type": "authorization_code",
     }
     close_client = client is None

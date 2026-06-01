@@ -30,6 +30,10 @@ def test_valid_production_auth_settings_are_accepted():
     assert settings.redis_url_value == "redis://localhost:6379/0"
     assert settings.sqlalchemy_database_url.startswith("postgresql+asyncpg://")
     assert settings.safe_summary()["google_client_id"] == "<configured>"
+    assert settings.hankyung_consensus_crawler_enabled is False
+    assert settings.hankyung_consensus_crawl_max_pages == 1
+    assert settings.hankyung_consensus_crawl_max_reports <= 50
+    assert settings.hankyung_consensus_api_base_url == "https://markets.hankyung.com"
 
 
 @pytest.mark.parametrize(
@@ -70,3 +74,27 @@ def test_secret_redaction_covers_urls_codes_and_tokens():
     assert "secret-token" not in redacted
     assert "real_secret" not in redacted
     assert "u:p@host" not in redacted
+
+
+def test_hankyung_crawler_auth_config_is_redacted_from_safe_summary():
+    settings = valid_settings(
+        HANKYUNG_CONSENSUS_API_BEARER_TOKEN="real-hankyung-bearer",
+        HANKYUNG_CONSENSUS_AUTH_HEADER="X-Hankyung-Auth: real-hankyung-header",
+    )
+
+    summary = settings.safe_summary()
+
+    assert summary["hankyung_consensus_api_bearer_token"] == "<configured>"
+    assert summary["hankyung_consensus_auth_header"] == "<configured>"
+    assert "real-hankyung" not in str(summary)
+
+
+def test_hankyung_crawler_rejects_invalid_base_url_and_unbounded_limits():
+    with pytest.raises(ValidationError):
+        valid_settings(HANKYUNG_CONSENSUS_API_BASE_URL="ftp://markets.hankyung.com")
+    with pytest.raises(ValidationError):
+        valid_settings(HANKYUNG_CONSENSUS_API_BASE_URL="https://consensus.hankyung.com")
+    with pytest.raises(ValidationError):
+        valid_settings(HANKYUNG_CONSENSUS_CRAWL_MAX_PAGES=999)
+    with pytest.raises(ValidationError):
+        valid_settings(HANKYUNG_CONSENSUS_CRAWL_MAX_REPORTS=9999)

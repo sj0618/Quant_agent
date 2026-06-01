@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AuthUser(BaseModel):
@@ -17,3 +17,24 @@ class AuthMeResponse(BaseModel):
 
 class CsrfResponse(BaseModel):
     csrfToken: str
+
+
+class GoogleAuthStartResponse(BaseModel):
+    authorizationUrl: str
+
+
+class GoogleAuthCallbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1)
+    state: str = Field(min_length=1)
+    redirectUri: str = Field(min_length=1)
+
+
+class AuthSessionResponse(BaseModel):
+    user: AuthUser
+
+
+class GoogleAuthCallbackResponse(BaseModel):
+    session: AuthSessionResponse
+    returnTo: str
