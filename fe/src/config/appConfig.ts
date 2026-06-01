@@ -24,8 +24,12 @@ function trimTrailingSlash(value: string | undefined) {
   return value ? value.replace(/\/+$/, "") : "";
 }
 
+function aiApiBaseUrl() {
+  return import.meta.env.DEV ? "/ai-api" : trimTrailingSlash(import.meta.env.VITE_AI_API_BASE_URL);
+}
+
 export const appConfig = {
-  aiApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AI_API_BASE_URL),
+  aiApiBaseUrl: aiApiBaseUrl(),
   authApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AUTH_API_BASE_URL),
   reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL),
   strategyApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_STRATEGY_API_BASE_URL),
