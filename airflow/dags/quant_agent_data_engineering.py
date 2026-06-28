@@ -47,6 +47,9 @@ KIS_ADJUSTED_INGEST_SCRIPT = Path(
 DART_BOK_INGEST_SCRIPT = Path(
     os.getenv("QUANT_AIRFLOW_DART_BOK_INGEST_SCRIPT", str(REPO_ROOT / "scripts" / "ingest_dart_bok_history.py"))
 )
+EXTERNAL_INGEST_SCRIPT = Path(
+    os.getenv("QUANT_AIRFLOW_EXTERNAL_INGEST_SCRIPT", str(REPO_ROOT / "scripts" / "ingest_external_data.py"))
+)
 TA_PIPELINE_SCRIPT = Path(
     os.getenv("QUANT_AIRFLOW_TA_PIPELINE_SCRIPT", str(REPO_ROOT / "scripts" / "compute_technical_indicators_pipeline.py"))
 )
@@ -149,6 +152,14 @@ if dag and task:  # pragma: no branch
                 _symbol_metadata_args(as_of_date=target_date),
             )
 
+        @task(task_id="refresh_symbol_sector_daily")
+        def refresh_symbol_sector_daily(logical_date: str | None = None) -> dict:
+            target_date = _target_date(logical_date)
+            return _run_python_script(
+                EXTERNAL_INGEST_SCRIPT,
+                _kind_sector_args(as_of_date=target_date),
+            )
+
         @task(task_id="run_data_quality_checks_daily")
         def run_data_quality_checks_daily(logical_date: str | None = None) -> dict:
             target_date = _target_date(logical_date)
@@ -207,6 +218,7 @@ if dag and task:  # pragma: no branch
 
         ingested = ingest_ohlcv_daily()
         symbol_metadata = refresh_symbol_metadata_daily()
+        sector_metadata = refresh_symbol_sector_daily()
         kis_adjusted = ingest_kis_adjusted_ohlcv_daily()
         computed = compute_ta_indicators_daily()
         qa = run_data_quality_checks_daily()
@@ -214,7 +226,7 @@ if dag and task:  # pragma: no branch
         dart = ingest_dart_financials_daily()
         seibro = ingest_seibro_reports_daily()
         ingested >> [symbol_metadata, kis_adjusted, bok, seibro]
-        symbol_metadata >> qa
+        symbol_metadata >> sector_metadata >> qa
         symbol_metadata >> dart
         kis_adjusted >> computed
         computed >> qa
@@ -323,6 +335,15 @@ def _data_quality_args(*, start_date: date, end_date: date) -> list[str]:
 
 def _symbol_metadata_args(*, as_of_date: date) -> list[str]:
     return [
+        "--as-of-date",
+        as_of_date.isoformat(),
+    ]
+
+
+def _kind_sector_args(*, as_of_date: date) -> list[str]:
+    return [
+        "--job",
+        "kind-sector",
         "--as-of-date",
         as_of_date.isoformat(),
     ]

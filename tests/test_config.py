@@ -4,7 +4,16 @@ import os
 from pathlib import Path
 import unittest
 
-from quant_agent.data.config import BokConfig, DartConfig, DatabaseConfig, KisConfig, KrxConfig, PilotConfig, SeibroConfig
+from quant_agent.data.config import (
+    BokConfig,
+    DartConfig,
+    DatabaseConfig,
+    KisConfig,
+    KindConfig,
+    KrxConfig,
+    PilotConfig,
+    SeibroConfig,
+)
 from quant_agent.data.db import resolve_execution_mode
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -74,12 +83,14 @@ class ConfigTests(unittest.TestCase):
             {
                 "BOK_API_KEY": "bok",
                 "DART_API_KEY": "dart",
+                "KIND_CORP_LIST_URL": "https://kind.krx.co.kr/corpgeneral/corpList.do",
                 "SEIBRO_COLLECTION_APPROVED": "true",
                 "SEIBRO_API_KEY": "seibro",
             }
         ):
             self.assertTrue(BokConfig.from_env().is_configured)
             self.assertTrue(DartConfig.from_env().is_configured)
+            self.assertTrue(KindConfig.from_env().is_configured)
             self.assertTrue(SeibroConfig.from_env().collection_approved)
 
     def test_dart_config_accepts_fss_api_key_alias(self):

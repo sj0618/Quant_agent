@@ -1,8 +1,8 @@
 # 공용 서버 DB 테이블/뷰 전체 현황
 
-작성일: 2026-05-25  
-대상 DB: 공용 서버 PostgreSQL/TimescaleDB `quant_agent`  
-검증 기준: Docker 컨테이너 `quant-agent-db`의 실제 row count와 `information_schema.columns` 기준 스키마.
+작성일: 2026-06-24
+대상 DB: 공용 서버 PostgreSQL/TimescaleDB `quant_agent` 및 로컬 동기화 DB
+검증 기준: 공용 DB 월별 유가 이관 완료 상태와 Docker 컨테이너 `quant-agent-db`의 실제 row count, `information_schema.columns` 기준 스키마.
 
 ## 1. 결론
 
@@ -10,11 +10,11 @@
 |---|---|
 | KRX 기본 OHLCV | 10년 구간 적재 완료. |
 | KIS 수정주가 | 10년 구간 적재 완료. |
-| TA 지표 | 10년 구간 적재 완료. |
+| TA 지표 | 10년 구간 적재 완료. 정의 카탈로그는 158개, 현재 ticker 기반 백테스트 feature에 선계산 저장된 기본 지표 key는 45개. |
 | SEIBro raw | 10년 구간 적재 완료. |
 | SEIBro feature/mart | 스키마만 있고 데이터 미적재. raw → feature 변환 미실행 상태. |
-| BOK | 파일럿 1개 series, 2일치만 있음. 장기/운영 데이터 미완. |
-| OpenDART | raw/feature/mart 모두 스키마만 있고 데이터 미적재. |
+| BOK | `rate-fx` preset 12개 series와 월별 유가 3개 series(WTI/Dubai/Brent) 10년치 적재 완료. `feature.bok_macro_daily`/`mart.bok_macro_asof` 기준 30,825건. |
+| OpenDART | CFS 재무제표 2016~2026 period_end 구간 로컬 적재 완료. `raw.dart_response` 81,021건, `feature.dart_financial_quarterly`/`mart.dart_financial_asof` 73,342건, `2016-03-31 ~ 2026-03-31`. |
 
 ## 2. 먼저 볼 객체
 
@@ -28,8 +28,8 @@
 | 원천 일봉 검증 | `core.ohlcv_daily` | KRX 10년 데이터 있음. |
 | KIS 수정주가 원천 검증 | `feature.kis_adjusted_ohlcv_daily` | KIS 10년 데이터 있음. |
 | SEIBro 원천 검증 | `raw.analyst_report_summary` | SEIBro 분석리포트 요약 10년 데이터 있음. |
-| 미수집 확인 | `raw.dart_response`, `feature.dart_*` | OpenDART 데이터 미적재. |
-| BOK 파일럿 확인 | `raw.bok_response`, `feature.bok_macro_daily` | 파일럿 데이터만 있음. |
+| OpenDART 적재 확인 | `raw.dart_response`, `feature.dart_*`, `mart.dart_financial_asof` | CFS 재무제표 `2016-03-31 ~ 2026-03-31` 구간 적재 완료. feature/mart row delta 0건. |
+| BOK macro 확인 | `raw.bok_response`, `feature.bok_macro_daily`, `mart.bok_macro_asof` | `rate-fx` 12개 series와 월별 유가 3개 series 적재 완료. |
 
 ## 3. 전체 객체 row count
 
@@ -49,8 +49,8 @@
 | 객체 | row 수 | 기간/범위 | 상태 |
 |---|---:|---|---|
 | `raw.analyst_report_summary` | 221,646 | `2016-05-20 ~ 2026-05-20` | SEIBro 분석리포트 요약 raw row 적재 완료. |
-| `raw.bok_response` | 1 | `2026-05-14 ~ 2026-05-15` 요청 1건 | BOK 파일럿만 있음. 장기 수집 미완. |
-| `raw.dart_response` | 0 | 없음 | OpenDART 스키마만 있고 데이터 미적재. |
+| `raw.bok_response` | 147 | BOK `rate-fx` 12개 series와 월별 유가 3개 series 요청 payload | BOK ECOS 원본 응답 적재 완료. |
+| `raw.dart_response` | 81,021 | OpenDART 재무제표 API 응답 payload | DART CFS 재무제표 원본 payload 적재 완료. |
 | `raw.ohlcv_response` | 6,107 | `2016-05-20 ~ 2026-05-21` 요청 | KRX raw 응답 적재 완료. |
 | `raw.seibro_report_response` | 734 | SEIBro 요청 payload | SEIBro raw payload 적재 완료. |
 
@@ -59,9 +59,9 @@
 | 객체 | row 수 | 기간/범위 | 상태 |
 |---|---:|---|---|
 | `feature.adjusted_ohlcv_daily` | 6,409,656 | `2016-05-20 ~ 2026-05-20` | 조정 OHLCV feature 적재 완료. |
-| `feature.bok_macro_daily` | 2 | `2026-05-14 ~ 2026-05-15` | BOK 파일럿 2일치만 있음. 장기 수집 미완. |
-| `feature.dart_corp_symbol_map` | 0 | 없음 | OpenDART 스키마만 있고 데이터 미적재. |
-| `feature.dart_financial_quarterly` | 0 | 없음 | OpenDART 스키마만 있고 데이터 미적재. |
+| `feature.bok_macro_daily` | 30,825 | `2016-01-01 ~ 2026-05-28`, 15개 series | BOK `rate-fx` 12개 series와 월별 유가 3개 series 적재 완료. KOFR은 원천 제공 시작일 영향으로 `2021-11-25`부터 있고, 월별 유가는 `2016-06-01 ~ 2026-05-01` 구간 360건. |
+| `feature.dart_corp_symbol_map` | 3,967 | DART corp code ↔ ticker 매핑 | corp-code 매핑 적재됨. |
+| `feature.dart_financial_quarterly` | 73,342 | `2016-03-31 ~ 2026-03-31`, 2,506개 symbol | DART CFS 재무제표 적재 완료. |
 | `feature.kis_adjusted_ohlcv_daily` | 5,997,018 | `2016-05-20 ~ 2026-05-20` | KIS 수정주가 적재 완료. |
 | `feature.seibro_report_summary` | 0 | 없음 | SEIBro feature 변환 미실행으로 데이터 미적재. |
 | `feature.seibro_sentiment` | 0 | 없음 | SEIBro sentiment 산출 미실행으로 데이터 미적재. |
@@ -82,8 +82,8 @@
 
 | 객체 | row 수 | 기간/범위 | 상태 |
 |---|---:|---|---|
-| `mart.bok_macro_asof` | 2 | `2026-05-14 ~ 2026-05-15` | BOK 파일럿 view만 조회됨. |
-| `mart.dart_financial_asof` | 0 | 없음 | OpenDART 하위 테이블 미적재로 비어 있음. |
+| `mart.bok_macro_asof` | 30,825 | `2016-01-01 ~ 2026-05-28`, 15개 series | BOK macro as-of view 정상 조회됨. 월별 유가는 실제 발표일이 별도 저장되지 않으므로 백테스트에서 보수적 lag 적용 필요. |
+| `mart.dart_financial_asof` | 73,342 | `2016-03-31 ~ 2026-03-31`, 2,506개 symbol | DART 재무제표 as-of view 정상 조회 가능. |
 | `mart.data_coverage_report` | 281,974 | `2016-12-31 ~ 2026-05-21` | 품질 리포트 view 정상. |
 | `mart.full_universe_asof` | 5,477,595 | `2016-05-20 ~ 2026-05-20` | universe view 정상. |
 | `mart.kis_adjusted_feature_frame_asof` | 5,943,964 | `2016-05-20 ~ 2026-05-20` | KIS 수정주가 feature frame view 정상. |
@@ -102,20 +102,15 @@
 | `meta.ingestion_run` | 175 | 수집/처리 실행 이력 적재됨. |
 | `meta.lineage_event` | 47,446,731 | lineage 이벤트 적재됨. |
 
-## 4. 미적재/부분 적재 주의 목록
+## 4. 미적재/주의 목록
 
 | 객체 | 현재 상태 | 해석 |
 |---|---|---|
-| `raw.dart_response` | 0건 | OpenDART raw 수집 미실행. |
-| `feature.dart_corp_symbol_map` | 0건 | OpenDART corp code → 종목 매핑 미적재. |
-| `feature.dart_financial_quarterly` | 0건 | OpenDART 재무제표 미적재. |
-| `mart.dart_financial_asof` | 0건 | DART feature가 없어서 view도 비어 있음. |
-| `raw.bok_response` | 1건 | BOK 파일럿 payload만 있음. 장기 수집 완료로 보면 안 됨. |
-| `feature.bok_macro_daily` | 2건 | BOK 2일치 파일럿만 있음. 운영 macro 데이터 미완. |
 | `feature.seibro_report_summary` | 0건 | SEIBro raw → feature 변환 미실행. |
 | `feature.seibro_sentiment` | 0건 | SEIBro sentiment 산출 미실행. |
 | `feature.seibro_universe_daily` | 0건 | SEIBro universe 산출 미실행. |
 | `mart.seibro_universe_asof` | 0건 | 하위 SEIBro universe feature 미적재로 비어 있음. |
+| `meta.ingestion_run` | 실패 run 2건 존재 | DART 초반 timeout/network 실패 이력이 남아 있으나 연도별 재실행 후 feature/mart 정합성 검증은 통과. error_message는 API URL/키 포함 가능성이 있어 문서에 원문을 남기지 않는다. |
 
 ## 5. `core` 스키마 상세
 
@@ -126,7 +121,7 @@
 | 용도 | 종목 마스터 테이블. |
 | row 수 | 3,226 |
 | 상태 | 적재 완료. |
-| 컬럼 | `symbol_id bigint`, `symbol text`, `name text`, `market text`, `security_type text`, `created_at timestamptz`, `updated_at timestamptz`, `market_segment text`, `listing_status text`, `listed_at date`, `delisted_at date`, `metadata_jsonb jsonb` |
+| 컬럼 | `symbol_id bigint`, `symbol text`, `name text`, `market text`, `security_type text`, `created_at timestamptz`, `updated_at timestamptz`, `market_segment text`, `listing_status text`, `listed_at date`, `delisted_at date`, `metadata_jsonb jsonb`, `sector text`, `sector_source text`, `sector_as_of date`, `sector_run_id uuid` |
 
 ### `core.symbol_listing_history`
 
@@ -209,8 +204,8 @@
 | 항목 | 내용 |
 |---|---|
 | 용도 | BOK ECOS 원본 응답 payload 저장 테이블. |
-| row 수 | 1 |
-| 상태 | 파일럿 payload 1건만 있음. 장기 수집 미완. |
+| row 수 | 147 |
+| 상태 | `rate-fx` preset 12개 series와 월별 유가 3개 series 원본 응답 적재 완료. |
 | 컬럼 | `raw_id bigint`, `stat_code text`, `item_code text`, `payload_hash text`, `payload_jsonb jsonb`, `run_id uuid`, `created_at timestamptz` |
 
 ### `raw.dart_response`
@@ -218,8 +213,8 @@
 | 항목 | 내용 |
 |---|---|
 | 용도 | OpenDART 원본 응답 payload 저장 테이블. |
-| row 수 | 0 |
-| 상태 | 스키마만 있고 데이터 미적재. |
+| row 수 | 81,021 |
+| 상태 | OpenDART CFS 재무제표 수집 payload 적재 완료. feature 변환 기준 `2016-03-31 ~ 2026-03-31` period_end 구간을 커버. |
 | 컬럼 | `raw_id bigint`, `corp_code text`, `report_code text`, `payload_hash text`, `payload_jsonb jsonb`, `run_id uuid`, `created_at timestamptz` |
 
 ## 7. `feature` 스키마 상세
@@ -251,17 +246,43 @@
 | 항목 | 내용 |
 |---|---|
 | 용도 | BOK ECOS 거시지표 일자별 feature 테이블. |
-| row 수 | 2 |
-| 상태 | `2026-05-14 ~ 2026-05-15` 파일럿 2일치만 있음. 장기 수집 미완. |
+| row 수 | 30,825 |
+| 상태 | `rate-fx` 12개 series 기준 `2016-01-01 ~ 2026-05-28` 적재 완료. 월별 유가 3개 series는 `2016-06-01 ~ 2026-05-01` 구간 360건 적재 완료. KOFR(`817Y002:010901000`)은 BOK 원천 제공 시작 영향으로 `2021-11-25 ~ 2026-05-26` 구간만 있음. |
 | 컬럼 | `series_id text`, `effective_date date`, `published_at timestamptz`, `value numeric`, `metadata_jsonb jsonb`, `run_id uuid` |
+
+| series_id | 의미 | row 수 | 기간 |
+|---|---|---:|---|
+| `722Y001:0101000` | 한국은행 기준금리 | 3,801 | `2016-01-01 ~ 2026-05-28` |
+| `731Y003:0000003` | 원/달러 종가 15:30 | 2,549 | `2016-01-04 ~ 2026-05-27` |
+| `731Y003:0000006` | 원/100엔 | 2,549 | `2016-01-04 ~ 2026-05-27` |
+| `731Y003:0000010` | 원/위안 종가 | 2,549 | `2016-01-04 ~ 2026-05-27` |
+| `817Y002:010101000` | 콜금리(1일, 전체거래) | 2,559 | `2016-01-04 ~ 2026-05-27` |
+| `817Y002:010190000` | 국고채(1년) | 2,559 | `2016-01-04 ~ 2026-05-27` |
+| `817Y002:010200000` | 국고채(3년) | 2,559 | `2016-01-04 ~ 2026-05-27` |
+| `817Y002:010210000` | 국고채(10년) | 2,559 | `2016-01-04 ~ 2026-05-27` |
+| `817Y002:010300000` | 회사채(3년, AA-) | 2,559 | `2016-01-04 ~ 2026-05-27` |
+| `817Y002:010320000` | 회사채(3년, BBB-) | 2,559 | `2016-01-04 ~ 2026-05-27` |
+| `817Y002:010502000` | CD(91일) | 2,559 | `2016-01-04 ~ 2026-05-27` |
+| `817Y002:010901000` | KOFR | 1,104 | `2021-11-25 ~ 2026-05-26` |
+| `902Y003:010101` | WTI 원유 월평균, `$/bbl` | 120 | `2016-06-01 ~ 2026-05-01` |
+| `902Y003:010102` | Dubai Fateh 원유 월평균, `$/bbl` | 120 | `2016-06-01 ~ 2026-05-01` |
+| `902Y003:010103` | Brent 원유 월평균, `$/bbl` | 120 | `2016-06-01 ~ 2026-05-01` |
+
+월별 유가 series는 `TIME=YYYYMM`을 해당 월 1일 `effective_date`로 정규화해 저장한다. BOK 응답에는 실제 발표일 필드가 없고 `published_at`은 수집 시각이므로, 일봉 백테스트에서는 다음 달 이후 사용 같은 보수적 as-of lag를 적용한다.
+
+| series_id | 의미 | 주기 | 단위 | 백테스트 사용 기준 |
+|---|---|---|---|---|
+| `902Y003:010101` | WTI 원유 | 월간 | `$/bbl` | 월평균값이므로 다음 달 이후 사용 등 as-of lag 적용 |
+| `902Y003:010102` | Dubai Fateh 원유 | 월간 | `$/bbl` | 월평균값이므로 다음 달 이후 사용 등 as-of lag 적용 |
+| `902Y003:010103` | Brent 원유 | 월간 | `$/bbl` | 월평균값이므로 다음 달 이후 사용 등 as-of lag 적용 |
 
 #### `feature.dart_corp_symbol_map`
 
 | 항목 | 내용 |
 |---|---|
 | 용도 | OpenDART corp code와 종목코드 매핑 테이블. |
-| row 수 | 0 |
-| 상태 | 스키마만 있고 데이터 미적재. |
+| row 수 | 3,967 |
+| 상태 | corp code ↔ ticker 매핑 적재됨. |
 | 컬럼 | `corp_code text`, `corp_name text`, `symbol text`, `modify_date text`, `run_id uuid`, `created_at timestamptz`, `updated_at timestamptz` |
 
 #### `feature.dart_financial_quarterly`
@@ -269,8 +290,8 @@
 | 항목 | 내용 |
 |---|---|
 | 용도 | OpenDART 분기/사업보고서 재무제표 feature 테이블. |
-| row 수 | 0 |
-| 상태 | 스키마만 있고 데이터 미적재. |
+| row 수 | 73,342 |
+| 상태 | CFS 기준 `2016-03-31 ~ 2026-03-31` period_end 구간 적재 완료. 2,506개 symbol 연결. |
 | 컬럼 | `symbol_id bigint`, `corp_code text`, `period_end date`, `reported_at timestamptz`, `report_code text`, `fs_div text`, `accounts_jsonb jsonb`, `run_id uuid` |
 
 #### `feature.seibro_report_summary`
@@ -311,6 +332,17 @@
 | 상태 | 적재 완료. |
 | 컬럼 | `indicator_id bigint`, `category text`, `name text`, `parameters_jsonb jsonb`, `warmup_days integer`, `output_schema_jsonb jsonb`, `transform_version text` |
 
+| 카테고리 | 정의 수 |
+|---|---:|
+| `Trend` | 56 |
+| `Momentum` | 35 |
+| `Volatility` | 3 |
+| `Volume` | 3 |
+| `Pattern` | 61 |
+| **합계** | **158** |
+
+> `feature.ta_indicator_definition`의 158개는 “계산 가능한 지표 카탈로그/정의”이다. 현재 mart 백테스트 경로가 실제로 읽는 ticker 기반 선계산 지표값은 아래 `feature.ta_*_ticker_daily.values_jsonb`에 저장된 기본 45개 key다. 정의 1개가 여러 output key를 만들 수 있어 `Volatility`는 정의 3개에서 `BBL/BBM/BBU/BBB/BBP` 등 7개 저장 key가 나온다.
+
 #### `feature.ta_*_daily` 공통
 
 | 테이블 | row 수 | 기간 | 저장 정보 |
@@ -339,7 +371,16 @@
 | 항목 | 내용 |
 |---|---|
 | 공통 컬럼 | `time date`, `ticker text`, `base_ticker text`, `segment_id integer`, `values_jsonb jsonb`, `quality_flags jsonb`, `run_id uuid`, `created_at timestamptz`, `updated_at timestamptz` |
-| 상태 | 위 5개 테이블 모두 적재 완료. |
+| 상태 | 위 5개 테이블 모두 적재 완료. `mart.symbol_feature_frame_asof`/`mart.kis_adjusted_feature_frame_asof`가 이 ticker 기반 TA 테이블을 join한다. |
+
+| 카테고리 | ticker_daily 테이블 | 현재 선계산 key 수 | 선계산 key |
+|---|---|---:|---|
+| `Trend` | `feature.ta_trend_ticker_daily` | 16 | `ADXR_14_2`, `ADX_14`, `AROOND_25`, `AROONOSC_25`, `AROONU_25`, `DMN_14`, `DMP_14`, `EMA_20`, `EMA_200`, `EMA_50`, `MACD_12_26_9`, `MACDh_12_26_9`, `MACDs_12_26_9`, `SMA_20`, `SMA_200`, `SMA_50` |
+| `Momentum` | `feature.ta_momentum_ticker_daily` | 8 | `CCI_20_0.015`, `MFI_14`, `ROC_10`, `RSI_14`, `STOCHd_14_3_3`, `STOCHh_14_3_3`, `STOCHk_14_3_3`, `WILLR_14` |
+| `Volatility` | `feature.ta_volatility_ticker_daily` | 7 | `ATRr_14`, `BBB_20_2.0_2.0`, `BBL_20_2.0_2.0`, `BBM_20_2.0_2.0`, `BBP_20_2.0_2.0`, `BBU_20_2.0_2.0`, `NATR_14` |
+| `Volume` | `feature.ta_volume_ticker_daily` | 4 | `AD`, `ADOSC_3_10`, `CMF_20`, `OBV` |
+| `Pattern` | `feature.ta_pattern_ticker_daily` | 10 | `CDL_DARKCLOUDCOVER`, `CDL_DOJI_10_0.1`, `CDL_ENGULFING`, `CDL_EVENINGSTAR`, `CDL_HAMMER`, `CDL_HANGINGMAN`, `CDL_HARAMI`, `CDL_MORNINGSTAR`, `CDL_PIERCING`, `CDL_SHOOTINGSTAR` |
+| **합계** | 5개 ticker_daily 테이블 | **45** | 현재 백테스트 mart 기본 입력 지표 |
 
 ## 8. `mart` view 상세
 
@@ -350,7 +391,7 @@
 | 용도 | `feature.adjusted_ohlcv_daily`와 TA ticker feature를 결합한 백테스트용 feature frame view. |
 | row 수 | 6,409,656 |
 | 상태 | 정상 조회 가능함. |
-| 컬럼 | `as_of_date date`, `symbol text`, `name text`, `market_segment text`, `listing_status text`, `listed_at date`, `delisted_at date`, `ticker text`, `base_ticker text`, `segment_id integer`, `open numeric`, `high numeric`, `low numeric`, `close numeric`, `volume numeric`, `adjusted_ohlcv_quality_flags jsonb`, `trend_values jsonb`, `momentum_values jsonb`, `volatility_values jsonb`, `volume_values jsonb`, `pattern_values jsonb`, `adjusted_ohlcv_run_id uuid` |
+| 컬럼 | `as_of_date date`, `symbol text`, `name text`, `market_segment text`, `listing_status text`, `listed_at date`, `delisted_at date`, `ticker text`, `base_ticker text`, `segment_id integer`, `open numeric`, `high numeric`, `low numeric`, `close numeric`, `volume numeric`, `adjusted_ohlcv_quality_flags jsonb`, `trend_values jsonb`, `momentum_values jsonb`, `volatility_values jsonb`, `volume_values jsonb`, `pattern_values jsonb`, `adjusted_ohlcv_run_id uuid`, `sector text` |
 
 ### `mart.kis_adjusted_feature_frame_asof`
 
@@ -359,7 +400,7 @@
 | 용도 | KIS 수정주가와 TA ticker feature를 결합한 백테스트용 feature frame view. |
 | row 수 | 5,943,964 |
 | 상태 | 정상 조회 가능함. |
-| 컬럼 | `as_of_date date`, `symbol text`, `name text`, `market_segment text`, `listing_status text`, `listed_at date`, `delisted_at date`, `ticker text`, `base_ticker text`, `segment_id integer`, `open numeric`, `high numeric`, `low numeric`, `close numeric`, `volume numeric`, `adjusted_ohlcv_quality_flags jsonb`, `trend_values jsonb`, `momentum_values jsonb`, `volatility_values jsonb`, `volume_values jsonb`, `pattern_values jsonb`, `adjusted_ohlcv_run_id uuid` |
+| 컬럼 | `as_of_date date`, `symbol text`, `name text`, `market_segment text`, `listing_status text`, `listed_at date`, `delisted_at date`, `ticker text`, `base_ticker text`, `segment_id integer`, `open numeric`, `high numeric`, `low numeric`, `close numeric`, `volume numeric`, `adjusted_ohlcv_quality_flags jsonb`, `trend_values jsonb`, `momentum_values jsonb`, `volatility_values jsonb`, `volume_values jsonb`, `pattern_values jsonb`, `adjusted_ohlcv_run_id uuid`, `sector text` |
 
 ### `mart.symbol_feature_frame_asof` vs `mart.kis_adjusted_feature_frame_asof`
 
@@ -432,7 +473,7 @@ MVP 백테스트/팩터 엔진은 기본적으로 이 view를 사용한다.
 | 용도 | 날짜별 투자 가능 universe view. |
 | row 수 | 5,477,595 |
 | 상태 | 정상 조회 가능함. |
-| 컬럼 | `as_of_date date`, `symbol_id bigint`, `symbol text`, `market_segment text`, `listing_status text` |
+| 컬럼 | `as_of_date date`, `symbol_id bigint`, `symbol text`, `market_segment text`, `listing_status text`, `sector text` |
 
 ### `mart.data_coverage_report`
 
@@ -441,15 +482,15 @@ MVP 백테스트/팩터 엔진은 기본적으로 이 view를 사용한다.
 | 용도 | OHLCV coverage/품질 요약 view. |
 | row 수 | 281,974 |
 | 상태 | 정상 조회 가능함. |
-| 컬럼 | `as_of_date date`, `symbol text`, `name text`, `market_segment text`, `listing_status text`, `expected_days integer`, `observed_days integer`, `coverage_ratio numeric`, `missing_days integer`, `issue_count integer` |
+| 컬럼 | `as_of_date date`, `symbol text`, `name text`, `market_segment text`, `listing_status text`, `expected_days integer`, `observed_days integer`, `coverage_ratio numeric`, `missing_days integer`, `issue_count integer`, `sector text` |
 
 ### `mart.bok_macro_asof`
 
 | 항목 | 내용 |
 |---|---|
 | 용도 | BOK macro feature의 as-of 조회 view. |
-| row 수 | 2 |
-| 상태 | BOK 파일럿 2일치만 조회됨. 장기 macro view로 보기엔 미완. |
+| row 수 | 30,825 |
+| 상태 | `rate-fx` 12개 series와 월별 유가 3개 series 기준 `2016-01-01 ~ 2026-05-28` 조회 가능. KOFR은 `2021-11-25`부터 조회되고 월별 유가는 `2016-06-01 ~ 2026-05-01` 구간 조회 가능. 유가 series는 실제 발표일이 별도 저장되지 않으므로 `available_from` 정책을 보수적으로 적용해야 함. |
 | 컬럼 | `series_id text`, `effective_date date`, `available_from date`, `value numeric`, `metadata_jsonb jsonb` |
 
 ### `mart.dart_financial_asof`
@@ -457,8 +498,8 @@ MVP 백테스트/팩터 엔진은 기본적으로 이 view를 사용한다.
 | 항목 | 내용 |
 |---|---|
 | 용도 | OpenDART 재무제표 as-of 조회 view. |
-| row 수 | 0 |
-| 상태 | 하위 DART feature 미적재로 비어 있음. |
+| row 수 | 73,342 |
+| 상태 | `feature.dart_financial_quarterly` 전체 적재분(`2016-03-31 ~ 2026-03-31`) 조회 가능. feature/mart row delta 0건. |
 | 컬럼 | `symbol text`, `corp_code text`, `period_end date`, `available_from date`, `report_code text`, `fs_div text`, `accounts_jsonb jsonb` |
 
 ### `mart.seibro_universe_asof`
@@ -477,8 +518,8 @@ MVP 백테스트/팩터 엔진은 기본적으로 이 view를 사용한다.
 | 항목 | 내용 |
 |---|---|
 | 용도 | 데이터 소스 마스터 테이블. |
-| row 수 | 7 |
-| 상태 | `BOK`, `DART`, `KIS`, `KRX`, `QA`, `SEIBRO`, `TA` 등록됨. |
+| row 수 | 8 |
+| 상태 | `BOK`, `DART`, `KIND`, `KIS`, `KRX`, `QA`, `SEIBRO`, `TA` 등록됨. |
 | 컬럼 | `source_id text`, `name text`, `base_url_key text`, `version text`, `is_primary boolean`, `created_at timestamptz`, `updated_at timestamptz` |
 
 ### `meta.ingestion_run`
@@ -486,8 +527,8 @@ MVP 백테스트/팩터 엔진은 기본적으로 이 view를 사용한다.
 | 항목 | 내용 |
 |---|---|
 | 용도 | 수집/처리 실행 이력 테이블. |
-| row 수 | 175 |
-| 상태 | 실행 이력 적재됨. BOK는 파일럿 1회, DART는 실행 이력 없음. |
+| row 수 | 199 |
+| 상태 | 실행 이력 적재됨. BOK `rate-fx` 10년치, BOK 월별 유가 10년치, DART 2016~2026 연도별 재무제표 적재 이력이 반영됨. DART 초반 실패 run은 재실행으로 데이터 정합성 검증 통과. |
 | 컬럼 | `run_id uuid`, `dag_id text`, `task_id text`, `source_id text`, `started_at timestamptz`, `ended_at timestamptz`, `status text`, `params_jsonb jsonb`, `error_message text` |
 
 ### `meta.api_request_log`
@@ -533,7 +574,7 @@ MVP 백테스트/팩터 엔진은 기본적으로 이 view를 사용한다.
 | 용도 | 공통주 universe helper view. |
 | row 수 | 2,554 |
 | 상태 | 정상 조회 가능함. |
-| 컬럼 | `symbol_id bigint`, `symbol text`, `name text`, `market text`, `market_segment text`, `security_type text`, `listing_status text`, `listed_at date`, `delisted_at date`, `metadata_jsonb jsonb` |
+| 컬럼 | `symbol_id bigint`, `symbol text`, `name text`, `market text`, `market_segment text`, `security_type text`, `listing_status text`, `listed_at date`, `delisted_at date`, `metadata_jsonb jsonb`, `sector text` |
 
 ## 10. 검증 SQL
 
@@ -586,11 +627,105 @@ UNION ALL SELECT 'meta.lineage_event', count(*) FROM meta.lineage_event
 UNION ALL SELECT 'meta.view_common_stock_universe', count(*) FROM meta.view_common_stock_universe;
 ```
 
+아래 SQL은 BOK 10년치 적재 범위, DART 재무제표 적재 범위, TA 지표 개수 재검증용.
+
+```sql
+SELECT 'feature.bok_macro_daily' AS object_name,
+       count(*) AS rows,
+       count(DISTINCT series_id) AS series_count,
+       min(effective_date) AS min_date,
+       max(effective_date) AS max_date
+FROM feature.bok_macro_daily
+UNION ALL
+SELECT 'mart.bok_macro_asof',
+       count(*),
+       count(DISTINCT series_id),
+       min(effective_date),
+       max(effective_date)
+FROM mart.bok_macro_asof;
+
+SELECT 'feature.dart_financial_quarterly' AS object_name,
+       count(*) AS rows,
+       count(DISTINCT symbol_id) AS symbol_count,
+       min(period_end) AS min_period_end,
+       max(period_end) AS max_period_end
+FROM feature.dart_financial_quarterly
+UNION ALL
+SELECT 'mart.dart_financial_asof',
+       count(*),
+       count(DISTINCT symbol),
+       min(period_end),
+       max(period_end)
+FROM mart.dart_financial_asof;
+
+SELECT 'duplicate_feature_pk_groups' AS check_name, count(*) AS issue_count
+FROM (
+  SELECT symbol_id, period_end, report_code, fs_div
+  FROM feature.dart_financial_quarterly
+  GROUP BY 1,2,3,4
+  HAVING count(*) > 1
+) d
+UNION ALL
+SELECT 'empty_or_null_accounts_jsonb', count(*)
+FROM feature.dart_financial_quarterly
+WHERE accounts_jsonb IS NULL OR accounts_jsonb = '{}'::jsonb
+UNION ALL
+SELECT 'feature_mart_row_delta',
+       (SELECT count(*) FROM feature.dart_financial_quarterly)
+     - (SELECT count(*) FROM mart.dart_financial_asof)
+UNION ALL
+SELECT 'feature_rows_without_corp_map', count(*)
+FROM feature.dart_financial_quarterly f
+LEFT JOIN feature.dart_corp_symbol_map m ON m.corp_code = f.corp_code
+WHERE m.corp_code IS NULL;
+
+SELECT category, count(*) AS catalog_definitions
+FROM feature.ta_indicator_definition
+GROUP BY category
+ORDER BY category;
+```
+
 ## 11. 운영 메모
 
 - `mart.*`는 view. 하위 `core.*`, `feature.*` 데이터가 없으면 row도 비어 있음.
 - `feature.*` 중 TimescaleDB hypertable은 부모 테이블만 덤프하면 빈 COPY가 생길 수 있음. 이관 시 `COPY (SELECT * FROM feature.<table>) TO STDOUT` 방식 권장.
 - `raw.analyst_report_summary`는 SEIBro 분석리포트 요약 raw row. `raw.seibro_report_response`를 AI가 요약한 결과가 아님.
-- OpenDART는 `raw.dart_response`, `feature.dart_corp_symbol_map`, `feature.dart_financial_quarterly`, `mart.dart_financial_asof` 모두 미적재.
-- BOK는 `raw.bok_response` 1건과 `feature.bok_macro_daily` 2건만 있으므로 파일럿 수준.
+- OpenDART는 CFS 재무제표 기준 `raw.dart_response` 81,021건, `feature.dart_financial_quarterly`/`mart.dart_financial_asof` 73,342건 적재 완료. `duplicate_feature_pk_groups`, `empty_or_null_accounts_jsonb`, `feature_mart_row_delta`, `feature_rows_without_corp_map` 검증값은 모두 0건이다.
+- BOK는 `rate-fx` 12개 series와 월별 유가 3개 series 기준 `raw.bok_response` 147건, `feature.bok_macro_daily`/`mart.bok_macro_asof` 30,825건 적재 완료. KOFR은 원천 제공 시작일 때문에 2016년부터 존재하지 않는다. 월별 유가는 `902Y003:010101`(WTI), `902Y003:010102`(Dubai Fateh), `902Y003:010103`(Brent)이며 각 120개월, 총 360건이다.
+- TA는 정의 카탈로그 158개와 현재 백테스트 mart 기본 입력 45개를 구분해야 한다. `feature.ta_indicator_definition`은 “정의”, `feature.ta_*_ticker_daily.values_jsonb`는 실제 선계산 값이다.
 - SEIBro는 raw 10년치 적재 완료이나 `feature.seibro_*`와 `mart.seibro_universe_asof`는 미적재.
+
+<!-- DART_BOK_LOCAL_STATUS:START -->
+## 부록. 로컬 DB DART/BOK 적재 현황
+
+갱신 시각: `2026-06-24T08:35:56+00:00`
+
+| 객체 | rows | 범위/비고 |
+|---|---:|---|
+| `feature.bok_macro_daily` | 30,825 | 15 series, `2016-01-01 ~ 2026-05-28`; 월별 유가 3개 series는 `2016-06-01 ~ 2026-05-01` |
+| `feature.dart_corp_symbol_map` | 3,967 | stock-code mapping symbols 3,967개 |
+| `feature.dart_financial_quarterly` | 73,342 | symbols 2,506개, `2016-03-31 ~ 2026-03-31` |
+
+DART 재무제표 연도별 적재 현황:
+
+| year | rows | symbols | period range |
+|---:|---:|---:|---|
+| 2016 | 5,652 | 1,494 | `2016-03-31 ~ 2016-12-31` |
+| 2017 | 5,987 | 1,573 | `2017-03-31 ~ 2017-12-31` |
+| 2018 | 6,357 | 1,669 | `2018-03-31 ~ 2018-12-31` |
+| 2019 | 6,647 | 1,733 | `2019-03-31 ~ 2019-12-31` |
+| 2020 | 6,959 | 1,821 | `2020-03-31 ~ 2020-12-31` |
+| 2021 | 7,246 | 1,897 | `2021-03-31 ~ 2021-12-31` |
+| 2022 | 7,531 | 1,960 | `2022-03-31 ~ 2022-12-31` |
+| 2023 | 7,939 | 2,099 | `2023-03-31 ~ 2023-12-31` |
+| 2024 | 8,312 | 2,167 | `2024-03-31 ~ 2024-12-31` |
+| 2025 | 8,574 | 2,218 | `2025-03-31 ~ 2025-12-31` |
+| 2026 | 2,138 | 2,138 | `2026-03-31 ~ 2026-03-31` |
+
+운영 메모:
+
+- DART 재무제표는 연도 단위로 분할 적재한다.
+- `feature.dart_financial_quarterly` 기본키는 `(symbol_id, period_end, report_code, fs_div)`이므로 같은 연도 재실행 시 중복 row는 삽입되지 않는다.
+- OpenDART `013` 응답은 해당 회사/보고서 데이터 없음으로 간주해 raw 응답만 보존하고 feature row는 생성하지 않는다.
+- 검증 산출물은 `.omx/logs/dart-validation-20260604-095618.md`와 `.omx/logs/dart-validation-20260604-095618.json`에 저장되어 있다.
+<!-- DART_BOK_LOCAL_STATUS:END -->

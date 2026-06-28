@@ -52,6 +52,7 @@ DEFAULT_SEIBRO_REQUEST_SLEEP_MIN_SECONDS = 1.0
 DEFAULT_SEIBRO_REQUEST_SLEEP_MAX_SECONDS = 3.0
 DEFAULT_BOK_BASE_URL = "https://ecos.bok.or.kr/api"
 DEFAULT_DART_BASE_URL = "https://opendart.fss.or.kr/api"
+DEFAULT_KIND_CORP_LIST_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do"
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -335,6 +336,25 @@ class DartConfig:
     @property
     def is_configured(self) -> bool:
         return bool(self.api_key)
+
+
+@dataclass(frozen=True)
+class KindConfig:
+    corp_list_url: str
+    request_timeout_seconds: int
+    retry: RetryConfig
+
+    @classmethod
+    def from_env(cls) -> "KindConfig":
+        return cls(
+            corp_list_url=(_env("KIND_CORP_LIST_URL", DEFAULT_KIND_CORP_LIST_URL) or DEFAULT_KIND_CORP_LIST_URL).rstrip("/"),
+            request_timeout_seconds=_env_int("API_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS),
+            retry=RetryConfig.from_env(),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.corp_list_url)
 
 
 def _parse_date(raw: str | None, default: date) -> date:

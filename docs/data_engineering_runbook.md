@@ -2,7 +2,7 @@
 
 ## 결론
 
-데이터 엔지니어링 실행 경로는 `KRX/KIS 파일럿 → KRX primary OHLCV 적재 → TA-Lib 선계산 → BOK/OpenDART/SEIBro 외부 데이터 적재 → mart/as-of 조회 → Airflow 운영` 순서다. 2026-06-24 기준 BOK `rate-fx` 12개 series, BOK 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 백필이 완료되어 증분 운영 대상으로 전환한다. BOK 월별 유가는 `902Y003` 월간 series로 저장하며 실제 ECOS 발표일이 별도 컬럼으로 저장되지 않으므로 백테스트 조인 시 보수적 lag를 적용한다.
+데이터 엔지니어링 실행 경로는 `KRX/KIS 파일럿 → KRX primary OHLCV 적재 → TA-Lib 선계산 → BOK/OpenDART/SEIBro/KIND 외부 데이터 적재 → mart/as-of 조회 → Airflow 운영` 순서다. 2026-06-24 기준 BOK `rate-fx` 12개 series, BOK 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 백필이 완료되어 증분 운영 대상으로 전환한다. 2026-06-28 기준 KIND 상장법인 목록 기반 섹터 스냅샷도 공용 DB에 붙여서 `core.symbol_master.sector`를 갱신한다. BOK 월별 유가는 `902Y003` 월간 series로 저장하며 실제 ECOS 발표일이 별도 컬럼으로 저장되지 않으므로 백테스트 조인 시 보수적 lag를 적용한다.
 
 ## 주요 명령
 
@@ -18,6 +18,7 @@
 | BOK 유가 단일 series 점검 | `python scripts/ingest_external_data.py --job bok-series --stat-code 902Y003 --cycle M --start-period 202601 --end-period 202605 --item-code1 010102 --db-mode docker` |
 | OpenDART corp code | `python scripts/ingest_external_data.py --job dart-corp-codes --db-mode docker` |
 | OpenDART financial | `python scripts/ingest_external_data.py --job dart-financial --symbol 005930 --corp-code <corp_code> --business-year 2025 --report-code 11011 --db-mode docker` |
+| KIND 섹터 스냅샷 | `python scripts/ingest_external_data.py --job kind-sector --as-of-date 2026-06-28 --db-mode docker` |
 | SEIBro reports | `python scripts/ingest_external_data.py --job seibro-reports --seibro-endpoint <approved_endpoint> --as-of-date 2026-05-15 --db-mode docker` |
 | SEIBro analyst report summary backfill | `python scripts/backfill_seibro_analyst_reports.py --start-date 2016-05-20 --end-date 2026-05-20 --chunk-months 1 --db-mode docker` |
 | KIS official adjusted full + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode full --start-date 2016-05-20 --end-date 2026-05-20 --resume` |
@@ -34,8 +35,9 @@
 | KIS | `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_TRADING_ENV` |
 | BOK | `BOK_API_KEY`, 선택: `BOK_BASE_URL` |
 | OpenDART | `DART_API_KEY` 또는 `OPENDART_API_KEY` |
+| KIND | `KIND_CORP_LIST_URL` |
 | SEIBro | `SEIBRO_COLLECTION_APPROVED=true`, `SEIBRO_REPORT_ENDPOINT`, 선택: `SEIBRO_API_KEY`; 분석리포트 WebSquare 수집 선택: `SEIBRO_WEB_BASE_URL`, `SEIBRO_ANALYST_REPORT_*`, `SEIBRO_REQUEST_SLEEP_*` |
-| Airflow | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON`, `DART_REFRESH_CORP_CODES`, `SEIBRO_REPORT_PARAMS_JSON`, `QUANT_AIRFLOW_DAILY_SCHEDULE` |
+| Airflow | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON`, `DART_REFRESH_CORP_CODES`, `SEIBRO_REPORT_PARAMS_JSON`, `QUANT_AIRFLOW_DAILY_SCHEDULE`, `QUANT_AIRFLOW_EXTERNAL_INGEST_SCRIPT` |
 
 공용 DB 정보를 서버에 넣을 때는 아래 위치 중 하나를 쓰면 된다.
 
@@ -148,11 +150,11 @@ wrapper 내부 검증은 KIS 적재 후 `failed_windows`가 비어 있을 때만
 
 ## Airflow
 
-`airflow/dags/quant_agent_data_engineering.py`는 다음 DAG를 제공한다.
+`airflow/dags/quant_agent_data_engineering.py`는 다음 DAG를 제공한다. 일일 DAG에는 `refresh_symbol_sector_daily`가 포함되어 KIND 상장법인 목록에서 업종(섹터) 스냅샷을 갱신한다.
 
 | DAG | 역할 |
 |---|---|
 | `quant_agent_daily_data_engineering` | 일일 OHLCV, TA-Lib, BOK, DART corp code, SEIBro report refresh |
 | `quant_agent_backfill_ohlcv_10y` | 설정된 primary source 기준 10년 OHLCV backfill |
 
-Airflow task는 credentials를 코드/파일에서 읽지 않고 런타임 환경, Airflow Connection, Secret Backend에 의존한다. KIS TA/품질 스크립트는 DB 정보가 주입되면 `psycopg`를 자동 선택하고, 그렇지 않으면 로컬 Docker DB 경로를 따른다.
+Airflow task는 credentials를 코드/파일에서 읽지 않고 런타임 환경, Airflow Connection, Secret Backend에 의존한다. 일일 DAG에는 `refresh_symbol_sector_daily`가 포함되어 KIND 상장법인 목록 기반 섹터(업종) 스냅샷을 `core.symbol_master`에 반영한다. KIS TA/품질 스크립트는 DB 정보가 주입되면 `psycopg`를 자동 선택하고, 그렇지 않으면 로컬 Docker DB 경로를 따른다.

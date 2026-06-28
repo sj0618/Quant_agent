@@ -57,6 +57,17 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("listing_status = 'listed'", sql)
         self.assertIn("'인프라펀드'", sql)
 
+    def test_symbol_sector_migration_adds_kind_snapshot_and_view_columns(self):
+        sql = Path("migrations/008_symbol_sector_metadata.sql").read_text(encoding="utf-8")
+        self.assertIn("ALTER TABLE core.symbol_master ADD COLUMN IF NOT EXISTS sector TEXT", sql)
+        self.assertIn("ALTER TABLE core.symbol_master ADD COLUMN IF NOT EXISTS sector_source TEXT", sql)
+        self.assertIn("ALTER TABLE core.symbol_master ADD COLUMN IF NOT EXISTS sector_as_of DATE", sql)
+        self.assertIn("ALTER TABLE core.symbol_master ADD COLUMN IF NOT EXISTS sector_run_id UUID", sql)
+        self.assertIn("CREATE OR REPLACE VIEW mart.symbol_feature_frame_asof", sql)
+        self.assertIn("sm.sector", sql)
+        self.assertIn("CREATE OR REPLACE VIEW mart.common_stock_universe_asof", sql)
+        self.assertIn("CREATE OR REPLACE VIEW meta.view_common_stock_universe", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

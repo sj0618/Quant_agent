@@ -1,4 +1,4 @@
-"""Run SEIBro/BOK/OpenDART ingestion jobs."""
+"""Run SEIBro/BOK/OpenDART/KIND ingestion jobs."""
 
 from __future__ import annotations
 
@@ -20,7 +20,11 @@ from quant_agent.data.repository import DataRepository  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest external macro/financial/report data.")
-    parser.add_argument("--job", required=True, choices=["bok-series", "dart-corp-codes", "dart-financial", "seibro-reports"])
+    parser.add_argument(
+        "--job",
+        required=True,
+        choices=["bok-series", "dart-corp-codes", "dart-financial", "kind-sector", "seibro-reports"],
+    )
     parser.add_argument("--db-mode", choices=["psycopg", "docker"], default=None)
     parser.add_argument("--db-container", default=None)
     parser.add_argument("--output", default=None)
@@ -76,6 +80,10 @@ def main() -> int:
             report_code=args.report_code,
             fs_div=args.fs_div,
             period_end=date.fromisoformat(args.period_end) if args.period_end else None,
+        )
+    elif args.job == "kind-sector":
+        count = service.ingest_kind_sector_snapshot(
+            as_of_date=date.fromisoformat(args.as_of_date) if args.as_of_date else None,
         )
     else:
         _require(args, "seibro_endpoint", "as_of_date")

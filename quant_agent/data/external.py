@@ -1,4 +1,4 @@
-"""External non-OHLCV ingestion services: SEIBro, BOK ECOS, OpenDART."""
+"""External non-OHLCV ingestion services: SEIBro, BOK ECOS, OpenDART, KIND."""
 
 from __future__ import annotations
 
@@ -9,11 +9,13 @@ import json
 from calendar import monthrange
 from typing import Any
 
-from quant_agent.data.config import BokConfig, DartConfig, SeibroConfig
+from quant_agent.data.config import BokConfig, DartConfig, KindConfig, SeibroConfig
+from quant_agent.data.db import sql_literal
 from quant_agent.data.models import ApiRequestLog, LineageEvent, RawSourcePayload
 from quant_agent.data.repository import DataRepository
 from quant_agent.data.sources.bok import BokEcosClient, normalize_bok_observations
 from quant_agent.data.sources.dart import OpenDartClient, normalize_corp_code_zip, normalize_financial_statement
+from quant_agent.data.sources.kind import KindListedCompanyClient
 from quant_agent.data.sources.seibro import (
     LexiconSentimentScorer,
     SeibroAnalystReportClient,
@@ -29,11 +31,13 @@ class ExternalDataIngestionService:
         repository: DataRepository | None = None,
         bok_config: BokConfig | None = None,
         dart_config: DartConfig | None = None,
+        kind_config: KindConfig | None = None,
         seibro_config: SeibroConfig | None = None,
     ) -> None:
         self.repository = repository or DataRepository()
         self.bok_client = BokEcosClient(bok_config or BokConfig.from_env())
         self.dart_client = OpenDartClient(dart_config or DartConfig.from_env())
+        self.kind_client = KindListedCompanyClient(kind_config or KindConfig.from_env())
         resolved_seibro_config = seibro_config or SeibroConfig.from_env()
         self.seibro_client = SeibroReportClient(resolved_seibro_config)
         self.seibro_analyst_client = SeibroAnalystReportClient(resolved_seibro_config)
@@ -140,6 +144,51 @@ class ExternalDataIngestionService:
             written = self.repository.upsert_dart_financials(rows, run_id)
             self.repository.finish_ingestion_run(run_id, status="success")
             return written
+        except Exception as exc:
+            self.repository.finish_ingestion_run(run_id, status="failed", error_message=str(exc))
+            raise
+
+    def ingest_kind_sector_snapshot(self, *, as_of_date: date | None = None) -> int:
+        snapshot_date = as_of_date or date.today()
+        run_id = self.repository.start_ingestion_run(
+            dag_id="manual_kind_ingestion",
+            task_id="ingest_kind_sector_snapshot",
+            source_id="KIND",
+            params={
+                "as_of_date": snapshot_date.isoformat(),
+                "source": "listed_company_directory",
+            },
+        )
+        try:
+            rows = self.kind_client.fetch_listed_company_rows()
+            for row in rows:
+                row["sector_as_of"] = snapshot_date
+            self.repository.upsert_kind_symbol_sectors(rows, run_id)
+            matched_rows = self.repository.executor.fetch_json(
+                f"""
+                SELECT COUNT(*)::int AS matched_count
+                  FROM core.symbol_master
+                 WHERE sector_run_id = {sql_literal(run_id)}
+                """
+            )[0]["matched_count"]
+            unmatched_rows = len(rows) - matched_rows
+            null_sector_count = self.repository.executor.fetch_json(
+                """
+                SELECT COUNT(*)::int AS null_count
+                  FROM core.symbol_master
+                 WHERE listing_status = 'listed'
+                   AND sector IS NULL
+                """
+            )[0]["null_count"]
+            if unmatched_rows > 0 or null_sector_count > 0:
+                # Keep the run successful so the matched universe stays fresh while the
+                # uncovered symbols are investigated separately in the collection plan.
+                print(
+                    "KIND sector snapshot warnings: "
+                    f"unmatched={unmatched_rows}/{len(rows)}, null_sector={null_sector_count}"
+                )
+            self.repository.finish_ingestion_run(run_id, status="success")
+            return matched_rows
         except Exception as exc:
             self.repository.finish_ingestion_run(run_id, status="failed", error_message=str(exc))
             raise
