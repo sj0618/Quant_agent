@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import subprocess
 from typing import Any, Protocol
 
@@ -54,6 +55,53 @@ class PsycopgExecutor:
             with conn.cursor() as cur:
                 cur.execute(sql)
                 return [dict(row) for row in cur.fetchall()]
+
+
+@dataclass(frozen=True)
+class PsycopgScriptClient:
+    """psycopg-backed helper for script-style COPY / temp-table workflows."""
+
+    config: DatabaseConfig
+
+    def connect(self):
+        try:
+            import psycopg
+        except ImportError as exc:  # pragma: no cover - depends on runtime image
+            raise SqlExecutionError("psycopg is required for direct PostgreSQL script execution.") from exc
+
+        try:
+            return psycopg.connect(self.config.psycopg_conninfo())
+        except Exception as exc:  # pragma: no cover - surfaced in integration tests
+            raise SqlExecutionError(f"PostgreSQL connection failed: {exc}") from exc
+
+    def execute(self, sql: str) -> str:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+        return ""
+
+    def fetch_csv_text(self, query: str) -> str:
+        copy_sql = f"COPY ({query.rstrip().rstrip(';')}) TO STDOUT WITH (FORMAT csv, HEADER true);"
+        chunks: list[bytes] = []
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                with cur.copy(copy_sql) as copy:
+                    while True:
+                        chunk = copy.read()
+                        if not chunk:
+                            break
+                        chunks.append(bytes(chunk))
+        return b"".join(chunks).decode("utf-8")
+
+    def execute_copy_csv(self, pre_sql: str, copy_sql: str, csv_text: str, post_sql: str) -> None:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                if pre_sql.strip():
+                    cur.execute(pre_sql)
+                with cur.copy(copy_sql) as copy:
+                    copy.write(csv_text)
+                if post_sql.strip():
+                    cur.execute(post_sql)
 
 
 @dataclass(frozen=True)
@@ -119,13 +167,29 @@ class DockerPsqlExecutor:
         return [dict(row) for row in loaded]
 
 
+def resolve_execution_mode(config: DatabaseConfig, requested_mode: str | None = None) -> str:
+    mode = (requested_mode or config.execution_mode or "").lower()
+    if mode not in {"docker", "psycopg"}:
+        raise ValueError(f"Unsupported QUANT_DB_EXECUTION_MODE: {mode}")
+    if mode == "docker":
+        return "docker"
+    if config.dsn or config.password:
+        return "psycopg"
+    if requested_mode is None:
+        return "docker"
+    raise ValueError(
+        "QUANT_DB_EXECUTION_MODE=psycopg requires QUANT_DB_DSN/DATABASE_URL or QUANT_DB_PASSWORD."
+    )
+
+
 def make_executor(config: DatabaseConfig | None = None) -> SqlExecutor:
     db_config = config or DatabaseConfig.from_env()
-    if db_config.execution_mode == "docker":
+    mode = resolve_execution_mode(db_config, os.getenv("QUANT_DB_EXECUTION_MODE"))
+    if mode == "docker":
         return DockerPsqlExecutor(db_config)
-    if db_config.execution_mode == "psycopg":
+    if mode == "psycopg":
         return PsycopgExecutor(db_config)
-    raise ValueError(f"Unsupported QUANT_DB_EXECUTION_MODE: {db_config.execution_mode}")
+    raise ValueError(f"Unsupported QUANT_DB_EXECUTION_MODE: {mode}")
 
 
 def sql_literal(value: Any) -> str:

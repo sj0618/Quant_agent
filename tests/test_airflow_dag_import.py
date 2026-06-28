@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from datetime import date
 import os
 from pathlib import Path
@@ -96,6 +97,73 @@ class AirflowDagImportTests(unittest.TestCase):
         args = module._symbol_metadata_args(as_of_date=date(2026, 5, 21))
 
         self.assertEqual(args, ["--as-of-date", "2026-05-21"])
+
+    def test_bok_series_json_defaults_include_monthly_oil(self):
+        with patch.dict(
+            os.environ,
+            {
+                "QUANT_AIRFLOW_LOAD_DOTENV": "false",
+                "BOK_DAILY_SERIES_JSON": "",
+                "BOK_SERIES_JSON": "",
+            },
+            clear=False,
+        ):
+            module = _load_dag_module("quant_agent_data_engineering_dag_bok_default")
+            series = json.loads(module._bok_series_json())
+
+        self.assertTrue(
+            any(
+                item.get("stat_code") == "902Y003"
+                and item.get("cycle") == "M"
+                and item.get("item_code1") == "010101"
+                for item in series
+            )
+        )
+        self.assertTrue(
+            any(
+                item.get("stat_code") == "902Y003"
+                and item.get("cycle") == "M"
+                and item.get("item_code1") == "010102"
+                for item in series
+            )
+        )
+        self.assertTrue(
+            any(
+                item.get("stat_code") == "902Y003"
+                and item.get("cycle") == "M"
+                and item.get("item_code1") == "010103"
+                for item in series
+            )
+        )
+
+    def test_bok_ingest_args_embed_monthly_oil_series(self):
+        with patch.dict(
+            os.environ,
+            {
+                "QUANT_AIRFLOW_LOAD_DOTENV": "false",
+                "BOK_DAILY_SERIES_JSON": "",
+                "BOK_SERIES_JSON": "",
+            },
+            clear=False,
+        ):
+            module = _load_dag_module("quant_agent_data_engineering_dag_bok_args")
+            args = module._dart_bok_ingest_args(
+                source="bok",
+                start_date=date(2026, 6, 21),
+                end_date=date(2026, 6, 28),
+                bok_series_json=module._bok_series_json(),
+            )
+
+        self.assertIn("--bok-series-json", args)
+        payload = json.loads(args[args.index("--bok-series-json") + 1])
+        self.assertTrue(
+            any(
+                item.get("stat_code") == "902Y003"
+                and item.get("cycle") == "M"
+                and item.get("item_code1") == "010102"
+                for item in payload
+            )
+        )
 
 
 def _load_dag_module(module_name: str = "quant_agent_data_engineering_dag"):

@@ -5,6 +5,7 @@ from pathlib import Path
 import unittest
 
 from quant_agent.data.config import BokConfig, DartConfig, DatabaseConfig, KisConfig, KrxConfig, PilotConfig, SeibroConfig
+from quant_agent.data.db import resolve_execution_mode
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,6 +49,25 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.database, "quant_agent")
         self.assertEqual(config.execution_mode, "docker")
         self.assertEqual(config.password, "pw")
+
+    def test_database_execution_mode_auto_falls_back_to_docker_without_credentials(self):
+        with EnvGuard({}):
+            config = DatabaseConfig.from_env()
+
+        self.assertEqual(resolve_execution_mode(config), "docker")
+
+    def test_database_execution_mode_prefers_psycopg_when_credentials_exist(self):
+        with EnvGuard({"QUANT_DB_PASSWORD": "pw"}):
+            config = DatabaseConfig.from_env()
+
+        self.assertEqual(resolve_execution_mode(config), "psycopg")
+
+    def test_database_execution_mode_rejects_explicit_psycopg_without_credentials(self):
+        with EnvGuard({}):
+            config = DatabaseConfig.from_env()
+
+        with self.assertRaises(ValueError):
+            resolve_execution_mode(config, "psycopg")
 
     def test_external_configs_from_env(self):
         with EnvGuard(

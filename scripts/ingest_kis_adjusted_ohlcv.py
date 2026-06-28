@@ -7,6 +7,11 @@ from the KRX-sourced ``core.ohlcv_daily`` table.
 
 Secrets are read only from process environment. This script never loads
 ``.env`` files.
+
+Database access auto-detects ``psycopg`` when ``QUANT_DB_DSN`` /
+``DATABASE_URL`` or ``QUANT_DB_PASSWORD`` is present; otherwise the local
+Docker container path is used. Pass ``--db-mode docker`` or
+``--db-mode psycopg`` to force a mode explicitly.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ import subprocess
 import sys
 from threading import Lock
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +38,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from quant_agent.data.config import DatabaseConfig, KisConfig  # noqa: E402
+from quant_agent.data.db import PsycopgScriptClient, resolve_execution_mode  # noqa: E402
 from quant_agent.data.models import ApiRequestLog  # noqa: E402
 from quant_agent.data.sources.kis import KisOhlcvClient, normalize_kis_daily_price  # noqa: E402
 
@@ -53,6 +59,20 @@ KIS_ADJUSTED_TRANSFORM_VERSION = "kis-adjusted-normalize-v1"
 class FetchWindow:
     start_date: date
     end_date: date
+
+
+class KisDbClient(Protocol):
+    def execute(self, sql: str) -> str:
+        ...
+
+    def fetch_csv(self, query: str, parse_dates: list[str] | None = None) -> list[dict[str, Any]]:
+        ...
+
+    def copy_adjusted_rows(self, rows: list[dict[str, Any]], run_id: str) -> None:
+        ...
+
+    def copy_api_request_logs(self, events: list[ApiRequestLog], run_id: str) -> None:
+        ...
 
 
 class DockerPsqlClient:
@@ -203,6 +223,124 @@ COMMIT;
         )
 
 
+class PsycopgClient(PsycopgScriptClient):
+    def fetch_csv(self, query: str, parse_dates: list[str] | None = None) -> list[dict[str, Any]]:
+        text = self.fetch_csv_text(query)
+        if not text.strip():
+            return []
+        reader = csv.DictReader(io.StringIO(text))
+        return [dict(row) for row in reader]
+
+    def copy_adjusted_rows(self, rows: list[dict[str, Any]], run_id: str) -> None:
+        if not rows:
+            return
+
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer, lineterminator="\n")
+        for row in rows:
+            writer.writerow(
+                [
+                    row["time"],
+                    row["ticker"],
+                    row["adj_open"],
+                    row["adj_high"],
+                    row["adj_low"],
+                    row["adj_close"],
+                    row["adj_volume"],
+                    row.get("mod_yn"),
+                    row.get("revision_reason"),
+                    json.dumps(row.get("raw", {}), ensure_ascii=False, separators=(",", ":"), default=str),
+                    json.dumps(row.get("quality_flags", {}), ensure_ascii=False, separators=(",", ":"), default=str),
+                    run_id,
+                ]
+            )
+
+        self.execute_copy_csv(
+            """
+            CREATE TEMP TABLE tmp_kis_adjusted_ohlcv (
+              "time" DATE,
+              ticker TEXT,
+              adj_open NUMERIC(20, 6),
+              adj_high NUMERIC(20, 6),
+              adj_low NUMERIC(20, 6),
+              adj_close NUMERIC(20, 6),
+              adj_volume NUMERIC(28, 6),
+              mod_yn TEXT,
+              revision_reason TEXT,
+              raw_payload_jsonb JSONB,
+              quality_flags JSONB,
+              run_id UUID
+            ) ON COMMIT DROP;
+            """,
+            """
+            COPY tmp_kis_adjusted_ohlcv
+              ("time", ticker, adj_open, adj_high, adj_low, adj_close, adj_volume, mod_yn, revision_reason,
+               raw_payload_jsonb, quality_flags, run_id)
+            FROM STDIN WITH (FORMAT csv)
+            """,
+            csv_buffer.getvalue(),
+            f"""
+            INSERT INTO {KIS_ADJUSTED_TABLE}
+              ("time", ticker, adj_open, adj_high, adj_low, adj_close, adj_volume, mod_yn, revision_reason,
+               raw_payload_jsonb, quality_flags, run_id)
+            SELECT "time", ticker, adj_open, adj_high, adj_low, adj_close, adj_volume, mod_yn, revision_reason,
+                   raw_payload_jsonb, quality_flags, run_id
+              FROM tmp_kis_adjusted_ohlcv
+            ON CONFLICT ("time", ticker) DO UPDATE SET
+              adj_open = EXCLUDED.adj_open,
+              adj_high = EXCLUDED.adj_high,
+              adj_low = EXCLUDED.adj_low,
+              adj_close = EXCLUDED.adj_close,
+              adj_volume = EXCLUDED.adj_volume,
+              mod_yn = EXCLUDED.mod_yn,
+              revision_reason = EXCLUDED.revision_reason,
+              raw_payload_jsonb = EXCLUDED.raw_payload_jsonb,
+              quality_flags = EXCLUDED.quality_flags,
+              run_id = EXCLUDED.run_id,
+              updated_at = now();
+            INSERT INTO meta.lineage_event
+              (target_table, target_key, source_table, source_key, run_id, transform_version, metadata_jsonb)
+            SELECT
+              {sql_literal(KIS_ADJUSTED_TABLE)},
+              ticker || ':' || "time"::text,
+              'kis_api.inquire_daily_itemchartprice',
+              ticker || ':' || "time"::text || ':fid_org_adj_prc=0',
+              run_id,
+              {sql_literal(KIS_ADJUSTED_TRANSFORM_VERSION)},
+              jsonb_build_object(
+                'stage', 'kis_adjusted_ingestion',
+                'adjusted_price_method', 'kis_official_adjusted',
+                'fid_org_adj_prc', '0'
+              )
+            FROM tmp_kis_adjusted_ohlcv;
+            """,
+        )
+
+    def copy_api_request_logs(self, events: list[ApiRequestLog], run_id: str) -> None:
+        if not events:
+            return
+        values = []
+        for event in events:
+            values.append(
+                "("
+                f"{sql_literal(run_id)}, {sql_literal(event.source_id)}, {sql_literal(event.endpoint_key)}, "
+                f"{sql_literal(stable_hash(event.request))}, {sql_literal(event.success)}, {sql_literal(event.status_code)}, "
+                f"{sql_literal(event.elapsed_ms)}, {sql_literal(event.retry_count)}, "
+                f"{sql_literal(stable_hash(event.response) if event.response is not None else None)}, "
+                f"{sql_literal(truncate(event.error_message, 4000))}, {jsonb_literal(event.metadata)}, "
+                f"{sql_literal(event.request_started_at.isoformat())}"
+                ")"
+            )
+        self.execute(
+            f"""
+            INSERT INTO meta.api_request_log
+              (run_id, source_id, endpoint_key, request_hash, success, status_code,
+               elapsed_ms, retry_count, response_hash, error_message, metadata_jsonb, request_started_at)
+            VALUES {", ".join(values)};
+            """
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest KIS official adjusted OHLCV into TimescaleDB.")
     parser.add_argument("--start-date", default=None, help="YYYY-MM-DD. Required unless --daily-incremental is set.")
@@ -235,7 +373,12 @@ def main() -> int:
     )
     parser.add_argument("--flush-rows", type=int, default=DEFAULT_FLUSH_ROWS)
     parser.add_argument("--max-requests", type=int, default=None, help="Optional safety limit for smoke runs.")
-    parser.add_argument("--db-mode", choices=["docker"], default="docker")
+    parser.add_argument(
+        "--db-mode",
+        choices=["docker", "psycopg"],
+        default=None,
+        help="Database access mode. Defaults to psycopg when DB credentials are configured; otherwise docker.",
+    )
     parser.add_argument("--db-container", default=None)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
@@ -250,7 +393,9 @@ def main() -> int:
     db_config = DatabaseConfig.from_env()
     if args.db_container:
         db_config = DatabaseConfig(**{**db_config.__dict__, "docker_container": args.db_container})
-    db = DockerPsqlClient(db_config)
+    requested_db_mode = args.db_mode or os.getenv("QUANT_DB_EXECUTION_MODE")
+    db_mode = resolve_execution_mode(db_config, requested_db_mode)
+    db: KisDbClient = DockerPsqlClient(db_config) if db_mode == "docker" else PsycopgClient(db_config)
     kis_client = KisOhlcvClient(KisConfig.from_env())
 
     run_id = str(uuid4())
