@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import auth, health, pages, reports_pdf_temp
+from app.api.routes import auth, fe_contract, health, pages, reports_pdf_temp
 from app.core.config import ConfigurationError, load_settings
 from app.core.errors import AppError, register_exception_handlers
 from app.db.session import create_db_engine, dispose_db_engine
@@ -56,7 +56,7 @@ def _install_credentialed_cors_middleware(app: FastAPI) -> None:
         if origin is not None:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Credentials"] = "true"
-            response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+            response.headers["Access-Control-Allow-Methods"] = "GET,POST,PATCH,PUT,OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type,X-CSRF-Token"
             vary = response.headers.get("Vary")
             response.headers["Vary"] = "Origin" if not vary else f"{vary}, Origin"
@@ -100,6 +100,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(reports_pdf_temp.router)
+    app.include_router(fe_contract.router)
     app.include_router(pages.router)
     return app
 

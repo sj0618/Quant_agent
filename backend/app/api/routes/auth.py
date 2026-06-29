@@ -53,7 +53,8 @@ async def google_start(
 
     if response_mode is not None and response_mode != "json":
         raise AppError(status_code=400, component="auth", code="unsupported_response_mode", message="response_mode is unsupported")
-    if response_mode == "json":
+    json_response_requested = response_mode == "json" or redirect_uri is not None
+    if json_response_requested:
         safe_redirect_uri = validate_oauth_redirect_uri(redirect_uri, settings)
         transaction_token = generate_token_urlsafe(32)
         await store.store_oauth_state(

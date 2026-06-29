@@ -81,6 +81,20 @@ def test_google_start_json_returns_authorization_url_and_binds_transaction_cooki
     assert payload["transaction_token_hash"] != response.cookies.get(OAUTH_TRANSACTION_COOKIE_NAME)
 
 
+def test_google_start_redirect_uri_implies_json_response_for_current_fe_client():
+    settings = valid_settings(AUTH_PUBLIC_BACKEND_ORIGIN=API_ORIGIN, AUTH_ALLOWED_ORIGINS=FE_ORIGIN)
+    client, _app = make_client(settings)
+
+    response = client.get(
+        "/auth/google/start",
+        params={"return_to": "/app", "redirect_uri": FE_CALLBACK},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["authorizationUrl"].startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+    assert f"{OAUTH_TRANSACTION_COOKIE_NAME}=" in response.headers["set-cookie"]
+
+
 @pytest.mark.parametrize(
     "redirect_uri",
     [

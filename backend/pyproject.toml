@@ -28,6 +28,9 @@ test = [
 where = ["."]
 include = ["app*"]
 
+[tool.setuptools.package-data]
+"app.data" = ["*.json"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

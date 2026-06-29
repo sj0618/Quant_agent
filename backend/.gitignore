@@ -1,9 +1,13 @@
 # Local backend artifacts
 .env
 .env.*
+!.env.example
 backend_old_*.zip
 __pycache__/
 .pytest_cache/
 *.py[cod]
 *.egg-info/
+fe-api-preview/node_modules/
+fe-api-preview/dist/
+fe-api-preview/.vite/
 
