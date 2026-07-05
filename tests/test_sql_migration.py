@@ -65,6 +65,8 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("ALTER TABLE core.symbol_master ADD COLUMN IF NOT EXISTS sector_run_id UUID", sql)
         self.assertIn("CREATE OR REPLACE VIEW mart.symbol_feature_frame_asof", sql)
         self.assertIn("sm.sector", sql)
+        self.assertIn("CREATE OR REPLACE VIEW mart.common_stock_feature_frame_asof", sql)
+        self.assertIn("f.adjusted_ohlcv_run_id,\n    sm.sector\nFROM mart.kis_adjusted_feature_frame_asof f", sql)
         self.assertIn("CREATE OR REPLACE VIEW mart.common_stock_universe_asof", sql)
         self.assertIn("CREATE OR REPLACE VIEW meta.view_common_stock_universe", sql)
 

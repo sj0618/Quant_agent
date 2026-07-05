@@ -1,7 +1,7 @@
 # Quant-Agent 데이터 엔지니어링 파이프라인 구축 기록
 
 LLM 기반 퀀트 전략을 **실제 데이터로 검증하고 서비스에서 조회할 수 있도록** 만든 데이터 엔지니어링 파이프라인입니다.
-현재 저장소의 데이터 레이어는 KRX/KIS/SEIBro 원천 데이터를 수집하고, TimescaleDB에 정규화한 뒤, TA 지표와 Mart/View까지 이어지는 흐름을 제공합니다.
+현재 저장소의 데이터 레이어는 KRX/KIS/SEIBro/BOK/DART 원천 데이터를 수집하고, TimescaleDB에 정규화한 뒤, TA 지표와 Mart/View까지 이어지는 흐름을 제공합니다.
 
 ---
 
@@ -13,9 +13,9 @@ LLM 기반 퀀트 전략을 **실제 데이터로 검증하고 서비스에서 �
 |---|---|---|---|---|
 | **KRX** | 국내 상장 종목의 10년치 OHLCV 원주가, 종목/시장 메타데이터 | `raw.ohlcv_response` | `core.ohlcv_daily`, `core.symbol_master`, `core.trading_calendar` | 기본 가격 이력, 거래일 캘린더, 원천 정합성 비교 |
 | **KIS Open API** | 공식 수정주가 기준 일봉 OHLCV, 재개 가능한 증분 수집 | `meta.api_request_log`에 요청 단위 로그 적재 | `feature.adjusted_ohlcv_daily` | 백테스트 기준 가격, TA 지표 입력 |
-| **TA-Lib / pandas-ta** | 수정 OHLCV 기반 기술적 지표 계산 | - | `feature.ta_*_ticker_daily`, `mart.kis_adjusted_feature_frame_asof` | 팩터 생성, 백테스트 feature frame |
+| **TA-Lib / pandas-ta** | 수정 OHLCV 기반 기술적 지표 계산. 정의 카탈로그 158개, mart 기본 선계산 key 45개 | - | `feature.ta_*_ticker_daily`, `mart.kis_adjusted_feature_frame_asof` | 팩터 생성, 백테스트 feature frame |
 | **SEIBro** | 분석리포트 요약 데이터 백필/증분 수집 | `raw.analyst_report_summary` | `feature.seibro_report_summary`, `feature.seibro_sentiment`, `mart.seibro_universe_asof` | 리포트 기반 보조 시그널, 종목 관심도 |
-| **BOK / DART** | 매크로/재무 데이터 확장용 파이프라인 골격 | `raw.bok_response`, `raw.dart_response` | `feature.bok_macro_daily`, `feature.dart_financial_quarterly` | 향후 macro/fundamental factor 결합 |
+| **BOK / DART** | BOK 금리/환율 12개 series와 월별 유가 3개 series(WTI/Dubai/Brent) 10년치 적재 완료. DART CFS 재무 데이터 2016~2026 period_end 구간 적재 완료 | `raw.bok_response`, `raw.dart_response` | `feature.bok_macro_daily`, `feature.dart_financial_quarterly` | macro/fundamental factor 결합 |
 
 ### 기본 퀀트 유니버스
 
@@ -81,18 +81,20 @@ meta.*       run, cursor, API request, QA issue, lineage 기록
 | 테이블 | 데이터 내용 | 주요 활용처 |
 |---|---|---|
 | `feature.adjusted_ohlcv_daily` | KIS 공식 수정주가 기반 canonical OHLCV | 백테스트 기준 가격, TA 입력 |
-| `feature.ta_trend_ticker_daily` | 이동평균, MACD 등 trend 계열 지표 | 전략 feature, 종목 스크리닝 |
-| `feature.ta_momentum_ticker_daily` | RSI 등 momentum 계열 지표 | 모멘텀/역추세 전략 |
-| `feature.ta_volatility_ticker_daily` | ATR, 변동성 등 volatility 지표 | 리스크 관리, 포지션 사이징 |
-| `feature.ta_volume_ticker_daily` | 거래량 기반 지표 | 수급/유동성 필터 |
-| `feature.ta_pattern_ticker_daily` | 캔들 패턴 지표 | 패턴 기반 보조 시그널 |
-| `feature.ta_indicator_definition` | 계산 가능한 TA 지표 정의/카탈로그 | 프론트 지표 목록, 계산 메타데이터 |
+| `feature.ta_trend_ticker_daily` | 이동평균, MACD 등 trend 계열 지표. 현재 선계산 key 16개 | 전략 feature, 종목 스크리닝 |
+| `feature.ta_momentum_ticker_daily` | RSI 등 momentum 계열 지표. 현재 선계산 key 8개 | 모멘텀/역추세 전략 |
+| `feature.ta_volatility_ticker_daily` | ATR, 변동성 등 volatility 지표. 현재 선계산 key 7개 | 리스크 관리, 포지션 사이징 |
+| `feature.ta_volume_ticker_daily` | 거래량 기반 지표. 현재 선계산 key 4개 | 수급/유동성 필터 |
+| `feature.ta_pattern_ticker_daily` | 캔들 패턴 지표. 현재 선계산 key 10개 | 패턴 기반 보조 시그널 |
+| `feature.ta_indicator_definition` | 계산 가능한 TA 지표 정의/카탈로그 158개 | 프론트 지표 목록, 계산 메타데이터 |
 | `feature.seibro_report_summary` | SEIBro 리포트 요약을 feature 계층으로 정규화한 데이터 | 리포트 이벤트 feature |
 | `feature.seibro_sentiment` | 리포트 텍스트/투자의견 기반 sentiment 확장 영역 | 텍스트 기반 시그널 |
 | `feature.seibro_universe_daily` | SEIBro 리포트 기반 일별 관심 종목 universe | 리포트 커버리지 필터 |
-| `feature.bok_macro_daily` | 일별 매크로 feature | 시장 regime/거시 변수 결합 |
-| `feature.dart_financial_quarterly` | 분기 재무 feature | fundamental factor |
+| `feature.bok_macro_daily` | BOK `rate-fx` 12개 series와 월별 유가 3개 series를 포함한 macro feature 30,825건. 유가 series는 `902Y003:010101`(WTI), `902Y003:010102`(Dubai Fateh), `902Y003:010103`(Brent) 월평균값 | 시장 regime/거시 변수 결합 |
+| `feature.dart_financial_quarterly` | 분기 재무 feature. 73,342건, `2016-03-31 ~ 2026-03-31` period_end 구간 적재 완료 | fundamental factor |
 | `feature.dart_corp_symbol_map` | DART corp_code와 ticker 매핑 | DART 재무 데이터 종목 연결 |
+
+TA 지표는 `feature.ta_indicator_definition`의 **계산 가능 카탈로그 158개**와 `feature.ta_*_ticker_daily.values_jsonb`의 **현재 백테스트 기본 선계산 key 45개**를 구분합니다. 45개 key 구성은 Trend 16, Momentum 8, Volatility 7, Volume 4, Pattern 10입니다. 정의 1개가 여러 output key를 만들 수 있으므로 정의 수와 저장 key 수는 1:1이 아닙니다.
 
 ### `mart` schema — 서비스/백테스트 조회용 view
 
@@ -103,8 +105,8 @@ meta.*       run, cursor, API request, QA issue, lineage 기록
 | `mart.full_universe_asof` | listed/coverage 조건을 반영한 전체 tradable universe | 기본 universe 조회 |
 | `mart.seibro_universe_asof` | SEIBro 리포트 기반 universe view | 리포트 기반 탐색/랭킹 |
 | `mart.data_coverage_report` | 종목별 데이터 커버리지/최근 일자 요약 | 운영 대시보드, 누락 점검 |
-| `mart.bok_macro_asof` | BOK macro as-of view | 거시 지표 조회 |
-| `mart.dart_financial_asof` | DART financial as-of view | 재무 지표 조회 |
+| `mart.bok_macro_asof` | BOK macro as-of view. 15개 series 30,825건. 월별 유가 사용 시 실제 발표일이 아닌 수집 시각이 `published_at`에 들어가므로 보수적 lag 기준 as-of join 필요 | 거시 지표 조회 |
+| `mart.dart_financial_asof` | DART financial as-of view. 73,342건, `2016-03-31 ~ 2026-03-31` | 재무 지표 조회 |
 
 ### `meta` schema — 실행·품질·관측성 메타데이터
 
@@ -116,7 +118,7 @@ meta.*       run, cursor, API request, QA issue, lineage 기록
 | `meta.api_request_log` | KIS 등 외부 API 요청 단위 성공/실패, HTTP 코드, retry, latency | API 관측성, rate limit/장애 분석 |
 | `meta.data_quality_issue` | 누락일, stale price, volume anomaly, 정합성 오류 등 품질 이슈 | QA 대시보드, 배치 실패 원인 |
 | `meta.lineage_event` | source → target 변환 의존성, run id, metadata | 데이터 lineage, 재처리 범위 산정 |
-| `meta.view_common_stock_universe` | KOSPI/KOSDAQ 보통주만 노출하는 기본 universe view | 백테스트 기본 종목 목록 |
+| `meta.view_common_stock_universe` | KOSPI/KOSDAQ 현재 상장 보통주만 노출하는 helper view | 현재 상장 보통주 조회. 상폐 포함 백테스트는 as-of mart view 사용 |
 
 ### 자주 쓰는 조회 대상
 
@@ -124,10 +126,10 @@ meta.*       run, cursor, API request, QA issue, lineage 기록
 |---|---|
 | 10년치 OHLCV 원주가 | `core.ohlcv_daily` |
 | KIS 공식 수정주가 | `feature.adjusted_ohlcv_daily` |
-| 기술적 지표 전체 | `feature.ta_trend_ticker_daily`, `feature.ta_momentum_ticker_daily`, `feature.ta_volatility_ticker_daily`, `feature.ta_volume_ticker_daily`, `feature.ta_pattern_ticker_daily` |
+| 기술적 지표 기본 선계산 값 45개 | `feature.ta_trend_ticker_daily`, `feature.ta_momentum_ticker_daily`, `feature.ta_volatility_ticker_daily`, `feature.ta_volume_ticker_daily`, `feature.ta_pattern_ticker_daily` |
 | 수정주가 + TA 통합 feature frame | `mart.kis_adjusted_feature_frame_asof` |
 | SEIBro 분석리포트 원본 | `raw.analyst_report_summary` |
-| KOSPI/KOSDAQ 보통주 유니버스 | `meta.view_common_stock_universe` |
+| 현재 상장 KOSPI/KOSDAQ 보통주 helper | `meta.view_common_stock_universe` |
 
 ---
 
@@ -294,6 +296,7 @@ python -m venv .venv
 | 종목 메타데이터 갱신 | `scripts/refresh_symbol_metadata.py` |
 | 종목 `security_type` 분류 | `scripts/classify_symbol_security_types.py` |
 | SEIBro 분석리포트 백필 | `scripts/backfill_seibro_analyst_reports.py` |
+| BOK 월별 유가 수집 | `scripts/ingest_dart_bok_history.py --scope custom --sources bok --start-date 2016-06-01 --end-date 2026-06-24 --bok-series-json '[{"stat_code":"902Y003","cycle":"M","item_code1":"010101","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010102","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010103","language":"en"}]'` |
 
 ### 5.5 Airflow DAG
 

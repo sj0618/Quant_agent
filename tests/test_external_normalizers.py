@@ -8,6 +8,7 @@ from quant_agent.data.models import RawSourcePayload
 from quant_agent.data.sources.bok import normalize_bok_observations
 from quant_agent.data.sources.dart import normalize_corp_code_zip, normalize_financial_statement
 from quant_agent.data.sources.kind import normalize_kind_listed_companies
+from quant_agent.data.sources.wics import normalize_wics_company_info
 from quant_agent.data.sources.seibro import LexiconSentimentScorer, normalize_seibro_reports
 
 
@@ -71,6 +72,34 @@ class ExternalNormalizerTests(unittest.TestCase):
         self.assertEqual(rows[0]["market_segment"], "KOSPI")
         self.assertEqual(rows[0]["listed_at"], date(1975, 6, 11))
         self.assertEqual(rows[0]["closing_month"], 12)
+
+    def test_normalize_wics_company_info(self):
+        html = """
+        <html>
+            <body>
+                <span style="display:none" id="strMarketTxt"> KOSPI 코스피 전기&#183;전자</span>
+                <span class="etc2">&#124;</span>
+                <span class="stxt stxt2">WI26 반도체</span>
+                <span class="etc2">&#124;</span>
+                <span class="stxt stxt3">K200</span>
+            </body>
+        </html>
+        """
+        row = normalize_wics_company_info(
+            html,
+            symbol="005930",
+            company_name="삼성전자",
+            source_url="https://wcomp.fnguide.com/CompanyInfo/Information?cmp_cd=005930",
+            as_of_date=date(2026, 6, 28),
+        )
+        self.assertEqual(row["symbol"], "005930")
+        self.assertEqual(row["company_name"], "삼성전자")
+        self.assertEqual(row["market_segment"], "KOSPI")
+        self.assertEqual(row["market_segment_raw"], "KOSPI 코스피 전기·전자")
+        self.assertEqual(row["sector_code"], "WI26")
+        self.assertEqual(row["sector"], "반도체")
+        self.assertEqual(row["sector_label"], "WI26 반도체")
+        self.assertEqual(row["sector_as_of"], date(2026, 6, 28))
 
     def test_normalize_seibro_reports_and_sentiment(self):
         reports = normalize_seibro_reports(

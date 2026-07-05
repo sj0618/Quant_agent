@@ -1,4 +1,4 @@
-"""Run SEIBro/BOK/OpenDART/KIND ingestion jobs."""
+"""Run BOK/OpenDART/KIND ingestion jobs."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def main() -> int:
     parser.add_argument(
         "--job",
         required=True,
-        choices=["bok-series", "dart-corp-codes", "dart-financial", "kind-sector", "seibro-reports"],
+        choices=["bok-series", "dart-corp-codes", "dart-financial", "kind-sector"],
     )
     parser.add_argument("--db-mode", choices=["psycopg", "docker"], default=None)
     parser.add_argument("--db-container", default=None)
@@ -42,11 +42,7 @@ def main() -> int:
     parser.add_argument("--fs-div", default="CFS")
     parser.add_argument("--period-end")
 
-    parser.add_argument("--seibro-endpoint")
-    parser.add_argument("--seibro-param", action="append", default=[], help="key=value, repeatable")
     parser.add_argument("--as-of-date")
-    parser.add_argument("--universe-min-score", type=float, default=0.0)
-    parser.add_argument("--universe-min-reports", type=int, default=1)
     args = parser.parse_args()
 
     db_config = DatabaseConfig.from_env()
@@ -86,14 +82,7 @@ def main() -> int:
             as_of_date=date.fromisoformat(args.as_of_date) if args.as_of_date else None,
         )
     else:
-        _require(args, "seibro_endpoint", "as_of_date")
-        count = service.ingest_seibro_reports(
-            endpoint_path=args.seibro_endpoint,
-            params=_parse_key_value(args.seibro_param),
-            as_of_date=date.fromisoformat(args.as_of_date),
-            universe_min_score=args.universe_min_score,
-            universe_min_reports=args.universe_min_reports,
-        )
+        raise SystemExit(f"Unsupported job: {args.job}")
 
     text = json.dumps({"job": args.job, "written": count}, ensure_ascii=False, indent=2)
     print(text)
@@ -108,17 +97,5 @@ def _require(args: argparse.Namespace, *names: str) -> None:
     missing = [name for name in names if getattr(args, name) in (None, "")]
     if missing:
         raise SystemExit(f"Missing required option(s) for job {args.job}: {', '.join('--' + name.replace('_', '-') for name in missing)}")
-
-
-def _parse_key_value(items: list[str]) -> dict[str, str]:
-    result = {}
-    for item in items:
-        if "=" not in item:
-            raise SystemExit(f"Invalid --seibro-param value: {item}. Expected key=value.")
-        key, value = item.split("=", 1)
-        result[key] = value
-    return result
-
-
 if __name__ == "__main__":
     raise SystemExit(main())

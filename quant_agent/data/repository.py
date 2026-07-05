@@ -28,6 +28,7 @@ DATA_SOURCES = {
     "KRX": ("Korea Exchange", "KRX_DAILY_MARKET_ENDPOINTS", True),
     "KIS": ("Korea Investment Securities", "KIS_BASE_URL", False),
     "KIND": ("Korea Exchange KIND listed-company directory", "KIND_CORP_LIST_URL", False),
+    "WICS": ("FnGuide Company Guide WICS classification", "WICS_COMPANY_INFO_URL", False),
     "SEIBRO": ("KSD SEIBro Open Platform", "SEIBRO_BASE_URL", False),
     "BOK": ("Bank of Korea ECOS", "BOK_BASE_URL", False),
     "DART": ("OpenDART Financial Supervisory Service", "DART_BASE_URL", False),
@@ -1101,6 +1102,37 @@ class DataRepository:
         )
         return len(usable_rows)
 
+    def upsert_wics_symbol_sectors(self, rows: list[dict[str, Any]], run_id: UUID) -> int:
+        usable_rows = [row for row in rows if row.get("symbol") and row.get("sector")]
+        if not usable_rows:
+            return 0
+        values = [
+            "("
+            f"{sql_literal(row['symbol'])}, {sql_literal(row.get('sector'))}, "
+            f"{sql_literal(row.get('market_segment'))}, {sql_literal(row.get('sector_as_of'))}, "
+            f"{jsonb_literal(_wics_sector_metadata(row, run_id))}, {sql_literal(run_id)}"
+            ")"
+            for row in usable_rows
+        ]
+        self.executor.execute_script(
+            f"""
+            WITH incoming(symbol, sector, market_segment, sector_as_of, metadata_jsonb, run_id) AS (
+                VALUES {", ".join(values)}
+            )
+            UPDATE core.symbol_master sm
+               SET sector = i.sector,
+                   sector_source = 'WICS',
+                   sector_as_of = i.sector_as_of::date,
+                   sector_run_id = i.run_id::uuid,
+                   market_segment = COALESCE(NULLIF(sm.market_segment, ''), NULLIF(i.market_segment, '')),
+                   metadata_jsonb = sm.metadata_jsonb || i.metadata_jsonb,
+                   updated_at = now()
+              FROM incoming i
+             WHERE sm.symbol = i.symbol;
+            """
+        )
+        return len(usable_rows)
+
     def upsert_dart_financials(self, rows: list[dict[str, Any]], run_id: UUID) -> int:
         if not rows:
             return 0
@@ -1278,6 +1310,20 @@ def _kind_sector_metadata(row: dict[str, Any], run_id: UUID) -> dict[str, Any]:
         "kind_sector_source": "KIND",
         "kind_sector_as_of": row.get("sector_as_of"),
         "kind_sector_run_id": str(run_id),
+    }
+
+
+def _wics_sector_metadata(row: dict[str, Any], run_id: UUID) -> dict[str, Any]:
+    return {
+        "wics_company_name": row.get("company_name"),
+        "wics_market_segment_raw": row.get("market_segment_raw"),
+        "wics_market_segment": row.get("market_segment"),
+        "wics_sector_code": row.get("sector_code"),
+        "wics_sector": row.get("sector"),
+        "wics_sector_label": row.get("sector_label"),
+        "wics_source_url": row.get("source_url"),
+        "wics_sector_as_of": row.get("sector_as_of"),
+        "wics_sector_run_id": str(run_id),
     }
 
 

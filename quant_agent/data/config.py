@@ -53,6 +53,8 @@ DEFAULT_SEIBRO_REQUEST_SLEEP_MAX_SECONDS = 3.0
 DEFAULT_BOK_BASE_URL = "https://ecos.bok.or.kr/api"
 DEFAULT_DART_BASE_URL = "https://opendart.fss.or.kr/api"
 DEFAULT_KIND_CORP_LIST_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do"
+DEFAULT_WICS_COMPANY_INFO_URL = "https://wcomp.fnguide.com/CompanyInfo/Information"
+DEFAULT_WICS_REQUEST_WORKERS = 4
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -355,6 +357,29 @@ class KindConfig:
     @property
     def is_configured(self) -> bool:
         return bool(self.corp_list_url)
+
+
+@dataclass(frozen=True)
+class WicsConfig:
+    company_info_url: str
+    request_workers: int
+    request_timeout_seconds: int
+    retry: RetryConfig
+
+    @classmethod
+    def from_env(cls) -> "WicsConfig":
+        return cls(
+            company_info_url=(
+                _env("WICS_COMPANY_INFO_URL", DEFAULT_WICS_COMPANY_INFO_URL) or DEFAULT_WICS_COMPANY_INFO_URL
+            ).rstrip("/"),
+            request_workers=_env_int("WICS_REQUEST_WORKERS", DEFAULT_WICS_REQUEST_WORKERS),
+            request_timeout_seconds=_env_int("API_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS),
+            retry=RetryConfig.from_env(),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.company_info_url)
 
 
 def _parse_date(raw: str | None, default: date) -> date:

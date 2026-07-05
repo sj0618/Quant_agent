@@ -5,14 +5,13 @@
 | 파일 | 목적 | 실행 주기/방식 |
 |---|---|---|
 | `scripts/ingest_dart_bok_history.py` | OpenDART 재무제표와 BOK ECOS 매크로 시계열을 기존 PostgreSQL feature 테이블에 스키마 스캔 후 적재 | 수동 1달 테스트, 10년 백필, Airflow 일일 실행. BOK `rate-fx` 12개 series, 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 적재 완료. |
-| `airflow/dags/quant_agent_data_engineering.py` | OHLCV, KIS 수정주가, TA, DQ, SEIBro, BOK, DART 일일 자동 수집 DAG | 기본 cron `0 4 * * *` |
+| `airflow/dags/quant_agent_data_engineering.py` | OHLCV, KIS 수정주가, TA, DQ, BOK, DART 일일 자동 수집 DAG | 기본 cron `0 4 * * *` |
 | `scripts/ingest_ohlcv.py` | KRX 등 원천 OHLCV 적재 | DAG `ingest_ohlcv_daily` |
 | `scripts/ingest_kis_adjusted_ohlcv.py` | KIS 공식 수정주가 OHLCV 적재 | DAG `ingest_kis_adjusted_ohlcv_daily` |
 | `scripts/compute_technical_indicators_pipeline.py` | 수정주가 기반 TA 지표 계산 | DAG `compute_ta_indicators_daily` |
 | `scripts/refresh_symbol_metadata.py` | 종목 메타데이터/분류 갱신 | DAG `refresh_symbol_metadata_daily` |
-| `scripts/ingest_external_data.py --job kind-sector` | KRX KIND 상장법인 목록에서 종목별 업종(섹터) 스냅샷 적재 | DAG `refresh_symbol_sector_daily` |
+| `scripts/ingest_wics_sectors.py` | FnGuide Company Guide WICS 섹터 스냅샷을 로컬 DB의 `core.symbol_master` 섹터 컬럼들(`sector`/`sector_source`/`sector_as_of`/`sector_run_id`)에 1회 적재 | 별도 one-shot 실행 |
 | `scripts/run_data_quality_checks.py` | 데이터 품질 검사 실행 | DAG `run_data_quality_checks_daily` |
-| `scripts/backfill_seibro_analyst_reports.py` | SEIBro 애널리스트 리포트 백필 | 별도 백필/운영 작업 |
 
 ## 1. `scripts/ingest_dart_bok_history.py`
 
@@ -53,7 +52,7 @@
 |---|---|
 | DART | `DART_API_KEY` 권장. 기존 `.env` 호환을 위해 `OPENDART_API_KEY`, `FSS_API_KEY`도 인식한다. |
 | BOK | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON` |
-| KIND | `KIND_CORP_LIST_URL` |
+| WICS | `WICS_COMPANY_INFO_URL`, 선택: `WICS_REQUEST_WORKERS` |
 | DB | 권장: `QUANT_DB_DSN` 또는 `DATABASE_URL`; 또는 `QUANT_DB_HOST`, `QUANT_DB_PORT`, `QUANT_DB_NAME`, `QUANT_DB_USER`, `QUANT_DB_PASSWORD` |
 | 선택 | `DART_SYMBOLS`, `DART_MAX_COMPANIES`, `DART_REFRESH_CORP_CODES`, `DART_REQUEST_SLEEP_SECONDS`, `BOK_REQUEST_SLEEP_SECONDS` |
 
@@ -141,13 +140,12 @@ DART 수집은 연도 단위로 나눠 재개했고, `feature.dart_financial_qua
 |---|---|---|
 | `ingest_ohlcv_daily` | `OhlcvIngestionService` | KRX 등 원천 OHLCV 일일 적재 |
 | `refresh_symbol_metadata_daily` | `scripts/refresh_symbol_metadata.py` | 종목 메타데이터 갱신 |
-| `refresh_symbol_sector_daily` | `scripts/ingest_external_data.py --job kind-sector` | KIND 상장법인 목록 기반 섹터/업종 스냅샷 갱신 |
+| `ingest_wics_sector_snapshot` | `scripts/ingest_wics_sectors.py` | FnGuide Company Guide WICS 섹터 스냅샷 1회 적재 |
 | `ingest_kis_adjusted_ohlcv_daily` | `scripts/ingest_kis_adjusted_ohlcv.py` | KIS 수정주가 적재 |
 | `compute_ta_indicators_daily` | `scripts/compute_technical_indicators_pipeline.py` | TA 지표 계산 |
 | `run_data_quality_checks_daily` | `scripts/run_data_quality_checks.py` | 품질 검사 |
 | `ingest_bok_daily` | `scripts/ingest_dart_bok_history.py --sources bok` | BOK 일일 macro 수집 |
 | `ingest_dart_financials_daily` | `scripts/ingest_dart_bok_history.py --sources dart` | OpenDART 재무제표 수집 및 corp-code 선택 갱신 |
-| `ingest_seibro_reports_daily` | `ExternalDataIngestionService.ingest_seibro_reports()` | SEIBro 리포트 기반 보조 feature 수집 |
 
 ### 의존성
 
@@ -157,7 +155,6 @@ ingest_ohlcv_daily
   │                                  └─ ingest_dart_financials_daily
   ├─ ingest_kis_adjusted_ohlcv_daily → compute_ta_indicators_daily → run_data_quality_checks_daily
   ├─ ingest_bok_daily
-  └─ ingest_seibro_reports_daily
 ```
 
 ## 3. 운영자가 팀에 설명할 핵심 포인트

@@ -123,6 +123,8 @@
 | 상태 | 적재 완료. |
 | 컬럼 | `symbol_id bigint`, `symbol text`, `name text`, `market text`, `security_type text`, `created_at timestamptz`, `updated_at timestamptz`, `market_segment text`, `listing_status text`, `listed_at date`, `delisted_at date`, `metadata_jsonb jsonb`, `sector text`, `sector_source text`, `sector_as_of date`, `sector_run_id uuid` |
 
+섹터는 별도 테이블이 아니라 `core.symbol_master`의 컬럼으로 관리한다. `sector`는 업종명, `sector_source`는 원천(`WICS`/`KIND`), `sector_as_of`는 스냅샷 기준일, `sector_run_id`는 마지막 적재 run_id다. 현재 WICS 섹터 예시는 `docs/data_engineering_runbook.md`의 목록을 참고한다.
+
 ### `core.symbol_listing_history`
 
 | 항목 | 내용 |
@@ -518,8 +520,8 @@ MVP 백테스트/팩터 엔진은 기본적으로 이 view를 사용한다.
 | 항목 | 내용 |
 |---|---|
 | 용도 | 데이터 소스 마스터 테이블. |
-| row 수 | 8 |
-| 상태 | `BOK`, `DART`, `KIND`, `KIS`, `KRX`, `QA`, `SEIBRO`, `TA` 등록됨. |
+| row 수 | 9 |
+| 상태 | `BOK`, `DART`, `KIND`, `KIS`, `KRX`, `QA`, `SEIBRO`, `TA`, `WICS` 등록됨. |
 | 컬럼 | `source_id text`, `name text`, `base_url_key text`, `version text`, `is_primary boolean`, `created_at timestamptz`, `updated_at timestamptz` |
 
 ### `meta.ingestion_run`

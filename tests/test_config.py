@@ -13,6 +13,7 @@ from quant_agent.data.config import (
     KrxConfig,
     PilotConfig,
     SeibroConfig,
+    WicsConfig,
 )
 from quant_agent.data.db import resolve_execution_mode
 
@@ -84,6 +85,8 @@ class ConfigTests(unittest.TestCase):
                 "BOK_API_KEY": "bok",
                 "DART_API_KEY": "dart",
                 "KIND_CORP_LIST_URL": "https://kind.krx.co.kr/corpgeneral/corpList.do",
+                "WICS_COMPANY_INFO_URL": "https://wcomp.fnguide.com/CompanyInfo/Information",
+                "WICS_REQUEST_WORKERS": "2",
                 "SEIBRO_COLLECTION_APPROVED": "true",
                 "SEIBRO_API_KEY": "seibro",
             }
@@ -91,6 +94,8 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(BokConfig.from_env().is_configured)
             self.assertTrue(DartConfig.from_env().is_configured)
             self.assertTrue(KindConfig.from_env().is_configured)
+            self.assertTrue(WicsConfig.from_env().is_configured)
+            self.assertEqual(WicsConfig.from_env().request_workers, 2)
             self.assertTrue(SeibroConfig.from_env().collection_approved)
 
     def test_dart_config_accepts_fss_api_key_alias(self):

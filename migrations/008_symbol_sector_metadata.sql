@@ -1,4 +1,4 @@
--- Add sector snapshot columns sourced from the official KIND listed-company directory.
+-- Add sector snapshot columns sourced from a listed-company sector directory.
 
 ALTER TABLE core.symbol_master ADD COLUMN IF NOT EXISTS sector TEXT;
 ALTER TABLE core.symbol_master ADD COLUMN IF NOT EXISTS sector_source TEXT;
@@ -8,8 +8,8 @@ ALTER TABLE core.symbol_master ADD COLUMN IF NOT EXISTS sector_run_id UUID REFER
 CREATE INDEX IF NOT EXISTS idx_symbol_master_sector_market
     ON core.symbol_master (sector, market_segment, listing_status);
 
-COMMENT ON COLUMN core.symbol_master.sector IS 'KRX KIND listed-company directory 업종.';
-COMMENT ON COLUMN core.symbol_master.sector_source IS '업종 원천 데이터 소스 ID. 기본값은 KIND.';
+COMMENT ON COLUMN core.symbol_master.sector IS 'Listed-company sector snapshot 업종.';
+COMMENT ON COLUMN core.symbol_master.sector_source IS '업종 원천 데이터 소스 ID. 예: WICS.';
 COMMENT ON COLUMN core.symbol_master.sector_as_of IS '업종 스냅샷 기준일.';
 COMMENT ON COLUMN core.symbol_master.sector_run_id IS '업종 컬럼을 마지막으로 갱신한 ingestion run_id.';
 
@@ -55,6 +55,38 @@ CREATE OR REPLACE VIEW mart.kis_adjusted_feature_frame_asof AS
 SELECT *
 FROM mart.symbol_feature_frame_asof
 WHERE adjusted_ohlcv_quality_flags->>'adjusted_price_method' = 'kis_official_adjusted';
+
+CREATE OR REPLACE VIEW mart.common_stock_feature_frame_asof AS
+SELECT
+    f.as_of_date,
+    f.symbol,
+    f.name,
+    f.market_segment,
+    f.listing_status,
+    f.listed_at,
+    f.delisted_at,
+    f.ticker,
+    f.base_ticker,
+    f.segment_id,
+    f.open,
+    f.high,
+    f.low,
+    f.close,
+    f.volume,
+    f.adjusted_ohlcv_quality_flags,
+    f.trend_values,
+    f.momentum_values,
+    f.volatility_values,
+    f.volume_values,
+    f.pattern_values,
+    f.adjusted_ohlcv_run_id,
+    sm.sector
+FROM mart.kis_adjusted_feature_frame_asof f
+JOIN core.symbol_master sm
+  ON sm.symbol = f.symbol
+WHERE sm.security_type = '보통주'
+  AND (sm.listed_at IS NULL OR f.as_of_date >= sm.listed_at)
+  AND (sm.delisted_at IS NULL OR f.as_of_date <= sm.delisted_at);
 
 CREATE OR REPLACE VIEW mart.full_universe_asof AS
 SELECT

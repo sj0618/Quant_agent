@@ -23,6 +23,15 @@
 | 감성 점수 | `feature.seibro_sentiment` 테이블은 있으나 현재 비어 있음 |
 | 유니버스 | `feature.seibro_universe_daily`, `mart.seibro_universe_asof`는 있으나 점수 미생성 상태 |
 
+2026-06-01 로컬 DB 기준, 이미 컬럼화되어 있는 `raw.analyst_report_summary`의 SEIBro 분석리포트 종목 universe 점검 결과는 다음과 같다.
+
+| 항목 | 값 |
+|---|---:|
+| SEIBro 분석리포트 raw rows | 221,646 |
+| SEIBro distinct tickers | 2,500 |
+| 기간 | `2016-05-20 ~ 2026-05-20` |
+| ticker 형식 | 전부 6자리 |
+
 현재 raw payload의 핵심 구조는 다음과 같다.
 
 ```text
@@ -80,6 +89,56 @@ SEIBro raw JSON에서 리포트 단위 필드를 추출해, 분석 가능한 컬
 | 종목 매핑 실패 | `symbol_id = NULL`로 보존하거나 별도 품질 로그 기록 |
 | 중복 리포트 | `report_date + symbol_id + institution + author + summary hash` 기준 dedupe |
 | 숫자 파싱 실패 | `target_price`, `close_price`는 `NULL` 허용 |
+
+### 4.1 보통주 universe 매칭 기준
+
+SEIBro 리포트 종목을 감성 유니버스로 사용할 때는 **현재 상장 helper view**인 `meta.view_common_stock_universe`만으로 필터링하지 않는다. 이 view는 `listing_status = 'listed'` 조건을 가지므로 상폐 종목이 빠져, 과거 백테스트에서 survivorship bias가 생긴다.
+
+백테스트용 정규화 단계에서는 `report_date` 시점 기준으로 다음 조건을 적용한다.
+
+```sql
+JOIN core.symbol_master sm
+  ON sm.symbol = r.ticker
+WHERE sm.market_segment IN ('KOSPI', 'KOSDAQ')
+  AND sm.security_type = '보통주'
+  AND (sm.listed_at IS NULL OR r.report_date >= sm.listed_at)
+  AND (sm.delisted_at IS NULL OR r.report_date <= sm.delisted_at)
+```
+
+2026-06-01 로컬 DB에서 `raw.analyst_report_summary`를 위 as-of 조건으로 점검한 결과는 다음과 같다.
+
+| 판정 | report rows | tickers | 해석 |
+|---|---:|---:|---|
+| KOSPI/KOSDAQ 보통주 as-of 매칭 | 220,310 | 2,350 | SEIBro 감성 유니버스 후보로 사용 가능 |
+| 보통주 아님/분류 없음 | 741 | 27 | 리츠, 인프라펀드, 우선주 등. 기본 보통주 백테스트에서는 제외 |
+| `symbol_master` 없음 | 317 | 122 | 코넥스/비상장/식별자 누락 가능성. QA 대상 |
+| 상장일 이전 리포트 | 278 | 68 | 리포트가 KOSPI/KOSDAQ 상장 전 발생. 상장 전 구간에는 백테스트 universe에서 제외 |
+| **합계** | **221,646** | - | - |
+
+현재 상장 helper 기준과 as-of 기준의 차이는 다음과 같다.
+
+| 기준 | rows 매칭 | rows 미매칭 | tickers 매칭 | tickers 미매칭 | 용도 |
+|---|---:|---:|---:|---:|---|
+| `meta.view_common_stock_universe` 현재 상장 helper | 218,254 | 3,392 | 2,257 | 243 | 현재 상장 종목 조회용 |
+| `core.symbol_master` as-of 조건 | 220,310 | 1,336 | 2,350 | 일부/미매칭 217 | 백테스트용 |
+
+미매칭 주요 예시는 다음과 같다.
+
+| 원인 | 예시 |
+|---|---|
+| 리츠/인프라펀드 | 맥쿼리인프라 `088980`, 신한알파리츠 `293940`, 롯데리츠 `330590`, SK리츠 `395400` |
+| 우선주로 분류 | 이오플로우 `294090`, 성우 `458650` |
+| `symbol_master` 없음 | SK에코플랜트 `003340`, SK시그넷 `260870`, 이엠티 `232530` |
+| 상장 전 리포트 | 카페24 `042000`, 툴젠 `199800`, 비나텍 `126340`, 지노믹트리 `228760` |
+
+정규화 결과에는 다음 상태를 남긴다.
+
+| 상태 | 처리 |
+|---|---|
+| as-of 보통주 매칭 | `symbol_id`를 채우고 LLM 감성 산출 대상에 포함 |
+| 보통주 아님 | 원문/정규화 row는 보존하되 기본 감성 유니버스에서는 제외 |
+| `symbol_master` 없음 | `symbol_mapping_failed`로 QA 로그 기록 |
+| 상장일 이전 리포트 | `pre_listing_report`로 QA 로그 기록. 상장 이후 기준일 집계에는 사용할지 별도 정책 필요 |
 
 권장 추출 SQL 초안:
 
@@ -237,7 +296,7 @@ LLM 출력은 반드시 JSON object 하나만 반환하도록 한다.
 | 필드 | 타입 | 필수 | 저장 위치 | 설명 |
 |---|---|---:|---|---|
 | `report_id` | integer | 예 | 검증용 | 입력 `report_id`와 동일해야 함 |
-| `sentiment_score` | number | 예 | `feature.seibro_sentiment.sentiment_score` | 최종 감성 점수, `-1.0 ~ 1.0` |
+| `sentiment_score` | number | 예 | `feature.seibro_sentiment.sentiment_score` | 리포트별 최종 감성 점수, `-1.0 ~ 1.0` |
 | `sentiment_label` | string | 예 | 로그/추후 확장 | 점수 라벨 |
 | `confidence` | number | 예 | 로그/추후 확장 | 판단 신뢰도, `0.0 ~ 1.0` |
 | `text_sentiment_score` | number | 예 | 로그/추후 확장 | 요약문 기반 점수 |
@@ -248,6 +307,8 @@ LLM 출력은 반드시 JSON object 하나만 반환하도록 한다.
 | `negative_factors` | string[] | 예 | 로그/추후 확장 | 부정 근거 최대 3개 |
 | `risk_flags` | string[] | 예 | 로그/추후 확장 | 표준화된 리스크 태그 |
 | `reasoning_short` | string | 예 | 로그/추후 확장 | 1문장 근거 |
+
+`sentiment_score`는 리포트 1건의 방향성을 나타내는 점수이며, 동일 종목 리포트 개수는 이 값에 직접 섞지 않는다. 리포트 개수 가중치는 기준일별 종목 집계 단계에서 `report_count_weight`와 `weighted_sentiment_score`로 별도 계산한다.
 
 현재 DB 스키마 기준으로는 `sentiment_score`, `model_version`, `prompt_version`, `run_id`만 `feature.seibro_sentiment`에 직접 저장한다.  
 그 외 상세 필드는 다음 중 하나로 관리한다.
@@ -322,12 +383,14 @@ risk_flags:
 9. Not Rated/HOLD/중립이어도 요약문과 목표가 정보가 긍정적이면 긍정 점수를 줄 수 있다.
 10. 불확실성이 크거나 근거가 부족하면 confidence를 낮춘다.
 11. 입력에 없는 사실을 추론해 추가하지 않는다.
+12. 동일 종목의 리포트 개수는 리포트별 sentiment_score에 직접 반영하지 않는다. report_count 기반 가중치는 종목×기준일 집계 단계에서만 적용한다.
 ```
 
 ### 7.2 User Prompt Template
 
 ```text
 다음 SEIBro 애널리스트 리포트 요약 정보를 감성 점수로 변환하라.
+이 단계는 리포트 1건의 감성만 평가한다. 동일 종목의 report_count, report_count_weight, weighted_sentiment_score는 후속 종목×기준일 집계 단계에서 계산하므로 이 점수에 반영하지 마라.
 
 입력:
 {
@@ -360,6 +423,26 @@ risk_flags:
 }
 ```
 
+### 7.3 Universe Aggregation Prompt
+
+```text
+다음 원칙으로 리포트별 sentiment_score를 종목×기준일 universe 점수로 집계하라.
+
+입력은 기준일 as_of_date 이전 lookback 기간 내 동일 종목 리포트 목록이다.
+
+집계 규칙:
+1. 리포트별 sentiment_score는 수정하지 않는다.
+2. avg_sentiment_score는 동일 종목의 리포트별 sentiment_score 단순 평균으로 계산한다.
+3. report_count는 lookback 기간 내 동일 종목 리포트 수다.
+4. report_count_weight는 리포트 개수에 따른 신뢰도/관심도 가중치다.
+5. 기본 공식은 report_count_weight = LEAST(1.0, LN(1 + report_count) / LN(1 + target_report_count)) 이다.
+6. target_report_count 기본값은 5다.
+7. weighted_sentiment_score = avg_sentiment_score * report_count_weight 로 계산한다.
+8. 최종 상대순위는 avg_sentiment_score가 아니라 weighted_sentiment_score 기준으로 계산한다.
+9. report_count가 많다는 이유만으로 부정 점수를 긍정으로 뒤집지 않는다.
+10. look-ahead bias 방지를 위해 report_date > as_of_date인 리포트는 제외한다.
+```
+
 ---
 
 ## 8. 감성 유니버스 생성 규칙
@@ -373,13 +456,20 @@ risk_flags:
 | lookback 기간 | 최근 12개월 |
 | 최소 리포트 수 | 1개 |
 | positive threshold | `avg_sentiment_score >= 0.30` |
+| weighted positive threshold | `weighted_sentiment_score >= 0.10` |
 | 상대순위 threshold | 기준일별 `sentiment_percentile >= 0.60` 권장 |
 | 기준일 조건 | `report_date <= as_of_date` |
 | 미래 데이터 사용 | 금지 |
-| 집계 방식 | 단순 평균 MVP, 추후 시간가중 평균 |
+| 집계 방식 | 리포트별 단순 평균 + 리포트 개수 신뢰도 가중치 |
+| 리포트 개수 가중치 | `report_count_weight = LEAST(1.0, LN(1 + report_count) / LN(1 + target_report_count))` |
+| `target_report_count` | 기본 `5`, 5개 이상은 최대 가중치 `1.0` |
 
 SEIBro는 매수 의견 편향이 강하므로, 절대점수 기준만 쓰면 유니버스가 과도하게 넓어질 수 있다.  
-따라서 MVP에서는 `avg_sentiment_score >= 0.30`을 기본 필터로 두되, 실전 백테스트 비교에서는 기준일별 상위 30~40% 같은 상대순위 필터를 함께 검토한다.
+따라서 MVP에서는 `avg_sentiment_score >= 0.30`을 기본 필터로 두되, 동일 종목 리포트 개수에 따른 `weighted_sentiment_score`를 함께 사용한다. 실전 백테스트 비교에서는 `weighted_sentiment_score` 기준 상위 30~40% 같은 상대순위 필터를 함께 검토한다.
+
+리포트 개수 가중치는 감성의 방향을 바꾸기 위한 값이 아니라, 동일 방향 리포트가 반복되는 종목의 신뢰도와 시장 관심도를 반영하기 위한 값이다. 따라서 리포트 1건의 강한 긍정보다, 여러 기관/작성자의 일관된 긍정 리포트가 있는 종목이 universe ranking에서 더 높은 점수를 받을 수 있다.
+
+현재 `feature.seibro_universe_daily` 스키마는 `avg_sentiment_score`와 `report_count`를 저장한다. `report_count_weight`, `weighted_sentiment_score`, `sentiment_percentile`은 MVP에서는 집계 SQL과 백테스트 리포트에서 재계산 가능한 파생값으로 관리하고, 운영 대시보드에서 직접 조회해야 하면 별도 컬럼 추가를 검토한다.
 
 ### 8.2 유니버스 포함 조건
 
@@ -388,10 +478,11 @@ included = true
 if
   report_count >= min_reports
   and avg_sentiment_score >= positive_threshold
+  and weighted_sentiment_score >= weighted_positive_threshold
   and sentiment_percentile >= relative_threshold
 ```
 
-단, 특정 기준일의 SEIBro 커버리지 종목 수가 너무 적으면 상대순위 필터가 과도하게 작동할 수 있다. 이 경우에는 `report_count`와 절대점수 기준만 적용하고, 리포트에는 “상대순위 필터 미적용”을 명시한다.
+단, 특정 기준일의 SEIBro 커버리지 종목 수가 너무 적으면 상대순위 필터가 과도하게 작동할 수 있다. 이 경우에는 `report_count`, `avg_sentiment_score`, `weighted_sentiment_score` 기준만 적용하고, 리포트에는 “상대순위 필터 미적용”을 명시한다.
 
 ### 8.3 제외 사유
 
@@ -399,8 +490,11 @@ if
 |---|---|
 | `insufficient_reports` | lookback 기간 내 리포트 수 부족 |
 | `sentiment_below_threshold` | 평균 감성 점수 미달 |
+| `weighted_sentiment_below_threshold` | 리포트 개수 가중 감성 점수 미달 |
 | `sentiment_percentile_below_threshold` | 기준일별 상대순위 미달 |
 | `symbol_mapping_failed` | 종목 매핑 실패 |
+| `not_common_stock` | 리츠, 인프라펀드, 우선주 등 보통주 universe 제외 대상 |
+| `pre_listing_report` | 리포트일이 KOSPI/KOSDAQ 상장일 이전 |
 | `llm_score_missing` | 감성 점수 미생성 |
 
 ### 8.4 기준 SQL 초안
@@ -418,6 +512,12 @@ WITH recent_reports AS (
    AND r.report_date > d.as_of_date - INTERVAL '12 months'
   JOIN feature.seibro_sentiment s
     ON s.report_id = r.report_id
+  JOIN core.symbol_master sm
+    ON sm.symbol_id = r.symbol_id
+   AND sm.market_segment IN ('KOSPI', 'KOSDAQ')
+   AND sm.security_type = '보통주'
+   AND (sm.listed_at IS NULL OR r.report_date >= sm.listed_at)
+   AND (sm.delisted_at IS NULL OR r.report_date <= sm.delisted_at)
   WHERE r.symbol_id IS NOT NULL
 ),
 aggregated AS (
@@ -429,14 +529,27 @@ aggregated AS (
   FROM recent_reports
   GROUP BY as_of_date, symbol_id
 ),
+weighted AS (
+  SELECT
+    *,
+    LEAST(
+      1.0,
+      LN(1 + report_count)::numeric / LN(1 + :target_report_count)::numeric
+    )::numeric(6,4) AS report_count_weight,
+    (
+      avg_sentiment_score
+      * LEAST(1.0, LN(1 + report_count)::numeric / LN(1 + :target_report_count)::numeric)
+    )::numeric(6,4) AS weighted_sentiment_score
+  FROM aggregated
+),
 ranked AS (
   SELECT
     *,
     PERCENT_RANK() OVER (
       PARTITION BY as_of_date
-      ORDER BY avg_sentiment_score
+      ORDER BY weighted_sentiment_score
     )::numeric(6,4) AS sentiment_percentile
-  FROM aggregated
+  FROM weighted
 )
 INSERT INTO feature.seibro_universe_daily (
   as_of_date,
@@ -452,13 +565,15 @@ SELECT
   symbol_id,
   avg_sentiment_score,
   report_count,
-  avg_sentiment_score >= 0.30
-    AND report_count >= 1
-    AND sentiment_percentile >= 0.60 AS included,
+  avg_sentiment_score >= :positive_threshold
+    AND report_count >= :min_reports
+    AND weighted_sentiment_score >= :weighted_positive_threshold
+    AND sentiment_percentile >= :relative_threshold AS included,
   CASE
-    WHEN report_count < 1 THEN 'insufficient_reports'
-    WHEN avg_sentiment_score < 0.30 THEN 'sentiment_below_threshold'
-    WHEN sentiment_percentile < 0.60 THEN 'sentiment_percentile_below_threshold'
+    WHEN report_count < :min_reports THEN 'insufficient_reports'
+    WHEN avg_sentiment_score < :positive_threshold THEN 'sentiment_below_threshold'
+    WHEN weighted_sentiment_score < :weighted_positive_threshold THEN 'weighted_sentiment_below_threshold'
+    WHEN sentiment_percentile < :relative_threshold THEN 'sentiment_percentile_below_threshold'
     ELSE NULL
   END AS exclusion_reason,
   :run_id
@@ -511,9 +626,13 @@ JOIN mart.seibro_universe_asof su
 | raw 펼치기 검증 | `raw rows[]` 수와 정규화 후보 row 수 비교 |
 | 필수 컬럼 검증 | `report_date`, `summary` null 비율 확인 |
 | 종목 매핑 검증 | `symbol_id IS NULL` 비율 확인 |
+| 보통주 universe 검증 | `report_date` 기준 KOSPI/KOSDAQ 보통주 as-of 매칭률 확인 |
+| 제외 사유 검증 | `not_common_stock`, `symbol_mapping_failed`, `pre_listing_report` 건수와 샘플 확인 |
 | LLM 출력 검증 | JSON schema, 범위, enum 검증 |
 | 중복 검증 | 동일 리포트 중복 삽입 방지 |
 | look-ahead 검증 | `report_date <= as_of_date` 위반 0건 |
+| 리포트 개수 가중치 검증 | `report_count_weight`가 `0.0 ~ 1.0` 범위이고 `report_count` 증가 시 단조 증가 |
+| 가중 점수 검증 | `weighted_sentiment_score = avg_sentiment_score * report_count_weight` 재계산 일치 |
 | 유니버스 검증 | 기준일별 included 종목 수 분포 확인 |
 | 백테스트 검증 | 전체 유니버스와 SEIBro 유니버스 결과 각각 재현 |
 
@@ -529,7 +648,7 @@ JOIN mart.seibro_universe_asof su
 | 4 | LLM prompt/version 고정 | `prompt_version` 확정 |
 | 5 | LLM JSON 출력 검증기 작성 | schema validation 통과 |
 | 6 | 리포트별 감성 점수 적재 | `feature.seibro_sentiment` 적재 |
-| 7 | 기준일별 유니버스 생성 | `feature.seibro_universe_daily` 적재 |
+| 7 | 기준일별 유니버스 생성 | `report_count_weight`와 `weighted_sentiment_score` 기준으로 included를 산출하고 `feature.seibro_universe_daily` 적재 |
 | 8 | as-of bias 검증 | 미래 리포트 사용 0건 |
 | 9 | 백테스트 입력 조립 | SEIBro universe OHLCV CSV 생성 |
 | 10 | 전체 vs SEIBro 백테스트 비교 | 비교 리포트 생성 |
@@ -545,8 +664,13 @@ JOIN mart.seibro_universe_asof su
 | 저장 점수 | `feature.seibro_sentiment.sentiment_score` |
 | 점수 범위 | `-1.0 ~ 1.0` |
 | 투자의견 처리 | `BUY`/`매수`는 약한 prior로만 사용, 단독 positive 판정 금지 |
-| 점수 가중치 | 요약문 60%, 투자의견 20%, 목표가 괴리율 20% |
+| 종목 universe 필터 | 현재 상장 helper가 아니라 `report_date` 기준 KOSPI/KOSDAQ 보통주 as-of 조건 사용 |
+| universe QA | 리츠/인프라펀드/우선주, `symbol_master` 미매칭, 상장 전 리포트는 제외 사유로 보존 |
+| 리포트별 점수 가중치 | 요약문 60%, 투자의견 20%, 목표가 괴리율 20% |
+| 리포트 개수 가중치 | `report_count_weight = LEAST(1.0, LN(1 + report_count) / LN(1 + target_report_count))`, 기본 `target_report_count = 5` |
+| 가중 유니버스 점수 | `weighted_sentiment_score = avg_sentiment_score * report_count_weight` |
 | 유니버스 절대 threshold | 기본 `avg_sentiment_score >= 0.30` |
+| 유니버스 가중 threshold | 기본 `weighted_sentiment_score >= 0.10` |
 | 유니버스 상대 threshold | 기준일별 상위 40% 이상, 즉 `sentiment_percentile >= 0.60` 권장 |
 | lookback | 기본 최근 12개월 |
 | 최소 리포트 수 | MVP `1`, 안정화 후 `2` 검토 |

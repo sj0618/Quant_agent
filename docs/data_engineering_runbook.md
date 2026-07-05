@@ -2,7 +2,7 @@
 
 ## 결론
 
-데이터 엔지니어링 실행 경로는 `KRX/KIS 파일럿 → KRX primary OHLCV 적재 → TA-Lib 선계산 → BOK/OpenDART/SEIBro/KIND 외부 데이터 적재 → mart/as-of 조회 → Airflow 운영` 순서다. 2026-06-24 기준 BOK `rate-fx` 12개 series, BOK 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 백필이 완료되어 증분 운영 대상으로 전환한다. 2026-06-28 기준 KIND 상장법인 목록 기반 섹터 스냅샷도 공용 DB에 붙여서 `core.symbol_master.sector`를 갱신한다. BOK 월별 유가는 `902Y003` 월간 series로 저장하며 실제 ECOS 발표일이 별도 컬럼으로 저장되지 않으므로 백테스트 조인 시 보수적 lag를 적용한다.
+데이터 엔지니어링 실행 경로는 `KRX/KIS 파일럿 → KRX primary OHLCV 적재 → TA-Lib 선계산 → BOK/OpenDART 외부 데이터 적재 → WICS one-shot 섹터 적재 → mart/as-of 조회 → Airflow 운영` 순서다. MVP에서는 SEIBro를 사용하지 않는다. 2026-06-24 기준 BOK `rate-fx` 12개 series, BOK 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 백필이 완료되어 증분 운영 대상으로 전환한다. 2026-06-28 기준 WICS Company Guide 기반 섹터 스냅샷을 로컬 DB에 1회 적재해 `core.symbol_master.sector`를 갱신한다. BOK 월별 유가는 `902Y003` 월간 series로 저장하며 실제 ECOS 발표일이 별도 컬럼으로 저장되지 않으므로 백테스트 조인 시 보수적 lag를 적용한다.
 
 ## 주요 명령
 
@@ -18,11 +18,17 @@
 | BOK 유가 단일 series 점검 | `python scripts/ingest_external_data.py --job bok-series --stat-code 902Y003 --cycle M --start-period 202601 --end-period 202605 --item-code1 010102 --db-mode docker` |
 | OpenDART corp code | `python scripts/ingest_external_data.py --job dart-corp-codes --db-mode docker` |
 | OpenDART financial | `python scripts/ingest_external_data.py --job dart-financial --symbol 005930 --corp-code <corp_code> --business-year 2025 --report-code 11011 --db-mode docker` |
-| KIND 섹터 스냅샷 | `python scripts/ingest_external_data.py --job kind-sector --as-of-date 2026-06-28 --db-mode docker` |
-| SEIBro reports | `python scripts/ingest_external_data.py --job seibro-reports --seibro-endpoint <approved_endpoint> --as-of-date 2026-05-15 --db-mode docker` |
-| SEIBro analyst report summary backfill | `python scripts/backfill_seibro_analyst_reports.py --start-date 2016-05-20 --end-date 2026-05-20 --chunk-months 1 --db-mode docker` |
+| WICS 섹터 스냅샷(1회) | `python scripts/ingest_wics_sectors.py --as-of-date 2026-06-28 --db-mode docker` |
 | KIS official adjusted full + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode full --start-date 2016-05-20 --end-date 2026-05-20 --resume` |
 | KIS official adjusted daily incremental + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode daily-incremental --target-date 2026-05-21 --resume` |
+
+2026-06-28 검증 결과, WICS 적재는 listed common-stock 2,536개 중 2,535개를 매칭했고 `230980`은 FnGuide Company Guide가 `InvalidCompany`를 반환해 `sector`가 `NULL`로 남았다.
+
+섹터 저장 방식:
+- 별도 섹터 테이블은 만들지 않고, WICS/KIND 섹터 스냅샷을 `core.symbol_master`의 `sector` 컬럼에 저장한다.
+- 출처와 스냅샷 시점은 각각 `sector_source`, `sector_as_of`, `sector_run_id`로 추적한다.
+- `mart.common_stock_feature_frame_asof`는 `mart.kis_adjusted_feature_frame_asof`를 기반으로 하지만, 섹터는 `core.symbol_master.sm.sector`를 **명시적으로** 다시 뽑는다. 그래서 섹터를 백테스트 기본 view까지 전파하려면 이 뷰도 `migrations/008_symbol_sector_metadata.sql`에서 함께 재생성해야 한다.
+- 2026-06-28 기준 WICS distinct sector 예시(현재 DB, 26개): `IT가전`, `IT하드웨어`, `건강관리`, `건설,건축관련`, `기계`, `디스플레이`, `미디어,교육`, `반도체`, `보험`, `비철,목재등`, `상사,자본재`, `소매(유통)`, `소프트웨어`, `에너지`, `운송`, `유틸리티`, `은행`, `자동차`, `조선`, `증권`, `철강`, `통신서비스`, `필수소비재`, `호텔,레저서비스`, `화장품,의류,완구`, `화학`.
 
 ## 환경변수
 
@@ -35,9 +41,8 @@
 | KIS | `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_TRADING_ENV` |
 | BOK | `BOK_API_KEY`, 선택: `BOK_BASE_URL` |
 | OpenDART | `DART_API_KEY` 또는 `OPENDART_API_KEY` |
-| KIND | `KIND_CORP_LIST_URL` |
-| SEIBro | `SEIBRO_COLLECTION_APPROVED=true`, `SEIBRO_REPORT_ENDPOINT`, 선택: `SEIBRO_API_KEY`; 분석리포트 WebSquare 수집 선택: `SEIBRO_WEB_BASE_URL`, `SEIBRO_ANALYST_REPORT_*`, `SEIBRO_REQUEST_SLEEP_*` |
-| Airflow | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON`, `DART_REFRESH_CORP_CODES`, `SEIBRO_REPORT_PARAMS_JSON`, `QUANT_AIRFLOW_DAILY_SCHEDULE`, `QUANT_AIRFLOW_EXTERNAL_INGEST_SCRIPT` |
+| WICS | `WICS_COMPANY_INFO_URL`, 선택: `WICS_REQUEST_WORKERS` |
+| Airflow | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON`, `DART_REFRESH_CORP_CODES`, `QUANT_AIRFLOW_DAILY_SCHEDULE` |
 
 공용 DB 정보를 서버에 넣을 때는 아래 위치 중 하나를 쓰면 된다.
 
@@ -63,10 +68,12 @@ BOK 월별 유가의 `TIME=YYYYMM`은 `feature.bok_macro_daily.effective_date = 
 
 | 계층 | 테이블/뷰 |
 |---|---|
-| Raw | `raw.ohlcv_response`, `raw.bok_response`, `raw.dart_response`, `raw.seibro_report_response` |
+| Raw | `raw.ohlcv_response`, `raw.bok_response`, `raw.dart_response` |
 | Core | `core.symbol_master`, `core.ohlcv_daily`, `core.ohlcv_quality_daily`, `core.trading_calendar` |
-| Feature | `feature.ta_*_daily`, `feature.ta_*_ticker_daily`, `feature.seibro_*`, `feature.bok_macro_daily`, `feature.dart_*` |
-| Mart | `mart.full_universe_asof`, `mart.seibro_universe_asof`, `mart.symbol_feature_frame_asof`, `mart.bok_macro_asof`, `mart.dart_financial_asof` |
+| Feature | `feature.ta_*_daily`, `feature.ta_*_ticker_daily`, `feature.bok_macro_daily`, `feature.dart_*` |
+| Mart | `mart.full_universe_asof`, `mart.symbol_feature_frame_asof`, `mart.bok_macro_asof`, `mart.dart_financial_asof` |
+
+MVP에서는 SEIBro 계층을 사용하지 않는다. 위 SEIBro 관련 raw/feature/mart 항목은 기존 적재 이력 또는 후속 과제용으로만 남겨둔다.
 
 ## 검증 쿼리
 
@@ -150,11 +157,11 @@ wrapper 내부 검증은 KIS 적재 후 `failed_windows`가 비어 있을 때만
 
 ## Airflow
 
-`airflow/dags/quant_agent_data_engineering.py`는 다음 DAG를 제공한다. 일일 DAG에는 `refresh_symbol_sector_daily`가 포함되어 KIND 상장법인 목록에서 업종(섹터) 스냅샷을 갱신한다.
+`airflow/dags/quant_agent_data_engineering.py`는 다음 DAG를 제공한다. 일일 DAG에는 섹터 스냅샷 태스크가 없고, WICS 섹터 수집은 `scripts/ingest_wics_sectors.py`로 한 번만 실행한다.
 
 | DAG | 역할 |
 |---|---|
-| `quant_agent_daily_data_engineering` | 일일 OHLCV, TA-Lib, BOK, DART corp code, SEIBro report refresh |
+| `quant_agent_daily_data_engineering` | 일일 OHLCV, TA-Lib, BOK, DART corp code refresh |
 | `quant_agent_backfill_ohlcv_10y` | 설정된 primary source 기준 10년 OHLCV backfill |
 
-Airflow task는 credentials를 코드/파일에서 읽지 않고 런타임 환경, Airflow Connection, Secret Backend에 의존한다. 일일 DAG에는 `refresh_symbol_sector_daily`가 포함되어 KIND 상장법인 목록 기반 섹터(업종) 스냅샷을 `core.symbol_master`에 반영한다. KIS TA/품질 스크립트는 DB 정보가 주입되면 `psycopg`를 자동 선택하고, 그렇지 않으면 로컬 Docker DB 경로를 따른다.
+Airflow task는 credentials를 코드/파일에서 읽지 않고 런타임 환경, Airflow Connection, Secret Backend에 의존한다. WICS 섹터 수집은 Airflow가 아닌 별도 one-shot 스크립트로만 실행한다. KIS TA/품질 스크립트는 DB 정보가 주입되면 `psycopg`를 자동 선택하고, 그렇지 않으면 로컬 Docker DB 경로를 따른다.

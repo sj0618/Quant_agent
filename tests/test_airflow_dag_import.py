@@ -80,6 +80,10 @@ class AirflowDagImportTests(unittest.TestCase):
         self.assertIn("symbol_metadata = refresh_symbol_metadata_daily()", source)
         self.assertIn("ingested >> [symbol_metadata, kis_adjusted", source)
         self.assertIn("computed >> qa", source)
+        self.assertNotIn("refresh_symbol_sector_daily", source)
+        self.assertNotIn("kind-sector", source)
+        self.assertNotIn("ingest_seibro_reports_daily", source)
+        self.assertNotIn("SEIBRO_REPORT_ENDPOINT", source)
         self.assertNotIn("ingested >> [computed", source)
 
     def test_data_quality_args_cover_all_checks(self):

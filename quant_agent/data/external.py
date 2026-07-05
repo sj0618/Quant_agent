@@ -1,4 +1,4 @@
-"""External non-OHLCV ingestion services: SEIBro, BOK ECOS, OpenDART, KIND."""
+"""External non-OHLCV ingestion services: SEIBro, BOK ECOS, OpenDART, KIND, WICS."""
 
 from __future__ import annotations
 
@@ -9,13 +9,14 @@ import json
 from calendar import monthrange
 from typing import Any
 
-from quant_agent.data.config import BokConfig, DartConfig, KindConfig, SeibroConfig
+from quant_agent.data.config import BokConfig, DartConfig, KindConfig, SeibroConfig, WicsConfig
 from quant_agent.data.db import sql_literal
 from quant_agent.data.models import ApiRequestLog, LineageEvent, RawSourcePayload
 from quant_agent.data.repository import DataRepository
 from quant_agent.data.sources.bok import BokEcosClient, normalize_bok_observations
 from quant_agent.data.sources.dart import OpenDartClient, normalize_corp_code_zip, normalize_financial_statement
 from quant_agent.data.sources.kind import KindListedCompanyClient
+from quant_agent.data.sources.wics import WicsCompanyGuideClient
 from quant_agent.data.sources.seibro import (
     LexiconSentimentScorer,
     SeibroAnalystReportClient,
@@ -32,12 +33,14 @@ class ExternalDataIngestionService:
         bok_config: BokConfig | None = None,
         dart_config: DartConfig | None = None,
         kind_config: KindConfig | None = None,
+        wics_config: WicsConfig | None = None,
         seibro_config: SeibroConfig | None = None,
     ) -> None:
         self.repository = repository or DataRepository()
         self.bok_client = BokEcosClient(bok_config or BokConfig.from_env())
         self.dart_client = OpenDartClient(dart_config or DartConfig.from_env())
         self.kind_client = KindListedCompanyClient(kind_config or KindConfig.from_env())
+        self.wics_client = WicsCompanyGuideClient(wics_config or WicsConfig.from_env())
         resolved_seibro_config = seibro_config or SeibroConfig.from_env()
         self.seibro_client = SeibroReportClient(resolved_seibro_config)
         self.seibro_analyst_client = SeibroAnalystReportClient(resolved_seibro_config)
@@ -186,6 +189,103 @@ class ExternalDataIngestionService:
                 print(
                     "KIND sector snapshot warnings: "
                     f"unmatched={unmatched_rows}/{len(rows)}, null_sector={null_sector_count}"
+                )
+            self.repository.finish_ingestion_run(run_id, status="success")
+            return matched_rows
+        except Exception as exc:
+            self.repository.finish_ingestion_run(run_id, status="failed", error_message=str(exc))
+            raise
+
+    def ingest_wics_sector_snapshot(
+        self,
+        *,
+        as_of_date: date | None = None,
+        max_workers: int | None = None,
+        symbol_limit: int | None = None,
+    ) -> int:
+        snapshot_date = as_of_date or date.today()
+        run_id = self.repository.start_ingestion_run(
+            dag_id="manual_wics_ingestion",
+            task_id="ingest_wics_sector_snapshot",
+            source_id="WICS",
+            params={
+                "as_of_date": snapshot_date.isoformat(),
+                "max_workers": max_workers,
+                "symbol_limit": symbol_limit,
+                "source": "company_guide_information",
+            },
+        )
+        try:
+            target_rows = self.repository.executor.fetch_json(
+                """
+                SELECT symbol, name, market_segment
+                  FROM core.symbol_master
+                 WHERE listing_status = 'listed'
+                   AND security_type = '보통주'
+                   AND symbol ~ '^[0-9]{6}$'
+                 ORDER BY symbol
+                """
+            )
+            if symbol_limit is not None:
+                target_rows = target_rows[:symbol_limit]
+            if not target_rows:
+                raise ValueError("No listed common-stock symbols were found for WICS ingestion.")
+
+            worker_count = max(1, max_workers or self.wics_client.config.request_workers)
+            sector_rows: list[dict[str, Any]] = []
+            failed_symbols: list[tuple[str, str]] = []
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                future_to_symbol = {
+                    pool.submit(
+                        self.wics_client.fetch_sector_row,
+                        symbol=row["symbol"],
+                        company_name=row.get("name"),
+                        market_segment=row.get("market_segment"),
+                        as_of_date=snapshot_date,
+                    ): row["symbol"]
+                    for row in target_rows
+                }
+                for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
+                    try:
+                        row = future.result()
+                    except Exception as exc:  # noqa: BLE001 - collect failure summary for operator review
+                        failed_symbols.append((symbol, str(exc)))
+                        continue
+                    if row.get("sector"):
+                        sector_rows.append(row)
+
+            if not sector_rows:
+                raise ValueError("WICS ingestion did not normalize any sector rows.")
+
+            self.repository.upsert_wics_symbol_sectors(sector_rows, run_id)
+            matched_rows = self.repository.executor.fetch_json(
+                f"""
+                SELECT COUNT(*)::int AS matched_count
+                  FROM core.symbol_master
+                 WHERE sector_run_id = {sql_literal(run_id)}
+                """
+            )[0]["matched_count"]
+            listed_common_null_sector_count = self.repository.executor.fetch_json(
+                """
+                SELECT COUNT(*)::int AS null_count
+                  FROM core.symbol_master
+                 WHERE listing_status = 'listed'
+                   AND security_type = '보통주'
+                   AND sector IS NULL
+                """
+            )[0]["null_count"]
+            unmatched_rows = len(target_rows) - matched_rows
+            if unmatched_rows > 0 or listed_common_null_sector_count > 0 or failed_symbols:
+                sample_failures = ", ".join(f"{symbol}: {error}" for symbol, error in failed_symbols[:5])
+                print(
+                    "WICS sector snapshot warnings: "
+                    f"matched={matched_rows}/{len(target_rows)}, "
+                    f"unmatched={unmatched_rows}, "
+                    f"common_null_sector={listed_common_null_sector_count}"
+                    + (f", failed={len(failed_symbols)} [{sample_failures}]" if failed_symbols else "")
                 )
             self.repository.finish_ingestion_run(run_id, status="success")
             return matched_rows
