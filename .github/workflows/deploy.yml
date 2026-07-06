@@ -120,20 +120,20 @@ jobs:
               return 1
             }
 
-            stop_listeners_on_port 8000
-            stop_listeners_on_port 5173
+            stop_listeners_on_port 18001
+            stop_listeners_on_port 18000
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/fe.pid"
 
             cd "$APP_DIR/ai"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn ai_graph.api:app \
               --host 0.0.0.0 \
-              --port 8000 \
+              --port 18001 \
               --reload \
               > "$RUN_DIR/ai.log" 2>&1 &
             echo "$!" > "$RUN_DIR/ai.pid"
 
             cd "$APP_DIR/fe"
-            nohup npm run dev -- --host 0.0.0.0 --port 5173 \
+            nohup npm run dev -- --host 0.0.0.0 --port 18000 \
               > "$RUN_DIR/fe.log" 2>&1 &
             echo "$!" > "$RUN_DIR/fe.pid"
 
@@ -153,6 +153,6 @@ jobs:
               return 1
             }
 
-            wait_for_url "AI API" "http://127.0.0.1:8000/health" "$RUN_DIR/ai.log"
-            wait_for_url "FE dev server" "http://127.0.0.1:5173/" "$RUN_DIR/fe.log"
+            wait_for_url "AI API" "http://127.0.0.1:18001/health" "$RUN_DIR/ai.log"
+            wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
           REMOTE

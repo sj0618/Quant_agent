@@ -4,6 +4,8 @@ export const ROUTES = {
   login: "/login",
   authCallback: "/auth/google/callback",
   reports: "/reports",
+  reportsHistory: "/reports/history",
+  reportStrategies: "/reports/strategies",
   me: "/me",
   notifications: "/me/notifications",
   search: "/search",
@@ -12,6 +14,7 @@ export const ROUTES = {
   disclaimer: "/disclaimer",
   unsubscribe: "/unsubscribe",
   reportDetail: (id: string) => `/reports/${encodeURIComponent(id)}`,
+  strategyReportDetail: (id: string) => `/reports/strategies/${encodeURIComponent(id)}`,
 } as const;
 
 export function withReturnTo(route: string, returnTo: string) {

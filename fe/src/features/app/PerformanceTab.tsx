@@ -30,11 +30,7 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
           <h1>{performance.headline}</h1>
           <p>{performance.period}</p>
         </div>
-        <div className="segmented">
-          <button className={mode === "selected" ? "is-active" : ""} onClick={() => setMode("selected")} type="button">선택 후보</button>
-          <button className={mode === "baseline" ? "is-active" : ""} onClick={() => setMode("baseline")} type="button">기준선</button>
-          <button className={mode === "combined" ? "is-active" : ""} onClick={() => setMode("combined")} type="button">동시 보기</button>
-        </div>
+
         <button className="export-button" onClick={() => downloadPerformanceCsv(performance)} type="button">CSV</button>
       </Card>
 

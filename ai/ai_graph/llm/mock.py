@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ai_graph.llm.base import LLMJsonRequest
@@ -559,26 +560,123 @@ VALUE_QUALITY_CANDIDATES = [
     VALUE_QUALITY_VOLUME_CODE,
 ]
 
+PULLBACK_RSI40_VOLUME_CODE = '''def build_signals(prices):
+    signals = []
+    closes = []
+    volumes = []
+    has_position = False
+    for row in prices:
+        close = float(row.get("close", 0))
+        volume = float(row.get("volume", 0))
+        rsi = float(row.get("rsi", row.get("rsi_14", 50)))
+        closes.append(close)
+        volumes.append(volume)
+        sma_window = closes[-200:]
+        volume_window = volumes[-20:]
+        sma_200 = sum(sma_window) / len(sma_window)
+        avg_volume = sum(volume_window) / len(volume_window)
+        above_trend = close >= sma_200
+        volume_ok = volume >= avg_volume
+        if (not has_position) and above_trend and rsi <= 40 and volume_ok:
+            action = "BUY"
+            has_position = True
+        elif has_position and (rsi >= 60 or close < sma_200):
+            action = "SELL"
+            has_position = False
+        else:
+            action = "HOLD"
+        signals.append({"date": row["date"], "action": action, "price": close})
+    return signals
+'''
+
+CONSERVATIVE_PULLBACK_RSI40_VOLUME_CODE = '''def build_signals(prices):
+    signals = []
+    closes = []
+    volumes = []
+    has_position = False
+    for row in prices:
+        close = float(row.get("close", 0))
+        volume = float(row.get("volume", 0))
+        rsi = float(row.get("rsi", row.get("rsi_14", 50)))
+        closes.append(close)
+        volumes.append(volume)
+        sma_window = closes[-200:]
+        volume_window = volumes[-20:]
+        sma_200 = sum(sma_window) / len(sma_window)
+        avg_volume = sum(volume_window) / len(volume_window)
+        above_trend = close >= sma_200
+        volume_ok = volume >= avg_volume * 1.05
+        if (not has_position) and above_trend and rsi <= 38 and volume_ok:
+            action = "BUY"
+            has_position = True
+        elif has_position and (rsi >= 58 or close < sma_200):
+            action = "SELL"
+            has_position = False
+        else:
+            action = "HOLD"
+        signals.append({"date": row["date"], "action": action, "price": close})
+    return signals
+'''
+
+REBOUND_PULLBACK_RSI40_VOLUME_CODE = '''def build_signals(prices):
+    signals = []
+    closes = []
+    volumes = []
+    previous_rsi = 50.0
+    has_position = False
+    for row in prices:
+        close = float(row.get("close", 0))
+        volume = float(row.get("volume", 0))
+        rsi = float(row.get("rsi", row.get("rsi_14", previous_rsi)))
+        closes.append(close)
+        volumes.append(volume)
+        sma_window = closes[-200:]
+        volume_window = volumes[-20:]
+        sma_200 = sum(sma_window) / len(sma_window)
+        avg_volume = sum(volume_window) / len(volume_window)
+        above_trend = close >= sma_200
+        volume_ok = volume >= avg_volume
+        rebound = previous_rsi <= 40 and rsi > previous_rsi
+        if (not has_position) and above_trend and rebound and volume_ok:
+            action = "BUY"
+            has_position = True
+        elif has_position and (rsi >= 62 or close < sma_200):
+            action = "SELL"
+            has_position = False
+        else:
+            action = "HOLD"
+        signals.append({"date": row["date"], "action": action, "price": close})
+        previous_rsi = rsi
+    return signals
+'''
+
+PULLBACK_RSI40_VOLUME_CANDIDATES = [
+    PULLBACK_RSI40_VOLUME_CODE,
+    CONSERVATIVE_PULLBACK_RSI40_VOLUME_CODE,
+    REBOUND_PULLBACK_RSI40_VOLUME_CODE,
+]
+
 
 class MockLLMClient:
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
         if request.schema_name == BACKTEST_CODE_SCHEMA_NAME:
-            if "breakout_volume_momentum" in request.user_prompt:
-                return {"candidates": BREAKOUT_VOLUME_CANDIDATES, "fallback_reasons": []}
-            if "bollinger" in request.user_prompt or "볼린저" in request.user_prompt:
-                return {"candidates": BOLLINGER_CANDIDATES, "fallback_reasons": []}
-            if any(strategy_id in request.user_prompt for strategy_id in ("value_quality", "reasonable_growth", "quality_growth", "growth_momentum")):
-                return {"candidates": VALUE_QUALITY_CANDIDATES, "fallback_reasons": []}
-            if any(strategy_id in request.user_prompt for strategy_id in ("pullback", "fcf_recovery", "dividend_defensive", "low_vol_defensive")):
-                return {"candidates": TREND_PULLBACK_CANDIDATES, "fallback_reasons": []}
-            if "relative_strength" in request.user_prompt:
-                return {"candidates": RELATIVE_STRENGTH_CANDIDATES, "fallback_reasons": []}
-            return {"candidates": MOCK_BACKTEST_CODE_CANDIDATES, "fallback_reasons": []}
+            strategy, variant = _strategy_and_variant_from_request(request)
+            return {
+                "candidates": self.generate_backtest_candidates(strategy, variant),
+                "fallback_reasons": [],
+            }
         return {"fallback_reasons": [f"unsupported mock schema: {request.schema_name}"]}
+
+    def generate_backtest_candidates(self, strategy: StrategySpec, variant: str) -> list[str]:
+        if strategy.strategy_id.startswith("pullback_rsi_volume"):
+            return list(PULLBACK_RSI40_VOLUME_CANDIDATES)
+        return list(MOCK_BACKTEST_CODE_CANDIDATES)
 
 
 class MockBacktestCodeLLM(MockLLMClient):
     def generate_backtest_candidates(self, strategy: StrategySpec, variant: str) -> list[str]:
+        if strategy.strategy_id.startswith("pullback_rsi_volume"):
+            return list(PULLBACK_RSI40_VOLUME_CANDIDATES)
         if strategy.strategy_id.startswith("breakout_volume_momentum"):
             return list(BREAKOUT_VOLUME_CANDIDATES)
         if strategy.strategy_id.startswith("bollinger"):
@@ -592,3 +690,31 @@ class MockBacktestCodeLLM(MockLLMClient):
         if strategy.strategy_id.startswith(("flow_accumulation", "short_covering_proxy", "gap_hold_momentum", "breakout_setup")):
             return list(BREAKOUT_VOLUME_CANDIDATES)
         return list(MOCK_BACKTEST_CODE_CANDIDATES)
+
+
+def _strategy_and_variant_from_request(request: LLMJsonRequest) -> tuple[StrategySpec, str]:
+    try:
+        payload = json.loads(request.user_prompt)
+        strategy = StrategySpec.model_validate(payload["strategy_spec"])
+        variant = str(payload.get("variant") or "A")
+    except (KeyError, TypeError, ValueError):
+        strategy = _default_rsi_strategy()
+        variant = "A"
+    return strategy, variant
+
+
+def _default_rsi_strategy() -> StrategySpec:
+    return StrategySpec(
+        strategy_id="rsi_rebound_a",
+        name="KOSPI200 RSI 과매도 반등",
+        universe="KOSPI200",
+        market="KRX",
+        timeframe="daily",
+        entry_conditions=[],
+        exit_conditions=[],
+        indicators=["RSI"],
+        risk_constraints={},
+        assumptions=[],
+        source_refs=[],
+        confidence=0.68,
+    )

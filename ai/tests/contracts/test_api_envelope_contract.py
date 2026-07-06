@@ -24,6 +24,13 @@ API_ENVELOPE_FIELDS = {
     "strategy_spec",
     "debug_ref",
     "retryable",
+    "semantic_slots",
+    "data_requirements",
+    "source_usage",
+    "freshness_status",
+    "proxy_disclosure",
+    "failure_cause",
+    "evidence_refs",
 }
 USER_PAYLOAD_FIELDS = {
     "headline",
@@ -54,6 +61,10 @@ def test_analysis_job_and_api_envelope_public_fields_are_frozen() -> None:
     assert set(job) == ANALYSIS_JOB_FIELDS
     assert set(job["stages"][0]) == STAGE_FIELDS
     assert set(result) == API_ENVELOPE_FIELDS
+    assert result["semantic_slots"]["indicator"]
+    assert result["data_requirements"]
+    assert result["source_usage"]
+    assert result["evidence_refs"]
     assert set(user_payload) == USER_PAYLOAD_FIELDS
     assert user_payload["performance"]["selected_candidate_id"]
     assert "metrics" in user_payload["performance"]

@@ -102,8 +102,8 @@ function conversationStatus(jobs: AnalysisJob[]): WorkspaceAnalysisStatus {
   return jobs[jobs.length - 1]?.result?.status ?? "running";
 }
 
-function hasWorkspaceResult(jobs: AnalysisJob[]) {
-  return jobs.some((job) => Boolean(job.result?.strategy_spec || job.result?.user_payload.report || job.result?.user_payload.performance));
+function hasWorkspaceResult(job: AnalysisJob | undefined) {
+  return Boolean(job?.result?.status === "ready" && (job.result.strategy_spec || job.result.user_payload.report || job.result.user_payload.performance));
 }
 
 function conversationPreview(conversation: WorkspaceConversation, template: AppOverview): ChatConversationPreview {
@@ -248,8 +248,12 @@ export function AppPage() {
     (currentOverview, job) => mergeAnalysisJobIntoOverview(currentOverview, job),
     data,
   );
+  const latestJob = analysisJobs.at(-1);
   const hasCurrentConversation = analysisJobs.length > 0;
-  const canRenderWorkspace = hasWorkspaceResult(analysisJobs);
+  const canRenderWorkspace = hasWorkspaceResult(latestJob);
+  const panelStrategy = canRenderWorkspace
+    ? overview.strategy
+    : { ...data.strategy, natural_language_strategy: latestJob?.query ?? data.strategy.natural_language_strategy };
   const historyPreviews = conversationHistory.map((conversation) => conversationPreview(conversation, data));
   const runningJob = [...analysisJobs].reverse().find((job) => !job.result);
   const workspaceProgress = buildWorkspaceProgress({ job: runningJob, pendingAnalysis, now: progressNow });
@@ -300,7 +304,7 @@ export function AppPage() {
             }
           }}
           onRestoreConversation={handleRestoreConversation}
-          strategy={overview.strategy}
+          strategy={panelStrategy}
         />
         <main className="workspace-main">
           {canRenderWorkspace ? (

@@ -4,12 +4,12 @@ import { Badge } from "../components/common/Badge";
 import { Button } from "../components/common/Button";
 import { Card } from "../components/common/Card";
 import { AppLayout } from "../components/layout/AppLayout";
-import { getAppOverview, getReports } from "../api/quantAgentClient";
+import { getReports } from "../api/quantAgentClient";
 import { ROUTES } from "../config/routes";
 import { useAsyncData } from "../hooks/useAsyncData";
 
 type SearchResult = {
-  kind: "strategy" | "candidate" | "report";
+  id: string;
   title: string;
   description: string;
   href: string;
@@ -24,10 +24,7 @@ export function SearchPage() {
   const params = new URLSearchParams(window.location.search);
   const initialQuery = params.get("q") ?? "";
   const [query, setQuery] = useState(initialQuery);
-  const { data, loading, error } = useAsyncData(async () => {
-    const [overview, reports] = await Promise.all([getAppOverview(), getReports()]);
-    return { overview, reports };
-  }, []);
+  const { data, loading, error } = useAsyncData(getReports, []);
 
   const results = useMemo<SearchResult[]>(() => {
     if (!data || !query.trim()) {
@@ -35,41 +32,15 @@ export function SearchPage() {
     }
 
     const normalized = query.trim();
-    const strategyResults: SearchResult[] = includesQuery(data.overview.strategy.natural_language_strategy, normalized)
-      ? [
-          {
-            kind: "strategy",
-            title: "활성 전략",
-            description: data.overview.strategy.natural_language_strategy,
-            href: ROUTES.app,
-            meta: data.overview.strategy.universe,
-          },
-        ]
-      : [];
-
-    const candidateResults = data.overview.candidates
-      .filter((candidate) =>
-        [candidate.name, candidate.ticker, candidate.sector, candidate.rationale].some((value) => includesQuery(value, normalized)),
-      )
-      .map<SearchResult>((candidate) => ({
-        kind: "candidate",
-        title: `${candidate.name} ${candidate.ticker}`,
-        description: candidate.rationale,
-        href: `${ROUTES.app}?tab=trading`,
-        meta: `${candidate.signal} · ${candidate.score.toFixed(2)}`,
-      }));
-
-    const reportResults = data.reports
-      .filter((report) => [report.title, report.summary, report.strategyName, report.date].some((value) => includesQuery(value, normalized)))
+    return data
+      .filter((report) => [report.title, report.summary, report.date].some((value) => includesQuery(value, normalized)))
       .map<SearchResult>((report) => ({
-        kind: "report",
+        id: report.id,
         title: report.title,
         description: report.summary,
         href: ROUTES.reportDetail(report.id),
         meta: `${report.date} · 권장도 ${report.recommendationScore}`,
       }));
-
-    return [...strategyResults, ...candidateResults, ...reportResults];
   }, [data, query]);
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -84,11 +55,11 @@ export function SearchPage() {
   };
 
   if (loading) {
-    return <AsyncState title="검색 데이터를 불러오는 중입니다" tone="loading" />;
+    return <AsyncState title="리포트 검색 데이터를 불러오는 중입니다" tone="loading" />;
   }
 
   if (error || !data) {
-    return <AsyncState title="검색 데이터를 불러오지 못했습니다" description={error?.message} tone="error" />;
+    return <AsyncState title="리포트 검색 데이터를 불러오지 못했습니다" description={error?.message} tone="error" />;
   }
 
   return (
@@ -96,11 +67,11 @@ export function SearchPage() {
       <main className="search-page">
         <form className="search-form" onSubmit={handleSubmit}>
           <label>
-            <span>통합 검색</span>
+            <span>리포트 검색</span>
             <input
               autoFocus
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="전략, 종목, 리포트 검색"
+              placeholder="내 리포트 제목 또는 요약 검색"
               value={query}
             />
           </label>
@@ -116,15 +87,13 @@ export function SearchPage() {
           {query.trim() && results.length === 0 ? (
             <Card>
               <strong>검색 결과가 없습니다</strong>
-              <p>전략명, 종목명, 티커, 리포트 제목을 다시 확인하세요.</p>
+              <p>내가 만든 리포트 제목 또는 요약을 다시 확인해 주세요.</p>
             </Card>
           ) : null}
 
           {results.map((result) => (
-            <a className="search-result-row" href={result.href} key={`${result.kind}-${result.title}`}>
-              <Badge variant={result.kind === "report" ? "info" : result.kind === "candidate" ? "dark" : "soft"}>
-                {result.kind}
-              </Badge>
+            <a className="search-result-row" href={result.href} key={result.id}>
+              <Badge variant="info">리포트</Badge>
               <span>
                 <strong>{result.title}</strong>
                 <small>{result.description}</small>

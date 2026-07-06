@@ -13,6 +13,7 @@ RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504})
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.25
+DEFAULT_WEB_SEARCH_TOOL_TYPE = "web_search_preview"
 
 
 class AOAIResponsesClient:
@@ -25,6 +26,7 @@ class AOAIResponsesClient:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+        web_search_tool_type: str = DEFAULT_WEB_SEARCH_TOOL_TYPE,
         http_client: httpx.Client | None = None,
     ) -> None:
         self.responses_url = responses_url
@@ -33,6 +35,7 @@ class AOAIResponsesClient:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
+        self.web_search_tool_type = web_search_tool_type
         self._http_client = http_client
 
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
@@ -44,7 +47,7 @@ class AOAIResponsesClient:
         return extract_json_object(payload)
 
     def _post_with_retries(self, request: LLMJsonRequest) -> httpx.Response:
-        body = {
+        body: dict[str, Any] = {
             "model": self.model,
             "input": [
                 {"role": "system", "content": request.system_prompt},
@@ -52,6 +55,8 @@ class AOAIResponsesClient:
             ],
             "temperature": request.temperature,
         }
+        if request.enable_web_search:
+            body["tools"] = [{"type": self.web_search_tool_type}]
         headers = {"Content-Type": "application/json", "api-key": self.api_key}
         attempts = self.max_retries + 1
         last_error: Exception | None = None
