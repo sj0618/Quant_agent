@@ -27,8 +27,8 @@ export function getDigestStrategySelection(): string[] {
   return readSelection();
 }
 
-export function saveDigestStrategySelection(strategyNames: string[]): string[] {
-  const unique = Array.from(new Set(strategyNames));
+export function saveDigestStrategySelection(strategyIds: string[]): string[] {
+  const unique = Array.from(new Set(strategyIds));
   if (unique.length > MAX_EMAIL_DIGEST_STRATEGIES) {
     throw new EmailDigestSelectionLimitError();
   }
@@ -36,8 +36,8 @@ export function saveDigestStrategySelection(strategyNames: string[]): string[] {
   return unique;
 }
 
-export function toggleDigestStrategySelection(strategyName: string, checked: boolean): string[] {
+export function toggleDigestStrategySelection(strategyId: string, checked: boolean): string[] {
   const current = readSelection();
-  const next = checked ? [...current, strategyName] : current.filter((name) => name !== strategyName);
+  const next = checked ? [...current, strategyId] : current.filter((name) => name !== strategyId);
   return saveDigestStrategySelection(next);
 }

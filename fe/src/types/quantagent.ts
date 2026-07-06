@@ -354,14 +354,17 @@ export interface LandingSample {
   faqs: Array<{ question: string; answer?: string }>;
 }
 
+export type ReportDeliveryStatus = "sent" | "draft" | "failed" | "resent";
+
 export interface ReportSummary {
   id: string;
+  strategyId?: string;
   date: string;
   weekday: string;
   sentAt: string;
   title: string;
   summary: string;
-  status: "sent" | "draft" | "failed";
+  status: ReportDeliveryStatus;
   strategyName: string;
   recommendationScore: string;
   signals: Record<SignalType, number>;
@@ -422,14 +425,52 @@ export interface DailyDigestReport {
   footer: string[];
 }
 
+export interface StrategyReportSummary {
+  id: string;
+  name: string;
+  description: string;
+  universe: string;
+  timeframe: string;
+  entrySummary: string;
+  exitSummary: string;
+  riskSummary: string;
+  latestSentAt: string;
+  latestReportDate: string;
+  latestStatus: ReportDeliveryStatus;
+  latestEmailReportId: string;
+  recommendationScore: string;
+  signals: Record<SignalType, number>;
+  summary: string;
+  tags: string[];
+}
+
+export interface StrategyReportDetail {
+  strategy: StrategyReportSummary;
+  emailReports: ReportDetail[];
+}
+
+export interface EmailDigestHistoryEntry {
+  id: string;
+  reportId: string;
+  strategyId: string;
+  strategyName: string;
+  reportDate: string;
+  sentAt: string;
+  status: ReportDeliveryStatus;
+  title: string;
+}
+
 export interface ReportDetail extends ReportSummary {
   recipient: string;
+  strategyUniverse?: string;
   marketBrief: string;
+  marketContext?: string;
   news: Array<{ rank: number; title: string; source: string; tone: Tone }>;
   candidates: TradingCandidate[];
   signalAxes: Array<{ label: string; weight: string; title: string; description: string }>;
   riskManagerOverride: string;
   conclusion: string;
+  warningNote?: string;
   performance: Pick<PerformanceSummary, "metrics" | "disclaimer">;
   costNotes: string[];
 }

@@ -26,6 +26,14 @@ class RoleDebatePayload(BaseModel):
     fallback_reasons: list[str] = Field(default_factory=list)
 
 
+class StrategyDescriptionPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    strategy_id: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    fallback_reasons: list[str] = Field(default_factory=list)
+
+
 def generate_role_debate(
     *,
     role: str,
@@ -100,6 +108,48 @@ def generate_daily_digest_overall_comment(
         ),
     )
     return payload.summary
+
+
+def generate_strategy_description(
+    *,
+    strategy_id: str,
+    name: str,
+    universe: str,
+    timeframe: str,
+    entry_summary: str,
+    exit_summary: str,
+    risk_summary: str,
+    tags: list[str],
+    fallback: str,
+) -> StrategyDescriptionPayload:
+    payload = generate_role_debate(
+        role="STRATEGY_DESCRIPTION",
+        task=(
+            "Write exactly one concise Korean sentence that explains the trading logic only. "
+            "Do not mention email delivery, sending cadence, UI, dashboards, or product copy."
+        ),
+        context={
+            "strategy_id": strategy_id,
+            "name": name,
+            "universe": universe,
+            "timeframe": timeframe,
+            "entry_summary": entry_summary,
+            "exit_summary": exit_summary,
+            "risk_summary": risk_summary,
+            "tags": tags,
+        },
+        fallback=RoleDebatePayload(
+            role="STRATEGY_DESCRIPTION",
+            summary=fallback,
+            recommendation="N/A",
+            confidence=0.5,
+        ),
+    )
+    return StrategyDescriptionPayload(
+        strategy_id=strategy_id,
+        description=payload.summary,
+        fallback_reasons=payload.fallback_reasons,
+    )
 
 
 MARKET_BRIEF_SYSTEM_PROMPT = """\

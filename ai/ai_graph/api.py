@@ -27,6 +27,7 @@ from ai_graph.jobs import (
     create_analysis_job_store_from_env,
     run_job_sync,
 )
+from ai_graph.llm.role_calls import generate_strategy_description
 from ai_graph.nodes.daily_digest import MAX_DIGEST_STRATEGIES, build_daily_digest
 from ai_graph.schemas import SCHEMA_VERSION
 from ai_graph.schemas import APIEnvelope, DailyDigestReport, DailyDigestStrategyInput, EnvelopeStatus, UserPayload
@@ -42,6 +43,7 @@ API_STATUS_PATH = "/api-status"
 ANALYSIS_JOBS_PATH = "/analysis-jobs"
 ANALYSIS_JOB_DETAIL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}"
 SPEC_STRATEGY_PARSE_PATH = "/api/strategies/parse"
+STRATEGY_DESCRIPTIONS_PATH = "/api/strategies/descriptions"
 SPEC_ANALYSIS_JOB_DETAIL_PATH = "/api/analysis-jobs/{job_id}"
 SPEC_BACKTEST_DETAIL_PATH = "/api/backtests/{strategy_id}"
 SPEC_REPORT_DETAIL_PATH = "/api/reports/{report_id}"
@@ -97,6 +99,39 @@ class CreateDailyDigestRequest(BaseModel):
     user_name: str = Field(min_length=1)
     report_date: str = Field(min_length=1)
     strategies: list[DailyDigestStrategyInput] = Field(min_length=1, max_length=MAX_DIGEST_STRATEGIES)
+
+
+class StrategyDescriptionInput(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    strategy_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    universe: str = Field(min_length=1)
+    timeframe: str = Field(min_length=1)
+    entry_summary: str = Field(min_length=1)
+    exit_summary: str = Field(min_length=1)
+    risk_summary: str = Field(min_length=1)
+    tags: list[str] = Field(default_factory=list, max_length=8)
+
+
+class StrategyDescriptionsRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    strategies: list[StrategyDescriptionInput] = Field(min_length=1, max_length=20)
+
+
+class StrategyDescriptionItem(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    strategy_id: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    fallback_reasons: list[str] = Field(default_factory=list)
+
+
+class StrategyDescriptionsResponse(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    items: list[StrategyDescriptionItem] = Field(min_length=1)
 
 
 class HealthResponse(BaseModel):
@@ -219,6 +254,40 @@ def create_app(
         )
         return run_job_sync(store, job.job_id, analysis_runner)
 
+    @app.post(
+        STRATEGY_DESCRIPTIONS_PATH,
+        response_model=StrategyDescriptionsResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Strategy"],
+    )
+    def describe_strategies(request: StrategyDescriptionsRequest) -> StrategyDescriptionsResponse:
+        return StrategyDescriptionsResponse(
+            items=[
+                StrategyDescriptionItem(
+                    strategy_id=payload.strategy_id,
+                    description=payload.description,
+                    fallback_reasons=payload.fallback_reasons,
+                )
+                for payload in [
+                    generate_strategy_description(
+                        strategy_id=strategy.strategy_id,
+                        name=strategy.name,
+                        universe=strategy.universe,
+                        timeframe=strategy.timeframe,
+                        entry_summary=strategy.entry_summary,
+                        exit_summary=strategy.exit_summary,
+                        risk_summary=strategy.risk_summary,
+                        tags=strategy.tags,
+                        fallback=(
+                            f"{strategy.universe} 내에서 {strategy.entry_summary} 조건이 맞는 종목을 선별하고 "
+                            f"{strategy.exit_summary} 기준으로 정리하는 전략입니다."
+                        ),
+                    )
+                    for strategy in request.strategies
+                ]
+            ]
+        )
+
     @app.get(
         ANALYSIS_JOB_DETAIL_PATH,
         response_model=AnalysisJob,
@@ -321,6 +390,12 @@ def _endpoint_statuses() -> list[EndpointStatus]:
             path=SPEC_STRATEGY_PARSE_PATH,
             state="local_sync",
             summary="Compatibility adapter for POST /api/strategies/parse.",
+        ),
+        EndpointStatus(
+            method="POST",
+            path=STRATEGY_DESCRIPTIONS_PATH,
+            state="local_sync",
+            summary="Generate concise strategy-only descriptions for FE strategy cards.",
         ),
         EndpointStatus(
             method="GET",

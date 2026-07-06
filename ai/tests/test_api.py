@@ -9,6 +9,7 @@ from ai_graph.api import (
     HEALTH_PATH,
     OPENAPI_URL,
     SPEC_STRATEGY_PARSE_PATH,
+    STRATEGY_DESCRIPTIONS_PATH,
     create_app,
 )
 from ai_graph.jobs import InMemoryAnalysisJobStore
@@ -46,6 +47,7 @@ def test_swagger_openapi_lists_current_api_surface() -> None:
     assert ANALYSIS_JOBS_PATH in paths
     assert ANALYSIS_JOB_DETAIL_PATH in paths
     assert SPEC_STRATEGY_PARSE_PATH in paths
+    assert STRATEGY_DESCRIPTIONS_PATH in paths
     assert "/api/analysis-jobs/{job_id}" in paths
     assert "/api/backtests/{strategy_id}" in paths
     assert "/api/reports/{report_id}" in paths
@@ -161,6 +163,34 @@ def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adap
     assert report_response.status_code == 200
     assert report_response.json()["status"] == "ready"
     assert report_response.json()["user_payload"]["report"]["web_projection"]["sections"]
+
+
+def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    response = client.post(
+        STRATEGY_DESCRIPTIONS_PATH,
+        json={
+            "strategies": [
+                {
+                    "strategy_id": "semiconductor-momentum",
+                    "name": "반도체 모멘텀 + 기관 매수",
+                    "universe": "KOSPI200 · 반도체",
+                    "timeframe": "daily",
+                    "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
+                    "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
+                    "risk_summary": "실적 발표와 환율 급등 구간에서는 신규 비중 확대를 늦춥니다.",
+                    "tags": ["모멘텀", "외국인 수급"],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()["items"][0]
+    assert payload["strategy_id"] == "semiconductor-momentum"
+    assert payload["description"]
+    assert "이메일" not in payload["description"]
 
 
 def test_spec_resource_adapters_return_failed_envelope_instead_of_404() -> None:

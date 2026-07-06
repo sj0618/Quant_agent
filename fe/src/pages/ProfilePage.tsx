@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { getEmailDigestHistory } from "../api/quantAgentClient";
 import { Badge } from "../components/common/Badge";
 import { Button } from "../components/common/Button";
 import { Card } from "../components/common/Card";
@@ -6,6 +7,8 @@ import { AppLayout } from "../components/layout/AppLayout";
 import { getCurrentSession, signOut } from "../api/authClient";
 import { getNotificationSettings, saveNotificationSettings } from "../api/preferencesClient";
 import { ROUTES } from "../config/routes";
+import { EmailHistoryTimeline } from "../features/reports/EmailHistoryTimeline";
+import { useAsyncData } from "../hooks/useAsyncData";
 import type { NotificationSettings } from "../types/auth";
 
 export function ProfilePage() {
@@ -15,6 +18,7 @@ export function ProfilePage() {
   const [settings, setSettings] = useState<NotificationSettings>(() =>
     getNotificationSettings(session?.user.email ?? ""),
   );
+  const history = useAsyncData(getEmailDigestHistory, []);
 
   if (!session) {
     return null;
@@ -95,6 +99,24 @@ export function ProfilePage() {
           <div className="form-actions">
             <Button onClick={handleSaveSettings} variant="dark">설정 저장</Button>
           </div>
+        </Card>
+
+        <Card className="settings-card">
+          <div className="settings-card__head">
+            <div>
+              <Badge variant="soft">발송 이력</Badge>
+              <h2>이메일 발송 타임라인</h2>
+              <p>전송 완료, 실패, 재전송 이력을 최근 순서대로 바로 확인합니다.</p>
+            </div>
+            <a className="reports-page__link" href={ROUTES.reportsHistory}>전체 이력 보기 →</a>
+          </div>
+
+          {history.loading ? <p className="settings-card__inline-copy">이메일 발송 이력을 불러오는 중입니다.</p> : null}
+          {history.error ? <p className="settings-card__inline-copy settings-card__inline-copy--error">{history.error.message}</p> : null}
+          {!history.loading && !history.error && history.data?.length ? <EmailHistoryTimeline entries={history.data} /> : null}
+          {!history.loading && !history.error && (!history.data || history.data.length === 0) ? (
+            <p className="settings-card__inline-copy">아직 표시할 이메일 발송 이력이 없습니다.</p>
+          ) : null}
         </Card>
       </main>
     </AppLayout>
