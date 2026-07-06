@@ -89,6 +89,27 @@ def test_pullback_term_uses_l1_l2_definition_without_blocking() -> None:
     assert envelope.user_payload.candidate_cards[0].strategy_id == "pullback_trend"
 
 
+def test_pullback_rsi40_volume_prompt_generates_nonzero_backtest() -> None:
+    envelope = run_analysis(
+        "200일선 위 상승추세를 유지하면서 RSI(14)가 40 이하로 눌리고 거래량이 20일 평균 이상인 종목을 찾아줘.",
+        trace_id="trace-pullback-rsi40-volume",
+    )
+
+    assert envelope.status == "ready"
+    assert envelope.strategy_spec is not None
+    assert envelope.strategy_spec.strategy_id == "pullback_rsi_volume_a"
+    assert [
+        (condition.left, condition.operator, condition.right)
+        for condition in envelope.strategy_spec.entry_conditions
+    ] == [
+        ("close_above_sma_200", "eq", 1),
+        ("rsi", "lte", 40),
+        ("volume_ratio_20", "gte", 1.0),
+    ]
+    assert envelope.user_payload.performance is not None
+    assert envelope.user_payload.performance.metrics_by_variant["A"].total_return != 0
+
+
 def test_option_short_straddle_is_rejected() -> None:
     envelope = run_analysis("옵션 양매도 전략 만들어줘", trace_id="trace-c5")
 

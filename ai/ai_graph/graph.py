@@ -740,6 +740,14 @@ def _has_unknown_term_risk(query: str) -> bool:
     return any(term in query for term in ("알아서", "좋은 종목", "괜찮은 종목"))
 
 
+def _is_pullback_rsi_volume_query(query: str) -> bool:
+    lowered = query.lower()
+    has_trend_filter = "200일" in query or "sma200" in lowered or "sma_200" in lowered
+    has_rsi_pullback = "rsi" in lowered and ("40" in query or "눌" in query)
+    has_volume_filter = "거래량" in query or "volume" in lowered
+    return has_trend_filter and has_rsi_pullback and has_volume_filter
+
+
 def _ambiguity_reasons(category: AmbiguityCode, query: str) -> list[str]:
     if category == AmbiguityCode.READY:
         return ["L1/L2 또는 기술 지표 조건으로 해석 가능한 KRX 현물 전략입니다."]
@@ -836,6 +844,27 @@ def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> d
 
 def _strategy_profile(query: str) -> dict[str, Any]:
     lowered = query.lower()
+    if _is_pullback_rsi_volume_query(query):
+        return {
+            "strategy_id": "pullback_rsi_volume",
+            "name": "KOSPI200 RSI40 거래량 눌림목",
+            "entry_conditions": [
+                Condition(left="close_above_sma_200", operator="eq", right=1, description="주가가 200일선 위"),
+                Condition(left="rsi", operator="lte", right=40, description="RSI(14) <= 40 눌림"),
+                Condition(left="volume_ratio_20", operator="gte", right=1.0, description="거래량이 20일 평균 이상"),
+            ],
+            "exit_conditions": [
+                Condition(left="rsi", operator="gte", right=60, description="RSI >= 60 회복"),
+                Condition(left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈"),
+            ],
+            "indicators": ["SMA200", "RSI", "volume_ratio_20"],
+            "assumptions": [
+                "200일선 위는 상승추세 필터로 해석",
+                "RSI 40 이하는 과매도보다 완만한 눌림목 조건으로 해석",
+                "거래량 20일 평균 이상은 volume_ratio_20 >= 1.0으로 해석",
+            ],
+            "confidence": 0.82,
+        }
     if "dividend_defensive" in lowered or "배당 방어주" in query:
         return {
             "strategy_id": "dividend_defensive",
