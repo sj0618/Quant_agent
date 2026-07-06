@@ -114,11 +114,16 @@ def build_google_user_upsert_sql(report: UserSchemaReport) -> str:
         values.append(":avatar_url")
         update_parts.append("avatar_url = EXCLUDED.avatar_url")
         returning.append("avatar_url")
+    elif "profile_image_url" in report.columns:
+        insert_columns.append("profile_image_url")
+        values.append(":avatar_url")
+        update_parts.append("profile_image_url = EXCLUDED.profile_image_url")
+        returning.append("profile_image_url AS avatar_url")
     elif "picture" in report.columns:
         insert_columns.append("picture")
         values.append(":avatar_url")
         update_parts.append("picture = EXCLUDED.picture")
-        returning.append("picture")
+        returning.append("picture AS avatar_url")
     if "email_verified" in report.columns:
         insert_columns.append("email_verified")
         values.append(":email_verified")
@@ -172,6 +177,8 @@ def build_load_user_sql(report: UserSchemaReport) -> str:
     name_expr = "name" if "name" in report.columns else "NULL AS name"
     if "avatar_url" in report.columns:
         avatar_expr = "avatar_url"
+    elif "profile_image_url" in report.columns:
+        avatar_expr = "profile_image_url AS avatar_url"
     elif "picture" in report.columns:
         avatar_expr = "picture AS avatar_url"
     else:

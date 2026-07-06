@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import statistics
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import date
@@ -11,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_graph.schemas import BacktestMetrics, CandidateBacktestResult, CodeCandidate
+from ai_graph.schemas import BacktestEquityPoint, BacktestMetrics, CandidateBacktestResult, CodeCandidate
 from ai_graph.schemas import StrategySpec as AIStrategySpec
 from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
 from ai_graph.security.ast_validator import validate_backtest_code
@@ -23,7 +22,6 @@ DEFAULT_FIXTURE_MARKET = "KRX"
 DEFAULT_FIXTURE_VOLUME = 1_000_000.0
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 DEFAULT_MAX_POSITIONS = 10
-TRADING_DAYS_PER_YEAR = 252
 METRIC_ROUND_DIGITS = 6
 MIN_RETURNS_FOR_SPLIT = 4
 BACKTEST_SPLIT_FRACTION = 0.5
@@ -35,6 +33,7 @@ GENERATED_SIGNAL_METRIC = "generated_signal"
 BUY_SIGNAL_VALUE = 1.0
 SELL_SIGNAL_VALUE = -1.0
 HOLD_SIGNAL_VALUE = 0.0
+EXECUTION_AUDIT_TAIL_LIMIT = 20
 PRICE_FIELD_NAMES = frozenset(
     {"date", "ticker", "name", "market", "open", "high", "low", "close", "volume"}
 )
@@ -111,6 +110,11 @@ try:
         TalibIndicatorConfig as EngineTalibIndicatorConfig,
         run_backtest as run_engine_backtest,
     )
+    from backtest_module.performance import (
+        QUANTSTATS_REQUIRED_MESSAGE,
+        quantstats_sharpe_from_returns,
+        returns_from_equity_curve,
+    )
 except ImportError:
     _ensure_backtest_module_source_path()
     sys.modules.pop("backtest_module", None)
@@ -126,6 +130,11 @@ except ImportError:
         OhlcvBar as EngineOhlcvBar,
         TalibIndicatorConfig as EngineTalibIndicatorConfig,
         run_backtest as run_engine_backtest,
+    )
+    from backtest_module.performance import (
+        QUANTSTATS_REQUIRED_MESSAGE,
+        quantstats_sharpe_from_returns,
+        returns_from_equity_curve,
     )
 
 
@@ -152,7 +161,7 @@ def run_candidate_backtest(
     rows = _price_rows(price_rows)
     enriched_candidates: list[CodeCandidate] = []
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
-    equity_curves_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    equity_curves_by_candidate: dict[str, list[BacktestEquityPoint]] = {}
     objective_scores_by_candidate: dict[str, float] = {}
 
     for candidate in candidates:
@@ -162,6 +171,8 @@ def run_candidate_backtest(
         try:
             engine_result = _run_candidate_backtest(strategy_a, candidate, rows)
         except Exception as exc:
+            if _is_quantstats_dependency_error(exc):
+                raise ModuleNotFoundError(QUANTSTATS_REQUIRED_MESSAGE) from exc
             enriched_candidates.append(
                 candidate.model_copy(
                     update={
@@ -177,9 +188,20 @@ def run_candidate_backtest(
         engine_summary = dict(engine_result.summary)
         engine_summary["buy_signal_count"] = _signal_action_count(engine_result, "BUY")
         engine_summary["sell_signal_count"] = _signal_action_count(engine_result, "SELL")
+        execution_audit = _execution_audit(engine_result)
+        engine_summary["execution_audit"] = execution_audit
+        available_ticker_count = _available_ticker_count(rows)
+        requested_max_positions = _requested_max_positions(strategy_a)
+        applied_max_positions = _applied_max_positions(strategy_a, available_ticker_count)
+        engine_summary["ai_backtest_context"] = {
+            "available_ticker_count": available_ticker_count,
+            "requested_max_positions": requested_max_positions,
+            "applied_max_positions": applied_max_positions,
+            "exposure_normalized": applied_max_positions != requested_max_positions,
+        }
         engine_summary["effective_trade_count"] = max(
             _summary_float_default(engine_summary, "trade_count", 0.0),
-            _summary_float_default(engine_summary, "buy_signal_count", 0.0),
+            float(execution_audit["executed_buy_count"]),
         )
         engine_summaries_by_candidate[candidate.candidate_id] = engine_summary
         equity_curves_by_candidate[candidate.candidate_id] = _public_equity_curve(engine_result)
@@ -193,6 +215,12 @@ def run_candidate_backtest(
         if candidate.validation_ok and candidate.metrics is not None
     ]
     if not valid_candidates:
+        if any(
+            QUANTSTATS_REQUIRED_MESSAGE in violation
+            for candidate in enriched_candidates
+            for violation in getattr(candidate, "violations", [])
+        ):
+            raise ModuleNotFoundError(QUANTSTATS_REQUIRED_MESSAGE)
         raise ValueError("at least one candidate must pass validation and engine backtest")
 
     selected = max(
@@ -263,7 +291,11 @@ def _run_candidate_backtest(
     generated_signals = _execute_candidate_code(candidate, price_rows)
     ohlcv_rows, base_metric_rows = _engine_market_rows(price_rows)
     metric_rows = _merge_generated_signals(base_metric_rows, generated_signals)
-    engine_spec = _engine_strategy_spec(strategy, candidate)
+    engine_spec = _engine_strategy_spec(
+        strategy,
+        candidate,
+        available_ticker_count=_available_ticker_count(price_rows),
+    )
     return run_engine_backtest(
         engine_spec,
         ohlcv_rows=ohlcv_rows,
@@ -382,7 +414,12 @@ def _merge_generated_signals(
     return metric_rows
 
 
-def _engine_strategy_spec(strategy: AIStrategySpec, candidate: CodeCandidate):
+def _engine_strategy_spec(
+    strategy: AIStrategySpec,
+    candidate: CodeCandidate,
+    *,
+    available_ticker_count: int | None = None,
+):
     return EngineStrategySpec(
         strategy_id=f"{strategy.strategy_id}_{candidate.candidate_id.lower()}",
         strategy_name=f"{strategy.name} {candidate.candidate_id}",
@@ -403,25 +440,26 @@ def _engine_strategy_spec(strategy: AIStrategySpec, candidate: CodeCandidate):
                 description="generated SELL signal",
             )
         ],
-        position_sizing=_engine_position_sizing(strategy),
+        position_sizing=_engine_position_sizing(
+            strategy,
+            available_ticker_count=available_ticker_count,
+        ),
         risk_controls=_engine_risk_controls(strategy),
     )
 
 
-def _engine_position_sizing(strategy: AIStrategySpec):
-    max_position_pct = _optional_positive_float(
-        strategy.risk_constraints.get("max_position_pct"),
-        "max_position_pct",
-        upper_bound=1.0,
-    )
-    if max_position_pct is None:
-        return EnginePositionSizing(max_positions=DEFAULT_MAX_POSITIONS)
-    return EnginePositionSizing(max_positions=max(1, math.ceil(1.0 / max_position_pct)))
+def _engine_position_sizing(
+    strategy: AIStrategySpec,
+    *,
+    available_ticker_count: int | None = None,
+):
+    applied_max_positions = _applied_max_positions(strategy, available_ticker_count)
+    return EnginePositionSizing(max_positions=applied_max_positions)
 
 
 def _engine_risk_controls(strategy: AIStrategySpec):
     raw = strategy.risk_constraints
-    values: dict[str, float] = {}
+    controls = EngineRiskControls()
     stop_loss_pct = _optional_positive_float(
         raw.get("stop_loss_pct"), "stop_loss_pct", upper_bound=1.0
     )
@@ -430,32 +468,96 @@ def _engine_risk_controls(strategy: AIStrategySpec):
         raw.get("max_position_pct"), "max_position_pct", upper_bound=1.0
     )
     if stop_loss_pct is not None:
-        values["stop_loss_pct"] = stop_loss_pct
+        controls = controls.model_copy(update={"stop_loss_pct": stop_loss_pct})
     if take_profit_pct is not None:
-        values["take_profit_pct"] = take_profit_pct
+        controls = controls.model_copy(update={"take_profit_pct": take_profit_pct})
     if max_position_pct is not None:
-        values["max_single_position_pct"] = max_position_pct
-    return EngineRiskControls(**values)
+        controls = controls.model_copy(update={"max_single_position_pct": max_position_pct})
+    return controls
+
+
+def _requested_max_positions(strategy: AIStrategySpec) -> int:
+    max_position_pct = _optional_positive_float(
+        strategy.risk_constraints.get("max_position_pct"),
+        "max_position_pct",
+        upper_bound=1.0,
+    )
+    if max_position_pct is None:
+        return DEFAULT_MAX_POSITIONS
+    return max(1, math.ceil(1.0 / max_position_pct))
+
+
+def _applied_max_positions(
+    strategy: AIStrategySpec, available_ticker_count: int | None = None
+) -> int:
+    requested_max_positions = _requested_max_positions(strategy)
+    if available_ticker_count is None or available_ticker_count <= 0:
+        return requested_max_positions
+    return max(1, min(requested_max_positions, available_ticker_count))
+
+
+def _available_ticker_count(price_rows: Sequence[Mapping[str, Any]]) -> int:
+    tickers = {
+        str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
+        for row in price_rows
+        if row.get("date") is not None
+    }
+    return max(1, len(tickers))
+
+
+def _execution_audit(engine_result: Any) -> dict[str, Any]:
+    events = [event.as_dict() for event in getattr(engine_result, "order_audit", [])]
+    executed_buy_count = sum(
+        1
+        for event in events
+        if str(event.get("status")) == "executed" and str(event.get("side")) == "buy"
+    )
+    executed_sell_count = sum(
+        1
+        for event in events
+        if str(event.get("status")) == "executed" and str(event.get("side")) == "sell"
+    )
+    blocked_count = sum(
+        1
+        for event in events
+        if str(event.get("status")).startswith("skipped")
+        or str(event.get("status")) == "ignored_missing_position"
+    )
+    unfilled_end_count = sum(1 for event in events if str(event.get("status")) == "unfilled_end")
+    return {
+        "submitted_count": sum(1 for event in events if str(event.get("status")) == "submitted"),
+        "executed_buy_count": executed_buy_count,
+        "executed_sell_count": executed_sell_count,
+        "blocked_count": blocked_count,
+        "unfilled_end_count": unfilled_end_count,
+        "completed_trade_count": len(getattr(engine_result, "trades", [])),
+        "has_real_fills": executed_buy_count > 0 or executed_sell_count > 0,
+        "recent_events": events[-EXECUTION_AUDIT_TAIL_LIMIT:],
+    }
 
 
 def _metrics_from_engine_result(engine_result) -> BacktestMetrics:
     summary = engine_result.summary
-    daily_returns = [point.daily_return for point in engine_result.equity_curve[1:]]
-    sharpe = _summary_float(summary, "daily_sharpe_like")
-    in_sample_sharpe, out_sample_sharpe = _split_sharpes(daily_returns)
+    metric_warnings = _summary_warning_list(summary)
+    daily_returns = returns_from_equity_curve(engine_result.equity_curve)
+    sharpe = _summary_float_default(summary, "sharpe", _summary_float_default(summary, "daily_sharpe_like", 0.0))
+    in_sample_sharpe, out_sample_sharpe = _split_sharpes(daily_returns, metric_warnings)
     degradation = _degradation(in_sample_sharpe, out_sample_sharpe)
     return BacktestMetrics(
         sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
         max_drawdown=round(_summary_float(summary, "max_drawdown"), METRIC_ROUND_DIGITS),
         win_rate=round(_summary_float(summary, "win_rate"), METRIC_ROUND_DIGITS),
-        total_return=round(_summary_float(summary, "period_return"), METRIC_ROUND_DIGITS),
+        total_return=round(
+            _summary_float_default(summary, "total_return", _summary_float_default(summary, "period_return", 0.0)),
+            METRIC_ROUND_DIGITS,
+        ),
         in_sample_sharpe=round(in_sample_sharpe, METRIC_ROUND_DIGITS),
         out_sample_sharpe=round(out_sample_sharpe, METRIC_ROUND_DIGITS),
         degradation=round(degradation, METRIC_ROUND_DIGITS),
     )
 
 
-def _public_equity_curve(engine_result) -> list[dict[str, Any]]:
+def _public_equity_curve(engine_result) -> list[BacktestEquityPoint]:
     summary = engine_result.summary
     initial_capital = _summary_float(summary, "initial_capital")
     if initial_capital == 0:
@@ -463,13 +565,13 @@ def _public_equity_curve(engine_result) -> list[dict[str, Any]]:
 
     sampled_points = _sample_points(engine_result.equity_curve, PUBLIC_EQUITY_CURVE_POINTS)
     return [
-        {
-            "date": str(point.date),
-            "cumulative_return": round(
+        BacktestEquityPoint(
+            date=str(point.date),
+            cumulative_return=round(
                 (float(point.total_equity) / initial_capital) - 1,
                 METRIC_ROUND_DIGITS,
             ),
-        }
+        )
         for point in sampled_points
     ]
 
@@ -488,24 +590,28 @@ def _sample_points(points: Sequence[Any], max_points: int) -> list[Any]:
     return [points[index] for index in indices]
 
 
-def _split_sharpes(daily_returns: list[float]) -> tuple[float, float]:
+def _split_sharpes(daily_returns: list[float], metric_warnings: list[dict[str, str]]) -> tuple[float, float]:
     if len(daily_returns) < MIN_RETURNS_FOR_SPLIT:
-        full_sample = _sharpe_like(daily_returns)
+        full_sample = _sharpe_like(daily_returns, metric_name="full_sample_sharpe", metric_warnings=metric_warnings)
         return full_sample, full_sample
     split_index = max(1, int(len(daily_returns) * BACKTEST_SPLIT_FRACTION))
     return (
-        _sharpe_like(daily_returns[:split_index]),
-        _sharpe_like(daily_returns[split_index:]),
+        _sharpe_like(daily_returns[:split_index], metric_name="in_sample_sharpe", metric_warnings=metric_warnings),
+        _sharpe_like(daily_returns[split_index:], metric_name="out_sample_sharpe", metric_warnings=metric_warnings),
     )
 
 
-def _sharpe_like(daily_returns: list[float]) -> float:
-    if len(daily_returns) < 2:
-        return 0.0
-    std = statistics.stdev(daily_returns)
-    if std == 0:
-        return 0.0
-    return statistics.mean(daily_returns) / std * math.sqrt(TRADING_DAYS_PER_YEAR)
+def _sharpe_like(
+    daily_returns: list[float],
+    *,
+    metric_name: str = "sharpe",
+    metric_warnings: list[dict[str, str]] | None = None,
+) -> float:
+    return quantstats_sharpe_from_returns(
+        daily_returns,
+        metric_name=metric_name,
+        metric_warnings=metric_warnings,
+    )
 
 
 def _degradation(in_sample_sharpe: float, out_sample_sharpe: float) -> float:
@@ -590,9 +696,11 @@ def _calmar_ratio(total_return: float, max_drawdown: float) -> float:
 
 
 def _profit_factor(engine_summary: Mapping[str, Any]) -> float:
-    if "profit_factor" in engine_summary:
-        return _summary_float_default(engine_summary, "profit_factor", 0.0)
-    win_rate = _summary_float_default(engine_summary, "win_rate", 0.0)
+    win_rate = _summary_float_default(
+        engine_summary,
+        "trade_win_rate",
+        _summary_float_default(engine_summary, "win_rate", 0.0),
+    )
     if win_rate <= 0:
         return 0.0
     if win_rate >= 1:
@@ -713,7 +821,20 @@ def _summary_float(summary: Mapping[str, Any], key: str) -> float:
 def _summary_float_default(summary: Mapping[str, Any], key: str, default: float) -> float:
     if key not in summary:
         return default
-    return _finite_float(summary[key], key)
+    value = summary[key]
+    if value in (None, ""):
+        return default
+    try:
+        return _finite_float(value, key)
+    except (TypeError, ValueError):
+        return default
+
+
+def _summary_warning_list(summary: Mapping[str, Any]) -> list[dict[str, str]]:
+    warnings = summary.get("metric_warnings")
+    if isinstance(warnings, list):
+        return warnings
+    return []
 
 
 def _is_numeric_metric(value: Any) -> bool:
@@ -724,3 +845,7 @@ def _is_numeric_metric(value: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return math.isfinite(parsed)
+
+
+def _is_quantstats_dependency_error(exc: BaseException) -> bool:
+    return isinstance(exc, ModuleNotFoundError) and QUANTSTATS_REQUIRED_MESSAGE in str(exc)
