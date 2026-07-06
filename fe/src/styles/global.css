@@ -456,3 +456,29 @@ p, h1, h2, h3, h4 { margin: 0; }
   .report-row { grid-template-columns: 1fr; }
   .report-paper__section { padding: 24px; }
 }
+
+.digest-subscription__error { color: var(--drop); font-weight: 700; }
+
+.digest-preview-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.5);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 40px 16px;
+  z-index: 50;
+}
+.digest-preview { width: 100%; max-width: 640px; padding: 24px; display: flex; flex-direction: column; gap: 20px; }
+.digest-preview__head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.digest-preview__head h2 { font-size: 16px; margin-top: 6px; }
+.digest-preview__head button { border: 1px solid var(--line); background: transparent; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+.digest-preview__section { border-top: 1px solid var(--line); padding-top: 16px; display: flex; flex-direction: column; gap: 8px; }
+.digest-preview__section:first-of-type { border-top: 0; padding-top: 0; }
+.digest-preview__section ul { display: flex; flex-direction: column; gap: 6px; padding-left: 18px; margin: 0; }
+.digest-preview__table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.digest-preview__table th, .digest-preview__table td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; }
+.digest-preview__cards { display: flex; flex-direction: column; gap: 12px; }
+.digest-preview__card { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.digest-preview__footer { border-top: 1px solid var(--line); padding-top: 12px; color: var(--subdued); font-size: 11px; display: flex; flex-direction: column; gap: 4px; }

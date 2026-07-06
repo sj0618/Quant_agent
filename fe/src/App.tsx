@@ -69,11 +69,11 @@ export default function App() {
   }
 
   if (path === ROUTES.me) {
-    return <ProfilePage initialTab="profile" />;
+    return <ProfilePage />;
   }
 
   if (path === ROUTES.notifications) {
-    return <ProfilePage initialTab="notifications" />;
+    return <ProfilePage />;
   }
 
   if (path === ROUTES.search) {

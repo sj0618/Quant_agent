@@ -133,7 +133,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
           </ul>
           <div>
             <a href={ROUTES.unsubscribe}>수신 거부</a>
-            <a href={ROUTES.notifications}>수신 정책</a>
+            <a href={ROUTES.me}>마이페이지</a>
             <span>© 2026 QuantAgent</span>
           </div>
         </section>

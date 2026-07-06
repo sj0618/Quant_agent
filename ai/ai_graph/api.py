@@ -27,8 +27,9 @@ from ai_graph.jobs import (
     create_analysis_job_store_from_env,
     run_job_sync,
 )
+from ai_graph.nodes.daily_digest import MAX_DIGEST_STRATEGIES, build_daily_digest
 from ai_graph.schemas import SCHEMA_VERSION
-from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
+from ai_graph.schemas import APIEnvelope, DailyDigestReport, DailyDigestStrategyInput, EnvelopeStatus, UserPayload
 
 
 API_TITLE = "QuantAgent AI API"
@@ -44,6 +45,7 @@ SPEC_STRATEGY_PARSE_PATH = "/api/strategies/parse"
 SPEC_ANALYSIS_JOB_DETAIL_PATH = "/api/analysis-jobs/{job_id}"
 SPEC_BACKTEST_DETAIL_PATH = "/api/backtests/{strategy_id}"
 SPEC_REPORT_DETAIL_PATH = "/api/reports/{report_id}"
+DAILY_DIGEST_PATH = "/ai/daily-digest"
 AI_CORS_ALLOW_ORIGINS_ENV = "AI_CORS_ALLOW_ORIGINS"
 CORS_ALLOW_METHODS = ["GET", "POST", "OPTIONS"]
 CORS_ALLOW_HEADERS = ["Authorization", "Content-Type"]
@@ -87,6 +89,14 @@ class ParseStrategyRequest(BaseModel):
     @property
     def request_text(self) -> str:
         return (self.natural_language or self.query or "").strip()
+
+
+class CreateDailyDigestRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    user_name: str = Field(min_length=1)
+    report_date: str = Field(min_length=1)
+    strategies: list[DailyDigestStrategyInput] = Field(min_length=1, max_length=MAX_DIGEST_STRATEGIES)
 
 
 class HealthResponse(BaseModel):
@@ -261,6 +271,22 @@ def create_app(
             message="No completed analysis job with report projection was found.",
         )
 
+    @app.post(
+        DAILY_DIGEST_PATH,
+        response_model=DailyDigestReport,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Daily Digest"],
+    )
+    def create_daily_digest(request: CreateDailyDigestRequest) -> DailyDigestReport:
+        try:
+            return build_daily_digest(
+                request.strategies,
+                user_name=request.user_name,
+                report_date=request.report_date,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
     return app
 
 
@@ -313,6 +339,12 @@ def _endpoint_statuses() -> list[EndpointStatus]:
             path=SPEC_REPORT_DETAIL_PATH,
             state="job_store",
             summary="MVP adapter returning the latest matching job envelope with report projection.",
+        ),
+        EndpointStatus(
+            method="POST",
+            path=DAILY_DIGEST_PATH,
+            state="local_sync",
+            summary="Compose the up-to-3-strategy daily email digest (comparison table, cards, AI comment, market brief).",
         ),
     ]
 

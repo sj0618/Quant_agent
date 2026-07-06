@@ -24,6 +24,7 @@ class LLMJsonRequest(BaseModel):
     system_prompt: str = Field(min_length=1)
     user_prompt: str = Field(min_length=1)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    enable_web_search: bool = False
 
 
 class LLMClient(Protocol):

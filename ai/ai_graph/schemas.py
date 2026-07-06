@@ -396,6 +396,89 @@ class UserPayload(BaseModel):
     recommended: int | None = Field(default=None, ge=0, le=2)
 
 
+NewsTone = Literal["positive", "warning", "negative", "neutral", "info"]
+
+
+class DailyDigestStrategyInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    universe: str = Field(min_length=1)
+    timeframe: str = Field(min_length=1)
+    today_signal: SignalAction
+    targets: list[str] = Field(default_factory=list)
+    metrics: BacktestMetrics
+    win_rate: float = Field(ge=0.0, le=1.0)
+    trade_count: int = Field(ge=0)
+
+
+class DailyDigestComparisonRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    today_signal: SignalAction
+    total_return: float
+    max_drawdown: float
+    sharpe_ratio: float
+    status: Literal["주목", "유지", "관망"]
+
+
+class DailyDigestStrategyCard(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    today_signal: SignalAction
+    targets: list[str] = Field(default_factory=list)
+    metrics: BacktestMetrics
+    win_rate: float = Field(ge=0.0, le=1.0)
+    trade_count: int = Field(ge=0)
+    ai_interpretation: str = Field(min_length=1)
+    caution: str = Field(min_length=1)
+
+
+class MarketBriefItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    url: str | None = None
+    published_at: datetime | None = None
+    tone: NewsTone = "neutral"
+    summary: str = Field(min_length=1)
+
+
+class MarketBrief(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    headline: str = Field(min_length=1)
+    items: list[MarketBriefItem] = Field(default_factory=list)
+    source_usage: SourceUsage | None = None
+    fallback_reasons: list[str] = Field(default_factory=list)
+
+
+class DailyDigestHeader(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    report_date: str = Field(min_length=1)
+    user_name: str = Field(min_length=1)
+    strategy_count: int = Field(ge=1, le=3)
+
+
+class DailyDigestReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    header: DailyDigestHeader
+    overall_summary: list[str] = Field(min_length=1)
+    comparison_rows: list[DailyDigestComparisonRow] = Field(min_length=1, max_length=3)
+    strategy_cards: list[DailyDigestStrategyCard] = Field(min_length=1, max_length=3)
+    ai_overall_comment: str = Field(min_length=1)
+    market_brief: MarketBrief
+    footer: list[str] = Field(min_length=1)
+
+
 class APIEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -368,6 +368,60 @@ export interface ReportSummary {
   marketSnapshot: Array<{ label: string; value: string; tone?: Tone }>;
 }
 
+export interface DailyDigestHeader {
+  reportDate: string;
+  userName: string;
+  strategyCount: number;
+}
+
+export interface DailyDigestComparisonRow {
+  strategyId: string;
+  name: string;
+  todaySignal: SignalType;
+  totalReturn: number;
+  maxDrawdown: number;
+  sharpeRatio: number;
+  status: "주목" | "유지" | "관망";
+}
+
+export interface DailyDigestStrategyCard {
+  strategyId: string;
+  title: string;
+  todaySignal: SignalType;
+  targets: string[];
+  totalReturn: number;
+  maxDrawdown: number;
+  sharpeRatio: number;
+  winRate: number;
+  tradeCount: number;
+  aiInterpretation: string;
+  caution: string;
+}
+
+export interface DailyDigestMarketBriefItem {
+  title: string;
+  source: string;
+  url?: string;
+  publishedAt?: string;
+  tone: Tone;
+  summary: string;
+}
+
+export interface DailyDigestMarketBrief {
+  headline: string;
+  items: DailyDigestMarketBriefItem[];
+}
+
+export interface DailyDigestReport {
+  header: DailyDigestHeader;
+  overallSummary: string[];
+  comparisonRows: DailyDigestComparisonRow[];
+  strategyCards: DailyDigestStrategyCard[];
+  aiOverallComment: string;
+  marketBrief: DailyDigestMarketBrief;
+  footer: string[];
+}
+
 export interface ReportDetail extends ReportSummary {
   recipient: string;
   marketBrief: string;

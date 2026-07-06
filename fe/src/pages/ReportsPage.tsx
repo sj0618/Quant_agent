@@ -4,6 +4,7 @@ import { AppLayout } from "../components/layout/AppLayout";
 import { getReports } from "../api/quantAgentClient";
 import { downloadReportsCsv, printCurrentView } from "../api/reportActionsClient";
 import { ROUTES } from "../config/routes";
+import { DailyDigestPreview } from "../features/reports/DailyDigestPreview";
 import { ReportList } from "../features/reports/ReportList";
 import {
   DEFAULT_REPORT_FILTERS,
@@ -13,11 +14,13 @@ import {
   type ReportFilters,
 } from "../features/reports/reportFilters";
 import { useAsyncData } from "../hooks/useAsyncData";
+import { dailyDigestReport } from "../mocks/dailyDigest.mock";
 
 export function ReportsPage() {
   const { data, loading, error } = useAsyncData(getReports, []);
   const [filters, setFilters] = useState<ReportFilters>(() => parseReportFilters(window.location.search));
   const [actionStatus, setActionStatus] = useState<string | null>(null);
+  const [showDigestPreview, setShowDigestPreview] = useState(false);
 
   const reports = data ?? [];
   const filteredReports = applyReportFilters(reports, filters);
@@ -63,6 +66,7 @@ export function ReportsPage() {
             <p>매일 오전 8시 발송된 일일 분석 리포트를 모두 확인할 수 있습니다.</p>
           </div>
           <div>
+            <button onClick={() => setShowDigestPreview(true)} type="button">이메일 다이제스트 미리보기</button>
             <button onClick={handlePrintPdf} type="button">전체 PDF 다운로드</button>
             <button onClick={handleDownloadCsv} type="button">↓ CSV 내보내기</button>
           </div>
@@ -75,6 +79,9 @@ export function ReportsPage() {
           onResetFilters={handleResetFilters}
           reports={filteredReports}
         />
+        {showDigestPreview ? (
+          <DailyDigestPreview digest={dailyDigestReport} onClose={() => setShowDigestPreview(false)} />
+        ) : null}
       </main>
     </AppLayout>
   );
