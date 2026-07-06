@@ -65,6 +65,7 @@ LIST_METRIC_DEFAULTS = {
 OBJECT_METRIC_DEFAULTS = {
     "compare": {},
     "montecarlo": {},
+    "montecarlo_cagr": {},
     "montecarlo_drawdown": {},
     "montecarlo_sharpe": {},
     "outliers": {},
@@ -494,6 +495,7 @@ def _montecarlo_detail(returns, *, np) -> dict[str, object]:
         return {
             "montecarlo": {},
             "montecarlo_mean": [],
+            "montecarlo_cagr": {},
             "montecarlo_drawdown": {},
             "montecarlo_sharpe": {},
         }
@@ -518,6 +520,9 @@ def _montecarlo_detail(returns, *, np) -> dict[str, object]:
         where=sharpe_denominator > 0,
     ) * math.sqrt(252)
 
+    annualization_factor = 252 / max(horizon, 1)
+    cagrs = np.power(np.maximum(1.0 + final_returns, 0.0), annualization_factor) - 1.0
+
     path_mean = cumulative_paths.mean(axis=0)
     path_p05 = np.quantile(cumulative_paths, 0.05, axis=0)
     path_p95 = np.quantile(cumulative_paths, 0.95, axis=0)
@@ -540,10 +545,12 @@ def _montecarlo_detail(returns, *, np) -> dict[str, object]:
             "positive_return_probability": _json_safe(float((final_returns > 0).mean())),
             "loss_probability": _json_safe(float((final_returns < 0).mean())),
             "total_return_quantiles": _distribution_summary(final_returns, np=np),
+            "cagr_quantiles": _distribution_summary(cagrs, np=np),
             "max_drawdown_quantiles": _distribution_summary(max_drawdowns, np=np),
             "sharpe_quantiles": _distribution_summary(sharpes, np=np),
         },
         "montecarlo_mean": montecarlo_mean,
+        "montecarlo_cagr": _distribution_summary(cagrs, np=np),
         "montecarlo_drawdown": _distribution_summary(max_drawdowns, np=np),
         "montecarlo_sharpe": _distribution_summary(sharpes, np=np),
     }

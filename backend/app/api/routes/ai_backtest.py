@@ -11,7 +11,7 @@ from app.services.ai_backtest_runtime import (
     AOAICodeGenerator,
     ASTCodeValidator,
     DeterministicBacktestReportGenerator,
-    InProcessBacktestExecutor,
+    SandboxedBacktestExecutor,
 )
 from app.services.session_store import AuthSessionStore
 
@@ -54,7 +54,7 @@ def get_ai_backtest_service(request: Request) -> AICodeBacktestService:
         repository=repository,
         code_generator=AOAICodeGenerator(),
         code_validator=ASTCodeValidator(),
-        code_executor=InProcessBacktestExecutor(),
+        code_executor=SandboxedBacktestExecutor(),
         report_generator=DeterministicBacktestReportGenerator(),
     )
 

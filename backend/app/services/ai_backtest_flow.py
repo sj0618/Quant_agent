@@ -387,8 +387,8 @@ class AICodeBacktestService:
                 trace_id=trace_id,
                 runtime_env=generated.target_runtime,
                 status="running",
-                timeout_seconds=300,
-                memory_limit_mb=512,
+                timeout_seconds=request.timeout_seconds,
+                memory_limit_mb=request.memory_limit_mb,
                 started_at=started_at,
             )
         )

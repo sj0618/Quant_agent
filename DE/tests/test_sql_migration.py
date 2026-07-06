@@ -107,6 +107,8 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("execution_run_id UUID REFERENCES app.code_execution_run(execution_run_id)", sql)
         self.assertIn("UNIQUE (auth_provider, provider_user_id)", sql)
         self.assertIn("UNIQUE (run_id, sequence_no)", sql)
+        self.assertNotIn("CREATE EXTENSION IF NOT EXISTS pgcrypto", sql)
+        self.assertIn("application must provide UUID values explicitly", sql)
 
 
 if __name__ == "__main__":

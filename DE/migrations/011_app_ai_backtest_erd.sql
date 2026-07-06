@@ -2,7 +2,9 @@
 -- This migration keeps the existing backtest result tables but shifts the primary
 -- execution path toward parse -> code generation -> validation -> sandbox execution.
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- pgcrypto/gen_random_uuid is not created here.
+-- Managed PostgreSQL deployments must provision required UUID extensions outside app migrations,
+-- or the application must provide UUID values explicitly.
 CREATE SCHEMA IF NOT EXISTS app;
 
 DO $$
@@ -58,7 +60,7 @@ CREATE TABLE IF NOT EXISTS app.strategy (
 CREATE INDEX IF NOT EXISTS idx_strategy_user_created ON app.strategy (user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.ai_chat_session (
-    session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID PRIMARY KEY,
     user_id BIGINT REFERENCES app.users(user_id),
     title TEXT,
     status TEXT NOT NULL DEFAULT 'active',
@@ -70,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_chat_session_user_created
     ON app.ai_chat_session (user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.ai_chat_message (
-    message_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    message_id UUID PRIMARY KEY,
     session_id UUID NOT NULL REFERENCES app.ai_chat_session(session_id) ON DELETE CASCADE,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
@@ -82,7 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_chat_message_session_created
     ON app.ai_chat_message (session_id, created_at ASC);
 
 CREATE TABLE IF NOT EXISTS app.ai_trace (
-    trace_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    trace_id UUID PRIMARY KEY,
     user_id BIGINT REFERENCES app.users(user_id),
     session_id UUID REFERENCES app.ai_chat_session(session_id),
     trace_kind TEXT NOT NULL DEFAULT 'ai_generated_backtest',
@@ -99,7 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_trace_session_started
     ON app.ai_trace (session_id, started_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.ai_strategy_parse (
-    parse_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parse_id UUID PRIMARY KEY,
     session_id UUID REFERENCES app.ai_chat_session(session_id),
     user_id BIGINT REFERENCES app.users(user_id),
     trace_id UUID REFERENCES app.ai_trace(trace_id),
@@ -119,7 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_strategy_parse_trace_created
     ON app.ai_strategy_parse (trace_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.ai_validation_result (
-    validation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    validation_id UUID PRIMARY KEY,
     parse_id UUID NOT NULL REFERENCES app.ai_strategy_parse(parse_id) ON DELETE CASCADE,
     strategy_id TEXT REFERENCES app.strategy(strategy_id),
     is_valid BOOLEAN NOT NULL,
@@ -135,7 +137,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_validation_result_strategy_created
     ON app.ai_validation_result (strategy_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.ai_code_generation (
-    code_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code_id UUID PRIMARY KEY,
     parse_id UUID REFERENCES app.ai_strategy_parse(parse_id) ON DELETE SET NULL,
     user_id BIGINT REFERENCES app.users(user_id),
     session_id UUID REFERENCES app.ai_chat_session(session_id),
@@ -161,7 +163,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_code_generation_hash
     ON app.ai_code_generation (code_hash);
 
 CREATE TABLE IF NOT EXISTS app.ai_code_validation_result (
-    validation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    validation_id UUID PRIMARY KEY,
     code_id UUID NOT NULL REFERENCES app.ai_code_generation(code_id) ON DELETE CASCADE,
     is_safe BOOLEAN NOT NULL,
     syntax_valid BOOLEAN NOT NULL,
@@ -177,7 +179,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_code_validation_result_code_created
     ON app.ai_code_validation_result (code_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.code_execution_run (
-    execution_run_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    execution_run_id UUID PRIMARY KEY,
     code_id UUID NOT NULL REFERENCES app.ai_code_generation(code_id) ON DELETE CASCADE,
     user_id BIGINT REFERENCES app.users(user_id),
     session_id UUID REFERENCES app.ai_chat_session(session_id),
@@ -204,7 +206,7 @@ CREATE INDEX IF NOT EXISTS idx_code_execution_run_status_created
     ON app.code_execution_run (status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.backtest_run (
-    run_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id UUID PRIMARY KEY,
     strategy_id TEXT REFERENCES app.strategy(strategy_id),
     user_id BIGINT REFERENCES app.users(user_id),
     session_id UUID REFERENCES app.ai_chat_session(session_id),
@@ -248,7 +250,7 @@ CREATE INDEX IF NOT EXISTS idx_backtest_run_execution_mode_created
     ON app.backtest_run (execution_mode, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.backtest_equity_point (
-    point_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    point_id UUID PRIMARY KEY,
     run_id UUID NOT NULL REFERENCES app.backtest_run(run_id) ON DELETE CASCADE,
     trade_date DATE NOT NULL,
     cash NUMERIC(20, 6),
@@ -308,7 +310,7 @@ CREATE INDEX IF NOT EXISTS idx_backtest_trade_run_ticker
     ON app.backtest_trade (run_id, ticker);
 
 CREATE TABLE IF NOT EXISTS app.backtest_summary (
-    summary_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    summary_id UUID PRIMARY KEY,
     run_id UUID NOT NULL UNIQUE REFERENCES app.backtest_run(run_id) ON DELETE CASCADE,
     final_equity NUMERIC(20, 6),
     final_cash NUMERIC(20, 6),
@@ -364,7 +366,7 @@ CREATE TABLE IF NOT EXISTS app.backtest_metric_detail (
 );
 
 CREATE TABLE IF NOT EXISTS app.ai_backtest_report (
-    report_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    report_id UUID PRIMARY KEY,
     run_id UUID NOT NULL REFERENCES app.backtest_run(run_id) ON DELETE CASCADE,
     user_id BIGINT REFERENCES app.users(user_id),
     trace_id UUID REFERENCES app.ai_trace(trace_id),
@@ -398,7 +400,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_backtest_report_trace_created
     ON app.ai_backtest_report (trace_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.ai_backtest_report_metric (
-    report_metric_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    report_metric_id UUID PRIMARY KEY,
     report_id UUID NOT NULL REFERENCES app.ai_backtest_report(report_id) ON DELETE CASCADE,
     run_id UUID REFERENCES app.backtest_run(run_id) ON DELETE CASCADE,
     metric_code TEXT NOT NULL,
@@ -415,7 +417,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_backtest_report_metric_report_group
     ON app.ai_backtest_report_metric (report_id, metric_group, metric_code);
 
 CREATE TABLE IF NOT EXISTS app.ai_model_call_log (
-    call_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    call_id UUID PRIMARY KEY,
     trace_id UUID REFERENCES app.ai_trace(trace_id),
     user_id BIGINT REFERENCES app.users(user_id),
     session_id UUID REFERENCES app.ai_chat_session(session_id),
@@ -451,7 +453,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_model_call_log_code_created
     ON app.ai_model_call_log (code_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.ai_prompt_log (
-    prompt_log_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    prompt_log_id UUID PRIMARY KEY,
     call_id UUID NOT NULL UNIQUE REFERENCES app.ai_model_call_log(call_id) ON DELETE CASCADE,
     user_id BIGINT REFERENCES app.users(user_id),
     session_id UUID REFERENCES app.ai_chat_session(session_id),
@@ -470,7 +472,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_prompt_log_session_created
     ON app.ai_prompt_log (session_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.ai_agent_execution_log (
-    execution_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    execution_id UUID PRIMARY KEY,
     trace_id UUID REFERENCES app.ai_trace(trace_id),
     user_id BIGINT REFERENCES app.users(user_id),
     session_id UUID REFERENCES app.ai_chat_session(session_id),
@@ -497,7 +499,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_agent_execution_log_execution_run_started
     ON app.ai_agent_execution_log (execution_run_id, started_at DESC);
 
 CREATE TABLE IF NOT EXISTS app.ai_error_log (
-    error_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    error_id UUID PRIMARY KEY,
     trace_id UUID REFERENCES app.ai_trace(trace_id),
     user_id BIGINT REFERENCES app.users(user_id),
     session_id UUID REFERENCES app.ai_chat_session(session_id),

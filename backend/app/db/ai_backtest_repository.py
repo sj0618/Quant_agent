@@ -354,7 +354,7 @@ class SqlAIBacktestRepository:
                             indicator_report_jsonb, cost_model_jsonb,
                             position_sizing_jsonb, metrics_version
                         ) VALUES (
-                            gen_random_uuid(), :run_id, :final_equity, :final_cash, :open_positions,
+                            :summary_id, :run_id, :final_equity, :final_cash, :open_positions,
                             :period_return, :cagr, :benchmark_return, :alpha, :beta,
                             :max_drawdown, :volatility, :sharpe_ratio, :sortino_ratio,
                             :calmar_ratio, :win_rate, :profit_factor, :payoff_ratio,
@@ -367,7 +367,7 @@ class SqlAIBacktestRepository:
                         )
                         """
                     ),
-                    {"run_id": str(run.run_id), **_summary_params(summary)},
+                    {"summary_id": str(uuid4()), "run_id": str(run.run_id), **_summary_params(summary)},
                 )
 
                 detail = payload.metric_detail
@@ -398,13 +398,14 @@ class SqlAIBacktestRepository:
                                 point_id, run_id, trade_date, cash,
                                 positions_value, total_equity, daily_return
                             ) VALUES (
-                                gen_random_uuid(), :run_id, :trade_date, :cash,
+                                :point_id, :run_id, :trade_date, :cash,
                                 :positions_value, :total_equity, :daily_return
                             )
                             """
                         ),
                         [
                             {
+                                "point_id": str(uuid4()),
                                 "run_id": str(run.run_id),
                                 "trade_date": point.trade_date,
                                 "cash": point.cash,
@@ -601,13 +602,14 @@ class SqlAIBacktestRepository:
                     assistant_response, variables_jsonb, prompt_version,
                     contains_pii, masked
                 ) VALUES (
-                    gen_random_uuid(), :call_id, :user_id, :session_id,
+                    :prompt_log_id, :call_id, :user_id, :session_id,
                     :prompt_template_name, :system_prompt, :user_prompt,
                     :assistant_response, :variables_jsonb::jsonb, :prompt_version,
                     :contains_pii, :masked
                 )
                 """,
                 {
+                    "prompt_log_id": str(uuid4()),
                     "call_id": str(call_id),
                     "user_id": user_id,
                     "session_id": str(session_id) if session_id else None,

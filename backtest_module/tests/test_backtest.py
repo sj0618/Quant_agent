@@ -263,6 +263,7 @@ def test_summary_includes_quantstats_metrics():
         "rolling_sharpe",
         "rolling_sortino",
         "montecarlo",
+        "montecarlo_cagr",
         "outliers",
     ]:
         assert key in metrics
@@ -280,6 +281,7 @@ def test_summary_includes_quantstats_metrics():
         "rolling_sharpe",
         "rolling_sortino",
         "montecarlo",
+        "montecarlo_cagr",
         "outliers",
         "final_cash",
         "avg_holding_days",
@@ -298,6 +300,7 @@ def test_summary_includes_quantstats_metrics():
     assert result.summary["monthly_returns"] == metrics["monthly_returns"]
     assert result.summary["drawdown_details"] == metrics["drawdown_details"]
     assert result.summary["drawdown_series"] == metrics["drawdown_series"]
+    assert result.summary["montecarlo_cagr"] == metrics["montecarlo_cagr"]
     assert result.summary["win_rate"] == result.summary["trade_win_rate"]
     assert result.summary["return_win_rate"] == metrics["win_rate"]
     assert result.summary["avg_holding_days"] == 2.0
@@ -309,6 +312,7 @@ def test_summary_includes_quantstats_metrics():
     assert isinstance(metrics["rolling_sortino"], list)
     assert isinstance(metrics["montecarlo"], dict)
     assert isinstance(metrics["montecarlo_mean"], list)
+    assert isinstance(metrics["montecarlo_cagr"], dict)
     assert isinstance(metrics["outliers"], dict)
     assert metrics["montecarlo"]["simulations"] > 0
     assert metrics["information_ratio"] is None
@@ -395,6 +399,7 @@ def test_single_point_equity_defaults_core_metrics_and_surfaces_warnings():
     assert metrics["compare"] == {}
     assert metrics["montecarlo"] == {}
     assert metrics["montecarlo_mean"] == []
+    assert metrics["montecarlo_cagr"] == {}
     assert metrics["montecarlo_drawdown"] == {}
     assert metrics["montecarlo_sharpe"] == {}
     assert metrics["outliers"] == {}

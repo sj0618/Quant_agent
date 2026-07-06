@@ -414,6 +414,8 @@ class AICodeBacktestFlowRequest(BaseModel):
     benchmark_ticker: str | None = None
     data_source: str | None = None
     report_model_name: str | None = None
+    timeout_seconds: int = Field(default=300, gt=0)
+    memory_limit_mb: int = Field(default=512, gt=0)
 
 
 class AICodeBacktestFlowResult(BaseModel):

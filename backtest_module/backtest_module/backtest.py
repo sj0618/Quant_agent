@@ -1183,6 +1183,7 @@ class BacktestEngine:
             "compare": metrics.get("compare"),
             "montecarlo": metrics.get("montecarlo"),
             "montecarlo_mean": metrics.get("montecarlo_mean"),
+            "montecarlo_cagr": metrics.get("montecarlo_cagr"),
             "montecarlo_drawdown": metrics.get("montecarlo_drawdown"),
             "montecarlo_sharpe": metrics.get("montecarlo_sharpe"),
             "outliers": metrics.get("outliers"),
