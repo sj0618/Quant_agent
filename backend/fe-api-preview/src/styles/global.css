@@ -235,14 +235,11 @@ p, h1, h2, h3, h4 { margin: 0; }
 .signal-card__score { text-align: right; }
 .signal-card__score strong { font-size: 18px; }
 .signal-card > p { border-top: 1px solid var(--line); padding: 12px 16px; color: var(--muted); font-size: 12px; line-height: 1.5; }
-.signal-card__meta { display: flex; justify-content: space-between; gap: 10px; padding: 0 16px 12px; color: var(--muted); font-size: 11px; }
-.signal-card__meta b { color: var(--subdued); }
+.signal-card__meta { display: flex; justify-content: flex-end; gap: 10px; padding: 0 16px 12px; color: var(--muted); font-size: 11px; }
 .signal-card__meta em { font-style: normal; margin-left: 4px; font-weight: 700; }
 .is-positive { color: var(--buy); font-style: normal; font-weight: 800; }
 .is-neutral { color: var(--muted); font-style: normal; font-weight: 800; }
 .is-negative { color: var(--drop); font-style: normal; font-weight: 800; }
-.signal-card__risks { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 16px 14px; }
-.signal-card__risks span { background: var(--soft); color: var(--muted); border-radius: 4px; padding: 4px 7px; font-size: 10px; }
 .recent-report-row { display: grid; grid-template-columns: 64px 1fr 32px; gap: 12px; align-items: center; padding: 12px 20px; border-top: 1px solid var(--line); }
 .recent-report-row:first-of-type { border-top: 0; }
 .recent-report-row small { display: block; color: var(--subdued); font-size: 10px; }
