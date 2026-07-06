@@ -5,9 +5,11 @@ import { LandingPage } from "./pages/LandingPage";
 import { LegalPage } from "./pages/LegalPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ProfilePage } from "./pages/ProfilePage";
+import { ReportsHistoryPage } from "./pages/ReportsHistoryPage";
 import { ReportDetailPage } from "./pages/ReportDetailPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { SearchPage } from "./pages/SearchPage";
+import { StrategyReportDetailPage } from "./pages/StrategyReportDetailPage";
 import { UnsubscribePage } from "./pages/UnsubscribePage";
 import { getCurrentSession } from "./api/authClient";
 import { ROUTES, getCurrentPathWithSearch, sanitizeReturnTo } from "./config/routes";
@@ -69,11 +71,11 @@ export default function App() {
   }
 
   if (path === ROUTES.me) {
-    return <ProfilePage initialTab="profile" />;
+    return <ProfilePage />;
   }
 
   if (path === ROUTES.notifications) {
-    return <ProfilePage initialTab="notifications" />;
+    return <ProfilePage />;
   }
 
   if (path === ROUTES.search) {
@@ -82,6 +84,14 @@ export default function App() {
 
   if (path === ROUTES.reports) {
     return <ReportsPage />;
+  }
+
+  if (path === ROUTES.reportsHistory) {
+    return <ReportsHistoryPage />;
+  }
+
+  if (path.startsWith(`${ROUTES.reportStrategies}/`)) {
+    return <StrategyReportDetailPage id={decodeURIComponent(path.replace(`${ROUTES.reportStrategies}/`, ""))} />;
   }
 
   if (path.startsWith(`${ROUTES.reports}/`)) {

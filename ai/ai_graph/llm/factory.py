@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from ai_graph.llm.aoai import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_WEB_SEARCH_TOOL_TYPE,
     AOAIResponsesClient,
 )
 from ai_graph.llm.base import LLMClient, LLMProviderConfigError
@@ -19,6 +20,7 @@ AI_AOAI_MODEL_ENV = "AI_AOAI_MODEL"
 AI_AOAI_TIMEOUT_SECONDS_ENV = "AI_AOAI_TIMEOUT_SECONDS"
 AI_AOAI_MAX_RETRIES_ENV = "AI_AOAI_MAX_RETRIES"
 AI_AOAI_RETRY_BACKOFF_SECONDS_ENV = "AI_AOAI_RETRY_BACKOFF_SECONDS"
+AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV = "AI_AOAI_WEB_SEARCH_TOOL_TYPE"
 
 LLM_PROVIDER_MOCK = "mock"
 LLM_PROVIDER_AOAI = "aoai"
@@ -65,6 +67,11 @@ def _create_aoai_client(
             _role_env_name(role, "RETRY_BACKOFF_SECONDS"),
             _float_env(env, AI_AOAI_RETRY_BACKOFF_SECONDS_ENV, 0.25),
         ),
+        web_search_tool_type=_str_env(
+            env,
+            _role_env_name(role, "WEB_SEARCH_TOOL_TYPE"),
+            _str_env(env, AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV, DEFAULT_WEB_SEARCH_TOOL_TYPE),
+        ),
     )
 
 
@@ -108,3 +115,10 @@ def _int_env(env: Mapping[str, str], key: str, default: int) -> int:
     if value is None or not value.strip():
         return default
     return int(value)
+
+
+def _str_env(env: Mapping[str, str], key: str, default: str) -> str:
+    value = env.get(key)
+    if value is None or not value.strip():
+        return default
+    return value.strip()

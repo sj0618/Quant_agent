@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from ai_graph.data_sources import load_pipeline_data_from_env
@@ -20,8 +21,13 @@ from ai_graph.schemas import (
     CandidateBacktestResult,
     ClarificationOption,
     Condition,
+    DataRequirement,
     EnvelopeStatus,
+    EvidenceRef,
+    FailureDiagnostic,
     InternalPayload,
+    SemanticSlots,
+    SourceUsage,
     StrategyCandidateCard,
     StrategySpec,
 )
@@ -125,6 +131,10 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
         "safety_priority": category == AmbiguityCode.INFEASIBLE,
         "reason": _ambiguity_reason(category),
         "ambiguity_reasons": _ambiguity_reasons(category, query),
+        "ambiguity_dimensions": _ambiguity_dimensions(category, query),
+        "source_resolvable": category in {AmbiguityCode.INPUT_AMBIGUOUS, AmbiguityCode.TERM_UNKNOWN},
+        "needs_clarification_after_source_check": category != AmbiguityCode.READY,
+        "clarification_blocker_type": _clarification_blocker_type(category),
         "retrieved_definitions": [hit.model_dump() for hit in retrieval.hits],
         "clarification_question": clarification["question"],
         "question_reason": clarification["question_reason"],
@@ -137,16 +147,27 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
 
 
 def data_node(state: QuantAgentState) -> dict[str, Any]:
+    semantic_slots = parse_semantic_slots(state["user_query"], trace_id=state["trace_id"])
+    data_requirements = plan_data_requirements(semantic_slots)
+    source_usage = build_source_usage(state["user_query"], data_requirements, trace_id=state["trace_id"])
+    evidence_refs = build_evidence_refs(source_usage, trace_id=state["trace_id"])
     retrieval = search_retrieval_corpus(state["user_query"], top_k=5)
     cards = strategy_candidate_cards(state["user_query"], retrieval.hits)
     pipeline_data = load_pipeline_data_from_env(state["user_query"], state["trace_id"])
     output: dict[str, Any] = {
+        "semantic_slots": semantic_slots.model_dump(),
+        "data_requirements": [requirement.model_dump() for requirement in data_requirements],
+        "source_usage": [usage.model_dump() for usage in source_usage],
+        "evidence_refs": [evidence.model_dump() for evidence in evidence_refs],
+        "freshness_status": _aggregate_freshness_status(source_usage),
+        "proxy_disclosure": _proxy_disclosure(data_requirements),
         "retrieval": retrieval.model_dump(),
         "data": {
             "candidate_cards": [card.model_dump() for card in cards],
             "pipeline_data_source": pipeline_data.metadata,
             "screening_candidates": pipeline_data.screening_candidates,
             "data_availability": pipeline_data.data_availability,
+            "data_source_inventory": data_source_inventory(),
         },
     }
     if pipeline_data.price_rows:
@@ -159,7 +180,12 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
 
 
 def research_node(state: QuantAgentState) -> dict[str, Any]:
-    strategy_a = build_strategy_spec(state["user_query"], variant="A", retrieval=state["retrieval"])
+    strategy_a = build_strategy_spec(
+        state["user_query"],
+        variant="A",
+        retrieval=state["retrieval"],
+        semantic_slots=state.get("semantic_slots"),
+    )
     debate = build_research_debate(state, strategy_a)
     original_strategy = strategy_a
     strategy_a = strategy_a.model_copy(
@@ -227,6 +253,13 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         user_payload=payload,
         strategy_spec=state.get("strategy_spec"),
         retryable=status in {EnvelopeStatus.NEED_CLARIFICATION, EnvelopeStatus.FAILED},
+        semantic_slots=state.get("semantic_slots"),
+        data_requirements=state.get("data_requirements"),
+        source_usage=state.get("source_usage"),
+        freshness_status=state.get("freshness_status"),
+        proxy_disclosure=state.get("proxy_disclosure"),
+        failure_cause=state.get("failure_cause"),
+        evidence_refs=state.get("evidence_refs"),
     )
     return {"envelope": envelope.model_dump()}
 
@@ -250,6 +283,219 @@ def classify_query(query: str) -> AmbiguityCode:
     if _has_unknown_term_risk(query):
         return AmbiguityCode.TERM_UNKNOWN
     return AmbiguityCode.READY
+
+
+def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
+    lowered = query.lower()
+    indicator: list[str] = []
+    threshold: list[str] = []
+    lookback: list[str] = []
+    horizon: list[str] = []
+    price_basis: list[str] = []
+    event: list[str] = []
+    action: list[str] = []
+    missing_slots: list[str] = []
+    contradictions: list[str] = []
+
+    if "rsi" in lowered or "과매도" in query:
+        indicator.append("rsi")
+    if "볼린저" in query or "bollinger" in lowered:
+        indicator.append("bollinger")
+    if any(term in query for term in ("거래량", "거래대금")):
+        indicator.append("volume")
+    if any(term in query for term in ("20일선", "20일 이동평균")):
+        indicator.append("sma_20")
+    if "200일" in query:
+        indicator.append("sma_200")
+    if any(term in query for term in ("per", "PER", "저PER")):
+        indicator.append("per")
+    if "roe" in lowered or "ROE" in query:
+        indicator.append("roe")
+
+    if "30" in query and "rsi" in lowered:
+        threshold.append("rsi <= 30")
+    if "40" in query and "rsi" in lowered:
+        threshold.append("rsi <= 40")
+    if "150" in query and "거래량" in query:
+        threshold.append("volume_ratio_20 >= 1.5")
+    if "100" in query and "부채" in query:
+        threshold.append("debt_ratio <= 100")
+
+    if "14" in query and "rsi" in lowered:
+        lookback.append("14d")
+    if "20일" in query:
+        lookback.append("20 trading days")
+    if "52주" in query:
+        lookback.append("52w")
+    if "최근" in query:
+        horizon.append("recent")
+    if "3개월" in query:
+        horizon.append("3m")
+    if "5거래일" in query:
+        horizon.append("5 trading days")
+
+    if any(term in query for term in ("종가", "close", "재진입", "반등", "돌파")):
+        price_basis.append("close")
+    if "하단" in query and ("재진입" in query or "반등" in query) and "bollinger" in indicator:
+        event.append("lower_band_reentry")
+        action.extend(["find_candidates", "reentry", "cross_above"])
+        if "close" not in price_basis:
+            price_basis.append("close")
+    elif any(term in query for term in ("신고가", "돌파")):
+        event.append("new_52w_high" if "52주" in query else "upper_band_breakout")
+        action.extend(["find_candidates", "breakout"])
+    elif "반등" in query:
+        event.append("rebound")
+        action.extend(["find_candidates", "rebound"])
+    else:
+        action.append("find_candidates")
+
+    universe = "KOSPI200" if "KOSPI200" in query.upper() else "KRX"
+    if not indicator:
+        missing_slots.append("indicator")
+    if "bollinger" in indicator and "lower_band_reentry" in event and "close" not in price_basis:
+        missing_slots.append("price_basis")
+    if _has_conflicting_targets(query):
+        contradictions.append("low_volatility_vs_short_term_surge")
+
+    confidence = 0.9 if indicator and not contradictions else 0.62 if indicator else 0.45
+    parse_status = "ready" if confidence >= 0.65 and not contradictions and not missing_slots else "needs_clarification"
+    return SemanticSlots(
+        indicator=_unique(indicator),
+        threshold=_unique(threshold),
+        lookback=_unique(lookback),
+        horizon=_unique(horizon),
+        price_basis=_unique(price_basis),
+        event=_unique(event),
+        action=_unique(action),
+        universe=universe,
+        slot_evidence_refs=[f"semantic:{trace_id}:deterministic"],
+        missing_slots=missing_slots,
+        contradictions=contradictions,
+        confidence=confidence,
+        parse_status=parse_status,
+    )
+
+
+def plan_data_requirements(semantic_slots: SemanticSlots) -> list[DataRequirement]:
+    requirements: list[DataRequirement] = [
+        DataRequirement(
+            family="universe",
+            availability="available",
+            owner="ai_graph",
+            preferred_source="internal_db",
+            fallback_sources=["krx"],
+            freshness_requirement="not_time_sensitive",
+            source_confidence_floor=0.8,
+            evidence_ref="data-plan:universe",
+        )
+    ]
+    indicators = set(semantic_slots.indicator)
+    events = set(semantic_slots.event)
+    if indicators & {"rsi", "bollinger", "volume", "sma_20", "sma_200"} or events & {"lower_band_reentry", "new_52w_high", "upper_band_breakout"}:
+        requirements.append(
+            DataRequirement(
+                family="ohlcv_ta",
+                availability="available",
+                owner="ai_graph",
+                preferred_source="internal_db",
+                fallback_sources=["krx"],
+                freshness_requirement="same_trading_day",
+                source_confidence_floor=0.85,
+                evidence_ref="data-plan:ohlcv_ta",
+            )
+        )
+    if indicators & {"per", "roe"} or any(slot in semantic_slots.threshold for slot in ("debt_ratio <= 100",)):
+        requirements.append(
+            DataRequirement(
+                family="fundamentals",
+                availability="outside_owner",
+                owner="product_data_gap",
+                preferred_source="dart",
+                fallback_sources=["aoai_web_search"],
+                freshness_requirement="report_period",
+                source_confidence_floor=0.75,
+                proxy_allowed=True,
+                evidence_ref="data-plan:fundamentals",
+            )
+        )
+    if events & {"disclosure", "earnings_surprise"}:
+        requirements.append(
+            DataRequirement(
+                family="disclosure",
+                availability="partial",
+                owner="data_source_config",
+                preferred_source="dart",
+                fallback_sources=["aoai_web_search"],
+                freshness_requirement="latest_filing",
+                source_confidence_floor=0.8,
+                evidence_ref="data-plan:disclosure",
+            )
+        )
+    return requirements
+
+
+def build_source_usage(query: str, requirements: list[DataRequirement], *, trace_id: str) -> list[SourceUsage]:
+    now = datetime.now(UTC)
+    usage: list[SourceUsage] = []
+    for requirement in requirements:
+        usage.append(
+            SourceUsage(
+                source_type=requirement.preferred_source,
+                query=f"{requirement.family}: {query}",
+                retrieved_at=now,
+                source_refs=[requirement.evidence_ref],
+                freshness_status="fresh" if requirement.availability in {"available", "derivable", "partial"} else "unknown",
+                confidence=requirement.source_confidence_floor,
+                fallback_used=False,
+                evidence_refs=[f"source:{trace_id}:{requirement.family}"],
+            )
+        )
+    return usage
+
+
+def build_evidence_refs(source_usage: list[SourceUsage], *, trace_id: str) -> list[EvidenceRef]:
+    return [
+        EvidenceRef(
+            ref_id=usage.evidence_refs[0] if usage.evidence_refs else f"source:{trace_id}:{index}",
+            source_type=usage.source_type,
+            stage="data_planning",
+            retrieved_at=usage.retrieved_at,
+            sanitized_summary=f"{usage.source_type} source plan for {usage.query.split(':', 1)[0]}",
+            confidence=usage.confidence,
+        )
+        for index, usage in enumerate(source_usage)
+    ]
+
+
+def data_source_inventory() -> list[dict[str, Any]]:
+    return [
+        {"source_type": "internal_db", "families": ["ohlcv_ta", "universe", "analyst_evidence"], "live_required": False},
+        {"source_type": "krx", "families": ["ohlcv_ta", "universe"], "live_required": False},
+        {"source_type": "dart", "families": ["disclosure", "event", "fundamentals"], "live_required": False},
+        {"source_type": "aoai_web_search", "families": ["event", "macro_fx_rates_commodities", "consensus_guidance"], "live_required": False},
+        {"source_type": "analyst_evidence", "families": ["analyst_evidence", "consensus_guidance"], "live_required": False},
+    ]
+
+
+def _aggregate_freshness_status(source_usage: list[SourceUsage]) -> str:
+    statuses = {usage.freshness_status for usage in source_usage}
+    if "stale" in statuses:
+        return "stale"
+    if "unknown" in statuses:
+        return "unknown"
+    return "fresh" if statuses else "unknown"
+
+
+def _proxy_disclosure(requirements: list[DataRequirement]) -> dict[str, str] | None:
+    proxied = [requirement for requirement in requirements if requirement.proxy_used]
+    if not proxied:
+        return None
+    return {requirement.family: requirement.proxy_disclosure.get("reason", "proxy used") if requirement.proxy_disclosure else "proxy used" for requirement in proxied}
+
+
+def _unique(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
 
 
 def strategy_candidate_cards(query: str, hits: list[Any]) -> list[StrategyCandidateCard]:
@@ -617,6 +863,33 @@ def _clarification_from_ambiguity(ambiguity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _ambiguity_dimensions(category: AmbiguityCode, query: str) -> list[str]:
+    if category == AmbiguityCode.READY:
+        return []
+    if category == AmbiguityCode.INPUT_AMBIGUOUS:
+        dimensions = ["data_missing"]
+        if _needs_query_smoothing(query):
+            dimensions.append("source_resolvable")
+        return dimensions
+    if category == AmbiguityCode.TERM_UNKNOWN:
+        return ["intent_ambiguous", "source_resolvable"]
+    if category == AmbiguityCode.CONFLICTING:
+        return ["intent_ambiguous", "source_conflict"]
+    return ["unsupported_source"]
+
+
+def _clarification_blocker_type(category: AmbiguityCode) -> str | None:
+    if category == AmbiguityCode.READY:
+        return None
+    if category == AmbiguityCode.INPUT_AMBIGUOUS:
+        return "data_missing"
+    if category == AmbiguityCode.TERM_UNKNOWN:
+        return "intent_ambiguous"
+    if category == AmbiguityCode.CONFLICTING:
+        return "source_conflict"
+    return "unsupported_source"
+
+
 def _has_conflicting_targets(query: str) -> bool:
     return any(term in query for term in ("변동성 낮", "저변동성")) and "급등" in query
 
@@ -740,6 +1013,14 @@ def _has_unknown_term_risk(query: str) -> bool:
     return any(term in query for term in ("알아서", "좋은 종목", "괜찮은 종목"))
 
 
+def _is_pullback_rsi_volume_query(query: str) -> bool:
+    lowered = query.lower()
+    has_trend_filter = "200일" in query or "sma200" in lowered or "sma_200" in lowered
+    has_rsi_pullback = "rsi" in lowered and ("40" in query or "눌" in query)
+    has_volume_filter = "거래량" in query or "volume" in lowered
+    return has_trend_filter and has_rsi_pullback and has_volume_filter
+
+
 def _ambiguity_reasons(category: AmbiguityCode, query: str) -> list[str]:
     if category == AmbiguityCode.READY:
         return ["L1/L2 또는 기술 지표 조건으로 해석 가능한 KRX 현물 전략입니다."]
@@ -752,9 +1033,15 @@ def _ambiguity_reasons(category: AmbiguityCode, query: str) -> list[str]:
     return [f"{query[:40]} 입력은 현재 KRX 현물 데이터 범위를 벗어난 자산군을 포함합니다."]
 
 
-def build_strategy_spec(query: str, *, variant: str, retrieval: dict[str, Any]) -> StrategySpec:
+def build_strategy_spec(
+    query: str,
+    *,
+    variant: str,
+    retrieval: dict[str, Any],
+    semantic_slots: Mapping[str, Any] | None = None,
+) -> StrategySpec:
     source_refs = [hit["document_id"] for hit in retrieval.get("hits", [])]
-    profile = _strategy_profile(query)
+    profile = _strategy_profile(query, semantic_slots=semantic_slots)
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
         name=str(profile["name"]),
@@ -834,8 +1121,31 @@ def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> d
     }
 
 
-def _strategy_profile(query: str) -> dict[str, Any]:
+def _strategy_profile(query: str, *, semantic_slots: Mapping[str, Any] | None = None) -> dict[str, Any]:
     lowered = query.lower()
+    slot_indicator = set(semantic_slots.get("indicator", [])) if semantic_slots else set()
+    slot_event = set(semantic_slots.get("event", [])) if semantic_slots else set()
+    if _is_pullback_rsi_volume_query(query):
+        return {
+            "strategy_id": "pullback_rsi_volume",
+            "name": "KOSPI200 RSI40 거래량 눌림목",
+            "entry_conditions": [
+                Condition(left="close_above_sma_200", operator="eq", right=1, description="주가가 200일선 위"),
+                Condition(left="rsi", operator="lte", right=40, description="RSI(14) <= 40 눌림"),
+                Condition(left="volume_ratio_20", operator="gte", right=1.0, description="거래량이 20일 평균 이상"),
+            ],
+            "exit_conditions": [
+                Condition(left="rsi", operator="gte", right=60, description="RSI >= 60 회복"),
+                Condition(left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈"),
+            ],
+            "indicators": ["SMA200", "RSI", "volume_ratio_20"],
+            "assumptions": [
+                "200일선 위는 상승추세 필터로 해석",
+                "RSI 40 이하는 과매도보다 완만한 눌림목 조건으로 해석",
+                "거래량 20일 평균 이상은 volume_ratio_20 >= 1.0으로 해석",
+            ],
+            "confidence": 0.82,
+        }
     if "dividend_defensive" in lowered or "배당 방어주" in query:
         return {
             "strategy_id": "dividend_defensive",
@@ -1143,20 +1453,27 @@ def _strategy_profile(query: str) -> dict[str, Any]:
             "assumptions": ["갭 유지 여부는 OHLCV 패턴으로 검증"],
             "confidence": 0.67,
         }
-    if any(term in query for term in ("볼린저", "밴드", "변동성")):
+    if "bollinger" in slot_indicator or "lower_band_reentry" in slot_event or "볼린저" in query or "변동성" in query:
+        lower_reentry = "lower_band_reentry" in slot_event or any(term in query for term in ("하단", "재진입", "반등"))
         return {
-            "strategy_id": "bollinger_squeeze_breakout",
-            "name": "KOSPI200 볼린저 스퀴즈 돌파",
+            "strategy_id": "bollinger_lower_reentry" if lower_reentry else "bollinger_squeeze_breakout",
+            "name": "KOSPI200 볼린저 하단 재진입" if lower_reentry else "KOSPI200 볼린저 스퀴즈 돌파",
             "entry_conditions": [
+                Condition(left="close_below_lower_band_recent", operator="eq", right=1, description="최근 종가가 볼린저 하단 밴드 아래를 확인"),
+                Condition(left="close_cross_above_lower_band", operator="eq", right=1, description="종가가 하단 밴드 위로 재진입"),
+            ] if lower_reentry else [
                 Condition(left="bb_width_percentile", operator="lte", right=0.25, description="밴드 폭 축소"),
                 Condition(left="bollinger_breakout", operator="eq", right=1, description="상단 돌파 또는 밴드 재진입"),
             ],
             "exit_conditions": [
                 Condition(left="close_below_middle_band", operator="eq", right=1, description="중심선 이탈")
             ],
-            "indicators": ["Bollinger Bands", "realized_volatility"],
-            "assumptions": ["상단 돌파와 하단 재진입은 입력 문맥에 따라 L2에서 분기"],
-            "confidence": 0.74,
+            "indicators": ["Bollinger Bands", "close"],
+            "assumptions": [
+                "볼린저 하단 재진입은 RSI 반등과 별도 의미로 보존",
+                "판정 기준은 종가 기준으로 고정",
+            ] if lower_reentry else ["상단 돌파와 하단 재진입은 입력 문맥에 따라 L2에서 분기"],
+            "confidence": 0.8 if lower_reentry else 0.74,
         }
     if "200일" in query and "rsi" in lowered:
         return {
@@ -1257,7 +1574,7 @@ def _strategy_profile(query: str) -> dict[str, Any]:
             "assumptions": ["성장·수익성 조건은 후보 필터, 추세는 OHLCV proxy로 검증"],
             "confidence": 0.7,
         }
-    if "rsi" in lowered or "과매도" in query or "반등" in query:
+    if "rsi" in lowered or "rsi" in slot_indicator or "과매도" in query or "반등" in query:
         return {
             "strategy_id": "rsi_rebound",
             "name": "KOSPI200 RSI 과매도 반등",
@@ -1353,6 +1670,11 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
         key: state[key]
         for key in (
             "ambiguity",
+            "semantic_slots",
+            "data_requirements",
+            "source_usage",
+            "failure_cause",
+            "evidence_refs",
             "data",
             "strategy_spec",
             "original_strategy_spec",
@@ -1374,6 +1696,9 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
         "langgraph_optional": True,
         "pipeline_data_source": state.get("data", {}).get("pipeline_data_source", {}),
         "data_availability": state.get("data", {}).get("data_availability", {}),
+        "semantic_parse_status": state.get("semantic_slots", {}).get("parse_status"),
+        "data_requirement_count": len(state.get("data_requirements", [])),
+        "source_usage_count": len(state.get("source_usage", [])),
     }
     return InternalPayload(
         trace_id=state["trace_id"],

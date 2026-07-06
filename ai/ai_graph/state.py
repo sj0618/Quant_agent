@@ -10,6 +10,13 @@ class QuantAgentState(TypedDict, total=False):
     route: str
     status: str
     ambiguity: dict[str, Any]
+    semantic_slots: dict[str, Any]
+    data_requirements: list[dict[str, Any]]
+    source_usage: list[dict[str, Any]]
+    freshness_status: str
+    proxy_disclosure: dict[str, str] | None
+    failure_cause: dict[str, Any]
+    evidence_refs: list[dict[str, Any]]
     retrieval: dict[str, Any]
     data: dict[str, Any]
     original_strategy_spec: dict[str, Any]

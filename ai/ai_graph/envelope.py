@@ -27,6 +27,13 @@ def build_envelope(
     user_payload: UserPayload | dict[str, Any],
     strategy_spec: dict[str, Any] | None,
     retryable: bool,
+    semantic_slots: dict[str, Any] | None = None,
+    data_requirements: list[dict[str, Any]] | None = None,
+    source_usage: list[dict[str, Any]] | None = None,
+    freshness_status: str | None = None,
+    proxy_disclosure: dict[str, str] | None = None,
+    failure_cause: dict[str, Any] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
 ) -> APIEnvelope:
     payload = (
         user_payload
@@ -40,4 +47,11 @@ def build_envelope(
         strategy_spec=strategy_spec,
         debug_ref=debug_ref,
         retryable=retryable,
+        semantic_slots=semantic_slots,
+        data_requirements=data_requirements or [],
+        source_usage=source_usage or [],
+        freshness_status=freshness_status,
+        proxy_disclosure=proxy_disclosure,
+        failure_cause=failure_cause,
+        evidence_refs=evidence_refs or [],
     )

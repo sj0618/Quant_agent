@@ -18,7 +18,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
         <Card>
           <div className="side-badge-line">
             <Badge variant="dark">TODAY</Badge>
-            <span>오전 8:00 발송</span>
+            <span>{report.sentAt}</span>
           </div>
           <h3>{report.date}</h3>
           <strong>권장도 {report.recommendationScore} / 10</strong>
@@ -35,7 +35,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
           <strong>기준 전략</strong>
           <h4>{report.strategyName}</h4>
           <dl>
-            <div><dt>유니버스</dt><dd>KOSPI200 · 반도체</dd></div>
+            <div><dt>유니버스</dt><dd>{report.strategyUniverse ?? "전략 유니버스 정보 없음"}</dd></div>
             <div><dt>신호</dt><dd>BUY {report.signals.BUY} · HOLD {report.signals.HOLD} · DROP {report.signals.DROP}</dd></div>
             <div><dt>권장도</dt><dd>{report.recommendationScore} / 10</dd></div>
           </dl>
@@ -63,7 +63,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
         </section>
 
         <Section title="전일 시황" index="02">
-          <p>외국인 순매수와 환율 안정이 동시에 관측되며 반도체 대형주의 모멘텀이 유지됐습니다. 화학·2차전지 소재는 컨센서스 하향과 수급 약세가 동반됐습니다.</p>
+          <p>{report.marketContext ?? report.marketBrief}</p>
         </Section>
 
         <Section title="주요 뉴스 5건" index="03">
@@ -116,7 +116,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
           </div>
           <div className="warning-box">
             <Badge variant="warning">주의</Badge>
-            <span>환율 변동성이 확대되는 구간입니다. 추가 매수는 분할 진입을 권장합니다.</span>
+            <span>{report.warningNote ?? "리스크 관리 기준을 함께 확인하고 분할 진입 원칙을 유지하세요."}</span>
           </div>
           <div className="report-cta-row">
             <a href={ROUTES.app}>워크스페이스에서 상세 보기 →</a>
@@ -133,7 +133,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
           </ul>
           <div>
             <a href={ROUTES.unsubscribe}>수신 거부</a>
-            <a href={ROUTES.notifications}>수신 정책</a>
+            <a href={ROUTES.me}>마이페이지</a>
             <span>© 2026 QuantAgent</span>
           </div>
         </section>
