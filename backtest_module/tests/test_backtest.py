@@ -1,5 +1,9 @@
 from datetime import date
 
+import pandas as pd
+import pytest
+import quantstats.stats as qs_stats
+
 from backtest_module import (
     Condition,
     ConditionOperator,
@@ -18,6 +22,7 @@ from backtest_module.backtest import (
     run_backtest,
     talib_function_catalog,
 )
+from backtest_module.performance import QUANTSTATS_REQUIRED_MESSAGE, calculate_quantstats_metrics
 
 
 def bars(ticker="005930"):
@@ -77,6 +82,13 @@ def test_conservative_daily_engine_fills_next_open_and_records_trade():
     assert trade.quantity == 9
     assert result.summary["final_equity"] == 1090
     assert result.summary["period_return"] == 0.09
+    assert [event.status for event in result.order_audit] == [
+        "submitted",
+        "executed",
+        "submitted",
+        "executed",
+    ]
+    assert [event.side for event in result.order_audit] == ["buy", "buy", "sell", "sell"]
 
 
 def test_missing_required_metric_excludes_ticker_from_run():
@@ -112,6 +124,7 @@ def test_outputs_are_written(tmp_path):
     assert (tmp_path / "trades.csv").exists()
     assert (tmp_path / "signals.csv").exists()
     assert result.output_paths["summary_json"].endswith("summary.json")
+    assert result.output_paths["order_audit_csv"].endswith("order_audit.csv")
 
 
 def test_sample_spec_runs_without_external_metrics():
@@ -222,3 +235,167 @@ def test_precomputed_metric_overrides_talib_value():
 
     assert result.trades[0].entry_date == "2026-01-05"
     assert result.trades[0].exit_date == "2026-01-06"
+
+
+def test_summary_includes_quantstats_metrics():
+    result = run_backtest(
+        rsi_spec(),
+        ohlcv_rows=bars(),
+        metric_rows=rsi_metrics(),
+        config=BacktestRunConfig(initial_capital=1000, write_outputs=False),
+    )
+
+    metrics = result.summary["metrics"]
+
+    for key in [
+        "cagr",
+        "sharpe",
+        "max_drawdown",
+        "total_return",
+        "monthly_returns",
+        "drawdown_details",
+        "drawdown_series",
+        "omega",
+        "common_sense_ratio",
+        "value_at_risk",
+        "ulcer_index",
+        "rolling_volatility",
+        "rolling_sharpe",
+        "rolling_sortino",
+        "montecarlo",
+        "outliers",
+    ]:
+        assert key in metrics
+    for key in [
+        "cagr",
+        "total_return",
+        "monthly_returns",
+        "drawdown_details",
+        "drawdown_series",
+        "omega",
+        "common_sense_ratio",
+        "value_at_risk",
+        "ulcer_index",
+        "rolling_volatility",
+        "rolling_sharpe",
+        "rolling_sortino",
+        "montecarlo",
+        "outliers",
+        "final_cash",
+        "avg_holding_days",
+        "sharpe_ratio",
+        "conditional_value_at_risk",
+        "annualized_volatility",
+    ]:
+        assert key in result.summary
+
+    assert result.summary["period_return"] == metrics["total_return"]
+    assert result.summary["daily_sharpe_like"] == metrics["sharpe"]
+    assert result.summary["sharpe_ratio"] == metrics["sharpe_ratio"]
+    assert result.summary["annualized_volatility"] == metrics["annualized_volatility"]
+    assert result.summary["conditional_value_at_risk"] == metrics["conditional_value_at_risk"]
+    assert result.summary["final_cash"] == result.summary["cash"]
+    assert result.summary["monthly_returns"] == metrics["monthly_returns"]
+    assert result.summary["drawdown_details"] == metrics["drawdown_details"]
+    assert result.summary["drawdown_series"] == metrics["drawdown_series"]
+    assert result.summary["win_rate"] == result.summary["trade_win_rate"]
+    assert result.summary["return_win_rate"] == metrics["win_rate"]
+    assert result.summary["avg_holding_days"] == 2.0
+    assert isinstance(metrics["monthly_returns"], list)
+    assert isinstance(metrics["drawdown_details"], list)
+    assert isinstance(metrics["drawdown_series"], list)
+    assert isinstance(metrics["rolling_volatility"], list)
+    assert isinstance(metrics["rolling_sharpe"], list)
+    assert isinstance(metrics["rolling_sortino"], list)
+    assert isinstance(metrics["montecarlo"], dict)
+    assert isinstance(metrics["montecarlo_mean"], list)
+    assert isinstance(metrics["outliers"], dict)
+    assert metrics["montecarlo"]["simulations"] > 0
+    assert metrics["information_ratio"] is None
+    assert metrics["r_squared"] is None
+    assert metrics["greeks"] is None
+    assert result.summary["trade_win_rate"] == 1.0
+
+
+def test_missing_quantstats_raises_clear_error(monkeypatch):
+    real_import = __import__
+
+    def raising_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "quantstats" or name.startswith("quantstats."):
+            raise ImportError("quantstats unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", raising_import)
+
+    with pytest.raises(ModuleNotFoundError, match=QUANTSTATS_REQUIRED_MESSAGE):
+        calculate_quantstats_metrics(
+            [
+                {"date": "2026-01-02", "total_equity": 1000.0},
+                {"date": "2026-01-03", "total_equity": 1010.0},
+            ]
+        )
+
+
+def test_benchmark_metrics_use_benchmark_returns_not_raw_equity():
+    equity_curve = [
+        {"date": "2026-01-02", "total_equity": 100.0},
+        {"date": "2026-01-03", "total_equity": 105.0},
+        {"date": "2026-01-04", "total_equity": 95.0},
+        {"date": "2026-01-05", "total_equity": 110.0},
+    ]
+    benchmark_curve = [
+        {"date": "2026-01-02", "total_equity": 200.0},
+        {"date": "2026-01-03", "total_equity": 202.0},
+        {"date": "2026-01-04", "total_equity": 201.0},
+        {"date": "2026-01-05", "total_equity": 205.0},
+    ]
+
+    metrics = calculate_quantstats_metrics(equity_curve, benchmark_returns=benchmark_curve)
+    returns = pd.Series(
+        [100.0, 105.0, 95.0, 110.0],
+        index=pd.to_datetime(["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"]),
+    ).pct_change().dropna()
+    benchmark_returns = pd.Series(
+        [200.0, 202.0, 201.0, 205.0],
+        index=pd.to_datetime(["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"]),
+    ).pct_change().dropna()
+
+    assert metrics["information_ratio"] is not None
+    assert metrics["r_squared"] is not None
+    assert metrics["greeks"] is not None
+    assert metrics["r_squared"] == pytest.approx(float(qs_stats.r_squared(returns, benchmark_returns)), rel=1e-6)
+    assert metrics["compare"]
+    assert isinstance(metrics["compare"]["cumulative"], list)
+    assert isinstance(metrics["rolling_greeks"], list)
+
+
+def test_single_point_equity_defaults_core_metrics_and_surfaces_warnings():
+    metrics = calculate_quantstats_metrics(
+        [
+            {"date": "2026-01-02", "total_equity": 1000.0},
+        ]
+    )
+
+    assert metrics["total_return"] == 0.0
+    assert metrics["cagr"] == 0.0
+    assert metrics["sharpe"] == 0.0
+    assert metrics["adjusted_sortino"] == 0.0
+    assert metrics["max_drawdown"] == 0.0
+    assert metrics["win_rate"] == 0.0
+    assert metrics["omega"] == 0.0
+    assert metrics["monthly_returns"] == []
+    assert metrics["drawdown_details"] == []
+    assert metrics["drawdown_series"] == []
+    assert metrics["rolling_volatility"] == []
+    assert metrics["rolling_sharpe"] == []
+    assert metrics["rolling_sortino"] == []
+    assert metrics["information_ratio"] is None
+    assert metrics["r_squared"] is None
+    assert metrics["greeks"] is None
+    assert metrics["compare"] == {}
+    assert metrics["montecarlo"] == {}
+    assert metrics["montecarlo_mean"] == []
+    assert metrics["montecarlo_drawdown"] == {}
+    assert metrics["montecarlo_sharpe"] == {}
+    assert metrics["outliers"] == {}
+    assert metrics["metric_warnings"]

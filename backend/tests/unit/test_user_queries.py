@@ -46,6 +46,17 @@ def test_google_user_upsert_returns_user_id_as_id_when_schema_uses_user_id():
     assert "RETURNING CAST(user_id AS text) AS id, email" in sql
 
 
+def test_google_user_upsert_uses_profile_image_url_when_erd_schema_is_applied():
+    report = UserSchemaReport(
+        columns={"user_id", "email", "auth_provider", "provider_user_id", "name", "profile_image_url", "created_at", "updated_at"},
+        has_provider_sub_unique=True,
+    )
+    sql = build_google_user_upsert_sql(report)
+    assert "profile_image_url" in sql
+    assert "profile_image_url AS avatar_url" in sql
+
+
+
 def test_load_user_sql_uses_null_aliases_for_missing_optional_columns():
     report = UserSchemaReport(columns={"id", "email", "auth_provider", "provider_user_id"}, has_provider_sub_unique=True)
     sql = build_load_user_sql(report)
@@ -60,3 +71,12 @@ def test_load_user_sql_maps_user_id_to_id_when_schema_uses_user_id():
     sql = build_load_user_sql(report)
     assert "SELECT CAST(user_id AS text) AS id, email" in sql
     assert "WHERE CAST(user_id AS text) = :user_id" in sql
+
+
+def test_load_user_sql_maps_profile_image_url_to_avatar_alias():
+    report = UserSchemaReport(
+        columns={"user_id", "email", "auth_provider", "provider_user_id", "profile_image_url"},
+        has_provider_sub_unique=True,
+    )
+    sql = build_load_user_sql(report)
+    assert "profile_image_url AS avatar_url" in sql
