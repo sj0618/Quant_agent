@@ -1,4 +1,6 @@
+import json
 from datetime import date
+from decimal import Decimal
 import unittest
 
 from scripts.ingest_dart_bok_history import (
@@ -6,6 +8,7 @@ from scripts.ingest_dart_bok_history import (
     SchemaMappingError,
     TableColumn,
     TableSchema,
+    convert_value_for_column,
     format_bok_period,
     load_bok_series_configs,
     parse_args,
@@ -84,6 +87,18 @@ class DartBokHistoryIngestTests(unittest.TestCase):
         self.assertEqual(configs[0].stat_code, "722Y001")
         self.assertEqual(configs[0].item_code1, "0101000")
         self.assertIn("731Y003", {config.stat_code for config in configs})
+
+    def test_jsonb_column_serializes_decimal_values(self):
+        column = TableColumn("accounts_jsonb", "jsonb", "jsonb", False, None, 1)
+
+        converted = convert_value_for_column(
+            {"amount": Decimal("1000.25"), "nested": [{"rate": Decimal("1.5")}]},
+            column,
+        )
+
+        payload = json.loads(converted.dumps(converted.obj))
+        self.assertEqual(payload["amount"], "1000.25")
+        self.assertEqual(payload["nested"][0]["rate"], "1.5")
 
 
 if __name__ == "__main__":

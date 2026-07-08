@@ -13,7 +13,7 @@ class AirflowDagImportTests(unittest.TestCase):
         self.assertTrue(module.DEFAULT_DAILY_SCHEDULE)
 
     def test_dag_file_does_not_require_airflow_package(self):
-        path = Path("airflow/dags/quant_agent_data_engineering.py")
+        path = Path("DE/airflow/dags/quant_agent_data_engineering.py")
         spec = importlib.util.spec_from_file_location("quant_agent_data_engineering_dag_no_airflow", path)
         self.assertIsNotNone(spec)
         module = importlib.util.module_from_spec(spec)
@@ -73,7 +73,7 @@ class AirflowDagImportTests(unittest.TestCase):
         self.assertEqual(args[args.index("--end-date") + 1], "2026-05-21")
 
     def test_daily_dag_orders_kis_adjusted_before_ta(self):
-        source = Path("airflow/dags/quant_agent_data_engineering.py").read_text(encoding="utf-8")
+        source = Path("DE/airflow/dags/quant_agent_data_engineering.py").read_text(encoding="utf-8")
 
         self.assertIn("kis_adjusted = ingest_kis_adjusted_ohlcv_daily()", source)
         self.assertIn("kis_adjusted >> computed", source)
@@ -171,7 +171,7 @@ class AirflowDagImportTests(unittest.TestCase):
 
 
 def _load_dag_module(module_name: str = "quant_agent_data_engineering_dag"):
-    path = Path("airflow/dags/quant_agent_data_engineering.py")
+    path = Path("DE/airflow/dags/quant_agent_data_engineering.py")
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)

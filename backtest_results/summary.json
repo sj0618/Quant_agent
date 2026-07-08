@@ -1,0 +1,61 @@
+{
+  "strategy_id": "my_first_rsi_test",
+  "strategy_name": "RSI 30/70 전략",
+  "initial_capital": 100000000.0,
+  "final_equity": 92593670.82701,
+  "cash": 1682117.82701,
+  "open_positions": 10,
+  "period_return": -0.0740632917,
+  "max_drawdown": -0.2260667267,
+  "daily_sharpe_like": -0.2024675283,
+  "trade_count": 52,
+  "win_rate": 0.3846153846,
+  "signal_count": 849624,
+  "excluded_ticker_count": 0,
+  "excluded_tickers": [],
+  "execution_timing": "next_open",
+  "cost_model": {
+    "commission_pct": 0.00015,
+    "tax_pct": 0.0023,
+    "slippage_pct": 0.001
+  },
+  "position_sizing": {
+    "method": "equal_weight",
+    "max_positions": 10,
+    "fixed_percent": null,
+    "risk_per_position": null
+  },
+  "indicator_report": {
+    "mode": "required",
+    "enabled": true,
+    "requested_required_metrics": [
+      "rsi_14"
+    ],
+    "planned_functions": [
+      "RSI"
+    ],
+    "computed_function_count": 1,
+    "computed_functions": [
+      "RSI"
+    ],
+    "failed_functions": {},
+    "computed_metric_names": [
+      "rsi",
+      "rsi_14",
+      "rsi_real"
+    ],
+    "talib_version": "0.6.8",
+    "talib_function_count": 158,
+    "talib_calculable_from_ohlcv_count": 157,
+    "talib_skipped": {
+      "MAVP": [
+        "periods"
+      ]
+    }
+  },
+  "notes": [
+    "Signals are evaluated from end-of-day metrics; fills occur at the next available open.",
+    "TA-Lib metrics are calculated from OHLCV when enabled; precomputed metric rows override calculated values.",
+    "Tickers missing required StrategySpec metrics are excluded and recorded here."
+  ]
+}
