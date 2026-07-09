@@ -1,0 +1,1503 @@
+{
+  "landingSample": {
+    "heroStats": [
+      {
+        "value": "150+",
+        "label": "TA-Lib 지표"
+      },
+      {
+        "value": "10년",
+        "label": "백테스트 시계열"
+      },
+      {
+        "value": "8 노드",
+        "label": "LLM 멀티 에이전트"
+      },
+      {
+        "value": "08:00",
+        "label": "매일 자동 발송"
+      }
+    ],
+    "steps": [
+      {
+        "label": "STEP 1",
+        "title": "자연어 입력",
+        "description": "원하는 전략을 그대로 적어주세요. 조건식·코드 불필요.",
+        "example": [
+          "\"반도체 섹터에서 RSI 30 이하로",
+          "과매도된 종목 잡아줘\""
+        ]
+      },
+      {
+        "label": "STEP 2",
+        "title": "전략 정형화",
+        "description": "Research 에이전트가 정/반/합 토론으로 StrategySpec을 생성합니다.",
+        "example": [
+          "universe: KOSPI200·반도체",
+          "buy: RSI ≤ 30 AND vol > 200%"
+        ]
+      },
+      {
+        "label": "STEP 3",
+        "title": "후보 코드 백테스트",
+        "description": "10년 시계열로 후보 코드를 검증하고 objective score 기준으로 선택합니다.",
+        "example": [
+          "선택 후보 Sharpe 1.42",
+          "MDD -9.4% · Win Rate 58%"
+        ]
+      },
+      {
+        "label": "STEP 4",
+        "title": "리포트 발송",
+        "description": "매일 오전 8시 KOSPI200 추천 종목·근거를 이메일로 보내드립니다.",
+        "example": [
+          "BUY 삼성전자 0.91",
+          "DROP LG화학 0.41"
+        ]
+      }
+    ],
+    "reportPreview": {
+      "title": "반도체 모멘텀 강세 지속, 신규 BUY 2건 추가",
+      "date": "2026.04.18 · 08:00",
+      "score": "7.6",
+      "market": [
+        {
+          "label": "KOSPI",
+          "value": "2,654.21",
+          "tone": "positive"
+        },
+        {
+          "label": "외국인",
+          "value": "+2,140억",
+          "tone": "positive"
+        },
+        {
+          "label": "USD/KRW",
+          "value": "1,378.20"
+        },
+        {
+          "label": "VKOSPI",
+          "value": "15.4"
+        }
+      ],
+      "signals": [
+        {
+          "signal": "BUY",
+          "name": "삼성전자",
+          "ticker": "005930",
+          "score": "0.91"
+        },
+        {
+          "signal": "BUY",
+          "name": "SK하이닉스",
+          "ticker": "000660",
+          "score": "0.84"
+        },
+        {
+          "signal": "HOLD",
+          "name": "현대차",
+          "ticker": "005380",
+          "score": "0.62"
+        },
+        {
+          "signal": "DROP",
+          "name": "LG화학",
+          "ticker": "051910",
+          "score": "0.41"
+        }
+      ]
+    },
+    "comparisonRows": [
+      {
+        "item": "기술 지표",
+        "traditional": "부분 지원",
+        "terminal": "라이브러리 직접 구성",
+        "quantAgent": "TA-Lib 150개"
+      },
+      {
+        "item": "텍스트 뉴스",
+        "traditional": "수작업",
+        "terminal": "고가 단말",
+        "quantAgent": "LLM 자동 요약"
+      },
+      {
+        "item": "검증",
+        "traditional": "없음",
+        "terminal": "전문가 설정",
+        "quantAgent": "10년 백테스트"
+      },
+      {
+        "item": "비용",
+        "traditional": "수수료만",
+        "terminal": "월 수십만 원",
+        "quantAgent": "무료"
+      },
+      {
+        "item": "접근성",
+        "traditional": "전용 PC",
+        "terminal": "전용 단말기",
+        "quantAgent": "웹 브라우저"
+      }
+    ],
+    "principles": [
+      {
+        "label": "DATA",
+        "title": "검증 가능한 데이터 소스",
+        "description": "KIS Open API · DART · 한경컨센서스 · 에이전틱 서치. 4-레이어 데이터로 매수·매도 모두 근거를 제시합니다."
+      },
+      {
+        "label": "TRANSPARENCY",
+        "title": "투명한 거래비용 모델",
+        "description": "수수료 0.015% · 거래세 0.23% · 슬리피지 0.1%를 백테스트에 반영. walk-forward로 과적합도 방지합니다."
+      },
+      {
+        "label": "COMPLIANCE",
+        "title": "PIPA 준수 · 면책 명시",
+        "description": "개인정보보호법 명시 동의 수집. 모든 리포트에 \"투자 권유가 아닙니다\" 면책 조항을 포함합니다."
+      }
+    ],
+    "faqs": [
+      {
+        "question": "투자 권유인가요?",
+        "answer": "아니요. QuantAgent는 과거 데이터 기반 분석 도구이며, 모든 신호와 리포트는 투자 의사결정을 돕는 참고 자료입니다. 실제 매매·손익은 사용자 본인의 책임입니다."
+      },
+      {
+        "question": "왜 무료인가요?",
+        "answer": "초기 버전은 전략 입력, 백테스트, Daily 리포트 품질 검증을 위해 무료로 제공합니다."
+      },
+      {
+        "question": "내 자산 정보를 입력해야 하나요?",
+        "answer": "아니요. 현재 목업 범위는 전략 분석과 리포트 발송이며 자산 정보나 주문 권한을 요구하지 않습니다."
+      },
+      {
+        "question": "어떤 종목을 분석하나요?",
+        "answer": "현재 기준은 KOSPI200 현물이며, 전략 조건에 맞는 섹터와 종목 후보를 선별합니다."
+      },
+      {
+        "question": "리포트는 언제 받나요?",
+        "answer": "Daily 리포트는 매일 오전 8시에 생성되며, 마이페이지 알림 설정에서 이메일 수신 여부를 바꿀 수 있습니다."
+      }
+    ]
+  },
+  "activeStrategySpec": {
+    "name": "반도체 모멘텀 + 기관 매수 회귀",
+    "natural_language_strategy": "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
+    "universe": "KOSPI200 · 반도체",
+    "sector": "반도체",
+    "buy_condition": "RSI ≤ 30 AND 거래량 > 200%",
+    "hold_condition": "RSI 31~70 또는 주요 이벤트 대기",
+    "drop_condition": "RSI ≥ 70 OR 보유 30일",
+    "rebalance": "매일 08:00 분석 후 신호 갱신",
+    "constraints": [
+      "KOSPI200 현물만 지원",
+      "거래비용 0.015% / 0.23% / 0.1% 반영"
+    ]
+  },
+  "readyEnvelope": {
+    "status": "ready",
+    "trace_id": "qa-trace-20260418-0800",
+    "schema_version": "qa.ai_envelope.v1",
+    "user_payload": {
+      "active_tab": "overview"
+    },
+    "strategy_spec": {
+      "name": "반도체 모멘텀 + 기관 매수 회귀",
+      "natural_language_strategy": "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
+      "universe": "KOSPI200 · 반도체",
+      "sector": "반도체",
+      "buy_condition": "RSI ≤ 30 AND 거래량 > 200%",
+      "hold_condition": "RSI 31~70 또는 주요 이벤트 대기",
+      "drop_condition": "RSI ≥ 70 OR 보유 30일",
+      "rebalance": "매일 08:00 분석 후 신호 갱신",
+      "constraints": [
+        "KOSPI200 현물만 지원",
+        "거래비용 0.015% / 0.23% / 0.1% 반영"
+      ]
+    },
+    "debug_ref": "dbg_20260418_0800_semiconductor",
+    "retryable": true
+  },
+  "analysisJobStatus": {
+    "trace_id": "qa-trace-20260418-0800",
+    "status": "ready",
+    "stages": [
+      {
+        "stage": "strategy_parse",
+        "status": "done",
+        "label": "전략 정형화",
+        "updated_at": "2026-04-18T07:12:00+09:00"
+      },
+      {
+        "stage": "data_collect",
+        "status": "done",
+        "label": "KIS·DART·뉴스 수집",
+        "updated_at": "2026-04-18T07:29:00+09:00"
+      },
+      {
+        "stage": "signal_judge",
+        "status": "done",
+        "label": "신호 판정",
+        "updated_at": "2026-04-18T07:44:00+09:00"
+      },
+      {
+        "stage": "backtest",
+        "status": "done",
+        "label": "Walk-forward 백테스트",
+        "updated_at": "2026-04-18T07:52:00+09:00"
+      },
+      {
+        "stage": "risk_review",
+        "status": "done",
+        "label": "Risk Manager 검토",
+        "updated_at": "2026-04-18T07:57:00+09:00"
+      },
+      {
+        "stage": "report_ready",
+        "status": "done",
+        "label": "리포트 준비 완료",
+        "updated_at": "2026-04-18T08:00:00+09:00"
+      }
+    ]
+  },
+  "tradingCandidates": [
+    {
+      "id": "005930",
+      "ticker": "005930",
+      "name": "삼성전자",
+      "sector": "반도체",
+      "signal": "BUY",
+      "confidence": 0.91,
+      "score": 0.91,
+      "price": "82,400원",
+      "changePercent": "+1.7%",
+      "rationale": "메모리 사이클 회복 + 외국인 5일 연속 순매수. 컨센서스 9.2만원 상향.",
+      "evidence": [
+        {
+          "provider": "미래에셋증권",
+          "title": "HBM 공급 개선과 서버 DRAM 회복",
+          "date": "04.17",
+          "summary": "메모리 가격 반등과 외국인 순매수가 동시에 확인됨."
+        }
+      ],
+      "riskReasons": [
+        "단기 환율 변동성",
+        "실적 발표 전 변동성 확대 가능"
+      ],
+      "web_projection": "AI 서버 수요 회복 가정 시 2분기 마진 개선 가능성이 높음"
+    },
+    {
+      "id": "000660",
+      "ticker": "000660",
+      "name": "SK하이닉스",
+      "sector": "반도체",
+      "signal": "BUY",
+      "confidence": 0.84,
+      "score": 0.84,
+      "price": "201,500원",
+      "changePercent": "+2.4%",
+      "rationale": "HBM3E 12단 양산 본격화. NVIDIA 공급 확대 모멘텀, 분기 영업이익 컨센 상향.",
+      "evidence": [
+        {
+          "provider": "삼성증권",
+          "title": "HBM 실적 민감도 상향",
+          "date": "04.17",
+          "summary": "HBM 매출 비중 확대와 기관 매수 전환 확인."
+        }
+      ],
+      "riskReasons": [
+        "고밸류 부담",
+        "고객사 발주 지연 가능성"
+      ]
+    },
+    {
+      "id": "035420",
+      "ticker": "035420",
+      "name": "NAVER",
+      "sector": "플랫폼",
+      "signal": "BUY",
+      "confidence": 0.78,
+      "score": 0.78,
+      "price": "187,000원",
+      "changePercent": "+0.9%",
+      "rationale": "커머스 사업 회복 + AI 검색 베타 호조. 외국인 3일 연속 순매수 전환.",
+      "evidence": [
+        {
+          "provider": "한국투자증권",
+          "title": "커머스·AI 검색 회복",
+          "date": "04.16",
+          "summary": "광고 단가와 커머스 거래액 반등이 확인됨."
+        }
+      ],
+      "riskReasons": [
+        "광고 경기 둔화",
+        "AI 서비스 비용 증가"
+      ]
+    },
+    {
+      "id": "035720",
+      "ticker": "035720",
+      "name": "카카오",
+      "sector": "플랫폼",
+      "signal": "BUY",
+      "confidence": 0.72,
+      "score": 0.72,
+      "price": "54,200원",
+      "changePercent": "+1.3%",
+      "rationale": "광고·결제 사업부 흑자 전환. AI 모델 카카오브레인 적용 발표 호재.",
+      "evidence": [
+        {
+          "provider": "NH투자증권",
+          "title": "비용 통제와 AI 적용",
+          "date": "04.17",
+          "summary": "비용 효율화와 신사업 모멘텀이 동시에 반영됨."
+        }
+      ],
+      "riskReasons": [
+        "규제 리스크",
+        "플랫폼 성장률 둔화"
+      ]
+    },
+    {
+      "id": "005380",
+      "ticker": "005380",
+      "name": "현대차",
+      "sector": "자동차",
+      "signal": "HOLD",
+      "confidence": 0.62,
+      "score": 0.62,
+      "price": "247,000원",
+      "changePercent": "+0.2%",
+      "rationale": "1Q 실적 양호하나 미국 IRA 관련 불확실성 잔존. 보유 유지 권고.",
+      "evidence": [
+        {
+          "provider": "KB증권",
+          "title": "북미 판매 견조",
+          "date": "04.16",
+          "summary": "판매는 견조하지만 정책 변수 확인이 필요함."
+        }
+      ],
+      "riskReasons": [
+        "IRA 보조금 정책 변경",
+        "원화 강세 시 마진 둔화"
+      ]
+    },
+    {
+      "id": "000270",
+      "ticker": "000270",
+      "name": "기아",
+      "sector": "자동차",
+      "signal": "HOLD",
+      "confidence": 0.58,
+      "score": 0.58,
+      "price": "128,500원",
+      "changePercent": "+0.1%",
+      "rationale": "북미 판매 견조하나 환율 변동성 확대. 추가 매수보다 보유 중심.",
+      "evidence": [
+        {
+          "provider": "하나증권",
+          "title": "판매 믹스 양호",
+          "date": "04.16",
+          "summary": "실적 안정성은 유지되나 신규 매수 점수는 낮음."
+        }
+      ],
+      "riskReasons": [
+        "환율 변동성",
+        "원가 상승 압력"
+      ]
+    },
+    {
+      "id": "051910",
+      "ticker": "051910",
+      "name": "LG화학",
+      "sector": "화학",
+      "signal": "DROP",
+      "confidence": 0.41,
+      "score": 0.41,
+      "price": "342,500원",
+      "changePercent": "-1.8%",
+      "rationale": "외국인 5일 연속 순매도 + 한경컨센서스 매수 의견 3주 누적 하향. 양극재 분할설 부담.",
+      "evidence": [
+        {
+          "provider": "한경컨센서스",
+          "title": "매수 의견 하향",
+          "date": "04.17",
+          "summary": "컨센서스 하향과 수급 약세가 동시에 관측됨."
+        }
+      ],
+      "riskReasons": [
+        "양극재 ASP 하락",
+        "사업부 분할 이슈"
+      ],
+      "risk_manager_override": "override 없음: Rule-based macro guard 안전 구간"
+    },
+    {
+      "id": "003670",
+      "ticker": "003670",
+      "name": "포스코퓨처엠",
+      "sector": "2차전지소재",
+      "signal": "DROP",
+      "confidence": 0.38,
+      "score": 0.38,
+      "price": "289,000원",
+      "changePercent": "-2.4%",
+      "rationale": "양극재 ASP 하락 압력. 외국인 4일 연속 순매도, 기술적 200일선 이탈.",
+      "evidence": [
+        {
+          "provider": "신한투자증권",
+          "title": "소재 업황 둔화",
+          "date": "04.16",
+          "summary": "업황 회복 신호가 약하고 기술적 지지선 이탈."
+        }
+      ],
+      "riskReasons": [
+        "ASP 하락",
+        "외국인 순매도"
+      ]
+    }
+  ],
+  "performanceSummary": {
+    "headline": "백테스트 결과",
+    "period": "Walk-forward · IS 18M / OOS 3M · 2016.01 ~ 2026.03",
+    "metrics": [
+      {
+        "key": "sharpe",
+        "label": "Sharpe Ratio",
+        "value": "1.42",
+        "delta": "기준선 1.11",
+        "tone": "positive",
+        "caption": "Walk-forward 평균. 1.5 이상이 우수."
+      },
+      {
+        "key": "mdd",
+        "label": "Max Drawdown",
+        "value": "-9.4%",
+        "delta": "기준선 -12.1%",
+        "tone": "negative",
+        "caption": "감내 가능한 수준. 시장 평균 -15% 대비 양호."
+      },
+      {
+        "key": "winRate",
+        "label": "Win Rate",
+        "value": "58.2%",
+        "delta": "+3.4pp",
+        "tone": "positive",
+        "caption": "수익 거래 비율. 10년 누적 1,247 거래."
+      },
+      {
+        "key": "totalReturn",
+        "label": "Total Return (10y)",
+        "value": "+92.4%",
+        "delta": "CAGR 6.8%",
+        "tone": "positive",
+        "caption": "거래비용 반영. KOSPI200 동기간 +54.3%."
+      }
+    ],
+    "equityCurve": [
+      {
+        "date": "2016",
+        "strategy": 0,
+        "original": 0,
+        "benchmark": 0
+      },
+      {
+        "date": "2018",
+        "strategy": 18,
+        "original": 14,
+        "benchmark": 9
+      },
+      {
+        "date": "2020",
+        "strategy": 35,
+        "original": 27,
+        "benchmark": 21
+      },
+      {
+        "date": "2022",
+        "strategy": 52,
+        "original": 38,
+        "benchmark": 30
+      },
+      {
+        "date": "2024",
+        "strategy": 68,
+        "original": 51,
+        "benchmark": 43
+      },
+      {
+        "date": "2026",
+        "strategy": 92.4,
+        "original": 70.1,
+        "benchmark": 54.3
+      }
+    ],
+    "comparison": [
+      {
+        "metric": "Sharpe",
+        "value": "1.42",
+        "context": "리스크 대비 수익",
+        "assessment": "양호",
+        "tone": "positive"
+      },
+      {
+        "metric": "MDD",
+        "value": "-9.4%",
+        "context": "최대 낙폭",
+        "assessment": "방어 양호",
+        "tone": "positive"
+      },
+      {
+        "metric": "Win Rate",
+        "value": "58.2%",
+        "context": "수익 거래 비율",
+        "assessment": "양호",
+        "tone": "positive"
+      },
+      {
+        "metric": "Total Return",
+        "value": "+92.4%",
+        "context": "10년 누적",
+        "assessment": "초과수익",
+        "tone": "positive"
+      },
+      {
+        "metric": "Trades",
+        "value": "1,247회",
+        "context": "엔진 요약",
+        "assessment": "거래 충분",
+        "tone": "positive"
+      }
+    ],
+    "macroEvents": [
+      {
+        "date": "20.03",
+        "label": "코로나19 패닉, KOSPI -33%",
+        "impact": "+α",
+        "tone": "positive"
+      },
+      {
+        "date": "22.02",
+        "label": "러시아 우크라이나 침공",
+        "impact": "-α",
+        "tone": "negative"
+      },
+      {
+        "date": "22.10",
+        "label": "美 연준 4연속 자이언트 스텝",
+        "impact": "-α",
+        "tone": "negative"
+      },
+      {
+        "date": "23.10",
+        "label": "이스라엘·하마스 무력 충돌",
+        "impact": "≈",
+        "tone": "warning"
+      },
+      {
+        "date": "24.08",
+        "label": "엔캐리 청산, 글로벌 변동성",
+        "impact": "+α",
+        "tone": "positive"
+      },
+      {
+        "date": "25.04",
+        "label": "美 상호관세 발표",
+        "impact": "-α",
+        "tone": "negative"
+      }
+    ],
+    "disclaimer": "Walk-forward 6개 윈도우 평균. OOS 구간 신뢰구간 ±2.1%pp. 미래 수익률을 보장하지 않으며, 거래비용은 수수료 0.015% · 거래세 0.23% · 슬리피지 0.1% 반영."
+  },
+  "appOverview": {
+    "strategy": {
+      "name": "반도체 모멘텀 + 기관 매수 회귀",
+      "natural_language_strategy": "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
+      "universe": "KOSPI200 · 반도체",
+      "sector": "반도체",
+      "buy_condition": "RSI ≤ 30 AND 거래량 > 200%",
+      "hold_condition": "RSI 31~70 또는 주요 이벤트 대기",
+      "drop_condition": "RSI ≥ 70 OR 보유 30일",
+      "rebalance": "매일 08:00 분석 후 신호 갱신",
+      "constraints": [
+        "KOSPI200 현물만 지원",
+        "거래비용 0.015% / 0.23% / 0.1% 반영"
+      ]
+    },
+    "recommendationScore": "7.6 / 10",
+    "recommendationDelta": "+0.4",
+    "passCount": 4,
+    "buyCount": 4,
+    "holdCount": 4,
+    "dropCount": 2,
+    "latestRunLabel": "최신 분석 · 오늘 08:00",
+    "nextRunLabel": "내일 08:00",
+    "chatMessages": [
+      {
+        "id": "m1",
+        "sender": "system",
+        "label": "SYSTEM",
+        "time": "오늘 08:00",
+        "body": "오늘의 분석이 완료되었습니다. 추천 종목 4건 (BUY 2, HOLD 1, DROP 1), 권장도 7.6 / 10. 우측 대시보드에서 상세 결과를 확인하세요."
+      },
+      {
+        "id": "m2",
+        "sender": "user",
+        "label": "나",
+        "time": "오늘 09:14",
+        "body": "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘"
+      },
+      {
+        "id": "m3",
+        "sender": "agent",
+        "label": "AGENT",
+        "time": "방금 전 · 분석 완료",
+        "body": "반도체 섹터 8개 종목에서 RSI ≤ 30 + 거래량 200% 이상 조건으로 스크리닝했습니다.",
+        "stats": [
+          {
+            "label": "통과 종목",
+            "value": "3"
+          },
+          {
+            "label": "BUY 신호",
+            "value": "2"
+          },
+          {
+            "label": "권장도",
+            "value": "7.8"
+          }
+        ]
+      }
+    ],
+    "candidates": [
+      {
+        "id": "005930",
+        "ticker": "005930",
+        "name": "삼성전자",
+        "sector": "반도체",
+        "signal": "BUY",
+        "confidence": 0.91,
+        "score": 0.91,
+        "price": "82,400원",
+        "changePercent": "+1.7%",
+        "rationale": "메모리 사이클 회복 + 외국인 5일 연속 순매수. 컨센서스 9.2만원 상향.",
+        "evidence": [
+          {
+            "provider": "미래에셋증권",
+            "title": "HBM 공급 개선과 서버 DRAM 회복",
+            "date": "04.17",
+            "summary": "메모리 가격 반등과 외국인 순매수가 동시에 확인됨."
+          }
+        ],
+        "riskReasons": [
+          "단기 환율 변동성",
+          "실적 발표 전 변동성 확대 가능"
+        ],
+        "web_projection": "AI 서버 수요 회복 가정 시 2분기 마진 개선 가능성이 높음"
+      },
+      {
+        "id": "000660",
+        "ticker": "000660",
+        "name": "SK하이닉스",
+        "sector": "반도체",
+        "signal": "BUY",
+        "confidence": 0.84,
+        "score": 0.84,
+        "price": "201,500원",
+        "changePercent": "+2.4%",
+        "rationale": "HBM3E 12단 양산 본격화. NVIDIA 공급 확대 모멘텀, 분기 영업이익 컨센 상향.",
+        "evidence": [
+          {
+            "provider": "삼성증권",
+            "title": "HBM 실적 민감도 상향",
+            "date": "04.17",
+            "summary": "HBM 매출 비중 확대와 기관 매수 전환 확인."
+          }
+        ],
+        "riskReasons": [
+          "고밸류 부담",
+          "고객사 발주 지연 가능성"
+        ]
+      },
+      {
+        "id": "035420",
+        "ticker": "035420",
+        "name": "NAVER",
+        "sector": "플랫폼",
+        "signal": "BUY",
+        "confidence": 0.78,
+        "score": 0.78,
+        "price": "187,000원",
+        "changePercent": "+0.9%",
+        "rationale": "커머스 사업 회복 + AI 검색 베타 호조. 외국인 3일 연속 순매수 전환.",
+        "evidence": [
+          {
+            "provider": "한국투자증권",
+            "title": "커머스·AI 검색 회복",
+            "date": "04.16",
+            "summary": "광고 단가와 커머스 거래액 반등이 확인됨."
+          }
+        ],
+        "riskReasons": [
+          "광고 경기 둔화",
+          "AI 서비스 비용 증가"
+        ]
+      },
+      {
+        "id": "035720",
+        "ticker": "035720",
+        "name": "카카오",
+        "sector": "플랫폼",
+        "signal": "BUY",
+        "confidence": 0.72,
+        "score": 0.72,
+        "price": "54,200원",
+        "changePercent": "+1.3%",
+        "rationale": "광고·결제 사업부 흑자 전환. AI 모델 카카오브레인 적용 발표 호재.",
+        "evidence": [
+          {
+            "provider": "NH투자증권",
+            "title": "비용 통제와 AI 적용",
+            "date": "04.17",
+            "summary": "비용 효율화와 신사업 모멘텀이 동시에 반영됨."
+          }
+        ],
+        "riskReasons": [
+          "규제 리스크",
+          "플랫폼 성장률 둔화"
+        ]
+      },
+      {
+        "id": "005380",
+        "ticker": "005380",
+        "name": "현대차",
+        "sector": "자동차",
+        "signal": "HOLD",
+        "confidence": 0.62,
+        "score": 0.62,
+        "price": "247,000원",
+        "changePercent": "+0.2%",
+        "rationale": "1Q 실적 양호하나 미국 IRA 관련 불확실성 잔존. 보유 유지 권고.",
+        "evidence": [
+          {
+            "provider": "KB증권",
+            "title": "북미 판매 견조",
+            "date": "04.16",
+            "summary": "판매는 견조하지만 정책 변수 확인이 필요함."
+          }
+        ],
+        "riskReasons": [
+          "IRA 보조금 정책 변경",
+          "원화 강세 시 마진 둔화"
+        ]
+      },
+      {
+        "id": "000270",
+        "ticker": "000270",
+        "name": "기아",
+        "sector": "자동차",
+        "signal": "HOLD",
+        "confidence": 0.58,
+        "score": 0.58,
+        "price": "128,500원",
+        "changePercent": "+0.1%",
+        "rationale": "북미 판매 견조하나 환율 변동성 확대. 추가 매수보다 보유 중심.",
+        "evidence": [
+          {
+            "provider": "하나증권",
+            "title": "판매 믹스 양호",
+            "date": "04.16",
+            "summary": "실적 안정성은 유지되나 신규 매수 점수는 낮음."
+          }
+        ],
+        "riskReasons": [
+          "환율 변동성",
+          "원가 상승 압력"
+        ]
+      },
+      {
+        "id": "051910",
+        "ticker": "051910",
+        "name": "LG화학",
+        "sector": "화학",
+        "signal": "DROP",
+        "confidence": 0.41,
+        "score": 0.41,
+        "price": "342,500원",
+        "changePercent": "-1.8%",
+        "rationale": "외국인 5일 연속 순매도 + 한경컨센서스 매수 의견 3주 누적 하향. 양극재 분할설 부담.",
+        "evidence": [
+          {
+            "provider": "한경컨센서스",
+            "title": "매수 의견 하향",
+            "date": "04.17",
+            "summary": "컨센서스 하향과 수급 약세가 동시에 관측됨."
+          }
+        ],
+        "riskReasons": [
+          "양극재 ASP 하락",
+          "사업부 분할 이슈"
+        ],
+        "risk_manager_override": "override 없음: Rule-based macro guard 안전 구간"
+      },
+      {
+        "id": "003670",
+        "ticker": "003670",
+        "name": "포스코퓨처엠",
+        "sector": "2차전지소재",
+        "signal": "DROP",
+        "confidence": 0.38,
+        "score": 0.38,
+        "price": "289,000원",
+        "changePercent": "-2.4%",
+        "rationale": "양극재 ASP 하락 압력. 외국인 4일 연속 순매도, 기술적 200일선 이탈.",
+        "evidence": [
+          {
+            "provider": "신한투자증권",
+            "title": "소재 업황 둔화",
+            "date": "04.16",
+            "summary": "업황 회복 신호가 약하고 기술적 지지선 이탈."
+          }
+        ],
+        "riskReasons": [
+          "ASP 하락",
+          "외국인 순매도"
+        ]
+      }
+    ],
+    "performance": {
+      "headline": "백테스트 결과",
+      "period": "Walk-forward · IS 18M / OOS 3M · 2016.01 ~ 2026.03",
+      "metrics": [
+        {
+          "key": "sharpe",
+          "label": "Sharpe Ratio",
+          "value": "1.42",
+          "delta": "기준선 1.11",
+          "tone": "positive",
+          "caption": "Walk-forward 평균. 1.5 이상이 우수."
+        },
+        {
+          "key": "mdd",
+          "label": "Max Drawdown",
+          "value": "-9.4%",
+          "delta": "기준선 -12.1%",
+          "tone": "negative",
+          "caption": "감내 가능한 수준. 시장 평균 -15% 대비 양호."
+        },
+        {
+          "key": "winRate",
+          "label": "Win Rate",
+          "value": "58.2%",
+          "delta": "+3.4pp",
+          "tone": "positive",
+          "caption": "수익 거래 비율. 10년 누적 1,247 거래."
+        },
+        {
+          "key": "totalReturn",
+          "label": "Total Return (10y)",
+          "value": "+92.4%",
+          "delta": "CAGR 6.8%",
+          "tone": "positive",
+          "caption": "거래비용 반영. KOSPI200 동기간 +54.3%."
+        }
+      ],
+      "equityCurve": [
+        {
+          "date": "2016",
+          "strategy": 0,
+          "original": 0,
+          "benchmark": 0
+        },
+        {
+          "date": "2018",
+          "strategy": 18,
+          "original": 14,
+          "benchmark": 9
+        },
+        {
+          "date": "2020",
+          "strategy": 35,
+          "original": 27,
+          "benchmark": 21
+        },
+        {
+          "date": "2022",
+          "strategy": 52,
+          "original": 38,
+          "benchmark": 30
+        },
+        {
+          "date": "2024",
+          "strategy": 68,
+          "original": 51,
+          "benchmark": 43
+        },
+        {
+          "date": "2026",
+          "strategy": 92.4,
+          "original": 70.1,
+          "benchmark": 54.3
+        }
+      ],
+      "comparison": [
+        {
+          "metric": "Sharpe",
+          "value": "1.42",
+          "context": "리스크 대비 수익",
+          "assessment": "양호",
+          "tone": "positive"
+        },
+        {
+          "metric": "MDD",
+          "value": "-9.4%",
+          "context": "최대 낙폭",
+          "assessment": "방어 양호",
+          "tone": "positive"
+        },
+        {
+          "metric": "Win Rate",
+          "value": "58.2%",
+          "context": "수익 거래 비율",
+          "assessment": "양호",
+          "tone": "positive"
+        },
+        {
+          "metric": "Total Return",
+          "value": "+92.4%",
+          "context": "10년 누적",
+          "assessment": "초과수익",
+          "tone": "positive"
+        },
+        {
+          "metric": "Trades",
+          "value": "1,247회",
+          "context": "엔진 요약",
+          "assessment": "거래 충분",
+          "tone": "positive"
+        }
+      ],
+      "macroEvents": [
+        {
+          "date": "20.03",
+          "label": "코로나19 패닉, KOSPI -33%",
+          "impact": "+α",
+          "tone": "positive"
+        },
+        {
+          "date": "22.02",
+          "label": "러시아 우크라이나 침공",
+          "impact": "-α",
+          "tone": "negative"
+        },
+        {
+          "date": "22.10",
+          "label": "美 연준 4연속 자이언트 스텝",
+          "impact": "-α",
+          "tone": "negative"
+        },
+        {
+          "date": "23.10",
+          "label": "이스라엘·하마스 무력 충돌",
+          "impact": "≈",
+          "tone": "warning"
+        },
+        {
+          "date": "24.08",
+          "label": "엔캐리 청산, 글로벌 변동성",
+          "impact": "+α",
+          "tone": "positive"
+        },
+        {
+          "date": "25.04",
+          "label": "美 상호관세 발표",
+          "impact": "-α",
+          "tone": "negative"
+        }
+      ],
+      "disclaimer": "Walk-forward 6개 윈도우 평균. OOS 구간 신뢰구간 ±2.1%pp. 미래 수익률을 보장하지 않으며, 거래비용은 수수료 0.015% · 거래세 0.23% · 슬리피지 0.1% 반영."
+    },
+    "recentReports": [],
+    "envelope": {
+      "status": "ready",
+      "trace_id": "qa-trace-20260418-0800",
+      "schema_version": "qa.ai_envelope.v1",
+      "user_payload": {
+        "active_tab": "overview"
+      },
+      "strategy_spec": {
+        "name": "반도체 모멘텀 + 기관 매수 회귀",
+        "natural_language_strategy": "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
+        "universe": "KOSPI200 · 반도체",
+        "sector": "반도체",
+        "buy_condition": "RSI ≤ 30 AND 거래량 > 200%",
+        "hold_condition": "RSI 31~70 또는 주요 이벤트 대기",
+        "drop_condition": "RSI ≥ 70 OR 보유 30일",
+        "rebalance": "매일 08:00 분석 후 신호 갱신",
+        "constraints": [
+          "KOSPI200 현물만 지원",
+          "거래비용 0.015% / 0.23% / 0.1% 반영"
+        ]
+      },
+      "debug_ref": "dbg_20260418_0800_semiconductor",
+      "retryable": true
+    },
+    "jobStatus": {
+      "trace_id": "qa-trace-20260418-0800",
+      "status": "ready",
+      "stages": [
+        {
+          "stage": "strategy_parse",
+          "status": "done",
+          "label": "전략 정형화",
+          "updated_at": "2026-04-18T07:12:00+09:00"
+        },
+        {
+          "stage": "data_collect",
+          "status": "done",
+          "label": "KIS·DART·뉴스 수집",
+          "updated_at": "2026-04-18T07:29:00+09:00"
+        },
+        {
+          "stage": "signal_judge",
+          "status": "done",
+          "label": "신호 판정",
+          "updated_at": "2026-04-18T07:44:00+09:00"
+        },
+        {
+          "stage": "backtest",
+          "status": "done",
+          "label": "Walk-forward 백테스트",
+          "updated_at": "2026-04-18T07:52:00+09:00"
+        },
+        {
+          "stage": "risk_review",
+          "status": "done",
+          "label": "Risk Manager 검토",
+          "updated_at": "2026-04-18T07:57:00+09:00"
+        },
+        {
+          "stage": "report_ready",
+          "status": "done",
+          "label": "리포트 준비 완료",
+          "updated_at": "2026-04-18T08:00:00+09:00"
+        }
+      ]
+    }
+  },
+  "reportSummaries": [
+    {
+      "id": "2026-04-18",
+      "date": "2026.04.18",
+      "weekday": "목요일",
+      "sentAt": "오전 8:00 발송",
+      "title": "반도체 모멘텀 강세 지속, 신규 BUY 2건 추가",
+      "summary": "메모리 사이클 회복 + 외국인 5일 연속 순매수로 반도체 섹터 BUY 신호가 강화됐고, LG화학은 사업부 분할 이슈로 DROP.",
+      "status": "sent",
+      "strategyName": "반도체 모멘텀 + 기관 매수",
+      "recommendationScore": "7.6",
+      "signals": {
+        "BUY": 2,
+        "HOLD": 1,
+        "DROP": 1
+      },
+      "marketSnapshot": [
+        {
+          "label": "KOSPI",
+          "value": "2,654.21 (+0.84%)",
+          "tone": "positive"
+        },
+        {
+          "label": "외국인",
+          "value": "+2,140억",
+          "tone": "positive"
+        },
+        {
+          "label": "USD/KRW",
+          "value": "1,378.20"
+        },
+        {
+          "label": "VKOSPI",
+          "value": "15.4"
+        }
+      ]
+    },
+    {
+      "id": "2026-04-17",
+      "date": "04.17",
+      "weekday": "수요일",
+      "sentAt": "오전 8:00",
+      "title": "전일 후보 조정, SK하이닉스 BUY 유지",
+      "summary": "외국인 4일 연속 순매수 지속. LG화학 DROP 추가, 양극재 분할설 부담.",
+      "status": "sent",
+      "strategyName": "반도체 모멘텀 + 기관 매수",
+      "recommendationScore": "7.4",
+      "signals": {
+        "BUY": 2,
+        "HOLD": 1,
+        "DROP": 1
+      },
+      "marketSnapshot": [
+        {
+          "label": "KOSPI",
+          "value": "+0.42%",
+          "tone": "positive"
+        },
+        {
+          "label": "외국인",
+          "value": "+1,820억",
+          "tone": "positive"
+        }
+      ]
+    },
+    {
+      "id": "2026-04-16",
+      "date": "04.16",
+      "weekday": "화요일",
+      "sentAt": "오전 8:00",
+      "title": "1Q 실적 시즌 본격화",
+      "summary": "현대차 호실적 후 HOLD 권고, 삼성전자 매수 신호 강화. KOSPI +0.42%.",
+      "status": "sent",
+      "strategyName": "반도체 모멘텀 + 기관 매수",
+      "recommendationScore": "7.1",
+      "signals": {
+        "BUY": 2,
+        "HOLD": 2,
+        "DROP": 0
+      },
+      "marketSnapshot": [
+        {
+          "label": "KOSPI",
+          "value": "+0.42%",
+          "tone": "positive"
+        }
+      ]
+    },
+    {
+      "id": "2026-04-15",
+      "date": "04.15",
+      "weekday": "월요일",
+      "sentAt": "오전 8:00",
+      "title": "주말 美 시장 강세, KOSPI 갭상승",
+      "summary": "반도체 섹터 전반 BUY, 화학 섹터 HOLD. 외국인 순매수 전환.",
+      "status": "sent",
+      "strategyName": "반도체 모멘텀 + 기관 매수",
+      "recommendationScore": "7.8",
+      "signals": {
+        "BUY": 3,
+        "HOLD": 1,
+        "DROP": 0
+      },
+      "marketSnapshot": [
+        {
+          "label": "KOSPI",
+          "value": "+0.67%",
+          "tone": "positive"
+        }
+      ]
+    },
+    {
+      "id": "2026-04-12",
+      "date": "04.12",
+      "weekday": "금요일",
+      "sentAt": "오전 8:00",
+      "title": "美 연준 6월 동결 시사",
+      "summary": "위험자산 선호 회복. 신규 BUY 종목 2건 추가, 1건 DROP 교체.",
+      "status": "sent",
+      "strategyName": "반도체 모멘텀 + 기관 매수",
+      "recommendationScore": "6.9",
+      "signals": {
+        "BUY": 2,
+        "HOLD": 1,
+        "DROP": 1
+      },
+      "marketSnapshot": [
+        {
+          "label": "KOSPI",
+          "value": "+0.31%",
+          "tone": "positive"
+        }
+      ]
+    },
+    {
+      "id": "2026-04-11",
+      "date": "04.11",
+      "weekday": "목요일",
+      "sentAt": "오전 8:00",
+      "title": "환율 변동성 확대",
+      "summary": "Risk Manager가 BUY confidence 0.7 cap 적용. HOLD 비중 증가.",
+      "status": "sent",
+      "strategyName": "반도체 모멘텀 + 기관 매수",
+      "recommendationScore": "6.2",
+      "signals": {
+        "BUY": 1,
+        "HOLD": 2,
+        "DROP": 1
+      },
+      "marketSnapshot": [
+        {
+          "label": "USD/KRW",
+          "value": "+0.78%",
+          "tone": "warning"
+        }
+      ]
+    },
+    {
+      "id": "2026-04-10",
+      "date": "04.10",
+      "weekday": "수요일",
+      "sentAt": "오전 8:00",
+      "title": "VKOSPI 30 돌파, macro override 발동",
+      "summary": "모든 신규 BUY 신호 HOLD로 강등. 시장 안정화 대기 권고.",
+      "status": "sent",
+      "strategyName": "반도체 모멘텀 + 기관 매수",
+      "recommendationScore": "5.8",
+      "signals": {
+        "BUY": 0,
+        "HOLD": 3,
+        "DROP": 1
+      },
+      "marketSnapshot": [
+        {
+          "label": "VKOSPI",
+          "value": "30.4",
+          "tone": "negative"
+        }
+      ]
+    }
+  ],
+  "reportDetails": [
+    {
+      "id": "2026-04-18",
+      "date": "2026.04.18",
+      "weekday": "목요일",
+      "sentAt": "오전 8:00 발송",
+      "title": "반도체 모멘텀 강세 지속, 신규 BUY 2건 추가",
+      "summary": "메모리 사이클 회복 + 외국인 5일 연속 순매수로 반도체 섹터 BUY 신호가 강화됐고, LG화학은 사업부 분할 이슈로 DROP.",
+      "status": "sent",
+      "strategyName": "반도체 모멘텀 + 기관 매수",
+      "recommendationScore": "7.6",
+      "signals": {
+        "BUY": 2,
+        "HOLD": 1,
+        "DROP": 1
+      },
+      "marketSnapshot": [
+        {
+          "label": "KOSPI",
+          "value": "2,654.21 (+0.84%)",
+          "tone": "positive"
+        },
+        {
+          "label": "외국인",
+          "value": "+2,140억",
+          "tone": "positive"
+        },
+        {
+          "label": "USD/KRW",
+          "value": "1,378.20"
+        },
+        {
+          "label": "VKOSPI",
+          "value": "15.4"
+        }
+      ],
+      "recipient": "홍길동 님께",
+      "marketBrief": "전일 KOSPI는 메모리 사이클 회복 기대로 +0.84% 상승. 외국인 5일 연속 순매수, 환율 안정세. 반도체 섹터 전반에 매수 신호가 강화됐고, 화학 섹터 일부에서 추세 약세가 관측됩니다.",
+      "news": [
+        {
+          "rank": 1,
+          "title": "반도체 업황 저점 통과, HBM 수요 확대 전망",
+          "source": "연합뉴스",
+          "tone": "positive"
+        },
+        {
+          "rank": 2,
+          "title": "외국인 KOSPI 5일 연속 순매수",
+          "source": "한국경제",
+          "tone": "positive"
+        },
+        {
+          "rank": 3,
+          "title": "원화 환율 안정세, 수출주 선호 유지",
+          "source": "Reuters",
+          "tone": "neutral"
+        },
+        {
+          "rank": 4,
+          "title": "LG화학, 양극재 ASP 하락 우려 확대",
+          "source": "한경컨센서스",
+          "tone": "negative"
+        },
+        {
+          "rank": 5,
+          "title": "현대차 1Q 호실적에도 IRA 변수",
+          "source": "DART",
+          "tone": "warning"
+        }
+      ],
+      "candidates": [
+        {
+          "id": "005930",
+          "ticker": "005930",
+          "name": "삼성전자",
+          "sector": "반도체",
+          "signal": "BUY",
+          "confidence": 0.91,
+          "score": 0.91,
+          "price": "82,400원",
+          "changePercent": "+1.7%",
+          "rationale": "메모리 사이클 회복 + 외국인 5일 연속 순매수. 컨센서스 9.2만원 상향.",
+          "evidence": [
+            {
+              "provider": "미래에셋증권",
+              "title": "HBM 공급 개선과 서버 DRAM 회복",
+              "date": "04.17",
+              "summary": "메모리 가격 반등과 외국인 순매수가 동시에 확인됨."
+            }
+          ],
+          "riskReasons": [
+            "단기 환율 변동성",
+            "실적 발표 전 변동성 확대 가능"
+          ],
+          "web_projection": "AI 서버 수요 회복 가정 시 2분기 마진 개선 가능성이 높음"
+        },
+        {
+          "id": "000660",
+          "ticker": "000660",
+          "name": "SK하이닉스",
+          "sector": "반도체",
+          "signal": "BUY",
+          "confidence": 0.84,
+          "score": 0.84,
+          "price": "201,500원",
+          "changePercent": "+2.4%",
+          "rationale": "HBM3E 12단 양산 본격화. NVIDIA 공급 확대 모멘텀, 분기 영업이익 컨센 상향.",
+          "evidence": [
+            {
+              "provider": "삼성증권",
+              "title": "HBM 실적 민감도 상향",
+              "date": "04.17",
+              "summary": "HBM 매출 비중 확대와 기관 매수 전환 확인."
+            }
+          ],
+          "riskReasons": [
+            "고밸류 부담",
+            "고객사 발주 지연 가능성"
+          ]
+        },
+        {
+          "id": "005380",
+          "ticker": "005380",
+          "name": "현대차",
+          "sector": "자동차",
+          "signal": "HOLD",
+          "confidence": 0.62,
+          "score": 0.62,
+          "price": "247,000원",
+          "changePercent": "+0.2%",
+          "rationale": "1Q 실적 양호하나 미국 IRA 관련 불확실성 잔존. 보유 유지 권고.",
+          "evidence": [
+            {
+              "provider": "KB증권",
+              "title": "북미 판매 견조",
+              "date": "04.16",
+              "summary": "판매는 견조하지만 정책 변수 확인이 필요함."
+            }
+          ],
+          "riskReasons": [
+            "IRA 보조금 정책 변경",
+            "원화 강세 시 마진 둔화"
+          ]
+        },
+        {
+          "id": "051910",
+          "ticker": "051910",
+          "name": "LG화학",
+          "sector": "화학",
+          "signal": "DROP",
+          "confidence": 0.41,
+          "score": 0.41,
+          "price": "342,500원",
+          "changePercent": "-1.8%",
+          "rationale": "외국인 5일 연속 순매도 + 한경컨센서스 매수 의견 3주 누적 하향. 양극재 분할설 부담.",
+          "evidence": [
+            {
+              "provider": "한경컨센서스",
+              "title": "매수 의견 하향",
+              "date": "04.17",
+              "summary": "컨센서스 하향과 수급 약세가 동시에 관측됨."
+            }
+          ],
+          "riskReasons": [
+            "양극재 ASP 하락",
+            "사업부 분할 이슈"
+          ],
+          "risk_manager_override": "override 없음: Rule-based macro guard 안전 구간"
+        }
+      ],
+      "signalAxes": [
+        {
+          "label": "축 1",
+          "weight": "0.35",
+          "title": "호재 (Bull)",
+          "description": "기술적 패턴 · 모멘텀 · 거래량"
+        },
+        {
+          "label": "축 2",
+          "weight": "0.35",
+          "title": "악재 (Bear)",
+          "description": "기술적 약세 · 이벤트 리스크"
+        },
+        {
+          "label": "축 3",
+          "weight": "0.30",
+          "title": "매도결손",
+          "description": "컨센 감소·외국인 순매도·IB"
+        }
+      ],
+      "riskManagerOverride": "KOSPI 일일 변동 -0.84%, USD/KRW 일일 변동 0.32%, VKOSPI 15.4 — 모두 안전 구간입니다. 룰베이스 macro override 발동 없이 Signal Judge 결과 그대로 유지됩니다.",
+      "conclusion": "반도체 섹터 모멘텀이 강화되는 구간이며, 외국인 수급도 우호적입니다. 다만 LG화학처럼 사업부 분할 이슈가 있는 종목은 단기 변동성이 클 수 있어 신규 진입을 권하지 않습니다.",
+      "performance": {
+        "metrics": [
+          {
+            "key": "sharpe",
+            "label": "Sharpe Ratio",
+            "value": "1.42",
+            "delta": "기준선 1.11",
+            "tone": "positive",
+            "caption": "Walk-forward 평균. 1.5 이상이 우수."
+          },
+          {
+            "key": "mdd",
+            "label": "Max Drawdown",
+            "value": "-9.4%",
+            "delta": "기준선 -12.1%",
+            "tone": "negative",
+            "caption": "감내 가능한 수준. 시장 평균 -15% 대비 양호."
+          },
+          {
+            "key": "winRate",
+            "label": "Win Rate",
+            "value": "58.2%",
+            "delta": "+3.4pp",
+            "tone": "positive",
+            "caption": "수익 거래 비율. 10년 누적 1,247 거래."
+          },
+          {
+            "key": "totalReturn",
+            "label": "Total Return (10y)",
+            "value": "+92.4%",
+            "delta": "CAGR 6.8%",
+            "tone": "positive",
+            "caption": "거래비용 반영. KOSPI200 동기간 +54.3%."
+          }
+        ],
+        "disclaimer": "Walk-forward 6개 윈도우 평균. OOS 구간 신뢰구간 ±2.1%pp. 미래 수익률을 보장하지 않으며, 거래비용은 수수료 0.015% · 거래세 0.23% · 슬리피지 0.1% 반영."
+      },
+      "costNotes": [
+        "본 리포트는 과거 시계열 데이터 기반 시뮬레이션이며 미래 수익을 보장하지 않습니다. 투자 결정과 손익은 사용자 본인에게 귀속됩니다.",
+        "거래비용 반영: 수수료 0.015%, 거래세 0.23%, 슬리피지 0.1%. 실제 시장에선 호가 잔량·체결 지연으로 인한 추가 비용이 발생할 수 있습니다.",
+        "KOSPI200 현물만 지원하며, 파생상품·옵션 전략은 제공하지 않습니다."
+      ]
+    }
+  ]
+}

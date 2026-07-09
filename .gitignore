@@ -207,3 +207,38 @@ marimo/_lsp/
 __marimo__/
 
 requirements.txt
+# omx
+fe/.omx/
+.omx
+.claude
+.playwright-mcp/
+omx.zip
+backend/var/
+
+# Node
+node_modules/
+fe/dist/
+fe/.cache/
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+LICENSE
+
+fe\.playwright-mcp

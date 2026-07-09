@@ -1,0 +1,6 @@
+{
+  "last_turn_at": "2026-05-23T12:31:32.502Z",
+  "turn_count": 1,
+  "last_progress_at": "2026-05-23T12:31:32.502Z",
+  "last_agent_output": "완료했습니다. 단, Figma MCP 확인 결과 **문자 그대로 `HI-FI |` prefix는 없었고**, 실제 프레임 prefix는 **`HI-FI ·`**였습니다. 그래서 요"
+}

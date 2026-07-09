@@ -1,0 +1,158 @@
+name: Deploy to SSH Server
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: fe/package-lock.json
+
+      - name: Install dependencies
+        working-directory: fe
+        run: npm ci
+
+      - name: Build
+        working-directory: fe
+        run: npm run build
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p 30233 quant-agent.kro.kr >> ~/.ssh/known_hosts
+
+      - name: Create deploy directory on server
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            "mkdir -p ~/mvp_sp1/quant-proj"
+
+      - name: Deploy via rsync
+        run: |
+          rsync -avz --delete \
+            --exclude='.git/' \
+            --exclude='node_modules/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            -e "ssh -i ~/.ssh/id_rsa -p 30233" \
+            ./ \
+            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
+
+      - name: Install and restart development servers
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+            set -euo pipefail
+
+            if [ -f "$HOME/.bashrc" ]; then
+              set +u
+              source "$HOME/.bashrc"
+              set -u
+            fi
+
+            APP_DIR="$HOME/mvp_sp1/quant-proj"
+            RUN_DIR="$APP_DIR/.run"
+            mkdir -p "$RUN_DIR"
+
+            python3.11 -m venv "$APP_DIR/ai/.venv"
+            "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
+            "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/ai"
+
+            cd "$APP_DIR/fe"
+            npm ci
+
+            stop_listeners_on_port() {
+              local port="$1"
+
+              find_listener_pids_on_port() {
+                local target_port="$1"
+                ss -H -ltnp "sport = :$target_port" 2>/dev/null \
+                  | grep -oE 'pid=[0-9]+' \
+                  | cut -d= -f2 \
+                  | sort -u \
+                  || true
+              }
+
+              for attempt in $(seq 1 5); do
+                local pids
+                pids="$(find_listener_pids_on_port "$port")"
+
+                if [ -z "$pids" ]; then
+                  echo "No listener found on port $port"
+                  return 0
+                fi
+
+                echo "Stopping listener(s) on port $port, attempt $attempt: $pids"
+                for pid in $pids; do
+                  kill "$pid" 2>/dev/null || true
+                done
+
+                for _ in $(seq 1 5); do
+                  if [ -z "$(find_listener_pids_on_port "$port")" ]; then
+                    return 0
+                  fi
+                  sleep 1
+                done
+
+                pids="$(find_listener_pids_on_port "$port")"
+                echo "Force stopping listener(s) on port $port: $pids"
+                for pid in $pids; do
+                  kill -9 "$pid" 2>/dev/null || true
+                done
+                sleep 1
+              done
+
+              echo "Port $port is still occupied after stop attempts"
+              ss -H -ltnp "sport = :$port" 2>/dev/null || true
+              return 1
+            }
+
+            stop_listeners_on_port 18001
+            stop_listeners_on_port 18000
+            rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/fe.pid"
+
+            cd "$APP_DIR/ai"
+            nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn ai_graph.api:app \
+              --host 0.0.0.0 \
+              --port 18001 \
+              --reload \
+              > "$RUN_DIR/ai.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/ai.pid"
+
+            cd "$APP_DIR/fe"
+            nohup npm run dev -- --host 0.0.0.0 --port 18000 \
+              > "$RUN_DIR/fe.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/fe.pid"
+
+            wait_for_url() {
+              local name="$1"
+              local url="$2"
+              local log_file="$3"
+              for _ in $(seq 1 30); do
+                if curl -fsS "$url" >/dev/null 2>&1; then
+                  echo "$name is ready: $url"
+                  return 0
+                fi
+                sleep 2
+              done
+              echo "$name did not become ready: $url"
+              tail -n 80 "$log_file" || true
+              return 1
+            }
+
+            wait_for_url "AI API" "http://127.0.0.1:18001/health" "$RUN_DIR/ai.log"
+            wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
+          REMOTE
