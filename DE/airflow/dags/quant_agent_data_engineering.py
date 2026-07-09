@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover
     task = None
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _load_airflow_dotenv() -> None:
@@ -58,9 +58,38 @@ SYMBOL_METADATA_SCRIPT = Path(
 )
 PYTHON_EXECUTABLE = os.getenv("QUANT_AIRFLOW_PYTHON", sys.executable)
 
+DEFAULT_BOK_RATE_FX_SERIES = (
+    {"stat_code": "722Y001", "cycle": "D", "item_code1": "0101000"},  # 한국은행 기준금리
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010101000"},  # 콜금리(1일, 전체거래)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010901000"},  # KOFR
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010502000"},  # CD(91일)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010190000"},  # 국고채(1년)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010200000"},  # 국고채(3년)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010210000"},  # 국고채(10년)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010300000"},  # 회사채(3년, AA-)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010320000"},  # 회사채(3년, BBB-)
+    {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000003"},  # 원/달러 종가 15:30
+    {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000006"},  # 원/100엔
+    {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000010"},  # 원/위안 종가
+)
+DEFAULT_BOK_MONTHLY_OIL_SERIES = (
+    {"stat_code": "902Y003", "cycle": "M", "item_code1": "010101", "language": "en"},  # WTI
+    {"stat_code": "902Y003", "cycle": "M", "item_code1": "010102", "language": "en"},  # Dubai Fateh
+    {"stat_code": "902Y003", "cycle": "M", "item_code1": "010103", "language": "en"},  # Brent
+)
+DEFAULT_BOK_SERIES_JSON = json.dumps(
+    [*DEFAULT_BOK_RATE_FX_SERIES, *DEFAULT_BOK_MONTHLY_OIL_SERIES],
+    ensure_ascii=False,
+    separators=(",", ":"),
+)
+
 
 def _symbols_from_env() -> tuple[str, ...]:
     return tuple(symbol.strip() for symbol in os.getenv("OHLCV_SYMBOLS", "").split(",") if symbol.strip())
+
+
+def _bok_series_json() -> str:
+    return os.getenv("BOK_SERIES_JSON") or os.getenv("BOK_DAILY_SERIES_JSON") or DEFAULT_BOK_SERIES_JSON
 
 
 if dag and task:  # pragma: no branch
@@ -131,8 +160,10 @@ if dag and task:  # pragma: no branch
 
         @task(task_id="ingest_bok_daily")
         def ingest_bok_daily(logical_date: str | None = None) -> dict:
-            if not (os.getenv("BOK_DAILY_SERIES_JSON") or os.getenv("BOK_SERIES_JSON")):
-                _skip("BOK_DAILY_SERIES_JSON is not configured.")
+            from quant_agent.data.config import BokConfig
+
+            if not BokConfig.from_env().is_configured:
+                _skip("BOK_API_KEY is not configured.")
             target_date = _target_date(logical_date)
             return _run_python_script(
                 DART_BOK_INGEST_SCRIPT,
@@ -140,6 +171,7 @@ if dag and task:  # pragma: no branch
                     source="bok",
                     start_date=_external_ingest_start_date(target_date),
                     end_date=target_date,
+                    bok_series_json=_bok_series_json(),
                 ),
             )
 
@@ -155,24 +187,6 @@ if dag and task:  # pragma: no branch
                 ),
             )
 
-        @task(task_id="ingest_seibro_reports_daily")
-        def ingest_seibro_reports_daily(logical_date: str | None = None) -> dict:
-            from quant_agent.data.external import ExternalDataIngestionService
-
-            endpoint = os.getenv("SEIBRO_REPORT_ENDPOINT")
-            if not endpoint:
-                _skip("SEIBRO_REPORT_ENDPOINT is not configured.")
-            target_date = _target_date(logical_date)
-            params = _json_env("SEIBRO_REPORT_PARAMS_JSON", {})
-            written = ExternalDataIngestionService().ingest_seibro_reports(
-                endpoint_path=endpoint,
-                params=params,
-                as_of_date=target_date,
-                universe_min_score=float(os.getenv("SEIBRO_UNIVERSE_MIN_SCORE", "0.0")),
-                universe_min_reports=int(os.getenv("SEIBRO_UNIVERSE_MIN_REPORTS", "1")),
-            )
-            return {"written": written}
-
         ingested = ingest_ohlcv_daily()
         symbol_metadata = refresh_symbol_metadata_daily()
         kis_adjusted = ingest_kis_adjusted_ohlcv_daily()
@@ -180,8 +194,7 @@ if dag and task:  # pragma: no branch
         qa = run_data_quality_checks_daily()
         bok = ingest_bok_daily()
         dart = ingest_dart_financials_daily()
-        seibro = ingest_seibro_reports_daily()
-        ingested >> [symbol_metadata, kis_adjusted, bok, seibro]
+        ingested >> [symbol_metadata, kis_adjusted, bok]
         symbol_metadata >> qa
         symbol_metadata >> dart
         kis_adjusted >> computed
@@ -233,13 +246,6 @@ def _target_date(logical_date: str | None) -> date:
         return get_current_context()["logical_date"].date()
     except (ImportError, KeyError, RuntimeError):
         return date.today()
-
-
-def _json_env(name: str, default):
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    return json.loads(raw)
 
 
 def _warmup_start_date(target_date: date) -> date:
@@ -296,7 +302,9 @@ def _symbol_metadata_args(*, as_of_date: date) -> list[str]:
     ]
 
 
-def _dart_bok_ingest_args(*, source: str, start_date: date, end_date: date) -> list[str]:
+def _dart_bok_ingest_args(
+    *, source: str, start_date: date, end_date: date, bok_series_json: str | None = None
+) -> list[str]:
     args = [
         "--scope",
         "custom",
@@ -313,6 +321,8 @@ def _dart_bok_ingest_args(*, source: str, start_date: date, end_date: date) -> l
         args.extend(["--dart-period-mode", os.getenv("DART_DAILY_PERIOD_MODE", "filing-window")])
         if os.getenv("DART_REFRESH_CORP_CODES", "true").lower() not in {"0", "false", "no", "off"}:
             args.append("--dart-refresh-corp-codes")
+    elif source == "bok" and bok_series_json:
+        args.extend(["--bok-series-json", bok_series_json])
     return args
 
 

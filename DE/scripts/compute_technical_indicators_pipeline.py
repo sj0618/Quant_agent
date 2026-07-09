@@ -11,6 +11,10 @@ The pipeline is intentionally DB-first:
 Secrets are never loaded from ``.env``. For local Docker DB usage, prefer:
 
     python scripts/compute_technical_indicators_pipeline.py --db-mode docker
+
+For public/shared DB usage, set ``QUANT_DB_DSN`` or the host/user/password
+environment variables and the script will auto-select ``psycopg`` unless you
+override it with ``--db-mode``.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from pathlib import Path
 import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 from uuid import uuid4
 
 import numpy as np
@@ -38,6 +42,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from quant_agent.data.config import DatabaseConfig  # noqa: E402
+from quant_agent.data.db import PsycopgScriptClient, resolve_execution_mode  # noqa: E402
 
 
 DEFAULT_TICKER_BATCH_SIZE = 64
@@ -99,6 +104,20 @@ class TickerResult:
     category_rows: dict[str, list[dict[str, Any]]]
     adjusted_rows: list[dict[str, Any]]
     diagnostics: dict[str, Any]
+
+
+class TaDbClient(Protocol):
+    def execute(self, sql: str) -> str:
+        ...
+
+    def fetch_csv(self, query: str, parse_dates: list[str] | None = None) -> pd.DataFrame:
+        ...
+
+    def copy_category_rows(self, table: str, rows: list[dict[str, Any]], run_id: str) -> None:
+        ...
+
+    def copy_adjusted_ohlcv_rows(self, rows: list[dict[str, Any]], run_id: str) -> None:
+        ...
 
 
 class DockerPsqlClient:
@@ -316,6 +335,192 @@ COMMIT;
         self.execute(sql)
 
 
+class PsycopgClient(PsycopgScriptClient):
+    def fetch_csv(self, query: str, parse_dates: list[str] | None = None) -> pd.DataFrame:
+        text = self.fetch_csv_text(query)
+        if not text.strip():
+            return pd.DataFrame()
+        return pd.read_csv(
+            io.StringIO(text),
+            parse_dates=parse_dates or [],
+            dtype={"ticker": "string", "base_ticker": "string", "symbol": "string"},
+        )
+
+    def copy_category_rows(self, table: str, rows: list[dict[str, Any]], run_id: str) -> None:
+        if not rows:
+            return
+
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer, lineterminator="\n")
+        for row in rows:
+            writer.writerow(
+                [
+                    row["time"],
+                    row["ticker"],
+                    row["base_ticker"],
+                    row["segment_id"],
+                    json.dumps(row["values"], ensure_ascii=False, separators=(",", ":"), default=str),
+                    json.dumps(row["quality_flags"], ensure_ascii=False, separators=(",", ":"), default=str),
+                    run_id,
+                ]
+            )
+
+        self.execute_copy_csv(
+            """
+            CREATE TEMP TABLE tmp_ta_rows (
+              "time" DATE,
+              ticker TEXT,
+              base_ticker TEXT,
+              segment_id INTEGER,
+              values_jsonb JSONB,
+              quality_flags JSONB,
+              run_id UUID
+            ) ON COMMIT DROP;
+            """,
+            """
+            COPY tmp_ta_rows ("time", ticker, base_ticker, segment_id, values_jsonb, quality_flags, run_id)
+            FROM STDIN WITH (FORMAT csv)
+            """,
+            csv_buffer.getvalue(),
+            f"""
+            INSERT INTO {table} ("time", ticker, base_ticker, segment_id, values_jsonb, quality_flags, run_id)
+            SELECT "time", ticker, base_ticker, segment_id, values_jsonb, quality_flags, run_id
+            FROM tmp_ta_rows
+            ON CONFLICT ("time", ticker) DO UPDATE SET
+              base_ticker = EXCLUDED.base_ticker,
+              segment_id = EXCLUDED.segment_id,
+              values_jsonb = EXCLUDED.values_jsonb,
+              quality_flags = EXCLUDED.quality_flags,
+              run_id = EXCLUDED.run_id,
+              updated_at = now();
+            INSERT INTO meta.lineage_event
+              (target_table, target_key, source_table, source_key, run_id, transform_version, metadata_jsonb)
+            SELECT
+              {sql_literal(table)},
+              ticker || ':' || "time"::text,
+              {sql_literal(ADJUSTED_OHLCV_TABLE)},
+              base_ticker || ':' || "time"::text,
+              run_id,
+              {sql_literal(TA_TRANSFORM_VERSION)},
+              jsonb_build_object('stage', 'ta_indicator_compute', 'target_table', {sql_literal(table)})
+            FROM tmp_ta_rows;
+            """,
+        )
+
+    def copy_adjusted_ohlcv_rows(self, rows: list[dict[str, Any]], run_id: str) -> None:
+        if not rows:
+            return
+
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer, lineterminator="\n")
+        for row in rows:
+            writer.writerow(
+                [
+                    row["time"],
+                    row["ticker"],
+                    row["base_ticker"],
+                    row["segment_id"],
+                    row["open"],
+                    row["high"],
+                    row["low"],
+                    row["close"],
+                    row["volume"],
+                    row["adj_open"],
+                    row["adj_high"],
+                    row["adj_low"],
+                    row["adj_close"],
+                    row["adj_volume"],
+                    row["adjustment_factor"],
+                    json.dumps(row["quality_flags"], ensure_ascii=False, separators=(",", ":"), default=str),
+                    run_id,
+                ]
+            )
+
+        self.execute_copy_csv(
+            """
+            CREATE TEMP TABLE tmp_adjusted_ohlcv (
+              "time" DATE,
+              ticker TEXT,
+              base_ticker TEXT,
+              segment_id INTEGER,
+              open NUMERIC(20, 6),
+              high NUMERIC(20, 6),
+              low NUMERIC(20, 6),
+              close NUMERIC(20, 6),
+              volume NUMERIC(28, 6),
+              adj_open NUMERIC(20, 6),
+              adj_high NUMERIC(20, 6),
+              adj_low NUMERIC(20, 6),
+              adj_close NUMERIC(20, 6),
+              adj_volume NUMERIC(28, 6),
+              adjustment_factor NUMERIC(28, 12),
+              quality_flags JSONB,
+              run_id UUID
+            ) ON COMMIT DROP;
+            """,
+            """
+            COPY tmp_adjusted_ohlcv (
+              "time", ticker, base_ticker, segment_id,
+              open, high, low, close, volume,
+              adj_open, adj_high, adj_low, adj_close, adj_volume,
+              adjustment_factor, quality_flags, run_id
+            )
+            FROM STDIN WITH (FORMAT csv)
+            """,
+            csv_buffer.getvalue(),
+            f"""
+            INSERT INTO {ADJUSTED_OHLCV_TABLE} (
+              "time", ticker, base_ticker, segment_id,
+              open, high, low, close, volume,
+              adj_open, adj_high, adj_low, adj_close, adj_volume,
+              adjustment_factor, quality_flags, run_id
+            )
+            SELECT
+              "time", ticker, base_ticker, segment_id,
+              open, high, low, close, volume,
+              adj_open, adj_high, adj_low, adj_close, adj_volume,
+              adjustment_factor, quality_flags, run_id
+            FROM tmp_adjusted_ohlcv
+            ON CONFLICT ("time", ticker) DO UPDATE SET
+              base_ticker = EXCLUDED.base_ticker,
+              segment_id = EXCLUDED.segment_id,
+              open = EXCLUDED.open,
+              high = EXCLUDED.high,
+              low = EXCLUDED.low,
+              close = EXCLUDED.close,
+              volume = EXCLUDED.volume,
+              adj_open = EXCLUDED.adj_open,
+              adj_high = EXCLUDED.adj_high,
+              adj_low = EXCLUDED.adj_low,
+              adj_close = EXCLUDED.adj_close,
+              adj_volume = EXCLUDED.adj_volume,
+              adjustment_factor = EXCLUDED.adjustment_factor,
+              quality_flags = EXCLUDED.quality_flags,
+              run_id = EXCLUDED.run_id,
+              updated_at = now();
+            INSERT INTO meta.lineage_event
+              (target_table, target_key, source_table, source_key, run_id, transform_version, metadata_jsonb)
+            SELECT
+              {sql_literal(ADJUSTED_OHLCV_TABLE)},
+              ticker || ':' || "time"::text,
+              CASE
+                WHEN quality_flags->>'adjusted_price_method' = 'kis_official_adjusted'
+                THEN 'feature.kis_adjusted_ohlcv_daily'
+                ELSE 'core.ohlcv_daily'
+              END,
+              base_ticker || ':' || "time"::text,
+              run_id,
+              {sql_literal(ADJUSTED_OHLCV_TRANSFORM_VERSION)},
+              jsonb_build_object(
+                'stage', 'adjusted_ohlcv_build',
+                'adjusted_price_method', quality_flags->>'adjusted_price_method',
+                'segment_id', segment_id
+              )
+            FROM tmp_adjusted_ohlcv;
+            """,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compute 10y TA indicators from local TimescaleDB OHLCV data.")
     parser.add_argument("--start-date", default=None, help="YYYY-MM-DD. Defaults to min core.ohlcv_daily date.")
@@ -334,7 +539,12 @@ def main() -> int:
         default="core",
         help="core uses core.ohlcv_daily plus continuity adjustment; kis-adjusted uses feature.kis_adjusted_ohlcv_daily.",
     )
-    parser.add_argument("--db-mode", choices=["docker"], default="docker")
+    parser.add_argument(
+        "--db-mode",
+        choices=["docker", "psycopg"],
+        default=None,
+        help="Database access mode. Defaults to psycopg when DB credentials are configured; otherwise docker.",
+    )
     parser.add_argument("--db-container", default=None)
     parser.add_argument("--dry-run", action="store_true", help="Compute but do not write indicator rows.")
     parser.add_argument("--output", default=None, help="Optional JSON summary artifact path.")
@@ -346,7 +556,9 @@ def main() -> int:
     config = DatabaseConfig.from_env()
     if args.db_container:
         config = DatabaseConfig(**{**config.__dict__, "docker_container": args.db_container})
-    client = DockerPsqlClient(config)
+    requested_db_mode = args.db_mode or os.getenv("QUANT_DB_EXECUTION_MODE")
+    db_mode = resolve_execution_mode(config, requested_db_mode)
+    client: TaDbClient = DockerPsqlClient(config) if db_mode == "docker" else PsycopgClient(config)
 
     start_date, end_date = resolve_date_window(client, args.start_date, args.end_date)
     options = RuntimeOptions(
@@ -593,9 +805,6 @@ def finish_run(client: DockerPsqlClient, run_id: str, status: str, error: str | 
 
 def mart_feature_view_sql() -> str:
     return f"""
-        DROP VIEW IF EXISTS {MART_FEATURE_VIEW};
-        DROP VIEW IF EXISTS {CANONICAL_SYMBOL_FEATURE_VIEW};
-
         CREATE OR REPLACE VIEW {CANONICAL_SYMBOL_FEATURE_VIEW} AS
         SELECT
             a."time" AS as_of_date,

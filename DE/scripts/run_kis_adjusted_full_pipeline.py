@@ -113,8 +113,6 @@ def run_pipeline(
             [
                 str(python_executable),
                 "scripts/compute_technical_indicators_pipeline.py",
-                "--db-mode",
-                "docker",
                 "--start-date",
                 start_date,
                 "--end-date",
@@ -140,8 +138,6 @@ def run_pipeline(
             [
                 str(python_executable),
                 "scripts/run_data_quality_checks.py",
-                "--db-mode",
-                "docker",
                 "--start-date",
                 start_date,
                 "--end-date",
