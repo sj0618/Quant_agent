@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,8 @@ from app.schemas.ai_backtest import (
     CodeExecutionResult,
     CodeValidationOutcome,
     GeneratedCodeResult,
+    ModelCallLogBundle,
+    PromptLogBundle,
 )
 
 RUNTIME_ALLOWED_IMPORTS = frozenset({"datetime", "math", "statistics"})
@@ -82,23 +86,47 @@ SUSPICIOUS_FILE_CALLS = frozenset(
 
 class AOAICodeGenerator:
     async def generate(self, request: AICodeBacktestFlowRequest, *, trace_id: UUID) -> GeneratedCodeResult:
-        build_strategy_spec, create_llm_client, generate_loop3_candidates, Loop3Request, StrategySpec, AI_AOAI_MODEL_ENV = _load_generation_modules()
+        (
+            build_strategy_spec,
+            build_backtest_code_json_request,
+            create_llm_client,
+            generate_loop3_candidates,
+            Loop3Request,
+            StrategySpec,
+            AOAIResponsesClient,
+            MockLLMClient,
+        ) = _load_generation_modules()
         strategy = (
             StrategySpec.model_validate(request.parsed_strategy_jsonb)
             if request.parsed_strategy_jsonb
             else build_strategy_spec(request.natural_language_prompt, variant="A", retrieval={"hits": []})
         )
+        prompt_request = build_backtest_code_json_request(strategy, "A")
+        llm_client = create_llm_client(role="BACKTEST_CODE")
         result = generate_loop3_candidates(
             Loop3Request(strategy=strategy, variant="A", trace_id=str(trace_id)),
-            llm_client=create_llm_client(role="BACKTEST_CODE"),
+            llm_client=llm_client,
         )
         selected = next((candidate for candidate in result.candidates if candidate.validation_ok), result.selected_candidate)
-        model_name = os.environ.get("AI_LLM_BACKTEST_CODE_MODEL") or os.environ.get(AI_AOAI_MODEL_ENV)
+        provider, model_name = _observed_provider_and_model(
+            llm_client,
+            aoai_client_type=AOAIResponsesClient,
+            mock_client_type=MockLLMClient,
+        )
+        deterministic_fallback = _used_deterministic_fallback(result)
         return GeneratedCodeResult(
             target_runtime=request.target_runtime,
             code_purpose=request.code_purpose,
             generated_code=selected.code,
             model_name=model_name,
+            model_call=_build_generation_model_call(
+                request,
+                prompt_request=prompt_request,
+                strategy_id=getattr(strategy, "strategy_id", None),
+                provider=provider,
+                model_name=model_name,
+                deterministic_fallback=deterministic_fallback,
+            ),
         )
 
 
@@ -275,7 +303,7 @@ class DeterministicBacktestReportGenerator:
             benchmark_return=summary.benchmark_return,
             overall_rating="pass" if (summary.period_return or 0) >= 0 else "watch",
             summary=(
-                f"AI generated backtest for '{request.natural_language_prompt[:80]}' completed with "
+                f"AI generated backtest for strategy '{request.strategy_id or 'unknown_strategy'}' completed with "
                 f"return {summary.period_return or 0:.4f} and sharpe {summary.sharpe_ratio or 0:.4f}."
             ),
             return_analysis="Generated code was validated and executed through the AI backtest flow.",
@@ -296,12 +324,24 @@ class DeterministicBacktestReportGenerator:
 def _load_generation_modules():
     try:
         from ai_graph.graph import build_strategy_spec
-        from ai_graph.llm.factory import AI_AOAI_MODEL_ENV, create_llm_client
+        from ai_graph.llm.aoai import AOAIResponsesClient
+        from ai_graph.llm.factory import create_llm_client
+        from ai_graph.llm.mock import MockLLMClient
+        from ai_graph.llm.prompts import build_backtest_code_json_request
         from ai_graph.nodes.backtest_code import Loop3Request, generate_loop3_candidates
         from ai_graph.schemas import StrategySpec
     except ModuleNotFoundError as exc:
         raise _pythonpath_error(exc) from exc
-    return build_strategy_spec, create_llm_client, generate_loop3_candidates, Loop3Request, StrategySpec, AI_AOAI_MODEL_ENV
+    return (
+        build_strategy_spec,
+        build_backtest_code_json_request,
+        create_llm_client,
+        generate_loop3_candidates,
+        Loop3Request,
+        StrategySpec,
+        AOAIResponsesClient,
+        MockLLMClient,
+    )
 
 
 def _load_validate_backtest_code():
@@ -310,6 +350,77 @@ def _load_validate_backtest_code():
     except ModuleNotFoundError as exc:
         raise _pythonpath_error(exc) from exc
     return validate_backtest_code
+
+
+def _build_generation_model_call(
+    request: AICodeBacktestFlowRequest,
+    *,
+    prompt_request: Any,
+    strategy_id: str | None,
+    provider: str | None,
+    model_name: str | None,
+    deterministic_fallback: bool,
+) -> ModelCallLogBundle:
+    return ModelCallLogBundle(
+        task_type="backtest_code_generation",
+        provider=provider,
+        model_name=model_name,
+        status="failed" if deterministic_fallback else "succeeded",
+        error_message=(
+            "LLM generated candidates failed validation; deterministic fallback code was executed."
+            if deterministic_fallback
+            else None
+        ),
+        prompt_log=PromptLogBundle(
+            prompt_template_name=prompt_request.schema_name,
+            system_prompt="[redacted stage1 backend code-generation system prompt]",
+            user_prompt="[redacted stage1 backend code-generation user prompt]",
+            assistant_response=None,
+            variables_jsonb={
+                "strategy_id": strategy_id,
+                "variant": "A",
+                "request_text_sha256": _sha256_text(request.natural_language_prompt),
+                "system_prompt_sha256": _sha256_text(prompt_request.system_prompt),
+                "user_prompt_sha256": _sha256_text(prompt_request.user_prompt),
+            },
+            prompt_version=prompt_request.schema_name,
+            contains_pii=_contains_pii_text(request.natural_language_prompt),
+            masked=True,
+        )
+    )
+
+
+def _observed_provider_and_model(
+    client: Any,
+    *,
+    aoai_client_type: type,
+    mock_client_type: type,
+) -> tuple[str | None, str | None]:
+    if isinstance(client, aoai_client_type):
+        model = getattr(client, "model", None)
+        return "aoai", model if isinstance(model, str) and model else None
+    if isinstance(client, mock_client_type):
+        return "mock", None
+    return None, None
+
+
+def _used_deterministic_fallback(result: Any) -> bool:
+    fallback_reasons = getattr(result, "fallback_reasons", None)
+    if not isinstance(fallback_reasons, list):
+        return False
+    return any(
+        isinstance(reason, str) and reason == "all generated candidates failed AST validation"
+        for reason in fallback_reasons
+    )
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _contains_pii_text(value: str) -> bool:
+    email_pattern = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+    phone_pattern = r"\b\d{2,4}[- ]?\d{3,4}[- ]?\d{4}\b"
+    return bool(re.search(email_pattern, value) or re.search(phone_pattern, value))
 
 
 def _runtime_import_violations(tree: ast.AST) -> list[dict[str, Any]]:

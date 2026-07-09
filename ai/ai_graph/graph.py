@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from ai_graph.audit import AuditSession, AuditSink, NoOpAuditSink, create_audit_correlation
 from ai_graph.data_sources import load_pipeline_data_from_env
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
@@ -98,25 +99,150 @@ def build_graph() -> Any:
     graph.add_edge("Envelope", END)
     return graph.compile()
 
-
-def run_analysis(user_query: str, trace_id: str | None = None) -> APIEnvelope:
-    state = build_graph().invoke({"user_query": user_query, "trace_id": trace_id or ""})
-    return APIEnvelope.model_validate(state["envelope"])
+def run_analysis(
+    user_query: str,
+    trace_id: str | None = None,
+    *,
+    audit_sink: AuditSink | None = None,
+    audit_session: AuditSession | None = None,
+    audit_entrypoint: str = "graph.run_analysis",
+    audit_feature: str = "analysis",
+    strategy_id: str | None = None,
+    client_request_id: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> APIEnvelope:
+    query = _normalize_user_query(user_query)
+    resolved_trace_id = trace_id or (_trace_id(query) if query else None)
+    session = audit_session or _open_audit_session(
+        audit_sink,
+        trace_id=resolved_trace_id,
+        debug_ref=None,
+        entrypoint=audit_entrypoint,
+        feature=audit_feature,
+        strategy_id=strategy_id,
+        client_request_id=client_request_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    if not query:
+        _record_error(
+            session,
+            "analysis_input_validation",
+            error_type="ValueError",
+            message="ValueError raised during analysis input validation",
+        )
+        _record_finalization(session, "failed", message="analysis execution failed before graph invocation")
+        raise ValueError("user_query must not be empty")
+    _record_step(session, "analysis_started", message="analysis execution started")
+    try:
+        state = build_graph().invoke({"user_query": query, "trace_id": resolved_trace_id or ""})
+        envelope = APIEnvelope.model_validate(state["envelope"])
+    except Exception as exc:
+        _record_error(
+            session,
+            "analysis_execution",
+            error_type=type(exc).__name__,
+            message=f"{type(exc).__name__} raised during analysis execution",
+        )
+        _record_finalization(session, "failed", message="analysis execution failed")
+        raise
+    status_label = envelope.status.value
+    _record_step(session, "analysis_completed", message=f"analysis returned status={status_label}")
+    _record_finalization(
+        session,
+        _finalization_status_for_envelope(envelope),
+        message=f"analysis completed with status={status_label}",
+    )
+    return envelope
 
 
 def supervisor_node(state: QuantAgentState) -> QuantAgentState:
-    query = " ".join(str(state.get("user_query", "")).split())
-    if not query:
-        raise ValueError("user_query must not be empty")
-    trace_id = state.get("trace_id") or _trace_id(query)
     return {
         **state,
-        "user_query": query,
-        "trace_id": trace_id,
-        "debug_ref": f"debug:{trace_id}",
-        "route": "strategy_parse",
-        "internal_payload": InternalPayload(trace_id=trace_id).model_dump(),
+        **_prepare_supervisor_state(
+            str(state.get("user_query", "")),
+            trace_id=state.get("trace_id") or None,
+        ),
     }
+
+
+def _prepare_supervisor_state(user_query: str, *, trace_id: str | None) -> QuantAgentState:
+    query = _normalize_user_query(user_query)
+    if not query:
+        raise ValueError("user_query must not be empty")
+    resolved_trace_id = trace_id or _trace_id(query)
+    return {
+        "user_query": query,
+        "trace_id": resolved_trace_id,
+        "debug_ref": f"debug:{resolved_trace_id}",
+        "route": "strategy_parse",
+        "internal_payload": InternalPayload(trace_id=resolved_trace_id).model_dump(),
+    }
+
+
+def _normalize_user_query(user_query: str) -> str:
+    return " ".join(str(user_query).split())
+
+
+def _open_audit_session(
+    audit_sink: AuditSink | None,
+    *,
+    trace_id: str | None,
+    debug_ref: str | None,
+    entrypoint: str,
+    feature: str,
+    strategy_id: str | None = None,
+    client_request_id: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> AuditSession:
+    correlation = create_audit_correlation(
+        trace_id=trace_id,
+        debug_ref=debug_ref,
+        entrypoint=entrypoint,
+        feature=feature,
+        strategy_id=strategy_id,
+        client_request_id=client_request_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    sink = audit_sink or NoOpAuditSink()
+    try:
+        return sink.open_session(correlation)
+    except Exception:
+        return NoOpAuditSink().open_session(correlation)
+
+
+def _record_step(session: AuditSession, step: str, *, message: str | None = None) -> None:
+    try:
+        session.record_step(step, message=message)
+    except Exception:
+        return None
+
+
+def _record_error(
+    session: AuditSession,
+    step: str,
+    *,
+    error_type: str,
+    message: str,
+) -> None:
+    try:
+        session.record_error(step, error_type=error_type, message=message)
+    except Exception:
+        return None
+
+
+def _record_finalization(session: AuditSession, status: str, *, message: str | None = None) -> None:
+    try:
+        session.record_finalization(status, message=message)
+    except Exception:
+        return None
+
+
+def _finalization_status_for_envelope(envelope: APIEnvelope) -> str:
+    return "failed" if envelope.status == EnvelopeStatus.FAILED else "completed"
 
 
 def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:

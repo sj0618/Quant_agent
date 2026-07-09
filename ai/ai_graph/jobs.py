@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai_graph.data_sources.db import resolve_database_dsn_from_env
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
 
 
@@ -49,6 +50,7 @@ class AnalysisJob(BaseModel):
     user_id: str | None = Field(default=None, exclude=True)
     strategy_id: str | None = Field(default=None, exclude=True)
     run_id: str | None = Field(default=None, exclude=True)
+    report_id: str | None = Field(default=None, exclude=True)
     status: AnalysisJobStatus = Field(exclude=True)
     polling_stage: Stage = Field(exclude=True)
     created_at: datetime
@@ -215,9 +217,13 @@ class InMemoryAnalysisJobStore:
         strategy_id = job.strategy_id
         if strategy_id is None and result_envelope.strategy_spec is not None:
             strategy_id = result_envelope.strategy_spec.strategy_id
+        report_id = job.report_id
+        if report_id is None and result_envelope.user_payload.report is not None:
+            report_id = f"report_{job.job_id}"
         job = job.model_copy(
             update={
                 "strategy_id": strategy_id,
+                "report_id": report_id,
                 "status": AnalysisJobStatus.COMPLETED,
                 "polling_stage": Stage.FINALIZING,
                 "updated_at": completed_at,
@@ -315,7 +321,8 @@ def create_analysis_job_store_from_env(
 ) -> JobStoreRuntime:
     source = environ if env is None else env
     requested_mode = _requested_job_store_mode(source)
-    dsn_configured = bool(source.get(AI_DATABASE_DSN_ENV))
+    dsn_value, dsn_env = resolve_database_dsn_from_env(source)
+    dsn_configured = bool(dsn_value)
     if requested_mode == MEMORY_JOB_STORE_MODE:
         store = InMemoryAnalysisJobStore()
         return JobStoreRuntime(
@@ -325,6 +332,7 @@ def create_analysis_job_store_from_env(
             fallback=False,
             fallback_reason=None,
             dsn_configured=dsn_configured,
+            dsn_env=dsn_env,
         )
     if requested_mode == PERSISTENT_JOB_STORE_MODE:
         if repository is None:
@@ -334,7 +342,8 @@ def create_analysis_job_store_from_env(
             )
             if not dsn_configured:
                 reason = (
-                    f"{AI_DATABASE_DSN_ENV} is not set for AI_JOB_STORE=persistent; "
+                    "database DSN is not set in any of "
+                    "AI_DATABASE_DSN/QUANT_DB_DSN/DATABASE_URL for AI_JOB_STORE=persistent; "
                     "falling back to in-memory job store."
                 )
             store = InMemoryAnalysisJobStore()
@@ -345,6 +354,7 @@ def create_analysis_job_store_from_env(
                 fallback=True,
                 fallback_reason=reason,
                 dsn_configured=dsn_configured,
+                dsn_env=dsn_env,
             )
         if persistent_store_factory is None:
             raise JobStoreConfigurationError(
@@ -358,6 +368,7 @@ def create_analysis_job_store_from_env(
             fallback=False,
             fallback_reason=None,
             dsn_configured=dsn_configured,
+            dsn_env=dsn_env,
         )
     message = (
         f"Unsupported {AI_JOB_STORE_ENV} value: {requested_mode!r}. Expected "

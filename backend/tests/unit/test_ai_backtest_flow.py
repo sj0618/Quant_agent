@@ -23,6 +23,8 @@ from app.schemas.ai_backtest import (
     CodeExecutionResult,
     CodeValidationOutcome,
     GeneratedCodeResult,
+    ModelCallLogBundle,
+    PromptLogBundle,
 )
 from app.services.ai_backtest_flow import AICodeBacktestService
 
@@ -108,6 +110,22 @@ class FakeGenerator:
             code_purpose=request.code_purpose,
             generated_code="def build_signals(prices):\n    return []\n",
             model_name="gpt-code",
+            model_call=ModelCallLogBundle(
+                task_type="backtest_code_generation",
+                provider="mock",
+                model_name="gpt-code",
+                status="succeeded",
+                prompt_log=PromptLogBundle(
+                    prompt_template_name="quantagent.backtest_code.v1",
+                    system_prompt="[redacted stage1 backend code-generation system prompt]",
+                    user_prompt="[redacted stage1 backend code-generation user prompt]",
+                    assistant_response=None,
+                    variables_jsonb={"request_text_sha256": "hash", "strategy_id": request.strategy_id},
+                    prompt_version="quantagent.backtest_code.v1",
+                    contains_pii=False,
+                    masked=True,
+                ),
+            ),
         )
 
 
@@ -196,6 +214,32 @@ class FakeExecutor:
         )
 
 
+class FailedExecutionExecutor:
+    async def execute(
+        self,
+        request: AICodeBacktestFlowRequest,
+        generated: GeneratedCodeResult,
+        *,
+        trace_id: UUID,
+        execution_run_id: UUID,
+    ) -> CodeExecutionResult:
+        now = datetime.now(UTC)
+        return CodeExecutionResult(
+            runtime_env=generated.target_runtime,
+            status="failed",
+            timeout_seconds=request.timeout_seconds,
+            memory_limit_mb=request.memory_limit_mb,
+            sandbox_id="sandbox-failed",
+            latency_ms=12.5,
+            stdout="stdout with raw execution details",
+            stderr="stderr with raw execution details",
+            output_artifacts_jsonb={"artifacts": []},
+            started_at=now,
+            ended_at=now,
+            backtest_result=None,
+        )
+
+
 class FakeReporter:
     def __init__(self):
         self.called = False
@@ -268,7 +312,62 @@ def test_ai_backtest_flow_persists_generated_code_validation_execution_and_repor
     assert repository.reports[0].run_id == result.run_id
     assert repository.finished_traces[-1]["status"] == "succeeded"
     assert repository.error_logs == []
+    assert len(repository.model_calls) == 1
+    persisted_model_call = repository.model_calls[0]["bundle"]
+    assert persisted_model_call.task_type == "backtest_code_generation"
+    assert persisted_model_call.provider == "mock"
+    assert persisted_model_call.model_name == "gpt-code"
+    assert persisted_model_call.prompt_log is not None
+    assert persisted_model_call.prompt_log.assistant_response is None
+    assert persisted_model_call.prompt_log.masked is True
+    assert persisted_model_call.prompt_log.system_prompt.startswith("[redacted")
+    assert persisted_model_call.prompt_log.user_prompt.startswith("[redacted")
+    generation_log = next(log for log in repository.agent_logs if log.step_name == "code_generation")
+    assert generation_log.input_jsonb["request_text_sha256"]
+    assert "prompt" not in generation_log.input_jsonb
+    assert "strategy" not in generation_log.input_jsonb
+    assert repository.agent_log_updates[0][1].output_jsonb["model_call_logged"] is True
+    assert repository.strategy_parses[0].raw_prompt.startswith("prompt_redacted_sha256=")
+    assert repository.strategy_parses[0].raw_prompt != request.natural_language_prompt
+    assert request.natural_language_prompt[:10] not in repository.reports[0].summary
 
+
+def test_ai_backtest_flow_records_sanitized_execution_failure_payloads():
+    repository = FakeRepository()
+    generator = FakeGenerator()
+    validator = SafeValidator()
+    executor = FailedExecutionExecutor()
+    service = AICodeBacktestService(repository, generator, validator, executor, FakeReporter())
+
+    request = AICodeBacktestFlowRequest(
+        user_id=9,
+        natural_language_prompt="실패하는 전략도 실행해줘",
+        parsed_strategy_jsonb={"strategy_id": "failed_execution_demo"},
+        strategy_id="failed_execution_demo",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+        timeout_seconds=30,
+        memory_limit_mb=256,
+    )
+
+    with pytest.raises(AppError) as exc_info:
+        asyncio.run(service.run_generated_backtest(request))
+
+    assert exc_info.value.code == "code_execution_failed"
+    assert repository.error_logs
+    execution_error = repository.error_logs[-1]
+    assert execution_error.error_type == "code_execution_failed"
+    assert "raw execution details" not in execution_error.error_message
+    assert execution_error.context_jsonb["status"] == "failed"
+    assert execution_error.context_jsonb["stdout_present"] is True
+    assert execution_error.context_jsonb["stderr_present"] is True
+    assert execution_error.context_jsonb["stdout_sha256"]
+    assert execution_error.context_jsonb["stderr_sha256"]
+    assert "stdout" not in execution_error.context_jsonb
+    assert "stderr" not in execution_error.context_jsonb
+    execution_update = repository.execution_updates[-1][1]
+    assert execution_update.stdout.startswith("stdout redacted sha256=")
+    assert execution_update.stderr.startswith("stderr redacted sha256=")
 
 def test_ai_backtest_flow_rejects_unsafe_code_before_execution():
     repository = FakeRepository()
@@ -294,3 +393,7 @@ def test_ai_backtest_flow_rejects_unsafe_code_before_execution():
     assert repository.backtest_results == []
     assert repository.error_logs
     assert repository.finished_traces[-1]["status"] == "rejected"
+    validation_error = repository.error_logs[-1]
+    assert validation_error.context_jsonb["validation_error_codes"] == ["import"]
+    assert "errors" not in validation_error.context_jsonb
+    assert "warnings" not in validation_error.context_jsonb

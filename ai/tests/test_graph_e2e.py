@@ -1,3 +1,8 @@
+from uuid import UUID
+
+import pytest
+
+from ai_graph.audit import RecordingAuditSink
 from ai_graph.graph import DEBUG_STORE, NODE_SEQUENCE, run_analysis
 from ai_graph.jobs import InMemoryAnalysisJobStore
 
@@ -139,6 +144,49 @@ def test_supported_prompt_set_avoids_c5_for_krx_stock_screening_language() -> No
         assert run_analysis(prompt, trace_id=f"trace-{len(prompt)}").status != "rejected"
 
 
+def test_run_analysis_records_audit_events_when_sink_provided() -> None:
+    sink = RecordingAuditSink()
+
+    envelope = run_analysis(
+        "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어",
+        trace_id="trace-audit-ready",
+        audit_sink=sink,
+    )
+
+    assert envelope.status == "ready"
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert isinstance(session.correlation.db_trace_id, UUID)
+    assert session.correlation.db_trace_id.version == 4
+    assert session.correlation.trace_id == envelope.trace_id
+    assert session.correlation.debug_ref is None
+    assert session.correlation.entrypoint == "graph.run_analysis"
+    assert session.correlation.feature == "analysis"
+    assert [event.kind for event in session.buffered_events] == ["step", "step", "finalization"]
+    assert [event.step for event in session.buffered_events if event.kind == "step"] == [
+        "analysis_started",
+        "analysis_completed",
+    ]
+    assert session.buffered_events[-1].status == "completed"
+    assert "internal_payload" not in envelope.model_dump()
+
+
+def test_run_analysis_records_error_audit_events_when_validation_fails() -> None:
+    sink = RecordingAuditSink()
+
+    with pytest.raises(ValueError, match="user_query must not be empty"):
+        run_analysis("   ", audit_sink=sink)
+
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert isinstance(session.correlation.db_trace_id, UUID)
+    assert session.correlation.trace_id is None
+    assert session.correlation.debug_ref is None
+    assert [event.kind for event in session.buffered_events] == ["error", "finalization"]
+    error_event = session.buffered_events[0]
+    assert error_event.error_type == "ValueError"
+    assert "user_query" not in error_event.message
+    assert session.buffered_events[-1].status == "failed"
 def test_analysis_job_polling_contract_runs_sync() -> None:
     store = InMemoryAnalysisJobStore()
     job = store.create("RSI가 30 이하인 KOSPI200")
