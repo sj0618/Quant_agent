@@ -89,7 +89,7 @@ class AICodeBacktestService:
                 session_id=request.session_id,
                 user_id=request.user_id,
                 trace_id=trace_id,
-                raw_prompt=request.natural_language_prompt,
+                raw_prompt=_redacted_prompt_token(request.natural_language_prompt),
                 parsed_strategy_jsonb=request.parsed_strategy_jsonb,
                 confidence=request.parse_confidence,
                 model_name=request.parse_model_name,
@@ -131,6 +131,7 @@ class AICodeBacktestService:
                     "execution_run_id": str(execution_run_id),
                 },
             )
+            failure_message = _execution_failure_message(execution.status)
             await self.repository.create_error_log(
                 AIErrorLogCreate(
                     error_id=uuid4(),
@@ -139,8 +140,8 @@ class AICodeBacktestService:
                     session_id=request.session_id,
                     execution_run_id=execution_run_id,
                     error_type="code_execution_failed",
-                    error_message=execution.stderr or f"sandbox execution ended with status={execution.status}",
-                    context_jsonb={"status": execution.status, "stdout": execution.stdout, "stderr": execution.stderr},
+                    error_message=failure_message,
+                    context_jsonb=_execution_failure_context(execution),
                     severity="error" if execution.status != "timeout" else "warning",
                 )
             )
@@ -224,7 +225,7 @@ class AICodeBacktestService:
                 session_id=request.session_id,
                 agent_name="ai_backtest",
                 step_name="code_generation",
-                input_jsonb={"prompt": request.natural_language_prompt, "strategy": request.parsed_strategy_jsonb},
+                input_jsonb=_generation_input_payload(request),
                 started_at=started_at,
             )
         )
@@ -260,18 +261,18 @@ class AICodeBacktestService:
                 execution_id,
                 AgentExecutionLogUpdate(
                     status="succeeded",
-                    output_jsonb={"code_id": str(code_id), "code_hash": code_hash},
+                    output_jsonb=_generation_output_payload(code_id=code_id, code_hash=code_hash, generated=generated),
                     latency_ms=_latency_ms(started_at),
                 ),
             )
             return generated
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             await self._record_step_failure(
                 request,
                 trace_id=trace_id,
                 execution_id=execution_id,
                 error_type="code_generation_failed",
-                error_message=str(exc),
+                started_at=started_at,
             )
             raise
 
@@ -304,7 +305,7 @@ class AICodeBacktestService:
                 execution_id,
                 AgentExecutionLogUpdate(
                     status="failed",
-                    output_jsonb={"code_id": str(code_id), "validation_id": str(validation.validation_id)},
+                    output_jsonb=_validation_output_payload(code_id=code_id, validation=validation),
                     error_message="Generated code failed validation",
                     latency_ms=_latency_ms(started_at),
                 ),
@@ -318,12 +319,7 @@ class AICodeBacktestService:
                     execution_id=execution_id,
                     error_type="generated_code_rejected",
                     error_message="Generated code failed validation",
-                    context_jsonb={
-                        "code_id": str(code_id),
-                        "validation_id": str(validation.validation_id),
-                        "errors": validation.errors_jsonb,
-                        "warnings": validation.warnings_jsonb,
-                    },
+                    context_jsonb=_validation_error_context(validation),
                     severity="warning",
                 )
             )
@@ -404,8 +400,8 @@ class AICodeBacktestService:
                 CodeExecutionRunUpdate(
                     status=result.status,
                     latency_ms=result.latency_ms,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
+                    stdout=_redacted_stream_summary("stdout", result.stdout),
+                    stderr=_redacted_stream_summary("stderr", result.stderr),
                     output_artifacts_jsonb=result.output_artifacts_jsonb,
                     sandbox_id=result.sandbox_id,
                     started_at=result.started_at or started_at,
@@ -416,24 +412,20 @@ class AICodeBacktestService:
                 execution_id,
                 AgentExecutionLogUpdate(
                     status="succeeded" if result.status == "succeeded" else "failed",
-                    output_jsonb={
-                        "execution_run_id": str(execution_run_id),
-                        "status": result.status,
-                        "has_backtest_result": result.backtest_result is not None,
-                    },
-                    error_message=None if result.status == "succeeded" else (result.stderr or f"status={result.status}"),
+                    output_jsonb=_execution_output_payload(execution_run_id=execution_run_id, result=result),
+                    error_message=None if result.status == "succeeded" else _execution_failure_message(result.status),
                     latency_ms=result.latency_ms or _latency_ms(started_at),
                 ),
             )
             return result
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             await self._record_step_failure(
                 request,
                 trace_id=trace_id,
                 execution_id=execution_id,
                 execution_run_id=execution_run_id,
                 error_type="code_execution_failed",
-                error_message=str(exc),
+                started_at=started_at,
             )
             raise
 
@@ -493,14 +485,14 @@ class AICodeBacktestService:
                 ),
             )
             return report
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             await self._record_step_failure(
                 request,
                 trace_id=trace_id,
                 execution_id=execution_id,
                 run_id=run_id,
                 error_type="report_generation_failed",
-                error_message=str(exc),
+                started_at=started_at,
             )
             raise
 
@@ -511,16 +503,18 @@ class AICodeBacktestService:
         trace_id: UUID,
         execution_id: UUID,
         error_type: str,
-        error_message: str,
+        started_at: datetime,
         execution_run_id: UUID | None = None,
         run_id: UUID | None = None,
     ) -> None:
+        message = _step_failure_message(error_type)
         await self.repository.update_agent_execution_log(
             execution_id,
             AgentExecutionLogUpdate(
                 status="failed",
-                error_message=error_message,
-                latency_ms=0.0,
+                output_jsonb=_step_failure_output_payload(error_type=error_type, run_id=run_id),
+                error_message=message,
+                latency_ms=_latency_ms(started_at),
             ),
         )
         await self.repository.create_error_log(
@@ -532,13 +526,130 @@ class AICodeBacktestService:
                 execution_id=execution_id,
                 execution_run_id=execution_run_id,
                 error_type=error_type,
-                error_message=error_message,
-                context_jsonb={"run_id": str(run_id) if run_id else None},
+                error_message=message,
+                context_jsonb=_step_failure_context(error_type=error_type, run_id=run_id),
                 severity="error",
             )
         )
 
 
+def _generation_input_payload(request: AICodeBacktestFlowRequest) -> dict[str, object]:
+    return {
+        "strategy_id": request.strategy_id,
+        "target_runtime": request.target_runtime,
+        "code_purpose": request.code_purpose,
+        "has_parsed_strategy": bool(request.parsed_strategy_jsonb),
+        "request_text_sha256": _sha256_text(request.natural_language_prompt),
+    }
+
+
+def _generation_output_payload(
+    *,
+    code_id: UUID,
+    code_hash: str,
+    generated: GeneratedCodeResult,
+) -> dict[str, object]:
+    return {
+        "code_id": str(code_id),
+        "code_hash": code_hash,
+        "model_call_logged": generated.model_call is not None,
+    }
+
+
+def _validation_output_payload(*, code_id: UUID, validation) -> dict[str, object]:
+    return {
+        "code_id": str(code_id),
+        "validation_id": str(validation.validation_id),
+        "error_count": len(validation.errors_jsonb),
+        "warning_count": len(validation.warnings_jsonb),
+        "validation_error_codes": _validation_issue_codes(validation.errors_jsonb),
+        "validation_warning_codes": _validation_issue_codes(validation.warnings_jsonb),
+    }
+
+
+def _validation_error_context(validation) -> dict[str, object]:
+    return {
+        "code_id": str(validation.code_id),
+        "validation_id": str(validation.validation_id),
+        "error_count": len(validation.errors_jsonb),
+        "warning_count": len(validation.warnings_jsonb),
+        "validation_error_codes": _validation_issue_codes(validation.errors_jsonb),
+        "validation_warning_codes": _validation_issue_codes(validation.warnings_jsonb),
+    }
+
+
+def _validation_issue_codes(items: list[dict[str, object]]) -> list[str]:
+    codes: list[str] = []
+    for item in items:
+        code = item.get("code") or item.get("rule") or item.get("type")
+        if isinstance(code, str) and code and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def _execution_output_payload(*, execution_run_id: UUID, result: CodeExecutionResult) -> dict[str, object]:
+    payload = {
+        "execution_run_id": str(execution_run_id),
+        "status": result.status,
+        "has_backtest_result": result.backtest_result is not None,
+        "stdout_present": bool(result.stdout),
+        "stderr_present": bool(result.stderr),
+    }
+    if result.sandbox_id:
+        payload["sandbox_id"] = result.sandbox_id
+    return payload
+
+
+def _execution_failure_context(execution: CodeExecutionResult) -> dict[str, object]:
+    return {
+        "status": execution.status,
+        "stdout_present": bool(execution.stdout),
+        "stderr_present": bool(execution.stderr),
+        "stdout_sha256": _sha256_text(execution.stdout) if execution.stdout else None,
+        "stderr_sha256": _sha256_text(execution.stderr) if execution.stderr else None,
+        "stdout_char_count": len(execution.stdout or ""),
+        "stderr_char_count": len(execution.stderr or ""),
+    }
+
+
+def _execution_failure_message(status: str) -> str:
+    return f"Sandbox execution ended with status={status} before producing a backtest result"
+
+
+def _step_failure_message(error_type: str) -> str:
+    return {
+        "code_generation_failed": "Code generation failed before producing a persisted result.",
+        "code_execution_failed": "Code execution failed before producing a persisted result.",
+        "report_generation_failed": "Report generation failed before producing a persisted result.",
+    }.get(error_type, "AI backtest step failed before producing a persisted result.")
+
+
+def _step_failure_output_payload(*, error_type: str, run_id: UUID | None) -> dict[str, object]:
+    payload: dict[str, object] = {"error_code": error_type}
+    if run_id is not None:
+        payload["run_id"] = str(run_id)
+    return payload
+
+
+def _step_failure_context(*, error_type: str, run_id: UUID | None) -> dict[str, object]:
+    payload: dict[str, object] = {"error_code": error_type}
+    if run_id is not None:
+        payload["run_id"] = str(run_id)
+    return payload
+
+
+def _redacted_stream_summary(name: str, value: str | None) -> str | None:
+    if not value:
+        return None
+    return f"{name} redacted sha256={_sha256_text(value)} chars={len(value)}"
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _redacted_prompt_token(value: str) -> str:
+    return f"prompt_redacted_sha256={_sha256_text(value)}"
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
