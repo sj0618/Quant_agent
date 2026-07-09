@@ -13,6 +13,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 AI_DATABASE_DSN_ENV = "AI_DATABASE_DSN"
+QUANT_DB_DSN_ENV = "QUANT_DB_DSN"
+DATABASE_URL_ENV = "DATABASE_URL"
+DATABASE_DSN_ENV_CANDIDATES = (
+    AI_DATABASE_DSN_ENV,
+    QUANT_DB_DSN_ENV,
+    DATABASE_URL_ENV,
+)
 AI_DEFAULT_TICKER_ENV = "AI_DEFAULT_TICKER"
 AI_BACKTEST_LOOKBACK_DAYS_ENV = "AI_BACKTEST_LOOKBACK_DAYS"
 AI_L4_EVIDENCE_LIMIT_ENV = "AI_L4_EVIDENCE_LIMIT"
@@ -72,6 +79,7 @@ class DataSourceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     database_dsn: str | None = None
+    database_dsn_env: str = AI_DATABASE_DSN_ENV
     default_ticker: str = Field(default=DEFAULT_BACKTEST_TICKER, min_length=6, max_length=6)
     backtest_lookback_days: int = Field(default=DEFAULT_BACKTEST_LOOKBACK_DAYS, gt=0)
     l4_evidence_limit: int = Field(default=DEFAULT_L4_EVIDENCE_LIMIT, gt=0)
@@ -82,8 +90,10 @@ class DataSourceConfig(BaseModel):
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "DataSourceConfig":
         env = environ or os.environ
+        database_dsn, database_dsn_env = resolve_database_dsn_from_env(env)
         return cls(
-            database_dsn=_blank_to_none(env.get(AI_DATABASE_DSN_ENV)),
+            database_dsn=database_dsn,
+            database_dsn_env=database_dsn_env,
             default_ticker=env.get(AI_DEFAULT_TICKER_ENV, DEFAULT_BACKTEST_TICKER),
             backtest_lookback_days=_int_env(
                 env, AI_BACKTEST_LOOKBACK_DAYS_ENV, DEFAULT_BACKTEST_LOOKBACK_DAYS
@@ -151,6 +161,7 @@ class PostgresPipelineDataSource:
             data_availability=_data_availability_for_query(query, source="postgres"),
             metadata={
                 "source": "postgres",
+                "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
@@ -254,7 +265,6 @@ class PostgresPipelineDataSource:
     def _connect(self) -> Any:
         import psycopg
         from psycopg.rows import dict_row
-
         return psycopg.connect(
             self.config.database_dsn,
             connect_timeout=self.config.connect_timeout_seconds,
@@ -420,7 +430,10 @@ class PostgresPipelineDataSource:
 def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
-        return _fixture_bundle(f"{AI_DATABASE_DSN_ENV} is not set.", query=query)
+        return _fixture_bundle(
+            f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.",
+            query=query,
+        )
     try:
         return PostgresPipelineDataSource(config).load(query, trace_id)
     except Exception as exc:
@@ -436,6 +449,7 @@ def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
         metadata={
             "source": "fixture",
             "reason": reason,
+            "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),
             "available_db_objects": [
                 KIS_FEATURE_FRAME_VIEW,
                 KIS_ADJUSTED_OHLCV_TABLE,
@@ -743,6 +757,24 @@ def _has_broad_universe_reference(query: str) -> bool:
 
 def _has_broad_screening_reference(query: str) -> bool:
     return any(term in query for term in BROAD_SCREENING_TERMS)
+
+
+def resolve_database_dsn_from_env(environ: Mapping[str, str] | None = None) -> tuple[str | None, str]:
+    env = environ or os.environ
+    for env_name in DATABASE_DSN_ENV_CANDIDATES:
+        raw_value = _blank_to_none(env.get(env_name))
+        if raw_value:
+            return _normalize_postgres_dsn(raw_value), env_name
+    return None, AI_DATABASE_DSN_ENV
+
+
+def _normalize_postgres_dsn(value: str) -> str:
+    normalized = value.strip()
+    if normalized.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + normalized.removeprefix("postgresql+asyncpg://")
+    if normalized.startswith("postgresql+psycopg://"):
+        return "postgresql://" + normalized.removeprefix("postgresql+psycopg://")
+    return normalized
 
 
 def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, Any]:

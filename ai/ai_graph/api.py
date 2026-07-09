@@ -13,7 +13,6 @@ from ai_graph.audit import AuditSession, AuditSink, NoOpAuditSink, create_audit_
 from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
     BOK_MACRO_VIEW,
-    DataSourceConfig,
     KIS_ADJUSTED_OHLCV_TABLE,
     UNIVERSE_VIEW,
     resolve_database_dsn_from_env,
@@ -644,10 +643,9 @@ def _cors_allow_origins() -> list[str]:
 
 
 def _data_source_status() -> DataSourceStatus:
-    config = DataSourceConfig.from_env()
-    _, dsn_env = resolve_database_dsn_from_env()
+    dsn_value, dsn_env = resolve_database_dsn_from_env()
     return DataSourceStatus(
-        configured=config.database_dsn is not None,
+        configured=dsn_value is not None,
         dsn_env=dsn_env,
         price_source=KIS_ADJUSTED_OHLCV_TABLE,
         universe_source=UNIVERSE_VIEW,
