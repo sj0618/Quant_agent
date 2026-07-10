@@ -2,15 +2,15 @@
 
 ## 결론
 
-데이터 엔지니어링 실행 경로는 `KRX/KIS 파일럿 → KRX primary OHLCV 적재 → TA-Lib 선계산 → BOK/OpenDART 외부 데이터 적재 → WICS one-shot 섹터 적재 → mart/as-of 조회 → Airflow 운영` 순서다. MVP에서는 SEIBro를 사용하지 않는다. 2026-06-24 기준 BOK `rate-fx` 12개 series, BOK 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 백필이 완료되어 증분 운영 대상으로 전환한다. 2026-06-28 기준 WICS Company Guide 기반 섹터 스냅샷을 로컬 DB에 1회 적재해 `core.symbol_master.sector`를 갱신한다. BOK 월별 유가는 `902Y003` 월간 series로 저장하며 실제 ECOS 발표일이 별도 컬럼으로 저장되지 않으므로 백테스트 조인 시 보수적 lag를 적용한다.
+데이터 엔지니어링 실행 경로는 `KRX/KIS 파일럿 → KRX primary OHLCV 적재 → TA-Lib 선계산 → BOK/OpenDART 외부 데이터 적재 → WICS one-shot 섹터 적재 → mart/as-of 조회 → Airflow 운영` 순서다. MVP에서는 SEIBro를 사용하지 않는다. 2026-07-09 기준 OHLCV 일일 수집 목표는 오늘 날짜까지이며, 최신 검증 결과는 `core.ohlcv_daily=2026-07-03`, `core.ohlcv_quality_daily=2026-07-05`, `feature.adjusted_ohlcv_daily=2026-07-03`, `feature.kis_adjusted_ohlcv_daily=2026-07-06`이다. 2026-06-24 기준 BOK `rate-fx` 12개 series, BOK 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 백필이 완료되어 증분 운영 대상으로 전환한다. 2026-06-28 기준 WICS Company Guide 기반 섹터 스냅샷을 로컬 DB에 1회 적재해 `core.symbol_master.sector`를 갱신한다. BOK 월별 유가는 `902Y003` 월간 series로 저장하며 실제 ECOS 발표일이 별도 컬럼으로 저장되지 않으므로 백테스트 조인 시 보수적 lag를 적용한다.
 
 ## 주요 명령
 
 | 목적 | 명령 |
 |---|---|
 | Source pilot | `python scripts/run_source_pilot.py --source both --symbol 005930 --krx-trade-date 2026-05-15 --start-date 2026-05-14 --end-date 2026-05-15` |
-| OHLCV daily/backfill | `python scripts/ingest_ohlcv.py --source KRX --start-date 2026-05-15 --end-date 2026-05-15 --db-mode docker` |
-| TA-Lib 계산 | `python scripts/compute_ta_indicators.py --start-date 2026-05-14 --end-date 2026-05-15 --symbols 005930 --db-mode docker` |
+| OHLCV daily/backfill | `python scripts/ingest_ohlcv.py --source KRX --start-date 2026-07-03 --end-date 2026-07-09 --db-mode docker` |
+| TA-Lib 계산 | `python scripts/compute_ta_indicators.py --start-date 2026-07-03 --end-date 2026-07-09 --symbols 005930 --db-mode docker` |
 | BOK rate-fx 10년 백필/재개 | `python scripts/ingest_dart_bok_history.py --scope full-10y --sources bok --bok-series-preset rate-fx --bok-request-sleep-seconds 0.2 --output .omx/logs/bok-rate-fx-full-10y.json` |
 | BOK 월별 유가 10년 백필 | `python scripts/ingest_dart_bok_history.py --scope custom --sources bok --start-date 2016-06-01 --end-date 2026-06-24 --bok-series-json '[{"stat_code":"902Y003","cycle":"M","item_code1":"010101","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010102","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010103","language":"en"}]' --output .omx/logs/bok-oil-monthly-full-10y-20260624.json` |
 | DART CFS 2016~2026 백필/재개 | `python scripts/ingest_dart_bok_history.py --scope full-10y --sources dart --dart-refresh-corp-codes --dart-fs-div CFS --dart-request-sleep-seconds 0.5 --output .omx/logs/dart-financial-full-10y.json` |
@@ -19,8 +19,8 @@
 | OpenDART corp code | `python scripts/ingest_external_data.py --job dart-corp-codes --db-mode docker` |
 | OpenDART financial | `python scripts/ingest_external_data.py --job dart-financial --symbol 005930 --corp-code <corp_code> --business-year 2025 --report-code 11011 --db-mode docker` |
 | WICS 섹터 스냅샷(1회) | `python scripts/ingest_wics_sectors.py --as-of-date 2026-06-28 --db-mode docker` |
-| KIS official adjusted full + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode full --start-date 2016-05-20 --end-date 2026-05-20 --resume` |
-| KIS official adjusted daily incremental + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode daily-incremental --target-date 2026-05-21 --resume` |
+| KIS official adjusted full + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode full --start-date 2016-05-20 --end-date 2026-07-09 --resume` |
+| KIS official adjusted daily incremental + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode daily-incremental --target-date 2026-07-09 --resume` |
 
 2026-06-28 검증 결과, WICS 적재는 listed common-stock 2,536개 중 2,535개를 매칭했고 `230980`은 FnGuide Company Guide가 `InvalidCompany`를 반환해 `sector`가 `NULL`로 남았다.
 
@@ -78,7 +78,7 @@ MVP에서는 SEIBro 계층을 사용하지 않는다. 위 SEIBro 관련 raw/feat
 ## 검증 쿼리
 
 ```sql
-SELECT count(*) FROM core.ohlcv_daily WHERE trade_date = '2026-05-15';
+SELECT count(*) FROM core.ohlcv_daily WHERE trade_date = '2026-07-03';
 SELECT category, count(*) FROM feature.ta_indicator_definition GROUP BY category ORDER BY category;
 SELECT * FROM mart.symbol_feature_frame_asof WHERE symbol = '005930' ORDER BY as_of_date DESC LIMIT 5;
 SELECT count(*) AS rows,

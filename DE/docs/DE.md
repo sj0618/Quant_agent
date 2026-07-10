@@ -14,9 +14,9 @@
 | 영역 | 구현 내용 |
 |---|---|
 | DB 계층 | `meta`, `raw`, `core`, `feature`, `mart` 5개 스키마로 분리. 원본 보존 → 정규화 → feature 계산 → mart 조회 흐름 구현. |
-| 10년 OHLCV | KRX 일별 전 종목 OHLCV를 `raw.ohlcv_response`와 `core.ohlcv_daily`에 적재. 종목 마스터, 상장 이력, 종목명 이력, 거래일 캘린더 동시 갱신 구현. |
-| 10년 수정주가 | KIS 공식 수정주가를 `feature.kis_adjusted_ohlcv_daily`에 별도 적재. KIS API 제한을 고려해 종목×기간 window 분할, resume, 병렬 수집 구현. |
-| TA 지표 | `feature.kis_adjusted_ohlcv_daily` 또는 `core.ohlcv_daily`를 입력으로 canonical `feature.adjusted_ohlcv_daily` 생성 후 5개 TA 카테고리 테이블 적재. `ProcessPoolExecutor` 기반 종목 단위 병렬 계산 구현. |
+| 10년 OHLCV | KRX 일별 전 종목 OHLCV를 `raw.ohlcv_response`와 `core.ohlcv_daily`에 적재. 최신 검증일은 2026-07-03이며, 종목 마스터·상장 이력·종목명 이력·거래일 캘린더 동시 갱신 구현. |
+| 10년 수정주가 | KIS 공식 수정주가를 `feature.kis_adjusted_ohlcv_daily`에 별도 적재. 최신 검증일은 2026-07-06이며, KIS API 제한을 고려해 종목×기간 window 분할, resume, 병렬 수집 구현. |
+| TA 지표 | `feature.kis_adjusted_ohlcv_daily` 또는 `core.ohlcv_daily`를 입력으로 canonical `feature.adjusted_ohlcv_daily` 생성 후 5개 TA 카테고리 테이블 적재. OHLCV 최신 거래일 기준으로 `ProcessPoolExecutor` 기반 종목 단위 병렬 계산 구현. |
 | SEIBro | SEIBro 분석리포트 요약을 월 단위 chunk, page 단위 pagination으로 수집. 원본 payload와 파싱 row를 각각 `raw.seibro_report_response`, `raw.analyst_report_summary`에 저장. |
 | 품질/감사 | `meta.ingestion_run`, `meta.api_request_log`, `meta.data_quality_issue`, `meta.lineage_event`, `meta.ingestion_cursor`로 실행 이력, API 관측성, 품질 이슈, lineage, resume 상태 관리. |
 | 운영 | Airflow DAG와 수동 backfill CLI 병행. full backfill, daily incremental, QA, 테스트까지 연결하는 wrapper 구현. |
@@ -220,7 +220,7 @@ meta        위 전체 흐름의 실행 이력, API 로그, 품질 이슈, linea
 python scripts/ingest_ohlcv.py `
   --source KRX `
   --start-date 2016-05-20 `
-  --end-date 2026-05-20 `
+  --end-date 2026-07-09 `
   --db-mode docker `
   --output .omx/artifacts/ohlcv-10y.json
 ```
@@ -256,7 +256,7 @@ python scripts/ingest_ohlcv.py `
 ```powershell
 python scripts/ingest_kis_adjusted_ohlcv.py `
   --start-date 2016-05-20 `
-  --end-date 2026-05-20 `
+  --end-date 2026-07-09 `
   --workers 4 `
   --request-window-days 120 `
   --skip-existing `
@@ -315,7 +315,7 @@ KIS 공식 수정주가 기반 10년 TA 계산 예시:
 python scripts/compute_technical_indicators_pipeline.py `
   --db-mode docker `
   --start-date 2016-05-20 `
-  --end-date 2026-05-20 `
+  --end-date 2026-07-09 `
   --input-price-source kis-adjusted `
   --workers 8 `
   --ticker-batch-size 32 `
@@ -379,7 +379,7 @@ python scripts/compute_technical_indicators_pipeline.py `
 ```powershell
 python scripts/backfill_seibro_analyst_reports.py `
   --start-date 2016-05-20 `
-  --end-date 2026-05-20 `
+  --end-date 2026-07-09 `
   --chunk-months 1 `
   --page-size 500 `
   --db-mode docker `

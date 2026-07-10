@@ -20,16 +20,21 @@ except ImportError:  # pragma: no cover
     task = None
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-
+if Path("/opt/airflow/DE").exists():
+    DE_ROOT = Path("/opt/airflow/DE")        # 도커 컨테이너 내부 경로
+    REPO_ROOT = Path("/opt/airflow/DE")
+else:
+    DE_ROOT = Path(__file__).resolve().parents[2]  # 로컬의 Quant-agent/DE 폴더
+    REPO_ROOT = DE_ROOT.parent                     # 로컬의 Quant-agent 최상위 폴더
 
 def _load_airflow_dotenv() -> None:
     if os.getenv("QUANT_AIRFLOW_LOAD_DOTENV", "true").lower() in {"0", "false", "no", "off"}:
         return
     try:
         from dotenv import load_dotenv
-    except ImportError:  # pragma: no cover - python-dotenv is a runtime dependency in this repo.
+    except ImportError:
         return
+    # 로컬 루트의 .env 파일 타겟팅
     dotenv_path = Path(os.getenv("QUANT_AIRFLOW_DOTENV_PATH", str(REPO_ROOT / ".env")))
     load_dotenv(dotenv_path=dotenv_path, override=False)
 
@@ -42,19 +47,19 @@ DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE"
 DEFAULT_TA_WARMUP_DAYS = int(os.getenv("QUANT_AIRFLOW_TA_WARMUP_DAYS", "365"))
 DEFAULT_EXTERNAL_LOOKBACK_DAYS = int(os.getenv("QUANT_AIRFLOW_EXTERNAL_LOOKBACK_DAYS", "7"))
 KIS_ADJUSTED_INGEST_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_KIS_ADJUSTED_INGEST_SCRIPT", str(REPO_ROOT / "scripts" / "ingest_kis_adjusted_ohlcv.py"))
+    os.getenv("QUANT_AIRFLOW_KIS_ADJUSTED_INGEST_SCRIPT", str(DE_ROOT / "scripts" / "ingest_kis_adjusted_ohlcv.py"))
 )
 DART_BOK_INGEST_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_DART_BOK_INGEST_SCRIPT", str(REPO_ROOT / "scripts" / "ingest_dart_bok_history.py"))
+    os.getenv("QUANT_AIRFLOW_DART_BOK_INGEST_SCRIPT", str(DE_ROOT / "scripts" / "ingest_dart_bok_history.py"))
 )
 TA_PIPELINE_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_TA_PIPELINE_SCRIPT", str(REPO_ROOT / "scripts" / "compute_technical_indicators_pipeline.py"))
+    os.getenv("QUANT_AIRFLOW_TA_PIPELINE_SCRIPT", str(DE_ROOT / "scripts" / "compute_technical_indicators_pipeline.py"))
 )
 QA_CHECK_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_QA_CHECK_SCRIPT", str(REPO_ROOT / "scripts" / "run_data_quality_checks.py"))
+    os.getenv("QUANT_AIRFLOW_QA_CHECK_SCRIPT", str(DE_ROOT / "scripts" / "run_data_quality_checks.py"))
 )
 SYMBOL_METADATA_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_SYMBOL_METADATA_SCRIPT", str(REPO_ROOT / "scripts" / "refresh_symbol_metadata.py"))
+    os.getenv("QUANT_AIRFLOW_SYMBOL_METADATA_SCRIPT", str(DE_ROOT / "scripts" / "refresh_symbol_metadata.py"))
 )
 PYTHON_EXECUTABLE = os.getenv("QUANT_AIRFLOW_PYTHON", sys.executable)
 
@@ -237,9 +242,15 @@ if dag and task:  # pragma: no branch
     quant_agent_backfill_ohlcv_10y = backfill_ohlcv_10y()
 
 
-def _target_date(logical_date: str | None) -> date:
+def _target_date(logical_date) -> date:
     if logical_date:
-        return date.fromisoformat(logical_date[:10])
+        # 문자열로 들어온 경우 안전하게 슬라이싱
+        if isinstance(logical_date, str):
+            return date.fromisoformat(logical_date[:10])
+        # Airflow 객체(pendulum/datetime)로 들어온 경우 .date() 메서드 호출
+        if hasattr(logical_date, "date"):
+            return logical_date.date()
+            
     try:  # pragma: no cover - Airflow context only exists inside task runtime.
         from airflow.operators.python import get_current_context
 

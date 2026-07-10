@@ -52,6 +52,13 @@ jobs:
             ./ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
 
+      - name: Deploy DE Environment File
+        run: |
+          cat << 'EOF' > de_env_temp.txt
+          ${{ secrets.DE_ENV_FILE_CONTENT }}
+          EOF
+          scp -i ~/.ssh/id_rsa -P 30233 de_env_temp.txt etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/DE/.env
+
       - name: Install and restart development servers
         run: |
           ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
@@ -66,6 +73,14 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
+
+            echo "============================================="
+            echo "Deploying Data Engineering (Airflow) Stack..."
+            cd "$APP_DIR/DE"
+            docker compose -f docker-compose-airflow-dev.yaml down
+            docker compose -f docker-compose-airflow-dev.yaml up -d --build
+            echo "Airflow containers restarted."
+            echo "============================================="
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel

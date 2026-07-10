@@ -106,13 +106,13 @@ docker compose down -v
 DB가 준비되면 M1 source pilot 결과를 바탕으로 M2 subset backfill을 구현한다.
 
 ```powershell
-python scripts/run_source_pilot.py --source both --symbol 005930 --krx-trade-date 2026-05-15 --start-date 2026-04-15 --end-date 2026-05-15
+python scripts/run_source_pilot.py --source both --symbol 005930 --krx-trade-date 2026-07-03 --start-date 2026-07-02 --end-date 2026-07-03
 ```
 
 실제 적재 small-run:
 
 ```powershell
 $env:QUANT_DB_EXECUTION_MODE = "docker"
-python scripts/ingest_ohlcv.py --source KRX --start-date 2026-05-15 --end-date 2026-05-15 --db-mode docker
-python scripts/compute_ta_indicators.py --start-date 2026-05-14 --end-date 2026-05-15 --symbols 005930 --db-mode docker
+python scripts/ingest_ohlcv.py --source KRX --start-date 2026-07-03 --end-date 2026-07-03 --db-mode docker
+python scripts/compute_ta_indicators.py --start-date 2026-07-02 --end-date 2026-07-03 --symbols 005930 --db-mode docker
 ```

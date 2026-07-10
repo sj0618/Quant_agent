@@ -77,8 +77,12 @@ class PsycopgScriptClient:
     def execute(self, sql: str) -> str:
         with self.connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql)
-        return ""
+                try:
+                    cur.execute(sql)
+                except Exception as e:
+                    # ✨ 핵심: 에러 메시지 꼬리표에 SQL 원문을 묶어서 냅다 던져버립니다!
+                    error_msg = f"\n\n🔥 [찾았다 요놈!] 뷰/테이블 충돌을 일으킨 SQL 쿼리 원문: 🔥\n{sql}\n"
+                    raise RuntimeError(error_msg) from e
 
     def fetch_csv_text(self, query: str) -> str:
         copy_sql = f"COPY ({query.rstrip().rstrip(';')}) TO STDOUT WITH (FORMAT csv, HEADER true);"
