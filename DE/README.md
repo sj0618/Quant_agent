@@ -11,8 +11,8 @@ LLM 기반 퀀트 전략을 **실제 데이터로 검증하고 서비스에서 �
 
 | 출처 | 수집 범위/역할 | 원본 Landing | 정규화/활용 테이블 | 주요 활용 |
 |---|---|---|---|---|
-| **KRX** | 국내 상장 종목의 10년치 OHLCV 원주가, 종목/시장 메타데이터 | `raw.ohlcv_response` | `core.ohlcv_daily`, `core.symbol_master`, `core.trading_calendar` | 기본 가격 이력, 거래일 캘린더, 원천 정합성 비교 |
-| **KIS Open API** | 공식 수정주가 기준 일봉 OHLCV, 재개 가능한 증분 수집 | `meta.api_request_log`에 요청 단위 로그 적재 | `feature.adjusted_ohlcv_daily` | 백테스트 기준 가격, TA 지표 입력 |
+| **KRX** | 국내 상장 종목의 10년치 OHLCV 원주가(최신 검증일 2026-07-03), 종목/시장 메타데이터 | `raw.ohlcv_response` | `core.ohlcv_daily`, `core.symbol_master`, `core.trading_calendar` | 기본 가격 이력, 거래일 캘린더, 원천 정합성 비교 |
+| **KIS Open API** | 공식 수정주가 기준 일봉 OHLCV(최신 검증일 2026-07-06), 재개 가능한 증분 수집 | `meta.api_request_log`에 요청 단위 로그 적재 | `feature.adjusted_ohlcv_daily` | 백테스트 기준 가격, TA 지표 입력 |
 | **TA-Lib / pandas-ta** | 수정 OHLCV 기반 기술적 지표 계산. 정의 카탈로그 158개, mart 기본 선계산 key 45개 | - | `feature.ta_*_ticker_daily`, `mart.kis_adjusted_feature_frame_asof` | 팩터 생성, 백테스트 feature frame |
 | **SEIBro** | 분석리포트 요약 데이터 백필/증분 수집 | `raw.analyst_report_summary` | `feature.seibro_report_summary`, `feature.seibro_sentiment`, `mart.seibro_universe_asof` | 리포트 기반 보조 시그널, 종목 관심도 |
 | **BOK / DART** | BOK 금리/환율 12개 series와 월별 유가 3개 series(WTI/Dubai/Brent) 10년치 적재 완료. DART CFS 재무 데이터 2016~2026 period_end 구간 적재 완료 | `raw.bok_response`, `raw.dart_response` | `feature.bok_macro_daily`, `feature.dart_financial_quarterly` | macro/fundamental factor 결합 |
@@ -73,7 +73,7 @@ meta.*       run, cursor, API request, QA issue, lineage 기록
 | `core.symbol_listing_history` | 상장, 상폐, 재상장 등 종목 lifecycle 이벤트 | 과거 백테스트 survivorship bias 완화 |
 | `core.symbol_name_history` | 종목명 변경 이력 | 과거 리포트/가격 데이터 매칭 |
 | `core.trading_calendar` | 거래일 캘린더 | 누락일 QA, 증분 수집 범위 산정 |
-| `core.ohlcv_daily` | 10년치 OHLCV 원주가 | KRX 기준 가격 조회, KIS 수정주가 정합성 비교 |
+| `core.ohlcv_daily` | 10년치 OHLCV 원주가(최신 검증일 2026-07-03) | KRX 기준 가격 조회, KIS 수정주가 정합성 비교 |
 | `core.ohlcv_quality_daily` | 일별 OHLCV 품질 요약 | 커버리지 모니터링, QA 리포트 |
 
 ### `feature` schema — 분석/모델 입력 feature
@@ -124,7 +124,7 @@ TA 지표는 `feature.ta_indicator_definition`의 **계산 가능 카탈로그 1
 
 | 보고 싶은 데이터 | 조회 대상 |
 |---|---|
-| 10년치 OHLCV 원주가 | `core.ohlcv_daily` |
+| 10년치 OHLCV 원주가(최신 검증일 2026-07-03) | `core.ohlcv_daily` |
 | KIS 공식 수정주가 | `feature.adjusted_ohlcv_daily` |
 | 기술적 지표 기본 선계산 값 45개 | `feature.ta_trend_ticker_daily`, `feature.ta_momentum_ticker_daily`, `feature.ta_volatility_ticker_daily`, `feature.ta_volume_ticker_daily`, `feature.ta_pattern_ticker_daily` |
 | 수정주가 + TA 통합 feature frame | `mart.kis_adjusted_feature_frame_asof` |
@@ -178,7 +178,7 @@ TA 지표는 `feature.ta_indicator_definition`의 **계산 가능 카탈로그 1
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\run_data_quality_checks.py `
   --start-date 2016-05-20 `
-  --end-date 2026-05-20 `
+  --end-date 2026-07-09 `
   --checks all
 ```
 

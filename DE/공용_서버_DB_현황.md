@@ -1,6 +1,6 @@
 # 공용 서버 DB 테이블/뷰 전체 현황
 
-작성일: 2026-05-25  
+작성일: 2026-07-09
 대상 DB: 공용 서버 PostgreSQL/TimescaleDB `quant_agent`  
 검증 기준: Docker 컨테이너 `quant-agent-db`의 실제 row count와 `information_schema.columns` 기준 스키마.
 
@@ -8,23 +8,40 @@
 
 | 구분 | 상태 |
 |---|---|
-| KRX 기본 OHLCV | 10년 구간 적재 완료. |
-| KIS 수정주가 | 10년 구간 적재 완료. |
-| TA 지표 | 10년 구간 적재 완료. |
+| KRX 기본 OHLCV | 2026-07-03까지 최신 확인. |
+| KIS 수정주가 | 2026-07-06까지 최신 확인. |
+| TA 지표 | OHLCV 최신 거래일(2026-07-03) 기준 적재 확인. |
 | SEIBro raw | 10년 구간 적재 완료. |
 | SEIBro feature/mart | 스키마만 있고 데이터 미적재. raw → feature 변환 미실행 상태. |
 | BOK | 파일럿 1개 series, 2일치만 있음. 장기/운영 데이터 미완. |
 | OpenDART | raw/feature/mart 모두 스키마만 있고 데이터 미적재. |
 
+## 1.1 최신 수집 확인 (2026-07-09)
+
+| data_name | latest_date |
+|---|---|
+| core.ohlcv_daily | 2026-07-03 |
+| core.ohlcv_quality_daily | 2026-07-05 |
+| feature.adjusted_ohlcv_daily | 2026-07-03 |
+| feature.bok_macro_daily | 2026-07-06 |
+| feature.dart_financial_quarterly | 2026-06-30 |
+| feature.kis_adjusted_ohlcv_daily | 2026-07-06 |
+| mart.kis_adjusted_feature_frame_asof | 2026-07-03 |
+| mart.symbol_feature_frame_asof | 2026-07-03 |
+| raw.ohlcv_response | 2026-07-05 |
+
+> OHLCV 일일 수집 목표는 오늘 날짜까지이며, 위 표는 2026-07-09 기준 실제 DB 확인 결과다.
+> 아래 3.x 상세 표는 문서 작성 시점의 스냅샷으로 남겨둔 값이며, 최신 판정은 위 1.1 검증 결과를 우선한다.
+
 ## 2. 먼저 볼 객체
 
 | 목적 | 우선 객체 | 상태 |
 |---|---|---|
-| 수정주가 백테스트 입력 | `mart.kis_adjusted_feature_frame_asof` | 정상 조회 가능함. |
-| 일반 조정 OHLCV 백테스트 입력 | `mart.symbol_feature_frame_asof` | 정상 조회 가능함. |
+| 수정주가 백테스트 입력 | `mart.kis_adjusted_feature_frame_asof` | 정상 조회 가능함. 최신: 2026-07-03. |
+| 일반 조정 OHLCV 백테스트 입력 | `mart.symbol_feature_frame_asof` | 정상 조회 가능함. 최신: 2026-07-03. |
 | 투자 가능 universe | `mart.full_universe_asof` | 정상 조회 가능함. |
-| 원천 일봉 검증 | `core.ohlcv_daily` | KRX 10년 데이터 있음. |
-| KIS 수정주가 원천 검증 | `feature.kis_adjusted_ohlcv_daily` | KIS 10년 데이터 있음. |
+| 원천 일봉 검증 | `core.ohlcv_daily` | KRX 10년 데이터 있음. 최신: 2026-07-03. |
+| KIS 수정주가 원천 검증 | `feature.kis_adjusted_ohlcv_daily` | KIS 10년 데이터 있음. 최신: 2026-07-06. |
 | SEIBro 원천 검증 | `raw.analyst_report_summary` | SEIBro 분석리포트 요약 10년 데이터 있음. |
 | 미수집 확인 | `raw.dart_response`, `feature.dart_*` | OpenDART 데이터 미적재. |
 | BOK 파일럿 확인 | `raw.bok_response`, `feature.bok_macro_daily` | 파일럿 데이터만 있음. |
