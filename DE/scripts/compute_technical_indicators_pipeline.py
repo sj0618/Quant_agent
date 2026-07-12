@@ -747,8 +747,6 @@ def ensure_feature_tables(client: DockerPsqlClient) -> None:
         """
         CREATE SCHEMA IF NOT EXISTS feature;
         CREATE SCHEMA IF NOT EXISTS mart;
-        DROP VIEW IF EXISTS mart.symbol_feature_frame_asof CASCADE; 
-        DROP VIEW IF EXISTS mart.kis_adjusted_feature_frame_asof CASCADE;
         ALTER TABLE meta.lineage_event ADD COLUMN IF NOT EXISTS metadata_jsonb JSONB NOT NULL DEFAULT '{{}}'::jsonb;
         INSERT INTO meta.data_source (source_id, name, base_url_key, version, is_primary)
         VALUES ('TA', 'Pandas-TA/TA-Lib technical indicator transform', 'TA_TRANSFORM_VERSION', 'pandas-ta-talib-v1', FALSE)
