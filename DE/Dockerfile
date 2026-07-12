@@ -24,7 +24,7 @@ USER airflow
 ARG PIP_CONSTRAINT=""
 
 # 1. 빌드에 필요한 핵심 도구(setuptools, wheel, Cython 3이상)와 NumPy 버전을 먼저 고정 설치
-RUN pip install --no-cache-dir "setuptools>=67.0.0" wheel "Cython>=3.0.0" numpy==1.26.4
+RUN pip install --no-cache-dir "setuptools>=67.0.0" wheel "Cython>=3.0.0" numpy==1.26.4 meson-python
 
 # 2. 이미 설치된 안전한 환경을 참조하여 TA-Lib을 컴파일
 RUN pip install --no-cache-dir --no-build-isolation TA-Lib==0.6.8
