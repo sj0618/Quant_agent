@@ -5,7 +5,7 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     wget \
-    && wget https://github.com/TA-Lib/ta-lib-builds/releases/download/v0.4.0/ta-lib-0.4.0-src.tar.gz \
+    && wget -O ta-lib-0.4.0-src.tar.gz https://sourceforge.net/projects/ta-lib/files/ta-lib/0.4.0/ta-lib-0.4.0-src.tar.gz/download \
     && tar -xzf ta-lib-0.4.0-src.tar.gz \
     && cd ta-lib/ \
     && ./configure --prefix=/usr \
