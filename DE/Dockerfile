@@ -21,15 +21,16 @@ ENV TA_LIBRARY_PATH=/usr/lib
 # 2. 에어플로우 안전 계정으로 복귀
 USER airflow
 
-ARG PIP_CONSTRAINT=""
+ENV PIP_CONSTRAINT=""
 
-# 1. 빌드에 필요한 핵심 도구(setuptools, wheel, Cython 3이상)와 NumPy 버전을 먼저 고정 설치
-RUN pip install --no-cache-dir "setuptools>=67.0.0" wheel "Cython>=3.0.0" numpy==1.26.4 meson-python
-
-# 2. 이미 설치된 안전한 환경을 참조하여 TA-Lib을 컴파일
+# 1. 고정할 핵심 뼈대 선설치
+RUN pip install --no-cache-dir numpy==1.26.4
 RUN pip install --no-cache-dir --no-build-isolation TA-Lib==0.6.8
 
-# 3. [핵심] requirements.txt를 설치할 때도 --no-build-isolation 플래그를 추가
-# 위에서 깔아놓은 안전한 Cython과 NumPy를 사용하여 pandas를 빌드
+# 2. 깨끗해진 requirements.txt 패키지들 정상 설치
 COPY requirements.txt /requirements.txt
-RUN pip install --no-cache-dir --no-build-isolation -r /requirements.txt
+RUN pip install --no-cache-dir -r /requirements.txt
+
+# 3. [대망의 필살기] 의존성 족보 싸움을 무시하고 pandas-ta 강제 주입
+# PyPI에서 최신 버전을 다운로드하되, 넘파이 버전 체크를 건너뛰고 1.26.4 위에 안전하게 안착시킵니다.
+RUN pip install --no-cache-dir --no-deps pandas-ta
