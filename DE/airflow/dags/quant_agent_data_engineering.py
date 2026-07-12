@@ -41,7 +41,7 @@ def _load_airflow_dotenv() -> None:
 
 _load_airflow_dotenv()
 
-DEFAULT_DAILY_SCHEDULE = os.getenv("QUANT_AIRFLOW_DAILY_SCHEDULE", "0 4 * * *")
+DEFAULT_DAILY_SCHEDULE = "CRON_TZ=Asia/Seoul 0 4 * * *"
 DEFAULT_BACKFILL_SCHEDULE = os.getenv("QUANT_AIRFLOW_BACKFILL_SCHEDULE", None)
 DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE", "2026-01-01T00:00:00"))
 DEFAULT_TA_WARMUP_DAYS = int(os.getenv("QUANT_AIRFLOW_TA_WARMUP_DAYS", "365"))
@@ -244,10 +244,16 @@ if dag and task:  # pragma: no branch
 
 def _target_date(logical_date) -> date:
     if logical_date:
-        # 문자열로 들어온 경우 안전하게 슬라이싱
+        # 1. datetime.datetime 객체인 경우 .date() 추출
+        if isinstance(logical_date, datetime):
+            return logical_date.date()
+        # 2. 순수 datetime.date 객체인 경우 그대로 반환
+        if isinstance(logical_date, date):
+            return logical_date
+        # 3. 문자열로 들어온 경우 안전하게 슬라이싱
         if isinstance(logical_date, str):
             return date.fromisoformat(logical_date[:10])
-        # Airflow 객체(pendulum/datetime)로 들어온 경우 .date() 메서드 호출
+        # 4. 그 외 Airflow/Pendulum 객체 대응
         if hasattr(logical_date, "date"):
             return logical_date.date()
             
