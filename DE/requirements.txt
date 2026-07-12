@@ -1,4 +1,5 @@
 # --- [1. 퀀트 / 데이터 수집 핵심 패키지] ---
+numpy==1.26.4
 pandas
 pandas-ta
 psycopg[binary]==3.2.13
