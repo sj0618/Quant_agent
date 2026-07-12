@@ -21,7 +21,8 @@ ENV TA_LIBRARY_PATH=/usr/lib
 # 2. 에어플로우 안전 계정으로 복귀
 USER airflow
 
-# 3. 🔥 TA-Lib 컴파일 지뢰 제거 핵심 패치
+# 3.TA-Lib 컴파일 지뢰 제거 핵심 패치
+ARG PIP_CONSTRAINT=""
 # 에어플로우 2.9와 호환되는 안전한 넘파이 1.x 버전을 먼저 설치합니다.
 RUN pip install --no-cache-dir numpy==1.26.4
 # 빌드 격리를 해제(--no-build-isolation)하여 위에서 깐 넘파이를 참조해 TA-Lib을 성공적으로 구워냅니다.
