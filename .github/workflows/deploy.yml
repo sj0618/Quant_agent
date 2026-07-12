@@ -77,6 +77,10 @@ jobs:
             echo "============================================="
             echo "Deploying Data Engineering (Airflow) Stack..."
             cd "$APP_DIR/DE"
+
+            export DOCKER_BUILDKIT=0
+            export COMPOSE_DOCKER_CLI_BUILD=0
+            
             docker compose -f docker-compose-airflow-dev.yaml down
             docker compose -f docker-compose-airflow-dev.yaml up -d --build
             echo "Airflow containers restarted."
