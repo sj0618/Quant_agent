@@ -72,7 +72,9 @@ def test_in_memory_job_store_failure_contract_includes_error_envelope() -> None:
     assert failed.fallback_reasons == ["fixture fallback"]
     assert failed.result is not None
     assert failed.result.status == EnvelopeStatus.FAILED
-    assert failed.result.user_payload.message == "execution failed"
+    assert failed.result.failure_cause is not None
+    assert failed.result.failure_cause.subcause == "unknown"
+    assert failed.result.user_payload.message != "execution failed"
 
 
 def test_job_store_factory_defaults_to_memory_without_env() -> None:
@@ -211,3 +213,22 @@ def test_job_store_factory_uses_persistent_repository_when_configured() -> None:
     created = runtime.store.create_job("RSI strategy")
     assert created.query == "RSI strategy"
     assert repository.calls == ["create_job"]
+
+
+def test_job_store_factory_uses_database_url_alias_when_configured() -> None:
+    repository = RecordingRepository()
+
+    runtime = create_analysis_job_store_from_env(
+        {
+            "AI_JOB_STORE": "persistent",
+            "DATABASE_URL": "postgresql+asyncpg://db-team-provided",
+        },
+        repository=repository,
+        persistent_store_factory=PersistentAnalysisJobStore,
+    )
+
+    assert runtime.requested_mode == "persistent"
+    assert runtime.active_mode == "persistent"
+    assert runtime.fallback is False
+    assert runtime.dsn_configured is True
+    assert runtime.dsn_env == "DATABASE_URL"

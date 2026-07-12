@@ -52,6 +52,14 @@ jobs:
             ./ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
 
+      - name: Deploy DE Environment File
+        run: |
+          cat << 'EOF' > de_env_temp.txt
+          ${{ secrets.DE_ENV_FILE_CONTENT }}
+          EOF
+          scp -i ~/.ssh/id_rsa -P 30233 de_env_temp.txt etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/DE/.env
+          rm de_env_temp.txt
+
       - name: Install and restart development servers
         run: |
           ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
@@ -66,6 +74,18 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
+
+            echo "============================================="
+            echo "Deploying Data Engineering (Airflow) Stack..."
+            cd "$APP_DIR/DE"
+
+            export DOCKER_BUILDKIT=0
+            export COMPOSE_DOCKER_CLI_BUILD=0
+            
+            docker compose -f docker-compose-airflow-dev.yaml down
+            docker compose -f docker-compose-airflow-dev.yaml up -d --build
+            echo "Airflow containers restarted."
+            echo "============================================="
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
@@ -120,20 +140,20 @@ jobs:
               return 1
             }
 
-            stop_listeners_on_port 8000
-            stop_listeners_on_port 5173
+            stop_listeners_on_port 18001
+            stop_listeners_on_port 18000
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/fe.pid"
 
             cd "$APP_DIR/ai"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn ai_graph.api:app \
               --host 0.0.0.0 \
-              --port 8000 \
+              --port 18001 \
               --reload \
               > "$RUN_DIR/ai.log" 2>&1 &
             echo "$!" > "$RUN_DIR/ai.pid"
 
             cd "$APP_DIR/fe"
-            nohup npm run dev -- --host 0.0.0.0 --port 5173 \
+            nohup npm run dev -- --host 0.0.0.0 --port 18000 \
               > "$RUN_DIR/fe.log" 2>&1 &
             echo "$!" > "$RUN_DIR/fe.pid"
 
@@ -153,6 +173,6 @@ jobs:
               return 1
             }
 
-            wait_for_url "AI API" "http://127.0.0.1:8000/health" "$RUN_DIR/ai.log"
-            wait_for_url "FE dev server" "http://127.0.0.1:5173/" "$RUN_DIR/fe.log"
+            wait_for_url "AI API" "http://127.0.0.1:18001/health" "$RUN_DIR/ai.log"
+            wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
           REMOTE

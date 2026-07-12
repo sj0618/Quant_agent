@@ -1,3 +1,8 @@
+from uuid import UUID
+
+import pytest
+
+from ai_graph.audit import RecordingAuditSink
 from ai_graph.graph import DEBUG_STORE, NODE_SEQUENCE, run_analysis
 from ai_graph.jobs import InMemoryAnalysisJobStore
 
@@ -89,6 +94,27 @@ def test_pullback_term_uses_l1_l2_definition_without_blocking() -> None:
     assert envelope.user_payload.candidate_cards[0].strategy_id == "pullback_trend"
 
 
+def test_pullback_rsi40_volume_prompt_generates_nonzero_backtest() -> None:
+    envelope = run_analysis(
+        "200일선 위 상승추세를 유지하면서 RSI(14)가 40 이하로 눌리고 거래량이 20일 평균 이상인 종목을 찾아줘.",
+        trace_id="trace-pullback-rsi40-volume",
+    )
+
+    assert envelope.status == "ready"
+    assert envelope.strategy_spec is not None
+    assert envelope.strategy_spec.strategy_id == "pullback_rsi_volume_a"
+    assert [
+        (condition.left, condition.operator, condition.right)
+        for condition in envelope.strategy_spec.entry_conditions
+    ] == [
+        ("close_above_sma_200", "eq", 1),
+        ("rsi", "lte", 40),
+        ("volume_ratio_20", "gte", 1.0),
+    ]
+    assert envelope.user_payload.performance is not None
+    assert envelope.user_payload.performance.metrics.total_return != 0
+
+
 def test_option_short_straddle_is_rejected() -> None:
     envelope = run_analysis("옵션 양매도 전략 만들어줘", trace_id="trace-c5")
 
@@ -118,6 +144,49 @@ def test_supported_prompt_set_avoids_c5_for_krx_stock_screening_language() -> No
         assert run_analysis(prompt, trace_id=f"trace-{len(prompt)}").status != "rejected"
 
 
+def test_run_analysis_records_audit_events_when_sink_provided() -> None:
+    sink = RecordingAuditSink()
+
+    envelope = run_analysis(
+        "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어",
+        trace_id="trace-audit-ready",
+        audit_sink=sink,
+    )
+
+    assert envelope.status == "ready"
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert isinstance(session.correlation.db_trace_id, UUID)
+    assert session.correlation.db_trace_id.version == 4
+    assert session.correlation.trace_id == envelope.trace_id
+    assert session.correlation.debug_ref is None
+    assert session.correlation.entrypoint == "graph.run_analysis"
+    assert session.correlation.feature == "analysis"
+    assert [event.kind for event in session.buffered_events] == ["step", "step", "finalization"]
+    assert [event.step for event in session.buffered_events if event.kind == "step"] == [
+        "analysis_started",
+        "analysis_completed",
+    ]
+    assert session.buffered_events[-1].status == "completed"
+    assert "internal_payload" not in envelope.model_dump()
+
+
+def test_run_analysis_records_error_audit_events_when_validation_fails() -> None:
+    sink = RecordingAuditSink()
+
+    with pytest.raises(ValueError, match="user_query must not be empty"):
+        run_analysis("   ", audit_sink=sink)
+
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert isinstance(session.correlation.db_trace_id, UUID)
+    assert session.correlation.trace_id is None
+    assert session.correlation.debug_ref is None
+    assert [event.kind for event in session.buffered_events] == ["error", "finalization"]
+    error_event = session.buffered_events[0]
+    assert error_event.error_type == "ValueError"
+    assert "user_query" not in error_event.message
+    assert session.buffered_events[-1].status == "failed"
 def test_analysis_job_polling_contract_runs_sync() -> None:
     store = InMemoryAnalysisJobStore()
     job = store.create("RSI가 30 이하인 KOSPI200")

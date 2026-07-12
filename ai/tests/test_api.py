@@ -1,3 +1,6 @@
+from uuid import UUID
+
+import pytest
 from fastapi.testclient import TestClient
 
 from ai_graph.api import (
@@ -5,12 +8,15 @@ from ai_graph.api import (
     ANALYSIS_JOB_DETAIL_PATH,
     ANALYSIS_JOBS_PATH,
     API_STATUS_PATH,
+    DAILY_DIGEST_PATH,
     DOCS_URL,
     HEALTH_PATH,
     OPENAPI_URL,
     SPEC_STRATEGY_PARSE_PATH,
+    STRATEGY_DESCRIPTIONS_PATH,
     create_app,
 )
+from ai_graph.audit import RecordingAuditSink
 from ai_graph.jobs import InMemoryAnalysisJobStore
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, Stage, UserPayload
 
@@ -29,6 +35,31 @@ def _ready_envelope(trace_id: str) -> APIEnvelope:
         retryable=False,
     )
 
+def _daily_digest_strategy_payload(
+    strategy_id: str,
+    name: str,
+    signal: str,
+) -> dict[str, object]:
+    return {
+        "strategy_id": strategy_id,
+        "name": name,
+        "universe": "KOSPI200",
+        "timeframe": "1d",
+        "today_signal": signal,
+        "targets": ["삼성전자"],
+        "metrics": {
+            "sharpe_ratio": 1.12,
+            "max_drawdown": -0.06,
+            "win_rate": 0.58,
+            "total_return": 0.14,
+            "in_sample_sharpe": 1.12,
+            "out_sample_sharpe": 1.12,
+            "degradation": 0.0,
+        },
+        "win_rate": 0.583,
+        "trade_count": 24,
+    }
+
 
 def test_swagger_openapi_lists_current_api_surface() -> None:
     client = TestClient(create_app(InMemoryAnalysisJobStore()))
@@ -46,6 +77,8 @@ def test_swagger_openapi_lists_current_api_surface() -> None:
     assert ANALYSIS_JOBS_PATH in paths
     assert ANALYSIS_JOB_DETAIL_PATH in paths
     assert SPEC_STRATEGY_PARSE_PATH in paths
+    assert STRATEGY_DESCRIPTIONS_PATH in paths
+    assert DAILY_DIGEST_PATH in paths
     assert "/api/analysis-jobs/{job_id}" in paths
     assert "/api/backtests/{strategy_id}" in paths
     assert "/api/reports/{report_id}" in paths
@@ -65,6 +98,20 @@ def test_api_status_exposes_data_source_without_dsn_value(monkeypatch) -> None:
     assert data_source["price_source"] == "feature.kis_adjusted_ohlcv_daily"
     assert response.json()["job_store"]["active_mode"] == "memory"
     assert "secret" not in str(response.json()["job_store"])
+
+
+def test_api_status_uses_database_url_alias_for_data_source(monkeypatch) -> None:
+    monkeypatch.delenv("AI_DATABASE_DSN", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://secret-user:secret-pass@db/quant_agent")
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    response = client.get(API_STATUS_PATH)
+
+    assert response.status_code == 200
+    data_source = response.json()["data_source"]
+    assert data_source["configured"] is True
+    assert data_source["dsn_env"] == "DATABASE_URL"
+    assert "secret" not in str(data_source)
 
 
 def test_api_status_reports_persistent_job_store_fallback(monkeypatch) -> None:
@@ -132,7 +179,8 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
 
 
 def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adapters() -> None:
-    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store))
 
     create_response = client.post(
         SPEC_STRATEGY_PARSE_PATH,
@@ -157,12 +205,233 @@ def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adap
     assert backtest_response.json()["status"] == "ready"
     assert backtest_response.json()["user_payload"]["performance"]["selected_candidate_id"]
 
-    report_response = client.get(f"/api/reports/{created_job['job_id']}")
+    stored_job = store.get_job(created_job["job_id"])
+    assert stored_job is not None
+    assert stored_job.report_id is not None
+
+    report_response = client.get(f"/api/reports/{stored_job.report_id}")
     assert report_response.status_code == 200
     assert report_response.json()["status"] == "ready"
     assert report_response.json()["user_payload"]["report"]["web_projection"]["sections"]
 
 
+def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    response = client.post(
+        STRATEGY_DESCRIPTIONS_PATH,
+        json={
+            "strategies": [
+                {
+                    "strategy_id": "semiconductor-momentum",
+                    "name": "반도체 모멘텀 + 기관 매수",
+                    "universe": "KOSPI200 · 반도체",
+                    "timeframe": "daily",
+                    "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
+                    "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
+                    "risk_summary": "실적 발표와 환율 급등 구간에서는 신규 비중 확대를 늦춥니다.",
+                    "tags": ["모멘텀", "외국인 수급"],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()["items"][0]
+    assert payload["strategy_id"] == "semiconductor-momentum"
+    assert payload["description"]
+    assert "이메일" not in payload["description"]
+
+
+def test_strategy_descriptions_route_records_per_item_audit_steps() -> None:
+    sink = RecordingAuditSink()
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+
+    response = client.post(
+        STRATEGY_DESCRIPTIONS_PATH,
+        json={
+            "strategies": [
+                {
+                    "strategy_id": "semiconductor-momentum",
+                    "name": "반도체 모멘텀 + 기관 매수",
+                    "universe": "KOSPI200 · 반도체",
+                    "timeframe": "daily",
+                    "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
+                    "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
+                    "risk_summary": "실적 발표와 환율 급등 구간에서는 신규 비중 확대를 늦춥니다.",
+                    "tags": ["모멘텀", "외국인 수급"],
+                },
+                {
+                    "strategy_id": "dividend-defensive",
+                    "name": "배당 방어주",
+                    "universe": "KOSPI200",
+                    "timeframe": "daily",
+                    "entry_summary": "배당수익률과 재무안정성이 높은 종목을 찾습니다.",
+                    "exit_summary": "배당 컷 또는 추세 훼손 시 비중을 줄입니다.",
+                    "risk_summary": "금리 급등 구간에서는 방어력이 약해질 수 있습니다.",
+                    "tags": ["배당", "방어"],
+                },
+            ]
+        },
+    )
+
+    assert response.status_code == 201
+    assert len(response.json()["items"]) == 2
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert isinstance(session.correlation.db_trace_id, UUID)
+    assert session.correlation.trace_id is None
+    assert session.correlation.entrypoint == "api.strategy_descriptions"
+    assert session.correlation.feature == "strategy_descriptions"
+    assert [event.kind for event in session.buffered_events] == ["step", "step", "step", "finalization"]
+    assert [event.step for event in session.buffered_events if event.kind == "step"] == [
+        "descriptions_started",
+        "description_generated",
+        "description_generated",
+    ]
+    assert "strategy_id=semiconductor-momentum" in session.buffered_events[1].message
+    assert "strategy_id=dividend-defensive" in session.buffered_events[2].message
+    assert session.buffered_events[-1].status == "completed"
+
+
+def test_strategy_descriptions_route_records_sanitized_error_audit_events(monkeypatch) -> None:
+    sink = RecordingAuditSink()
+
+    def failing_generate_strategy_description(*args, **kwargs):
+        raise RuntimeError("description generation exploded with raw request details")
+
+    monkeypatch.setattr("ai_graph.api.generate_strategy_description", failing_generate_strategy_description)
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+
+    with pytest.raises(RuntimeError, match="description generation exploded with raw request details"):
+        client.post(
+            STRATEGY_DESCRIPTIONS_PATH,
+            json={
+                "strategies": [
+                    {
+                        "strategy_id": "semiconductor-momentum",
+                        "name": "반도체 모멘텀 + 기관 매수",
+                        "universe": "KOSPI200 · 반도체",
+                        "timeframe": "daily",
+                        "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
+                        "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
+                        "risk_summary": "실적 발표와 환율 급등 구간에서는 신규 비중 확대를 늦춥니다.",
+                        "tags": ["모멘텀", "외국인 수급"],
+                    }
+                ]
+            },
+        )
+
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert [event.kind for event in session.buffered_events] == ["step", "error", "finalization"]
+    assert [event.step for event in session.buffered_events if event.kind in {"step", "error"}] == [
+        "descriptions_started",
+        "description_generation",
+    ]
+    error_event = session.buffered_events[-2]
+    assert error_event.error_type == "RuntimeError"
+    assert "raw request details" not in error_event.message
+    assert session.buffered_events[-1].status == "failed"
+def test_daily_digest_route_records_success_audit_steps() -> None:
+    sink = RecordingAuditSink()
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+
+    response = client.post(
+        DAILY_DIGEST_PATH,
+        json={
+            "user_name": "홍길동",
+            "report_date": "2026-06-29",
+            "strategies": [
+                _daily_digest_strategy_payload("rsi", "RSI 전략", "BUY"),
+                _daily_digest_strategy_payload("macd", "MACD 전략", "HOLD"),
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["header"]["strategy_count"] == 2
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert isinstance(session.correlation.db_trace_id, UUID)
+    assert session.correlation.trace_id is None
+    assert session.correlation.entrypoint == "api.daily_digest"
+    assert session.correlation.feature == "daily_digest"
+    assert [event.kind for event in session.buffered_events] == ["step", "step", "step", "step", "finalization"]
+    assert [event.step for event in session.buffered_events if event.kind == "step"] == [
+        "daily_digest_started",
+        "daily_digest_card_ready",
+        "daily_digest_card_ready",
+        "daily_digest_market_brief",
+    ]
+    assert "strategy_id=rsi" in session.buffered_events[1].message
+    assert "strategy_id=macd" in session.buffered_events[2].message
+    assert session.buffered_events[-1].status == "completed"
+
+
+def test_report_route_uses_injected_report_resolver_for_real_report_ids() -> None:
+    resolved_ids: list[str] = []
+
+    def report_resolver(report_id: str) -> APIEnvelope | None:
+        resolved_ids.append(report_id)
+        return APIEnvelope(
+            status=EnvelopeStatus.READY,
+            trace_id="trace-report-resolver",
+            user_payload=UserPayload(
+                headline="ready",
+                message="report resolved",
+                next_actions=[],
+                report={
+                    "web_projection": {"title": "웹", "summary": "요약", "sections": []},
+                    "email_projection": {"title": "메일", "summary": "요약", "sections": []},
+                    "risk_adjustments": [],
+                },
+            ),
+            strategy_spec=None,
+            debug_ref="debug:trace-report-resolver",
+            retryable=False,
+        )
+
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), report_resolver=report_resolver))
+
+    response = client.get("/api/reports/backend-report-1")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+    assert response.json()["user_payload"]["report"]["web_projection"]["title"] == "웹"
+    assert resolved_ids == ["backend-report-1"]
+def test_daily_digest_route_records_sanitized_error_audit_events(monkeypatch) -> None:
+    sink = RecordingAuditSink()
+
+    def failing_build_daily_digest(*args, **kwargs):
+        raise ValueError("daily digest exploded with raw request details")
+
+    monkeypatch.setattr("ai_graph.api.build_daily_digest", failing_build_daily_digest)
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+
+    response = client.post(
+        DAILY_DIGEST_PATH,
+        json={
+            "user_name": "홍길동",
+            "report_date": "2026-06-29",
+            "strategies": [_daily_digest_strategy_payload("rsi", "RSI 전략", "BUY")],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "daily digest exploded with raw request details"
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert [event.kind for event in session.buffered_events] == ["step", "error", "finalization"]
+    assert [event.step for event in session.buffered_events if event.kind in {"step", "error"}] == [
+        "daily_digest_started",
+        "daily_digest_validation",
+    ]
+    error_event = session.buffered_events[-2]
+    assert error_event.error_type == "ValueError"
+    assert "raw request details" not in error_event.message
+    assert session.buffered_events[-1].status == "failed"
 def test_spec_resource_adapters_return_failed_envelope_instead_of_404() -> None:
     client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
@@ -204,6 +473,83 @@ def test_analysis_job_route_uses_injected_store_and_preserves_polling_contract()
     assert poll_response.json()["job_id"] == created_job["job_id"]
 
 
+def test_analysis_job_route_records_audit_events_with_real_runner() -> None:
+    sink = RecordingAuditSink()
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+
+    response = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={
+            "query": "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어",
+        },
+    )
+
+    assert response.status_code == 201
+    created_job = response.json()
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert isinstance(session.correlation.db_trace_id, UUID)
+    assert session.correlation.db_trace_id.version == 4
+    assert session.correlation.trace_id == created_job["trace_id"]
+    assert session.correlation.debug_ref is None
+    assert session.correlation.entrypoint == "api.analysis_jobs"
+    assert session.correlation.feature == "analysis_job"
+    assert [event.kind for event in session.buffered_events] == ["step", "step", "step", "finalization"]
+    assert [event.step for event in session.buffered_events if event.kind == "step"] == [
+        "job_dispatched",
+        "analysis_started",
+        "analysis_completed",
+    ]
+    assert session.buffered_events[-1].status == "completed"
+    assert created_job["result"]["trace_id"] == created_job["trace_id"]
+    assert "internal_payload" not in created_job["result"]
+
+
+def test_parse_strategy_route_records_failure_audit_events_with_request_metadata() -> None:
+    sink = RecordingAuditSink()
+
+    def failing_runner(query: str, trace_id: str) -> APIEnvelope:
+        raise RuntimeError(f"runner failed for {query} with {trace_id}")
+
+    client = TestClient(
+        create_app(
+            InMemoryAnalysisJobStore(),
+            analysis_runner=failing_runner,
+            audit_sink=sink,
+        )
+    )
+
+    response = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={
+            "natural_language": "최근 52주 신고가 돌파 종목을 찾아줘.",
+            "strategy_id": "breakout_volume_momentum",
+            "client_request_id": "client-parse-1",
+        },
+    )
+
+    assert response.status_code == 201
+    failed_job = response.json()
+    assert failed_job["result"]["status"] == "failed"
+    assert failed_job["result"]["debug_ref"].startswith("job-error:")
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert isinstance(session.correlation.db_trace_id, UUID)
+    assert session.correlation.trace_id == failed_job["trace_id"]
+    assert session.correlation.entrypoint == "api.strategy_parse"
+    assert session.correlation.feature == "strategy_parse"
+    assert session.correlation.strategy_id == "breakout_volume_momentum"
+    assert session.correlation.client_request_id == "client-parse-1"
+    assert [event.kind for event in session.buffered_events] == ["step", "step", "error", "finalization"]
+    assert [event.step for event in session.buffered_events if event.kind in {"step", "error"}] == [
+        "job_dispatched",
+        "analysis_started",
+        "analysis_execution",
+    ]
+    error_event = session.buffered_events[-2]
+    assert error_event.error_type == "RuntimeError"
+    assert "runner failed" not in error_event.message
+    assert session.buffered_events[-1].status == "failed"
 def test_failed_analysis_job_returns_error_contract() -> None:
     def failing_runner(query: str, trace_id: str) -> APIEnvelope:
         raise RuntimeError(f"runner failed for {query} with {trace_id}")
@@ -215,7 +561,9 @@ def test_failed_analysis_job_returns_error_contract() -> None:
     assert response.status_code == 201
     failed_job = response.json()
     assert failed_job["result"]["status"] == "failed"
-    assert failed_job["result"]["user_payload"]["message"].startswith("runner failed")
+    assert failed_job["result"]["failure_cause"]["subcause"] == "unknown"
+    assert "runner failed" not in failed_job["result"]["user_payload"]["message"]
+    assert failed_job["result"]["debug_ref"].startswith("job-error:")
     assert failed_job["stages"][-1]["status"] == "failed"
 
 

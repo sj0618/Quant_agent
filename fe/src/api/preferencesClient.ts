@@ -19,9 +19,6 @@ export function getNotificationSettings(email: string): NotificationSettings {
   return (
     readSettings() ?? {
       dailyReportEmail: true,
-      actionEmails: true,
-      marketingEmail: false,
-      deliveryHour: "08:00",
       email,
     }
   );

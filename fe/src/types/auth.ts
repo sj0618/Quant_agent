@@ -14,8 +14,5 @@ export interface AuthSession {
 
 export interface NotificationSettings {
   dailyReportEmail: boolean;
-  actionEmails: boolean;
-  marketingEmail: boolean;
-  deliveryHour: string;
   email: string;
 }

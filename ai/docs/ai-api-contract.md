@@ -79,6 +79,41 @@ replaced by an SDK-backed implementation behind the same `LLMClient` interface.
 | `stage` | `interpreting`, `code_generation`, `backtest`, `debate`, `finalizing` |
 | `stage_status` | `queued`, `running`, `succeeded`, `failed` |
 
+## Strategy Description
+
+`POST /api/strategies/descriptions`
+
+```json
+{
+  "strategies": [
+    {
+      "strategy_id": "semiconductor-momentum",
+      "name": "반도체 모멘텀 + 기관 매수",
+      "universe": "KOSPI200 · 반도체",
+      "timeframe": "daily",
+      "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
+      "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
+      "risk_summary": "실적 발표와 환율 급등 구간에서는 신규 비중 확대를 늦춥니다.",
+      "tags": ["모멘텀", "외국인 수급"]
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "strategy_id": "semiconductor-momentum",
+      "description": "반도체 업종 내 상대강도와 외국인 순매수 흐름이 동시에 강화되는 종목에 집중하는 모멘텀 전략입니다.",
+      "fallback_reasons": []
+    }
+  ]
+}
+```
+
 ## Envelope
 
 FE/BE public contract is frozen by `tests/contracts/test_api_envelope_contract.py`.

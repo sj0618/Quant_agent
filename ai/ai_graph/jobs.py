@@ -13,7 +13,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_graph.schemas import APIEnvelope, EnvelopeStatus, Stage, StageStatus, UserPayload
+from ai_graph.data_sources.db import resolve_database_dsn_from_env
+from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
 
 
 AI_JOB_STORE_ENV = "AI_JOB_STORE"
@@ -49,6 +50,7 @@ class AnalysisJob(BaseModel):
     user_id: str | None = Field(default=None, exclude=True)
     strategy_id: str | None = Field(default=None, exclude=True)
     run_id: str | None = Field(default=None, exclude=True)
+    report_id: str | None = Field(default=None, exclude=True)
     status: AnalysisJobStatus = Field(exclude=True)
     polling_stage: Stage = Field(exclude=True)
     created_at: datetime
@@ -215,9 +217,13 @@ class InMemoryAnalysisJobStore:
         strategy_id = job.strategy_id
         if strategy_id is None and result_envelope.strategy_spec is not None:
             strategy_id = result_envelope.strategy_spec.strategy_id
+        report_id = job.report_id
+        if report_id is None and result_envelope.user_payload.report is not None:
+            report_id = f"report_{job.job_id}"
         job = job.model_copy(
             update={
                 "strategy_id": strategy_id,
+                "report_id": report_id,
                 "status": AnalysisJobStatus.COMPLETED,
                 "polling_stage": Stage.FINALIZING,
                 "updated_at": completed_at,
@@ -298,7 +304,12 @@ def run_job_sync(store: AnalysisJobStore, job_id: str, runner: AnalysisRunner) -
     try:
         result = runner(job.query, job.trace_id)
     except Exception as exc:
-        return store.fail_job(job_id, str(exc))
+        diagnostic = classify_failure(exc, stage=Stage.FINALIZING.value)
+        return store.fail_job(
+            job_id,
+            diagnostic.safe_message,
+            result_envelope=_failure_envelope(job, diagnostic.safe_message, failure_cause=diagnostic),
+        )
     return store.complete_job(job_id, result)
 
 
@@ -310,7 +321,8 @@ def create_analysis_job_store_from_env(
 ) -> JobStoreRuntime:
     source = environ if env is None else env
     requested_mode = _requested_job_store_mode(source)
-    dsn_configured = bool(source.get(AI_DATABASE_DSN_ENV))
+    dsn_value, dsn_env = resolve_database_dsn_from_env(source)
+    dsn_configured = bool(dsn_value)
     if requested_mode == MEMORY_JOB_STORE_MODE:
         store = InMemoryAnalysisJobStore()
         return JobStoreRuntime(
@@ -320,6 +332,7 @@ def create_analysis_job_store_from_env(
             fallback=False,
             fallback_reason=None,
             dsn_configured=dsn_configured,
+            dsn_env=dsn_env,
         )
     if requested_mode == PERSISTENT_JOB_STORE_MODE:
         if repository is None:
@@ -329,7 +342,8 @@ def create_analysis_job_store_from_env(
             )
             if not dsn_configured:
                 reason = (
-                    f"{AI_DATABASE_DSN_ENV} is not set for AI_JOB_STORE=persistent; "
+                    "database DSN is not set in any of "
+                    "AI_DATABASE_DSN/QUANT_DB_DSN/DATABASE_URL for AI_JOB_STORE=persistent; "
                     "falling back to in-memory job store."
                 )
             store = InMemoryAnalysisJobStore()
@@ -340,6 +354,7 @@ def create_analysis_job_store_from_env(
                 fallback=True,
                 fallback_reason=reason,
                 dsn_configured=dsn_configured,
+                dsn_env=dsn_env,
             )
         if persistent_store_factory is None:
             raise JobStoreConfigurationError(
@@ -353,6 +368,7 @@ def create_analysis_job_store_from_env(
             fallback=False,
             fallback_reason=None,
             dsn_configured=dsn_configured,
+            dsn_env=dsn_env,
         )
     message = (
         f"Unsupported {AI_JOB_STORE_ENV} value: {requested_mode!r}. Expected "
@@ -411,19 +427,66 @@ def _stage_status_for(
     return StageStatus.QUEUED
 
 
+def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
+    raw = str(exc).lower()
+    if "connection timeout" in raw or "connect timeout" in raw or "connection timed out" in raw:
+        return FailureDiagnostic(
+            category="infrastructure_failure",
+            subcause="db_connect_timeout",
+            failure_stage=stage,
+            owner="data_source_config",
+            retryable=True,
+            safe_message="데이터 소스 연결 시간이 초과되었습니다. 잠시 후 다시 시도하거나 데이터 소스 설정을 확인해 주세요.",
+            evidence_refs=["failure:db_connect_timeout"],
+        )
+    if "statement timeout" in raw or "query timeout" in raw:
+        return FailureDiagnostic(
+            category="infrastructure_failure",
+            subcause="db_statement_timeout",
+            failure_stage=stage,
+            owner="data_source_config",
+            retryable=True,
+            safe_message="데이터 조회 시간이 초과되었습니다. 조건을 좁혀 다시 시도해 주세요.",
+            evidence_refs=["failure:db_statement_timeout"],
+        )
+    if "validation" in raw or "contract" in raw or "schema" in raw:
+        return FailureDiagnostic(
+            category="semantic_failure",
+            subcause="contract_shape_error",
+            failure_stage=stage,
+            owner="ai_graph",
+            retryable=False,
+            safe_message="AI 파이프라인 계약 검증에 실패했습니다. 지원팀이 추적할 수 있도록 debug_ref를 보존했습니다.",
+            evidence_refs=["failure:contract_shape_error"],
+        )
+    return FailureDiagnostic(
+        category="unknown_failure",
+        subcause="unknown",
+        failure_stage=stage,
+        owner="unknown",
+        retryable=True,
+        safe_message="AI 분석 중 분류되지 않은 오류가 발생했습니다. 원문 오류는 공개 응답에 노출하지 않고 debug_ref로 추적합니다.",
+        evidence_refs=["failure:unknown"],
+    )
+
+
 def _failure_envelope(
     job: AnalysisJob,
     error_message: str,
+    *,
+    failure_cause: FailureDiagnostic | None = None,
 ) -> APIEnvelope:
+    diagnostic = failure_cause or classify_failure(RuntimeError(error_message), stage=Stage.FINALIZING.value)
     return APIEnvelope(
         status=EnvelopeStatus.FAILED,
         trace_id=job.trace_id,
         user_payload=UserPayload(
-            headline="Analysis job failed",
-            message=error_message,
-            next_actions=["Check the request and retry after the service issue is resolved."],
+            headline="AI 분석을 완료하지 못했습니다.",
+            message=diagnostic.safe_message,
+            next_actions=["조건을 좁혀 재시도", "문제가 반복되면 debug_ref 공유"],
         ),
         strategy_spec=None,
         debug_ref=f"job-error:{job.job_id}",
-        retryable=True,
+        retryable=diagnostic.retryable,
+        failure_cause=diagnostic,
     )

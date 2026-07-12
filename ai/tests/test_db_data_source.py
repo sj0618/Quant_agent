@@ -6,24 +6,61 @@ import pytest
 
 from ai_graph.data_sources.db import (
     AI_DATABASE_DSN_ENV,
+    DATABASE_URL_ENV,
     DEFAULT_BACKTEST_LOOKBACK_DAYS,
     DataSourceConfig,
     PostgresPipelineDataSource,
+    QUANT_DB_DSN_ENV,
     RSI_OVERSOLD_THRESHOLD,
     _price_row_from_feature_frame_record,
     load_pipeline_data_from_env,
+    resolve_database_dsn_from_env,
 )
 
 
 def test_pipeline_data_source_uses_fixture_boundary_without_dsn(monkeypatch) -> None:
     monkeypatch.delenv(AI_DATABASE_DSN_ENV, raising=False)
+    monkeypatch.delenv(QUANT_DB_DSN_ENV, raising=False)
+    monkeypatch.delenv(DATABASE_URL_ENV, raising=False)
 
     bundle = load_pipeline_data_from_env("RSI가 30 이하인 KOSPI200", "trace-db")
 
     assert bundle.price_rows == []
     assert bundle.l4_evidence == []
     assert bundle.metadata["source"] == "fixture"
+    assert bundle.metadata["dsn_env_candidates"] == [
+        AI_DATABASE_DSN_ENV,
+        QUANT_DB_DSN_ENV,
+        DATABASE_URL_ENV,
+    ]
     assert "mart.kis_adjusted_feature_frame_asof" in bundle.metadata["available_db_objects"]
+
+
+def test_data_source_config_uses_quant_db_dsn_alias() -> None:
+    config = DataSourceConfig.from_env({QUANT_DB_DSN_ENV: "postgresql://example"})
+
+    assert config.database_dsn == "postgresql://example"
+    assert config.database_dsn_env == QUANT_DB_DSN_ENV
+
+
+def test_data_source_config_normalizes_database_url_driver_prefix() -> None:
+    config = DataSourceConfig.from_env({DATABASE_URL_ENV: "postgresql+asyncpg://user:pass@db/quant"})
+
+    assert config.database_dsn == "postgresql://user:pass@db/quant"
+    assert config.database_dsn_env == DATABASE_URL_ENV
+
+
+def test_resolve_database_dsn_prefers_ai_database_dsn() -> None:
+    dsn, env_name = resolve_database_dsn_from_env(
+        {
+            AI_DATABASE_DSN_ENV: "postgresql://ai-db",
+            QUANT_DB_DSN_ENV: "postgresql://quant-db",
+            DATABASE_URL_ENV: "postgresql://database-url",
+        }
+    )
+
+    assert dsn == "postgresql://ai-db"
+    assert env_name == AI_DATABASE_DSN_ENV
 
 
 def test_feature_frame_record_maps_prices_and_rsi_metric() -> None:

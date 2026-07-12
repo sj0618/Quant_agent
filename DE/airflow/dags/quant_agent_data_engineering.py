@@ -20,47 +20,88 @@ except ImportError:  # pragma: no cover
     task = None
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
+if Path("/opt/airflow/DE").exists():
+    DE_ROOT = Path("/opt/airflow/DE")        # 도커 컨테이너 내부 경로
+    REPO_ROOT = Path("/opt/airflow/DE")
+else:
+    DE_ROOT = Path(__file__).resolve().parents[2]  # 로컬의 Quant-agent/DE 폴더
+    REPO_ROOT = DE_ROOT.parent                     # 로컬의 Quant-agent 최상위 폴더
 
 def _load_airflow_dotenv() -> None:
     if os.getenv("QUANT_AIRFLOW_LOAD_DOTENV", "true").lower() in {"0", "false", "no", "off"}:
         return
     try:
         from dotenv import load_dotenv
-    except ImportError:  # pragma: no cover - python-dotenv is a runtime dependency in this repo.
+    except ImportError:
         return
+    # 로컬 루트의 .env 파일 타겟팅
     dotenv_path = Path(os.getenv("QUANT_AIRFLOW_DOTENV_PATH", str(REPO_ROOT / ".env")))
     load_dotenv(dotenv_path=dotenv_path, override=False)
 
 
+import pendulum  # 1. 펜듈럼 임포트 추가
+
 _load_airflow_dotenv()
 
-DEFAULT_DAILY_SCHEDULE = os.getenv("QUANT_AIRFLOW_DAILY_SCHEDULE", "0 4 * * *")
+# 2. 한국 타임존 세팅 및 크론식에서 CRON_TZ 문구 제거 (순수 시간만 남김)
+LOCAL_TZ = pendulum.timezone("Asia/Seoul")
+DEFAULT_DAILY_SCHEDULE = "0 4 * * *" 
+
 DEFAULT_BACKFILL_SCHEDULE = os.getenv("QUANT_AIRFLOW_BACKFILL_SCHEDULE", None)
-DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE", "2026-01-01T00:00:00"))
+
+# 3. 뒤에 .replace(tzinfo=LOCAL_TZ)를 붙여 시작 날짜에 한국 타임존 주입
+DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE", "2026-01-01T00:00:00")).replace(tzinfo=LOCAL_TZ)
 DEFAULT_TA_WARMUP_DAYS = int(os.getenv("QUANT_AIRFLOW_TA_WARMUP_DAYS", "365"))
 DEFAULT_EXTERNAL_LOOKBACK_DAYS = int(os.getenv("QUANT_AIRFLOW_EXTERNAL_LOOKBACK_DAYS", "7"))
 KIS_ADJUSTED_INGEST_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_KIS_ADJUSTED_INGEST_SCRIPT", str(REPO_ROOT / "scripts" / "ingest_kis_adjusted_ohlcv.py"))
+    os.getenv("QUANT_AIRFLOW_KIS_ADJUSTED_INGEST_SCRIPT", str(DE_ROOT / "scripts" / "ingest_kis_adjusted_ohlcv.py"))
 )
 DART_BOK_INGEST_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_DART_BOK_INGEST_SCRIPT", str(REPO_ROOT / "scripts" / "ingest_dart_bok_history.py"))
+    os.getenv("QUANT_AIRFLOW_DART_BOK_INGEST_SCRIPT", str(DE_ROOT / "scripts" / "ingest_dart_bok_history.py"))
 )
 TA_PIPELINE_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_TA_PIPELINE_SCRIPT", str(REPO_ROOT / "scripts" / "compute_technical_indicators_pipeline.py"))
+    os.getenv("QUANT_AIRFLOW_TA_PIPELINE_SCRIPT", str(DE_ROOT / "scripts" / "compute_technical_indicators_pipeline.py"))
 )
 QA_CHECK_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_QA_CHECK_SCRIPT", str(REPO_ROOT / "scripts" / "run_data_quality_checks.py"))
+    os.getenv("QUANT_AIRFLOW_QA_CHECK_SCRIPT", str(DE_ROOT / "scripts" / "run_data_quality_checks.py"))
 )
 SYMBOL_METADATA_SCRIPT = Path(
-    os.getenv("QUANT_AIRFLOW_SYMBOL_METADATA_SCRIPT", str(REPO_ROOT / "scripts" / "refresh_symbol_metadata.py"))
+    os.getenv("QUANT_AIRFLOW_SYMBOL_METADATA_SCRIPT", str(DE_ROOT / "scripts" / "refresh_symbol_metadata.py"))
 )
 PYTHON_EXECUTABLE = os.getenv("QUANT_AIRFLOW_PYTHON", sys.executable)
+
+DEFAULT_BOK_RATE_FX_SERIES = (
+    {"stat_code": "722Y001", "cycle": "D", "item_code1": "0101000"},  # 한국은행 기준금리
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010101000"},  # 콜금리(1일, 전체거래)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010901000"},  # KOFR
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010502000"},  # CD(91일)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010190000"},  # 국고채(1년)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010200000"},  # 국고채(3년)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010210000"},  # 국고채(10년)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010300000"},  # 회사채(3년, AA-)
+    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010320000"},  # 회사채(3년, BBB-)
+    {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000003"},  # 원/달러 종가 15:30
+    {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000006"},  # 원/100엔
+    {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000010"},  # 원/위안 종가
+)
+DEFAULT_BOK_MONTHLY_OIL_SERIES = (
+    {"stat_code": "902Y003", "cycle": "M", "item_code1": "010101", "language": "en"},  # WTI
+    {"stat_code": "902Y003", "cycle": "M", "item_code1": "010102", "language": "en"},  # Dubai Fateh
+    {"stat_code": "902Y003", "cycle": "M", "item_code1": "010103", "language": "en"},  # Brent
+)
+DEFAULT_BOK_SERIES_JSON = json.dumps(
+    [*DEFAULT_BOK_RATE_FX_SERIES, *DEFAULT_BOK_MONTHLY_OIL_SERIES],
+    ensure_ascii=False,
+    separators=(",", ":"),
+)
 
 
 def _symbols_from_env() -> tuple[str, ...]:
     return tuple(symbol.strip() for symbol in os.getenv("OHLCV_SYMBOLS", "").split(",") if symbol.strip())
+
+
+def _bok_series_json() -> str:
+    return os.getenv("BOK_SERIES_JSON") or os.getenv("BOK_DAILY_SERIES_JSON") or DEFAULT_BOK_SERIES_JSON
 
 
 if dag and task:  # pragma: no branch
@@ -131,8 +172,10 @@ if dag and task:  # pragma: no branch
 
         @task(task_id="ingest_bok_daily")
         def ingest_bok_daily(logical_date: str | None = None) -> dict:
-            if not (os.getenv("BOK_DAILY_SERIES_JSON") or os.getenv("BOK_SERIES_JSON")):
-                _skip("BOK_DAILY_SERIES_JSON is not configured.")
+            from quant_agent.data.config import BokConfig
+
+            if not BokConfig.from_env().is_configured:
+                _skip("BOK_API_KEY is not configured.")
             target_date = _target_date(logical_date)
             return _run_python_script(
                 DART_BOK_INGEST_SCRIPT,
@@ -140,6 +183,7 @@ if dag and task:  # pragma: no branch
                     source="bok",
                     start_date=_external_ingest_start_date(target_date),
                     end_date=target_date,
+                    bok_series_json=_bok_series_json(),
                 ),
             )
 
@@ -155,24 +199,6 @@ if dag and task:  # pragma: no branch
                 ),
             )
 
-        @task(task_id="ingest_seibro_reports_daily")
-        def ingest_seibro_reports_daily(logical_date: str | None = None) -> dict:
-            from quant_agent.data.external import ExternalDataIngestionService
-
-            endpoint = os.getenv("SEIBRO_REPORT_ENDPOINT")
-            if not endpoint:
-                _skip("SEIBRO_REPORT_ENDPOINT is not configured.")
-            target_date = _target_date(logical_date)
-            params = _json_env("SEIBRO_REPORT_PARAMS_JSON", {})
-            written = ExternalDataIngestionService().ingest_seibro_reports(
-                endpoint_path=endpoint,
-                params=params,
-                as_of_date=target_date,
-                universe_min_score=float(os.getenv("SEIBRO_UNIVERSE_MIN_SCORE", "0.0")),
-                universe_min_reports=int(os.getenv("SEIBRO_UNIVERSE_MIN_REPORTS", "1")),
-            )
-            return {"written": written}
-
         ingested = ingest_ohlcv_daily()
         symbol_metadata = refresh_symbol_metadata_daily()
         kis_adjusted = ingest_kis_adjusted_ohlcv_daily()
@@ -180,8 +206,7 @@ if dag and task:  # pragma: no branch
         qa = run_data_quality_checks_daily()
         bok = ingest_bok_daily()
         dart = ingest_dart_financials_daily()
-        seibro = ingest_seibro_reports_daily()
-        ingested >> [symbol_metadata, kis_adjusted, bok, seibro]
+        ingested >> [symbol_metadata, kis_adjusted, bok]
         symbol_metadata >> qa
         symbol_metadata >> dart
         kis_adjusted >> computed
@@ -224,22 +249,27 @@ if dag and task:  # pragma: no branch
     quant_agent_backfill_ohlcv_10y = backfill_ohlcv_10y()
 
 
-def _target_date(logical_date: str | None) -> date:
+def _target_date(logical_date) -> date:
     if logical_date:
-        return date.fromisoformat(logical_date[:10])
+        # 1. datetime.datetime 객체인 경우 .date() 추출
+        if isinstance(logical_date, datetime):
+            return logical_date.date()
+        # 2. 순수 datetime.date 객체인 경우 그대로 반환
+        if isinstance(logical_date, date):
+            return logical_date
+        # 3. 문자열로 들어온 경우 안전하게 슬라이싱
+        if isinstance(logical_date, str):
+            return date.fromisoformat(logical_date[:10])
+        # 4. 그 외 Airflow/Pendulum 객체 대응
+        if hasattr(logical_date, "date"):
+            return logical_date.date()
+            
     try:  # pragma: no cover - Airflow context only exists inside task runtime.
         from airflow.operators.python import get_current_context
 
         return get_current_context()["logical_date"].date()
     except (ImportError, KeyError, RuntimeError):
         return date.today()
-
-
-def _json_env(name: str, default):
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    return json.loads(raw)
 
 
 def _warmup_start_date(target_date: date) -> date:
@@ -296,7 +326,9 @@ def _symbol_metadata_args(*, as_of_date: date) -> list[str]:
     ]
 
 
-def _dart_bok_ingest_args(*, source: str, start_date: date, end_date: date) -> list[str]:
+def _dart_bok_ingest_args(
+    *, source: str, start_date: date, end_date: date, bok_series_json: str | None = None
+) -> list[str]:
     args = [
         "--scope",
         "custom",
@@ -313,6 +345,8 @@ def _dart_bok_ingest_args(*, source: str, start_date: date, end_date: date) -> l
         args.extend(["--dart-period-mode", os.getenv("DART_DAILY_PERIOD_MODE", "filing-window")])
         if os.getenv("DART_REFRESH_CORP_CODES", "true").lower() not in {"0", "false", "no", "off"}:
             args.append("--dart-refresh-corp-codes")
+    elif source == "bok" and bok_series_json:
+        args.extend(["--bok-series-json", bok_series_json])
     return args
 
 

@@ -4,6 +4,7 @@ import type { ReportDetail, ReportSummary } from "../types/quantagent";
 export const reportSummaries: ReportSummary[] = [
   {
     id: "2026-04-18",
+    strategyId: "semiconductor-momentum",
     date: "2026.04.18",
     weekday: "목요일",
     sentAt: "오전 8:00 발송",
@@ -22,6 +23,7 @@ export const reportSummaries: ReportSummary[] = [
   },
   {
     id: "2026-04-17",
+    strategyId: "semiconductor-momentum",
     date: "04.17",
     weekday: "수요일",
     sentAt: "오전 8:00",
@@ -38,6 +40,7 @@ export const reportSummaries: ReportSummary[] = [
   },
   {
     id: "2026-04-16",
+    strategyId: "semiconductor-momentum",
     date: "04.16",
     weekday: "화요일",
     sentAt: "오전 8:00",
@@ -51,6 +54,7 @@ export const reportSummaries: ReportSummary[] = [
   },
   {
     id: "2026-04-15",
+    strategyId: "semiconductor-momentum",
     date: "04.15",
     weekday: "월요일",
     sentAt: "오전 8:00",
@@ -64,6 +68,7 @@ export const reportSummaries: ReportSummary[] = [
   },
   {
     id: "2026-04-12",
+    strategyId: "semiconductor-momentum",
     date: "04.12",
     weekday: "금요일",
     sentAt: "오전 8:00",
@@ -77,6 +82,7 @@ export const reportSummaries: ReportSummary[] = [
   },
   {
     id: "2026-04-11",
+    strategyId: "semiconductor-momentum",
     date: "04.11",
     weekday: "목요일",
     sentAt: "오전 8:00",
@@ -90,6 +96,7 @@ export const reportSummaries: ReportSummary[] = [
   },
   {
     id: "2026-04-10",
+    strategyId: "semiconductor-momentum",
     date: "04.10",
     weekday: "수요일",
     sentAt: "오전 8:00",
@@ -107,8 +114,11 @@ export const reportDetails: ReportDetail[] = [
   {
     ...reportSummaries[0],
     recipient: "홍길동 님께",
+    strategyUniverse: "KOSPI200 · 반도체",
     marketBrief:
       "전일 KOSPI는 메모리 사이클 회복 기대로 +0.84% 상승. 외국인 5일 연속 순매수, 환율 안정세. 반도체 섹터 전반에 매수 신호가 강화됐고, 화학 섹터 일부에서 추세 약세가 관측됩니다.",
+    marketContext:
+      "외국인 순매수와 환율 안정이 동시에 관측되며 반도체 대형주의 모멘텀이 유지됐습니다. 화학·2차전지 소재는 컨센서스 하향과 수급 약세가 동반됐습니다.",
     news: [
       { rank: 1, title: "반도체 업황 저점 통과, HBM 수요 확대 전망", source: "연합뉴스", tone: "positive" },
       { rank: 2, title: "외국인 KOSPI 5일 연속 순매수", source: "한국경제", tone: "positive" },
@@ -126,6 +136,7 @@ export const reportDetails: ReportDetail[] = [
       "KOSPI 일일 변동 -0.84%, USD/KRW 일일 변동 0.32%, VKOSPI 15.4 — 모두 안전 구간입니다. 룰베이스 macro override 발동 없이 Signal Judge 결과 그대로 유지됩니다.",
     conclusion:
       "반도체 섹터 모멘텀이 강화되는 구간이며, 외국인 수급도 우호적입니다. 다만 LG화학처럼 사업부 분할 이슈가 있는 종목은 단기 변동성이 클 수 있어 신규 진입을 권하지 않습니다.",
+    warningNote: "환율 변동성과 실적 발표 구간의 이벤트 리스크를 함께 확인하고 분할 진입 원칙을 유지하세요.",
     performance: {
       metrics: performanceSummary.metrics,
       disclaimer: performanceSummary.disclaimer,

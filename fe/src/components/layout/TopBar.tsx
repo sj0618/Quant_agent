@@ -43,7 +43,7 @@ export function TopBar({ active }: TopBarProps) {
         <div className="topbar__right">
           <a className={["search-pill", active === "search" ? "is-active" : ""].filter(Boolean).join(" ")} href={ROUTES.search}>
             <span>🔍</span>
-            <span>전략·종목·리포트 검색</span>
+            <span>내 리포트 검색</span>
             <kbd>⌘ K</kbd>
           </a>
           <a className="user-pill" href={profileHref}>

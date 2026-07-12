@@ -69,6 +69,8 @@ def normalize_bok_observations(raw_payload: RawSourcePayload, *, published_at_po
     if rows is None:
         error = raw_payload.payload.get("RESULT") or raw_payload.payload.get("StatisticSearch", {}).get("RESULT")
         if error:
+            if error.get("CODE") == "INFO-200":
+                return []
             raise SourceResponseError(f"BOK API returned error metadata: {error}")
         return []
     if not isinstance(rows, list):

@@ -52,7 +52,13 @@ export function ReportDetailPage({ id }: ReportDetailPageProps) {
   return (
     <AppLayout active="reports">
       <div className="report-subbar">
-        <a href={ROUTES.reports}>← 리포트 목록</a>
+        <a href={ROUTES.reports}>← 전략 레포트 목록</a>
+        {data.strategyId ? (
+          <>
+            <span>/</span>
+            <a href={ROUTES.strategyReportDetail(data.strategyId)}>{data.strategyName}</a>
+          </>
+        ) : null}
         <span>/</span>
         <strong>{data.date}</strong>
         <div>

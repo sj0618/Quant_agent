@@ -24,22 +24,12 @@ export function SignalCard({ candidate, compact = false }: SignalCardProps) {
       <p>{candidate.rationale}</p>
       <div className="signal-card__meta">
         <span>
-          <b>근거</b> {candidate.evidence[0]?.provider} · {candidate.evidence[0]?.date}
-        </span>
-        <span>
           <strong>{candidate.price}</strong>
           <em className={candidate.changePercent.startsWith("-") ? "is-negative" : "is-positive"}>
             {candidate.changePercent}
           </em>
         </span>
       </div>
-      {!compact && candidate.riskReasons.length > 0 ? (
-        <div className="signal-card__risks">
-          {candidate.riskReasons.map((risk) => (
-            <span key={risk}>{risk}</span>
-          ))}
-        </div>
-      ) : null}
     </article>
   );
 }

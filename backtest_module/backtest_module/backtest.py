@@ -6,13 +6,13 @@ import gzip
 import json
 import math
 from functools import lru_cache
-import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Iterable, Literal, Mapping, Sequence
 
 from .models import Condition, ConditionOperator, ExecutionTiming, MarketSnapshot, SignalAction, StrategySpec
+from .performance import calculate_quantstats_metrics
 from .strategy import METRIC_ALIASES, QuantStrategy
 
 DEFAULT_INITIAL_CAPITAL = 100_000_000.0
@@ -122,12 +122,28 @@ class SignalRecord:
 
 
 @dataclass(frozen=True)
+class OrderAuditRecord:
+    date: str
+    ticker: str
+    side: str
+    status: str
+    signal_date: str
+    reason: str
+    price: float | None = None
+    quantity: int | None = None
+    detail: str = ""
+
+    def as_dict(self) -> dict[str, object]:
+        return self.__dict__.copy()
+
+@dataclass(frozen=True)
 class BacktestResult:
     strategy_id: str
     summary: dict[str, object]
     equity_curve: list[EquityPoint]
     trades: list[TradeRecord]
     signals: list[SignalRecord]
+    order_audit: list[OrderAuditRecord] = field(default_factory=list)
     output_paths: dict[str, str] = field(default_factory=dict)
 
 
@@ -654,20 +670,23 @@ class BacktestEngine:
         equity_curve: list[EquityPoint] = []
         trades: list[TradeRecord] = []
         signals: list[SignalRecord] = []
+        order_audit: list[OrderAuditRecord] = []
         previous_equity: float | None = None
 
         for current_date in dates:
             today_bars = bars_by_date[current_date]
-            cash, pending_orders, executed = self._execute_pending_orders(
+            cash, pending_orders, executed, execution_audit = self._execute_pending_orders(
                 current_date, today_bars, positions, cash, pending_orders
             )
             trades.extend(executed)
+            order_audit.extend(execution_audit)
 
-            generated_orders, generated_signals = self._generate_signals_for_date(
+            generated_orders, generated_signals, generated_audit = self._generate_signals_for_date(
                 current_date, today_bars, positions, metrics_by_key, previous_metrics_by_key, pending_orders
             )
             pending_orders.extend(generated_orders)
             signals.extend(generated_signals)
+            order_audit.extend(generated_audit)
 
             for ticker, position in positions.items():
                 if ticker in today_bars:
@@ -675,6 +694,21 @@ class BacktestEngine:
             point = self._equity_point(current_date, cash, positions, today_bars, previous_equity)
             equity_curve.append(point)
             previous_equity = point.total_equity
+
+        if dates and pending_orders:
+            final_date = dates[-1].isoformat()
+            order_audit.extend(
+                OrderAuditRecord(
+                    date=final_date,
+                    ticker=order.ticker,
+                    side=order.side,
+                    status="unfilled_end",
+                    signal_date=order.signal_date.isoformat(),
+                    reason=order.reason,
+                    detail="No later open was available to execute this order.",
+                )
+                for order in pending_orders
+            )
 
         final_equity = equity_curve[-1].total_equity if equity_curve else cash
         summary = self._summary(cash, positions, trades, equity_curve, signals, exclusions, final_equity)
@@ -684,6 +718,7 @@ class BacktestEngine:
             equity_curve=equity_curve,
             trades=trades,
             signals=signals,
+            order_audit=order_audit,
         )
         if self.config.write_outputs:
             output_dir = self.config.output_dir or DEFAULT_OUTPUT_ROOT / self.spec.strategy_id
@@ -786,9 +821,21 @@ class BacktestEngine:
         ]
         remaining = [order for order in pending_orders if order not in executable]
         trades: list[TradeRecord] = []
+        audit: list[OrderAuditRecord] = []
         for order in [item for item in executable if item.side == "sell"]:
             position = positions.pop(order.ticker, None)
             if position is None:
+                audit.append(
+                    OrderAuditRecord(
+                        date=current_date.isoformat(),
+                        ticker=order.ticker,
+                        side=order.side,
+                        status="ignored_missing_position",
+                        signal_date=order.signal_date.isoformat(),
+                        reason=order.reason,
+                        detail="Sell order reached the next open without an active position.",
+                    )
+                )
                 continue
             bar = today_bars[order.ticker]
             sell_price = bar.open * (1 - self.spec.backtest.cost_model.slippage_pct)
@@ -815,10 +862,34 @@ class BacktestEngine:
                     reason=order.reason,
                 )
             )
+            audit.append(
+                OrderAuditRecord(
+                    date=current_date.isoformat(),
+                    ticker=order.ticker,
+                    side=order.side,
+                    status="executed",
+                    signal_date=order.signal_date.isoformat(),
+                    reason=order.reason,
+                    price=round(sell_price, 6),
+                    quantity=position.quantity,
+                    detail="Filled at the next available open.",
+                )
+            )
         buy_orders = [item for item in executable if item.side == "buy" and item.ticker not in positions]
         buy_orders.sort(key=lambda order: order.ticker)
         for order in buy_orders:
             if len(positions) >= self.spec.position_sizing.max_positions:
+                audit.append(
+                    OrderAuditRecord(
+                        date=current_date.isoformat(),
+                        ticker=order.ticker,
+                        side=order.side,
+                        status="skipped_max_positions",
+                        signal_date=order.signal_date.isoformat(),
+                        reason=order.reason,
+                        detail="Position cap was already full at the fill open.",
+                    )
+                )
                 continue
             bar = today_bars[order.ticker]
             current_equity = cash + self._positions_value(positions, today_bars)
@@ -827,9 +898,32 @@ class BacktestEngine:
             buy_price = bar.open * (1 + self.spec.backtest.cost_model.slippage_pct)
             unit_cash = buy_price * (1 + self.spec.backtest.cost_model.commission_pct)
             if unit_cash <= 0:
+                audit.append(
+                    OrderAuditRecord(
+                        date=current_date.isoformat(),
+                        ticker=order.ticker,
+                        side=order.side,
+                        status="skipped_invalid_unit_cash",
+                        signal_date=order.signal_date.isoformat(),
+                        reason=order.reason,
+                        detail="Unit cash was non-positive at the fill open.",
+                    )
+                )
                 continue
             quantity = int(budget // unit_cash)
             if quantity <= 0:
+                audit.append(
+                    OrderAuditRecord(
+                        date=current_date.isoformat(),
+                        ticker=order.ticker,
+                        side=order.side,
+                        status="skipped_insufficient_cash",
+                        signal_date=order.signal_date.isoformat(),
+                        reason=order.reason,
+                        price=round(buy_price, 6),
+                        detail="Budget could not buy one share at the fill open.",
+                    )
+                )
                 continue
             notional = quantity * buy_price
             entry_cost = notional * self.spec.backtest.cost_model.commission_pct
@@ -844,7 +938,20 @@ class BacktestEngine:
                 last_price=bar.close,
                 entry_reason=order.reason,
             )
-        return cash, remaining, trades
+            audit.append(
+                OrderAuditRecord(
+                    date=current_date.isoformat(),
+                    ticker=order.ticker,
+                    side=order.side,
+                    status="executed",
+                    signal_date=order.signal_date.isoformat(),
+                    reason=order.reason,
+                    price=round(buy_price, 6),
+                    quantity=quantity,
+                    detail="Filled at the next available open.",
+                )
+            )
+        return cash, remaining, trades, audit
 
     def _generate_signals_for_date(
         self,
@@ -858,6 +965,7 @@ class BacktestEngine:
         pending_tickers = {(order.side, order.ticker) for order in pending_orders}
         orders: list[PendingOrder] = []
         signals: list[SignalRecord] = []
+        audit: list[OrderAuditRecord] = []
         for ticker in sorted(today_bars):
             metrics = metrics_by_key[(current_date, ticker)]
             prev_metrics = previous_metrics_by_key.get((current_date, ticker))
@@ -881,6 +989,17 @@ class BacktestEngine:
                         reason=";".join(decision.reasons),
                     )
                 )
+                audit.append(
+                    OrderAuditRecord(
+                        date=current_date.isoformat(),
+                        ticker=ticker,
+                        side="buy",
+                        status="submitted",
+                        signal_date=current_date.isoformat(),
+                        reason=";".join(decision.reasons),
+                        detail="Queued for the next available open.",
+                    )
+                )
             elif decision.action == SignalAction.SELL and has_position and ("sell", ticker) not in pending_tickers:
                 orders.append(
                     PendingOrder(
@@ -888,6 +1007,17 @@ class BacktestEngine:
                         side="sell",
                         signal_date=current_date,
                         reason=";".join(decision.reasons),
+                    )
+                )
+                audit.append(
+                    OrderAuditRecord(
+                        date=current_date.isoformat(),
+                        ticker=ticker,
+                        side="sell",
+                        status="submitted",
+                        signal_date=current_date.isoformat(),
+                        reason=";".join(decision.reasons),
+                        detail="Queued for the next available open.",
                     )
                 )
             elif has_position and ("sell", ticker) not in pending_tickers:
@@ -911,7 +1041,18 @@ class BacktestEngine:
                             matching_exit_rules=risk_reason,
                         )
                     )
-        return orders, signals
+                    audit.append(
+                        OrderAuditRecord(
+                            date=current_date.isoformat(),
+                            ticker=ticker,
+                            side="sell",
+                            status="submitted",
+                            signal_date=current_date.isoformat(),
+                            reason=risk_reason,
+                            detail="Risk control queued the exit for the next available open.",
+                        )
+                    )
+        return orders, signals, audit
 
     def _risk_exit_reason(self, position: Position, bar: OhlcvBar) -> str | None:
         stop_loss = self.spec.risk_controls.stop_loss_pct
@@ -954,27 +1095,109 @@ class BacktestEngine:
         return total
 
     def _summary(self, cash, positions, trades, equity_curve, signals, exclusions, final_equity):
-        returns = [point.daily_return for point in equity_curve[1:]]
+        metrics = calculate_quantstats_metrics(equity_curve, include_montecarlo=True)
         winners = [trade for trade in trades if trade.net_pnl > 0]
+        trade_win_rate = round(len(winners) / len(trades), 10) if trades else 0.0
+        holding_days = [
+            (date.fromisoformat(trade.exit_date) - date.fromisoformat(trade.entry_date)).days
+            for trade in trades
+        ]
+        avg_holding_days = round(sum(holding_days) / len(holding_days), 6) if holding_days else 0.0
+        excluded_tickers = [item.as_dict() for item in exclusions]
+        cost_model = self.spec.backtest.cost_model.model_dump(mode="json")
+        position_sizing = self.spec.position_sizing.model_dump(mode="json")
         return {
             "strategy_id": self.spec.strategy_id,
             "strategy_name": self.spec.strategy_name,
             "initial_capital": self.config.initial_capital,
             "final_equity": round(final_equity, 6),
             "cash": round(cash, 6),
+            "final_cash": round(cash, 6),
             "open_positions": len(positions),
-            "period_return": round((final_equity / self.config.initial_capital) - 1, 10),
-            "max_drawdown": round(_max_drawdown([point.total_equity for point in equity_curve]), 10),
-            "daily_sharpe_like": round(_sharpe_like(returns), 10),
+            "metrics": metrics,
+            "period_return": metrics.get("total_return"),
+            "total_return": metrics.get("total_return"),
+            "cagr": metrics.get("cagr"),
+            "max_drawdown": metrics.get("max_drawdown"),
+            "daily_sharpe_like": metrics.get("sharpe"),
+            "sharpe": metrics.get("sharpe"),
+            "sharpe_ratio": metrics.get("sharpe_ratio"),
+            "sortino": metrics.get("sortino"),
+            "sortino_ratio": metrics.get("sortino_ratio"),
+            "adjusted_sortino": metrics.get("adjusted_sortino"),
+            "adjusted_sortino_ratio": metrics.get("adjusted_sortino_ratio"),
+            "calmar": metrics.get("calmar"),
+            "calmar_ratio": metrics.get("calmar_ratio"),
+            "volatility": metrics.get("volatility"),
+            "annualized_volatility": metrics.get("annualized_volatility"),
+            "common_sense_ratio": metrics.get("common_sense_ratio"),
+            "gain_to_pain_ratio": metrics.get("gain_to_pain_ratio"),
+            "geometric_mean": metrics.get("geometric_mean"),
+            "kelly_criterion": metrics.get("kelly_criterion"),
+            "exposure": metrics.get("exposure"),
+            "cpc_index": metrics.get("cpc_index"),
+            "omega": metrics.get("omega"),
+            "value_at_risk": metrics.get("value_at_risk"),
+            "conditional_value_at_risk": metrics.get("conditional_value_at_risk"),
+            "cvar": metrics.get("cvar"),
+            "ulcer_index": metrics.get("ulcer_index"),
+            "ulcer_performance_index": metrics.get("ulcer_performance_index"),
+            "risk_of_ruin": metrics.get("risk_of_ruin"),
+            "tail_ratio": metrics.get("tail_ratio"),
+            "kurtosis": metrics.get("kurtosis"),
+            "skew": metrics.get("skew"),
             "trade_count": len(trades),
-            "win_rate": round(len(winners) / len(trades), 10) if trades else 0.0,
+            "trade_win_rate": trade_win_rate,
+            "win_rate": trade_win_rate,
+            "return_win_rate": metrics.get("win_rate"),
             "signal_count": len(signals),
+            "avg_holding_days": avg_holding_days,
+            "avg_return": metrics.get("avg_return"),
+            "avg_period_return": metrics.get("avg_period_return"),
+            "avg_win": metrics.get("avg_win"),
+            "avg_positive_period_return": metrics.get("avg_positive_period_return"),
+            "avg_loss": metrics.get("avg_loss"),
+            "avg_negative_period_return": metrics.get("avg_negative_period_return"),
+            "best": metrics.get("best"),
+            "best_period_return": metrics.get("best_period_return"),
+            "worst": metrics.get("worst"),
+            "worst_period_return": metrics.get("worst_period_return"),
+            "profit_factor": metrics.get("profit_factor"),
+            "payoff_ratio": metrics.get("payoff_ratio"),
+            "outlier_loss_ratio": metrics.get("outlier_loss_ratio"),
+            "outlier_win_ratio": metrics.get("outlier_win_ratio"),
+            "recovery_factor": metrics.get("recovery_factor"),
+            "expected_return": metrics.get("expected_return"),
+            "consecutive_negative_periods": metrics.get("consecutive_negative_periods"),
+            "consecutive_positive_periods": metrics.get("consecutive_positive_periods"),
+            "monthly_returns": metrics.get("monthly_returns"),
+            "drawdown_details": metrics.get("drawdown_details"),
+            "drawdown_series": metrics.get("drawdown_series"),
+            "rolling_volatility": metrics.get("rolling_volatility"),
+            "rolling_sharpe": metrics.get("rolling_sharpe"),
+            "rolling_sortino": metrics.get("rolling_sortino"),
+            "information_ratio": metrics.get("information_ratio"),
+            "r_squared": metrics.get("r_squared"),
+            "greeks": metrics.get("greeks"),
+            "rolling_greeks": metrics.get("rolling_greeks"),
+            "compare": metrics.get("compare"),
+            "montecarlo": metrics.get("montecarlo"),
+            "montecarlo_mean": metrics.get("montecarlo_mean"),
+            "montecarlo_cagr": metrics.get("montecarlo_cagr"),
+            "montecarlo_drawdown": metrics.get("montecarlo_drawdown"),
+            "montecarlo_sharpe": metrics.get("montecarlo_sharpe"),
+            "outliers": metrics.get("outliers"),
+            "metric_warnings": metrics.get("metric_warnings", []),
             "excluded_ticker_count": len(exclusions),
-            "excluded_tickers": [item.as_dict() for item in exclusions],
+            "excluded_tickers": excluded_tickers,
+            "excluded_ticker_jsonb": excluded_tickers,
             "execution_timing": self.spec.backtest.execution_timing.value,
-            "cost_model": self.spec.backtest.cost_model.model_dump(mode="json"),
-            "position_sizing": self.spec.position_sizing.model_dump(mode="json"),
+            "cost_model": cost_model,
+            "cost_model_jsonb": cost_model,
+            "position_sizing": position_sizing,
+            "position_sizing_jsonb": position_sizing,
             "indicator_report": self.indicator_report,
+            "indicator_report_jsonb": self.indicator_report,
             "notes": [
                 "Signals are evaluated from end-of-day metrics; fills occur at the next available open.",
                 "TA-Lib metrics are calculated from OHLCV when enabled; "
@@ -991,6 +1214,7 @@ class BacktestEngine:
         equity_path = output_dir / "equity_curve.csv"
         trades_path = output_dir / "trades.csv"
         signals_path = output_dir / "signals.csv"
+        order_audit_path = output_dir / "order_audit.csv"
         summary_path.write_text(json.dumps(result.summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         _write_csv(
             equity_path,
@@ -1003,17 +1227,24 @@ class BacktestEngine:
             [signal.as_dict() for signal in result.signals],
             SignalRecord.__dataclass_fields__.keys(),
         )
+        _write_csv(
+            order_audit_path,
+            [event.as_dict() for event in result.order_audit],
+            OrderAuditRecord.__dataclass_fields__.keys(),
+        )
         return BacktestResult(
             strategy_id=result.strategy_id,
             summary=result.summary,
             equity_curve=result.equity_curve,
             trades=result.trades,
             signals=result.signals,
+            order_audit=result.order_audit,
             output_paths={
                 "summary_json": str(summary_path),
                 "equity_curve_csv": str(equity_path),
                 "trades_csv": str(trades_path),
                 "signals_csv": str(signals_path),
+                "order_audit_csv": str(order_audit_path),
             },
         )
 
@@ -1024,25 +1255,6 @@ def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-
-
-def _max_drawdown(equity_values: list[float]) -> float:
-    peak = None
-    max_dd = 0.0
-    for value in equity_values:
-        peak = value if peak is None else max(peak, value)
-        if peak:
-            max_dd = min(max_dd, (value / peak) - 1)
-    return max_dd
-
-
-def _sharpe_like(daily_returns: list[float]) -> float:
-    if len(daily_returns) < 2:
-        return 0.0
-    std = statistics.stdev(daily_returns)
-    if std == 0:
-        return 0.0
-    return statistics.mean(daily_returns) / std * math.sqrt(252)
 
 
 def run_backtest(

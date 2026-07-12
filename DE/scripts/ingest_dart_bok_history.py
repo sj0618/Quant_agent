@@ -36,6 +36,11 @@ except ImportError:  # pragma: no cover - exercised only in incomplete local env
     dict_row = None
     Jsonb = None
 
+
+def jsonb_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -530,7 +535,7 @@ def start_ingestion_run(
             VALUES (%s, %s, %s, %s, %s, 'running', %s)
             ON CONFLICT DO NOTHING;
             """,
-            (run_id, dag_id, task_id, source_id, datetime.now(timezone.utc), Jsonb(params)),
+            (run_id, dag_id, task_id, source_id, datetime.now(timezone.utc), Jsonb(params, dumps=jsonb_dumps)),
         )
     conn.commit()
     return run_id
@@ -939,7 +944,7 @@ def convert_value_for_column(value: Any, column: TableColumn) -> Any:
     if column.udt_name in {"json", "jsonb"}:
         if Jsonb is None:
             raise RuntimeError("psycopg is required for JSONB value adaptation.")
-        return Jsonb(value)
+        return Jsonb(value, dumps=jsonb_dumps)
     if column.udt_name in {"date"}:
         if isinstance(value, date) and not isinstance(value, datetime):
             return value
