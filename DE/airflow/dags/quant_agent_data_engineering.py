@@ -39,11 +39,18 @@ def _load_airflow_dotenv() -> None:
     load_dotenv(dotenv_path=dotenv_path, override=False)
 
 
+import pendulum  # 1. 펜듈럼 임포트 추가
+
 _load_airflow_dotenv()
 
-DEFAULT_DAILY_SCHEDULE = "CRON_TZ=Asia/Seoul 0 4 * * *"
+# 2. 한국 타임존 세팅 및 크론식에서 CRON_TZ 문구 제거 (순수 시간만 남김)
+LOCAL_TZ = pendulum.timezone("Asia/Seoul")
+DEFAULT_DAILY_SCHEDULE = "0 4 * * *" 
+
 DEFAULT_BACKFILL_SCHEDULE = os.getenv("QUANT_AIRFLOW_BACKFILL_SCHEDULE", None)
-DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE", "2026-01-01T00:00:00"))
+
+# 3. 뒤에 .replace(tzinfo=LOCAL_TZ)를 붙여 시작 날짜에 한국 타임존 주입
+DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE", "2026-01-01T00:00:00")).replace(tzinfo=LOCAL_TZ)
 DEFAULT_TA_WARMUP_DAYS = int(os.getenv("QUANT_AIRFLOW_TA_WARMUP_DAYS", "365"))
 DEFAULT_EXTERNAL_LOOKBACK_DAYS = int(os.getenv("QUANT_AIRFLOW_EXTERNAL_LOOKBACK_DAYS", "7"))
 KIS_ADJUSTED_INGEST_SCRIPT = Path(
