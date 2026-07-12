@@ -41,7 +41,7 @@ def _load_airflow_dotenv() -> None:
 
 _load_airflow_dotenv()
 
-DEFAULT_DAILY_SCHEDULE = "CRON_TZ=Asia/Seoul 0 4 * * *"
+DEFAULT_DAILY_SCHEDULE = os.getenv("QUANT_AIRFLOW_DAILY_SCHEDULE", "0 4 * * *")
 DEFAULT_BACKFILL_SCHEDULE = os.getenv("QUANT_AIRFLOW_BACKFILL_SCHEDULE", None)
 DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE", "2026-01-01T00:00:00"))
 DEFAULT_TA_WARMUP_DAYS = int(os.getenv("QUANT_AIRFLOW_TA_WARMUP_DAYS", "365"))
