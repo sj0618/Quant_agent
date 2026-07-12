@@ -48,6 +48,8 @@ jobs:
             --exclude='node_modules/' \
             --exclude='.env' \
             --exclude='.env.*' \
+            --exclude='__pycache__/' \
+            --exclude='airflow.db' \
             -e "ssh -i ~/.ssh/id_rsa -p 30233" \
             ./ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
