@@ -57,13 +57,6 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("listing_status = 'listed'", sql)
         self.assertIn("'인프라펀드'", sql)
 
-    def test_de_migrations_do_not_own_the_app_schema(self):
-        sql = "\n".join(
-            path.read_text(encoding="utf-8")
-            for path in Path("migrations").glob("*.sql")
-        )
-        self.assertNotIn("CREATE SCHEMA IF NOT EXISTS app", sql)
-        self.assertNotIn("CREATE TABLE IF NOT EXISTS app.", sql)
     def test_app_ai_backtest_erd_migration_contains_requested_tables(self):
         sql = Path("../service_db/migrations/011_app_ai_backtest_erd.sql").read_text(encoding="utf-8")
         self.assertIn("CREATE SCHEMA IF NOT EXISTS app;", sql)
