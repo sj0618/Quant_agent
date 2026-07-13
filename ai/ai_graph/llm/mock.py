@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
+from ai_graph.audit import begin_model_call, finish_model_call
 from ai_graph.llm.base import LLMJsonRequest
 from ai_graph.llm.prompts import BACKTEST_CODE_SCHEMA_NAME
 from ai_graph.schemas import StrategySpec
@@ -659,13 +661,51 @@ PULLBACK_RSI40_VOLUME_CANDIDATES = [
 
 class MockLLMClient:
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
-        if request.schema_name == BACKTEST_CODE_SCHEMA_NAME:
-            strategy, variant = _strategy_and_variant_from_request(request)
-            return {
-                "candidates": self.generate_backtest_candidates(strategy, variant),
-                "fallback_reasons": [],
-            }
-        return {"fallback_reasons": [f"unsupported mock schema: {request.schema_name}"]}
+        call_id = begin_model_call(
+            task_type=request.task_type or request.schema_name,
+            provider="mock",
+            model_name="deterministic",
+            system_prompt=request.system_prompt,
+            user_prompt=request.user_prompt,
+            variables_jsonb=request.variables_jsonb,
+            prompt_template_name=request.prompt_template_name,
+            prompt_version=request.prompt_version,
+            temperature=request.temperature,
+            response_schema_name=request.schema_name,
+            web_search_used=request.enable_web_search,
+        )
+        started_at = time.perf_counter()
+        try:
+            if request.schema_name == BACKTEST_CODE_SCHEMA_NAME:
+                strategy, variant = _strategy_and_variant_from_request(request)
+                result = {
+                    "candidates": self.generate_backtest_candidates(strategy, variant),
+                    "fallback_reasons": [],
+                }
+            else:
+                result = {"fallback_reasons": [f"unsupported mock schema: {request.schema_name}"]}
+        except Exception as exc:
+            finish_model_call(
+                call_id,
+                status="failed",
+                assistant_response=None,
+                model_name="deterministic",
+                latency_ms=(time.perf_counter() - started_at) * 1000,
+                error_type=type(exc).__name__,
+                error_message=f"{type(exc).__name__} during model call",
+            )
+            raise
+
+        finish_model_call(
+            call_id,
+            status="succeeded",
+            assistant_response=json.dumps(
+                result, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ),
+            model_name="deterministic",
+            latency_ms=(time.perf_counter() - started_at) * 1000,
+        )
+        return result
 
     def generate_backtest_candidates(self, strategy: StrategySpec, variant: str) -> list[str]:
         if strategy.strategy_id.startswith("pullback_rsi_volume"):

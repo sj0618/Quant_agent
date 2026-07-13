@@ -11,6 +11,9 @@ from ai_graph.schemas import DailyDigestComparisonRow, DailyDigestStrategyInput,
 
 ROLE_DEBATE_SCHEMA_NAME = "quantagent.role_debate.v1"
 MARKET_BRIEF_SCHEMA_NAME = "quantagent.market_brief.v1"
+ROLE_DEBATE_PROMPT_TEMPLATE_NAME = "role_debate"
+MARKET_BRIEF_PROMPT_TEMPLATE_NAME = "daily_market_brief"
+PROMPT_VERSION = "v1"
 
 
 class RoleDebatePayload(BaseModel):
@@ -52,6 +55,10 @@ def generate_role_debate(
         system_prompt=_system_prompt(role, task),
         user_prompt=_user_prompt(context),
         temperature=0.0,
+        task_type=role.lower(),
+        prompt_template_name=ROLE_DEBATE_PROMPT_TEMPLATE_NAME,
+        prompt_version=PROMPT_VERSION,
+        variables_jsonb={"role": role, "task": task, "context": context},
     )
     try:
         payload = create_llm_client(role=role).generate_json(request)
@@ -176,20 +183,21 @@ def generate_market_brief(
     rest of the daily digest still renders without the news section blocking it.
     """
 
+    variables = {
+        "report_date": report_date,
+        "strategy_universes": strategy_names,
+        "expected_json_schema": MarketBrief.model_json_schema(),
+    }
     request = LLMJsonRequest(
         schema_name=MARKET_BRIEF_SCHEMA_NAME,
         system_prompt=MARKET_BRIEF_SYSTEM_PROMPT,
-        user_prompt=json.dumps(
-            {
-                "report_date": report_date,
-                "strategy_universes": strategy_names,
-                "expected_json_schema": MarketBrief.model_json_schema(),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ),
+        user_prompt=json.dumps(variables, ensure_ascii=False, sort_keys=True),
         temperature=0.2,
         enable_web_search=True,
+        task_type="digest_market_brief",
+        prompt_template_name=MARKET_BRIEF_PROMPT_TEMPLATE_NAME,
+        prompt_version=PROMPT_VERSION,
+        variables_jsonb=variables,
     )
     try:
         payload = create_llm_client(role="DIGEST_MARKET_BRIEF").generate_json(request)

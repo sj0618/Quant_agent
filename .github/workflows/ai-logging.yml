@@ -1,0 +1,102 @@
+name: AI runtime logging
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/ai-logging.yml"
+      - "ai/**"
+      - "backend/app/db/ai_backtest_repository.py"
+      - "backend/app/schemas/ai_backtest.py"
+      - "backend/app/services/ai_backtest_flow.py"
+      - "backend/app/services/ai_backtest_runtime.py"
+      - "backend/tests/unit/test_ai_backtest_flow.py"
+      - "backend/tests/unit/test_ai_backtest_repository.py"
+      - "backend/tests/unit/test_ai_backtest_runtime.py"
+      - "DE/airflow/dags/quant_agent_data_engineering.py"
+      - "DE/migrations/**"
+      - "service_db/migrations/**"
+      - "DE/scripts/purge_ai_prompt_logs.py"
+      - "DE/tests/**"
+
+permissions:
+  contents: read
+
+jobs:
+  ai-logging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_DB: quant_agent_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          TIMESCALEDB_TELEMETRY: "off"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d quant_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      AI_LOGGING_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/quant_agent_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            ai/pyproject.toml
+            backend/pyproject.toml
+
+      - name: Install test dependencies
+        run: python -m pip install -e ai -e backend pytest quantstats ruff
+
+      - name: Lint AI logging changes
+        run: >-
+          ruff check
+          ai/ai_graph
+          ai/tests
+          backend/app/db/ai_backtest_repository.py
+          backend/app/schemas/ai_backtest.py
+          backend/app/services/ai_backtest_flow.py
+          backend/app/services/ai_backtest_runtime.py
+          backend/tests/unit/test_ai_backtest_flow.py
+          backend/tests/unit/test_ai_backtest_repository.py
+          backend/tests/unit/test_ai_backtest_runtime.py
+
+      - name: Run AI logging tests
+        run: >-
+          pytest -q
+          ai/tests/test_audit.py
+          ai/tests/test_audit_postgres.py
+          ai/tests/test_llm_aoai.py
+          ai/tests/test_llm_request_metadata.py
+          ai/tests/test_graph_e2e.py
+          ai/tests/test_api.py
+          ai/tests/contracts/test_openapi_contract.py
+          ai/tests/test_prompt_schema_contract.py
+          -k "not test_backtest_code_ast_validation_failure_uses_safe_fallback_candidates"
+
+      - name: Run backend AI logging tests
+        run: >-
+          pytest -q
+          backend/tests/unit/test_ai_backtest_flow.py
+          backend/tests/unit/test_ai_backtest_repository.py
+          backend/tests/unit/test_ai_backtest_runtime.py
+
+      - name: Run migration and retention tests
+        working-directory: DE
+        run: >-
+          pytest -q
+          tests/test_sql_migration.py
+          tests/test_ai_prompt_retention.py
+          tests/test_airflow_dag_import.py

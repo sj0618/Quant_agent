@@ -59,6 +59,7 @@ class AIBacktestRepository(Protocol):
         self,
         *,
         trace_id: UUID | None,
+        execution_id: UUID | None,
         user_id: int | None,
         session_id: UUID | None,
         message_id: UUID | None,
@@ -544,6 +545,7 @@ class SqlAIBacktestRepository:
         self,
         *,
         trace_id: UUID | None,
+        execution_id: UUID | None,
         user_id: int | None,
         session_id: UUID | None,
         message_id: UUID | None,
@@ -551,78 +553,94 @@ class SqlAIBacktestRepository:
         bundle: ModelCallLogBundle,
     ) -> UUID:
         call_id = uuid4()
-        await self._execute(
-            """
-            INSERT INTO app.ai_model_call_log (
-                call_id, trace_id, user_id, session_id, message_id, code_id,
-                task_type, provider, provider_request_id, model_name,
-                temperature, top_p, seed, prompt_tokens, completion_tokens,
-                total_tokens, latency_ms, cost, retry_count, cache_hit,
-                tool_calls_jsonb, status, error_message
-            ) VALUES (
-                :call_id, :trace_id, :user_id, :session_id, :message_id, :code_id,
-                :task_type, :provider, :provider_request_id, :model_name,
-                :temperature, :top_p, :seed, :prompt_tokens, :completion_tokens,
-                :total_tokens, :latency_ms, :cost, :retry_count, :cache_hit,
-                :tool_calls_jsonb::jsonb, :status, :error_message
-            )
-            """,
-            {
-                "call_id": str(call_id),
-                "trace_id": str(trace_id) if trace_id else None,
-                "user_id": user_id,
-                "session_id": str(session_id) if session_id else None,
-                "message_id": str(message_id) if message_id else None,
-                "code_id": str(code_id) if code_id else None,
-                "task_type": bundle.task_type,
-                "provider": bundle.provider,
-                "provider_request_id": bundle.provider_request_id,
-                "model_name": bundle.model_name,
-                "temperature": bundle.temperature,
-                "top_p": bundle.top_p,
-                "seed": bundle.seed,
-                "prompt_tokens": bundle.prompt_tokens,
-                "completion_tokens": bundle.completion_tokens,
-                "total_tokens": bundle.total_tokens,
-                "latency_ms": bundle.latency_ms,
-                "cost": bundle.cost,
-                "retry_count": bundle.retry_count,
-                "cache_hit": bundle.cache_hit,
-                "tool_calls_jsonb": _json_dumps(bundle.tool_calls_jsonb),
-                "status": bundle.status,
-                "error_message": bundle.error_message,
-            },
-        )
-        if bundle.prompt_log is not None:
-            await self._execute(
-                """
-                INSERT INTO app.ai_prompt_log (
-                    prompt_log_id, call_id, user_id, session_id,
-                    prompt_template_name, system_prompt, user_prompt,
-                    assistant_response, variables_jsonb, prompt_version,
-                    contains_pii, masked
-                ) VALUES (
-                    :prompt_log_id, :call_id, :user_id, :session_id,
-                    :prompt_template_name, :system_prompt, :user_prompt,
-                    :assistant_response, :variables_jsonb::jsonb, :prompt_version,
-                    :contains_pii, :masked
+        try:
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        """
+                        INSERT INTO app.ai_model_call_log (
+                            call_id, trace_id, execution_id, user_id, session_id,
+                            message_id, code_id, task_type, provider,
+                            provider_request_id, model_name, temperature, top_p,
+                            seed, response_schema_name, web_search_used,
+                            prompt_tokens, completion_tokens, total_tokens,
+                            latency_ms, cost, retry_count, cache_hit,
+                            tool_calls_jsonb, status, error_message
+                        ) VALUES (
+                            :call_id, :trace_id, :execution_id, :user_id, :session_id,
+                            :message_id, :code_id, :task_type, :provider,
+                            :provider_request_id, :model_name, :temperature, :top_p,
+                            :seed, :response_schema_name, :web_search_used,
+                            :prompt_tokens, :completion_tokens, :total_tokens,
+                            :latency_ms, :cost, :retry_count, :cache_hit,
+                            :tool_calls_jsonb::jsonb, :status, :error_message
+                        )
+                        """
+                    ),
+                    {
+                        "call_id": str(call_id),
+                        "trace_id": str(trace_id) if trace_id else None,
+                        "execution_id": str(execution_id) if execution_id else None,
+                        "user_id": user_id,
+                        "session_id": str(session_id) if session_id else None,
+                        "message_id": str(message_id) if message_id else None,
+                        "code_id": str(code_id) if code_id else None,
+                        "task_type": bundle.task_type,
+                        "provider": bundle.provider,
+                        "provider_request_id": bundle.provider_request_id,
+                        "model_name": bundle.model_name,
+                        "temperature": bundle.temperature,
+                        "top_p": bundle.top_p,
+                        "seed": bundle.seed,
+                        "response_schema_name": bundle.response_schema_name,
+                        "web_search_used": bundle.web_search_used,
+                        "prompt_tokens": bundle.prompt_tokens,
+                        "completion_tokens": bundle.completion_tokens,
+                        "total_tokens": bundle.total_tokens,
+                        "latency_ms": bundle.latency_ms,
+                        "cost": bundle.cost,
+                        "retry_count": bundle.retry_count,
+                        "cache_hit": bundle.cache_hit,
+                        "tool_calls_jsonb": _json_dumps(bundle.tool_calls_jsonb),
+                        "status": bundle.status,
+                        "error_message": bundle.error_message,
+                    },
                 )
-                """,
-                {
-                    "prompt_log_id": str(uuid4()),
-                    "call_id": str(call_id),
-                    "user_id": user_id,
-                    "session_id": str(session_id) if session_id else None,
-                    "prompt_template_name": bundle.prompt_log.prompt_template_name,
-                    "system_prompt": bundle.prompt_log.system_prompt,
-                    "user_prompt": bundle.prompt_log.user_prompt,
-                    "assistant_response": bundle.prompt_log.assistant_response,
-                    "variables_jsonb": _json_dumps(bundle.prompt_log.variables_jsonb),
-                    "prompt_version": bundle.prompt_log.prompt_version,
-                    "contains_pii": bundle.prompt_log.contains_pii,
-                    "masked": bundle.prompt_log.masked,
-                },
-            )
+                await conn.execute(
+                    text(
+                        """
+                        INSERT INTO app.ai_prompt_log (
+                            prompt_log_id, call_id, user_id, session_id,
+                            prompt_template_name, system_prompt, user_prompt,
+                            assistant_response, variables_jsonb, prompt_version,
+                            contains_pii, masked
+                        ) VALUES (
+                            :prompt_log_id, :call_id, :user_id, :session_id,
+                            :prompt_template_name, :system_prompt, :user_prompt,
+                            :assistant_response, :variables_jsonb::jsonb, :prompt_version,
+                            :contains_pii, :masked
+                        )
+                        """
+                    ),
+                    {
+                        "prompt_log_id": str(uuid4()),
+                        "call_id": str(call_id),
+                        "user_id": user_id,
+                        "session_id": str(session_id) if session_id else None,
+                        "prompt_template_name": bundle.prompt_log.prompt_template_name,
+                        "system_prompt": bundle.prompt_log.system_prompt,
+                        "user_prompt": bundle.prompt_log.user_prompt,
+                        "assistant_response": bundle.prompt_log.assistant_response,
+                        "variables_jsonb": _json_dumps(bundle.prompt_log.variables_jsonb),
+                        "prompt_version": bundle.prompt_log.prompt_version,
+                        "contains_pii": bundle.prompt_log.contains_pii,
+                        "masked": bundle.prompt_log.masked,
+                    },
+                )
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise self._db_error(exc) from exc
         return call_id
 
     async def create_agent_execution_log(self, record: AgentExecutionLogCreate) -> UUID:
@@ -758,4 +776,3 @@ def _json_default(value: Any):
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
