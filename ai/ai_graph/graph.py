@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from hashlib import sha256
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any
+from uuid import UUID
 
-from ai_graph.audit import AuditSession, AuditSink, NoOpAuditSink, create_audit_correlation
+from ai_graph.audit import (
+    AuditSession,
+    AuditSink,
+    NoOpAuditSink,
+    bind_audit_context,
+    create_audit_correlation,
+    report_audit_failure,
+)
 from ai_graph.data_sources import load_pipeline_data_from_env
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
@@ -25,7 +34,6 @@ from ai_graph.schemas import (
     DataRequirement,
     EnvelopeStatus,
     EvidenceRef,
-    FailureDiagnostic,
     InternalPayload,
     SemanticSlots,
     SourceUsage,
@@ -50,38 +58,56 @@ NODE_SEQUENCE = (
 
 
 class FallbackGraph:
+    def __init__(self, audit_session: AuditSession | None = None) -> None:
+        self.audit_session = audit_session
+
     def invoke(self, state: QuantAgentState) -> QuantAgentState:
-        current = supervisor_node(state)
-        current.update(ambiguity_classifier_node(current))
-        current.update(data_node(current))
+        current = self._invoke("Supervisor", supervisor_node, state)
+        current.update(self._invoke("Ambiguity Classifier", ambiguity_classifier_node, current))
+        current.update(self._invoke("Data", data_node, current))
         if current["status"] == EnvelopeStatus.READY.value:
-            current.update(research_node(current))
-            current.update(backtest_code_node(current))
-            current.update(backtest_node(current))
-            current.update(signal_node(current))
-            current.update(risk_manager_node(current))
-            current.update(report_node(current))
-        current.update(envelope_node(current))
+            current.update(self._invoke("Research", research_node, current))
+            current.update(self._invoke("BacktestCode", backtest_code_node, current))
+            current.update(self._invoke("Backtest", backtest_node, current))
+            current.update(self._invoke("Signal", signal_node, current))
+            current.update(self._invoke("Risk Manager", risk_manager_node, current))
+            current.update(self._invoke("Report", report_node, current))
+        current.update(self._invoke("Envelope", envelope_node, current))
         return current
 
+    def _invoke(
+        self,
+        name: str,
+        node: Callable[[QuantAgentState], QuantAgentState | dict[str, Any]],
+        state: QuantAgentState,
+    ) -> QuantAgentState | dict[str, Any]:
+        return instrument_node(self.audit_session, name, node)(state)
 
-def build_graph() -> Any:
+
+def build_graph(audit_session: AuditSession | None = None) -> Any:
     try:
         from langgraph.graph import END, START, StateGraph
     except ModuleNotFoundError:
-        return FallbackGraph()
+        return FallbackGraph(audit_session)
 
     graph = StateGraph(QuantAgentState)
-    graph.add_node("Supervisor", supervisor_node)
-    graph.add_node("Ambiguity Classifier", ambiguity_classifier_node)
-    graph.add_node("Data", data_node)
-    graph.add_node("Research", research_node)
-    graph.add_node("BacktestCode", backtest_code_node)
-    graph.add_node("Backtest", backtest_node)
-    graph.add_node("Signal", signal_node)
-    graph.add_node("Risk Manager", risk_manager_node)
-    graph.add_node("Report", report_node)
-    graph.add_node("Envelope", envelope_node)
+    graph.add_node("Supervisor", instrument_node(audit_session, "Supervisor", supervisor_node))
+    graph.add_node(
+        "Ambiguity Classifier",
+        instrument_node(audit_session, "Ambiguity Classifier", ambiguity_classifier_node),
+    )
+    graph.add_node("Data", instrument_node(audit_session, "Data", data_node))
+    graph.add_node("Research", instrument_node(audit_session, "Research", research_node))
+    graph.add_node(
+        "BacktestCode", instrument_node(audit_session, "BacktestCode", backtest_code_node)
+    )
+    graph.add_node("Backtest", instrument_node(audit_session, "Backtest", backtest_node))
+    graph.add_node("Signal", instrument_node(audit_session, "Signal", signal_node))
+    graph.add_node(
+        "Risk Manager", instrument_node(audit_session, "Risk Manager", risk_manager_node)
+    )
+    graph.add_node("Report", instrument_node(audit_session, "Report", report_node))
+    graph.add_node("Envelope", instrument_node(audit_session, "Envelope", envelope_node))
     graph.add_edge(START, "Supervisor")
     graph.add_edge("Supervisor", "Ambiguity Classifier")
     graph.add_edge("Ambiguity Classifier", "Data")
@@ -136,7 +162,9 @@ def run_analysis(
         raise ValueError("user_query must not be empty")
     _record_step(session, "analysis_started", message="analysis execution started")
     try:
-        state = build_graph().invoke({"user_query": query, "trace_id": resolved_trace_id or ""})
+        state = build_graph(audit_session=session).invoke(
+            {"user_query": query, "trace_id": resolved_trace_id or ""}
+        )
         envelope = APIEnvelope.model_validate(state["envelope"])
     except Exception as exc:
         _record_error(
@@ -153,8 +181,101 @@ def run_analysis(
         session,
         _finalization_status_for_envelope(envelope),
         message=f"analysis completed with status={status_label}",
+        metadata_jsonb={"debug_ref": envelope.debug_ref, "public_trace_id": envelope.trace_id},
     )
     return envelope
+
+
+def instrument_node(
+    session: AuditSession | None,
+    name: str,
+    node: Callable[[QuantAgentState], QuantAgentState | dict[str, Any]],
+) -> Callable[[QuantAgentState], QuantAgentState | dict[str, Any]]:
+    if session is None:
+        return node
+
+    def wrapped(state: QuantAgentState) -> QuantAgentState | dict[str, Any]:
+        execution_id = _start_agent_execution(session, name, state)
+        started = perf_counter()
+        try:
+            with bind_audit_context(session, execution_id):
+                result = node(state)
+        except Exception as exc:
+            latency_ms = (perf_counter() - started) * 1_000
+            _finish_agent_execution(
+                session,
+                execution_id,
+                status="failed",
+                output_jsonb={},
+                error_message=f"{type(exc).__name__} raised during {name}",
+                latency_ms=latency_ms,
+            )
+            _record_error(
+                session,
+                name,
+                error_type=type(exc).__name__,
+                message=f"{type(exc).__name__} raised during graph node execution",
+                execution_id=execution_id,
+            )
+            raise
+        _finish_agent_execution(
+            session,
+            execution_id,
+            status="succeeded",
+            output_jsonb=_safe_state_metadata(result),
+            latency_ms=(perf_counter() - started) * 1_000,
+        )
+        return result
+
+    return wrapped
+
+
+def _start_agent_execution(
+    session: AuditSession,
+    name: str,
+    state: Mapping[str, Any],
+) -> UUID | None:
+    try:
+        return session.start_agent_execution(
+            name,
+            step_name=name,
+            input_jsonb=_safe_state_metadata(state),
+        )
+    except Exception:
+        report_audit_failure("start_agent_execution")
+        return None
+
+
+def _finish_agent_execution(
+    session: AuditSession,
+    execution_id: UUID | None,
+    *,
+    status: str,
+    output_jsonb: Mapping[str, Any],
+    error_message: str | None = None,
+    latency_ms: float,
+) -> None:
+    if execution_id is None:
+        return
+    try:
+        session.finish_agent_execution(
+            execution_id,
+            status=status,
+            output_jsonb=output_jsonb,
+            error_message=error_message,
+            latency_ms=latency_ms,
+        )
+    except Exception:
+        report_audit_failure("finish_agent_execution")
+
+
+def _safe_state_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"keys": sorted(str(key) for key in value)}
+    for key in ("route", "status", "trace_id"):
+        candidate = value.get(key)
+        if isinstance(candidate, (str, int, float, bool)):
+            metadata[key] = str(candidate)[:128]
+    return metadata
 
 
 def supervisor_node(state: QuantAgentState) -> QuantAgentState:
@@ -211,6 +332,7 @@ def _open_audit_session(
     try:
         return sink.open_session(correlation)
     except Exception:
+        report_audit_failure("open_session")
         return NoOpAuditSink().open_session(correlation)
 
 
@@ -218,7 +340,7 @@ def _record_step(session: AuditSession, step: str, *, message: str | None = None
     try:
         session.record_step(step, message=message)
     except Exception:
-        return None
+        report_audit_failure("record_step")
 
 
 def _record_error(
@@ -227,18 +349,30 @@ def _record_error(
     *,
     error_type: str,
     message: str,
+    execution_id: UUID | None = None,
 ) -> None:
     try:
-        session.record_error(step, error_type=error_type, message=message)
+        session.record_error(
+            step,
+            error_type=error_type,
+            message=message,
+            execution_id=execution_id,
+        )
     except Exception:
-        return None
+        report_audit_failure("record_error")
 
 
-def _record_finalization(session: AuditSession, status: str, *, message: str | None = None) -> None:
+def _record_finalization(
+    session: AuditSession,
+    status: str,
+    *,
+    message: str | None = None,
+    metadata_jsonb: Mapping[str, Any] | None = None,
+) -> None:
     try:
-        session.record_finalization(status, message=message)
+        session.record_finalization(status, message=message, metadata_jsonb=metadata_jsonb)
     except Exception:
-        return None
+        report_audit_failure("record_finalization")
 
 
 def _finalization_status_for_envelope(envelope: APIEnvelope) -> str:

@@ -1,3 +1,4 @@
+import json
 from uuid import UUID
 
 import pytest
@@ -27,6 +28,64 @@ def test_rsi_strategy_runs_ready_e2e_without_external_keys() -> None:
     assert internal is not None
     assert internal.validation["node_sequence"] == list(NODE_SEQUENCE)
     assert len(internal.model_dump()) == 7
+
+
+def test_ready_analysis_connects_trace_nodes_model_calls_and_full_prompts() -> None:
+    sink = RecordingAuditSink()
+
+    envelope = run_analysis(
+        "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어",
+        trace_id="trace-logging-ready",
+        audit_sink=sink,
+    )
+
+    assert envelope.status == "ready"
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert [record.agent_name for record in session.agent_executions] == [
+        "Supervisor",
+        "Ambiguity Classifier",
+        "Data",
+        "Research",
+        "BacktestCode",
+        "Backtest",
+        "Signal",
+        "Risk Manager",
+        "Report",
+        "Envelope",
+    ]
+    assert {record.status for record in session.agent_executions} == {"succeeded"}
+    assert len(session.model_calls) == 10
+    assert len(session.prompt_logs) == 10
+    assert {record.trace_id for record in session.model_calls} == {
+        session.correlation.db_trace_id
+    }
+    assert all(record.execution_id is not None for record in session.model_calls)
+    assert {record.call_id for record in session.model_calls} == {
+        record.call_id for record in session.prompt_logs
+    }
+    assert all(record.system_prompt for record in session.prompt_logs)
+    assert all(record.user_prompt for record in session.prompt_logs)
+    assert all(record.assistant_response is not None for record in session.prompt_logs)
+    assert all(
+        json.dumps(record.variables_jsonb, ensure_ascii=False, allow_nan=False)
+        for record in session.prompt_logs
+    )
+
+
+def test_clarification_route_logs_only_nodes_that_really_execute() -> None:
+    sink = RecordingAuditSink()
+
+    envelope = run_analysis("저평가주 사줘", trace_id="trace-logging-clarify", audit_sink=sink)
+
+    assert envelope.status == "need_clarification"
+    assert [record.agent_name for record in sink.sessions[0].agent_executions] == [
+        "Supervisor",
+        "Ambiguity Classifier",
+        "Data",
+        "Envelope",
+    ]
+    assert sink.sessions[0].model_calls == ()
 
 
 def test_ambiguous_value_request_returns_cards() -> None:

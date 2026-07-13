@@ -9,6 +9,8 @@ from ai_graph.schemas import StrategySpec
 
 
 BACKTEST_CODE_SCHEMA_NAME = "backtest_code_candidates.v1"
+BACKTEST_CODE_PROMPT_TEMPLATE_NAME = "backtest_code_generation"
+BACKTEST_CODE_PROMPT_VERSION = "v1"
 BACKTEST_CODE_SYSTEM_PROMPT = """\
 You are QuantAgent's backtest-code generation node.
 Return only JSON that conforms to the requested schema.
@@ -53,4 +55,8 @@ def build_backtest_code_json_request(strategy: StrategySpec, variant: str) -> LL
         system_prompt=BACKTEST_CODE_SYSTEM_PROMPT,
         user_prompt=json.dumps(user_prompt, ensure_ascii=False, sort_keys=True),
         temperature=0.0,
+        task_type="backtest_code_generation",
+        prompt_template_name=BACKTEST_CODE_PROMPT_TEMPLATE_NAME,
+        prompt_version=BACKTEST_CODE_PROMPT_VERSION,
+        variables_jsonb=user_prompt,
     )
