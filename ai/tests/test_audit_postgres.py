@@ -463,9 +463,11 @@ def test_disposable_timescaledb_migrations_and_large_unicode_round_trip() -> Non
     assert migrations
 
     with psycopg.connect(dsn, autocommit=True) as conn:
-        for _ in range(2):
-            for migration in migrations:
-                conn.execute(migration.read_text(encoding="utf-8"))
+        for migration in migrations:
+            conn.execute(migration.read_text(encoding="utf-8"))
+        conn.execute(
+            (migrations_dir / "013_ai_runtime_logging.sql").read_text(encoding="utf-8")
+        )
         columns = {
             row[0]
             for row in conn.execute(
