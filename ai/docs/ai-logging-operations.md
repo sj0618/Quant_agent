@@ -4,6 +4,28 @@
 PostgreSQL에 저장하는 기능의 활성화·검증·롤백 절차다. 로그 조회 API,
 관리 UI, 외부 observability 플랫폼은 제공하지 않는다.
 
+## 실행 경로와 실패 규칙
+
+- `ai_graph`는 실제 실행된 Supervisor, Ambiguity Classifier, Data, Research,
+  BacktestCode, Backtest, Signal, Risk Manager, Report, Envelope 노드를 같은
+  trace 아래 기록한다. 작업 노드가 예외를 내면 해당 execution과 error를
+  연결하고 이후 노드를 실행하지 않은 채 trace를 실패로 종료한다.
+- backend 생성형 백테스트는 `code_generation`, `code_validation`,
+  `code_execution`, `report_generation` 네 단계를 기록한다. 모델 호출은 해당
+  단계의 `execution_id`와 연결되고 system/user prompt 및 assistant response
+  원문을 `masked=false`로 저장한다.
+- 재시도는 하나의 논리적 model call 안에서 수행한다. 모델 호출이 끝내
+  실패해도 deterministic fallback이 성공하면 model call과 error는 실패로
+  남지만 agent와 trace는 성공할 수 있다. fallback도 실패하면 agent와 trace를
+  실패로 종료하되 이미 캡처한 model call, prompt, error는 해당 execution에
+  연결해 저장한다. `error_message`에는 timeout, provider HTTP 상태, transport,
+  JSON 해석, 코드 검증, 실행 상태 및 안전한 내부 오류 코드처럼 조치 가능한
+  실패 이유를 남기되 secret이나 내부 예외 원문은 복사하지 않는다.
+- audit 테이블 저장이 한 번 실패하면 rollback 후 해당 세션의 추가 audit DB
+  쓰기를 중단하고 연결을 닫으며, 안전한 stderr 이벤트와 실패 카운터만 남긴다.
+  AI 결과는 바뀌지 않는다. 반면 백테스트 결과·전략·실행 결과 같은 업무
+  데이터 저장 실패는 audit 실패가 아니므로 기존 API 실패 처리 대상이다.
+
 ## 1. 실행 설정
 
 | 설정 | 값 | 동작 |
@@ -113,6 +135,7 @@ LEFT JOIN app.ai_model_call_log AS model
 LEFT JOIN app.ai_prompt_log AS prompt USING (call_id)
 LEFT JOIN app.ai_error_log AS error
   ON error.trace_id = target.trace_id
+ AND error.execution_id IS NOT DISTINCT FROM agent.execution_id
  AND (error.call_id IS NULL OR error.call_id = model.call_id)
 ORDER BY agent.started_at, model.created_at, error.created_at;
 ```

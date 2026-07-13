@@ -94,7 +94,7 @@ class AOAIResponsesClient:
                 latency_ms=(time.perf_counter() - started_at) * 1000,
                 retry_count=retry_count,
                 error_type=type(exc).__name__,
-                error_message=f"{type(exc).__name__} during model call",
+                error_message=_safe_model_failure_message(exc),
             )
             raise
 
@@ -254,6 +254,21 @@ def _usage(payload: Any) -> tuple[int | None, int | None, int | None]:
 
 def _optional_int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _safe_model_failure_message(exc: Exception) -> str:
+    if isinstance(exc, LLMResponseParseError):
+        return "Model response could not be parsed as the required JSON object."
+    cause = exc.__cause__
+    if isinstance(cause, httpx.TimeoutException):
+        return "Model request timed out after retry attempts."
+    if isinstance(cause, httpx.HTTPStatusError):
+        return f"Model provider returned HTTP {cause.response.status_code} after retry attempts."
+    if isinstance(cause, httpx.TransportError):
+        return "Model provider transport failed after retry attempts."
+    if isinstance(exc, LLMClientError):
+        return "Model request failed after retry attempts."
+    return f"{type(exc).__name__} during model call."
 
 
 def _looks_like_direct_json_payload(payload: dict[str, Any]) -> bool:

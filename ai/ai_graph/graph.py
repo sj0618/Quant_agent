@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
@@ -55,6 +56,7 @@ NODE_SEQUENCE = (
     "Risk Manager",
     "Report",
 )
+_NODE_ERROR_RECORDED: ContextVar[bool] = ContextVar("node_error_recorded", default=False)
 
 
 class FallbackGraph:
@@ -161,20 +163,24 @@ def run_analysis(
         _record_finalization(session, "failed", message="analysis execution failed before graph invocation")
         raise ValueError("user_query must not be empty")
     _record_step(session, "analysis_started", message="analysis execution started")
+    node_error_token = _NODE_ERROR_RECORDED.set(False)
     try:
         state = build_graph(audit_session=session).invoke(
             {"user_query": query, "trace_id": resolved_trace_id or ""}
         )
         envelope = APIEnvelope.model_validate(state["envelope"])
     except Exception as exc:
-        _record_error(
-            session,
-            "analysis_execution",
-            error_type=type(exc).__name__,
-            message=f"{type(exc).__name__} raised during analysis execution",
-        )
+        if not _NODE_ERROR_RECORDED.get():
+            _record_error(
+                session,
+                "analysis_execution",
+                error_type=type(exc).__name__,
+                message=f"{type(exc).__name__} raised during analysis execution",
+            )
         _record_finalization(session, "failed", message="analysis execution failed")
         raise
+    finally:
+        _NODE_ERROR_RECORDED.reset(node_error_token)
     status_label = envelope.status.value
     _record_step(session, "analysis_completed", message=f"analysis returned status={status_label}")
     _record_finalization(
@@ -217,6 +223,7 @@ def instrument_node(
                 message=f"{type(exc).__name__} raised during graph node execution",
                 execution_id=execution_id,
             )
+            _NODE_ERROR_RECORDED.set(True)
             raise
         _finish_agent_execution(
             session,

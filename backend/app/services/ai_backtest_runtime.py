@@ -10,7 +10,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from app.core.errors import AppError
 from app.schemas.ai_backtest import (
@@ -84,6 +84,12 @@ SUSPICIOUS_FILE_CALLS = frozenset(
 )
 
 
+class CodeGenerationFailure(RuntimeError):
+    def __init__(self, message: str, *, model_call: ModelCallLogBundle) -> None:
+        super().__init__(message)
+        self.model_call = model_call
+
+
 class AOAICodeGenerator:
     async def generate(self, request: AICodeBacktestFlowRequest, *, trace_id: UUID) -> GeneratedCodeResult:
         (
@@ -103,17 +109,53 @@ class AOAICodeGenerator:
         )
         prompt_request = build_backtest_code_json_request(strategy, "A")
         llm_client = create_llm_client(role="BACKTEST_CODE")
-        result = generate_loop3_candidates(
-            Loop3Request(strategy=strategy, variant="A", trace_id=str(trace_id)),
-            llm_client=llm_client,
+        RecordingAuditSink, bind_audit_context, create_audit_correlation = _load_audit_modules()
+        capture_sink = RecordingAuditSink()
+        capture_session = capture_sink.open_session(
+            create_audit_correlation(
+                trace_id=str(trace_id),
+                debug_ref=None,
+                entrypoint="backend.ai_backtest",
+                feature="backtest_code_generation",
+                strategy_id=getattr(strategy, "strategy_id", None),
+                user_id=str(request.user_id) if request.user_id is not None else None,
+                session_id=str(request.session_id) if request.session_id is not None else None,
+                db_trace_id=trace_id,
+            )
         )
-        selected = next((candidate for candidate in result.candidates if candidate.validation_ok), result.selected_candidate)
         provider, model_name = _observed_provider_and_model(
             llm_client,
             aoai_client_type=AOAIResponsesClient,
             mock_client_type=MockLLMClient,
         )
-        deterministic_fallback = _used_deterministic_fallback(result)
+        try:
+            with bind_audit_context(capture_session):
+                result = generate_loop3_candidates(
+                    Loop3Request(strategy=strategy, variant="A", trace_id=str(trace_id)),
+                    llm_client=llm_client,
+                )
+        except Exception as exc:
+            if not capture_session.model_calls:
+                raise
+            raise CodeGenerationFailure(
+                "Code generation failed after the model call and deterministic fallback.",
+                model_call=_build_generation_model_call(
+                    request,
+                    prompt_request=prompt_request,
+                    strategy_id=getattr(strategy, "strategy_id", None),
+                    provider=provider,
+                    model_name=model_name,
+                    fallback_error=_generation_exception_error(exc),
+                    captured_model=capture_session.model_calls[0],
+                    captured_prompt=capture_session.prompt_logs[0],
+                    captured_error=next(
+                        (event for event in capture_session.buffered_events if event.kind == "error"),
+                        None,
+                    ),
+                ),
+            ) from exc
+        selected = next((candidate for candidate in result.candidates if candidate.validation_ok), result.selected_candidate)
+        fallback_error = _fallback_error(result)
         return GeneratedCodeResult(
             target_runtime=request.target_runtime,
             code_purpose=request.code_purpose,
@@ -125,7 +167,13 @@ class AOAICodeGenerator:
                 strategy_id=getattr(strategy, "strategy_id", None),
                 provider=provider,
                 model_name=model_name,
-                deterministic_fallback=deterministic_fallback,
+                fallback_error=fallback_error,
+                captured_model=capture_session.model_calls[0] if capture_session.model_calls else None,
+                captured_prompt=capture_session.prompt_logs[0] if capture_session.prompt_logs else None,
+                captured_error=next(
+                    (event for event in capture_session.buffered_events if event.kind == "error"),
+                    None,
+                ),
             ),
         )
 
@@ -352,6 +400,14 @@ def _load_validate_backtest_code():
     return validate_backtest_code
 
 
+def _load_audit_modules():
+    try:
+        from ai_graph.audit import RecordingAuditSink, bind_audit_context, create_audit_correlation
+    except ModuleNotFoundError as exc:
+        raise _pythonpath_error(exc) from exc
+    return RecordingAuditSink, bind_audit_context, create_audit_correlation
+
+
 def _build_generation_model_call(
     request: AICodeBacktestFlowRequest,
     *,
@@ -359,33 +415,60 @@ def _build_generation_model_call(
     strategy_id: str | None,
     provider: str | None,
     model_name: str | None,
-    deterministic_fallback: bool,
+    fallback_error: tuple[str, str] | None,
+    captured_model: Any | None,
+    captured_prompt: Any | None,
+    captured_error: Any | None,
 ) -> ModelCallLogBundle:
+    model_failed = captured_model is not None and captured_model.status == "failed"
+    failed = fallback_error is not None or model_failed
+    error_type = None
+    error_message = None
+    if model_failed:
+        error_type = getattr(captured_error, "error_type", None) or "model_call_failed"
+        error_message = captured_model.error_message or "Model call failed before fallback execution."
+    elif fallback_error is not None:
+        error_type, error_message = fallback_error
+
     return ModelCallLogBundle(
-        task_type="backtest_code_generation",
-        provider=provider,
-        model_name=model_name,
-        status="failed" if deterministic_fallback else "succeeded",
-        error_message=(
-            "LLM generated candidates failed validation; deterministic fallback code was executed."
-            if deterministic_fallback
-            else None
+        task_type=getattr(captured_model, "task_type", None) or "backtest_code_generation",
+        provider=getattr(captured_model, "provider", None) or provider,
+        provider_request_id=getattr(captured_model, "provider_request_id", None),
+        model_name=getattr(captured_model, "model_name", None) or model_name,
+        temperature=getattr(captured_model, "temperature", None),
+        response_schema_name=(
+            getattr(captured_model, "response_schema_name", None) or prompt_request.schema_name
         ),
+        web_search_used=bool(getattr(captured_model, "web_search_used", False)),
+        prompt_tokens=getattr(captured_model, "prompt_tokens", None),
+        completion_tokens=getattr(captured_model, "completion_tokens", None),
+        total_tokens=getattr(captured_model, "total_tokens", None),
+        latency_ms=getattr(captured_model, "latency_ms", None),
+        retry_count=getattr(captured_model, "retry_count", 0),
+        status="failed" if failed else "succeeded",
+        error_type=error_type,
+        error_message=error_message,
         prompt_log=PromptLogBundle(
-            prompt_template_name=prompt_request.schema_name,
-            system_prompt="[redacted stage1 backend code-generation system prompt]",
-            user_prompt="[redacted stage1 backend code-generation user prompt]",
-            assistant_response=None,
-            variables_jsonb={
-                "strategy_id": strategy_id,
-                "variant": "A",
-                "request_text_sha256": _sha256_text(request.natural_language_prompt),
-                "system_prompt_sha256": _sha256_text(prompt_request.system_prompt),
-                "user_prompt_sha256": _sha256_text(prompt_request.user_prompt),
-            },
-            prompt_version=prompt_request.schema_name,
+            prompt_template_name=(
+                getattr(captured_prompt, "prompt_template_name", None)
+                or getattr(prompt_request, "prompt_template_name", None)
+                or prompt_request.schema_name
+            ),
+            system_prompt=getattr(captured_prompt, "system_prompt", None) or prompt_request.system_prompt,
+            user_prompt=getattr(captured_prompt, "user_prompt", None) or prompt_request.user_prompt,
+            assistant_response=getattr(captured_prompt, "assistant_response", None),
+            variables_jsonb=(
+                dict(captured_prompt.variables_jsonb)
+                if captured_prompt is not None
+                else dict(getattr(prompt_request, "variables_jsonb", {}) or {"strategy_id": strategy_id, "variant": "A"})
+            ),
+            prompt_version=(
+                getattr(captured_prompt, "prompt_version", None)
+                or getattr(prompt_request, "prompt_version", None)
+                or prompt_request.schema_name
+            ),
             contains_pii=_contains_pii_text(request.natural_language_prompt),
-            masked=True,
+            masked=False,
         )
     )
 
@@ -404,14 +487,36 @@ def _observed_provider_and_model(
     return None, None
 
 
-def _used_deterministic_fallback(result: Any) -> bool:
+def _fallback_error(result: Any) -> tuple[str, str] | None:
     fallback_reasons = getattr(result, "fallback_reasons", None)
     if not isinstance(fallback_reasons, list):
-        return False
-    return any(
-        isinstance(reason, str) and reason == "all generated candidates failed AST validation"
-        for reason in fallback_reasons
-    )
+        return None
+    for reason in fallback_reasons:
+        if reason == "all generated candidates failed AST validation":
+            return (
+                "LLMOutputValidationError",
+                "LLM generated candidates failed validation; deterministic fallback code was executed.",
+            )
+        if isinstance(reason, str) and reason.startswith("ValidationError:"):
+            return (
+                "LLMResponseSchemaError",
+                "Model response did not match the required schema; deterministic fallback code was executed.",
+            )
+        if isinstance(reason, str) and reason.startswith("LLMClientError:"):
+            return (
+                "LLMClientError",
+                "Model request failed; deterministic fallback code was executed.",
+            )
+    return None
+
+
+def _generation_exception_error(exc: Exception) -> tuple[str, str] | None:
+    if isinstance(exc, ValueError) and str(exc) == "safe fallback candidates failed AST validation":
+        return (
+            "LLMOutputValidationError",
+            "LLM-generated and deterministic fallback candidates failed validation.",
+        )
+    return None
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()

@@ -246,6 +246,48 @@ def test_run_analysis_records_error_audit_events_when_validation_fails() -> None
     assert error_event.error_type == "ValueError"
     assert "user_query" not in error_event.message
     assert session.buffered_events[-1].status == "failed"
+
+
+def test_work_agent_failure_stops_downstream_and_keeps_one_correlated_error(monkeypatch) -> None:
+    sink = RecordingAuditSink()
+
+    class RejectMarkerError(RuntimeError):
+        def __setattr__(self, name, value):
+            if name.startswith("_quantagent"):
+                raise AttributeError("custom marker rejected")
+            super().__setattr__(name, value)
+
+    def fail_backtest(state):
+        raise RejectMarkerError("private backtest failure")
+
+    monkeypatch.setattr("ai_graph.graph.backtest_node", fail_backtest)
+
+    with pytest.raises(RejectMarkerError, match="private backtest failure"):
+        run_analysis(
+            "RSI가 30 이하로 떨어진 종목을 사고 70 이상이면 팔아줘",
+            trace_id="trace-work-agent-failure",
+            audit_sink=sink,
+        )
+
+    session = sink.sessions[0]
+    assert [record.agent_name for record in session.agent_executions] == [
+        "Supervisor",
+        "Ambiguity Classifier",
+        "Data",
+        "Research",
+        "BacktestCode",
+        "Backtest",
+    ]
+    failed_execution = session.agent_executions[-1]
+    assert failed_execution.status == "failed"
+    errors = [event for event in session.buffered_events if event.kind == "error"]
+    assert len(errors) == 1
+    assert errors[0].step == "Backtest"
+    assert errors[0].execution_id == failed_execution.execution_id
+    assert session.buffered_events[-1].kind == "finalization"
+    assert session.buffered_events[-1].status == "failed"
+
+
 def test_analysis_job_polling_contract_runs_sync() -> None:
     store = InMemoryAnalysisJobStore()
     job = store.create("RSI가 30 이하인 KOSPI200")

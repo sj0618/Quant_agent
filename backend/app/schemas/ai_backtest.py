@@ -276,6 +276,8 @@ class ModelCallLogBundle(BaseModel):
     provider_request_id: str | None = None
     model_name: str | None = None
     temperature: float | None = None
+    response_schema_name: str | None = None
+    web_search_used: bool = False
     top_p: float | None = None
     seed: int | None = None
     prompt_tokens: int | None = None
@@ -287,8 +289,9 @@ class ModelCallLogBundle(BaseModel):
     cache_hit: bool = False
     tool_calls_jsonb: list[Any] = Field(default_factory=list)
     status: str = Field(default="succeeded", min_length=1)
+    error_type: str | None = None
     error_message: str | None = None
-    prompt_log: PromptLogBundle | None = None
+    prompt_log: PromptLogBundle
 
 
 class AIBacktestReportDraft(BaseModel):
