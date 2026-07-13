@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS app.strategy_report_profile (
 CREATE TABLE IF NOT EXISTS app.strategy_email_report (
     report_id text NOT NULL,
     strategy_id text NOT NULL,
+    backtest_run_id uuid,
+    ai_report_id uuid,
     report_date date NOT NULL,
     weekday text,
     sent_at timestamptz,
@@ -56,6 +58,14 @@ CREATE TABLE IF NOT EXISTS app.strategy_email_report (
         FOREIGN KEY (strategy_id)
         REFERENCES app.strategy_report_profile(strategy_id)
         ON DELETE CASCADE,
+    CONSTRAINT strategy_email_report_backtest_run_id_fkey
+        FOREIGN KEY (backtest_run_id)
+        REFERENCES app.backtest_run(run_id)
+        ON DELETE SET NULL,
+    CONSTRAINT strategy_email_report_ai_report_id_fkey
+        FOREIGN KEY (ai_report_id)
+        REFERENCES app.ai_backtest_report(report_id)
+        ON DELETE SET NULL,
     CONSTRAINT strategy_email_report_status_check
         CHECK (status = ANY (ARRAY['sent'::text, 'draft'::text, 'failed'::text, 'resent'::text])),
     CONSTRAINT strategy_email_report_recommendation_score_check
@@ -211,6 +221,10 @@ CREATE INDEX IF NOT EXISTS idx_strategy_email_report_strategy_date
     ON app.strategy_email_report USING btree (strategy_id, report_date DESC, sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_strategy_email_report_status
     ON app.strategy_email_report USING btree (status);
+CREATE INDEX IF NOT EXISTS idx_strategy_email_report_backtest_run
+    ON app.strategy_email_report USING btree (backtest_run_id);
+CREATE INDEX IF NOT EXISTS idx_strategy_email_report_ai_report
+    ON app.strategy_email_report USING btree (ai_report_id);
 CREATE INDEX IF NOT EXISTS idx_strategy_email_report_news_report
     ON app.strategy_email_report_news USING btree (report_id, rank);
 CREATE INDEX IF NOT EXISTS idx_strategy_email_report_candidate_report
@@ -271,6 +285,10 @@ COMMENT ON TABLE app.strategy_report_profile IS
     'Display profile for strategy report list and strategy detail pages.';
 COMMENT ON TABLE app.strategy_email_report IS
     'Generated email report content and summary for a strategy on one report date.';
+COMMENT ON COLUMN app.strategy_email_report.backtest_run_id IS
+    'Optional source backtest run used to generate this immutable report snapshot.';
+COMMENT ON COLUMN app.strategy_email_report.ai_report_id IS
+    'Optional source AI backtest report used to generate this email report.';
 COMMENT ON TABLE app.strategy_email_report_news IS
     'Ranked news and market context items embedded in one email report.';
 COMMENT ON TABLE app.strategy_email_report_candidate IS

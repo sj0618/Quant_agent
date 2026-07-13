@@ -1,6 +1,6 @@
 # Report and Email Storage
 
-`003_create_report_email_tables.sql` supports the report pages and email
+`014_create_report_email_tables.sql` supports the report pages and email
 history routes currently represented by FE mocks.
 
 ## Route Mapping
@@ -23,3 +23,8 @@ history routes currently represented by FE mocks.
 
 `app.email_digest_subscription` enforces a maximum of three strategies per user
 with a trigger, matching the FE daily digest selection rule.
+
+`app.strategy_email_report.backtest_run_id` and `ai_report_id` are nullable
+source references. They link an email report to the backtest run and AI report
+that produced it when those records exist. `performance_jsonb` remains the
+immutable display snapshot used to reproduce the delivered report.

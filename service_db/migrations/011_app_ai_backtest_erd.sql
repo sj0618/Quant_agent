@@ -1,4 +1,4 @@
--- Application / AI / backtest ERD aligned to the generated-code execution flow.
+-- Service DB application / AI / backtest ERD aligned to the generated-code execution flow.
 -- This migration keeps the existing backtest result tables but shifts the primary
 -- execution path toward parse -> code generation -> validation -> sandbox execution.
 
