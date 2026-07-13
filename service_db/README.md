@@ -72,15 +72,6 @@ $env:QUANT_DB_PASSWORD = "<local-password>"
 ./service_db/scripts/apply_migrations.ps1
 ```
 
-DE와 service_db를 모두 적용:
-
-```powershell
-$env:QUANT_DB_PASSWORD = "<local-password>"
-./scripts/apply_all_migrations.ps1
-```
-
-통합 스크립트는 재현 가능한 기본 순서로 DE migration을 먼저 적용하고 service_db migration을 적용한다. 현재 두 영역 사이에 직접적인 DDL 의존성은 없지만, 각 폴더 내부의 파일명 순서는 반드시 지킨다.
-
 ## 확인
 
 ```sql
