@@ -892,9 +892,19 @@ class BacktestEngine:
                 )
                 continue
             bar = today_bars[order.ticker]
-            current_equity = cash + self._positions_value(positions, today_bars)
+            positions_value = sum(
+                position.quantity
+                * (today_bars[ticker].open if ticker in today_bars else position.last_price)
+                for ticker, position in positions.items()
+            )
+            current_equity = cash + positions_value
             slots_left = max(1, self.spec.position_sizing.max_positions - len(positions))
-            budget = min(cash / slots_left, current_equity / self.spec.position_sizing.max_positions)
+            budget = min(
+                cash / slots_left,
+                current_equity / self.spec.position_sizing.max_positions,
+                current_equity * self.spec.risk_controls.max_single_position_pct,
+                max(0.0, current_equity * self.spec.risk_controls.max_gross_exposure_pct - positions_value),
+            )
             buy_price = bar.open * (1 + self.spec.backtest.cost_model.slippage_pct)
             unit_cash = buy_price * (1 + self.spec.backtest.cost_model.commission_pct)
             if unit_cash <= 0:
