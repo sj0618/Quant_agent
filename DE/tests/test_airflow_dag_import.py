@@ -97,6 +97,21 @@ class AirflowDagImportTests(unittest.TestCase):
 
         self.assertEqual(args, ["--as-of-date", "2026-05-21"])
 
+    def test_ai_prompt_retention_dag_is_independent_and_daily(self):
+        module = _load_dag_module("quant_agent_data_engineering_dag_prompt_retention")
+        source = Path("airflow/dags/quant_agent_data_engineering.py").read_text(encoding="utf-8")
+
+        self.assertEqual(module.PROMPT_RETENTION_DAG_ID, "quant_agent_ai_prompt_retention")
+        self.assertEqual(module.DEFAULT_PROMPT_RETENTION_SCHEDULE, "0 5 * * *")
+        self.assertEqual(module.PROMPT_RETENTION_RETRIES, 3)
+        self.assertEqual(module.PROMPT_RETENTION_RETRY_DELAY.total_seconds(), 300)
+        self.assertEqual(module.PROMPT_RETENTION_SCRIPT.name, "purge_ai_prompt_logs.py")
+        self.assertIn("def ai_prompt_retention():", source)
+        self.assertIn("catchup=False", source)
+        self.assertIn("max_active_runs=1", source)
+        self.assertIn("_run_python_script(PROMPT_RETENTION_SCRIPT, [])", source)
+        self.assertNotIn("purge_ai_prompt_logs >>", source)
+
 
 def _load_dag_module(module_name: str = "quant_agent_data_engineering_dag"):
     path = Path("airflow/dags/quant_agent_data_engineering.py")

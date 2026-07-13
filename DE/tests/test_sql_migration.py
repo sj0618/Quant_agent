@@ -110,6 +110,24 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertNotIn("CREATE EXTENSION IF NOT EXISTS pgcrypto", sql)
         self.assertIn("application must provide UUID values explicitly", sql)
 
+    def test_ai_runtime_logging_migration_is_additive_and_idempotent(self):
+        sql = Path("migrations/013_ai_runtime_logging.sql").read_text(encoding="utf-8")
+        upper_sql = sql.upper()
+
+        self.assertIn("ADD COLUMN IF NOT EXISTS execution_id UUID", sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS response_schema_name TEXT", sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS web_search_used BOOLEAN NOT NULL DEFAULT FALSE", sql)
+        self.assertIn("fk_ai_model_call_log_execution", sql)
+        self.assertIn("REFERENCES app.ai_agent_execution_log(execution_id)", sql)
+        self.assertIn("ON DELETE SET NULL", sql)
+        self.assertIn("CREATE INDEX IF NOT EXISTS idx_ai_model_call_log_execution_created", sql)
+        self.assertIn("ON app.ai_model_call_log (execution_id, created_at DESC)", sql)
+        self.assertIn("CREATE INDEX IF NOT EXISTS idx_ai_prompt_log_retention", sql)
+        self.assertIn("ON app.ai_prompt_log (created_at, prompt_log_id)", sql)
+        self.assertNotIn("DROP ", upper_sql)
+        self.assertNotIn("TRUNCATE ", upper_sql)
+        self.assertNotIn("PGCRYPTO", upper_sql)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from ai_graph.audit import begin_model_call, finish_model_call
 from ai_graph.llm.base import LLMClientError, LLMJsonRequest, LLMResponseParseError
 
 
@@ -39,14 +40,79 @@ class AOAIResponsesClient:
         self._http_client = http_client
 
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
-        response = self._post_with_retries(request)
+        call_id = begin_model_call(
+            task_type=request.task_type or request.schema_name,
+            provider="aoai",
+            model_name=self.model,
+            system_prompt=request.system_prompt,
+            user_prompt=request.user_prompt,
+            variables_jsonb=request.variables_jsonb,
+            prompt_template_name=request.prompt_template_name,
+            prompt_version=request.prompt_version,
+            temperature=request.temperature,
+            response_schema_name=request.schema_name,
+            web_search_used=request.enable_web_search,
+        )
+        started_at = time.perf_counter()
+        assistant_response: str | None = None
+        retry_count = 0
+        provider_request_id: str | None = None
+        response_model = self.model
+        prompt_tokens: int | None = None
+        completion_tokens: int | None = None
+        total_tokens: int | None = None
         try:
-            payload = response.json()
-        except json.JSONDecodeError as exc:
-            raise LLMResponseParseError("AOAI response body is not valid JSON") from exc
-        return extract_json_object(payload)
+            response, retry_count = self._post_with_retries(request)
+            provider_request_id = _provider_request_id(None, response)
+            try:
+                payload = response.json()
+            except json.JSONDecodeError as exc:
+                assistant_response = response.text
+                raise LLMResponseParseError("AOAI response body is not valid JSON") from exc
 
-    def _post_with_retries(self, request: LLMJsonRequest) -> httpx.Response:
+            provider_request_id = _provider_request_id(payload, response)
+            response_model = _response_model(payload) or self.model
+            prompt_tokens, completion_tokens, total_tokens = _usage(payload)
+            raw_output = _raw_assistant_output(payload, response.text)
+            try:
+                result = extract_json_object(payload)
+            except LLMResponseParseError:
+                assistant_response = raw_output
+                raise
+            assistant_response = raw_output
+        except Exception as exc:
+            retry_count = max(retry_count, getattr(exc, "retry_count", 0))
+            finish_model_call(
+                call_id,
+                status="failed",
+                assistant_response=assistant_response,
+                provider_request_id=provider_request_id,
+                model_name=response_model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                latency_ms=(time.perf_counter() - started_at) * 1000,
+                retry_count=retry_count,
+                error_type=type(exc).__name__,
+                error_message=f"{type(exc).__name__} during model call",
+            )
+            raise
+
+        finish_model_call(
+            call_id,
+            status="succeeded",
+            assistant_response=assistant_response,
+            provider_request_id=provider_request_id,
+            model_name=response_model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            latency_ms=(time.perf_counter() - started_at) * 1000,
+            retry_count=retry_count,
+        )
+        return result
+
+    def _post_with_retries(self, request: LLMJsonRequest) -> tuple[httpx.Response, int]:
         body: dict[str, Any] = {
             "model": self.model,
             "input": [
@@ -60,8 +126,10 @@ class AOAIResponsesClient:
         headers = {"Content-Type": "application/json", "api-key": self.api_key}
         attempts = self.max_retries + 1
         last_error: Exception | None = None
+        last_attempt = 0
 
         for attempt in range(attempts):
+            last_attempt = attempt
             try:
                 client = self._http_client or httpx.Client(timeout=self.timeout_seconds)
                 if self._http_client is None:
@@ -73,14 +141,16 @@ class AOAIResponsesClient:
                     _sleep_before_retry(self.retry_backoff_seconds, attempt)
                     continue
                 response.raise_for_status()
-                return response
+                return response, attempt
             except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
                 last_error = exc
                 if not _should_retry(exc) or attempt >= attempts - 1:
                     break
                 _sleep_before_retry(self.retry_backoff_seconds, attempt)
 
-        raise LLMClientError("AOAI Responses request failed") from last_error
+        raise LLMClientError(
+            "AOAI Responses request failed", retry_count=last_attempt
+        ) from last_error
 
 
 def extract_json_object(payload: Any) -> dict[str, Any]:
@@ -123,6 +193,8 @@ def _extract_nested_output_text(payload: dict[str, Any]) -> str | None:
     for item in output:
         if not isinstance(item, dict):
             continue
+        if item.get("type") not in (None, "message"):
+            continue
         content = item.get("content")
         if isinstance(content, str):
             text_parts.append(content)
@@ -132,12 +204,56 @@ def _extract_nested_output_text(payload: dict[str, Any]) -> str | None:
         for content_item in content:
             if not isinstance(content_item, dict):
                 continue
+            if content_item.get("type") not in (None, "output_text"):
+                continue
             text = content_item.get("text")
             if isinstance(text, str):
                 text_parts.append(text)
     if not text_parts:
         return None
     return "\n".join(text_parts)
+
+
+def _raw_assistant_output(payload: Any, response_text: str) -> str:
+    if isinstance(payload, dict):
+        output_text = payload.get("output_text")
+        if isinstance(output_text, str):
+            return output_text
+        nested_text = _extract_nested_output_text(payload)
+        if nested_text is not None:
+            return nested_text
+        if isinstance(payload.get("output"), list):
+            return ""
+        return response_text
+    if isinstance(payload, str):
+        return payload
+    return response_text
+
+
+def _provider_request_id(payload: Any, response: httpx.Response) -> str | None:
+    if isinstance(payload, dict) and isinstance(payload.get("id"), str):
+        return payload["id"]
+    return response.headers.get("x-request-id") or response.headers.get("apim-request-id")
+
+
+def _response_model(payload: Any) -> str | None:
+    if isinstance(payload, dict) and isinstance(payload.get("model"), str):
+        return payload["model"]
+    return None
+
+
+def _usage(payload: Any) -> tuple[int | None, int | None, int | None]:
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return None, None, None
+    prompt = _optional_int(usage.get("input_tokens", usage.get("prompt_tokens")))
+    completion = _optional_int(usage.get("output_tokens", usage.get("completion_tokens")))
+    total = _optional_int(usage.get("total_tokens"))
+    return prompt, completion, total
+
+
+def _optional_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _looks_like_direct_json_payload(payload: dict[str, Any]) -> bool:
