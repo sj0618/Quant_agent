@@ -56,12 +56,12 @@ AI_AUDIT_STATEMENT_TIMEOUT_MS=2000
 
 ## 2. 마이그레이션
 
-선행 조건은 `DE/migrations/011_app_ai_backtest_erd.sql`이 적용된 DB다. 코드
+선행 조건은 `service_db/migrations/011_app_ai_backtest_erd.sql`이 적용된 DB다. 코드
 활성화 전에 additive migration 013을 적용한다.
 
 ```bash
 psql "$AI_DATABASE_DSN" -v ON_ERROR_STOP=1 \
-  -f DE/migrations/013_ai_runtime_logging.sql
+  -f service_db/migrations/013_ai_runtime_logging.sql
 ```
 
 013은 다음만 추가하며 기존 컬럼이나 데이터를 삭제하지 않는다.

@@ -1,4 +1,4 @@
--- Add the minimal runtime relationships and indexes required by AI logging.
+-- Add the minimal service DB relationships and indexes required by AI logging.
 
 ALTER TABLE app.ai_model_call_log
     ADD COLUMN IF NOT EXISTS execution_id UUID;

@@ -444,7 +444,7 @@ def test_ready_analysis_with_postgres_sink_persists_all_calls_and_finalizes(caps
 )
 def test_disposable_timescaledb_migrations_and_large_unicode_round_trip() -> None:
     dsn = os.environ["AI_LOGGING_TEST_DSN"]
-    migrations_dir = Path(__file__).resolve().parents[2] / "DE" / "migrations"
+    migrations_dir = Path(__file__).resolve().parents[2] / "service_db" / "migrations"
     migrations = sorted(migrations_dir.glob("*.sql"))
     assert migrations
 

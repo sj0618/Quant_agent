@@ -14,6 +14,7 @@ on:
       - "backend/tests/unit/test_ai_backtest_runtime.py"
       - "DE/airflow/dags/quant_agent_data_engineering.py"
       - "DE/migrations/**"
+      - "service_db/migrations/**"
       - "DE/scripts/purge_ai_prompt_logs.py"
       - "DE/tests/**"
 
