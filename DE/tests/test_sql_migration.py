@@ -58,7 +58,7 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("'인프라펀드'", sql)
 
     def test_app_ai_backtest_erd_migration_contains_requested_tables(self):
-        sql = Path("migrations/011_app_ai_backtest_erd.sql").read_text(encoding="utf-8")
+        sql = Path("../service_db/migrations/011_app_ai_backtest_erd.sql").read_text(encoding="utf-8")
         self.assertIn("CREATE SCHEMA IF NOT EXISTS app;", sql)
         for table_name in (
             "app.users",
@@ -84,7 +84,7 @@ class SqlMigrationTests(unittest.TestCase):
             self.assertIn(f"CREATE TABLE IF NOT EXISTS {table_name}", sql)
 
     def test_app_ai_backtest_erd_migration_contains_key_columns(self):
-        sql = Path("migrations/011_app_ai_backtest_erd.sql").read_text(encoding="utf-8")
+        sql = Path("../service_db/migrations/011_app_ai_backtest_erd.sql").read_text(encoding="utf-8")
         self.assertIn("CREATE TYPE app.ai_code_status AS ENUM", sql)
         self.assertIn("CREATE TYPE app.code_execution_status AS ENUM", sql)
         self.assertIn("CREATE TYPE app.backtest_execution_mode AS ENUM", sql)
@@ -111,7 +111,7 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("application must provide UUID values explicitly", sql)
 
     def test_ai_runtime_logging_migration_is_additive_and_idempotent(self):
-        sql = Path("migrations/013_ai_runtime_logging.sql").read_text(encoding="utf-8")
+        sql = Path("../service_db/migrations/013_ai_runtime_logging.sql").read_text(encoding="utf-8")
         upper_sql = sql.upper()
 
         self.assertIn("ADD COLUMN IF NOT EXISTS execution_id UUID", sql)

@@ -273,7 +273,7 @@ def test_sink_factory_is_disabled_by_default_and_reuses_dsn_priority() -> None:
     assert "postgresql://preferred" not in repr(sink)
 
 
-def test_terminal_model_persistence_failure_keeps_known_correlation_ids(capsys) -> None:
+def test_terminal_model_persistence_failure_stops_db_writes(capsys) -> None:
     conn = FakeConnection()
     session = PostgresAuditSink(
         "postgresql://test",
@@ -296,6 +296,7 @@ def test_terminal_model_persistence_failure_keeps_known_correlation_ids(capsys) 
         execution_id=execution_id,
     )
     conn.fail_matching = "UPDATE app.ai_model_call_log"
+    executions_before_failure = len(conn.executions)
 
     session.finish_model_call(
         call_id,
@@ -303,21 +304,13 @@ def test_terminal_model_persistence_failure_keeps_known_correlation_ids(capsys) 
         assistant_response='{"ok":true}',
     )
 
-    failure_params = next(
-        params
-        for statement, params in conn.executions
-        if "audit_persistence_failure" in statement
-    )
-    assert failure_params[1:4] == (
-        session.correlation.db_trace_id,
-        call_id,
-        execution_id,
-    )
+    assert len(conn.executions) == executions_before_failure + 1
+    assert "audit_persistence_failure" not in "\n".join(statement for statement, _ in conn.executions)
     assert conn.close_calls == 1
     assert "ai_audit_failure" in capsys.readouterr().err
 
 
-def test_terminal_agent_persistence_failure_keeps_execution_id(capsys) -> None:
+def test_terminal_agent_persistence_failure_stops_db_writes(capsys) -> None:
     conn = FakeConnection()
     session = PostgresAuditSink(
         "postgresql://test",
@@ -326,19 +319,12 @@ def test_terminal_agent_persistence_failure_keeps_execution_id(capsys) -> None:
     assert isinstance(session, PostgresAuditSession)
     execution_id = session.start_agent_execution("Research", step_name="Research")
     conn.fail_matching = "UPDATE app.ai_agent_execution_log"
+    executions_before_failure = len(conn.executions)
 
     session.finish_agent_execution(execution_id, status="succeeded")
 
-    failure_params = next(
-        params
-        for statement, params in conn.executions
-        if "audit_persistence_failure" in statement
-    )
-    assert failure_params[1:4] == (
-        session.correlation.db_trace_id,
-        None,
-        execution_id,
-    )
+    assert len(conn.executions) == executions_before_failure + 1
+    assert "audit_persistence_failure" not in "\n".join(statement for statement, _ in conn.executions)
     assert conn.close_calls == 1
     assert "ai_audit_failure" in capsys.readouterr().err
 
@@ -360,7 +346,7 @@ def test_connect_failure_returns_noop_and_emits_one_sanitized_signal(capsys) -> 
     assert "postgresql://secret" not in stderr
 
 
-def test_failure_while_recording_audit_failure_stops_without_recursion(capsys) -> None:
+def test_failure_signal_stops_without_recursive_db_write(capsys) -> None:
     conn = RecursiveFailureConnection()
     session = PostgresAuditSink(
         "postgresql://test",
@@ -373,8 +359,8 @@ def test_failure_while_recording_audit_failure_stops_without_recursion(capsys) -
 
     session.start_agent_execution("Research", step_name="Research")
 
-    assert len(conn.executions) == executions_before_failure + 2
-    assert conn.rollbacks == 2
+    assert len(conn.executions) == executions_before_failure + 1
+    assert conn.rollbacks == 1
     assert conn.close_calls == 1
     assert audit_failure_count() == before + 1
     stderr = capsys.readouterr().err
@@ -458,7 +444,7 @@ def test_ready_analysis_with_postgres_sink_persists_all_calls_and_finalizes(caps
 )
 def test_disposable_timescaledb_migrations_and_large_unicode_round_trip() -> None:
     dsn = os.environ["AI_LOGGING_TEST_DSN"]
-    migrations_dir = Path(__file__).resolve().parents[2] / "DE" / "migrations"
+    migrations_dir = Path(__file__).resolve().parents[2] / "service_db" / "migrations"
     migrations = sorted(migrations_dir.glob("*.sql"))
     assert migrations
 

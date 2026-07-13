@@ -247,7 +247,7 @@ def test_aoai_audit_preserves_malformed_2xx_before_raising(
         client.generate_json(make_request())
 
     assert session.model_calls[0].status == "failed"
-    assert session.model_calls[0].error_message
+    assert session.model_calls[0].error_message == "Model response could not be parsed as the required JSON object."
     assert session.buffered_events[0].call_id == session.model_calls[0].call_id
     assert_exact_text(session.prompt_logs[0].assistant_response, expected_assistant)
 
@@ -269,6 +269,7 @@ def test_aoai_audit_non_2xx_has_null_response_and_keeps_original_error() -> None
         client.generate_json(make_request())
 
     assert session.model_calls[0].status == "failed"
+    assert session.model_calls[0].error_message == "Model provider returned HTTP 503 after retry attempts."
     assert session.prompt_logs[0].assistant_response is None
     persisted = repr((session.model_calls, session.prompt_logs, session.buffered_events))
     assert "secret-key-must-not-persist" not in persisted
@@ -297,6 +298,7 @@ def test_aoai_audit_transport_failure_has_null_response() -> None:
     session.finish_agent_execution(execution_id, status="succeeded")
 
     assert session.model_calls[0].status == "failed"
+    assert session.model_calls[0].error_message == "Model request timed out after retry attempts."
     assert session.model_calls[0].retry_count == 0
     assert session.prompt_logs[0].assistant_response is None
     assert session.model_calls[0].execution_id == execution_id

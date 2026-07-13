@@ -65,10 +65,8 @@ class PostgresAuditSink:
                 ),
             )
             conn.commit()
-        except Exception as exc:  # noqa: BLE001 - audit must remain fail-open
+        except Exception:  # noqa: BLE001 - audit must remain fail-open
             _rollback(conn)
-            if conn is not None and not _connection_unusable(conn, exc):
-                _direct_audit_failure_insert(conn, None, "open_session")
             _close(conn)
             report_audit_failure("open_session")
             return NoOpAuditSession(correlation)
@@ -142,12 +140,7 @@ class PostgresAuditSession:
                 ),
             )
 
-        self._transaction(
-            "record_error",
-            action,
-            call_id=call_id,
-            execution_id=execution_id,
-        )
+        self._transaction("record_error", action)
         return event
 
     def record_finalization(
@@ -245,11 +238,7 @@ class PostgresAuditSession:
                 (status, _json(output_jsonb or {}), safe_error, latency_ms, timestamp, execution_id),
             )
 
-        self._transaction(
-            "finish_agent_execution",
-            action,
-            execution_id=execution_id,
-        )
+        self._transaction("finish_agent_execution", action)
 
     def start_model_call(
         self,
@@ -378,12 +367,7 @@ class PostgresAuditSession:
                     context_jsonb={"operation": "finish_model_call"},
                 )
 
-        self._transaction(
-            "finish_model_call",
-            action,
-            call_id=call_id,
-            execution_id=execution_id,
-        )
+        self._transaction("finish_model_call", action)
 
     def close(self) -> None:
         if self._closed:
@@ -423,9 +407,6 @@ class PostgresAuditSession:
         self,
         operation: str,
         action: Callable[[], None],
-        *,
-        call_id: UUID | None = None,
-        execution_id: UUID | None = None,
     ) -> bool:
         if self._broken or self._closed:
             return False
@@ -433,35 +414,15 @@ class PostgresAuditSession:
             action()
             self.connection.commit()
             return True
-        except Exception as exc:  # noqa: BLE001 - audit must remain fail-open
-            self._handle_failure(
-                operation,
-                exc,
-                call_id=call_id,
-                execution_id=execution_id,
-            )
+        except Exception:  # noqa: BLE001 - audit must remain fail-open
+            self._handle_failure(operation)
             return False
 
-    def _handle_failure(
-        self,
-        operation: str,
-        exc: Exception,
-        *,
-        call_id: UUID | None,
-        execution_id: UUID | None,
-    ) -> None:
+    def _handle_failure(self, operation: str) -> None:
         if self._broken:
             return
         self._broken = True
         _rollback(self.connection)
-        if not _connection_unusable(self.connection, exc):
-            _direct_audit_failure_insert(
-                self.connection,
-                self.correlation.db_trace_id,
-                operation,
-                call_id=call_id,
-                execution_id=execution_id,
-            )
         if not self._failure_reported:
             self._failure_reported = True
             report_audit_failure(operation)
@@ -507,43 +468,6 @@ def _correlation_metadata(correlation: AuditCorrelation) -> dict[str, str]:
         "session_id": correlation.session_id,
     }
     return {key: value for key, value in values.items() if value is not None}
-
-
-def _direct_audit_failure_insert(
-    conn: Any,
-    trace_id: UUID | None,
-    operation: str,
-    *,
-    call_id: UUID | None = None,
-    execution_id: UUID | None = None,
-) -> None:
-    try:
-        conn.execute(
-            """
-            INSERT INTO app.ai_error_log (
-                error_id, trace_id, call_id, execution_id, error_type,
-                error_message, stack_trace, context_jsonb, severity, created_at
-            ) VALUES (%s, %s, %s, %s, 'audit_persistence_failure',
-                      'AI audit persistence failed', NULL, %s::jsonb, 'error', %s)
-            """,
-            (
-                uuid4(),
-                trace_id,
-                call_id,
-                execution_id,
-                _json({"operation": operation[:64]}),
-                _utcnow(),
-            ),
-        )
-        conn.commit()
-    except Exception:  # noqa: BLE001 - recursion is intentionally stopped here
-        _rollback(conn)
-
-
-def _connection_unusable(conn: Any, exc: Exception) -> bool:
-    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)) or bool(
-        getattr(conn, "closed", False)
-    )
 
 
 def _rollback(conn: Any | None) -> None:

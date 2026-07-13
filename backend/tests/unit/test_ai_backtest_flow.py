@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -26,7 +26,8 @@ from app.schemas.ai_backtest import (
     ModelCallLogBundle,
     PromptLogBundle,
 )
-from app.services.ai_backtest_flow import AICodeBacktestService
+from app.services.ai_backtest_flow import AICodeBacktestService, ai_backtest_audit_failure_count
+from app.services.ai_backtest_runtime import CodeGenerationFailure
 
 
 @dataclass(slots=True)
@@ -84,8 +85,9 @@ class FakeRepository:
         return record.report_id
 
     async def create_model_call_log(self, **kwargs):
-        self.model_calls.append(kwargs)
-        return uuid4()
+        call_id = uuid4()
+        self.model_calls.append({**kwargs, "call_id": call_id})
+        return call_id
 
     async def create_agent_execution_log(self, record):
         self.agent_logs.append(record)
@@ -117,15 +119,90 @@ class FakeGenerator:
                 status="succeeded",
                 prompt_log=PromptLogBundle(
                     prompt_template_name="quantagent.backtest_code.v1",
-                    system_prompt="[redacted stage1 backend code-generation system prompt]",
-                    user_prompt="[redacted stage1 backend code-generation user prompt]",
-                    assistant_response=None,
-                    variables_jsonb={"request_text_sha256": "hash", "strategy_id": request.strategy_id},
+                    system_prompt="Generate safe backtest code.",
+                    user_prompt=request.natural_language_prompt,
+                    assistant_response='{"candidates":["full raw response"]}',
+                    variables_jsonb={"strategy_id": request.strategy_id},
                     prompt_version="quantagent.backtest_code.v1",
                     contains_pii=False,
-                    masked=True,
+                    masked=False,
                 ),
             ),
+        )
+
+
+class ModelFallbackGenerator(FakeGenerator):
+    async def generate(self, request: AICodeBacktestFlowRequest, *, trace_id: UUID) -> GeneratedCodeResult:
+        generated = await super().generate(request, trace_id=trace_id)
+        assert generated.model_call is not None
+        return generated.model_copy(
+            update={
+                "model_call": generated.model_call.model_copy(
+                    update={
+                        "status": "failed",
+                        "error_type": "LLMClientError",
+                        "error_message": "Model request timed out after retry attempts.",
+                    }
+                )
+            }
+        )
+
+
+class FailedGenerator:
+    async def generate(self, request: AICodeBacktestFlowRequest, *, trace_id: UUID) -> GeneratedCodeResult:
+        raise ValueError("private generation detail")
+
+
+class InvalidModelOutputAndFallbackGenerator:
+    async def generate(self, request: AICodeBacktestFlowRequest, *, trace_id: UUID) -> GeneratedCodeResult:
+        raise CodeGenerationFailure(
+            "private fallback detail",
+            model_call=ModelCallLogBundle(
+                task_type="backtest_code_generation",
+                provider="aoai",
+                model_name="gpt-failed",
+                retry_count=0,
+                status="failed",
+                error_type="LLMOutputValidationError",
+                error_message="LLM-generated and deterministic fallback candidates failed validation.",
+                prompt_log=PromptLogBundle(
+                    prompt_template_name="quantagent.backtest_code.v1",
+                    system_prompt="full system prompt",
+                    user_prompt=request.natural_language_prompt,
+                    assistant_response='{"candidates":["unsafe"]}',
+                    variables_jsonb={"strategy_id": request.strategy_id},
+                    prompt_version="quantagent.backtest_code.v1",
+                    contains_pii=False,
+                    masked=False,
+                ),
+            ),
+        )
+
+
+class TraceLoggingFailureRepository(FakeRepository):
+    async def create_trace(self, record: AITraceCreate):
+        raise RuntimeError("private database detail")
+
+
+class CodeGenerationPersistenceFailureRepository(FakeRepository):
+    async def create_code_generation(self, record):
+        raise AppError(
+            status_code=503,
+            component="db",
+            code="db_query_failed",
+            message="Database query failed",
+            details={"private": "detail"},
+        )
+
+
+class BacktestPersistenceFailureRepository(FakeRepository):
+    async def persist_backtest_result(self, payload: BacktestResultPayload):
+        raise AppError(
+            status_code=503,
+            component="db",
+            code="db_query_failed",
+            message="Database query failed",
+            details={"private": "detail"},
         )
 
 
@@ -318,11 +395,12 @@ def test_ai_backtest_flow_persists_generated_code_validation_execution_and_repor
     assert persisted_model_call.provider == "mock"
     assert persisted_model_call.model_name == "gpt-code"
     assert persisted_model_call.prompt_log is not None
-    assert persisted_model_call.prompt_log.assistant_response is None
-    assert persisted_model_call.prompt_log.masked is True
-    assert persisted_model_call.prompt_log.system_prompt.startswith("[redacted")
-    assert persisted_model_call.prompt_log.user_prompt.startswith("[redacted")
+    assert persisted_model_call.prompt_log.assistant_response == '{"candidates":["full raw response"]}'
+    assert persisted_model_call.prompt_log.masked is False
+    assert persisted_model_call.prompt_log.system_prompt == "Generate safe backtest code."
+    assert persisted_model_call.prompt_log.user_prompt == request.natural_language_prompt
     generation_log = next(log for log in repository.agent_logs if log.step_name == "code_generation")
+    assert repository.model_calls[0]["execution_id"] == generation_log.execution_id
     assert generation_log.input_jsonb["request_text_sha256"]
     assert "prompt" not in generation_log.input_jsonb
     assert "strategy" not in generation_log.input_jsonb
@@ -330,6 +408,241 @@ def test_ai_backtest_flow_persists_generated_code_validation_execution_and_repor
     assert repository.strategy_parses[0].raw_prompt.startswith("prompt_redacted_sha256=")
     assert repository.strategy_parses[0].raw_prompt != request.natural_language_prompt
     assert request.natural_language_prompt[:10] not in repository.reports[0].summary
+
+
+def test_model_failure_logs_call_error_and_allows_successful_fallback() -> None:
+    repository = FakeRepository()
+    service = AICodeBacktestService(
+        repository,
+        ModelFallbackGenerator(),
+        SafeValidator(),
+        FakeExecutor(),
+        FakeReporter(),
+    )
+    request = AICodeBacktestFlowRequest(
+        user_id=11,
+        natural_language_prompt="모델 실패 뒤 안전한 fallback을 실행해줘",
+        parsed_strategy_jsonb={"strategy_id": "fallback_demo"},
+        strategy_id="fallback_demo",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    result = asyncio.run(service.run_generated_backtest(request))
+
+    assert result.execution_status == "succeeded"
+    assert repository.finished_traces[-1]["status"] == "succeeded"
+    generation = next(log for log in repository.agent_logs if log.step_name == "code_generation")
+    generation_update = next(
+        update for execution_id, update in repository.agent_log_updates if execution_id == generation.execution_id
+    )
+    assert generation_update.status == "succeeded"
+    model_call = repository.model_calls[0]
+    error = repository.error_logs[0]
+    assert model_call["bundle"].status == "failed"
+    assert error.trace_id == result.trace_id
+    assert error.execution_id == generation.execution_id == model_call["execution_id"]
+    assert error.call_id == model_call["call_id"]
+    assert error.error_type == "LLMClientError"
+    assert error.error_message == "Model request timed out after retry attempts."
+
+
+def test_generation_failure_records_safe_reason_and_stops_downstream() -> None:
+    repository = FakeRepository()
+    executor = FakeExecutor()
+    reporter = FakeReporter()
+    service = AICodeBacktestService(repository, FailedGenerator(), SafeValidator(), executor, reporter)
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="생성 단계 실패를 기록해줘",
+        parsed_strategy_jsonb={"strategy_id": "generation_failure"},
+        strategy_id="generation_failure",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    with pytest.raises(ValueError, match="private generation detail"):
+        asyncio.run(service.run_generated_backtest(request))
+
+    assert executor.called is False
+    assert reporter.called is False
+    assert [log.step_name for log in repository.agent_logs] == ["code_generation"]
+    assert repository.agent_log_updates[-1][1].status == "failed"
+    error = repository.error_logs[-1]
+    assert error.error_type == "code_generation_failed"
+    assert error.context_jsonb["cause_type"] == "ValueError"
+    assert "Cause type: ValueError" in error.error_message
+    assert "private generation detail" not in error.error_message
+    assert repository.finished_traces[-1]["status"] == "failed"
+
+
+def test_invalid_model_output_and_fallback_failure_persists_correlated_errors() -> None:
+    repository = FakeRepository()
+    service = AICodeBacktestService(
+        repository,
+        InvalidModelOutputAndFallbackGenerator(),
+        SafeValidator(),
+        FakeExecutor(),
+        FakeReporter(),
+    )
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="모델과 fallback이 모두 실패하는 요청",
+        parsed_strategy_jsonb={"strategy_id": "double_failure"},
+        strategy_id="double_failure",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    with pytest.raises(CodeGenerationFailure, match="private fallback detail"):
+        asyncio.run(service.run_generated_backtest(request))
+
+    generation = repository.agent_logs[0]
+    model_call = repository.model_calls[0]
+    model_error, step_error = repository.error_logs
+    assert model_call["execution_id"] == generation.execution_id
+    assert model_call["bundle"].status == "failed"
+    assert model_call["bundle"].prompt_log.user_prompt == request.natural_language_prompt
+    assert model_call["bundle"].prompt_log.assistant_response == '{"candidates":["unsafe"]}'
+    assert model_error.trace_id == repository.traces[0].trace_id
+    assert model_error.execution_id == generation.execution_id
+    assert model_error.call_id == model_call["call_id"]
+    assert model_error.error_type == "LLMOutputValidationError"
+    assert model_error.error_message == "LLM-generated and deterministic fallback candidates failed validation."
+    assert step_error.execution_id == generation.execution_id
+    assert step_error.error_type == "code_generation_failed"
+    assert "Cause type: CodeGenerationFailure" in step_error.error_message
+    assert "private fallback detail" not in step_error.error_message
+    assert repository.finished_traces[-1]["status"] == "failed"
+
+
+def test_step_app_error_includes_safe_error_code_without_private_details() -> None:
+    repository = CodeGenerationPersistenceFailureRepository()
+    service = AICodeBacktestService(
+        repository,
+        FakeGenerator(),
+        SafeValidator(),
+        FakeExecutor(),
+        FakeReporter(),
+    )
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="생성 결과 저장 실패를 기록해줘",
+        parsed_strategy_jsonb={"strategy_id": "generation_persistence_failure"},
+        strategy_id="generation_persistence_failure",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    with pytest.raises(AppError) as exc_info:
+        asyncio.run(service.run_generated_backtest(request))
+
+    assert exc_info.value.code == "db_query_failed"
+    error = repository.error_logs[-1]
+    update = repository.agent_log_updates[-1][1]
+    assert error.error_type == "code_generation_failed"
+    assert error.context_jsonb["cause_code"] == "db_query_failed"
+    assert update.output_jsonb["cause_code"] == "db_query_failed"
+    assert "Error code: db_query_failed" in error.error_message
+    assert "detail" not in error.error_message
+    assert repository.finished_traces[-1]["status"] == "failed"
+
+
+def test_business_persistence_failure_fails_current_agent_and_trace() -> None:
+    repository = BacktestPersistenceFailureRepository()
+    reporter = FakeReporter()
+    service = AICodeBacktestService(
+        repository,
+        FakeGenerator(),
+        SafeValidator(),
+        FakeExecutor(),
+        reporter,
+    )
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="결과 저장 실패를 기록해줘",
+        parsed_strategy_jsonb={"strategy_id": "persistence_failure"},
+        strategy_id="persistence_failure",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    with pytest.raises(AppError) as exc_info:
+        asyncio.run(service.run_generated_backtest(request))
+
+    assert exc_info.value.code == "db_query_failed"
+    assert reporter.called is False
+    execution = next(log for log in repository.agent_logs if log.step_name == "code_execution")
+    execution_updates = [
+        update for execution_id, update in repository.agent_log_updates if execution_id == execution.execution_id
+    ]
+    assert len(execution_updates) == 1
+    assert execution_updates[0].status == "succeeded"
+    assert execution_updates[0].output_jsonb["execution_run_id"] == str(execution.execution_run_id)
+    assert execution_updates[0].latency_ms is not None
+    error = repository.error_logs[-1]
+    assert error.execution_id is None
+    assert error.error_type == "db_query_failed"
+    assert "Error code: db_query_failed" in error.error_message
+    assert "detail" not in error.error_message
+    assert repository.finished_traces[-1]["status"] == "failed"
+
+
+def test_trace_logging_failure_is_fail_open_and_stops_further_audit_writes(capsys) -> None:
+    repository = TraceLoggingFailureRepository()
+    generator = FakeGenerator()
+    executor = FakeExecutor()
+    reporter = FakeReporter()
+    service = AICodeBacktestService(repository, generator, SafeValidator(), executor, reporter)
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="로깅 DB가 실패해도 백테스트해줘",
+        parsed_strategy_jsonb={"strategy_id": "audit_failure_demo"},
+        strategy_id="audit_failure_demo",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+    before = ai_backtest_audit_failure_count()
+
+    result = asyncio.run(service.run_generated_backtest(request))
+
+    assert result.execution_status == "succeeded"
+    assert generator.called and executor.called and reporter.called
+    assert repository.strategy_parses[0].trace_id is None
+    assert repository.code_generations[0].trace_id is None
+    assert repository.backtest_results[0].run.trace_id is None
+    assert repository.agent_logs == []
+    assert repository.model_calls == []
+    assert repository.error_logs == []
+    assert repository.finished_traces == []
+    assert ai_backtest_audit_failure_count() == before + 1
+    stderr = capsys.readouterr().err
+    assert stderr.count("ai_audit_failure") == 1
+    assert "private database detail" not in stderr
+
+
+def test_trace_logging_failure_stays_fail_open_when_stderr_is_unavailable(monkeypatch) -> None:
+    class BrokenStderr:
+        def write(self, value):
+            raise OSError("stderr unavailable")
+
+        def flush(self):
+            raise OSError("stderr unavailable")
+
+    monkeypatch.setattr("app.services.ai_backtest_flow.sys.stderr", BrokenStderr())
+    service = AICodeBacktestService(
+        TraceLoggingFailureRepository(),
+        FakeGenerator(),
+        SafeValidator(),
+        FakeExecutor(),
+        FakeReporter(),
+    )
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="stderr도 실패해도 계속 실행해줘",
+        parsed_strategy_jsonb={"strategy_id": "stderr_failure_demo"},
+        strategy_id="stderr_failure_demo",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    result = asyncio.run(service.run_generated_backtest(request))
+
+    assert result.execution_status == "succeeded"
 
 
 def test_ai_backtest_flow_records_sanitized_execution_failure_payloads():
@@ -357,6 +670,10 @@ def test_ai_backtest_flow_records_sanitized_execution_failure_payloads():
     assert repository.error_logs
     execution_error = repository.error_logs[-1]
     assert execution_error.error_type == "code_execution_failed"
+    execution_log = next(log for log in repository.agent_logs if log.step_name == "code_execution")
+    assert execution_error.trace_id == repository.traces[0].trace_id
+    assert execution_error.execution_id == execution_log.execution_id
+    assert execution_error.execution_run_id == execution_log.execution_run_id
     assert "raw execution details" not in execution_error.error_message
     assert execution_error.context_jsonb["status"] == "failed"
     assert execution_error.context_jsonb["stdout_present"] is True
