@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Mapping
+from secrets import token_urlsafe
 from datetime import UTC, date, datetime
 from typing import Any, Protocol
 from uuid import UUID, uuid4
@@ -19,15 +21,70 @@ from app.schemas.ai_backtest import (
     AIStrategyParseCreate,
     AITraceCreate,
     AgentExecutionLogCreate,
+    AIBacktestRequestClaim,
+    AIBacktestReplacementApproval,
+    AICodeBacktestFlowRequest,
     AgentExecutionLogUpdate,
     BacktestResultPayload,
     CodeExecutionRunCreate,
     CodeExecutionRunUpdate,
     ModelCallLogBundle,
 )
+from app.services.raw_audit_admission import RawAuditAdmission, verify_raw_audit_admission
 
 
 class AIBacktestRepository(Protocol):
+    async def claim_idempotent_request(
+        self,
+        request: AICodeBacktestFlowRequest,
+        *,
+        trace: AITraceCreate,
+    ) -> AIBacktestRequestClaim: ...
+
+    async def transition_idempotent_request(
+        self,
+        request_id: UUID,
+        *,
+        expected_state: str,
+        next_state: str,
+        safety_lease: str | None = None,
+        execution_run_id: UUID | None = None,
+        terminal_response: Mapping[str, Any] | None = None,
+        terminal_evidence: Mapping[str, Any] | None = None,
+    ) -> AIBacktestRequestClaim: ...
+    async def release_armed_execution_request(
+        self,
+        request_id: UUID,
+        *,
+        expected_state_version: int,
+        execution_run_id: UUID,
+        attempt_id: UUID,
+    ) -> AIBacktestRequestClaim: ...
+    async def operator_terminalize_idempotent_request(
+        self,
+        request_id: UUID,
+        *,
+        expected_state: str,
+        expected_state_version: int,
+        terminal_state: str,
+        terminal_evidence: Mapping[str, Any],
+    ) -> AIBacktestRequestClaim: ...
+    async def operator_record_terminal_evidence(
+        self,
+        request_id: UUID,
+        *,
+        expected_state: str,
+        expected_state_version: int,
+        terminal_evidence: Mapping[str, Any],
+    ) -> AIBacktestRequestClaim: ...
+    async def operator_issue_replacement_approval(
+        self,
+        source_request_id: UUID,
+        *,
+        expires_at: datetime,
+    ) -> AIBacktestReplacementApproval: ...
+
+
     async def create_trace(self, record: AITraceCreate) -> UUID: ...
 
     async def finish_trace(
@@ -50,6 +107,17 @@ class AIBacktestRepository(Protocol):
     async def create_code_execution_run(self, record: CodeExecutionRunCreate) -> UUID: ...
 
     async def update_code_execution_run(self, execution_run_id: UUID, update: CodeExecutionRunUpdate) -> None: ...
+    async def record_code_execution_process_identity(
+        self,
+        execution_run_id: UUID,
+        *,
+        attempt_id: UUID,
+        worker_host: str,
+        worker_pid: int,
+        worker_pgid: int,
+        worker_started_at: datetime,
+        idempotency_request_id: UUID | None = None,
+    ) -> None: ...
 
     async def persist_backtest_result(self, payload: BacktestResultPayload) -> UUID: ...
 
@@ -65,7 +133,8 @@ class AIBacktestRepository(Protocol):
         message_id: UUID | None,
         code_id: UUID | None,
         bundle: ModelCallLogBundle,
-    ) -> UUID: ...
+        raw_audit_admission: RawAuditAdmission,
+    ) -> UUID | None: ...
 
     async def create_agent_execution_log(self, record: AgentExecutionLogCreate) -> UUID: ...
 
@@ -78,6 +147,723 @@ class SqlAIBacktestRepository:
     def __init__(self, engine: AsyncEngine):
         self.engine = engine
 
+    async def claim_idempotent_request(
+        self,
+        request: AICodeBacktestFlowRequest,
+        *,
+        trace: AITraceCreate,
+    ) -> AIBacktestRequestClaim:
+        context = request.execution_context
+        if (
+            context is None
+            or request.idempotency_key is None
+            or request.request_fingerprint is None
+            or request.fingerprint_version is None
+        ):
+            raise AppError(
+                status_code=401,
+                component="ai_backtest",
+                code="execution_context_required",
+                message="Authenticated execution context is required",
+            )
+
+        request_id = uuid4()
+        advisory_key = _scope_advisory_key(
+            context.scope_family_id,
+            request.fingerprint_version,
+            request.request_fingerprint,
+        )
+        try:
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    text("SELECT pg_advisory_xact_lock(CAST(:lock_key AS bigint))"),
+                    {"lock_key": advisory_key},
+                )
+                key_row = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT request_id, trace_id, state, safety_lease, state_version,
+                                   terminal_response_jsonb, payload_fingerprint, fingerprint_version
+                            FROM app.ai_backtest_request
+                            WHERE scope_family_id = :scope_family_id
+                              AND client_request_key = :client_request_key
+                            FOR UPDATE
+                            """
+                        ),
+                        {
+                            "scope_family_id": str(context.scope_family_id),
+                            "client_request_key": request.idempotency_key,
+                        },
+                    )
+                ).mappings().first()
+                if key_row is not None:
+                    if (
+                        key_row["payload_fingerprint"] != request.request_fingerprint
+                        or key_row["fingerprint_version"] != request.fingerprint_version
+                    ):
+                        raise AppError(
+                            status_code=409,
+                            component="ai_backtest",
+                            code="idempotency_key_reused",
+                            message="Idempotency key was reused with a different request",
+                            details={"request_id": str(key_row["request_id"])},
+                        )
+                    return _claim_from_row(key_row)
+
+                prior = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT request_id, trace_id, state, safety_lease, state_version,
+                                   terminal_response_jsonb
+                            FROM app.ai_backtest_request
+                            WHERE scope_family_id = :scope_family_id
+                              AND fingerprint_version = :fingerprint_version
+                              AND payload_fingerprint = :payload_fingerprint
+                            ORDER BY CASE WHEN safety_lease IN ('active', 'blocked_unknown') THEN 0 ELSE 1 END,
+                                     created_at DESC
+                            FOR UPDATE
+                            """
+                        ),
+                        {
+                            "scope_family_id": str(context.scope_family_id),
+                            "fingerprint_version": request.fingerprint_version,
+                            "payload_fingerprint": request.request_fingerprint,
+                        },
+                    )
+                ).mappings().first()
+                if prior is not None:
+                    if prior["safety_lease"] in {"active", "blocked_unknown"}:
+                        return _claim_from_row(prior)
+                    if request.replacement_approval_id is None or request.replacement_approval_token is None:
+                        raise AppError(
+                            status_code=409,
+                            component="ai_backtest",
+                            code="terminal_evidence_required",
+                            message="A replacement approval is required",
+                            details={"request_id": str(prior["request_id"])},
+                        )
+                    approval = (
+                        await conn.execute(
+                            text(
+                                """
+                                SELECT approval_id, source_request_id, scope_family_id, fingerprint_version,
+                                       payload_fingerprint, replacement_key_hash, status, expires_at
+                                FROM app.ai_backtest_replacement_approval
+                                WHERE approval_id = :approval_id
+                                FOR UPDATE
+                                """
+                            ),
+                            {"approval_id": str(request.replacement_approval_id)},
+                        )
+                    ).mappings().first()
+                    if (
+                        approval is None
+                        or str(approval["scope_family_id"]) != str(context.scope_family_id)
+                        or approval["fingerprint_version"] != request.fingerprint_version
+                        or approval["payload_fingerprint"] != request.request_fingerprint
+                        or approval["replacement_key_hash"]
+                        != _replacement_key_hash(request.replacement_approval_token.get_secret_value())
+                        or approval["status"] != "issued"
+                        or approval["expires_at"] <= _utcnow()
+                    ):
+                        raise AppError(
+                            status_code=409,
+                            component="ai_backtest",
+                            code="replacement_approval_invalid",
+                            message="Replacement approval is invalid",
+                        )
+                    source = (
+                        await conn.execute(
+                            text(
+                                """
+                                SELECT request_id
+                                FROM app.ai_backtest_request
+                                WHERE request_id = :source_request_id
+                                  AND scope_family_id = :scope_family_id
+                                  AND fingerprint_version = :fingerprint_version
+                                  AND payload_fingerprint = :payload_fingerprint
+                                  AND state IN ('succeeded', 'failed', 'abandoned')
+                                  AND safety_lease = 'closed'
+                                  AND terminal_evidence_jsonb IS NOT NULL
+                                FOR UPDATE
+                                """
+                            ),
+                            {
+                                "source_request_id": str(approval["source_request_id"]),
+                                "scope_family_id": str(context.scope_family_id),
+                                "fingerprint_version": request.fingerprint_version,
+                                "payload_fingerprint": request.request_fingerprint,
+                            },
+                        )
+                    ).mappings().first()
+                    if source is None:
+                        raise AppError(
+                            status_code=409,
+                            component="ai_backtest",
+                            code="terminal_evidence_required",
+                            message="Terminal evidence is required before replacement",
+                        )
+                    consumed = (
+                        await conn.execute(
+                            text(
+                                """
+                                UPDATE app.ai_backtest_replacement_approval
+                                SET status = 'consumed',
+                                    consumed_at = :consumed_at
+                                WHERE approval_id = :approval_id
+                                  AND status = 'issued'
+                                  AND expires_at > :consumed_at
+                                RETURNING approval_id
+                                """
+                            ),
+                            {
+                                "approval_id": str(request.replacement_approval_id),
+                                "consumed_at": _utcnow(),
+                            },
+                        )
+                    ).mappings().first()
+                    if consumed is None:
+                        raise AppError(
+                            status_code=409,
+                            component="ai_backtest",
+                            code="replacement_approval_invalid",
+                            message="Replacement approval is invalid",
+                        )
+                inserted = (
+                    await conn.execute(
+                        text(
+                            """
+                            INSERT INTO app.ai_backtest_request (
+                                request_id, scope_family_id, client_request_key,
+                                payload_fingerprint, fingerprint_version, session_hmac,
+                                session_hmac_version, state, safety_lease
+                            ) VALUES (
+                                :request_id, :scope_family_id, :client_request_key,
+                                :payload_fingerprint, :fingerprint_version, :session_hmac,
+                                :session_hmac_version, 'claimed', 'active'
+                            )
+                            ON CONFLICT DO NOTHING
+                            RETURNING request_id, trace_id, state, safety_lease, state_version,
+                                      terminal_response_jsonb
+                            """
+                        ),
+                        {
+                            "request_id": str(request_id),
+                            "scope_family_id": str(context.scope_family_id),
+                            "client_request_key": request.idempotency_key,
+                            "payload_fingerprint": request.request_fingerprint,
+                            "fingerprint_version": request.fingerprint_version,
+                            "session_hmac": context.session_hmac,
+                            "session_hmac_version": context.session_hmac_version,
+                        },
+                    )
+                ).mappings().first()
+                if inserted is not None:
+                    await conn.execute(
+                        text(
+                            """
+                            INSERT INTO app.ai_trace (
+                                trace_id, user_id, session_id, trace_kind, status,
+                                metadata_jsonb, started_at, ended_at
+                            ) VALUES (
+                                :trace_id, :user_id, :session_id, :trace_kind, :status,
+                                :metadata_jsonb::jsonb, :started_at, :ended_at
+                            )
+                            """
+                        ),
+                        {
+                            "trace_id": str(trace.trace_id),
+                            "user_id": trace.user_id,
+                            "session_id": str(trace.session_id) if trace.session_id else None,
+                            "trace_kind": trace.trace_kind,
+                            "status": trace.status,
+                            "metadata_jsonb": _json_dumps(trace.metadata_jsonb),
+                            "started_at": trace.started_at or _utcnow(),
+                            "ended_at": trace.ended_at,
+                        },
+                    )
+                    await conn.execute(
+                        text(
+                            """
+                            UPDATE app.ai_backtest_request
+                            SET trace_id = :trace_id
+                            WHERE request_id = :request_id
+                            """
+                        ),
+                        {"request_id": str(request_id), "trace_id": str(trace.trace_id)},
+                    )
+                    return AIBacktestRequestClaim(
+                        request_id=request_id,
+                        trace_id=trace.trace_id,
+                        state="claimed",
+                        safety_lease="active",
+                        state_version=1,
+                    )
+
+                existing = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT request_id, trace_id, state, safety_lease, state_version,
+                                   terminal_response_jsonb, payload_fingerprint, fingerprint_version
+                            FROM app.ai_backtest_request
+                            WHERE scope_family_id = :scope_family_id
+                              AND client_request_key = :client_request_key
+                            FOR UPDATE
+                            """
+                        ),
+                        {
+                            "scope_family_id": str(context.scope_family_id),
+                            "client_request_key": request.idempotency_key,
+                        },
+                    )
+                ).mappings().first()
+                if existing is not None:
+                    if (
+                        existing["payload_fingerprint"] != request.request_fingerprint
+                        or existing["fingerprint_version"] != request.fingerprint_version
+                    ):
+                        raise AppError(
+                            status_code=409,
+                            component="ai_backtest",
+                            code="idempotency_key_reused",
+                            message="Idempotency key was reused with a different request",
+                            details={"request_id": str(existing["request_id"])},
+                        )
+                    return _claim_from_row(existing)
+
+                equivalent = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT request_id, trace_id, state, safety_lease, state_version,
+                                   terminal_response_jsonb
+                            FROM app.ai_backtest_request
+                            WHERE scope_family_id = :scope_family_id
+                              AND fingerprint_version = :fingerprint_version
+                              AND payload_fingerprint = :payload_fingerprint
+                              AND safety_lease IN ('active', 'blocked_unknown')
+                            FOR UPDATE
+                            """
+                        ),
+                        {
+                            "scope_family_id": str(context.scope_family_id),
+                            "fingerprint_version": request.fingerprint_version,
+                            "payload_fingerprint": request.request_fingerprint,
+                        },
+                    )
+                ).mappings().first()
+                if equivalent is None:
+                    raise AppError(
+                        status_code=503,
+                        component="ai_backtest",
+                        code="idempotency_claim_inconsistent",
+                        message="Idempotency claim outcome was not found",
+                    )
+                return _claim_from_row(equivalent)
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise self._db_error(exc) from exc
+
+    async def transition_idempotent_request(
+        self,
+        request_id: UUID,
+        *,
+        expected_state: str,
+        next_state: str,
+        safety_lease: str | None = None,
+        execution_run_id: UUID | None = None,
+        terminal_response: Mapping[str, Any] | None = None,
+        terminal_evidence: Mapping[str, Any] | None = None,
+    ) -> AIBacktestRequestClaim:
+        terminal = next_state in {"succeeded", "failed", "abandoned"}
+        sql = """
+            UPDATE app.ai_backtest_request
+            SET state = :next_state,
+                safety_lease = COALESCE(:safety_lease, safety_lease),
+                execution_run_id = COALESCE(:execution_run_id, execution_run_id),
+                terminal_response_jsonb = COALESCE(:terminal_response::jsonb, terminal_response_jsonb),
+                terminal_evidence_jsonb = COALESCE(:terminal_evidence::jsonb, terminal_evidence_jsonb),
+                state_version = state_version + 1,
+                updated_at = :updated_at,
+                terminal_at = CASE WHEN :terminal THEN :updated_at ELSE terminal_at END
+            WHERE request_id = :request_id
+              AND state = :expected_state
+            RETURNING request_id, trace_id, state, safety_lease, state_version, terminal_response_jsonb
+        """
+        try:
+            async with self.engine.begin() as conn:
+                row = (
+                    await conn.execute(
+                        text(sql),
+                        {
+                            "request_id": str(request_id),
+                            "expected_state": expected_state,
+                            "next_state": next_state,
+                            "safety_lease": safety_lease,
+                            "execution_run_id": str(execution_run_id) if execution_run_id else None,
+                            "terminal_response": _json_dumps(terminal_response) if terminal_response is not None else None,
+                            "terminal_evidence": _json_dumps(terminal_evidence) if terminal_evidence is not None else None,
+                            "updated_at": _utcnow(),
+                            "terminal": terminal,
+                        },
+                    )
+                ).mappings().first()
+                if row is None:
+                    raise AppError(
+                        status_code=409,
+                        component="ai_backtest",
+                        code="duplicate_execution_active",
+                        message="Idempotency request state changed concurrently",
+                        details={"request_id": str(request_id)},
+                    )
+                return _claim_from_row(row)
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise self._db_error(exc) from exc
+    async def release_armed_execution_request(
+        self,
+        request_id: UUID,
+        *,
+        expected_state_version: int,
+        execution_run_id: UUID,
+        attempt_id: UUID,
+    ) -> AIBacktestRequestClaim:
+        sql = """
+            UPDATE app.ai_backtest_request AS request
+            SET state = 'execution_released',
+                state_version = state_version + 1,
+                updated_at = :updated_at
+            WHERE request.request_id = :request_id
+              AND request.state = 'execution_armed'
+              AND request.safety_lease = 'active'
+              AND request.state_version = :expected_state_version
+              AND request.execution_run_id = :execution_run_id
+              AND EXISTS (
+                  SELECT 1
+                  FROM app.code_execution_run AS execution
+                  WHERE execution.execution_run_id = request.execution_run_id
+                    AND execution.attempt_id = :attempt_id
+                    AND execution.worker_host IS NOT NULL
+                    AND execution.worker_pid IS NOT NULL
+                    AND execution.worker_pgid IS NOT NULL
+                    AND execution.worker_started_at IS NOT NULL
+              )
+            RETURNING request_id, trace_id, state, safety_lease, state_version, terminal_response_jsonb
+        """
+        try:
+            async with self.engine.begin() as conn:
+                row = (
+                    await conn.execute(
+                        text(sql),
+                        {
+                            "request_id": str(request_id),
+                            "expected_state_version": expected_state_version,
+                            "execution_run_id": str(execution_run_id),
+                            "attempt_id": str(attempt_id),
+                            "updated_at": _utcnow(),
+                        },
+                    )
+                ).mappings().first()
+                if row is None:
+                    raise AppError(
+                        status_code=409,
+                        component="ai_backtest",
+                        code="duplicate_execution_active",
+                        message="Execution release ownership changed concurrently",
+                        details={"request_id": str(request_id)},
+                    )
+                return _claim_from_row(row)
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise self._db_error(exc) from exc
+    async def operator_terminalize_idempotent_request(
+        self,
+        request_id: UUID,
+        *,
+        expected_state: str,
+        expected_state_version: int,
+        terminal_state: str,
+        terminal_evidence: Mapping[str, Any],
+    ) -> AIBacktestRequestClaim:
+        requires_execution_evidence = expected_state in {"execution_armed", "execution_released"}
+        evidence_execution_run_id = _evidence_uuid(terminal_evidence.get("execution_run_id"))
+        evidence_attempt_id = _evidence_uuid(terminal_evidence.get("attempt_id"))
+        release_state = terminal_evidence.get("release_state")
+        if (
+            terminal_state not in {"failed", "abandoned"}
+            or not terminal_evidence
+            or (
+                requires_execution_evidence
+                and (
+                    evidence_execution_run_id is None
+                    or evidence_attempt_id is None
+                    or release_state != expected_state
+                )
+            )
+        ):
+            raise AppError(
+                status_code=409,
+                component="ai_backtest",
+                code="terminal_evidence_required",
+                message="Process and release evidence is required",
+                details={"request_id": str(request_id)},
+            )
+        try:
+            async with self.engine.begin() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            """
+                            UPDATE app.ai_backtest_request
+                            SET state = :terminal_state,
+                                safety_lease = 'closed',
+                                terminal_evidence_jsonb = :terminal_evidence::jsonb,
+                                state_version = state_version + 1,
+                                updated_at = :updated_at,
+                                terminal_at = :updated_at
+                            WHERE request_id = :request_id
+                              AND state = :expected_state
+                              AND state_version = :expected_state_version
+                              AND safety_lease IN ('active', 'blocked_unknown')
+                              AND (
+                                  NOT :requires_execution_evidence
+                                  OR (
+                                      execution_run_id = :evidence_execution_run_id
+                                      AND :release_state = :expected_state
+                                      AND EXISTS (
+                                          SELECT 1
+                                          FROM app.code_execution_run AS execution
+                                          WHERE execution.execution_run_id = app.ai_backtest_request.execution_run_id
+                                            AND execution.attempt_id = :evidence_attempt_id
+                                            AND execution.worker_host IS NOT NULL
+                                            AND execution.worker_pid IS NOT NULL
+                                            AND execution.worker_pgid IS NOT NULL
+                                            AND execution.worker_started_at IS NOT NULL
+                                            AND (
+                                                app.ai_backtest_request.state <> 'execution_released'
+                                                OR (
+                                                    execution.status IN ('succeeded', 'failed', 'timeout')
+                                                    AND execution.ended_at IS NOT NULL
+                                                )
+                                            )
+                                      )
+                                  )
+                              )
+                            RETURNING request_id, trace_id, state, safety_lease, state_version,
+                                      terminal_response_jsonb
+                            """
+                        ),
+                        {
+                            "request_id": str(request_id),
+                            "expected_state": expected_state,
+                            "expected_state_version": expected_state_version,
+                            "terminal_state": terminal_state,
+                            "terminal_evidence": _json_dumps(terminal_evidence),
+                            "updated_at": _utcnow(),
+                            "requires_execution_evidence": requires_execution_evidence,
+                            "evidence_execution_run_id": str(evidence_execution_run_id)
+                            if evidence_execution_run_id is not None
+                            else None,
+                            "evidence_attempt_id": str(evidence_attempt_id)
+                            if evidence_attempt_id is not None
+                            else None,
+                            "release_state": release_state,
+                        },
+                    )
+                ).mappings().first()
+                if row is None:
+                    raise AppError(
+                        status_code=409,
+                        component="ai_backtest",
+                        code="duplicate_execution_active",
+                        message="Idempotency request state changed concurrently",
+                        details={"request_id": str(request_id)},
+                    )
+                return _claim_from_row(row)
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise self._db_error(exc) from exc
+    async def operator_record_terminal_evidence(
+        self,
+        request_id: UUID,
+        *,
+        expected_state: str,
+        expected_state_version: int,
+        terminal_evidence: Mapping[str, Any],
+    ) -> AIBacktestRequestClaim:
+        if not terminal_evidence:
+            raise AppError(
+                status_code=409,
+                component="ai_backtest",
+                code="terminal_evidence_required",
+                message="Terminal evidence is required",
+                details={"request_id": str(request_id)},
+            )
+        try:
+            async with self.engine.begin() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            """
+                            UPDATE app.ai_backtest_request
+                            SET terminal_evidence_jsonb = :terminal_evidence::jsonb,
+                                state_version = state_version + 1,
+                                updated_at = :updated_at
+                            WHERE request_id = :request_id
+                              AND state = :expected_state
+                              AND state_version = :expected_state_version
+                              AND state IN ('succeeded', 'failed', 'abandoned')
+                              AND safety_lease = 'closed'
+                              AND terminal_evidence_jsonb IS NULL
+                            RETURNING request_id, trace_id, state, safety_lease, state_version,
+                                      terminal_response_jsonb
+                            """
+                        ),
+                        {
+                            "request_id": str(request_id),
+                            "expected_state": expected_state,
+                            "expected_state_version": expected_state_version,
+                            "terminal_evidence": _json_dumps(terminal_evidence),
+                            "updated_at": _utcnow(),
+                        },
+                    )
+                ).mappings().first()
+                if row is None:
+                    raise AppError(
+                        status_code=409,
+                        component="ai_backtest",
+                        code="terminal_evidence_required",
+                        message="Terminal evidence state changed concurrently",
+                        details={"request_id": str(request_id)},
+                    )
+                return _claim_from_row(row)
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise self._db_error(exc) from exc
+
+    async def operator_issue_replacement_approval(
+        self,
+        source_request_id: UUID,
+        *,
+        expires_at: datetime,
+    ) -> AIBacktestReplacementApproval:
+        now = _utcnow()
+        if expires_at.tzinfo is None or expires_at <= now:
+            raise AppError(
+                status_code=409,
+                component="ai_backtest",
+                code="replacement_approval_invalid",
+                message="Replacement approval expiry must be in the future",
+            )
+        approval_id = uuid4()
+        approval_token = token_urlsafe(32)
+        try:
+            async with self.engine.begin() as conn:
+                source = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT request_id, scope_family_id, fingerprint_version, payload_fingerprint,
+                                   state, safety_lease, terminal_evidence_jsonb
+                            FROM app.ai_backtest_request
+                            WHERE request_id = :source_request_id
+                            FOR UPDATE
+                            """
+                        ),
+                        {"source_request_id": str(source_request_id)},
+                    )
+                ).mappings().first()
+                if (
+                    source is None
+                    or source["state"] not in {"succeeded", "failed", "abandoned"}
+                    or source["safety_lease"] != "closed"
+                    or source["terminal_evidence_jsonb"] is None
+                ):
+                    raise AppError(
+                        status_code=409,
+                        component="ai_backtest",
+                        code="terminal_evidence_required",
+                        message="Terminal evidence is required before replacement approval",
+                        details={"request_id": str(source_request_id)},
+                    )
+                await conn.execute(
+                    text(
+                        """
+                        UPDATE app.ai_backtest_replacement_approval
+                        SET status = 'expired'
+                        WHERE source_request_id = :source_request_id
+                          AND status = 'issued'
+                          AND expires_at <= :now
+                        """
+                    ),
+                    {"source_request_id": str(source_request_id), "now": now},
+                )
+                live_approval = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT approval_id
+                            FROM app.ai_backtest_replacement_approval
+                            WHERE source_request_id = :source_request_id
+                              AND status = 'issued'
+                              AND expires_at > :now
+                            FOR UPDATE
+                            """
+                        ),
+                        {"source_request_id": str(source_request_id), "now": now},
+                    )
+                ).mappings().first()
+                if live_approval is not None:
+                    raise AppError(
+                        status_code=409,
+                        component="ai_backtest",
+                        code="replacement_approval_already_issued",
+                        message="A live replacement approval already exists",
+                        details={"request_id": str(source_request_id)},
+                    )
+                await conn.execute(
+                    text(
+                        """
+                        INSERT INTO app.ai_backtest_replacement_approval (
+                            approval_id, source_request_id, scope_family_id, fingerprint_version,
+                            payload_fingerprint, replacement_key_hash, expires_at
+                        ) VALUES (
+                            :approval_id, :source_request_id, :scope_family_id, :fingerprint_version,
+                            :payload_fingerprint, :replacement_key_hash, :expires_at
+                        )
+                        """
+                    ),
+                    {
+                        "approval_id": str(approval_id),
+                        "source_request_id": str(source_request_id),
+                        "scope_family_id": str(source["scope_family_id"]),
+                        "fingerprint_version": source["fingerprint_version"],
+                        "payload_fingerprint": source["payload_fingerprint"],
+                        "replacement_key_hash": _replacement_key_hash(approval_token),
+                        "expires_at": expires_at,
+                    },
+                )
+                return AIBacktestReplacementApproval(
+                    approval_id=approval_id,
+                    source_request_id=source_request_id,
+                    scope_family_id=UUID(str(source["scope_family_id"])),
+                    fingerprint_version=source["fingerprint_version"],
+                    payload_fingerprint=source["payload_fingerprint"],
+                    approval_token=approval_token,
+                    expires_at=expires_at,
+                )
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise self._db_error(exc) from exc
     async def create_trace(self, record: AITraceCreate) -> UUID:
         await self._execute(
             """
@@ -286,6 +1072,67 @@ class SqlAIBacktestRepository:
             },
         )
 
+    async def record_code_execution_process_identity(
+        self,
+        execution_run_id: UUID,
+        *,
+        attempt_id: UUID,
+        worker_host: str,
+        worker_pid: int,
+        worker_pgid: int,
+        worker_started_at: datetime,
+        idempotency_request_id: UUID | None = None,
+    ) -> None:
+        try:
+            async with self.engine.begin() as conn:
+                sql = """
+                    UPDATE app.code_execution_run
+                    SET attempt_id = :attempt_id,
+                        worker_host = :worker_host,
+                        worker_pid = :worker_pid,
+                        worker_pgid = :worker_pgid,
+                        worker_started_at = :worker_started_at
+                    WHERE execution_run_id = :execution_run_id
+                """
+                params: dict[str, object] = {
+                    "execution_run_id": str(execution_run_id),
+                    "attempt_id": str(attempt_id),
+                    "worker_host": worker_host,
+                    "worker_pid": worker_pid,
+                    "worker_pgid": worker_pgid,
+                    "worker_started_at": worker_started_at,
+                }
+                if idempotency_request_id is not None:
+                    sql += """
+                        AND EXISTS (
+                            SELECT 1
+                            FROM app.ai_backtest_request AS request
+                            WHERE request.request_id = :request_id
+                              AND request.execution_run_id = :execution_run_id
+                              AND request.state = 'execution_armed'
+                              AND request.safety_lease = 'active'
+                        )
+                    """
+                    params["request_id"] = str(idempotency_request_id)
+                result = await conn.execute(text(sql), params)
+                if result.rowcount != 1:
+                    raise AppError(
+                        status_code=409 if idempotency_request_id is not None else 503,
+                        component="ai_backtest" if idempotency_request_id is not None else "db",
+                        code="duplicate_execution_active" if idempotency_request_id is not None else "execution_run_not_found",
+                        message=(
+                            "Execution request state changed before ownership persistence"
+                            if idempotency_request_id is not None
+                            else "Execution ownership could not be persisted"
+                        ),
+                        details={"request_id": str(idempotency_request_id)}
+                        if idempotency_request_id is not None
+                        else None,
+                    )
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise self._db_error(exc) from exc
     async def persist_backtest_result(self, payload: BacktestResultPayload) -> UUID:
         async with self.engine.begin() as conn:
             try:
@@ -551,7 +1398,10 @@ class SqlAIBacktestRepository:
         message_id: UUID | None,
         code_id: UUID | None,
         bundle: ModelCallLogBundle,
-    ) -> UUID:
+        raw_audit_admission: RawAuditAdmission,
+    ) -> UUID | None:
+        if not verify_raw_audit_admission(raw_audit_admission):
+            return None
         call_id = uuid4()
         try:
             async with self.engine.begin() as conn:
@@ -748,6 +1598,32 @@ class SqlAIBacktestRepository:
         )
 
 
+def _scope_advisory_key(scope_family_id: UUID, fingerprint_version: str, fingerprint: str) -> int:
+    digest = hashlib.sha256(
+        f"{scope_family_id}\x00{fingerprint_version}\x00{fingerprint}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+def _replacement_key_hash(approval_token: str) -> str:
+    return hashlib.sha256(approval_token.encode("utf-8")).hexdigest()
+
+
+
+def _claim_from_row(row: Mapping[str, Any]) -> AIBacktestRequestClaim:
+    terminal_response = row.get("terminal_response_jsonb")
+    if isinstance(terminal_response, str):
+        try:
+            terminal_response = json.loads(terminal_response)
+        except json.JSONDecodeError:
+            terminal_response = None
+    return AIBacktestRequestClaim(
+        request_id=UUID(str(row["request_id"])),
+        trace_id=UUID(str(row["trace_id"])) if row.get("trace_id") else None,
+        state=str(row["state"]),
+        safety_lease=str(row["safety_lease"]),
+        state_version=int(row["state_version"]),
+        terminal_response=terminal_response if isinstance(terminal_response, dict) else None,
+    )
+
 def _summary_params(summary) -> dict[str, Any]:
     payload = summary.model_dump(mode="python")
     payload["excluded_tickers_jsonb"] = _json_dumps(payload["excluded_tickers_jsonb"])
@@ -761,6 +1637,12 @@ def _metric_detail_params(detail) -> dict[str, Any]:
     payload = detail.model_dump(mode="python")
     return {key: _json_dumps(value) for key, value in payload.items()}
 
+
+def _evidence_uuid(value: object) -> UUID | None:
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=_json_default)

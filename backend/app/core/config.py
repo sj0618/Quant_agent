@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import re
 from typing import Any
 from urllib.parse import urlsplit
@@ -69,6 +70,24 @@ class Settings(BaseSettings):
     auth_state_ttl_seconds: int = Field(default=600, alias="AUTH_STATE_TTL_SECONDS", ge=60, le=3600)
     auth_session_ttl_seconds: int = Field(default=60 * 60 * 8, alias="AUTH_SESSION_TTL_SECONDS", ge=300)
     auth_csrf_ttl_seconds: int = Field(default=3600, alias="AUTH_CSRF_TTL_SECONDS", ge=300)
+    ai_backtest_scope_hmac_primary: SecretStr | None = Field(
+        default=None,
+        alias="AI_BACKTEST_SCOPE_HMAC_PRIMARY",
+    )
+    ai_backtest_scope_hmac_primary_version: str | None = Field(
+        default=None,
+        alias="AI_BACKTEST_SCOPE_HMAC_PRIMARY_VERSION",
+        min_length=1,
+    )
+    ai_backtest_scope_hmac_previous: SecretStr | None = Field(
+        default=None,
+        alias="AI_BACKTEST_SCOPE_HMAC_PREVIOUS",
+    )
+    ai_backtest_scope_hmac_previous_version: str | None = Field(
+        default=None,
+        alias="AI_BACKTEST_SCOPE_HMAC_PREVIOUS_VERSION",
+        min_length=1,
+    )
     auth_csrf_required: bool = Field(default=False, alias="AUTH_CSRF_REQUIRED")
 
     pdf_temp_ingest_enabled: bool = Field(default=False, alias="PDF_TEMP_INGEST_ENABLED")
@@ -87,6 +106,34 @@ class Settings(BaseSettings):
     pdf_temp_url_max_redirects: int = Field(default=3, alias="PDF_TEMP_URL_MAX_REDIRECTS", ge=0, le=10)
     pdf_temp_min_text_chars: int = Field(default=20, alias="PDF_TEMP_MIN_TEXT_CHARS", ge=0)
     pdf_temp_max_seed_batch_size: int = Field(default=3, alias="PDF_TEMP_MAX_SEED_BATCH_SIZE", ge=1, le=10)
+    ai_backtest_raw_audit_admission_hmac_secret: SecretStr | None = Field(
+        default=None,
+        alias="AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET",
+    )
+    ai_backtest_raw_audit_admission_hmac_key_version: str | None = Field(
+        default=None,
+        alias="AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_KEY_VERSION",
+        min_length=1,
+    )
+    ai_backtest_raw_audit_admission_token: SecretStr | None = Field(
+        default=None,
+        alias="AI_BACKTEST_RAW_AUDIT_ADMISSION_TOKEN",
+    )
+    ai_backtest_raw_audit_admission_audience: str | None = Field(
+        default=None,
+        alias="AI_BACKTEST_RAW_AUDIT_ADMISSION_AUDIENCE",
+        min_length=1,
+    )
+    ai_backtest_raw_audit_evidence_id: str | None = Field(
+        default=None,
+        alias="AI_BACKTEST_RAW_AUDIT_EVIDENCE_ID",
+        min_length=1,
+    )
+    ai_backtest_raw_audit_deployment_revision: str | None = Field(
+        default=None,
+        alias="AI_BACKTEST_RAW_AUDIT_DEPLOYMENT_REVISION",
+        min_length=1,
+    )
 
     hankyung_consensus_crawler_enabled: bool = Field(default=False, alias="HANKYUNG_CONSENSUS_CRAWLER_ENABLED")
     hankyung_consensus_api_base_url: str = Field(
@@ -128,8 +175,12 @@ class Settings(BaseSettings):
         "database_url",
         "redis_url",
         "google_client_secret",
+        "ai_backtest_scope_hmac_primary",
+        "ai_backtest_scope_hmac_previous",
         "hankyung_consensus_api_bearer_token",
         "hankyung_consensus_auth_header",
+        "ai_backtest_raw_audit_admission_hmac_secret",
+        "ai_backtest_raw_audit_admission_token",
         mode="before",
     )
     @classmethod
@@ -154,6 +205,22 @@ class Settings(BaseSettings):
         if raw and any(marker in lowered for marker in _PLACEHOLDER_MARKERS):
             raise ValueError("placeholder values are not valid runtime config")
         return raw or None
+
+
+    @field_validator(
+        "ai_backtest_raw_audit_admission_hmac_key_version",
+        "ai_backtest_raw_audit_admission_audience",
+        "ai_backtest_raw_audit_evidence_id",
+        "ai_backtest_raw_audit_deployment_revision",
+        mode="before",
+    )
+    @classmethod
+    def normalize_raw_audit_admission_strings(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        return raw or None
+
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -237,6 +304,34 @@ class Settings(BaseSettings):
             missing.append("GOOGLE_CLIENT_SECRET")
         if not self.google_redirect_uri:
             missing.append("GOOGLE_REDIRECT_URI")
+        if self.ai_backtest_scope_hmac_primary is None:
+            missing.append("AI_BACKTEST_SCOPE_HMAC_PRIMARY")
+        if not self.ai_backtest_scope_hmac_primary_version:
+            missing.append("AI_BACKTEST_SCOPE_HMAC_PRIMARY_VERSION")
+        previous_present = self.ai_backtest_scope_hmac_previous is not None
+        previous_version_present = bool(self.ai_backtest_scope_hmac_previous_version)
+        if previous_present != previous_version_present:
+            missing.append(
+                "AI_BACKTEST_SCOPE_HMAC_PREVIOUS and AI_BACKTEST_SCOPE_HMAC_PREVIOUS_VERSION must be set together"
+            )
+        raw_audit_values = {
+            "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET": self.ai_backtest_raw_audit_admission_hmac_secret,
+            "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_KEY_VERSION": self.ai_backtest_raw_audit_admission_hmac_key_version,
+            "AI_BACKTEST_RAW_AUDIT_ADMISSION_TOKEN": self.ai_backtest_raw_audit_admission_token,
+            "AI_BACKTEST_RAW_AUDIT_ADMISSION_AUDIENCE": self.ai_backtest_raw_audit_admission_audience,
+            "AI_BACKTEST_RAW_AUDIT_EVIDENCE_ID": self.ai_backtest_raw_audit_evidence_id,
+            "AI_BACKTEST_RAW_AUDIT_DEPLOYMENT_REVISION": self.ai_backtest_raw_audit_deployment_revision,
+        }
+        missing.extend(name for name, value in raw_audit_values.items() if value is None)
+        if (
+            self.google_client_secret is not None
+            and self.ai_backtest_raw_audit_admission_hmac_secret is not None
+            and hmac.compare_digest(
+                self.google_client_secret_value or "",
+                self.ai_backtest_raw_audit_admission_hmac_secret.get_secret_value(),
+            )
+        ):
+            missing.append("AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET must not reuse GOOGLE_CLIENT_SECRET")
         if missing:
             raise ValueError(f"auth-enabled runtime requires {', '.join(missing)}")
 

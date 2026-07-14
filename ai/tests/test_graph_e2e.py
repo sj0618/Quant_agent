@@ -4,6 +4,7 @@ from uuid import UUID
 import pytest
 
 from ai_graph.audit import RecordingAuditSink
+from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.graph import DEBUG_STORE, NODE_SEQUENCE, run_analysis
 from ai_graph.jobs import InMemoryAnalysisJobStore
 
@@ -36,7 +37,7 @@ def test_ready_analysis_connects_trace_nodes_model_calls_and_full_prompts() -> N
     envelope = run_analysis(
         "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어",
         trace_id="trace-logging-ready",
-        audit_sink=sink,
+        audit_sink=_create_test_audit_sink(sink),
     )
 
     assert envelope.status == "ready"
@@ -76,7 +77,11 @@ def test_ready_analysis_connects_trace_nodes_model_calls_and_full_prompts() -> N
 def test_clarification_route_logs_only_nodes_that_really_execute() -> None:
     sink = RecordingAuditSink()
 
-    envelope = run_analysis("저평가주 사줘", trace_id="trace-logging-clarify", audit_sink=sink)
+    envelope = run_analysis(
+        "저평가주 사줘",
+        trace_id="trace-logging-clarify",
+        audit_sink=_create_test_audit_sink(sink),
+    )
 
     assert envelope.status == "need_clarification"
     assert [record.agent_name for record in sink.sessions[0].agent_executions] == [
@@ -209,7 +214,7 @@ def test_run_analysis_records_audit_events_when_sink_provided() -> None:
     envelope = run_analysis(
         "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어",
         trace_id="trace-audit-ready",
-        audit_sink=sink,
+        audit_sink=_create_test_audit_sink(sink),
     )
 
     assert envelope.status == "ready"
@@ -234,7 +239,7 @@ def test_run_analysis_records_error_audit_events_when_validation_fails() -> None
     sink = RecordingAuditSink()
 
     with pytest.raises(ValueError, match="user_query must not be empty"):
-        run_analysis("   ", audit_sink=sink)
+        run_analysis("   ", audit_sink=_create_test_audit_sink(sink))
 
     assert len(sink.sessions) == 1
     session = sink.sessions[0]
@@ -266,7 +271,7 @@ def test_work_agent_failure_stops_downstream_and_keeps_one_correlated_error(monk
         run_analysis(
             "RSI가 30 이하로 떨어진 종목을 사고 70 이상이면 팔아줘",
             trace_id="trace-work-agent-failure",
-            audit_sink=sink,
+            audit_sink=_create_test_audit_sink(sink),
         )
 
     session = sink.sessions[0]

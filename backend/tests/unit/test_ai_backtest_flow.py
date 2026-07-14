@@ -8,11 +8,14 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from app.core.config import Settings
 from app.core.errors import AppError
 from app.schemas.ai_backtest import (
     AIBacktestReportCreate,
     AIBacktestReportDraft,
     AICodeBacktestFlowRequest,
+    AIBacktestExecutionContext,
+    AIBacktestRequestClaim,
     AIErrorLogCreate,
     AIStrategyParseCreate,
     AITraceCreate,
@@ -26,8 +29,17 @@ from app.schemas.ai_backtest import (
     ModelCallLogBundle,
     PromptLogBundle,
 )
-from app.services.ai_backtest_flow import AICodeBacktestService, ai_backtest_audit_failure_count
-from app.services.ai_backtest_runtime import CodeGenerationFailure
+from app.services.ai_backtest_flow import (
+    AICodeBacktestService,
+    ai_backtest_audit_failure_count,
+    build_request_fingerprint,
+)
+from app.services.ai_backtest_runtime import CodeGenerationFailure, SubprocessProcessIdentity
+from app.services.raw_audit_admission import (
+    RawAuditAdmission,
+    issue_test_raw_audit_admission,
+    verify_raw_audit_admission,
+)
 
 
 @dataclass(slots=True)
@@ -46,6 +58,83 @@ class FakeRepository:
     agent_log_updates: list[Any] = field(default_factory=list)
     error_logs: list[AIErrorLogCreate] = field(default_factory=list)
     finished_traces: list[dict[str, Any]] = field(default_factory=list)
+    idempotent_claims: dict[UUID, AIBacktestRequestClaim] = field(default_factory=dict)
+
+    async def claim_idempotent_request(self, request, *, trace):
+        existing = next(
+            (
+                claim
+                for claim in self.idempotent_claims.values()
+                if claim.trace_id != trace.trace_id
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        claim = AIBacktestRequestClaim(
+            request_id=uuid4(),
+            trace_id=trace.trace_id,
+            state="claimed",
+            safety_lease="active",
+            state_version=1,
+        )
+        self.idempotent_claims[claim.request_id] = claim
+        self.traces.append(trace)
+        return claim
+
+    async def transition_idempotent_request(
+        self,
+        request_id,
+        *,
+        expected_state,
+        next_state,
+        safety_lease=None,
+        execution_run_id=None,
+        terminal_response=None,
+        terminal_evidence=None,
+    ):
+        claim = self.idempotent_claims[request_id]
+        if claim.state != expected_state:
+            raise AppError(
+                status_code=409,
+                component="test",
+                code="duplicate_execution_active",
+                message="state changed",
+            )
+        updated = claim.model_copy(
+            update={
+                "state": next_state,
+                "safety_lease": safety_lease or claim.safety_lease,
+                "state_version": claim.state_version + 1,
+                "terminal_response": terminal_response or claim.terminal_response,
+            }
+        )
+        self.idempotent_claims[request_id] = updated
+        return updated
+    async def release_armed_execution_request(
+        self,
+        request_id,
+        *,
+        expected_state_version,
+        execution_run_id,
+        attempt_id,
+    ):
+        claim = self.idempotent_claims[request_id]
+        if claim.state != "execution_armed" or claim.state_version != expected_state_version:
+            raise AppError(
+                status_code=409,
+                component="test",
+                code="duplicate_execution_active",
+                message="release ownership changed",
+            )
+        updated = claim.model_copy(
+            update={
+                "state": "execution_released",
+                "state_version": claim.state_version + 1,
+            }
+        )
+        self.idempotent_claims[request_id] = updated
+        return updated
 
     async def create_trace(self, record: AITraceCreate):
         self.traces.append(record)
@@ -75,6 +164,8 @@ class FakeRepository:
 
     async def update_code_execution_run(self, execution_run_id, update):
         self.execution_updates.append((execution_run_id, update))
+    async def record_code_execution_process_identity(self, execution_run_id, **kwargs):
+        return None
 
     async def persist_backtest_result(self, payload: BacktestResultPayload):
         self.backtest_results.append(payload)
@@ -84,9 +175,34 @@ class FakeRepository:
         self.reports.append(record)
         return record.report_id
 
-    async def create_model_call_log(self, **kwargs):
+    async def create_model_call_log(
+        self,
+        *,
+        trace_id: UUID | None,
+        execution_id: UUID | None,
+        user_id: int | None,
+        session_id: UUID | None,
+        message_id: UUID | None,
+        code_id: UUID | None,
+        bundle: ModelCallLogBundle,
+        raw_audit_admission: RawAuditAdmission | None,
+    ) -> UUID | None:
+        if not verify_raw_audit_admission(raw_audit_admission):
+            return None
         call_id = uuid4()
-        self.model_calls.append({**kwargs, "call_id": call_id})
+        self.model_calls.append(
+            {
+                "trace_id": trace_id,
+                "execution_id": execution_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "message_id": message_id,
+                "code_id": code_id,
+                "bundle": bundle,
+                "raw_audit_admission": raw_audit_admission,
+                "call_id": call_id,
+            }
+        )
         return call_id
 
     async def create_agent_execution_log(self, record):
@@ -100,6 +216,34 @@ class FakeRepository:
         self.error_logs.append(record)
         return record.error_id
 
+
+def make_raw_audit_admission() -> RawAuditAdmission:
+    admission = issue_test_raw_audit_admission(Settings.model_construct(app_env="test"))
+    assert admission is not None
+    return admission
+
+
+def make_flow_request(**values: object) -> AICodeBacktestFlowRequest:
+    user_id = int(values.pop("user_id", 1))
+    context = AIBacktestExecutionContext(
+        user_id=user_id,
+        scope_family_id=uuid4(),
+        session_hmac="a" * 64,
+        session_hmac_version="test-v1",
+    )
+    values.setdefault("natural_language_prompt", "테스트 전략을 실행해줘")
+    values.setdefault("target_runtime", "python-sandbox")
+    values.setdefault("code_purpose", "backtest")
+    provisional = AICodeBacktestFlowRequest(
+        user_id=user_id,
+        execution_context=context,
+        idempotency_key=f"test-{uuid4().hex}",
+        request_fingerprint="0" * 64,
+        fingerprint_version="ai-backtest-intent-v1",
+        **values,
+    )
+    version, fingerprint = build_request_fingerprint(provisional)
+    return provisional.model_copy(update={"fingerprint_version": version, "request_fingerprint": fingerprint})
 
 class FakeGenerator:
     def __init__(self):
@@ -180,7 +324,7 @@ class InvalidModelOutputAndFallbackGenerator:
 
 
 class TraceLoggingFailureRepository(FakeRepository):
-    async def create_trace(self, record: AITraceCreate):
+    async def claim_idempotent_request(self, request, *, trace):
         raise RuntimeError("private database detail")
 
 
@@ -245,9 +389,22 @@ class FakeExecutor:
         *,
         trace_id: UUID,
         execution_run_id: UUID,
+        process_identity_recorder=None,
+        release_authorizer=None,
     ) -> CodeExecutionResult:
         self.called = True
         now = datetime.now(UTC)
+        identity = SubprocessProcessIdentity(
+            attempt_id=uuid4(),
+            worker_host="worker-a",
+            worker_pid=123,
+            worker_pgid=123,
+            worker_started_at=now,
+        )
+        assert process_identity_recorder is not None
+        assert release_authorizer is not None
+        await process_identity_recorder(identity)
+        await release_authorizer(identity)
         run_id = uuid4()
         payload = BacktestResultPayload(
             run=BacktestRunCreate(
@@ -299,8 +456,21 @@ class FailedExecutionExecutor:
         *,
         trace_id: UUID,
         execution_run_id: UUID,
+        process_identity_recorder=None,
+        release_authorizer=None,
     ) -> CodeExecutionResult:
         now = datetime.now(UTC)
+        identity = SubprocessProcessIdentity(
+            attempt_id=uuid4(),
+            worker_host="worker-a",
+            worker_pid=123,
+            worker_pgid=123,
+            worker_started_at=now,
+        )
+        assert process_identity_recorder is not None
+        assert release_authorizer is not None
+        await process_identity_recorder(identity)
+        await release_authorizer(identity)
         return CodeExecutionResult(
             runtime_env=generated.target_runtime,
             status="failed",
@@ -316,6 +486,69 @@ class FailedExecutionExecutor:
             backtest_result=None,
         )
 
+
+class TerminalizingReleaseRepository(FakeRepository):
+    async def release_armed_execution_request(self, request_id, **kwargs):
+        claim = self.idempotent_claims[request_id]
+        self.idempotent_claims[request_id] = claim.model_copy(
+            update={
+                "state": "abandoned",
+                "safety_lease": "closed",
+                "state_version": claim.state_version + 1,
+            }
+        )
+        return await super().release_armed_execution_request(request_id, **kwargs)
+
+
+class ReleaseRaceExecutor:
+    def __init__(self):
+        self.release_byte_written = False
+
+    async def execute(
+        self,
+        request,
+        generated,
+        *,
+        trace_id,
+        execution_run_id,
+        process_identity_recorder=None,
+        release_authorizer=None,
+    ):
+        assert process_identity_recorder is not None
+        assert release_authorizer is not None
+        identity = SubprocessProcessIdentity(
+            attempt_id=uuid4(),
+            worker_host="worker-a",
+            worker_pid=123,
+            worker_pgid=123,
+            worker_started_at=datetime.now(UTC),
+        )
+        await process_identity_recorder(identity)
+        await release_authorizer(identity)
+        self.release_byte_written = True
+        raise AssertionError("release fence should reject the terminalized owner")
+
+
+def test_release_fence_blocks_terminalized_owner_before_subprocess_release():
+    repository = TerminalizingReleaseRepository()
+    executor = ReleaseRaceExecutor()
+    service = AICodeBacktestService(
+        repository,
+        FakeGenerator(),
+        SafeValidator(),
+        executor,
+        FakeReporter(),
+        raw_audit_admission=make_raw_audit_admission(),
+    )
+
+    with pytest.raises(AppError, match="release ownership changed") as exc_info:
+        asyncio.run(service.run_generated_backtest(make_flow_request()))
+
+    assert exc_info.value.code == "duplicate_execution_active"
+    assert executor.release_byte_written is False
+    claim = next(iter(repository.idempotent_claims.values()))
+    assert claim.state == "abandoned"
+    assert claim.safety_lease == "closed"
 
 class FakeReporter:
     def __init__(self):
@@ -354,9 +587,16 @@ def test_ai_backtest_flow_persists_generated_code_validation_execution_and_repor
     validator = SafeValidator()
     executor = FakeExecutor()
     reporter = FakeReporter()
-    service = AICodeBacktestService(repository, generator, validator, executor, reporter)
+    service = AICodeBacktestService(
+        repository,
+        generator,
+        validator,
+        executor,
+        reporter,
+        raw_audit_admission=make_raw_audit_admission(),
+    )
 
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         user_id=7,
         natural_language_prompt="RSI 반등 전략을 코드로 생성해서 백테스트해줘",
         parsed_strategy_jsonb={"strategy_id": "rsi_rebound", "entry": "rsi <= 30"},
@@ -410,6 +650,28 @@ def test_ai_backtest_flow_persists_generated_code_validation_execution_and_repor
     assert request.natural_language_prompt[:10] not in repository.reports[0].summary
 
 
+def test_ai_backtest_flow_denies_raw_model_logging_without_admission() -> None:
+    repository = FakeRepository()
+    service = AICodeBacktestService(
+        repository,
+        FakeGenerator(),
+        SafeValidator(),
+        FakeExecutor(),
+        FakeReporter(),
+    )
+    request = make_flow_request(
+        natural_language_prompt="admission 없이도 백테스트 결과는 반환한다",
+        parsed_strategy_jsonb={"strategy_id": "no_raw_audit"},
+        strategy_id="no_raw_audit",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    result = asyncio.run(service.run_generated_backtest(request))
+
+    assert result.execution_status == "succeeded"
+    assert repository.model_calls == []
+
 def test_model_failure_logs_call_error_and_allows_successful_fallback() -> None:
     repository = FakeRepository()
     service = AICodeBacktestService(
@@ -418,8 +680,9 @@ def test_model_failure_logs_call_error_and_allows_successful_fallback() -> None:
         SafeValidator(),
         FakeExecutor(),
         FakeReporter(),
+        raw_audit_admission=make_raw_audit_admission(),
     )
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         user_id=11,
         natural_language_prompt="모델 실패 뒤 안전한 fallback을 실행해줘",
         parsed_strategy_jsonb={"strategy_id": "fallback_demo"},
@@ -452,7 +715,7 @@ def test_generation_failure_records_safe_reason_and_stops_downstream() -> None:
     executor = FakeExecutor()
     reporter = FakeReporter()
     service = AICodeBacktestService(repository, FailedGenerator(), SafeValidator(), executor, reporter)
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         natural_language_prompt="생성 단계 실패를 기록해줘",
         parsed_strategy_jsonb={"strategy_id": "generation_failure"},
         strategy_id="generation_failure",
@@ -483,8 +746,9 @@ def test_invalid_model_output_and_fallback_failure_persists_correlated_errors() 
         SafeValidator(),
         FakeExecutor(),
         FakeReporter(),
+        raw_audit_admission=make_raw_audit_admission(),
     )
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         natural_language_prompt="모델과 fallback이 모두 실패하는 요청",
         parsed_strategy_jsonb={"strategy_id": "double_failure"},
         strategy_id="double_failure",
@@ -523,7 +787,7 @@ def test_step_app_error_includes_safe_error_code_without_private_details() -> No
         FakeExecutor(),
         FakeReporter(),
     )
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         natural_language_prompt="생성 결과 저장 실패를 기록해줘",
         parsed_strategy_jsonb={"strategy_id": "generation_persistence_failure"},
         strategy_id="generation_persistence_failure",
@@ -555,7 +819,7 @@ def test_business_persistence_failure_fails_current_agent_and_trace() -> None:
         FakeExecutor(),
         reporter,
     )
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         natural_language_prompt="결과 저장 실패를 기록해줘",
         parsed_strategy_jsonb={"strategy_id": "persistence_failure"},
         strategy_id="persistence_failure",
@@ -584,13 +848,13 @@ def test_business_persistence_failure_fails_current_agent_and_trace() -> None:
     assert repository.finished_traces[-1]["status"] == "failed"
 
 
-def test_trace_logging_failure_is_fail_open_and_stops_further_audit_writes(capsys) -> None:
+def test_trace_bootstrap_failure_is_fail_closed(capsys) -> None:
     repository = TraceLoggingFailureRepository()
     generator = FakeGenerator()
     executor = FakeExecutor()
     reporter = FakeReporter()
     service = AICodeBacktestService(repository, generator, SafeValidator(), executor, reporter)
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         natural_language_prompt="로깅 DB가 실패해도 백테스트해줘",
         parsed_strategy_jsonb={"strategy_id": "audit_failure_demo"},
         strategy_id="audit_failure_demo",
@@ -599,13 +863,16 @@ def test_trace_logging_failure_is_fail_open_and_stops_further_audit_writes(capsy
     )
     before = ai_backtest_audit_failure_count()
 
-    result = asyncio.run(service.run_generated_backtest(request))
+    with pytest.raises(AppError) as raised:
+        asyncio.run(service.run_generated_backtest(request))
 
-    assert result.execution_status == "succeeded"
-    assert generator.called and executor.called and reporter.called
-    assert repository.strategy_parses[0].trace_id is None
-    assert repository.code_generations[0].trace_id is None
-    assert repository.backtest_results[0].run.trace_id is None
+    assert raised.value.status_code == 503
+    assert raised.value.code == "service_unavailable"
+    assert not generator.called and not executor.called and not reporter.called
+    assert repository.traces == []
+    assert repository.strategy_parses == []
+    assert repository.code_generations == []
+    assert repository.backtest_results == []
     assert repository.agent_logs == []
     assert repository.model_calls == []
     assert repository.error_logs == []
@@ -616,7 +883,7 @@ def test_trace_logging_failure_is_fail_open_and_stops_further_audit_writes(capsy
     assert "private database detail" not in stderr
 
 
-def test_trace_logging_failure_stays_fail_open_when_stderr_is_unavailable(monkeypatch) -> None:
+def test_trace_bootstrap_failure_stays_sanitized_when_stderr_is_unavailable(monkeypatch) -> None:
     class BrokenStderr:
         def write(self, value):
             raise OSError("stderr unavailable")
@@ -632,7 +899,7 @@ def test_trace_logging_failure_stays_fail_open_when_stderr_is_unavailable(monkey
         FakeExecutor(),
         FakeReporter(),
     )
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         natural_language_prompt="stderr도 실패해도 계속 실행해줘",
         parsed_strategy_jsonb={"strategy_id": "stderr_failure_demo"},
         strategy_id="stderr_failure_demo",
@@ -640,9 +907,11 @@ def test_trace_logging_failure_stays_fail_open_when_stderr_is_unavailable(monkey
         code_purpose="backtest",
     )
 
-    result = asyncio.run(service.run_generated_backtest(request))
+    with pytest.raises(AppError) as raised:
+        asyncio.run(service.run_generated_backtest(request))
 
-    assert result.execution_status == "succeeded"
+    assert raised.value.status_code == 503
+    assert raised.value.code == "service_unavailable"
 
 
 def test_ai_backtest_flow_records_sanitized_execution_failure_payloads():
@@ -652,7 +921,7 @@ def test_ai_backtest_flow_records_sanitized_execution_failure_payloads():
     executor = FailedExecutionExecutor()
     service = AICodeBacktestService(repository, generator, validator, executor, FakeReporter())
 
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         user_id=9,
         natural_language_prompt="실패하는 전략도 실행해줘",
         parsed_strategy_jsonb={"strategy_id": "failed_execution_demo"},
@@ -692,7 +961,7 @@ def test_ai_backtest_flow_rejects_unsafe_code_before_execution():
     executor = FakeExecutor()
     service = AICodeBacktestService(repository, generator, UnsafeValidator(), executor, FakeReporter())
 
-    request = AICodeBacktestFlowRequest(
+    request = make_flow_request(
         user_id=8,
         natural_language_prompt="위험한 import가 들어간 전략도 생성해줘",
         parsed_strategy_jsonb={"strategy_id": "unsafe_demo"},

@@ -4,13 +4,16 @@ import ast
 import hashlib
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.core.errors import AppError
 from app.schemas.ai_backtest import (
@@ -213,6 +216,52 @@ class ASTCodeValidator:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SubprocessProcessIdentity:
+    attempt_id: UUID
+    worker_host: str
+    worker_pid: int
+    worker_pgid: int
+    worker_started_at: datetime
+
+
+ProcessIdentityRecorder = Callable[[SubprocessProcessIdentity], Awaitable[None]]
+ReleaseAuthorizer = Callable[[SubprocessProcessIdentity], Awaitable[None]]
+
+
+def _failed_execution_result(
+    *,
+    request: AICodeBacktestFlowRequest,
+    generated: GeneratedCodeResult,
+    execution_run_id: UUID,
+    started_at: datetime,
+    stderr: str,
+) -> CodeExecutionResult:
+    ended_at = datetime.now(UTC)
+    return CodeExecutionResult(
+        runtime_env=generated.target_runtime,
+        status="failed",
+        timeout_seconds=request.timeout_seconds,
+        memory_limit_mb=request.memory_limit_mb,
+        sandbox_id=f"subprocess:{execution_run_id}",
+        latency_ms=round((ended_at - started_at).total_seconds() * 1000, 6),
+        stdout="",
+        stderr=stderr,
+        output_artifacts_jsonb=None,
+        started_at=started_at,
+        ended_at=ended_at,
+        backtest_result=None,
+    )
+
+
+async def _withhold_release_and_wait(process: subprocess.Popen[str]) -> None:
+    try:
+        process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+
+
 class SandboxedBacktestExecutor:
     async def execute(
         self,
@@ -221,7 +270,11 @@ class SandboxedBacktestExecutor:
         *,
         trace_id: UUID,
         execution_run_id: UUID,
+        process_identity_recorder: ProcessIdentityRecorder | None = None,
+        release_authorizer: ReleaseAuthorizer | None = None,
     ) -> CodeExecutionResult:
+        from app.services.ai_backtest_subprocess_runner import _RELEASE_BYTE
+
         runner_module = "app.services.ai_backtest_subprocess_runner"
         repo_root = Path(__file__).resolve().parents[3]
         env = os.environ.copy()
@@ -235,6 +288,7 @@ class SandboxedBacktestExecutor:
             output_path = temp_path / "result.json"
             request_path.write_text(request.model_dump_json(indent=2), encoding="utf-8")
             generated_path.write_text(generated.generated_code, encoding="utf-8")
+            release_read_fd, release_write_fd = os.pipe()
             command = [
                 sys.executable,
                 "-m",
@@ -243,18 +297,100 @@ class SandboxedBacktestExecutor:
                 str(generated_path),
                 str(output_path),
                 str(trace_id),
+                str(release_read_fd),
             ]
             try:
-                completed = subprocess.run(
+                process = subprocess.Popen(
                     command,
                     cwd=temp_dir,
                     env=env,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=request.timeout_seconds,
+                    start_new_session=True,
+                    pass_fds=(release_read_fd,),
                     preexec_fn=_limit_subprocess_resources(request.memory_limit_mb, request.timeout_seconds),
                 )
+            except Exception:
+                os.close(release_write_fd)
+                raise
+            finally:
+                os.close(release_read_fd)
+
+            if process_identity_recorder is None:
+                os.close(release_write_fd)
+                await _withhold_release_and_wait(process)
+                return _failed_execution_result(
+                    request=request,
+                    generated=generated,
+                    execution_run_id=execution_run_id,
+                    started_at=started_at,
+                    stderr="subprocess ownership persistence was not configured; execution was not released",
+                )
+
+            try:
+                identity = SubprocessProcessIdentity(
+                    attempt_id=uuid4(),
+                    worker_host=socket.gethostname(),
+                    worker_pid=process.pid,
+                    worker_pgid=os.getpgid(process.pid),
+                    worker_started_at=started_at,
+                )
+                await process_identity_recorder(identity)
+            except Exception:  # noqa: BLE001 - child must never run without durable ownership
+                os.close(release_write_fd)
+                await _withhold_release_and_wait(process)
+                return _failed_execution_result(
+                    request=request,
+                    generated=generated,
+                    execution_run_id=execution_run_id,
+                    started_at=started_at,
+                    stderr="subprocess ownership persistence failed; execution was not released",
+                )
+            if release_authorizer is None:
+                os.close(release_write_fd)
+                await _withhold_release_and_wait(process)
+                return _failed_execution_result(
+                    request=request,
+                    generated=generated,
+                    execution_run_id=execution_run_id,
+                    started_at=started_at,
+                    stderr="subprocess release authorization was not configured; execution was not released",
+                )
+            try:
+                await release_authorizer(identity)
+            except Exception:  # noqa: BLE001 - child must never run without a durable release fence
+                os.close(release_write_fd)
+                await _withhold_release_and_wait(process)
+                return _failed_execution_result(
+                    request=request,
+                    generated=generated,
+                    execution_run_id=execution_run_id,
+                    started_at=started_at,
+                    stderr="subprocess release authorization failed; execution was not released",
+                )
+
+            try:
+                release_written = os.write(release_write_fd, _RELEASE_BYTE)
+            except OSError:
+                release_written = 0
+            finally:
+                os.close(release_write_fd)
+            if release_written != len(_RELEASE_BYTE):
+                await _withhold_release_and_wait(process)
+                return _failed_execution_result(
+                    request=request,
+                    generated=generated,
+                    execution_run_id=execution_run_id,
+                    started_at=started_at,
+                    stderr="subprocess release failed; execution was not released",
+                )
+
+            try:
+                stdout, stderr = process.communicate(timeout=request.timeout_seconds)
             except subprocess.TimeoutExpired as exc:
+                process.kill()
+                stdout, stderr = process.communicate()
                 ended_at = datetime.now(UTC)
                 return CodeExecutionResult(
                     runtime_env=generated.target_runtime,
@@ -263,17 +399,17 @@ class SandboxedBacktestExecutor:
                     memory_limit_mb=request.memory_limit_mb,
                     sandbox_id=f"subprocess:{execution_run_id}",
                     latency_ms=round((ended_at - started_at).total_seconds() * 1000, 6),
-                    stdout=exc.stdout,
-                    stderr=(exc.stderr or "") + "\nexecution timed out",
+                    stdout=stdout or exc.stdout or "",
+                    stderr=(stderr or exc.stderr or "") + "\nexecution timed out",
                     output_artifacts_jsonb=None,
                     started_at=started_at,
                     ended_at=ended_at,
                     backtest_result=None,
                 )
             ended_at = datetime.now(UTC)
-            stdout = completed.stdout or ""
-            stderr = completed.stderr or ""
-            if completed.returncode != 0:
+            stdout = stdout or ""
+            stderr = stderr or ""
+            if process.returncode != 0:
                 return CodeExecutionResult(
                     runtime_env=generated.target_runtime,
                     status="failed",
@@ -282,7 +418,7 @@ class SandboxedBacktestExecutor:
                     sandbox_id=f"subprocess:{execution_run_id}",
                     latency_ms=round((ended_at - started_at).total_seconds() * 1000, 6),
                     stdout=stdout,
-                    stderr=stderr or f"subprocess exited with code {completed.returncode}",
+                    stderr=stderr or f"subprocess exited with code {process.returncode}",
                     output_artifacts_jsonb=None,
                     started_at=started_at,
                     ended_at=ended_at,

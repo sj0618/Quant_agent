@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
 import json
+import math
 import os
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -13,6 +19,8 @@ import psycopg
 from ai_graph.audit import (
     AuditCorrelation,
     AuditEvent,
+    AuditSession,
+    AuditSink,
     ErrorAuditEvent,
     FinalizationAuditEvent,
     FinalizationStatus,
@@ -27,18 +35,88 @@ from ai_graph.data_sources.db import resolve_database_dsn_from_env
 AI_AUDIT_SINK_ENV = "AI_AUDIT_SINK"
 AI_AUDIT_CONNECT_TIMEOUT_SECONDS_ENV = "AI_AUDIT_CONNECT_TIMEOUT_SECONDS"
 AI_AUDIT_STATEMENT_TIMEOUT_MS_ENV = "AI_AUDIT_STATEMENT_TIMEOUT_MS"
+AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET_ENV = "AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET"
+AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION_ENV = "AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION"
+AI_AUDIT_GATE_B_ADMISSION_TOKEN_ENV = "AI_AUDIT_GATE_B_ADMISSION_TOKEN"
+AI_AUDIT_GATE_B_ADMISSION_AUDIENCE_ENV = "AI_AUDIT_GATE_B_ADMISSION_AUDIENCE"
+AI_AUDIT_GATE_B_EVIDENCE_ID_ENV = "AI_AUDIT_GATE_B_EVIDENCE_ID"
+AI_AUDIT_GATE_B_DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
 DEFAULT_AUDIT_CONNECT_TIMEOUT_SECONDS = 2
 DEFAULT_AUDIT_STATEMENT_TIMEOUT_MS = 2_000
+_AUDIT_WRITER_CAPABILITY = object()
+_AUDIT_TEST_SINK_CAPABILITY = object()
+_RAW_AUDIT_ADMISSION_ISSUER = object()
 
 
-@dataclass(slots=True)
-class PostgresAuditSink:
-    dsn: str = field(repr=False)
-    connect_timeout_seconds: int = DEFAULT_AUDIT_CONNECT_TIMEOUT_SECONDS
-    statement_timeout_ms: int = DEFAULT_AUDIT_STATEMENT_TIMEOUT_MS
-    connector: Callable[..., Any] = psycopg.connect
+class _RawAuditAdmission:
+    __slots__ = ("_expires_at", "_issuer_token")
 
-    def open_session(self, correlation: AuditCorrelation) -> PostgresAuditSession | NoOpAuditSession:
+    def __init__(self) -> None:
+        raise TypeError("raw audit admission is issued only after signed Gate B verification")
+
+    def authorizes_writer(self) -> bool:
+        expires_at = getattr(self, "_expires_at", None)
+        return (
+            getattr(self, "_issuer_token", None) is _RAW_AUDIT_ADMISSION_ISSUER
+            and _valid_timestamp(expires_at)
+            and expires_at > time.time()
+        )
+
+
+class _TestAuditSink:
+    __slots__ = ("_sink", "_capability")
+
+    def __init__(self, sink: AuditSink, *, _capability: object) -> None:
+        if _capability is not _AUDIT_TEST_SINK_CAPABILITY:
+            raise PermissionError("test audit sinks must be issued by the test sink factory")
+        self._sink = sink
+        self._capability = _capability
+
+    def authorizes_ingress(self) -> bool:
+        return self._capability is _AUDIT_TEST_SINK_CAPABILITY
+
+    def open_session(self, correlation: AuditCorrelation) -> AuditSession:
+        return self._sink.open_session(correlation)
+
+
+class AuthorizedAuditSink:
+    """Persistent audit sink issued only after Gate B admission verification."""
+
+    __slots__ = ("_writer",)
+
+    def __init__(self, writer: "_PostgresAuditWriter", *, _capability: object) -> None:
+        if _capability is not _AUDIT_WRITER_CAPABILITY:
+            raise PermissionError("persistent audit sinks must be issued by the audit resolver")
+        self._writer = writer
+
+    def open_session(self, correlation: AuditCorrelation) -> AuditSession:
+        return self._writer.open_session(correlation)
+
+
+class _PostgresAuditWriter:
+    __slots__ = ("dsn", "admission", "connect_timeout_seconds", "statement_timeout_ms", "connector")
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        admission: _RawAuditAdmission,
+        connect_timeout_seconds: int = DEFAULT_AUDIT_CONNECT_TIMEOUT_SECONDS,
+        statement_timeout_ms: int = DEFAULT_AUDIT_STATEMENT_TIMEOUT_MS,
+        connector: Callable[..., Any] = psycopg.connect,
+    ) -> None:
+        if not isinstance(admission, _RawAuditAdmission) or not admission.authorizes_writer():
+            raise PermissionError("raw audit writer requires a verified Gate B admission")
+        self.dsn = dsn
+        self.admission = admission
+        self.connect_timeout_seconds = connect_timeout_seconds
+        self.statement_timeout_ms = statement_timeout_ms
+        self.connector = connector
+
+    def open_session(self, correlation: AuditCorrelation) -> "_PostgresAuditSession | NoOpAuditSession":
+        if not self.admission.authorizes_writer():
+            report_audit_failure("gate_b_admission_denied")
+            return NoOpAuditSession(correlation)
         conn: Any | None = None
         try:
             conn = self.connector(
@@ -70,17 +148,39 @@ class PostgresAuditSink:
             _close(conn)
             report_audit_failure("open_session")
             return NoOpAuditSession(correlation)
-        return PostgresAuditSession(correlation=correlation, connection=conn)
+        return _PostgresAuditSession(
+            correlation=correlation,
+            connection=conn,
+            _capability=_AUDIT_WRITER_CAPABILITY,
+        )
 
 
-@dataclass(slots=True)
-class PostgresAuditSession:
+@dataclass(slots=True, init=False)
+class _PostgresAuditSession:
     correlation: AuditCorrelation
     connection: Any = field(repr=False)
     _broken: bool = False
     _closed: bool = False
     _failure_reported: bool = False
     _model_execution_ids: dict[UUID, UUID | None] = field(default_factory=dict)
+    _capability: object = field(default=None, repr=False)
+
+    def __init__(
+        self,
+        correlation: AuditCorrelation,
+        connection: Any,
+        *,
+        _capability: object,
+    ) -> None:
+        if _capability is not _AUDIT_WRITER_CAPABILITY:
+            raise PermissionError("raw audit sessions must be opened by an authorized sink")
+        self.correlation = correlation
+        self.connection = connection
+        self._broken = False
+        self._closed = False
+        self._failure_reported = False
+        self._capability = _capability
+        self._model_execution_ids = {}
 
     @property
     def buffered_events(self) -> tuple[AuditEvent, ...]:
@@ -431,7 +531,7 @@ class PostgresAuditSession:
 
 def create_audit_sink_from_env(
     environ: Mapping[str, str] | None = None,
-) -> PostgresAuditSink | NoOpAuditSink:
+) -> AuthorizedAuditSink | NoOpAuditSink:
     env = os.environ if environ is None else environ
     selector = env.get(AI_AUDIT_SINK_ENV, "noop").strip().lower()
     if selector in {"", "noop"}:
@@ -439,12 +539,16 @@ def create_audit_sink_from_env(
     if selector != "postgres":
         report_audit_failure("invalid_sink_selector")
         return NoOpAuditSink()
+    admission = _admission_from_env(env)
+    if admission is None:
+        return NoOpAuditSink()
     dsn, _ = resolve_database_dsn_from_env(env)
     if not dsn:
         report_audit_failure("missing_database_dsn")
         return NoOpAuditSink()
-    return PostgresAuditSink(
-        dsn=dsn,
+    return _authorized_sink(
+        dsn,
+        admission=admission,
         connect_timeout_seconds=_positive_int(
             env.get(AI_AUDIT_CONNECT_TIMEOUT_SECONDS_ENV),
             DEFAULT_AUDIT_CONNECT_TIMEOUT_SECONDS,
@@ -454,6 +558,135 @@ def create_audit_sink_from_env(
             DEFAULT_AUDIT_STATEMENT_TIMEOUT_MS,
         ),
     )
+
+
+def resolve_audit_sink(
+    candidate: AuditSink | None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> AuditSink:
+    """Normalize every audit ingress to an authorized, no-op, or private test sink."""
+    if candidate is None:
+        return create_audit_sink_from_env(environ)
+    if isinstance(candidate, (AuthorizedAuditSink, NoOpAuditSink)):
+        return candidate
+    if isinstance(candidate, _TestAuditSink) and candidate.authorizes_ingress():
+        return candidate
+    report_audit_failure("unapproved_audit_sink")
+    return NoOpAuditSink()
+
+def is_authorized_audit_session(candidate: object) -> bool:
+    return not isinstance(candidate, _PostgresAuditSession) or getattr(candidate, "_capability", None) is _AUDIT_WRITER_CAPABILITY
+
+
+
+def _create_test_audit_sink(sink: AuditSink) -> AuditSink:
+    """Wrap a test double for explicit, non-production audit ingress."""
+    return _TestAuditSink(sink, _capability=_AUDIT_TEST_SINK_CAPABILITY)
+
+
+def _admission_from_env(env: Mapping[str, str]) -> _RawAuditAdmission | None:
+    secret = _required_text(env.get(AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET_ENV))
+    token = _required_text(env.get(AI_AUDIT_GATE_B_ADMISSION_TOKEN_ENV))
+    key_version = _required_text(env.get(AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION_ENV))
+    evidence_id = _required_text(env.get(AI_AUDIT_GATE_B_EVIDENCE_ID_ENV))
+    deployment_revision = _required_text(env.get(AI_AUDIT_GATE_B_DEPLOYMENT_REVISION_ENV))
+    audience = _required_text(env.get(AI_AUDIT_GATE_B_ADMISSION_AUDIENCE_ENV))
+    if not all((secret, token, key_version, evidence_id, deployment_revision, audience)):
+        report_audit_failure("gate_b_admission_denied")
+        return None
+    parsed = _parse_signed_admission(token, secret)
+    if parsed is None:
+        report_audit_failure("gate_b_admission_denied")
+        return None
+    header, claims = parsed
+    if (
+        header.get("alg") != "HS256"
+        or header.get("key_version") != key_version
+        or claims.get("key_version") != key_version
+        or claims.get("evidence_id") != evidence_id
+        or claims.get("deployment_revision") != deployment_revision
+        or claims.get("audience") != audience
+    ):
+        report_audit_failure("gate_b_admission_denied")
+        return None
+    issued_at = claims.get("issued_at")
+    expires_at = claims.get("expiry")
+    now = time.time()
+    if (
+        not _valid_timestamp(issued_at)
+        or not _valid_timestamp(expires_at)
+        or issued_at > now
+        or expires_at <= now
+        or expires_at <= issued_at
+    ):
+        report_audit_failure("gate_b_admission_denied")
+        return None
+    return _new_raw_audit_admission(expires_at)
+
+def _new_raw_audit_admission(expires_at: float) -> _RawAuditAdmission:
+    admission = object.__new__(_RawAuditAdmission)
+    admission._issuer_token = _RAW_AUDIT_ADMISSION_ISSUER
+    admission._expires_at = expires_at
+    return admission
+
+
+def _parse_signed_admission(token: str, secret: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    encoded_header, encoded_claims, encoded_signature = parts
+    try:
+        header = _decode_json_segment(encoded_header)
+        claims = _decode_json_segment(encoded_claims)
+        signature = _decode_segment(encoded_signature)
+    except (ValueError, binascii.Error, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    signing_input = f"{encoded_header}.{encoded_claims}".encode("ascii")
+    expected_signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    if not hmac.compare_digest(signature, expected_signature):
+        return None
+    return header, claims
+
+
+def _decode_json_segment(value: str) -> dict[str, Any]:
+    parsed = json.loads(_decode_segment(value).decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError("token segment must be an object")
+    return parsed
+
+
+def _decode_segment(value: str) -> bytes:
+    if not value or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for character in value):
+        raise ValueError("invalid base64url token segment")
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _required_text(value: object) -> str | None:
+    normalized = value.strip() if isinstance(value, str) else ""
+    return normalized or None
+
+
+def _valid_timestamp(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _authorized_sink(
+    dsn: str,
+    *,
+    admission: _RawAuditAdmission,
+    connector: Callable[..., Any] = psycopg.connect,
+    connect_timeout_seconds: int = DEFAULT_AUDIT_CONNECT_TIMEOUT_SECONDS,
+    statement_timeout_ms: int = DEFAULT_AUDIT_STATEMENT_TIMEOUT_MS,
+) -> AuthorizedAuditSink:
+    writer = _PostgresAuditWriter(
+        dsn,
+        admission=admission,
+        connector=connector,
+        connect_timeout_seconds=connect_timeout_seconds,
+        statement_timeout_ms=statement_timeout_ms,
+    )
+    return AuthorizedAuditSink(writer, _capability=_AUDIT_WRITER_CAPABILITY)
 
 
 def _correlation_metadata(correlation: AuditCorrelation) -> dict[str, str]:
@@ -516,9 +749,15 @@ def _utcnow() -> datetime:
 
 __all__ = [
     "AI_AUDIT_CONNECT_TIMEOUT_SECONDS_ENV",
+    "AI_AUDIT_GATE_B_ADMISSION_AUDIENCE_ENV",
+    "AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION_ENV",
+    "AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET_ENV",
+    "AI_AUDIT_GATE_B_ADMISSION_TOKEN_ENV",
+    "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION_ENV",
+    "AI_AUDIT_GATE_B_EVIDENCE_ID_ENV",
     "AI_AUDIT_SINK_ENV",
     "AI_AUDIT_STATEMENT_TIMEOUT_MS_ENV",
-    "PostgresAuditSession",
-    "PostgresAuditSink",
+    "AuthorizedAuditSink",
     "create_audit_sink_from_env",
+    "resolve_audit_sink",
 ]

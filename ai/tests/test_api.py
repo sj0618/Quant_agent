@@ -17,6 +17,7 @@ from ai_graph.api import (
     create_app,
 )
 from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
+from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import InMemoryAnalysisJobStore
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, Stage, UserPayload
 
@@ -181,7 +182,7 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
 def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adapters() -> None:
     store = InMemoryAnalysisJobStore()
     sink = RecordingAuditSink()
-    client = TestClient(create_app(store, audit_sink=sink))
+    client = TestClient(create_app(store, audit_sink=_create_test_audit_sink(sink)))
 
     create_response = client.post(
         SPEC_STRATEGY_PARSE_PATH,
@@ -251,7 +252,7 @@ def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:
 
 def test_strategy_descriptions_route_records_per_item_audit_steps() -> None:
     sink = RecordingAuditSink()
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     response = client.post(
         STRATEGY_DESCRIPTIONS_PATH,
@@ -309,7 +310,7 @@ def test_strategy_descriptions_route_records_sanitized_error_audit_events(monkey
         raise RuntimeError("description generation exploded with raw request details")
 
     monkeypatch.setattr("ai_graph.api.generate_strategy_description", failing_generate_strategy_description)
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     with pytest.raises(RuntimeError, match="description generation exploded with raw request details"):
         client.post(
@@ -343,7 +344,7 @@ def test_strategy_descriptions_route_records_sanitized_error_audit_events(monkey
     assert session.buffered_events[-1].status == "failed"
 def test_daily_digest_route_records_success_audit_steps() -> None:
     sink = RecordingAuditSink()
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     response = client.post(
         DAILY_DIGEST_PATH,
@@ -418,7 +419,7 @@ def test_daily_digest_route_records_sanitized_error_audit_events(monkeypatch) ->
         raise ValueError("daily digest exploded with raw request details")
 
     monkeypatch.setattr("ai_graph.api.build_daily_digest", failing_build_daily_digest)
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     response = client.post(
         DAILY_DIGEST_PATH,
@@ -485,7 +486,7 @@ def test_analysis_job_route_uses_injected_store_and_preserves_polling_contract()
 
 def test_analysis_job_route_records_audit_events_with_real_runner() -> None:
     sink = RecordingAuditSink()
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     response = client.post(
         ANALYSIS_JOBS_PATH,
@@ -524,7 +525,7 @@ def test_analysis_audit_session_opens_only_after_job_runner_entry(monkeypatch) -
         raise RuntimeError("job store failed before runner")
 
     monkeypatch.setattr("ai_graph.api.run_job_sync", fail_before_runner)
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     with pytest.raises(RuntimeError, match="job store failed before runner"):
         client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI strategy"})
@@ -534,6 +535,7 @@ def test_analysis_audit_session_opens_only_after_job_runner_entry(monkeypatch) -
 
 def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys) -> None:
     class FailingOpenAuditSink:
+
         def open_session(self, correlation):
             raise RuntimeError("postgresql://user:secret@db must not leak")
 
@@ -547,7 +549,7 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
         )
 
     normal = client(NoOpAuditSink())
-    broken = client(FailingOpenAuditSink())
+    broken = client(_create_test_audit_sink(FailingOpenAuditSink()))
 
     def stable_job_payload(response):
         body = response.json()
@@ -618,7 +620,7 @@ def test_parse_strategy_route_records_failure_audit_events_with_request_metadata
         create_app(
             InMemoryAnalysisJobStore(),
             analysis_runner=failing_runner,
-            audit_sink=sink,
+            audit_sink=_create_test_audit_sink(sink),
         )
     )
 

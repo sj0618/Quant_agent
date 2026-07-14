@@ -8,8 +8,6 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from app.core.config import ConfigurationError, redact_secrets
-
-
 class AppError(RuntimeError):
     def __init__(
         self,
@@ -77,5 +75,15 @@ def register_exception_handlers(app: FastAPI) -> None:
             code="payload_validation_failed",
             message="Payload validation failed",
             details=exc.errors(include_url=False),
+        )
+        return JSONResponse(status_code=app_error.status_code, content=app_error.payload())
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(_: Request, __: Exception) -> JSONResponse:
+        app_error = AppError(
+            status_code=500,
+            component="api",
+            code="internal_error",
+            message="Internal server error",
         )
         return JSONResponse(status_code=app_error.status_code, content=app_error.payload())

@@ -16,6 +16,7 @@ from ai_graph.audit import (
     create_audit_correlation,
     report_audit_failure,
 )
+from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_sink
 from ai_graph.data_sources import load_pipeline_data_from_env
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
@@ -142,6 +143,10 @@ def run_analysis(
 ) -> APIEnvelope:
     query = _normalize_user_query(user_query)
     resolved_trace_id = trace_id or (_trace_id(query) if query else None)
+    if audit_session is not None and not is_authorized_audit_session(audit_session):
+        report_audit_failure("unapproved_audit_session")
+        audit_session = None
+        audit_sink = NoOpAuditSink()
     session = audit_session or _open_audit_session(
         audit_sink,
         trace_id=resolved_trace_id,
@@ -335,7 +340,7 @@ def _open_audit_session(
         user_id=user_id,
         session_id=session_id,
     )
-    sink = audit_sink or NoOpAuditSink()
+    sink = resolve_audit_sink(audit_sink)
     try:
         return sink.open_session(correlation)
     except Exception:

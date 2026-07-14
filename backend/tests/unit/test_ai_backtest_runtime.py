@@ -71,12 +71,102 @@ def test_sandboxed_backtest_executor_enforces_timeout():
         generated_code="def build_signals(prices):\n    while True:\n        pass\n",
     )
 
-    result = asyncio.run(executor.execute(request, generated, trace_id=uuid4(), execution_run_id=uuid4()))
+    persisted_identity = []
+
+    async def persist_identity(identity):
+        persisted_identity.append(identity)
+
+    async def authorize_release(_identity):
+        return None
+    result = asyncio.run(
+        executor.execute(
+            request,
+            generated,
+            trace_id=uuid4(),
+            execution_run_id=uuid4(),
+            process_identity_recorder=persist_identity,
+            release_authorizer=authorize_release,
+        )
+    )
 
     assert result.status == "timeout"
     assert result.timeout_seconds == 1
     assert result.memory_limit_mb == 128
     assert result.backtest_result is None
+    assert len(persisted_identity) == 1
+    assert persisted_identity[0].worker_pid > 0
+    assert persisted_identity[0].worker_pgid > 0
+
+
+def test_sandboxed_backtest_executor_withholds_release_when_identity_persistence_fails():
+    executor = SandboxedBacktestExecutor()
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="ownership persistence failure",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+        timeout_seconds=5,
+        memory_limit_mb=128,
+    )
+    generated = GeneratedCodeResult(
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+        generated_code="def build_signals(prices):\n    return []\n",
+    )
+
+    async def reject_identity(_identity):
+        raise RuntimeError("database commit failed")
+
+    result = asyncio.run(
+        executor.execute(
+            request,
+            generated,
+            trace_id=uuid4(),
+            execution_run_id=uuid4(),
+            process_identity_recorder=reject_identity,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.backtest_result is None
+    assert result.stdout == ""
+    assert result.stderr == "subprocess ownership persistence failed; execution was not released"
+
+def test_sandboxed_backtest_executor_withholds_release_when_release_cas_fails():
+    executor = SandboxedBacktestExecutor()
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="release CAS failure",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+        timeout_seconds=5,
+        memory_limit_mb=128,
+    )
+    generated = GeneratedCodeResult(
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+        generated_code="def build_signals(prices):\n    return []\n",
+    )
+
+    async def persist_identity(_identity):
+        return None
+
+    async def reject_release(_identity):
+        raise RuntimeError("state version changed")
+
+    result = asyncio.run(
+        executor.execute(
+            request,
+            generated,
+            trace_id=uuid4(),
+            execution_run_id=uuid4(),
+            process_identity_recorder=persist_identity,
+            release_authorizer=reject_release,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.backtest_result is None
+    assert result.stdout == ""
+    assert result.stderr == "subprocess release authorization failed; execution was not released"
 
 def test_aoai_code_generator_captures_full_model_call(monkeypatch):
     monkeypatch.setenv("AI_LLM_PROVIDER", "mock")

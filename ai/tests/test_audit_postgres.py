@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-import json
+import base64
+import hashlib
+import hmac
 import importlib.util
+import json
 import os
+import time
 from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -19,11 +23,79 @@ from ai_graph.audit import (
     create_audit_correlation,
 )
 from ai_graph.audit_postgres import (
-    PostgresAuditSession,
-    PostgresAuditSink,
+    AuthorizedAuditSink,
+    _authorized_sink,
+    _create_test_audit_sink,
+    _new_raw_audit_admission,
     create_audit_sink_from_env,
 )
+from ai_graph.api import create_app
 from ai_graph.graph import run_analysis
+
+_AUDIT_ADMISSION_SECRET = "test-ai-audit-admission-secret"
+_AUDIT_ADMISSION_KEY_VERSION = "test-v1"
+_AUDIT_ADMISSION_AUDIENCE = "quantagent.ai.audit"
+_AUDIT_ADMISSION_EVIDENCE_ID = "gate-b-evidence-001"
+_AUDIT_ADMISSION_REVISION = "revision-9"
+
+def _create_test_persistent_sink(
+    dsn: str,
+    *,
+    connector=psycopg.connect,
+    connect_timeout_seconds: int = 2,
+    statement_timeout_ms: int = 2_000,
+) -> AuthorizedAuditSink:
+    return _authorized_sink(
+        dsn,
+        admission=_new_raw_audit_admission(time.time() + 300),
+        connector=connector,
+        connect_timeout_seconds=connect_timeout_seconds,
+        statement_timeout_ms=statement_timeout_ms,
+    )
+
+def _base64url_json(value: dict[str, object]) -> str:
+    encoded = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
+
+
+def _signed_admission_token(claim_overrides: dict[str, object] | None = None) -> str:
+    claims: dict[str, object] = {
+        "audience": _AUDIT_ADMISSION_AUDIENCE,
+        "deployment_revision": _AUDIT_ADMISSION_REVISION,
+        "evidence_id": _AUDIT_ADMISSION_EVIDENCE_ID,
+        "expiry": time.time() + 300,
+        "issued_at": time.time() - 1,
+        "key_version": _AUDIT_ADMISSION_KEY_VERSION,
+    }
+    if claim_overrides:
+        claims.update(claim_overrides)
+    header = {"alg": "HS256", "key_version": _AUDIT_ADMISSION_KEY_VERSION}
+    signing_input = f"{_base64url_json(header)}.{_base64url_json(claims)}"
+    signature = hmac.new(
+        _AUDIT_ADMISSION_SECRET.encode("utf-8"),
+        signing_input.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    return f"{signing_input}.{encoded_signature}"
+
+
+def _audit_sink_env(
+    *,
+    token: str | None = None,
+    audience: str = _AUDIT_ADMISSION_AUDIENCE,
+    revision: str = _AUDIT_ADMISSION_REVISION,
+) -> dict[str, str]:
+    return {
+        "AI_AUDIT_SINK": "postgres",
+        "AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET": _AUDIT_ADMISSION_SECRET,
+        "AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION": _AUDIT_ADMISSION_KEY_VERSION,
+        "AI_AUDIT_GATE_B_ADMISSION_TOKEN": token or _signed_admission_token(),
+        "AI_AUDIT_GATE_B_ADMISSION_AUDIENCE": audience,
+        "AI_AUDIT_GATE_B_EVIDENCE_ID": _AUDIT_ADMISSION_EVIDENCE_ID,
+        "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION": revision,
+        "AI_DATABASE_DSN": "postgresql://preferred",
+    }
 
 
 class FakeConnection:
@@ -92,12 +164,9 @@ def make_correlation():
 def test_postgres_session_persists_joined_lifecycles_and_closes_once() -> None:
     conn = FakeConnection()
     connector = CapturingConnector(conn)
-    session = PostgresAuditSink(
-        "postgresql://db.example/app",
-        connector=connector,
-    ).open_session(make_correlation())
-
-    assert isinstance(session, PostgresAuditSession)
+    session = _create_test_persistent_sink("postgresql://db.example/app",
+    connector=connector,).open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
     execution_id = session.start_agent_execution(
         "Research",
         step_name="Research",
@@ -189,11 +258,9 @@ def test_initial_model_prompt_serialization_failure_rolls_back_and_breaks_sessio
     capsys,
 ) -> None:
     conn = FakeConnection()
-    session = PostgresAuditSink(
-        "postgresql://test",
-        connector=CapturingConnector(conn),
-    ).open_session(make_correlation())
-    assert isinstance(session, PostgresAuditSession)
+    session = _create_test_persistent_sink("postgresql://test",
+    connector=CapturingConnector(conn),).open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
 
     session.start_model_call(
         task_type="bad_json",
@@ -222,10 +289,10 @@ def test_initial_model_prompt_serialization_failure_rolls_back_and_breaks_sessio
 def test_connection_error_does_not_attempt_recursive_db_error_insert(capsys) -> None:
     conn = FakeConnection()
     connector = CapturingConnector(conn)
-    session = PostgresAuditSink("postgresql://test", connector=connector).open_session(
+    session = _create_test_persistent_sink("postgresql://test", connector=connector).open_session(
         make_correlation()
     )
-    assert isinstance(session, PostgresAuditSession)
+    assert not isinstance(session, NoOpAuditSession)
     conn.fail_matching = "INSERT INTO app.ai_agent_execution_log"
     conn.failure = psycopg.OperationalError("connection closed")
 
@@ -239,11 +306,9 @@ def test_connection_error_does_not_attempt_recursive_db_error_insert(capsys) -> 
 
 def test_terminal_update_failure_closes_once_and_keeps_business_path_open(capsys) -> None:
     conn = FakeConnection()
-    session = PostgresAuditSink(
-        "postgresql://test",
-        connector=CapturingConnector(conn),
-    ).open_session(make_correlation())
-    assert isinstance(session, PostgresAuditSession)
+    session = _create_test_persistent_sink("postgresql://test",
+    connector=CapturingConnector(conn),).open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
     conn.fail_matching = "UPDATE app.ai_trace"
 
     event = session.record_finalization("completed")
@@ -254,32 +319,133 @@ def test_terminal_update_failure_closes_once_and_keeps_business_path_open(capsys
     assert "ai_audit_failure" in capsys.readouterr().err
 
 
-def test_sink_factory_is_disabled_by_default_and_reuses_dsn_priority() -> None:
+def test_sink_factory_requires_signed_gate_b_admission_before_issuing_persistent_sink() -> None:
     assert isinstance(create_audit_sink_from_env({}), NoOpAuditSink)
-    sink = create_audit_sink_from_env(
-        {
-            "AI_AUDIT_SINK": "postgres",
-            "AI_DATABASE_DSN": "postgresql://preferred",
-            "QUANT_DB_DSN": "postgresql://secondary",
-            "AI_AUDIT_CONNECT_TIMEOUT_SECONDS": "3",
-            "AI_AUDIT_STATEMENT_TIMEOUT_MS": "1500",
-        }
+    assert isinstance(
+        create_audit_sink_from_env(
+            {
+                "AI_AUDIT_SINK": "postgres",
+                "AI_AUDIT_GATE_B_ADMISSION": "approved",
+                "AI_AUDIT_GATE_B_EVIDENCE_ID": _AUDIT_ADMISSION_EVIDENCE_ID,
+                "AI_DATABASE_DSN": "postgresql://preferred",
+            }
+        ),
+        NoOpAuditSink,
     )
 
-    assert isinstance(sink, PostgresAuditSink)
-    assert sink.dsn == "postgresql://preferred"
-    assert sink.connect_timeout_seconds == 3
-    assert sink.statement_timeout_ms == 1500
+    sink = create_audit_sink_from_env(_audit_sink_env())
+    assert isinstance(sink, AuthorizedAuditSink)
     assert "postgresql://preferred" not in repr(sink)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        _signed_admission_token({"expiry": time.time() - 1}),
+        _signed_admission_token({"audience": "wrong-audience"}),
+        _signed_admission_token({"deployment_revision": "wrong-revision"}),
+        "forged.admission.token",
+    ],
+)
+def test_sink_factory_denies_invalid_signed_gate_b_admissions(token: str) -> None:
+    assert isinstance(create_audit_sink_from_env(_audit_sink_env(token=token)), NoOpAuditSink)
+
+
+def test_factory_create_app_and_run_analysis_deny_forged_environment_admission(monkeypatch) -> None:
+    for name, value in _audit_sink_env(token="forged.admission.token").items():
+        monkeypatch.setenv(name, value)
+
+    app = create_app()
+    envelope = run_analysis("저평가주 사줘")
+
+    assert isinstance(app.state.audit_sink, NoOpAuditSink)
+    assert envelope.status == "need_clarification"
+
+
+def test_forgeable_test_marker_is_noop_for_app_and_direct_graph_ingress() -> None:
+    class ForgedSink:
+        __audit_sink_test_only__ = True
+
+        def __init__(self) -> None:
+            self.open_calls = 0
+
+        def open_session(self, correlation):
+            self.open_calls += 1
+            raise AssertionError("forged audit sink must not be opened")
+
+    sink = ForgedSink()
+    app = create_app(audit_sink=sink)
+    assert isinstance(app.state.audit_sink, NoOpAuditSink)
+
+    envelope = run_analysis("저평가주 사줘", audit_sink=sink)
+
+    assert envelope.status == "need_clarification"
+    assert sink.open_calls == 0
+
+
+def test_private_test_sink_factory_allows_explicit_test_doubles() -> None:
+    class TestSink:
+        def __init__(self) -> None:
+            self.open_calls = 0
+
+        def open_session(self, correlation):
+            self.open_calls += 1
+            return NoOpAuditSink().open_session(correlation)
+
+    sink = TestSink()
+    app = create_app(audit_sink=_create_test_audit_sink(sink))
+    app.state.audit_sink.open_session(make_correlation())
+    assert sink.open_calls == 1
+
+
+def test_legacy_raw_symbols_are_not_importable_and_private_writers_reject_bypass() -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+
+    with pytest.raises(ImportError):
+        exec("from ai_graph.audit_postgres import PostgresAuditSink", {})
+    with pytest.raises(ImportError):
+        exec("from ai_graph.audit_postgres import PostgresAuditSession", {})
+    with pytest.raises(PermissionError):
+        module.AuthorizedAuditSink(None, _capability=object())
+    with pytest.raises(PermissionError):
+        module._PostgresAuditWriter("postgresql://test", admission=None)
+
+    forged_admission = object.__new__(module._RawAuditAdmission)
+    forged_admission._issuer_token = object()
+    forged_admission._expires_at = time.time() + 300
+    connector = CapturingConnector(FakeConnection())
+    with pytest.raises(PermissionError):
+        module._PostgresAuditWriter(
+            "postgresql://test",
+            admission=forged_admission,
+            connector=connector,
+        )
+    assert connector.calls == []
+
+
+def test_direct_writer_denies_expired_admission_before_connecting() -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    admission = module._admission_from_env(_audit_sink_env())
+    assert admission is not None
+    connector = CapturingConnector(FakeConnection())
+    writer = module._PostgresAuditWriter(
+        "postgresql://test",
+        admission=admission,
+        connector=connector,
+    )
+    admission._expires_at = time.time() - 1
+
+    session = writer.open_session(make_correlation())
+
+    assert isinstance(session, NoOpAuditSession)
+    assert connector.calls == []
 
 
 def test_terminal_model_persistence_failure_stops_db_writes(capsys) -> None:
     conn = FakeConnection()
-    session = PostgresAuditSink(
-        "postgresql://test",
-        connector=CapturingConnector(conn),
-    ).open_session(make_correlation())
-    assert isinstance(session, PostgresAuditSession)
+    session = _create_test_persistent_sink("postgresql://test",
+    connector=CapturingConnector(conn),).open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
     execution_id = session.start_agent_execution("Research", step_name="Research")
     call_id = session.start_model_call(
         task_type="research",
@@ -312,11 +478,9 @@ def test_terminal_model_persistence_failure_stops_db_writes(capsys) -> None:
 
 def test_terminal_agent_persistence_failure_stops_db_writes(capsys) -> None:
     conn = FakeConnection()
-    session = PostgresAuditSink(
-        "postgresql://test",
-        connector=CapturingConnector(conn),
-    ).open_session(make_correlation())
-    assert isinstance(session, PostgresAuditSession)
+    session = _create_test_persistent_sink("postgresql://test",
+    connector=CapturingConnector(conn),).open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
     execution_id = session.start_agent_execution("Research", step_name="Research")
     conn.fail_matching = "UPDATE app.ai_agent_execution_log"
     executions_before_failure = len(conn.executions)
@@ -334,7 +498,7 @@ def test_connect_failure_returns_noop_and_emits_one_sanitized_signal(capsys) -> 
         raise psycopg.OperationalError("password=must-not-appear")
 
     before = audit_failure_count()
-    session = PostgresAuditSink("postgresql://secret", connector=fail_connect).open_session(
+    session = _create_test_persistent_sink("postgresql://secret", connector=fail_connect).open_session(
         make_correlation()
     )
 
@@ -348,11 +512,9 @@ def test_connect_failure_returns_noop_and_emits_one_sanitized_signal(capsys) -> 
 
 def test_failure_signal_stops_without_recursive_db_write(capsys) -> None:
     conn = RecursiveFailureConnection()
-    session = PostgresAuditSink(
-        "postgresql://test",
-        connector=CapturingConnector(conn),
-    ).open_session(make_correlation())
-    assert isinstance(session, PostgresAuditSession)
+    session = _create_test_persistent_sink("postgresql://test",
+    connector=CapturingConnector(conn),).open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
     before = audit_failure_count()
     executions_before_failure = len(conn.executions)
     conn.fail_after_open = True
@@ -385,10 +547,8 @@ def test_mid_session_sql_fault_does_not_change_analysis_result(failure, capsys) 
     actual = run_analysis(
         query,
         trace_id="trace-fail-open",
-        audit_sink=PostgresAuditSink(
-            "postgresql://user:password@db/app",
-            connector=CapturingConnector(conn),
-        ),
+        audit_sink=_create_test_persistent_sink("postgresql://user:password@db/app",
+        connector=CapturingConnector(conn),),
     )
 
     assert (
@@ -419,10 +579,8 @@ def test_ready_analysis_with_postgres_sink_persists_all_calls_and_finalizes(caps
     envelope = run_analysis(
         "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어",
         trace_id="trace-postgres-ready",
-        audit_sink=PostgresAuditSink(
-            "postgresql://test",
-            connector=CapturingConnector(conn),
-        ),
+        audit_sink=_create_test_persistent_sink("postgresql://test",
+        connector=CapturingConnector(conn),),
     )
 
     statements = [statement for statement, _ in conn.executions]
@@ -519,8 +677,8 @@ def test_disposable_timescaledb_migrations_and_large_unicode_round_trip() -> Non
     large_text = "가" * 349_525 + "x"
     assert len(large_text.encode("utf-8")) == 1024 * 1024
     variables = {"payload": large_text}
-    session = PostgresAuditSink(dsn).open_session(correlation)
-    assert isinstance(session, PostgresAuditSession)
+    session = _create_test_persistent_sink(dsn).open_session(correlation)
+    assert not isinstance(session, NoOpAuditSession)
 
     try:
         execution_id = session.start_agent_execution("Research", step_name="Research")

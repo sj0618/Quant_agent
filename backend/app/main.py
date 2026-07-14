@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import ai_backtest, auth, health, pages, reports_pdf_temp
+from app.api.routes import ai_backtest, auth, fe_contract, health, pages, reports_pdf_temp
 from app.core.config import ConfigurationError, load_settings
 from app.core.errors import AppError, register_exception_handlers
 from app.db.session import create_db_engine, dispose_db_engine

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import unicodedata
+import re
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -16,6 +19,9 @@ from app.schemas.ai_backtest import (
     AIBacktestReportCreate,
     AIBacktestReportDraft,
     AICodeBacktestFlowRequest,
+    AIBacktestRequestClaim,
+    AIBacktestErrorResponse,
+    AIBacktestRunningResponse,
     AICodeBacktestFlowResult,
     AICodeGenerationCreate,
     AICodeValidationResultCreate,
@@ -31,6 +37,8 @@ from app.schemas.ai_backtest import (
     GeneratedCodeResult,
     ModelCallLogBundle,
 )
+from app.services.raw_audit_admission import RawAuditAdmission
+from app.services.ai_backtest_runtime import ProcessIdentityRecorder, ReleaseAuthorizer
 
 
 _AUDIT_FAILURE_COUNT = 0
@@ -85,6 +93,8 @@ class CodeExecutor(Protocol):
         *,
         trace_id: UUID,
         execution_run_id: UUID,
+        process_identity_recorder: ProcessIdentityRecorder | None = None,
+        release_authorizer: ReleaseAuthorizer | None = None,
     ) -> CodeExecutionResult: ...
 
 
@@ -106,15 +116,49 @@ class AICodeBacktestService:
     code_validator: CodeValidator
     code_executor: CodeExecutor
     report_generator: BacktestReportGenerator
+    raw_audit_admission: RawAuditAdmission | None = None
 
-    async def run_generated_backtest(self, request: AICodeBacktestFlowRequest) -> AICodeBacktestFlowResult:
-        trace_id = request.trace_id or uuid4()
-        audit = _AuditWrites(self.repository, trace_id)
+    async def run_generated_backtest(
+        self, request: AICodeBacktestFlowRequest
+    ) -> AICodeBacktestFlowResult | AIBacktestRunningResponse | AIBacktestErrorResponse:
+        _validate_execution_request(request)
+        trace_id = uuid4()
+        trace = AITraceCreate(
+            trace_id=trace_id,
+            user_id=request.execution_context.user_id if request.execution_context else None,
+            metadata_jsonb={"entrypoint": "ai_generated_backtest", "strategy_id": request.strategy_id},
+            started_at=_utcnow(),
+        )
+        claim: AIBacktestRequestClaim
         try:
-            return await self._execute_generated_backtest(request, trace_id=trace_id, audit=audit)
+            claim = await self.repository.claim_idempotent_request(request, trace=trace)
+        except Exception as exc:  # noqa: BLE001 - trace bootstrap is fail-closed
+            _report_audit_failure("create_trace")
+            raise AppError(
+                status_code=503,
+                component="ai_backtest",
+                code="service_unavailable",
+                message="Backtest service is temporarily unavailable",
+            ) from exc
+        if claim.trace_id != trace_id:
+            return _replay_or_conflict(claim)
+        request_id = claim.request_id
+        audit = _AuditWrites(self.repository, trace_id, trace_persisted=True)
+        try:
+            await self.repository.transition_idempotent_request(
+                request_id,
+                expected_state="claimed",
+                next_state="generation_in_progress",
+            )
+            result = await self._execute_generated_backtest(
+                request,
+                trace_id=trace_id,
+                audit=audit,
+                request_id=request_id,
+            )
+            await self._complete_success(request_id, result)
+            return result
         except Exception as exc:  # noqa: BLE001
-            if isinstance(exc, AppError) and exc.code == "generated_code_rejected":
-                raise
             if not audit.failure_recorded:
                 await self._record_flow_failure(request, audit=audit, exc=exc)
                 await audit.write(
@@ -129,7 +173,78 @@ class AICodeBacktestService:
                         ),
                     ),
                 )
+            if isinstance(exc, AppError) and exc.status_code in {422, 502, 504}:
+                response = AIBacktestErrorResponse(
+                    code=exc.code,
+                    message=exc.message,
+                    details=exc.details if isinstance(exc.details, dict) else None,
+                )
+                try:
+                    await self._complete_failure(request_id, response.model_dump(mode="json"))
+                except Exception:  # noqa: BLE001 - unresolved terminal persistence must remain blocked
+                    await self._mark_outcome_unknown(request_id)
+                raise
+            await self._mark_outcome_unknown(request_id)
             raise
+
+    async def _complete_success(self, request_id: UUID, result: AICodeBacktestFlowResult) -> None:
+        await self._transition_from_any(
+            request_id,
+            ("execution_released", "generation_in_progress"),
+            "succeeded",
+            safety_lease="closed",
+            terminal_response=result.model_dump(mode="json"),
+        )
+
+    async def _complete_failure(self, request_id: UUID, response: dict[str, object]) -> None:
+        await self._transition_from_any(
+            request_id,
+            ("execution_released", "execution_outcome_unknown", "execution_armed", "generation_in_progress"),
+            "failed",
+            safety_lease="closed",
+            terminal_response=response,
+        )
+
+    async def _mark_outcome_unknown(self, request_id: UUID) -> None:
+        try:
+            await self._transition_from_any(
+                request_id,
+                ("execution_released", "execution_armed", "generation_in_progress", "claimed"),
+                "execution_outcome_unknown",
+                safety_lease="blocked_unknown",
+            )
+        except AppError:
+            # A concurrent observer never clears a durable unknown lease.
+            return
+
+    async def _transition_from_any(
+        self,
+        request_id: UUID,
+        expected_states: tuple[str, ...],
+        next_state: str,
+        *,
+        safety_lease: str | None = None,
+        terminal_response: dict[str, object] | None = None,
+        execution_run_id: UUID | None = None,
+    ) -> None:
+        last_error: AppError | None = None
+        for expected_state in expected_states:
+            try:
+                await self.repository.transition_idempotent_request(
+                    request_id,
+                    expected_state=expected_state,
+                    next_state=next_state,
+                    safety_lease=safety_lease,
+                    execution_run_id=execution_run_id,
+                    terminal_response=terminal_response,
+                )
+                return
+            except AppError as exc:
+                if exc.code != "duplicate_execution_active":
+                    raise
+                last_error = exc
+        if last_error is not None:
+            raise last_error
 
     async def _execute_generated_backtest(
         self,
@@ -137,6 +252,7 @@ class AICodeBacktestService:
         *,
         trace_id: UUID,
         audit: _AuditWrites,
+        request_id: UUID,
     ) -> AICodeBacktestFlowResult:
         parse_id = uuid4()
         code_id = uuid4()
@@ -144,15 +260,7 @@ class AICodeBacktestService:
         execution_run_id = uuid4()
         started_at = _utcnow()
 
-        await audit.start(
-            AITraceCreate(
-                trace_id=trace_id,
-                user_id=request.user_id,
-                session_id=request.session_id,
-                metadata_jsonb={"entrypoint": "ai_generated_backtest", "strategy_id": request.strategy_id},
-                started_at=started_at,
-            )
-        )
+        # The request claim atomically created the trace before any external work.
         await self.repository.create_strategy_parse(
             AIStrategyParseCreate(
                 parse_id=parse_id,
@@ -188,6 +296,7 @@ class AICodeBacktestService:
             audit=audit,
             trace_id=trace_id,
             code_id=code_id,
+            request_id=request_id,
             execution_run_id=execution_run_id,
             generated=generated,
         )
@@ -490,6 +599,7 @@ class AICodeBacktestService:
         audit: _AuditWrites,
         trace_id: UUID,
         code_id: UUID,
+        request_id: UUID,
         execution_run_id: UUID,
         generated: GeneratedCodeResult,
     ) -> CodeExecutionResult:
@@ -527,12 +637,52 @@ class AICodeBacktestService:
                     started_at=started_at,
                 )
             )
+            armed_claim = await self.repository.transition_idempotent_request(
+                request_id,
+                expected_state="generation_in_progress",
+                next_state="execution_armed",
+                execution_run_id=execution_run_id,
+            )
+
+            async def persist_process_identity(identity) -> None:
+                await self.repository.record_code_execution_process_identity(
+                    execution_run_id,
+                    attempt_id=identity.attempt_id,
+                    worker_host=identity.worker_host,
+                    worker_pid=identity.worker_pid,
+                    worker_pgid=identity.worker_pgid,
+                    worker_started_at=identity.worker_started_at,
+                    idempotency_request_id=request_id,
+                )
+
+            release_authorized = False
+
+            async def authorize_subprocess_release(identity) -> None:
+                nonlocal release_authorized
+                await self.repository.release_armed_execution_request(
+                    request_id,
+                    expected_state_version=armed_claim.state_version,
+                    execution_run_id=execution_run_id,
+                    attempt_id=identity.attempt_id,
+                )
+                release_authorized = True
+
             result = await self.code_executor.execute(
                 request,
                 generated,
                 trace_id=trace_id,
                 execution_run_id=execution_run_id,
+                process_identity_recorder=persist_process_identity,
+                release_authorizer=authorize_subprocess_release,
             )
+            if not release_authorized:
+                raise AppError(
+                    status_code=503,
+                    component="ai_backtest",
+                    code="execution_release_not_authorized",
+                    message="Execution completed without a durable release authorization",
+                    details={"request_id": str(request_id), "execution_run_id": str(execution_run_id)},
+                )
             await self.repository.update_code_execution_run(
                 execution_run_id,
                 CodeExecutionRunUpdate(
@@ -733,6 +883,7 @@ class AICodeBacktestService:
                 message_id=request.source_message_id,
                 code_id=code_id,
                 bundle=bundle,
+                raw_audit_admission=self.raw_audit_admission,
             ),
         )
         if bundle.status != "failed" or not isinstance(call_id, UUID):
@@ -819,6 +970,120 @@ class AICodeBacktestService:
             ),
         )
 
+
+REQUEST_FINGERPRINT_VERSION = "ai-backtest-intent-v1"
+_IDEMPOTENCY_KEY_PATTERN = r"^[A-Za-z0-9._~-]{8,128}$"
+
+
+def build_request_fingerprint(payload: AICodeBacktestFlowRequest) -> tuple[str, str]:
+    intent = {
+        "natural_language_prompt": " ".join(unicodedata.normalize("NFC", payload.natural_language_prompt).split()),
+        "parsed_strategy_jsonb": _canonical_json_value(payload.parsed_strategy_jsonb),
+        "parse_confidence": _canonical_json_value(payload.parse_confidence),
+        "parse_model_name": _canonical_json_value(payload.parse_model_name),
+        "strategy_id": _canonical_json_value(payload.strategy_id),
+        "target_runtime": _canonical_json_value(payload.target_runtime),
+        "code_purpose": _canonical_json_value(payload.code_purpose),
+        "benchmark_ticker": _canonical_json_value(payload.benchmark_ticker),
+        "data_source": _canonical_json_value(payload.data_source),
+        "report_model_name": _canonical_json_value(payload.report_model_name),
+        "timeout_seconds": payload.timeout_seconds,
+        "memory_limit_mb": payload.memory_limit_mb,
+    }
+    canonical = json.dumps(
+        intent,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return REQUEST_FINGERPRINT_VERSION, hashlib.sha256(canonical).hexdigest()
+
+
+def _canonical_json_value(value: object) -> object:
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise AppError(
+                status_code=422,
+                component="ai_backtest",
+                code="request_validation_failed",
+                message="Request contains a non-finite number",
+            )
+        return value
+    if isinstance(value, list):
+        return [_canonical_json_value(item) for item in value]
+    if isinstance(value, dict):
+        normalized: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise AppError(
+                    status_code=422,
+                    component="ai_backtest",
+                    code="request_validation_failed",
+                    message="Request contains a non-string JSON key",
+                )
+            normalized[unicodedata.normalize("NFC", key)] = _canonical_json_value(item)
+        return normalized
+    raise AppError(
+        status_code=422,
+        component="ai_backtest",
+        code="request_validation_failed",
+        message="Request contains a non-JSON value",
+    )
+
+
+def _validate_execution_request(request: AICodeBacktestFlowRequest) -> None:
+    context = request.execution_context
+    if context is None or request.user_id != context.user_id:
+        raise AppError(
+            status_code=401,
+            component="ai_backtest",
+            code="execution_context_required",
+            message="Authenticated execution context is required",
+        )
+    if request.idempotency_key is None or not re.fullmatch(_IDEMPOTENCY_KEY_PATTERN, request.idempotency_key):
+        raise AppError(
+            status_code=400,
+            component="ai_backtest",
+            code="idempotency_key_invalid",
+            message="A valid Idempotency-Key is required",
+        )
+    fingerprint_version, fingerprint = build_request_fingerprint(request)
+    if request.fingerprint_version != fingerprint_version or request.request_fingerprint != fingerprint:
+        raise AppError(
+            status_code=422,
+            component="ai_backtest",
+            code="request_validation_failed",
+            message="Request fingerprint is invalid",
+        )
+
+
+def _replay_or_conflict(
+    claim: AIBacktestRequestClaim,
+) -> AICodeBacktestFlowResult | AIBacktestRunningResponse | AIBacktestErrorResponse:
+    if claim.terminal_response is not None:
+        if "code" in claim.terminal_response:
+            return AIBacktestErrorResponse.model_validate(claim.terminal_response)
+        return AICodeBacktestFlowResult.model_validate(claim.terminal_response)
+    if claim.state == "execution_outcome_unknown" or claim.safety_lease == "blocked_unknown":
+        raise AppError(
+            status_code=409,
+            component="ai_backtest",
+            code="execution_outcome_unknown",
+            message="Prior execution outcome is unresolved",
+            details={"request_id": str(claim.request_id), "trace_id": str(claim.trace_id) if claim.trace_id else None, "state": claim.state},
+        )
+    return AIBacktestRunningResponse(
+        request_id=claim.request_id,
+        trace_id=claim.trace_id,
+        state=claim.state,
+    )
 
 def _generation_input_payload(request: AICodeBacktestFlowRequest) -> dict[str, object]:
     return {

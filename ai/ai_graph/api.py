@@ -17,7 +17,7 @@ from ai_graph.audit import (
     create_audit_correlation,
     report_audit_failure,
 )
-from ai_graph.audit_postgres import create_audit_sink_from_env
+from ai_graph.audit_postgres import resolve_audit_sink
 from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
     BOK_MACRO_VIEW,
@@ -287,7 +287,7 @@ def _open_request_audit_session(
         user_id=user_id,
         session_id=session_id,
     )
-    sink = audit_sink or NoOpAuditSink()
+    sink = resolve_audit_sink(audit_sink)
     try:
         return sink.open_session(correlation)
     except Exception:
@@ -356,7 +356,7 @@ def create_app(
         )
     app.state.job_store = store
     app.state.job_store_runtime = runtime
-    app.state.audit_sink = audit_sink if audit_sink is not None else create_audit_sink_from_env()
+    app.state.audit_sink = resolve_audit_sink(audit_sink)
     app.state.report_resolver = report_resolver
 
     @app.get(HEALTH_PATH, response_model=HealthResponse, tags=["System"])

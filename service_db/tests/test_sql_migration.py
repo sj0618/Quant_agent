@@ -62,5 +62,20 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         self.assertNotIn("TRUNCATE ", upper_sql)
 
 
+    def test_ai_backtest_idempotency_migration_is_additive_and_idempotent(self):
+        sql = (SERVICE_DB_ROOT / "migrations/016_ai_backtest_idempotency.sql").read_text(encoding="utf-8")
+        upper_sql = sql.upper()
+        self.assertIn("CREATE TABLE IF NOT EXISTS app.ai_backtest_request", sql)
+        self.assertIn("scope_family_id UUID NOT NULL", sql)
+        self.assertIn("client_request_key TEXT NOT NULL", sql)
+        self.assertIn("payload_fingerprint TEXT NOT NULL", sql)
+        self.assertIn("CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_backtest_request_scope_key", sql)
+        self.assertIn("WHERE safety_lease IN ('active', 'blocked_unknown')", sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS app.ai_backtest_replacement_approval", sql)
+        self.assertIn("CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_backtest_replacement_key_hash", sql)
+        self.assertIn("WHERE status = 'issued'", sql)
+        self.assertNotIn("DROP ", upper_sql)
+        self.assertNotIn("TRUNCATE ", upper_sql)
+
 if __name__ == "__main__":
     unittest.main()

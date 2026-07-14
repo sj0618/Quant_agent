@@ -18,6 +18,14 @@ def valid_settings(**overrides):
         "AUTH_ALLOWED_HOSTS": "api.example.co.kr",
         "AUTH_COOKIE_SECURE": True,
         "AUTH_COOKIE_SAMESITE": "lax",
+        "AI_BACKTEST_SCOPE_HMAC_PRIMARY": "real-ai-backtest-scope-hmac-secret",
+        "AI_BACKTEST_SCOPE_HMAC_PRIMARY_VERSION": "v1",
+        "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET": "real-raw-audit-admission-hmac-secret",
+        "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_KEY_VERSION": "v1",
+        "AI_BACKTEST_RAW_AUDIT_ADMISSION_TOKEN": "signed-gate-b-admission-token",
+        "AI_BACKTEST_RAW_AUDIT_ADMISSION_AUDIENCE": "quantagent.backend.raw-audit",
+        "AI_BACKTEST_RAW_AUDIT_EVIDENCE_ID": "gate-b-evidence-001",
+        "AI_BACKTEST_RAW_AUDIT_DEPLOYMENT_REVISION": "revision-9",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -38,7 +46,18 @@ def test_valid_production_auth_settings_are_accepted():
 
 @pytest.mark.parametrize(
     "missing_key",
-    ["REDIS_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"],
+    [
+        "REDIS_URL",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REDIRECT_URI",
+        "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET",
+        "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_KEY_VERSION",
+        "AI_BACKTEST_RAW_AUDIT_ADMISSION_TOKEN",
+        "AI_BACKTEST_RAW_AUDIT_ADMISSION_AUDIENCE",
+        "AI_BACKTEST_RAW_AUDIT_EVIDENCE_ID",
+        "AI_BACKTEST_RAW_AUDIT_DEPLOYMENT_REVISION",
+    ],
 )
 def test_auth_enabled_runtime_rejects_missing_auth_critical_settings(missing_key: str):
     values = valid_settings().model_dump(by_alias=True)
@@ -64,6 +83,12 @@ def test_placeholder_values_are_rejected():
         valid_settings(**{"GOOGLE_CLIENT_SECRET": "<google-client-secret>"})
     with pytest.raises(ValidationError):
         valid_settings(DATABASE_URL="postgresql+asyncpg://<user>:<password>@<host>:5432/<database>")
+
+
+def test_raw_audit_hmac_secret_must_not_reuse_the_oauth_secret():
+    with pytest.raises(ValidationError):
+        valid_settings(AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET="real-google-client-secret")
+
 
 
 def test_secret_redaction_covers_urls_codes_and_tokens():
