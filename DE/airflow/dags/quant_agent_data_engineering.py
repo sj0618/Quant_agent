@@ -278,23 +278,43 @@ if dag and task:  # pragma: no branch
 
 def _target_date(logical_date) -> date:
     if logical_date:
-        # 1. datetime.datetime 객체인 경우 .date() 추출
+        # Airflow logical_date는 UTC 기준일 수 있으므로, 먼저 한국시간 기준 날짜로 맞춘다.
         if isinstance(logical_date, datetime):
-            return logical_date.date()
-        # 2. 순수 datetime.date 객체인 경우 그대로 반환
-        if isinstance(logical_date, date):
-            return logical_date
-        # 3. 문자열로 들어온 경우 안전하게 슬라이싱
-        if isinstance(logical_date, str):
-            return date.fromisoformat(logical_date[:10])
-        # 4. 그 외 Airflow/Pendulum 객체 대응
-        if hasattr(logical_date, "date"):
-            return logical_date.date()
-            
+            run_date = logical_date.astimezone(LOCAL_TZ).date() if logical_date.tzinfo else logical_date.replace(tzinfo=LOCAL_TZ).date()
+        elif isinstance(logical_date, date):
+            run_date = logical_date
+        elif isinstance(logical_date, str):
+            parsed = datetime.fromisoformat(logical_date)
+            run_date = parsed.astimezone(LOCAL_TZ).date() if parsed.tzinfo else parsed.date()
+        elif hasattr(logical_date, "date"):
+            candidate = logical_date.date()
+            run_date = candidate.astimezone(LOCAL_TZ).date() if isinstance(candidate, datetime) else candidate
+        else:
+            run_date = date.today()
+        
+        current_date_kst = datetime.now(LOCAL_TZ).date()
+        operator = "<" if run_date >= current_date_kst else "<="
+        
+        from quant_agent.data.repository import DataRepository
+
+        rows = DataRepository().executor.fetch_json(
+            f"""
+            SELECT MAX(trade_date)::text AS trade_date
+              FROM core.trading_calendar
+             WHERE market = 'KRX'
+               AND is_open = TRUE
+               AND trade_date {operator} DATE '{run_date.isoformat()}'
+            """
+        )
+        raw_trade_date = rows[0].get("trade_date") if rows else None
+        if not raw_trade_date:
+            raise ValueError(f"No KRX open trade date found {operator} {run_date.isoformat()}.")
+        return date.fromisoformat(str(raw_trade_date))
+
     try:  # pragma: no cover - Airflow context only exists inside task runtime.
         from airflow.operators.python import get_current_context
 
-        return get_current_context()["logical_date"].date()
+        return _target_date(get_current_context()["logical_date"])
     except (ImportError, KeyError, RuntimeError):
         return date.today()
 
