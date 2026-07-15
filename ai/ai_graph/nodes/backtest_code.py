@@ -13,6 +13,12 @@ from ai_graph.llm.mock import (
     VALUE_QUALITY_CANDIDATES,
 )
 from ai_graph.llm.prompts import BacktestCodeLLMOutput, build_backtest_code_json_request
+from ai_graph.nodes.position_sizing import (
+    DEFAULT_MAX_POSITIONS,
+    applied_max_positions,
+    available_ticker_count,
+    max_position_pct_from_risk_constraints,
+)
 from ai_graph.schemas import CodeCandidate, StrategySpec
 from ai_graph.security.ast_validator import validate_backtest_code
 
@@ -57,6 +63,7 @@ class Loop3Request(BaseModel):
     strategy: StrategySpec
     variant: str = Field(pattern="^(A|B)$")
     trace_id: str = Field(min_length=1)
+    max_positions: int = Field(default=DEFAULT_MAX_POSITIONS, gt=0)
 
 
 class Loop3Result(BaseModel):
@@ -81,7 +88,9 @@ def generate_loop3_candidates(
     llm_candidates, ignored_legacy_count = _non_legacy_llm_candidates(
         output.candidates, request.strategy
     )
-    code_candidates = _candidate_code_pool(llm_candidates, request.strategy, code_plan)
+    code_candidates = _candidate_code_pool(
+        llm_candidates, request.strategy, code_plan, request.max_positions
+    )
     candidates = _validate_candidates(request, code_candidates)
     valid_candidates = [candidate for candidate in candidates if candidate.validation_ok]
     fallback_reasons = list(output.fallback_reasons)
@@ -99,7 +108,7 @@ def generate_loop3_candidates(
         ]
         candidates = _validate_candidates(
             request,
-            _deterministic_fallback_candidates(request.strategy, code_plan),
+            _deterministic_fallback_candidates(request.strategy, code_plan, request.max_positions),
         )
         valid_candidates = [candidate for candidate in candidates if candidate.validation_ok]
         if not valid_candidates:
@@ -194,8 +203,18 @@ def _strategy_template_candidates(strategy: StrategySpec) -> list[str] | None:
 
 def backtest_code_node(state: dict) -> dict:
     strategy_a = StrategySpec.model_validate(state["strategy_spec"])
+    price_rows = state.get("price_rows") or []
+    max_positions = applied_max_positions(
+        max_position_pct_from_risk_constraints(strategy_a.risk_constraints),
+        available_ticker_count(price_rows) if price_rows else None,
+    )
     result_a = generate_loop3_candidates(
-        Loop3Request(strategy=strategy_a, variant="A", trace_id=state["trace_id"])
+        Loop3Request(
+            strategy=strategy_a,
+            variant="A",
+            trace_id=state["trace_id"],
+            max_positions=max_positions,
+        )
     )
     candidates = result_a.candidates
     selected = next(candidate for candidate in candidates if candidate.validation_ok)
@@ -326,17 +345,20 @@ def build_code_generation_plan(
 
 
 def _candidate_code_pool(
-    llm_candidates: list[str], strategy: StrategySpec, plan: CodeGenerationPlan
+    llm_candidates: list[str],
+    strategy: StrategySpec,
+    plan: CodeGenerationPlan,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[str]:
     pool: list[str] = []
-    for code in _generated_strategy_candidates(strategy, plan):
+    for code in _generated_strategy_candidates(strategy, plan, max_positions):
         if code not in pool:
             pool.append(code)
     for code in llm_candidates:
         if code not in pool:
             pool.append(code)
     if len(pool) < MIN_GENERATED_CANDIDATES:
-        for code in _deterministic_fallback_candidates(strategy, plan):
+        for code in _deterministic_fallback_candidates(strategy, plan, max_positions):
             if code not in pool:
                 pool.append(code)
     return pool[:MAX_GENERATED_CANDIDATES]
@@ -351,14 +373,20 @@ def _non_legacy_llm_candidates(
 
 
 def _deterministic_fallback_candidates(
-    strategy: StrategySpec, plan: CodeGenerationPlan
+    strategy: StrategySpec,
+    plan: CodeGenerationPlan,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[str]:
     templates = _strategy_template_candidates(strategy) or MOCK_BACKTEST_CODE_LLM.generate_backtest_candidates(strategy, "A")
-    generated = _generated_strategy_candidates(strategy, plan)
+    generated = _generated_strategy_candidates(strategy, plan, max_positions)
     return (generated + templates)[:MAX_GENERATED_CANDIDATES]
 
 
-def _generated_strategy_candidates(strategy: StrategySpec, plan: CodeGenerationPlan) -> list[str]:
+def _generated_strategy_candidates(
+    strategy: StrategySpec,
+    plan: CodeGenerationPlan,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
+) -> list[str]:
     codes: list[str] = []
     profiles = _candidate_profiles(plan)
     lookbacks = [*plan.lookbacks, 75, 100, 125, 150, 200, 252]
@@ -377,6 +405,7 @@ def _generated_strategy_candidates(strategy: StrategySpec, plan: CodeGenerationP
                 threshold=threshold,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
+                max_positions=max_positions,
             )
         )
     return codes
@@ -453,6 +482,7 @@ def _render_adaptive_signal_code(
     threshold: float,
     stop_loss: float,
     take_profit: float,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> str:
     mode = plan.entry_feature
     return f'''def build_signals(prices):
@@ -469,7 +499,7 @@ def _render_adaptive_signal_code(
     mode = {mode!r}
     profile = {profile!r}
     strategy_id = {strategy_id!r}
-    max_positions = 5
+    max_positions = {int(max_positions)}
     for current_date in sorted(rows_by_date):
         evaluations = []
         for row in rows_by_date[current_date]:
@@ -615,6 +645,7 @@ def generate_self_improvement_candidates(
     *,
     start_index: int,
     iteration: int,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[CodeCandidate]:
     plan = CodeGenerationPlan.model_validate(code_plan)
     adjusted_plans = [
@@ -640,7 +671,7 @@ def generate_self_improvement_candidates(
     candidates: list[CodeCandidate] = []
     seen: set[str] = set()
     for adjusted in adjusted_plans:
-        for code in _generated_strategy_candidates(strategy, adjusted)[:6]:
+        for code in _generated_strategy_candidates(strategy, adjusted, max_positions)[:6]:
             if code in seen:
                 continue
             seen.add(code)
@@ -655,7 +686,7 @@ def generate_self_improvement_candidates(
                     metrics=None,
                 )
             )
-    for code in _self_improvement_grid_codes(strategy, plan, iteration):
+    for code in _self_improvement_grid_codes(strategy, plan, iteration, max_positions):
         if len(candidates) >= MAX_SELF_IMPROVEMENT_CANDIDATES:
             break
         if code in seen:
@@ -696,7 +727,10 @@ def _selective_threshold(value: float, entry_feature: str, iteration: int) -> fl
 
 
 def _self_improvement_grid_codes(
-    strategy: StrategySpec, plan: CodeGenerationPlan, iteration: int
+    strategy: StrategySpec,
+    plan: CodeGenerationPlan,
+    iteration: int,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[str]:
     profiles = [
         "volatility_breakout_hold",
@@ -748,6 +782,7 @@ def _self_improvement_grid_codes(
                             "take_profit_pct", plan.take_profit_pct
                         )
                     ),
+                    max_positions=max_positions,
                 )
             )
     return codes

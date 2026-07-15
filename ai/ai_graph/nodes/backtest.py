@@ -13,6 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from ai_graph.schemas import BacktestEquityPoint, BacktestMetrics, CandidateBacktestResult, CodeCandidate
 from ai_graph.schemas import StrategySpec as AIStrategySpec
 from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
+from ai_graph.nodes.position_sizing import (
+    DEFAULT_MAX_POSITIONS,
+    applied_max_positions as _shared_applied_max_positions,
+    available_ticker_count as _shared_available_ticker_count,
+    requested_max_positions as _shared_requested_max_positions,
+)
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
@@ -21,7 +27,6 @@ DEFAULT_FIXTURE_TICKER = "005930"
 DEFAULT_FIXTURE_MARKET = "KRX"
 DEFAULT_FIXTURE_VOLUME = 1_000_000.0
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
-DEFAULT_MAX_POSITIONS = 10
 METRIC_ROUND_DIGITS = 6
 MIN_RETURNS_FOR_SPLIT = 4
 BACKTEST_SPLIT_FRACTION = 0.5
@@ -251,10 +256,14 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         CodeCandidate.model_validate(candidate)
         for candidate in state["backtest_code"]["candidates"]
     ]
+    price_rows = state["price_rows"] if "price_rows" in state else state.get("market_prices")
+    max_positions = _applied_max_positions(
+        strategy_a, _available_ticker_count(_price_rows(price_rows))
+    )
     result = run_candidate_backtest(
         strategy_a,
         candidates,
-        price_rows=state["price_rows"] if "price_rows" in state else state.get("market_prices"),
+        price_rows=price_rows,
         feature_coverage=state.get("backtest_code", {}).get("feature_mapping", {}),
         fallback_reasons=state.get("backtest_code", {}).get("fallback_reasons", []),
     )
@@ -268,6 +277,7 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
             state.get("backtest_code", {}).get("code_plan", {}),
             start_index=len(all_candidates) + 1,
             iteration=iteration,
+            max_positions=max_positions,
         )
         all_candidates = [*all_candidates, *improved]
         fallback_reasons.append(
@@ -482,27 +492,22 @@ def _requested_max_positions(strategy: AIStrategySpec) -> int:
         "max_position_pct",
         upper_bound=1.0,
     )
-    if max_position_pct is None:
-        return DEFAULT_MAX_POSITIONS
-    return max(1, math.ceil(1.0 / max_position_pct))
+    return _shared_requested_max_positions(max_position_pct)
 
 
 def _applied_max_positions(
     strategy: AIStrategySpec, available_ticker_count: int | None = None
 ) -> int:
-    requested_max_positions = _requested_max_positions(strategy)
-    if available_ticker_count is None or available_ticker_count <= 0:
-        return requested_max_positions
-    return max(1, min(requested_max_positions, available_ticker_count))
+    max_position_pct = _optional_positive_float(
+        strategy.risk_constraints.get("max_position_pct"),
+        "max_position_pct",
+        upper_bound=1.0,
+    )
+    return _shared_applied_max_positions(max_position_pct, available_ticker_count)
 
 
 def _available_ticker_count(price_rows: Sequence[Mapping[str, Any]]) -> int:
-    tickers = {
-        str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
-        for row in price_rows
-        if row.get("date") is not None
-    }
-    return max(1, len(tickers))
+    return _shared_available_ticker_count(price_rows)
 
 
 def _execution_audit(engine_result: Any) -> dict[str, Any]:

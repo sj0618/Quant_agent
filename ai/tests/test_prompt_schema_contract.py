@@ -36,6 +36,7 @@ def test_strategy_spec_contract_preserves_rsi_buy_sell_semantics() -> None:
     serialized = json.loads(spec.model_dump_json())
 
     assert "KOSPI200" in serialized["universe"]
+    assert "sector" in serialized
     assert any(
         condition.left.lower() == "rsi" and condition.operator == "lte" and condition.right == 30
         for condition in spec.entry_conditions

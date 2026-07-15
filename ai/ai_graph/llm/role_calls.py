@@ -27,6 +27,7 @@ class RoleDebatePayload(BaseModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_results: dict[str, Any] = Field(default_factory=dict)
     fallback_reasons: list[str] = Field(default_factory=list)
+    citations: list[dict[str, str]] = Field(default_factory=list)
 
 
 class StrategyDescriptionPayload(BaseModel):
@@ -43,18 +44,24 @@ def generate_role_debate(
     task: str,
     context: dict[str, Any],
     fallback: RoleDebatePayload,
+    enable_web_search: bool = False,
 ) -> RoleDebatePayload:
     """Run a role-specific LLM call, falling back to deterministic MVP notes.
 
     The fallback keeps local tests and mock mode stable, while AOAI deployments can
     be split by role through create_llm_client(role=...).
+
+    enable_web_search mirrors generate_market_brief's usage: it asks the AOAI
+    Responses API to attach its web search tool for this call so the role can
+    ground its findings in current information instead of local retrieval only.
     """
 
     request = LLMJsonRequest(
         schema_name=ROLE_DEBATE_SCHEMA_NAME,
-        system_prompt=_system_prompt(role, task),
+        system_prompt=_system_prompt(role, task, enable_web_search=enable_web_search),
         user_prompt=_user_prompt(context),
         temperature=0.0,
+        enable_web_search=enable_web_search,
         task_type=role.lower(),
         prompt_template_name=ROLE_DEBATE_PROMPT_TEMPLATE_NAME,
         prompt_version=PROMPT_VERSION,
@@ -73,11 +80,20 @@ def generate_role_debate(
         return fallback.model_copy(update={"fallback_reasons": reasons})
 
 
-def _system_prompt(role: str, task: str) -> str:
-    return (
+def _system_prompt(role: str, task: str, *, enable_web_search: bool = False) -> str:
+    base = (
         "You are a QuantAgent role-specific analyst. Return JSON only with "
         "summary, evidence, concerns, recommendation, confidence, and "
         f"validation_results. Role={role}. Task={task}."
+    )
+    if not enable_web_search:
+        return base
+    return (
+        f"{base} Use the web search tool to find current, relevant information "
+        "when the local context is insufficient. Also return a \"citations\" "
+        "array of objects with \"title\" and \"url\" for every source found via "
+        "the web search tool; never invent a citation, and leave citations "
+        "empty if no web search was needed."
     )
 
 

@@ -3,11 +3,6 @@ from datetime import datetime
 import pytest
 from pydantic import ValidationError
 
-from ai_graph.nodes.research import (
-    MockResearchLLM,
-    build_research_summary,
-    research_node,
-)
 from ai_graph.nodes.signal import SignalCondition, build_investment_signal, generate_signal, signal_node
 
 
@@ -104,23 +99,3 @@ def test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence():
 def test_signal_condition_validates_between_shape():
     with pytest.raises(ValidationError):
         SignalCondition(left="rsi", operator="between", right=[70])
-
-
-def test_research_summary_uses_mock_llm_and_local_evidence():
-    summary = build_research_summary(
-        "KRX 삼성전자 RSI 리서치", trace_id="trace-3", llm_client=MockResearchLLM()
-    )
-
-    assert summary.trace_id == "trace-3"
-    assert summary.debug_ref == "research:trace-3"
-    assert summary.evidence
-    assert "005930" in summary.candidate_tickers
-
-
-def test_research_node_preserves_trace_id():
-    output = research_node(
-        {"trace_id": "trace-4", "user_query": "KRX SK하이닉스 리서치 후보"}
-    )
-
-    assert output["trace_id"] == "trace-4"
-    assert output["research"]["debug_ref"] == "research:trace-4"

@@ -1,4 +1,26 @@
-from ai_graph.graph import run_analysis
+"""Prompt semantics inspection script.
+
+Not a pytest test: runs every prompt in PROMPT_CASES through the full
+QuantAgent graph (mock LLM / fixture data source) and dumps what every node
+produced, grouped node-by-node, as readable JSON. The final report for each
+prompt is also written out as markdown.
+
+Run directly:
+    cd ai
+    uv run python tests/test_strategy_prompt_semantics.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+os.environ.setdefault("AI_LLM_PROVIDER", "mock")
+os.environ.setdefault("AI_DATABASE_DSN", "")
+
+from ai_graph.graph import build_graph  # noqa: E402
 
 
 PROMPT_CASES = [
@@ -35,27 +57,174 @@ PROMPT_CASES = [
     ("pullback_rsi_volume", "200일선 위 상승추세를 유지하면서 RSI(14)가 40 이하로 눌리고 거래량이 20일 평균 이상인 종목을 찾아줘."),
     ("breakout_volume_momentum", "최근 52주 신고가를 돌파했고 거래량이 20일 평균 대비 150% 이상 증가한 종목을 찾아줘."),
     ("reasonable_growth", "ROE 15% 이상, 매출 성장률 10% 이상, PER이 업종 평균 이하인 합리적 성장주를 찾아줘."),
+    ("relative_strength_leader", "반도체 섹터 주도주 중 상대강도 강한 종목을 찾아줘."),
+    ("rsi_rebound", "반도체 섹터에서 RSI 30 이하로 과매도된 반등 후보 종목을 찾아줘."),
 ]
 
+# state 키를 노드 단위로 묶어서 출력하기 위한 매핑. 여기 없는 키는 "Other"로 빠진다.
+NODE_KEY_GROUPS: list[tuple[str, list[str]]] = [
+    ("Supervisor", ["user_query", "trace_id", "debug_ref", "route", "internal_payload"]),
+    ("Ambiguity Classifier", ["ambiguity", "status"]),
+    (
+        "Data",
+        [
+            "semantic_slots",
+            "data_requirements",
+            "source_usage",
+            "evidence_refs",
+            "freshness_status",
+            "proxy_disclosure",
+            "retrieval",
+            "data",
+            "price_rows",
+            "l4_evidence",
+            "macro_snapshot",
+        ],
+    ),
+    ("Research", ["original_strategy_spec", "strategy_spec", "research_debate"]),
+    ("BacktestCode", ["backtest_code"]),
+    ("Backtest", ["backtest"]),
+    ("Signal", ["signal"]),
+    ("Risk Manager", ["risk"]),
+    ("Report", ["report", "report_debate"]),
+    ("Envelope", ["envelope"]),
+]
 
-def test_screening_prompt_batch_maps_to_related_strategy_and_nonzero_report(monkeypatch) -> None:
-    monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
-    monkeypatch.setenv("AI_DATABASE_DSN", "")
+OUTPUT_DIR = Path(__file__).parent / "prompt_semantics_output"
+JSON_OUTPUT_PATH = OUTPUT_DIR / "node_results.json"
+MARKDOWN_OUTPUT_PATH = OUTPUT_DIR / "report.md"
 
+
+def group_state_by_node(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    remaining = dict(state)
+    grouped: dict[str, dict[str, Any]] = {}
+    for node_name, keys in NODE_KEY_GROUPS:
+        grouped[node_name] = {key: remaining.pop(key) for key in keys if key in remaining}
+    if remaining:
+        grouped["Other"] = remaining
+    return grouped
+
+
+# Backtest/BacktestCode carry generated Python source per candidate and full
+# per-trade execution audit logs across up to ~36 self-improvement candidates
+# per prompt - dumped raw this balloons to 100+ MB and is unreadable. Truncate
+# long strings everywhere, and only truncate lists under known-bulky keys
+# (candidate pools / per-trade logs) - other lists (e.g. report "sections",
+# "entry_conditions") are structural and consumed downstream, so they must
+# keep their exact shape (dicts stay dicts, no injected marker strings).
+MAX_STRING_LENGTH = 400
+MAX_LIST_ITEMS = 6
+TRUNCATE_LIST_KEYS = frozenset(
+    {"candidates", "execution_audit", "equity_curve", "engine_summaries_by_candidate"}
+)
+
+
+def compact_for_display(value: Any, *, key: str | None = None) -> Any:
+    if isinstance(value, str):
+        if len(value) <= MAX_STRING_LENGTH:
+            return value
+        return f"{value[:MAX_STRING_LENGTH]}... [truncated, {len(value)} chars total]"
+    if isinstance(value, dict):
+        if key in TRUNCATE_LIST_KEYS and len(value) > MAX_LIST_ITEMS:
+            kept = dict(list(value.items())[:MAX_LIST_ITEMS])
+            return {
+                **{k: compact_for_display(v, key=k) for k, v in kept.items()},
+                "_truncated": f"{len(value) - MAX_LIST_ITEMS} more entries omitted",
+            }
+        return {k: compact_for_display(v, key=k) for k, v in value.items()}
+    if isinstance(value, list):
+        if key in TRUNCATE_LIST_KEYS and len(value) > MAX_LIST_ITEMS:
+            return [compact_for_display(item, key=key) for item in value[:MAX_LIST_ITEMS]] + [
+                f"... [truncated, {len(value) - MAX_LIST_ITEMS} more items]"
+            ]
+        return [compact_for_display(item, key=key) for item in value]
+    return value
+
+
+def run_prompt(index: int, expected_strategy_id: str, prompt: str) -> dict[str, Any]:
+    trace_id = f"semantic-{index:02d}"
+    try:
+        state = build_graph().invoke({"user_query": prompt, "trace_id": trace_id})
+        error = None
+    except Exception as exc:  # noqa: BLE001 - want to keep going across all prompts
+        state = {}
+        error = f"{type(exc).__name__}: {exc}"
+
+    actual_strategy_id = (state.get("strategy_spec") or {}).get("strategy_id")
+    matches_expected = bool(actual_strategy_id and actual_strategy_id.startswith(expected_strategy_id))
+    return {
+        "index": index,
+        "trace_id": trace_id,
+        "prompt": prompt,
+        "expected_strategy_id": expected_strategy_id,
+        "actual_strategy_id": actual_strategy_id,
+        "matches_expected": matches_expected,
+        "status": state.get("status"),
+        "error": error,
+        "nodes": compact_for_display(group_state_by_node(state)) if state else {},
+    }
+
+
+def render_markdown_report(results: list[dict[str, Any]]) -> str:
+    lines = ["# Strategy Prompt Semantics - Report Output", ""]
+    for result in results:
+        marker = "OK" if result["matches_expected"] else ("ERROR" if result["error"] else "MISMATCH")
+        lines.append(
+            f"## [{result['index']:02d}] {marker} - expected `{result['expected_strategy_id']}`"
+            f" / actual `{result['actual_strategy_id']}`"
+        )
+        lines.append("")
+        lines.append(f"**prompt**: {result['prompt']}")
+        lines.append("")
+        lines.append(f"**status**: `{result['status']}`")
+        lines.append("")
+        if result["error"]:
+            lines.append(f"**error**: `{result['error']}`")
+            lines.append("")
+            continue
+
+        report = result["nodes"].get("Report", {}).get("report")
+        if not report:
+            lines.append("_리포트 없음 (status != ready)_")
+            lines.append("")
+            continue
+
+        web = report.get("web_projection", {})
+        lines.append(f"### {web.get('title', '(제목 없음)')}")
+        lines.append("")
+        lines.append(web.get("summary", ""))
+        lines.append("")
+        for section in web.get("sections", []):
+            lines.append(f"#### {section.get('title', section.get('id'))} (`{section.get('id')}`)")
+            lines.append("")
+            lines.append("```json")
+            lines.append(json.dumps(section.get("items"), ensure_ascii=False, indent=2, default=str))
+            lines.append("```")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    results = []
     for index, (expected_strategy_id, prompt) in enumerate(PROMPT_CASES, start=1):
-        envelope = run_analysis(prompt, trace_id=f"semantic-{index:02d}")
+        print(f"[{index:02d}/{len(PROMPT_CASES)}] {expected_strategy_id}: {prompt[:40]}...")
+        result = run_prompt(index, expected_strategy_id, prompt)
+        results.append(result)
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        print()
 
-        assert envelope.status == "ready"
-        assert envelope.strategy_spec is not None
-        assert envelope.strategy_spec.strategy_id.startswith(expected_strategy_id)
+    JSON_OUTPUT_PATH.write_text(
+        json.dumps(results, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    MARKDOWN_OUTPUT_PATH.write_text(render_markdown_report(results), encoding="utf-8")
 
-        performance = envelope.user_payload.performance
-        assert performance is not None
-        selected_metrics = performance.metrics
-        assert selected_metrics.total_return != 0
-        assert performance.selected_candidate_id
+    matched = sum(1 for r in results if r["matches_expected"])
+    errored = sum(1 for r in results if r["error"])
+    print(f"총 {len(results)}개 중 {matched}개 strategy_id 일치, {errored}개 에러.")
+    print(f"노드별 전체 결과(JSON): {JSON_OUTPUT_PATH}")
+    print(f"최종 리포트(Markdown): {MARKDOWN_OUTPUT_PATH}")
 
-        report = envelope.user_payload.report
-        assert report is not None
-        section_ids = {section["id"] for section in report.web_projection.sections}
-        assert {"strategy", "entry_conditions", "assumptions", "backtest"} <= section_ids
+
+if __name__ == "__main__":
+    main()

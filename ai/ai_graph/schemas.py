@@ -71,6 +71,7 @@ class SemanticSlots(BaseModel):
     event: list[str] = Field(default_factory=list)
     action: list[str] = Field(default_factory=list)
     universe: str | None = None
+    sector: str | None = None
     slot_evidence_refs: list[str] = Field(default_factory=list)
     missing_slots: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
@@ -210,6 +211,17 @@ class StageStatus(str, Enum):
     FAILED = "failed"
 
 
+class ScreeningMatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: str = Field(min_length=6, max_length=6)
+    name: str = Field(min_length=1)
+    market: str = Field(min_length=1)
+    sector: str | None = None
+    score: float
+    as_of_date: str = Field(min_length=1)
+
+
 class StrategyCandidateCard(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -219,6 +231,8 @@ class StrategyCandidateCard(BaseModel):
     key_conditions: list[str] = Field(min_length=1, max_length=5)
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str | None = None
+    sector: str | None = None
+    matches: list[ScreeningMatch] = Field(default_factory=list, max_length=10)
 
 
 class ClarificationOption(BaseModel):
@@ -243,6 +257,7 @@ class StrategySpec(BaseModel):
     name: str = Field(min_length=1)
     universe: str = Field(min_length=1)
     market: str = Field(min_length=1)
+    sector: str | None = None
     timeframe: str = Field(min_length=1)
     entry_conditions: list[Condition] = Field(min_length=1)
     exit_conditions: list[Condition] = Field(default_factory=list)

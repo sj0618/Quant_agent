@@ -2,8 +2,7 @@ import { useState } from "react";
 import { Badge } from "../components/common/Badge";
 import { Button } from "../components/common/Button";
 import { Card } from "../components/common/Card";
-import { getCurrentSession, saveTestSession, startGoogleSignIn } from "../api/authClient";
-import { appConfig } from "../config/appConfig";
+import { getCurrentSession, startGoogleSignIn } from "../api/authClient";
 import { ROUTES, sanitizeReturnTo } from "../config/routes";
 
 interface LoginPageProps {
@@ -26,11 +25,6 @@ export function LoginPage({ returnTo }: LoginPageProps) {
       setSubmitting(false);
       setError(loginError instanceof Error ? loginError.message : "Google 로그인을 시작하지 못했습니다.");
     }
-  };
-
-  const handleTestSignIn = () => {
-    saveTestSession();
-    window.location.assign(nextPath);
   };
 
   return (
@@ -63,11 +57,6 @@ export function LoginPage({ returnTo }: LoginPageProps) {
           <Button disabled={submitting} onClick={handleGoogleSignIn} variant="dark">
             {submitting ? "Google로 이동 중" : "Google로 로그인"}
           </Button>
-          {appConfig.testLoginEnabled && !session ? (
-            <Button disabled={submitting} onClick={handleTestSignIn} variant="secondary">
-              테스트 로그인
-            </Button>
-          ) : null}
           <a className="button button--secondary" href={ROUTES.home}>홈으로</a>
         </div>
       </Card>

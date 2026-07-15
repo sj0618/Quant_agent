@@ -5,7 +5,7 @@ from __future__ import annotations
 from os import environ
 from typing import Callable, ClassVar, Literal
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -18,6 +18,7 @@ from ai_graph.audit import (
     report_audit_failure,
 )
 from ai_graph.audit_postgres import resolve_audit_sink
+from ai_graph.auth import RequireAuthenticatedUser, SessionResolver
 from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
     BOK_MACRO_VIEW,
@@ -335,9 +336,11 @@ def create_app(
     job_store_runtime: JobStoreRuntime | None = None,
     audit_sink: AuditSink | None = None,
     report_resolver: ReportResolver | None = None,
+    session_resolver: SessionResolver | None = None,
 ) -> FastAPI:
     runtime = job_store_runtime or _job_store_runtime(job_store)
     store = runtime.store
+    require_user = RequireAuthenticatedUser(session_resolver)
     app = FastAPI(
         title=API_TITLE,
         version=API_VERSION,
@@ -381,8 +384,11 @@ def create_app(
         status_code=status.HTTP_201_CREATED,
         tags=["Analysis Jobs"],
     )
-    def create_analysis_job(request: CreateAnalysisJobRequest) -> AnalysisJob:
-        job = store.create_job(request.query)
+    def create_analysis_job(
+        request: CreateAnalysisJobRequest,
+        user_id: str = Depends(require_user),
+    ) -> AnalysisJob:
+        job = store.create_job(request.query, user_id=user_id)
         return run_job_sync(
             store,
             job.job_id,
@@ -392,6 +398,7 @@ def create_app(
                 trace_id=job.trace_id,
                 entrypoint="api.analysis_jobs",
                 feature="analysis_job",
+                user_id=user_id,
             ),
         )
 
@@ -401,9 +408,13 @@ def create_app(
         status_code=status.HTTP_201_CREATED,
         tags=["Spec Compatibility"],
     )
-    def parse_strategy(request: ParseStrategyRequest) -> AnalysisJob:
+    def parse_strategy(
+        request: ParseStrategyRequest,
+        user_id: str = Depends(require_user),
+    ) -> AnalysisJob:
         job = store.create_job(
             request.request_text,
+            user_id=user_id,
             strategy_id=request.strategy_id,
             run_id=request.client_request_id,
         )
@@ -418,6 +429,7 @@ def create_app(
                 feature="strategy_parse",
                 strategy_id=request.strategy_id,
                 client_request_id=request.client_request_id,
+                user_id=user_id,
             ),
         )
 
@@ -427,12 +439,16 @@ def create_app(
         status_code=status.HTTP_201_CREATED,
         tags=["Strategy"],
     )
-    def describe_strategies(request: StrategyDescriptionsRequest) -> StrategyDescriptionsResponse:
+    def describe_strategies(
+        request: StrategyDescriptionsRequest,
+        user_id: str = Depends(require_user),
+    ) -> StrategyDescriptionsResponse:
         session = _open_request_audit_session(
             app.state.audit_sink,
             trace_id=None,
             entrypoint="api.strategy_descriptions",
             feature="strategy_descriptions",
+            user_id=user_id,
         )
         _record_step(session, "descriptions_started", message=f"strategy_count={len(request.strategies)}")
         try:
@@ -485,8 +501,8 @@ def create_app(
         response_model=AnalysisJob,
         tags=["Analysis Jobs"],
     )
-    def get_analysis_job(job_id: str) -> AnalysisJob:
-        job = store.get_job(job_id)
+    def get_analysis_job(job_id: str, user_id: str = Depends(require_user)) -> AnalysisJob:
+        job = _owned_job(store, job_id, user_id)
         if job is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -499,16 +515,16 @@ def create_app(
         response_model=AnalysisJob,
         tags=["Spec Compatibility"],
     )
-    def get_spec_analysis_job(job_id: str) -> AnalysisJob:
-        return get_analysis_job(job_id)
+    def get_spec_analysis_job(job_id: str, user_id: str = Depends(require_user)) -> AnalysisJob:
+        return get_analysis_job(job_id, user_id)
 
     @app.get(
         SPEC_BACKTEST_DETAIL_PATH,
         response_model=APIEnvelope,
         tags=["Spec Compatibility"],
     )
-    def get_backtest(strategy_id: str) -> APIEnvelope:
-        job = _find_job_by_strategy(store, strategy_id)
+    def get_backtest(strategy_id: str, user_id: str = Depends(require_user)) -> APIEnvelope:
+        job = _find_job_by_strategy(store, strategy_id, user_id)
         if job and job.result and job.result.user_payload.performance is not None:
             return job.result
         return _not_found_envelope(
@@ -522,11 +538,11 @@ def create_app(
         response_model=APIEnvelope,
         tags=["Spec Compatibility"],
     )
-    def get_report(report_id: str) -> APIEnvelope:
+    def get_report(report_id: str, user_id: str = Depends(require_user)) -> APIEnvelope:
         job = (
-            store.get_job(report_id)
-            or _find_job_by_report_id(store, report_id)
-            or _find_job_by_trace_or_debug_ref(store, report_id)
+            _owned_job(store, report_id, user_id)
+            or _find_job_by_report_id(store, report_id, user_id)
+            or _find_job_by_trace_or_debug_ref(store, report_id, user_id)
         )
         if job and job.result and job.result.user_payload.report is not None:
             return job.result
@@ -707,9 +723,16 @@ def _job_store_status(runtime: JobStoreRuntime) -> JobStoreStatus:
     )
 
 
-def _find_job_by_strategy(store: AnalysisJobStore, strategy_id: str) -> AnalysisJob | None:
+def _owned_job(store: AnalysisJobStore, job_id: str, user_id: str) -> AnalysisJob | None:
+    job = store.get_job(job_id)
+    return job if job is not None and job.user_id == user_id else None
+
+
+def _find_job_by_strategy(store: AnalysisJobStore, strategy_id: str, user_id: str) -> AnalysisJob | None:
     normalized = strategy_id.strip().lower()
     for job in reversed(store.list_jobs()):
+        if job.user_id != user_id:
+            continue
         if not job.result or not job.result.strategy_spec:
             continue
         result_strategy_id = job.result.strategy_spec.strategy_id
@@ -718,9 +741,11 @@ def _find_job_by_strategy(store: AnalysisJobStore, strategy_id: str) -> Analysis
     return None
 
 
-def _find_job_by_trace_or_debug_ref(store: AnalysisJobStore, value: str) -> AnalysisJob | None:
+def _find_job_by_trace_or_debug_ref(store: AnalysisJobStore, value: str, user_id: str) -> AnalysisJob | None:
     normalized = value.strip()
     for job in reversed(store.list_jobs()):
+        if job.user_id != user_id:
+            continue
         if job.job_id == normalized or job.trace_id == normalized:
             return job
         if job.result and job.result.debug_ref == normalized:
@@ -728,9 +753,11 @@ def _find_job_by_trace_or_debug_ref(store: AnalysisJobStore, value: str) -> Anal
     return None
 
 
-def _find_job_by_report_id(store: AnalysisJobStore, report_id: str) -> AnalysisJob | None:
+def _find_job_by_report_id(store: AnalysisJobStore, report_id: str, user_id: str) -> AnalysisJob | None:
     normalized = report_id.strip()
     for job in reversed(store.list_jobs()):
+        if job.user_id != user_id:
+            continue
         if getattr(job, "report_id", None) == normalized:
             return job
     return None

@@ -11,6 +11,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .sectors import extract_sector_from_query, get_known_sectors
+
 
 AI_DATABASE_DSN_ENV = "AI_DATABASE_DSN"
 QUANT_DB_DSN_ENV = "QUANT_DB_DSN"
@@ -26,17 +28,20 @@ AI_L4_EVIDENCE_LIMIT_ENV = "AI_L4_EVIDENCE_LIMIT"
 AI_DB_CONNECT_TIMEOUT_SECONDS_ENV = "AI_DB_CONNECT_TIMEOUT_SECONDS"
 AI_DB_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_STATEMENT_TIMEOUT_MS"
 AI_SCREENING_LIMIT_ENV = "AI_SCREENING_LIMIT"
+AI_SCREENING_BACKTEST_SELECTION_LIMIT_ENV = "AI_SCREENING_BACKTEST_SELECTION_LIMIT"
+AI_PORTFOLIO_BACKTEST_TICKER_LIMIT_ENV = "AI_PORTFOLIO_BACKTEST_TICKER_LIMIT"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_BACKTEST_LOOKBACK_YEARS = 10
 DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * DEFAULT_BACKTEST_LOOKBACK_YEARS
 DEFAULT_L4_EVIDENCE_LIMIT = 5
-DEFAULT_SCREENING_LIMIT = 10
+# 유니버스 스크리닝/백테스트 후보 수를 좌우하던 3단계 상한. 예전에는 10 -> 10 -> 5로
+# 2000+ 종목 유니버스가 사실상 5종목(또는 1종목)만 거래되도록 잘려나갔다. 유니버스
+# 제한을 두지 않는 기획이므로 기본값은 전부 None(무제한)이며, 필요하면 아래 env로만
+# 값을 넣어 되살릴 수 있다.
 DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 5
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 10_000
-SCREENING_BACKTEST_SELECTION_LIMIT = 10
-PORTFOLIO_BACKTEST_TICKER_LIMIT = 5
 POSTGRES_TIMEOUT_UNIT = "ms"
 BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 3
 RSI_OVERSOLD_THRESHOLD = 30.0
@@ -83,9 +88,12 @@ class DataSourceConfig(BaseModel):
     default_ticker: str = Field(default=DEFAULT_BACKTEST_TICKER, min_length=6, max_length=6)
     backtest_lookback_days: int = Field(default=DEFAULT_BACKTEST_LOOKBACK_DAYS, gt=0)
     l4_evidence_limit: int = Field(default=DEFAULT_L4_EVIDENCE_LIMIT, gt=0)
-    screening_limit: int = Field(default=DEFAULT_SCREENING_LIMIT, gt=0)
+    # None = 무제한(전체 유니버스 스크리닝/백테스트). 값을 넣으면 그만큼으로 캡핑된다.
+    screening_limit: int | None = Field(default=None, gt=0)
     connect_timeout_seconds: int = Field(default=DEFAULT_DB_CONNECT_TIMEOUT_SECONDS, gt=0)
     statement_timeout_ms: int = Field(default=DEFAULT_DB_STATEMENT_TIMEOUT_MS, gt=0)
+    screening_backtest_selection_limit: int | None = Field(default=None, gt=0)
+    portfolio_backtest_ticker_limit: int | None = Field(default=None, gt=0)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "DataSourceConfig":
@@ -101,12 +109,18 @@ class DataSourceConfig(BaseModel):
             l4_evidence_limit=_int_env(
                 env, AI_L4_EVIDENCE_LIMIT_ENV, DEFAULT_L4_EVIDENCE_LIMIT
             ),
-            screening_limit=_int_env(env, AI_SCREENING_LIMIT_ENV, DEFAULT_SCREENING_LIMIT),
+            screening_limit=_optional_int_env(env, AI_SCREENING_LIMIT_ENV),
             connect_timeout_seconds=_int_env(
                 env, AI_DB_CONNECT_TIMEOUT_SECONDS_ENV, DEFAULT_DB_CONNECT_TIMEOUT_SECONDS
             ),
             statement_timeout_ms=_int_env(
                 env, AI_DB_STATEMENT_TIMEOUT_MS_ENV, DEFAULT_DB_STATEMENT_TIMEOUT_MS
+            ),
+            screening_backtest_selection_limit=_optional_int_env(
+                env, AI_SCREENING_BACKTEST_SELECTION_LIMIT_ENV
+            ),
+            portfolio_backtest_ticker_limit=_optional_int_env(
+                env, AI_PORTFOLIO_BACKTEST_TICKER_LIMIT_ENV
             ),
         )
 
@@ -132,8 +146,24 @@ class PostgresPipelineDataSource:
         with self._connect() as conn:
             self._set_statement_timeout(conn)
             screening_candidates = []
+            ticker_resolution = "screening"
             if _query_requests_universe_screening(query):
                 screening_candidates = self._fetch_screening_candidates(conn, query)
+            single_ticker: str | None = None
+            if not screening_candidates:
+                single_ticker = self._resolve_ticker(conn, query)
+                if single_ticker is None:
+                    # Ambiguous query (no explicit ticker, no name match): retry as
+                    # an unfiltered universe screen instead of silently trading a
+                    # single hardcoded default ticker.
+                    screening_candidates = self._fetch_screening_candidates(conn, query)
+                    ticker_resolution = (
+                        "ambiguous_fallback_to_screening"
+                        if screening_candidates
+                        else "ambiguous_fallback_to_default_ticker"
+                    )
+                else:
+                    ticker_resolution = "explicit_or_name_match"
             if screening_candidates:
                 tickers, universe, price_rows, effective_lookback_days, selection_score = (
                     self._fetch_screening_portfolio_price_rows(
@@ -142,7 +172,7 @@ class PostgresPipelineDataSource:
                 )
                 ticker = tickers[0]
             else:
-                ticker = self._resolve_ticker(conn, query)
+                ticker = single_ticker or self.config.default_ticker
                 tickers = [ticker]
                 universe = self._fetch_universe_status(conn, ticker)
                 price_rows, effective_lookback_days = self._fetch_price_rows(
@@ -164,6 +194,7 @@ class PostgresPipelineDataSource:
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
+                "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [
                     TA_MOMENTUM_TICKER_TABLE,
@@ -186,19 +217,23 @@ class PostgresPipelineDataSource:
 
     def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
         profile = _screening_profile(query)
+        sector = extract_sector_from_query(query, get_known_sectors(conn=conn))
+        limit = self.config.screening_limit
+        params: list[Any] = []
+        if sector:
+            params.append(sector)
+        if limit is not None:
+            params.append(limit)
         rows = conn.execute(
-            _screening_sql(profile),
-            [
-                self.config.screening_limit,
-            ],
+            _screening_sql(profile, sector=sector, limit=limit), params
         ).fetchall()
-        return [_screening_candidate_from_row(row, profile) for row in rows]
+        return [_screening_candidate_from_row(row, profile, sector=sector) for row in rows]
 
     def _select_screening_backtest_candidate(
         self, conn: Any, screening_candidates: list[dict[str, Any]], query: str
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]], int, float]:
         best: tuple[float, str, dict[str, Any], list[dict[str, Any]], int] | None = None
-        for candidate in screening_candidates[:SCREENING_BACKTEST_SELECTION_LIMIT]:
+        for candidate in screening_candidates[: self.config.screening_backtest_selection_limit]:
             ticker = str(candidate["ticker"]).zfill(6)
             universe = self._fetch_universe_status(ticker=ticker, conn=conn)
             price_rows, effective_lookback_days = self._fetch_price_rows(
@@ -223,7 +258,7 @@ class PostgresPipelineDataSource:
         self, conn: Any, screening_candidates: list[dict[str, Any]], query: str
     ) -> tuple[list[str], dict[str, Any], list[dict[str, Any]], int, float]:
         ranked: list[tuple[float, str, dict[str, Any], list[dict[str, Any]], int]] = []
-        for candidate in screening_candidates[:SCREENING_BACKTEST_SELECTION_LIMIT]:
+        for candidate in screening_candidates[: self.config.screening_backtest_selection_limit]:
             ticker = str(candidate["ticker"]).zfill(6)
             universe = self._fetch_universe_status(conn, ticker)
             price_rows, effective_lookback_days = self._fetch_price_rows(
@@ -247,7 +282,7 @@ class PostgresPipelineDataSource:
             return [ticker], universe, price_rows, effective_lookback_days, score
 
         selected = sorted(ranked, key=lambda item: item[0], reverse=True)[
-            :PORTFOLIO_BACKTEST_TICKER_LIMIT
+            : self.config.portfolio_backtest_ticker_limit
         ]
         tickers = [item[1] for item in selected]
         combined_rows = [
@@ -275,12 +310,19 @@ class PostgresPipelineDataSource:
         timeout_value = f"{self.config.statement_timeout_ms}{POSTGRES_TIMEOUT_UNIT}"
         _ = conn.execute("SELECT set_config('statement_timeout', %s, true)", [timeout_value])
 
-    def _resolve_ticker(self, conn: Any, query: str) -> str:
+    def _resolve_ticker(self, conn: Any, query: str) -> str | None:
+        """Resolve a single explicit ticker for `query`, or None if ambiguous.
+
+        Returning None (instead of silently defaulting to
+        `self.config.default_ticker`) lets `load()` retry ambiguous queries as
+        an unfiltered universe screen rather than always trading the same
+        single hardcoded ticker.
+        """
         explicit_ticker = TICKER_PATTERN.search(query)
         if explicit_ticker:
             return explicit_ticker.group(0)
         if _has_broad_universe_reference(query) or _has_broad_screening_reference(query):
-            return self.config.default_ticker
+            return None
 
         rows = conn.execute(
             """
@@ -296,7 +338,7 @@ class PostgresPipelineDataSource:
                 return symbol.zfill(6)
             if name and name in query:
                 return symbol.zfill(6)
-        return self.config.default_ticker
+        return None
 
     def _fetch_price_rows(
         self, conn: Any, ticker: str, universe: Mapping[str, Any], query: str
@@ -464,7 +506,11 @@ def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
 def _query_requests_universe_screening(query: str) -> bool:
     return (
         TICKER_PATTERN.search(query) is None
-        and (_has_broad_universe_reference(query) or _has_broad_screening_reference(query))
+        and (
+            _has_broad_universe_reference(query)
+            or _has_broad_screening_reference(query)
+            or extract_sector_from_query(query) is not None
+        )
     )
 
 
@@ -483,7 +529,7 @@ def _screening_profile(query: str) -> str:
     return "technical_proxy"
 
 
-def _screening_sql(profile: str) -> str:
+def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None = None) -> str:
     where_clause = {
         "breakout_volume": (
             "close >= high_252 * 0.995 AND volume_ratio_20 >= 1.5 "
@@ -498,6 +544,7 @@ def _screening_sql(profile: str) -> str:
         ),
         "relative_strength": "relative_strength_20d >= 0 AND relative_strength_60d >= 0",
     }.get(profile, "technical_score > 0")
+    sector_predicate = "\n              AND u.sector = %s" if sector else ""
     return f"""
         WITH latest_date AS (
             SELECT max(time) AS as_of_date
@@ -510,6 +557,7 @@ def _screening_sql(profile: str) -> str:
                 u.name,
                 u.market,
                 u.market_segment,
+                u.sector,
                 p.adj_open AS open,
                 p.adj_high AS high,
                 p.adj_low AS low,
@@ -519,7 +567,7 @@ def _screening_sql(profile: str) -> str:
             JOIN meta.view_common_stock_universe u
               ON u.symbol = p.ticker
             WHERE p.time >= (SELECT as_of_date FROM latest_date) - INTERVAL '420 days'
-              AND (u.listing_status IS NULL OR u.listing_status = 'LISTED')
+              AND (u.listing_status IS NULL OR u.listing_status = 'LISTED'){sector_predicate}
         ),
         features AS (
             SELECT
@@ -617,11 +665,13 @@ def _screening_sql(profile: str) -> str:
         FROM scored
         WHERE {where_clause}
         ORDER BY technical_score DESC, turnover DESC NULLS LAST
-        LIMIT %s
+        {"LIMIT %s" if limit is not None else ""}
     """
 
 
-def _screening_candidate_from_row(row: Mapping[str, Any], profile: str) -> dict[str, Any]:
+def _screening_candidate_from_row(
+    row: Mapping[str, Any], profile: str, *, sector: str | None = None
+) -> dict[str, Any]:
     volume_ratio = _optional_float_value(row.get("volume_ratio_20"))
     relative_strength = _optional_float_value(row.get("relative_strength_20d"))
     close = _optional_float_value(row.get("close"))
@@ -629,6 +679,7 @@ def _screening_candidate_from_row(row: Mapping[str, Any], profile: str) -> dict[
         "ticker": str(row.get("ticker") or "").zfill(6),
         "name": row.get("name") or "",
         "market": row.get("market_segment") or row.get("market") or "KRX",
+        "sector": row.get("sector") or sector,
         "as_of_date": _date_value(row.get("time")).isoformat(),
         "screening_profile": profile,
         "score": _float_value(row.get("technical_score") or 0),
@@ -940,4 +991,11 @@ def _int_env(env: Mapping[str, str], key: str, default: int) -> int:
     value = env.get(key)
     if value is None or not value.strip():
         return default
+    return int(value)
+
+
+def _optional_int_env(env: Mapping[str, str], key: str) -> int | None:
+    value = env.get(key)
+    if value is None or not value.strip():
+        return None
     return int(value)
