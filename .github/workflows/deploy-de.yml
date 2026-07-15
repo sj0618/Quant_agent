@@ -1,0 +1,90 @@
+name: Deploy Data Engineering
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'DE/**'
+      - '.github/workflows/deploy-de.yml'
+
+concurrency:
+  group: quant-agent-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p 30233 quant-agent.kro.kr >> ~/.ssh/known_hosts
+
+      - name: Create deploy directory on server
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            "mkdir -p ~/mvp_sp1/quant-proj"
+
+      - name: Deploy via rsync
+        run: |
+          rsync -rlvz --delete \
+            --omit-dir-times \
+            --no-perms --no-owner --no-group \
+            --delete-excluded \
+            --exclude='.git/' \
+            --exclude='node_modules/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='**/__pycache__/' \
+            --exclude='**/*.pyc' \
+            --exclude='**/airflow.db' \
+            --exclude='**/logs/' \
+            --exclude='**/.pytest_cache/' \
+            --exclude='ai/.venv/' \
+            --exclude='DE/airflow/dags/logs/' \
+            --exclude='DE/airflow/dags/__pycache__/' \
+            -e "ssh -i ~/.ssh/id_rsa -p 30233" \
+            ./ \
+            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
+
+      - name: Deploy DE Environment File
+        run: |
+          cat << 'EOF' > de_env_temp.txt
+          ${{ secrets.DE_ENV_FILE_CONTENT }}
+          EOF
+          scp -i ~/.ssh/id_rsa -P 30233 de_env_temp.txt etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/DE/.env
+          rm de_env_temp.txt
+
+      - name: Restart Airflow (DE)
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+            set -euo pipefail
+
+            if [ -f "$HOME/.bashrc" ]; then
+              set +u
+              source "$HOME/.bashrc"
+              set -u
+            fi
+
+            APP_DIR="$HOME/mvp_sp1/quant-proj"
+            
+            echo "============================================="
+            echo "Deploying Data Engineering (Airflow) Stack..."
+            cd "$APP_DIR/DE"
+
+            export DOCKER_BUILDKIT=0
+            export COMPOSE_DOCKER_CLI_BUILD=0
+            
+            docker compose -f docker-compose-airflow-dev.yaml down
+            docker compose -f docker-compose-airflow-dev.yaml up -d --build
+            echo "Airflow containers restarted."
+            echo "============================================="
+          REMOTE
