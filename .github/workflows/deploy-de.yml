@@ -5,9 +5,12 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'DE/**'
+      - '.github/workflows/deploy-de.yml'
 
 concurrency:
-  group: deploy-to-quant-server
+  group: quant-agent-deploy
   cancel-in-progress: false
 
 jobs:
@@ -39,6 +42,9 @@ jobs:
             --exclude='.env' \
             --exclude='.env.*' \
             --exclude='airflow/logs/' \
+            --exclude='airflow/logs/**' \
+            --exclude='airflow/dags/logs/' \
+            --exclude='airflow/dags/logs/**' \
             --exclude='airflow/airflow.db' \
             --exclude='**/__pycache__/' \
             --exclude='**/*.pyc' \
