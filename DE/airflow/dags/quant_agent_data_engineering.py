@@ -39,13 +39,21 @@ def _load_airflow_dotenv() -> None:
     load_dotenv(dotenv_path=dotenv_path, override=False)
 
 
-import pendulum  # 1. 펜듈럼 임포트 추가
+try:  # pragma: no cover - installed with Airflow in production.
+    import pendulum
+except ImportError:  # Local import-safe fallback.
+    pendulum = None
+    from zoneinfo import ZoneInfo
 
 _load_airflow_dotenv()
 
 # 2. 한국 타임존 세팅 및 크론식에서 CRON_TZ 문구 제거 (순수 시간만 남김)
-LOCAL_TZ = pendulum.timezone("Asia/Seoul")
+LOCAL_TZ = pendulum.timezone("Asia/Seoul") if pendulum else ZoneInfo("Asia/Seoul")
 DEFAULT_DAILY_SCHEDULE = "0 4 * * *" 
+DEFAULT_PROMPT_RETENTION_SCHEDULE = "0 5 * * *"
+PROMPT_RETENTION_DAG_ID = "quant_agent_ai_prompt_retention"
+PROMPT_RETENTION_RETRIES = 3
+PROMPT_RETENTION_RETRY_DELAY = timedelta(minutes=5)
 
 DEFAULT_BACKFILL_SCHEDULE = os.getenv("QUANT_AIRFLOW_BACKFILL_SCHEDULE", None)
 
@@ -68,6 +76,7 @@ QA_CHECK_SCRIPT = Path(
 SYMBOL_METADATA_SCRIPT = Path(
     os.getenv("QUANT_AIRFLOW_SYMBOL_METADATA_SCRIPT", str(DE_ROOT / "scripts" / "refresh_symbol_metadata.py"))
 )
+PROMPT_RETENTION_SCRIPT = DE_ROOT / "scripts" / "purge_ai_prompt_logs.py"
 PYTHON_EXECUTABLE = os.getenv("QUANT_AIRFLOW_PYTHON", sys.executable)
 
 DEFAULT_BOK_RATE_FX_SERIES = (
@@ -245,29 +254,67 @@ if dag and task:  # pragma: no branch
 
         backfill_ohlcv()
 
+    @dag(
+        dag_id=PROMPT_RETENTION_DAG_ID,
+        description="Delete AI prompt and response content older than 90 days.",
+        schedule=DEFAULT_PROMPT_RETENTION_SCHEDULE,
+        start_date=DEFAULT_START_DATE,
+        catchup=False,
+        max_active_runs=1,
+        default_args={"retries": PROMPT_RETENTION_RETRIES, "retry_delay": PROMPT_RETENTION_RETRY_DELAY},
+        tags=["quant-agent", "ai", "retention"],
+    )
+    def ai_prompt_retention():
+        @task(task_id="purge_ai_prompt_logs")
+        def purge_ai_prompt_logs() -> dict:
+            return _run_python_script(PROMPT_RETENTION_SCRIPT, [])
+
+        purge_ai_prompt_logs()
+
     quant_agent_daily_data_engineering = daily_data_engineering()
     quant_agent_backfill_ohlcv_10y = backfill_ohlcv_10y()
+    quant_agent_ai_prompt_retention = ai_prompt_retention()
 
 
 def _target_date(logical_date) -> date:
     if logical_date:
-        # 1. datetime.datetime 객체인 경우 .date() 추출
+        # Airflow logical_date는 UTC 기준일 수 있으므로, 먼저 한국시간 기준 날짜로 맞춘다.
         if isinstance(logical_date, datetime):
-            return logical_date.date()
-        # 2. 순수 datetime.date 객체인 경우 그대로 반환
-        if isinstance(logical_date, date):
-            return logical_date
-        # 3. 문자열로 들어온 경우 안전하게 슬라이싱
-        if isinstance(logical_date, str):
-            return date.fromisoformat(logical_date[:10])
-        # 4. 그 외 Airflow/Pendulum 객체 대응
-        if hasattr(logical_date, "date"):
-            return logical_date.date()
-            
+            run_date = logical_date.astimezone(LOCAL_TZ).date() if logical_date.tzinfo else logical_date.replace(tzinfo=LOCAL_TZ).date()
+        elif isinstance(logical_date, date):
+            run_date = logical_date
+        elif isinstance(logical_date, str):
+            parsed = datetime.fromisoformat(logical_date)
+            run_date = parsed.astimezone(LOCAL_TZ).date() if parsed.tzinfo else parsed.date()
+        elif hasattr(logical_date, "date"):
+            candidate = logical_date.date()
+            run_date = candidate.astimezone(LOCAL_TZ).date() if isinstance(candidate, datetime) else candidate
+        else:
+            run_date = date.today()
+        
+        current_date_kst = datetime.now(LOCAL_TZ).date()
+        operator = "<" if run_date >= current_date_kst else "<="
+        
+        from quant_agent.data.repository import DataRepository
+
+        rows = DataRepository().executor.fetch_json(
+            f"""
+            SELECT MAX(trade_date)::text AS trade_date
+              FROM core.trading_calendar
+             WHERE market = 'KRX'
+               AND is_open = TRUE
+               AND trade_date {operator} DATE '{run_date.isoformat()}'
+            """
+        )
+        raw_trade_date = rows[0].get("trade_date") if rows else None
+        if not raw_trade_date:
+            raise ValueError(f"No KRX open trade date found {operator} {run_date.isoformat()}.")
+        return date.fromisoformat(str(raw_trade_date))
+
     try:  # pragma: no cover - Airflow context only exists inside task runtime.
         from airflow.operators.python import get_current_context
 
-        return get_current_context()["logical_date"].date()
+        return _target_date(get_current_context()["logical_date"])
     except (ImportError, KeyError, RuntimeError):
         return date.today()
 

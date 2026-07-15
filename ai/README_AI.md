@@ -41,6 +41,19 @@ AI_L4_EVIDENCE_LIMIT=5
 python3 -m uvicorn ai_graph.api:app --host "$AI_API_HOST" --port "$AI_API_PORT" --reload
 ```
 
+AI 운영 로그는 기본적으로 꺼져 있다. migration 013과 운영 DB 보안 검증을
+완료한 환경에서만 PostgreSQL sink를 활성화한다.
+
+```bash
+AI_AUDIT_SINK=postgres
+AI_AUDIT_CONNECT_TIMEOUT_SECONDS=2
+AI_AUDIT_STATEMENT_TIMEOUT_MS=2000
+```
+
+DSN은 `AI_DATABASE_DSN`, `QUANT_DB_DSN`, `DATABASE_URL` 순서로 선택된다.
+즉시 롤백은 `AI_AUDIT_SINK=noop`이다. migration, canary, 90일 삭제, TLS·backup
+검증은 [AI 로깅 운영 런북](docs/ai-logging-operations.md)을 따른다.
+
 AOAI Responses API는 opt-in이다. 기본값은 mock LLM이며, 아래 값이 모두 있을 때만
 `httpx` 기반 AOAI client를 사용한다.
 

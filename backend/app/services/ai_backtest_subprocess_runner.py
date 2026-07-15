@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -19,15 +20,35 @@ from app.schemas.ai_backtest import (
     GeneratedCodeResult,
 )
 
+_RELEASE_BYTE = b"\x01"
+_RELEASE_FAILURE_EXIT_CODE = 2
+
+
+def _await_release(release_fd: int) -> bool:
+    try:
+        if os.read(release_fd, 1) != _RELEASE_BYTE:
+            return False
+        return os.read(release_fd, 1) == b""
+    finally:
+        os.close(release_fd)
 
 def main(argv: list[str] | None = None) -> int:
     args = argv or sys.argv[1:]
-    if len(args) != 4:
-        raise SystemExit("usage: python -m app.services.ai_backtest_subprocess_runner <request.json> <generated_code.py> <result.json> <trace_id>")
+    if len(args) != 5:
+        raise SystemExit(
+            "usage: python -m app.services.ai_backtest_subprocess_runner "
+            "<request.json> <generated_code.py> <result.json> <trace_id> <release_fd>"
+        )
     request_path = Path(args[0])
     code_path = Path(args[1])
     result_path = Path(args[2])
     trace_id = UUID(args[3])
+    try:
+        release_fd = int(args[4])
+    except ValueError:
+        return _RELEASE_FAILURE_EXIT_CODE
+    if not _await_release(release_fd):
+        return _RELEASE_FAILURE_EXIT_CODE
 
     request = AICodeBacktestFlowRequest.model_validate_json(request_path.read_text(encoding="utf-8"))
     generated = GeneratedCodeResult(

@@ -165,6 +165,53 @@ def test_generated_backtest_supports_multi_ticker_portfolio_rows() -> None:
     assert result.selected_candidate.metrics is not None
 
 
+def test_generated_backtest_preserves_requested_position_limit_with_fewer_tickers() -> None:
+    strategy = make_strategy("multi-ticker-risk-limit", "Multi Ticker Risk Limit")
+    candidate = CodeCandidate(
+        candidate_id="multi-ticker-risk-a",
+        variant="A",
+        code="""def build_signals(prices):
+    return [
+        {
+            "date": row["date"],
+            "ticker": row["ticker"],
+            "action": "BUY" if row["date"] == "2026-01-02" else "HOLD",
+            "price": float(row["close"]),
+        }
+        for row in prices
+    ]
+""",
+        validation_ok=True,
+    )
+    price_rows = [
+        {
+            "date": row_date,
+            "ticker": ticker,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": 1_000_000,
+            "rsi": 20 if row_date == "2026-01-02" else 50,
+        }
+        for row_date in ("2026-01-02", "2026-01-05")
+        for ticker, price in (("000001", 10), ("000002", 20), ("000003", 30))
+    ]
+
+    result = run_candidate_backtest(strategy, [candidate], price_rows=price_rows)
+    audit = result.engine_summary["execution_audit"]
+    buys = [
+        event
+        for event in audit["recent_events"]
+        if event["status"] == "executed" and event["side"] == "buy"
+    ]
+
+    assert result.engine_summary["ai_backtest_context"]["requested_max_positions"] == 10
+    assert result.engine_summary["ai_backtest_context"]["applied_max_positions"] == 3
+    assert len(buys) == 3
+    assert all(event["price"] * event["quantity"] <= 100_000 for event in buys)
+
+
 def test_candidate_backtest_handles_single_price_row_without_metric_crash() -> None:
     strategy_a = make_strategy("single-row", "Single Row")
     candidates = [

@@ -56,6 +56,10 @@ def test_backtest_code_prompt_declares_expected_json_schema() -> None:
     schema = prompt_payload["expected_json_schema"]
 
     assert request.schema_name == "backtest_code_candidates.v1"
+    assert request.task_type == "backtest_code_generation"
+    assert request.prompt_template_name == "backtest_code_generation"
+    assert request.prompt_version == "v1"
+    assert request.variables_jsonb == prompt_payload
     assert "candidates" in schema["properties"]
     assert schema["properties"]["candidates"]["minItems"] == 3
     assert schema["properties"]["candidates"]["maxItems"] == 12

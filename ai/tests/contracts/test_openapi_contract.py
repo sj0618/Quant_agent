@@ -45,3 +45,16 @@ def test_openapi_analysis_job_result_uses_api_envelope_schema() -> None:
     result_schema = analysis_job["properties"]["result"]
 
     assert "APIEnvelope" in str(result_schema)
+
+
+def test_openapi_contract_does_not_expose_ai_logging_surfaces() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    paths = client.get(OPENAPI_URL).json()["paths"]
+    forbidden_fragments = ("/logs", "/audit", "/observability", "/metrics", "/admin")
+
+    assert not {
+        path
+        for path in paths
+        if any(fragment in path.lower() for fragment in forbidden_fragments)
+    }

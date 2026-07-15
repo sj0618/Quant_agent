@@ -9,7 +9,15 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ai_graph.audit import AuditSession, AuditSink, NoOpAuditSink, create_audit_correlation
+from ai_graph.audit import (
+    AuditSession,
+    AuditSink,
+    NoOpAuditSink,
+    bind_audit_context,
+    create_audit_correlation,
+    report_audit_failure,
+)
+from ai_graph.audit_postgres import resolve_audit_sink
 from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
     BOK_MACRO_VIEW,
@@ -201,51 +209,59 @@ def _build_analysis_runner_with_audit(
     user_id: str | None = None,
     session_id: str | None = None,
 ) -> AnalysisRunner:
-    session = _open_request_audit_session(
-        audit_sink,
-        trace_id=trace_id,
-        entrypoint=entrypoint,
-        feature=feature,
-        strategy_id=strategy_id,
-        client_request_id=client_request_id,
-        user_id=user_id,
-        session_id=session_id,
-    )
-
     def runner(query: str, trace_id: str) -> APIEnvelope:
-        _record_step(session, "job_dispatched", message="analysis request dispatched")
-        if analysis_runner is run_analysis:
-            return run_analysis(
-                query,
-                trace_id,
-                audit_session=session,
-                audit_entrypoint=entrypoint,
-                audit_feature=feature,
-                strategy_id=strategy_id,
-                client_request_id=client_request_id,
-                user_id=user_id,
-                session_id=session_id,
-            )
-        _record_step(session, "analysis_started", message="analysis runner execution started")
-        try:
-            envelope = analysis_runner(query, trace_id)
-        except Exception as exc:
-            _record_error(
-                session,
-                "analysis_execution",
-                error_type=type(exc).__name__,
-                message=f"{type(exc).__name__} raised during analysis runner execution",
-            )
-            _record_finalization(session, "failed", message="analysis runner execution failed")
-            raise
-        status_label = envelope.status.value
-        _record_step(session, "analysis_completed", message=f"analysis runner returned status={status_label}")
-        _record_finalization(
-            session,
-            "failed" if envelope.status == EnvelopeStatus.FAILED else "completed",
-            message=f"analysis runner completed with status={status_label}",
+        session = _open_request_audit_session(
+            audit_sink,
+            trace_id=trace_id,
+            entrypoint=entrypoint,
+            feature=feature,
+            strategy_id=strategy_id,
+            client_request_id=client_request_id,
+            user_id=user_id,
+            session_id=session_id,
         )
-        return envelope
+        _record_step(session, "job_dispatched", message="analysis request dispatched")
+        with bind_audit_context(session):
+            if analysis_runner is run_analysis:
+                return run_analysis(
+                    query,
+                    trace_id,
+                    audit_session=session,
+                    audit_entrypoint=entrypoint,
+                    audit_feature=feature,
+                    strategy_id=strategy_id,
+                    client_request_id=client_request_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+            _record_step(session, "analysis_started", message="analysis runner execution started")
+            try:
+                envelope = analysis_runner(query, trace_id)
+            except Exception as exc:
+                _record_error(
+                    session,
+                    "analysis_execution",
+                    error_type=type(exc).__name__,
+                    message=f"{type(exc).__name__} raised during analysis runner execution",
+                )
+                _record_finalization(session, "failed", message="analysis runner execution failed")
+                raise
+            status_label = envelope.status.value
+            _record_step(
+                session,
+                "analysis_completed",
+                message=f"analysis runner returned status={status_label}",
+            )
+            _record_finalization(
+                session,
+                "failed" if envelope.status == EnvelopeStatus.FAILED else "completed",
+                message=f"analysis runner completed with status={status_label}",
+                metadata_jsonb={
+                    "debug_ref": envelope.debug_ref,
+                    "public_trace_id": envelope.trace_id,
+                },
+            )
+            return envelope
 
     return runner
 
@@ -271,10 +287,11 @@ def _open_request_audit_session(
         user_id=user_id,
         session_id=session_id,
     )
-    sink = audit_sink or NoOpAuditSink()
+    sink = resolve_audit_sink(audit_sink)
     try:
         return sink.open_session(correlation)
     except Exception:
+        report_audit_failure("open_session")
         return NoOpAuditSink().open_session(correlation)
 
 
@@ -282,7 +299,7 @@ def _record_step(session: AuditSession, step: str, *, message: str | None = None
     try:
         session.record_step(step, message=message)
     except Exception:
-        return None
+        report_audit_failure("record_step")
 
 
 def _record_error(
@@ -295,14 +312,20 @@ def _record_error(
     try:
         session.record_error(step, error_type=error_type, message=message)
     except Exception:
-        return None
+        report_audit_failure("record_error")
 
 
-def _record_finalization(session: AuditSession, status: str, *, message: str | None = None) -> None:
+def _record_finalization(
+    session: AuditSession,
+    status: str,
+    *,
+    message: str | None = None,
+    metadata_jsonb: dict[str, object] | None = None,
+) -> None:
     try:
-        session.record_finalization(status, message=message)
+        session.record_finalization(status, message=message, metadata_jsonb=metadata_jsonb)
     except Exception:
-        return None
+        report_audit_failure("record_finalization")
 
 
 def create_app(
@@ -333,7 +356,7 @@ def create_app(
         )
     app.state.job_store = store
     app.state.job_store_runtime = runtime
-    app.state.audit_sink = audit_sink or NoOpAuditSink()
+    app.state.audit_sink = resolve_audit_sink(audit_sink)
     app.state.report_resolver = report_resolver
 
     @app.get(HEALTH_PATH, response_model=HealthResponse, tags=["System"])
@@ -413,37 +436,38 @@ def create_app(
         )
         _record_step(session, "descriptions_started", message=f"strategy_count={len(request.strategies)}")
         try:
-            items: list[StrategyDescriptionItem] = []
-            for strategy in request.strategies:
-                payload = generate_strategy_description(
-                    strategy_id=strategy.strategy_id,
-                    name=strategy.name,
-                    universe=strategy.universe,
-                    timeframe=strategy.timeframe,
-                    entry_summary=strategy.entry_summary,
-                    exit_summary=strategy.exit_summary,
-                    risk_summary=strategy.risk_summary,
-                    tags=strategy.tags,
-                    fallback=(
-                        f"{strategy.universe} 내에서 {strategy.entry_summary} 조건이 맞는 종목을 선별하고 "
-                        f"{strategy.exit_summary} 기준으로 정리하는 전략입니다."
-                    ),
-                )
-                items.append(
-                    StrategyDescriptionItem(
-                        strategy_id=payload.strategy_id,
-                        description=payload.description,
-                        fallback_reasons=payload.fallback_reasons,
+            with bind_audit_context(session):
+                items: list[StrategyDescriptionItem] = []
+                for strategy in request.strategies:
+                    payload = generate_strategy_description(
+                        strategy_id=strategy.strategy_id,
+                        name=strategy.name,
+                        universe=strategy.universe,
+                        timeframe=strategy.timeframe,
+                        entry_summary=strategy.entry_summary,
+                        exit_summary=strategy.exit_summary,
+                        risk_summary=strategy.risk_summary,
+                        tags=strategy.tags,
+                        fallback=(
+                            f"{strategy.universe} 내에서 {strategy.entry_summary} 조건이 맞는 종목을 선별하고 "
+                            f"{strategy.exit_summary} 기준으로 정리하는 전략입니다."
+                        ),
                     )
-                )
-                _record_step(
-                    session,
-                    "description_generated",
-                    message=(
-                        f"strategy_id={payload.strategy_id} "
-                        f"fallback_used={'true' if payload.fallback_reasons else 'false'}"
-                    ),
-                )
+                    items.append(
+                        StrategyDescriptionItem(
+                            strategy_id=payload.strategy_id,
+                            description=payload.description,
+                            fallback_reasons=payload.fallback_reasons,
+                        )
+                    )
+                    _record_step(
+                        session,
+                        "description_generated",
+                        message=(
+                            f"strategy_id={payload.strategy_id} "
+                            f"fallback_used={'true' if payload.fallback_reasons else 'false'}"
+                        ),
+                    )
         except Exception as exc:
             _record_error(
                 session,
@@ -532,11 +556,12 @@ def create_app(
         )
         _record_step(session, "daily_digest_started", message=f"strategy_count={len(request.strategies)}")
         try:
-            report = build_daily_digest(
-                request.strategies,
-                user_name=request.user_name,
-                report_date=request.report_date,
-            )
+            with bind_audit_context(session):
+                report = build_daily_digest(
+                    request.strategies,
+                    user_name=request.user_name,
+                    report_date=request.report_date,
+                )
         except ValueError as exc:
             _record_error(
                 session,

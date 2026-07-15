@@ -16,7 +16,8 @@ from ai_graph.api import (
     STRATEGY_DESCRIPTIONS_PATH,
     create_app,
 )
-from ai_graph.audit import RecordingAuditSink
+from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
+from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import InMemoryAnalysisJobStore
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, Stage, UserPayload
 
@@ -180,7 +181,8 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
 
 def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adapters() -> None:
     store = InMemoryAnalysisJobStore()
-    client = TestClient(create_app(store))
+    sink = RecordingAuditSink()
+    client = TestClient(create_app(store, audit_sink=_create_test_audit_sink(sink)))
 
     create_response = client.post(
         SPEC_STRATEGY_PARSE_PATH,
@@ -214,6 +216,11 @@ def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adap
     assert report_response.json()["status"] == "ready"
     assert report_response.json()["user_payload"]["report"]["web_projection"]["sections"]
 
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert len(session.model_calls) == len(session.prompt_logs) == 10
+    assert all(call.execution_id is not None for call in session.model_calls)
+
 
 def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:
     client = TestClient(create_app(InMemoryAnalysisJobStore()))
@@ -245,7 +252,7 @@ def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:
 
 def test_strategy_descriptions_route_records_per_item_audit_steps() -> None:
     sink = RecordingAuditSink()
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     response = client.post(
         STRATEGY_DESCRIPTIONS_PATH,
@@ -292,6 +299,8 @@ def test_strategy_descriptions_route_records_per_item_audit_steps() -> None:
     assert "strategy_id=semiconductor-momentum" in session.buffered_events[1].message
     assert "strategy_id=dividend-defensive" in session.buffered_events[2].message
     assert session.buffered_events[-1].status == "completed"
+    assert len(session.model_calls) == len(session.prompt_logs) == 2
+    assert all(call.execution_id is None for call in session.model_calls)
 
 
 def test_strategy_descriptions_route_records_sanitized_error_audit_events(monkeypatch) -> None:
@@ -301,7 +310,7 @@ def test_strategy_descriptions_route_records_sanitized_error_audit_events(monkey
         raise RuntimeError("description generation exploded with raw request details")
 
     monkeypatch.setattr("ai_graph.api.generate_strategy_description", failing_generate_strategy_description)
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     with pytest.raises(RuntimeError, match="description generation exploded with raw request details"):
         client.post(
@@ -335,7 +344,7 @@ def test_strategy_descriptions_route_records_sanitized_error_audit_events(monkey
     assert session.buffered_events[-1].status == "failed"
 def test_daily_digest_route_records_success_audit_steps() -> None:
     sink = RecordingAuditSink()
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     response = client.post(
         DAILY_DIGEST_PATH,
@@ -368,6 +377,8 @@ def test_daily_digest_route_records_success_audit_steps() -> None:
     assert "strategy_id=rsi" in session.buffered_events[1].message
     assert "strategy_id=macd" in session.buffered_events[2].message
     assert session.buffered_events[-1].status == "completed"
+    assert len(session.model_calls) == len(session.prompt_logs) == 4
+    assert all(call.execution_id is None for call in session.model_calls)
 
 
 def test_report_route_uses_injected_report_resolver_for_real_report_ids() -> None:
@@ -408,7 +419,7 @@ def test_daily_digest_route_records_sanitized_error_audit_events(monkeypatch) ->
         raise ValueError("daily digest exploded with raw request details")
 
     monkeypatch.setattr("ai_graph.api.build_daily_digest", failing_build_daily_digest)
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     response = client.post(
         DAILY_DIGEST_PATH,
@@ -475,7 +486,7 @@ def test_analysis_job_route_uses_injected_store_and_preserves_polling_contract()
 
 def test_analysis_job_route_records_audit_events_with_real_runner() -> None:
     sink = RecordingAuditSink()
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=sink))
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
     response = client.post(
         ANALYSIS_JOBS_PATH,
@@ -503,6 +514,100 @@ def test_analysis_job_route_records_audit_events_with_real_runner() -> None:
     assert session.buffered_events[-1].status == "completed"
     assert created_job["result"]["trace_id"] == created_job["trace_id"]
     assert "internal_payload" not in created_job["result"]
+    assert len(session.model_calls) == len(session.prompt_logs) == 10
+    assert all(call.execution_id is not None for call in session.model_calls)
+
+
+def test_analysis_audit_session_opens_only_after_job_runner_entry(monkeypatch) -> None:
+    sink = RecordingAuditSink()
+
+    def fail_before_runner(*args, **kwargs):
+        raise RuntimeError("job store failed before runner")
+
+    monkeypatch.setattr("ai_graph.api.run_job_sync", fail_before_runner)
+    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
+
+    with pytest.raises(RuntimeError, match="job store failed before runner"):
+        client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI strategy"})
+
+    assert sink.sessions == ()
+
+
+def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys) -> None:
+    class FailingOpenAuditSink:
+
+        def open_session(self, correlation):
+            raise RuntimeError("postgresql://user:secret@db must not leak")
+
+    def client(audit_sink):
+        return TestClient(
+            create_app(
+                InMemoryAnalysisJobStore(),
+                analysis_runner=lambda query, trace_id: _ready_envelope(trace_id),
+                audit_sink=audit_sink,
+            )
+        )
+
+    normal = client(NoOpAuditSink())
+    broken = client(_create_test_audit_sink(FailingOpenAuditSink()))
+
+    def stable_job_payload(response):
+        body = response.json()
+        result = dict(body["result"])
+        result.pop("trace_id")
+        result.pop("debug_ref")
+        return result, [(stage["stage"], stage["status"]) for stage in body["stages"]]
+
+    job_payloads = [
+        (ANALYSIS_JOBS_PATH, {"query": "RSI strategy"}),
+        (
+            SPEC_STRATEGY_PARSE_PATH,
+            {
+                "natural_language": "RSI strategy",
+                "strategy_id": "rsi",
+                "client_request_id": "request-1",
+            },
+        ),
+    ]
+    for path, payload in job_payloads:
+        normal_response = normal.post(path, json=payload)
+        broken_response = broken.post(path, json=payload)
+        assert broken_response.status_code == normal_response.status_code
+        assert stable_job_payload(broken_response) == stable_job_payload(normal_response)
+
+    descriptions_payload = {
+        "strategies": [
+            {
+                "strategy_id": "rsi",
+                "name": "RSI",
+                "universe": "KOSPI200",
+                "timeframe": "daily",
+                "entry_summary": "RSI 30 이하",
+                "exit_summary": "RSI 70 이상",
+                "risk_summary": "시장 급락",
+                "tags": ["RSI"],
+            }
+        ]
+    }
+    normal_response = normal.post(STRATEGY_DESCRIPTIONS_PATH, json=descriptions_payload)
+    broken_response = broken.post(STRATEGY_DESCRIPTIONS_PATH, json=descriptions_payload)
+    assert broken_response.status_code == normal_response.status_code
+    assert broken_response.json() == normal_response.json()
+
+    digest_payload = {
+        "user_name": "홍길동",
+        "report_date": "2026-07-13",
+        "strategies": [_daily_digest_strategy_payload("rsi", "RSI", "BUY")],
+    }
+    normal_response = normal.post(DAILY_DIGEST_PATH, json=digest_payload)
+    broken_response = broken.post(DAILY_DIGEST_PATH, json=digest_payload)
+    assert broken_response.status_code == normal_response.status_code
+    assert broken_response.json() == normal_response.json()
+
+    stderr = capsys.readouterr().err
+    assert stderr.count("ai_audit_failure") == 4
+    assert "postgresql://" not in stderr
+    assert "secret" not in stderr
 
 
 def test_parse_strategy_route_records_failure_audit_events_with_request_metadata() -> None:
@@ -515,7 +620,7 @@ def test_parse_strategy_route_records_failure_audit_events_with_request_metadata
         create_app(
             InMemoryAnalysisJobStore(),
             analysis_runner=failing_runner,
-            audit_sink=sink,
+            audit_sink=_create_test_audit_sink(sink),
         )
     )
 

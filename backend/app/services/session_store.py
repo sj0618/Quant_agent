@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from dataclasses import dataclass
+from uuid import UUID, uuid4
 
 from app.core.config import Settings, redact_secrets
 from app.core.errors import AppError
 from app.core.security import generate_token_urlsafe
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedSessionContext:
+    user_id: int
+    redis_session_id: str
+    scope_family_id: UUID
 
 
 class AuthSessionStore:
@@ -68,7 +77,7 @@ class AuthSessionStore:
         csrf_token = generate_token_urlsafe(32)
         await self._set_json(
             self.session_key(session_id),
-            {"user_id": str(user_id)},
+            {"user_id": str(user_id), "scope_family_id": str(uuid4())},
             ttl_seconds=self.settings.auth_session_ttl_seconds,
         )
         await self._set_json(
@@ -86,6 +95,24 @@ class AuthSessionStore:
             return None
         user_id = payload.get("user_id")
         return str(user_id) if user_id else None
+    async def get_authenticated_session_context(self, session_id: str | None) -> AuthenticatedSessionContext | None:
+        if not session_id:
+            return None
+        payload = await self._get_json(self.session_key(session_id))
+        if not isinstance(payload, dict):
+            return None
+        try:
+            user_id = int(payload["user_id"])
+            scope_family_id = UUID(str(payload["scope_family_id"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if user_id <= 0:
+            return None
+        return AuthenticatedSessionContext(
+            user_id=user_id,
+            redis_session_id=session_id,
+            scope_family_id=scope_family_id,
+        )
 
     async def get_csrf_token(self, session_id: str | None) -> str | None:
         if not session_id:

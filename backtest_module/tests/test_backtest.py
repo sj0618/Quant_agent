@@ -41,7 +41,11 @@ def rsi_spec() -> StrategySpec:
         entry_rules=[Condition(left="rsi_14", operator=ConditionOperator.LTE, right=30, description="RSI <= 30")],
         exit_rules=[Condition(left="rsi_14", operator=ConditionOperator.GTE, right=70, description="RSI >= 70")],
         position_sizing=PositionSizing(max_positions=1),
-        risk_controls=RiskControls(stop_loss_pct=0.5, take_profit_pct=None),
+        risk_controls=RiskControls(
+            max_single_position_pct=1.0,
+            stop_loss_pct=0.5,
+            take_profit_pct=None,
+        ),
         backtest={"cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump()},
     )
 
@@ -89,6 +93,97 @@ def test_conservative_daily_engine_fills_next_open_and_records_trade():
         "executed",
     ]
     assert [event.side for event in result.order_audit] == ["buy", "buy", "sell", "sell"]
+
+
+def test_multi_ticker_buys_respect_single_and_gross_exposure_limits():
+    tickers = ("000001", "000002", "000003")
+    trade_dates = (date(2026, 1, 2), date(2026, 1, 5))
+    result = run_backtest(
+        StrategySpec(
+            strategy_id="multi_ticker_risk_limits",
+            strategy_name="Multi Ticker Risk Limits",
+            entry_rules=[Condition(left="rsi_14", operator=ConditionOperator.LTE, right=30)],
+            exit_rules=[Condition(left="rsi_14", operator=ConditionOperator.GTE, right=70)],
+            position_sizing=PositionSizing(max_positions=3),
+            risk_controls=RiskControls(
+                max_gross_exposure_pct=0.5,
+                max_single_position_pct=0.2,
+                stop_loss_pct=0.5,
+            ),
+            backtest={"cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump()},
+        ),
+        ohlcv_rows=[
+            OhlcvBar(date=day, ticker=ticker, open=10, high=10, low=10, close=10, volume=1000)
+            for day in trade_dates
+            for ticker in tickers
+        ],
+        metric_rows=[
+            {
+                "date": day.isoformat(),
+                "ticker": ticker,
+                "rsi_14": 20 if day == trade_dates[0] else 50,
+            }
+            for day in trade_dates
+            for ticker in tickers
+        ],
+        config=BacktestRunConfig(
+            initial_capital=1000,
+            write_outputs=False,
+            talib=TalibIndicatorConfig(enabled=False, mode="none"),
+        ),
+    )
+
+    buys = [event for event in result.order_audit if event.status == "executed" and event.side == "buy"]
+
+    assert len(buys) == 3
+    assert all(event.price * event.quantity <= 200 for event in buys)
+    assert result.equity_curve[-1].positions_value <= 500
+
+
+def test_full_krx_universe_of_2000_tickers_runs():
+    tickers = tuple(f"{index:06d}" for index in range(1, 2001))
+    trade_dates = (date(2026, 1, 2), date(2026, 1, 5))
+    initial_capital = 100_000_000
+    result = run_backtest(
+        StrategySpec(
+            strategy_id="full_krx_universe",
+            strategy_name="Full KRX Universe",
+            entry_rules=[Condition(left="rsi_14", operator=ConditionOperator.LTE, right=30)],
+            exit_rules=[Condition(left="rsi_14", operator=ConditionOperator.GTE, right=70)],
+            position_sizing=PositionSizing(max_positions=len(tickers)),
+            risk_controls=RiskControls(
+                max_gross_exposure_pct=1.0,
+                max_single_position_pct=1 / len(tickers),
+                stop_loss_pct=0.5,
+            ),
+            backtest={"cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump()},
+        ),
+        ohlcv_rows=[
+            OhlcvBar(date=day, ticker=ticker, open=100, high=100, low=100, close=100, volume=1000)
+            for day in trade_dates
+            for ticker in tickers
+        ],
+        metric_rows=[
+            {
+                "date": day.isoformat(),
+                "ticker": ticker,
+                "rsi_14": 20 if day == trade_dates[0] else 50,
+            }
+            for day in trade_dates
+            for ticker in tickers
+        ],
+        config=BacktestRunConfig(
+            initial_capital=initial_capital,
+            write_outputs=False,
+            talib=TalibIndicatorConfig(enabled=False, mode="none"),
+        ),
+    )
+
+    buys = [event for event in result.order_audit if event.status == "executed" and event.side == "buy"]
+
+    assert len(buys) == len(tickers)
+    assert result.summary["open_positions"] == len(tickers)
+    assert result.summary["final_equity"] == initial_capital
 
 
 def test_missing_required_metric_excludes_ticker_from_run():

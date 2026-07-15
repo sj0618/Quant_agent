@@ -4,7 +4,7 @@ from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 ExecutionMode = Literal["engine", "ai_generated_code"]
 AICodeStatus = Literal["generated", "validated", "rejected", "executed", "failed"]
@@ -276,6 +276,8 @@ class ModelCallLogBundle(BaseModel):
     provider_request_id: str | None = None
     model_name: str | None = None
     temperature: float | None = None
+    response_schema_name: str | None = None
+    web_search_used: bool = False
     top_p: float | None = None
     seed: int | None = None
     prompt_tokens: int | None = None
@@ -287,8 +289,9 @@ class ModelCallLogBundle(BaseModel):
     cache_hit: bool = False
     tool_calls_jsonb: list[Any] = Field(default_factory=list)
     status: str = Field(default="succeeded", min_length=1)
+    error_type: str | None = None
     error_message: str | None = None
-    prompt_log: PromptLogBundle | None = None
+    prompt_log: PromptLogBundle
 
 
 class AIBacktestReportDraft(BaseModel):
@@ -395,15 +398,77 @@ class CodeExecutionResult(BaseModel):
     started_at: datetime | None = None
     ended_at: datetime | None = None
     backtest_result: BacktestResultPayload | None = None
+class AIBacktestExecutionContext(BaseModel):
+    """Authenticated server-bound identity; never accepted from the public body."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    user_id: int = Field(gt=0)
+    scope_family_id: UUID
+    session_hmac: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    session_hmac_version: str = Field(min_length=1, max_length=64)
+
+
+class AIBacktestRequestClaim(BaseModel):
+    """Durable claim result used internally by the synchronous execution owner."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID
+    trace_id: UUID | None = None
+    state: str
+    safety_lease: str
+    state_version: int
+    terminal_response: dict[str, Any] | None = None
+class AIBacktestReplacementApproval(BaseModel):
+    """Operator-issued, single-use authorization for a closed request replacement."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    approval_id: UUID
+    source_request_id: UUID
+    scope_family_id: UUID
+    fingerprint_version: str
+    payload_fingerprint: str
+    approval_token: SecretStr = Field(min_length=43, max_length=128)
+    expires_at: datetime
+
+
+
+
+class AICodeBacktestPublicRequest(BaseModel):
+    """Public intent DTO; execution identity is bound from the authenticated session."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    natural_language_prompt: str = Field(min_length=1)
+    parsed_strategy_jsonb: dict[str, Any] = Field(default_factory=dict)
+    parse_confidence: float | None = None
+    parse_model_name: str | None = None
+    strategy_id: str | None = None
+    target_runtime: str = Field(min_length=1)
+    code_purpose: str = Field(min_length=1)
+    benchmark_ticker: str | None = None
+    data_source: str | None = None
+    report_model_name: str | None = None
+    timeout_seconds: int = Field(default=300, gt=0)
+    memory_limit_mb: int = Field(default=512, gt=0)
+
 
 
 class AICodeBacktestFlowRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     user_id: int | None = None
     session_id: UUID | None = None
     source_message_id: UUID | None = None
     trace_id: UUID | None = None
+    execution_context: AIBacktestExecutionContext | None = None
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._~-]+$")
+    request_fingerprint: str | None = Field(default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    fingerprint_version: str | None = Field(default=None, min_length=1, max_length=64)
+    replacement_approval_id: UUID | None = None
+    replacement_approval_token: SecretStr | None = Field(default=None, min_length=43, max_length=128)
     natural_language_prompt: str = Field(min_length=1)
     parsed_strategy_jsonb: dict[str, Any] = Field(default_factory=dict)
     parse_confidence: float | None = None
@@ -430,3 +495,28 @@ class AICodeBacktestFlowResult(BaseModel):
     report_id: UUID | None = None
     code_status: AICodeStatus
     execution_status: CodeExecutionStatus | None = None
+class AIBacktestRunningResponse(BaseModel):
+    """Safe response for an idempotent request that is still executing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID
+    trace_id: UUID | None = None
+    state: Literal[
+        "claimed",
+        "generation_in_progress",
+        "execution_armed",
+        "execution_outcome_unknown",
+        "execution_released",
+    ]
+
+
+class AIBacktestErrorResponse(BaseModel):
+    """Stable public error envelope for allowlisted backtest failures."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    trace_id: UUID | None = None
+    details: dict[str, Any] | None = None
