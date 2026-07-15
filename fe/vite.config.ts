@@ -8,6 +8,7 @@ export default defineConfig({
     port: 18000,
     allowedHosts: [
       "quant-agent.kro.kr",
+      "qt-agent.kro.kr",
     ],
     proxy: {
       "/ai-api": {
