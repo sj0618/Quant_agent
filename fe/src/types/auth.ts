@@ -2,7 +2,7 @@ export interface AuthUser {
   id: string;
   name: string;
   email: string;
-  provider: "google" | "test";
+  provider: "google";
   avatarUrl?: string;
 }
 
