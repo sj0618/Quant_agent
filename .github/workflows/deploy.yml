@@ -47,7 +47,7 @@ jobs:
 
       - name: Deploy via rsync
         run: |
-          rsync -rlvz --delete \
+          rsync -rlvvz --delete --stats \
             --old-args \
             --omit-dir-times \
             --no-perms --no-owner --no-group \
@@ -60,7 +60,7 @@ jobs:
             --exclude='**/logs/' \
             --exclude='**/.pytest_cache/' \
             --exclude='ai/.venv/' \
-            -e "ssh -i ~/.ssh/id_rsa -p 30233" \
+            -e "ssh -v -i ~/.ssh/id_rsa -p 30233" \
             ./ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
 
