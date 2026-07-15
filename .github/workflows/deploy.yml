@@ -53,7 +53,6 @@ jobs:
           rsync -rlvz --delete \
             --omit-dir-times \
             --no-perms --no-owner --no-group \
-            --delete-excluded \
             --exclude='.git/' \
             --exclude='node_modules/' \
             --exclude='.env' \
