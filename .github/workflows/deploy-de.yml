@@ -38,7 +38,6 @@ jobs:
           rsync -rlvz --delete \
             --omit-dir-times \
             --no-perms --no-owner --no-group \
-            --delete-excluded \
             --exclude='.env' \
             --exclude='.env.*' \
             --exclude='airflow/logs/' \
