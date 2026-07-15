@@ -21,7 +21,9 @@ service_db/
 ├── migrations/
 │   ├── 011_app_ai_backtest_erd.sql
 │   ├── 013_ai_runtime_logging.sql
-│   └── 014_create_report_email_tables.sql
+│   ├── 014_create_report_email_tables.sql
+│   ├── 015_ai_backtest_execution_process_identity.sql
+│   └── 016_ai_backtest_idempotency.sql
 ├── scripts/
 │   └── apply_migrations.ps1
 ├── tests/
@@ -55,6 +57,18 @@ service_db/
 
 이메일 리포트는 `strategy_id`를 필수로 참조하고, 생성 근거를 추적할 수 있도록 `backtest_run_id`와 `ai_report_id`를 선택적으로 참조한다. 화면 재현을 위한 `performance_jsonb`는 당시 표시값의 snapshot으로 유지한다.
 
+### `015_ai_backtest_execution_process_identity.sql`
+
+백테스트 하위 프로세스를 안전하게 추적할 수 있도록 실행 시도 ID, worker host, PID, process group ID, 시작 시각을 `app.code_execution_run`에 추가한다.
+
+### `016_ai_backtest_idempotency.sql`
+
+동일한 AI 백테스트 요청의 중복 실행을 차단하고 실행 결과가 불명확한 요청을 안전하게 격리하기 위한 요청 lease와 대체 실행 승인 정보를 저장한다.
+
+## 공용 서버 적용 상태
+
+2026-07-15 공용 서버 `qt_db`의 기존 `app` 스키마를 정리한 뒤 저장소에 존재하는 service DB migration `011`, `013`, `014`, `015`, `016`을 순서대로 적용했다. `012` migration 파일은 이 저장소에 없으며 적용 대상이 아니다.
+
 ## 로컬 실행
 
 로컬 TimescaleDB는 기존 `DE/compose.yaml`의 `db` 서비스를 재사용한다. service_db가 별도 DB 컨테이너를 만들지는 않는다.
@@ -79,10 +93,25 @@ SELECT
     to_regclass('app.backtest_run'),
     to_regclass('app.ai_model_call_log'),
     to_regclass('app.strategy_email_report'),
-    to_regclass('app.email_delivery_history');
-```
+    to_regclass('app.email_delivery_history'),
+    to_regclass('app.ai_backtest_request'),
+    to_regclass('app.ai_backtest_replacement_approval');
 
-테이블이 생성되어 있으면 각 열에 정규화된 테이블 이름이 표시되고, 없으면 `NULL`이 표시된다.
+SELECT
+    column_name
+FROM information_schema.columns
+WHERE table_schema = 'app'
+  AND table_name = 'code_execution_run'
+  AND column_name IN (
+      'attempt_id',
+      'worker_host',
+      'worker_pid',
+      'worker_pgid',
+      'worker_started_at'
+  )
+ORDER BY column_name;
+```
+첫 번째 조회에서는 각 테이블의 정규화된 이름이 표시되어야 한다. 두 번째 조회에서는 process identity 컬럼 5개가 모두 표시되어야 한다.
 
 정적 계약 테스트:
 
@@ -92,9 +121,9 @@ python -m unittest discover -s service_db/tests -p "test_*.py"
 
 ## 적용 시 주의사항
 
-- PR merge만으로 공용 서버 DB에 migration을 자동 적용하지 않는다.
-- 서버 적용 전 대상 DB, 백업, 적용 파일과 시간을 팀에서 합의한다.
-- 로컬에서 기존 DE 011을 이미 적용한 경우 `001`을 다시 실행하지 말고 적용 완료 baseline으로 취급한다.
+- 공용 서버 `qt_db`에는 2026-07-15 기준 `011`, `013`, `014`, `015`, `016`이 적용되어 있다. 재적용 전 실제 스키마와 migration 이력을 먼저 대조한다.
+- 이후 migration은 대상 DB, 백업, 적용 파일과 시간을 팀에서 합의한 뒤 수동 적용한다.
+- 로컬에서 기존 DE 011을 이미 적용한 경우 `011`을 다시 실행하지 말고 적용 완료 baseline으로 취급한다.
 - migration 파일명만이 아니라 `DE/...` 또는 `service_db/...` 전체 경로를 적용 이력의 식별자로 사용해야 한다.
 - 비밀번호, DSN, API key와 `.env` 값은 저장소에 커밋하지 않는다.
 - 운영 로그 저장 활성화 전 서버 DB의 TLS 연결을 구성하고 검증한다.
