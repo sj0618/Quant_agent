@@ -62,6 +62,24 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         self.assertNotIn("TRUNCATE ", upper_sql)
 
 
+    def test_execution_process_identity_migration_is_additive_and_idempotent(self):
+        sql = (
+            SERVICE_DB_ROOT
+            / "migrations/015_ai_backtest_execution_process_identity.sql"
+        ).read_text(encoding="utf-8")
+        upper_sql = sql.upper()
+        for column_definition in (
+            "ADD COLUMN IF NOT EXISTS attempt_id UUID",
+            "ADD COLUMN IF NOT EXISTS worker_host TEXT",
+            "ADD COLUMN IF NOT EXISTS worker_pid INTEGER",
+            "ADD COLUMN IF NOT EXISTS worker_pgid INTEGER",
+            "ADD COLUMN IF NOT EXISTS worker_started_at TIMESTAMPTZ",
+        ):
+            self.assertIn(column_definition, sql)
+        self.assertIn("CREATE INDEX IF NOT EXISTS idx_code_execution_run_attempt", sql)
+        self.assertNotIn("DROP ", upper_sql)
+        self.assertNotIn("TRUNCATE ", upper_sql)
+
     def test_ai_backtest_idempotency_migration_is_additive_and_idempotent(self):
         sql = (SERVICE_DB_ROOT / "migrations/016_ai_backtest_idempotency.sql").read_text(encoding="utf-8")
         upper_sql = sql.upper()
