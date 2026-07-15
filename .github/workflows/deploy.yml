@@ -5,9 +5,6 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - 'DE/**'
-      - '.github/workflows/deploy-de.yml'
 
 concurrency:
   group: quant-agent-deploy
@@ -59,12 +56,9 @@ jobs:
             --exclude='.env.*' \
             --exclude='**/__pycache__/' \
             --exclude='**/*.pyc' \
-            --exclude='**/airflow.db' \
             --exclude='**/logs/' \
             --exclude='**/.pytest_cache/' \
             --exclude='ai/.venv/' \
-            --exclude='DE/airflow/dags/logs/' \
-            --exclude='DE/airflow/dags/__pycache__/' \
             -e "ssh -i ~/.ssh/id_rsa -p 30233" \
             ./ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
