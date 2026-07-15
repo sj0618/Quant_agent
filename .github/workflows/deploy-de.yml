@@ -1,4 +1,4 @@
-name: Deploy Data Engineering
+name: Deploy DE to SSH Server
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
       - name: Create deploy directory on server
         run: |
           ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
-            "mkdir -p ~/mvp_sp1/quant-proj"
+            "mkdir -p ~/mvp_sp1/quant-proj/DE"
 
       - name: Deploy via rsync
         run: |
@@ -39,21 +39,18 @@ jobs:
             --omit-dir-times \
             --no-perms --no-owner --no-group \
             --delete-excluded \
-            --exclude='.git/' \
-            --exclude='node_modules/' \
             --exclude='.env' \
             --exclude='.env.*' \
+            --exclude='airflow/logs/' \
+            --exclude='airflow/logs/**' \
+            --exclude='airflow/dags/logs/' \
+            --exclude='airflow/dags/logs/**' \
+            --exclude='airflow/airflow.db' \
             --exclude='**/__pycache__/' \
             --exclude='**/*.pyc' \
-            --exclude='**/airflow.db' \
-            --exclude='**/logs/' \
-            --exclude='**/.pytest_cache/' \
-            --exclude='ai/.venv/' \
-            --exclude='DE/airflow/dags/logs/' \
-            --exclude='DE/airflow/dags/__pycache__/' \
             -e "ssh -i ~/.ssh/id_rsa -p 30233" \
-            ./ \
-            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
+            DE/ \
+            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/DE/
 
       - name: Deploy DE Environment File
         run: |
@@ -63,7 +60,7 @@ jobs:
           scp -i ~/.ssh/id_rsa -P 30233 de_env_temp.txt etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/DE/.env
           rm de_env_temp.txt
 
-      - name: Restart Airflow (DE)
+      - name: Install and restart development servers
         run: |
           ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
             set -euo pipefail
@@ -75,7 +72,7 @@ jobs:
             fi
 
             APP_DIR="$HOME/mvp_sp1/quant-proj"
-            
+
             echo "============================================="
             echo "Deploying Data Engineering (Airflow) Stack..."
             cd "$APP_DIR/DE"
