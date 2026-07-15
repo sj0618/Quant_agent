@@ -7,6 +7,7 @@ from typing import Any
 
 from ai_graph.audit import AuditSession, AuditSink, NoOpAuditSink, create_audit_correlation
 from ai_graph.data_sources import load_pipeline_data_from_env
+from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
 from ai_graph.nodes.backtest import backtest_node
@@ -27,6 +28,7 @@ from ai_graph.schemas import (
     EvidenceRef,
     FailureDiagnostic,
     InternalPayload,
+    ScreeningMatch,
     SemanticSlots,
     SourceUsage,
     StrategyCandidateCard,
@@ -278,8 +280,13 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
     source_usage = build_source_usage(state["user_query"], data_requirements, trace_id=state["trace_id"])
     evidence_refs = build_evidence_refs(source_usage, trace_id=state["trace_id"])
     retrieval = search_retrieval_corpus(state["user_query"], top_k=5)
-    cards = strategy_candidate_cards(state["user_query"], retrieval.hits)
     pipeline_data = load_pipeline_data_from_env(state["user_query"], state["trace_id"])
+    cards = strategy_candidate_cards(
+        state["user_query"],
+        retrieval.hits,
+        screening_candidates=pipeline_data.screening_candidates,
+        sector=semantic_slots.sector,
+    )
     output: dict[str, Any] = {
         "semantic_slots": semantic_slots.model_dump(),
         "data_requirements": [requirement.model_dump() for requirement in data_requirements],
@@ -477,6 +484,7 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
         action.append("find_candidates")
 
     universe = "KOSPI200" if "KOSPI200" in query.upper() else "KRX"
+    sector = extract_sector_from_query(query, get_known_sectors())
     if not indicator:
         missing_slots.append("indicator")
     if "bollinger" in indicator and "lower_band_reentry" in event and "close" not in price_basis:
@@ -495,6 +503,7 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
         event=_unique(event),
         action=_unique(action),
         universe=universe,
+        sector=sector,
         slot_evidence_refs=[f"semantic:{trace_id}:deterministic"],
         missing_slots=missing_slots,
         contradictions=contradictions,
@@ -624,7 +633,57 @@ def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
-def strategy_candidate_cards(query: str, hits: list[Any]) -> list[StrategyCandidateCard]:
+def strategy_candidate_cards(
+    query: str,
+    hits: list[Any],
+    *,
+    screening_candidates: list[dict[str, Any]] | None = None,
+    sector: str | None = None,
+) -> list[StrategyCandidateCard]:
+    cards = _static_strategy_candidate_cards(query, hits)
+    if screening_candidates:
+        cards = _attach_screening_matches(cards, screening_candidates, sector=sector)
+    return cards
+
+
+# 리포트/카드에 표시되는 스크리닝 매치 개수 상한(표시 전용, 백테스트 유니버스 크기와는 무관).
+SCREENING_MATCH_DISPLAY_LIMIT = 5
+
+
+def _attach_screening_matches(
+    cards: list[StrategyCandidateCard],
+    screening_candidates: list[dict[str, Any]],
+    *,
+    sector: str | None,
+) -> list[StrategyCandidateCard]:
+    if not cards:
+        return cards
+    filtered = (
+        [c for c in screening_candidates if not sector or c.get("sector") == sector]
+        or screening_candidates
+    )
+    matches = [
+        ScreeningMatch(
+            ticker=c["ticker"],
+            name=c["name"],
+            market=c["market"],
+            sector=c.get("sector"),
+            score=c["score"],
+            as_of_date=c["as_of_date"],
+        )
+        for c in filtered[:SCREENING_MATCH_DISPLAY_LIMIT]
+    ]
+    primary = cards[0].model_copy(
+        update={
+            "sector": sector,
+            "matches": matches,
+            "title": f"{cards[0].title} · {sector}" if sector else cards[0].title,
+        }
+    )
+    return [primary, *cards[1:]]
+
+
+def _static_strategy_candidate_cards(query: str, hits: list[Any]) -> list[StrategyCandidateCard]:
     lowered = query.lower()
     if any(term in query for term in ("EPS", "컨센서스", "어닝", "가이던스", "실적 발표")):
         return [
@@ -1168,18 +1227,22 @@ def build_strategy_spec(
 ) -> StrategySpec:
     source_refs = [hit["document_id"] for hit in retrieval.get("hits", [])]
     profile = _strategy_profile(query, semantic_slots=semantic_slots)
+    slots = semantic_slots or {}
+    universe = str(slots.get("universe") or "KOSPI200")
+    sector = slots.get("sector")
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
         name=str(profile["name"]),
-        universe="KOSPI200",
+        universe=universe,
         market="KRX",
+        sector=sector,
         timeframe="daily",
         entry_conditions=profile["entry_conditions"],
         exit_conditions=profile["exit_conditions"],
         indicators=profile["indicators"],
         risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
         assumptions=[
-            "fixture KOSPI200 universe",
+            f"fixture {universe} universe" + (f" filtered to {sector} sector" if sector else ""),
             "daily adjusted close data",
             *profile["assumptions"],
         ],
@@ -1208,6 +1271,7 @@ def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> d
             recommendation="proceed",
             confidence=0.72,
         ),
+        enable_web_search=True,
     )
     bear = generate_role_debate(
         role="RESEARCH_BEAR",
@@ -1217,10 +1281,11 @@ def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> d
             role="RESEARCH_BEAR",
             summary="재무·컨센서스·공시·실시간 뉴스 조건은 현재 DB 상태에 따라 proxy 또는 availability 표시가 필요합니다.",
             evidence=[],
-            concerns=["OpenDART feature mart is empty.", "BOK macro mart is pilot-only.", "Agentic web search is not connected in MVP."],
+            concerns=["OpenDART feature mart is empty.", "BOK macro mart is pilot-only."],
             recommendation="proceed_with_proxy_disclosure",
             confidence=0.7,
         ),
+        enable_web_search=True,
     )
     judge = generate_role_debate(
         role="RESEARCH_JUDGE",
@@ -1239,6 +1304,7 @@ def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> d
                 "proxy_disclosure": "required",
             },
         ),
+        enable_web_search=True,
     )
     return {
         "bull": bull.model_dump(),
@@ -1248,6 +1314,18 @@ def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> d
 
 
 def _strategy_profile(query: str, *, semantic_slots: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    profile = _strategy_profile_base(query, semantic_slots=semantic_slots)
+    sector = semantic_slots.get("sector") if semantic_slots else None
+    if sector:
+        profile = {
+            **profile,
+            "name": f"{profile['name']} ({sector})",
+            "assumptions": [*profile["assumptions"], f"{sector} 섹터로 후보를 한정합니다."],
+        }
+    return profile
+
+
+def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | None = None) -> dict[str, Any]:
     lowered = query.lower()
     slot_indicator = set(semantic_slots.get("indicator", [])) if semantic_slots else set()
     slot_event = set(semantic_slots.get("event", [])) if semantic_slots else set()

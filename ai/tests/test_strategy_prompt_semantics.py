@@ -35,6 +35,8 @@ PROMPT_CASES = [
     ("pullback_rsi_volume", "200일선 위 상승추세를 유지하면서 RSI(14)가 40 이하로 눌리고 거래량이 20일 평균 이상인 종목을 찾아줘."),
     ("breakout_volume_momentum", "최근 52주 신고가를 돌파했고 거래량이 20일 평균 대비 150% 이상 증가한 종목을 찾아줘."),
     ("reasonable_growth", "ROE 15% 이상, 매출 성장률 10% 이상, PER이 업종 평균 이하인 합리적 성장주를 찾아줘."),
+    ("relative_strength_leader", "반도체 섹터 주도주 중 상대강도 강한 종목을 찾아줘."),
+    ("rsi_rebound", "반도체 섹터에서 RSI 30 이하로 과매도된 반등 후보 종목을 찾아줘."),
 ]
 
 

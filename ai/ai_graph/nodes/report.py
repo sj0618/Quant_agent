@@ -13,6 +13,7 @@ def build_report_bundle(
     *,
     data: dict[str, Any] | None = None,
     debate: dict[str, Any] | None = None,
+    citations: list[dict[str, str]] | None = None,
 ) -> ReportBundle:
     signal = risk.signal
     risk_text = (
@@ -27,6 +28,8 @@ def build_report_bundle(
         {"id": "signal", "title": "Signal Judge", "items": signal.model_dump()},
         {"id": "risk", "title": "Risk Manager", "items": [item.model_dump() for item in risk.adjustments]},
     ]
+    if citations:
+        sections.append({"id": "citations", "title": "출처", "items": citations})
     if data:
         sections.insert(
             3,
@@ -100,8 +103,24 @@ def report_node(state: dict) -> dict:
         state.get("backtest"),
         data=state.get("data"),
         debate=debate,
+        citations=_research_citations(state.get("research_debate")),
     )
     return {"report": report.model_dump(), "report_debate": debate}
+
+
+def _research_citations(research_debate: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not research_debate:
+        return []
+    seen: set[str] = set()
+    citations: list[dict[str, str]] = []
+    for role in ("judge", "bull", "bear"):
+        for citation in research_debate.get(role, {}).get("citations", []):
+            url = citation.get("url")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            citations.append(citation)
+    return citations
 
 
 def build_report_debate(
