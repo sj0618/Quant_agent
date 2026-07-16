@@ -4,6 +4,16 @@ import type { AuthSession } from "../types/auth";
 
 const AUTH_SESSION_STORAGE_KEY = "quantagent.auth.session.v1";
 
+// TEMP(dev-auth-gate): test-login bypass until BE session integration ships.
+const TEST_AUTH_SESSION: AuthSession = {
+  user: {
+    id: "local-test-user",
+    name: "테스트 사용자",
+    email: "test.user@quantagent.local",
+    provider: "test",
+  },
+};
+
 interface StartGoogleResponse {
   authorizationUrl?: string;
 }
@@ -51,6 +61,16 @@ export function getCurrentSession(): AuthSession | null {
 
 export function saveCurrentSession(session: AuthSession) {
   window.localStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(session));
+}
+
+// TEMP(dev-auth-gate): remove once BE session integration ships.
+export function saveTestSession() {
+  const session = {
+    ...TEST_AUTH_SESSION,
+    user: { ...TEST_AUTH_SESSION.user },
+  };
+  saveCurrentSession(session);
+  return session;
 }
 
 export function clearCurrentSession() {
@@ -112,7 +132,7 @@ export async function completeGoogleSignIn(params: URLSearchParams) {
 
 export async function signOut() {
   const session = getCurrentSession();
-  if (appConfig.authApiBaseUrl && session) {
+  if (appConfig.authApiBaseUrl && session?.user.provider !== "test") {
     const response = await fetch(`${appConfig.authApiBaseUrl}${AUTH_ENDPOINTS.logout}`, {
       method: "POST",
       credentials: "include",

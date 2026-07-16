@@ -26,6 +26,8 @@ Figma MCP에서 확인한 순수 `HI-FI ·` 프레임 기준의 React + TypeScri
 | `VITE_AUTH_API_BASE_URL` | Google OAuth 시작/콜백/로그아웃 API base URL |
 | `VITE_REPORT_ACTION_API_BASE_URL` | 리포트 이메일 재발송 API base URL |
 | `VITE_STRATEGY_API_BASE_URL` | 전략 저장/분석 실행 API base URL |
+| `VITE_ENABLE_TEST_LOGIN` (TEMP, dev-auth-gate) | 인증 백엔드 통합 전 로컬 테스트 로그인 버튼 활성화 (`1`이면 활성화) |
+| `VITE_SITE_PASSWORD_ENTRIES` (TEMP, dev-auth-gate) | 랜딩 페이지 비밀번호 팝업이 허용하는 `salt:hash:expiresAt` 목록 (콤마 구분, 비어있으면 비활성화). `node scripts/generate-site-gate-entries.mjs`로 발급/재발급 |
 
 ## 실행
 
