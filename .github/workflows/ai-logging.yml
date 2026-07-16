@@ -56,13 +56,14 @@ jobs:
           cache-dependency-path: |
             ai/pyproject.toml
             backend/pyproject.toml
+            backtest_module/pyproject.toml
 
       - name: Install test dependencies
-        run: python -m pip install -e ai -e backend pytest quantstats ruff
+        run: python -m pip install -e backtest_module -e ai -e backend pytest quantstats ruff
 
       - name: Lint AI logging changes
         run: >-
-          ruff check
+          python -m ruff check
           ai/ai_graph
           ai/tests
           backend/app/db/ai_backtest_repository.py
@@ -75,7 +76,7 @@ jobs:
 
       - name: Run AI logging tests
         run: >-
-          pytest -q
+          python -m pytest -q
           ai/tests/test_audit.py
           ai/tests/test_audit_postgres.py
           ai/tests/test_llm_aoai.py
@@ -88,7 +89,7 @@ jobs:
 
       - name: Run backend AI logging tests
         run: >-
-          pytest -q
+          python -m pytest -q
           backend/tests/unit/test_ai_backtest_flow.py
           backend/tests/unit/test_ai_backtest_repository.py
           backend/tests/unit/test_ai_backtest_runtime.py
@@ -96,7 +97,7 @@ jobs:
       - name: Run migration and retention tests
         working-directory: DE
         run: >-
-          pytest -q
+          python -m pytest -q
           tests/test_sql_migration.py
           tests/test_ai_prompt_retention.py
           tests/test_airflow_dag_import.py
