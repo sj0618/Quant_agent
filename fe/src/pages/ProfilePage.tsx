@@ -23,6 +23,9 @@ export function ProfilePage() {
   if (!session) {
     return null;
   }
+  // TEMP(dev-auth-gate): drop once BE session integration ships.
+  const providerLabel = session.user.provider === "test" ? "테스트 세션" : "Google 계정 연결됨";
+
   const handleSaveSettings = () => {
     saveNotificationSettings(settings);
     setError(null);
@@ -61,7 +64,7 @@ export function ProfilePage() {
             <div>
               <h2>{session.user.name}</h2>
               <p>{session.user.email}</p>
-              <Badge variant="info">Google 계정 연결됨</Badge>
+              <Badge variant="info">{providerLabel}</Badge>
             </div>
           </div>
           <dl className="settings-list">

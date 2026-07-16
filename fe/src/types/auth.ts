@@ -2,7 +2,8 @@ export interface AuthUser {
   id: string;
   name: string;
   email: string;
-  provider: "google";
+  // TEMP(dev-auth-gate): drop "test" once BE session integration ships.
+  provider: "google" | "test";
   avatarUrl?: string;
 }
 
