@@ -136,6 +136,10 @@ jobs:
             stop_listeners_on_port 18000
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/fe.pid"
 
+            export AUTH_ENABLED=0
+            export AI_LLM_PROVIDER=mock
+            export AI_JOB_STORE=memory
+            export AI_AUDIT_SINK=noop
             cd "$APP_DIR/ai"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn ai_graph.api:app \
               --host 0.0.0.0 \
