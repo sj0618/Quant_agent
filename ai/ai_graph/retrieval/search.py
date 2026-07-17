@@ -100,6 +100,17 @@ def search_retrieval_corpus(
         key=lambda item: (-item.score, item.document.level, item.document.document_id)
     )
 
+    selected = scored[:top_k]
+    selected_levels = {item.document.level for item in selected}
+    available_levels = {item.document.level for item in scored}
+    if top_k >= 2 and selected_levels != available_levels:
+        for level in sorted(available_levels - selected_levels):
+            replacement = next(item for item in scored if item.document.level == level)
+            selected[-1] = replacement
+        selected.sort(
+            key=lambda item: (-item.score, item.document.level, item.document.document_id)
+        )
+
     hits = [
         RetrievalHit(
             document_id=item.document.document_id,
@@ -109,7 +120,7 @@ def search_retrieval_corpus(
             snippet=item.snippet,
             source_path=item.document.path,
         )
-        for item in scored[:top_k]
+        for item in selected
     ]
     return RetrievalResponse(query=normalized_query, hits=hits, corpus_size=len(corpus))
 

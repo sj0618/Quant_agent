@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "scope": "G002 non-architectural code-review remediation",
+  "commands": [
+    "cd backend && python -m pytest -q tests/unit/test_ai_backtest_runtime.py tests/unit/test_ai_backtest_subprocess_runner.py tests/unit/test_pdf_temp.py tests/unit/test_ai_backtest_flow.py tests/unit/test_ai_backtest_repository.py tests/unit/test_auth_config.py",
+    "cd ai && python -m pytest -q tests/test_retrieval.py tests/test_prompt_schema_contract.py tests/test_ai_graph_backtest_module_integration.py tests/test_daily_digest.py tests/test_graph_e2e.py",
+    "cd DE && python -m pytest -q tests/test_config.py",
+    "python -m ruff check DE/tests/test_config.py ai/ai_graph/nodes/backtest_code.py ai/ai_graph/retrieval/search.py ai/tests/test_prompt_schema_contract.py ai/tests/test_retrieval.py backend/app/api/routes/reports_pdf_temp.py backend/app/schemas/ai_backtest.py backend/app/services/ai_backtest_subprocess_runner.py backend/tests/unit/test_ai_backtest_subprocess_runner.py backend/tests/unit/test_ai_backtest_runtime.py backend/tests/unit/test_pdf_temp.py",
+    "python -m py_compile DE/tests/test_config.py ai/ai_graph/nodes/backtest_code.py ai/ai_graph/retrieval/search.py backend/app/api/routes/reports_pdf_temp.py backend/app/schemas/ai_backtest.py backend/app/services/ai_backtest_subprocess_runner.py backend/tests/unit/test_ai_backtest_subprocess_runner.py backend/tests/unit/test_ai_backtest_runtime.py backend/tests/unit/test_pdf_temp.py",
+    "git diff --check"
+  ],
+  "results": {
+    "backend": "114 passed, 61 warnings",
+    "ai": "40 passed",
+    "de": "7 passed",
+    "ruff": "passed",
+    "py_compile": "passed",
+    "diff_check": "passed"
+  },
+  "contractCoverage": [
+    {"id":"C1","contractRef":"backtest-resource-limits","obligation":"Prompt 16000 chars, timeout 300 seconds, memory 512 MB are upper bounds","status":"covered","surfaceEvidenceRefs":["S1"],"adversarialCaseRefs":["A1"]},
+    {"id":"C2","contractRef":"realized-backtest-costs","obligation":"Persist realized commission/tax/slippage amounts and never rate fallbacks for malformed data","status":"covered","surfaceEvidenceRefs":["S1"],"adversarialCaseRefs":["A2"]},
+    {"id":"C3","contractRef":"retrieval-l1-l2-diversity","obligation":"top_k >= 2 preserves matching L1 and L2 evidence","status":"covered","surfaceEvidenceRefs":["S2"],"adversarialCaseRefs":["A3"]},
+    {"id":"C4","contractRef":"fallback-reason-boundary","obligation":"Unsafe candidate reasons remain internal and explicit","status":"covered","surfaceEvidenceRefs":["S2"],"adversarialCaseRefs":["A4"]},
+    {"id":"C5","contractRef":"pdf-unsafe-post-protection","obligation":"Ingest and crawler import enforce existing origin/conditional CSRF policy","status":"covered","surfaceEvidenceRefs":["S1"],"adversarialCaseRefs":["A5"]},
+    {"id":"C6","contractRef":"de-config-dotenv","obligation":"Actual DE config module has no dotenv import/load","status":"covered","surfaceEvidenceRefs":["S3"],"adversarialCaseRefs":["A6"]}
+  ],
+  "surfaceEvidence": [
+    {"id":"S1","contractRef":"backend","surface":"api","invocation":"Focused backend pytest suite","verdict":"passed","artifactRefs":["Q1"]},
+    {"id":"S2","contractRef":"ai","surface":"package","invocation":"Focused AI retrieval/fallback/backtest pytest suite","verdict":"passed","artifactRefs":["Q1"]},
+    {"id":"S3","contractRef":"de","surface":"package","invocation":"DE config security pytest","verdict":"passed","artifactRefs":["Q1"]}
+  ],
+  "adversarialCases": [
+    {"id":"A1","contractRef":"backtest-resource-limits","scenario":"16001-char prompt, 301-second timeout, 513-MB memory","expectedBehavior":"Validation rejects all oversized values","verdict":"passed","artifactRefs":["Q1"]},
+    {"id":"A2","contractRef":"realized-backtest-costs","scenario":"None or non-numeric trade cost","expectedBehavior":"Return null totals, never store a rate as money","verdict":"passed","artifactRefs":["Q1"]},
+    {"id":"A3","contractRef":"retrieval-l1-l2-diversity","scenario":"L1 score dominates while matching L2 exists","expectedBehavior":"top_k=2 includes both levels","verdict":"passed","artifactRefs":["Q1"]},
+    {"id":"A4","contractRef":"fallback-reason-boundary","scenario":"Schema-invalid and AST-unsafe generated candidates","expectedBehavior":"Safe fallback plus candidate-specific internal reasons","verdict":"passed","artifactRefs":["Q1"]},
+    {"id":"A5","contractRef":"pdf-unsafe-post-protection","scenario":"Missing/foreign Origin, missing/invalid CSRF, valid CSRF on ingest and crawler import","expectedBehavior":"403 for invalid requests and success for valid token","verdict":"passed","artifactRefs":["Q1"]},
+    {"id":"A6","contractRef":"de-config-dotenv","scenario":"AST inspect actual config module","expectedBehavior":"No dotenv import or load_dotenv call","verdict":"passed","artifactRefs":["Q1"]}
+  ],
+  "artifactRefs": [
+    {"id":"Q1","kind":"api-package-test-report","path":"backend/docs/code-review-remediation-qa.json","description":"Focused regression and adversarial QA evidence"}
+  ],
+  "blockers": [],
+  "limitations": ["External PostgreSQL/Redis/OAuth/AOAI integrations were not run.","Architecture-level findings remain explicitly BLOCKED in the remediation report and were not changed."]
+}

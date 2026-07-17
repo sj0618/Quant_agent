@@ -351,10 +351,10 @@ def _candidate_code_pool(
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[str]:
     pool: list[str] = []
-    for code in _generated_strategy_candidates(strategy, plan, max_positions):
+    for code in llm_candidates:
         if code not in pool:
             pool.append(code)
-    for code in llm_candidates:
+    for code in _generated_strategy_candidates(strategy, plan, max_positions):
         if code not in pool:
             pool.append(code)
     if len(pool) < MIN_GENERATED_CANDIDATES:

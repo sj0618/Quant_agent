@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -79,3 +80,38 @@ def test_runner_reads_and_executes_only_after_valid_release(monkeypatch, tmp_pat
     assert exit_code == 0
     assert executed == [(request, "def build_signals(prices):\n    return []\n")]
     assert CodeExecutionResult.model_validate_json(result_path.read_text(encoding="utf-8")).status == "succeeded"
+def test_realized_cost_totals_sum_trade_costs_and_fill_slippage():
+    trade = SimpleNamespace(
+        ticker="005930",
+        entry_date="2025-01-02",
+        exit_date="2025-01-03",
+        entry_price=101.0,
+        exit_price=117.6,
+        quantity=10,
+        entry_cost=1.01,
+        exit_cost=35.28,
+    )
+    ohlcv_rows = [
+        SimpleNamespace(date=date(2025, 1, 2), ticker="005930", open=100.0),
+        SimpleNamespace(date=date(2025, 1, 3), ticker="005930", open=120.0),
+    ]
+
+    commission, tax, slippage = runner._realized_cost_totals(
+        trades=[trade],
+        ohlcv_rows=ohlcv_rows,
+        cost_model={"commission_pct": 0.01, "tax_pct": 0.02, "slippage_pct": 0.01},
+    )
+
+    assert commission == pytest.approx(12.77)
+    assert tax == pytest.approx(23.52)
+    assert slippage == pytest.approx(34.0)
+
+
+def test_realized_cost_totals_does_not_store_rates_when_trade_data_is_incomplete():
+    commission, tax, slippage = runner._realized_cost_totals(
+        trades=[SimpleNamespace(entry_cost=None, exit_cost=1.0)],
+        ohlcv_rows=[],
+        cost_model={"commission_pct": 0.00015, "tax_pct": 0.0023, "slippage_pct": 0.001},
+    )
+
+    assert (commission, tax, slippage) == (None, None, None)
