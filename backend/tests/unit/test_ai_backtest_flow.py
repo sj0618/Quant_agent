@@ -218,7 +218,9 @@ class FakeRepository:
 
 
 def make_raw_audit_admission() -> RawAuditAdmission:
-    admission = issue_test_raw_audit_admission(Settings.model_construct(app_env="test"))
+    admission = issue_test_raw_audit_admission(
+        Settings.model_construct(app_env="test", ai_backtest_raw_audit_enabled=True)
+    )
     assert admission is not None
     return admission
 
@@ -650,14 +652,19 @@ def test_ai_backtest_flow_persists_generated_code_validation_execution_and_repor
     assert request.natural_language_prompt[:10] not in repository.reports[0].summary
 
 
-def test_ai_backtest_flow_denies_raw_model_logging_without_admission() -> None:
+def test_ai_backtest_flow_denies_raw_model_logging_when_raw_audit_is_disabled() -> None:
     repository = FakeRepository()
+    raw_audit_admission = issue_test_raw_audit_admission(
+        Settings.model_construct(app_env="test", ai_backtest_raw_audit_enabled=False)
+    )
+    assert raw_audit_admission is None
     service = AICodeBacktestService(
         repository,
         FakeGenerator(),
         SafeValidator(),
         FakeExecutor(),
         FakeReporter(),
+        raw_audit_admission=raw_audit_admission,
     )
     request = make_flow_request(
         natural_language_prompt="admission 없이도 백테스트 결과는 반환한다",

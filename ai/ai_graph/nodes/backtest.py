@@ -14,7 +14,6 @@ from ai_graph.schemas import BacktestEquityPoint, BacktestMetrics, CandidateBack
 from ai_graph.schemas import StrategySpec as AIStrategySpec
 from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
 from ai_graph.nodes.position_sizing import (
-    DEFAULT_MAX_POSITIONS,
     applied_max_positions as _shared_applied_max_positions,
     available_ticker_count as _shared_available_ticker_count,
     requested_max_positions as _shared_requested_max_positions,

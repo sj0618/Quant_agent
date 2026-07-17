@@ -88,6 +88,7 @@ def _audit_sink_env(
 ) -> dict[str, str]:
     return {
         "AI_AUDIT_SINK": "postgres",
+        "APP_ENV": "development",
         "AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET": _AUDIT_ADMISSION_SECRET,
         "AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION": _AUDIT_ADMISSION_KEY_VERSION,
         "AI_AUDIT_GATE_B_ADMISSION_TOKEN": token or _signed_admission_token(),
@@ -124,6 +125,17 @@ class FakeConnection:
     def close(self) -> None:
         self.close_calls += 1
         self.closed = True
+class RevokingConnection(FakeConnection):
+    def __init__(self, env: dict[str, str]) -> None:
+        super().__init__()
+        self._env = env
+
+    def commit(self) -> None:
+        super().commit()
+        if self.commits == 1:
+            self._env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "revoked"
+
+
 
 
 class CapturingConnector:
@@ -337,6 +349,22 @@ def test_sink_factory_requires_signed_gate_b_admission_before_issuing_persistent
     assert isinstance(sink, AuthorizedAuditSink)
     assert "postgresql://preferred" not in repr(sink)
 
+@pytest.mark.parametrize("app_env", ["production", "prod", "staging", "stage"])
+def test_postgres_sink_and_admission_are_hard_disabled_without_external_provider(
+    app_env: str,
+) -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    env = _audit_sink_env()
+    env["APP_ENV"] = app_env
+    env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "active"
+
+    assert module._admission_from_env(env) is None
+    assert isinstance(
+        module.resolve_audit_sink(_create_test_persistent_sink("postgresql://test"), environ=env),
+        NoOpAuditSink,
+    )
+    assert isinstance(create_audit_sink_from_env(env), NoOpAuditSink)
+
 
 @pytest.mark.parametrize(
     "token",
@@ -440,6 +468,164 @@ def test_direct_writer_denies_expired_admission_before_connecting() -> None:
     assert isinstance(session, NoOpAuditSession)
     assert connector.calls == []
 
+def test_unavailable_revocation_verifier_denies_initial_raw_audit_write(capsys) -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    admission = module._admission_from_env(_audit_sink_env())
+    assert admission is not None
+    connector = CapturingConnector(FakeConnection())
+    writer = module._PostgresAuditWriter(
+        "postgresql://test",
+        admission=admission,
+        connector=connector,
+    )
+
+    session = writer.open_session(make_correlation())
+
+    assert isinstance(session, NoOpAuditSession)
+    assert connector.calls == []
+    assert "ai_audit_failure" in capsys.readouterr().err
+
+def test_active_env_admission_allows_raw_audit_write(capsys) -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    env = _audit_sink_env()
+    env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "active"
+    admission = module._admission_from_env(env)
+    assert admission is not None
+    conn = FakeConnection()
+    writer = module._PostgresAuditWriter(
+        "postgresql://test",
+        admission=admission,
+        connector=CapturingConnector(conn),
+    )
+    session = writer.open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
+
+    session.start_agent_execution("Research", step_name="Research")
+
+    assert any("INSERT INTO app.ai_agent_execution_log" in sql for sql, _ in conn.executions)
+    assert "ai_audit_failure" not in capsys.readouterr().err
+
+def test_write_time_expiry_denies_subsequent_raw_audit_write(capsys) -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    admission = _new_raw_audit_admission(time.time() + 300)
+    conn = FakeConnection()
+    writer = module._PostgresAuditWriter(
+        "postgresql://test",
+        admission=admission,
+        connector=CapturingConnector(conn),
+    )
+    session = writer.open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
+
+    admission._expires_at = time.time() - 1
+    before = audit_failure_count()
+    writes_before_denial = len(conn.executions)
+    session.start_agent_execution("Research", step_name="Research")
+
+    assert len(conn.executions) == writes_before_denial
+    assert conn.rollbacks == 1
+    assert conn.close_calls == 1
+    assert audit_failure_count() == before + 1
+    assert "ai_audit_failure" in capsys.readouterr().err
+
+
+def test_write_time_revocation_denies_subsequent_raw_audit_write(capsys) -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    env = _audit_sink_env()
+    env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "active"
+    admission = module._admission_from_env(env)
+    assert admission is not None
+    conn = FakeConnection()
+    writer = module._PostgresAuditWriter(
+        "postgresql://test",
+        admission=admission,
+        connector=CapturingConnector(conn),
+    )
+    session = writer.open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
+
+    env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "revoked"
+    before = audit_failure_count()
+    writes_before_denial = len(conn.executions)
+    session.start_agent_execution("Research", step_name="Research")
+
+    assert len(conn.executions) == writes_before_denial
+    assert conn.rollbacks == 1
+    assert conn.close_calls == 1
+    assert audit_failure_count() == before + 1
+    assert "ai_audit_failure" in capsys.readouterr().err
+
+
+def test_write_time_claim_integrity_failure_denies_raw_audit_write(capsys) -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    env = _audit_sink_env()
+    env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "active"
+    admission = module._admission_from_env(env)
+    assert admission is not None
+    conn = FakeConnection()
+    writer = module._PostgresAuditWriter(
+        "postgresql://test",
+        admission=admission,
+        connector=CapturingConnector(conn),
+    )
+    session = writer.open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
+
+    env["AI_AUDIT_GATE_B_ADMISSION_AUDIENCE"] = "tampered-audience"
+    writes_before_denial = len(conn.executions)
+    session.start_agent_execution("Research", step_name="Research")
+
+    assert len(conn.executions) == writes_before_denial
+    assert "ai_audit_failure" in capsys.readouterr().err
+
+
+def test_unavailable_write_time_revocation_verifier_denies_raw_audit_write(capsys) -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    env = _audit_sink_env()
+    env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "active"
+    admission = module._admission_from_env(env)
+    assert admission is not None
+    conn = FakeConnection()
+    writer = module._PostgresAuditWriter(
+        "postgresql://test",
+        admission=admission,
+        connector=CapturingConnector(conn),
+    )
+    session = writer.open_session(make_correlation())
+    assert not isinstance(session, NoOpAuditSession)
+
+    del env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"]
+    writes_before_denial = len(conn.executions)
+    session.start_agent_execution("Research", step_name="Research")
+
+    assert len(conn.executions) == writes_before_denial
+    assert "ai_audit_failure" in capsys.readouterr().err
+
+
+def test_write_time_revocation_keeps_analysis_result_successful(capsys) -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    query = "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어"
+    baseline = run_analysis(query, trace_id="trace-write-time-revocation")
+    env = _audit_sink_env()
+    env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "active"
+    admission = module._admission_from_env(env)
+    assert admission is not None
+    conn = RevokingConnection(env)
+    actual = run_analysis(
+        query,
+        trace_id="trace-write-time-revocation",
+        audit_sink=_authorized_sink(
+            "postgresql://test",
+            admission=admission,
+            connector=CapturingConnector(conn),
+        ),
+    )
+
+    assert actual.status == baseline.status == "ready"
+    statements = [statement for statement, _ in conn.executions]
+    assert sum("INSERT INTO app.ai_trace" in sql for sql in statements) == 1
+    assert not any("ai_agent_execution_log" in sql for sql in statements)
+    assert "ai_audit_failure" in capsys.readouterr().err
 
 def test_terminal_model_persistence_failure_stops_db_writes(capsys) -> None:
     conn = FakeConnection()

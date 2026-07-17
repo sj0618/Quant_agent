@@ -258,7 +258,6 @@ class AICodeBacktestService:
         code_id = uuid4()
         validation_id = uuid4()
         execution_run_id = uuid4()
-        started_at = _utcnow()
 
         # The request claim atomically created the trace before any external work.
         await self.repository.create_strategy_parse(

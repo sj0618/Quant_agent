@@ -1,0 +1,181 @@
+{
+  "schemaVersion": "1.0",
+  "kind": "test-report",
+  "commands": [
+    {
+      "cwd": "backend",
+      "command": "python3 -m pytest -q tests/unit/test_auth_config.py::test_development_allows_a_valid_signed_raw_audit_admission tests/unit/test_auth_config.py::test_production_and_staging_aliases_hard_disable_signed_raw_audit_admission tests/unit/test_ai_backtest_flow.py::test_ai_backtest_flow_denies_raw_model_logging_when_raw_audit_is_disabled tests/unit/test_ai_backtest_repository.py::test_model_call_rejects_missing_raw_admission_before_opening_transaction tests/unit/test_ai_backtest_repository.py::test_invalid_signed_admissions_never_open_a_raw_audit_transaction"
+    },
+    {
+      "cwd": "ai",
+      "command": "python3 -m pytest -q tests/test_audit_postgres.py::test_sink_factory_requires_signed_gate_b_admission_before_issuing_persistent_sink tests/test_audit_postgres.py::test_postgres_sink_and_admission_are_hard_disabled_without_external_provider tests/test_audit_postgres.py::test_forgeable_test_marker_is_noop_for_app_and_direct_graph_ingress tests/test_audit_postgres.py::test_unavailable_revocation_verifier_denies_initial_raw_audit_write tests/test_audit_postgres.py::test_write_time_expiry_denies_subsequent_raw_audit_write tests/test_audit_postgres.py::test_write_time_revocation_denies_subsequent_raw_audit_write tests/test_audit_postgres.py::test_write_time_revocation_keeps_analysis_result_successful"
+    },
+    {
+      "cwd": "service_db",
+      "command": "python3 -m pytest -q tests/test_sql_migration.py"
+    },
+    {
+      "cwd": "DE",
+      "command": "python3 -m pytest -q -rs tests/test_ai_prompt_retention.py"
+    },
+    {
+      "cwd": "ai",
+      "command": "python3 -m pytest -q -rs tests/test_audit_postgres.py::test_disposable_timescaledb_migrations_and_large_unicode_round_trip"
+    },
+    {
+      "cwd": "service_db",
+      "command": "unset SERVICE_DB_REPLAY_EXTERNAL_SIGNER SERVICE_DB_REPLAY_SBOM SERVICE_DB_REPLAY_TRUSTED_ROOT; python3 scripts/verify_fixed_migration_replay.py --artifact /tmp/p0-fixed-replay-blocked.json"
+    }
+  ],
+  "results": [
+    {
+      "commandIndex": 0,
+      "status": "passed",
+      "summary": "8 passed, 1 warning in 0.25s",
+      "evidence": [
+        "A valid signed raw-audit admission is accepted in development.",
+        "The same admission is hard-disabled for all four protected aliases: production, prod, staging, and stage.",
+        "Disabled, missing, or invalid admission paths do not persist raw model calls or open raw-audit transactions while the backtest remains successful."
+      ],
+      "warnings": [
+        "PytestConfigWarning: Unknown config option: asyncio_mode"
+      ]
+    },
+    {
+      "commandIndex": 1,
+      "status": "passed",
+      "summary": "10 passed in 7.67s",
+      "evidence": [
+        "Missing signed Gate B admission resolves to NoOp; a forged test-only sink marker is never opened.",
+        "All four protected aliases force admission and persistent-sink resolution to NoOp without invoking an external provider.",
+        "Unavailable initial revocation verification, write-time expiry, and write-time revocation deny raw writes before additional SQL, roll back, and close the fake session.",
+        "Revocation during analysis preserves the successful analysis result while stopping subsequent audit SQL."
+      ]
+    },
+    {
+      "commandIndex": 2,
+      "status": "passed",
+      "summary": "9 passed in 0.01s",
+      "evidence": [
+        "Fixed replay rejects a wrong disposable database and a wrong application_name marker.",
+        "The unit verifier writes a signed BLOCKED artifact before SQL when signer, SBOM, and trusted-root inputs are absent.",
+        "The fixed migration sequence, pgcrypto/PG17 catalog contract, replay workflow database isolation, artifact upload, and forced-discard runner contract are statically pinned."
+      ]
+    },
+    {
+      "commandIndex": 3,
+      "status": "passed_with_skips",
+      "summary": "6 passed, 2 skipped in 0.04s",
+      "evidence": [
+        "Purge uses strict created_at < cutoff semantics, retains the exact cutoff and future rows, batches with SKIP LOCKED, and returns zero on rerun.",
+        "The purge targets only app.ai_prompt_log and preserves parent rows."
+      ],
+      "skips": [
+        "Two real PostgreSQL retention integration tests skipped because AI_PROMPT_RETENTION_TEST_DSN was not set to a disposable database."
+      ]
+    },
+    {
+      "commandIndex": 4,
+      "status": "skipped",
+      "summary": "1 skipped in 0.23s",
+      "skips": [
+        "AI_LOGGING_TEST_DSN must point to a disposable TimescaleDB database."
+      ]
+    },
+    {
+      "commandIndex": 5,
+      "status": "blocked",
+      "exitCode": 2,
+      "artifact": "/tmp/p0-fixed-replay-blocked.json",
+      "summary": "Verifier wrote a BLOCKED artifact before SQL.",
+      "evidence": [
+        "status=BLOCKED",
+        "missing_external_inputs=[external_signer, sbom, trusted_root]",
+        "markers transition from CREATED version 0 to BLOCKED version 1",
+        "artifact_sha256=fc0861b35b401c127ed1fb7ac83da518a52e8df952ab98637368cd648d8ad6c6"
+      ]
+    }
+  ],
+  "contractCoverage": [
+    {
+      "contract": "Raw logging accepts a verified development admission, but hard-disables production, prod, staging, and stage aliases and fails closed for disabled or forged-marker paths.",
+      "status": "covered",
+      "evidence": [0, 1]
+    },
+    {
+      "contract": "AI raw-audit admission is revalidated before subsequent writes; expiry and revocation stop raw SQL without changing the business analysis outcome.",
+      "status": "covered",
+      "evidence": [1]
+    },
+    {
+      "contract": "Fixed replay rejects invalid disposable DSN components and blocks before SQL without external signer inputs; fixed migrations require the pgcrypto/PG17 and workflow isolation/discard static contracts.",
+      "status": "covered_unit_and_blocked_live",
+      "evidence": [2, 5]
+    },
+    {
+      "contract": "Prompt purge is strictly before the cutoff, preserves boundary and future rows, is safe to rerun, and uses SKIP LOCKED batches.",
+      "status": "covered_unit_live_skipped",
+      "evidence": [3, 4]
+    }
+  ],
+  "adversarialCases": [
+    {
+      "case": "four protected raw-audit aliases and valid development admission",
+      "status": "passed",
+      "evidence": "Development accepted the valid signed admission. production, prod, staging, and stage each rejected the same admission and forced AI persistent-sink resolution to NoOp."
+    },
+    {
+      "case": "disabled, missing, invalid, or forgeable raw-audit admission",
+      "status": "passed",
+      "evidence": "Disabled/missing/invalid backend admissions opened no raw-audit transaction; unsigned Gate B and the forgeable test-only sink marker resolved to NoOp without opening the forged sink."
+    },
+    {
+      "case": "AI session expiry or revocation between writes",
+      "status": "passed",
+      "evidence": "Both conditions stopped the next write before additional SQL, rolled back, and closed the fake session; revocation during analysis retained successful business output."
+    },
+    {
+      "case": "invalid replay disposable DSN and marker",
+      "status": "passed",
+      "evidence": "Wrong database and application_name marker variants raised the fixed replay contract error."
+    },
+    {
+      "case": "replay without external signer inputs",
+      "status": "blocked_as_designed",
+      "evidence": "The real verifier exited 2 before SQL and wrote /tmp/p0-fixed-replay-blocked.json with external_signer, sbom, and trusted_root missing."
+    },
+    {
+      "case": "pgcrypto, workflow static contract, and fixed replay order",
+      "status": "passed_unit_live_blocked",
+      "evidence": "Static tests pin pgcrypto provision before replay, PG17/catalog assertions, separate replay/purge databases, artifact upload, and forced-discard markers; live replay remains blocked by absent external inputs."
+    },
+    {
+      "case": "purge cutoff boundary, future rows, rerun, and disposable DB absence",
+      "status": "passed_unit_live_skipped",
+      "evidence": "Unit tests preserved boundary/future rows and verified rerun zero; real retention and TimescaleDB tests skipped because no disposable PostgreSQL DSN was supplied."
+    }
+  ],
+  "blockers": [
+    {
+      "status": "BLOCKED",
+      "surface": "Fixed migration replay live execution",
+      "reason": "SERVICE_DB_REPLAY_EXTERNAL_SIGNER, SERVICE_DB_REPLAY_SBOM, and SERVICE_DB_REPLAY_TRUSTED_ROOT were intentionally absent; the verifier stopped before SQL.",
+      "evidence": "/tmp/p0-fixed-replay-blocked.json"
+    },
+    {
+      "status": "SKIPPED",
+      "surface": "AI audit migration/large-unicode live integration",
+      "reason": "AI_LOGGING_TEST_DSN was not set to a disposable TimescaleDB database."
+    },
+    {
+      "status": "SKIPPED",
+      "surface": "Prompt-retention live PostgreSQL integration",
+      "reason": "AI_PROMPT_RETENTION_TEST_DSN was not set to a disposable database."
+    },
+    {
+      "status": "LIMITATION",
+      "surface": "External provider and raw-on/canary/Gate B activation",
+      "reason": "No external signer/provider or raw-on/canary/Gate B activation was invoked. All admission and audit cases used local fakes or fail-closed paths."
+    }
+  ]
+}

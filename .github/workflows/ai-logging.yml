@@ -5,16 +5,22 @@ on:
     paths:
       - ".github/workflows/ai-logging.yml"
       - "ai/**"
+      - "backend/app/core/config.py"
       - "backend/app/db/ai_backtest_repository.py"
       - "backend/app/schemas/ai_backtest.py"
       - "backend/app/services/ai_backtest_flow.py"
       - "backend/app/services/ai_backtest_runtime.py"
+      - "backend/app/services/raw_audit_admission.py"
+      - "backend/.env.example"
+      - "backend/tests/unit/test_auth_config.py"
       - "backend/tests/unit/test_ai_backtest_flow.py"
       - "backend/tests/unit/test_ai_backtest_repository.py"
       - "backend/tests/unit/test_ai_backtest_runtime.py"
       - "DE/airflow/dags/quant_agent_data_engineering.py"
       - "DE/migrations/**"
       - "service_db/migrations/**"
+      - "service_db/scripts/**"
+      - "service_db/tests/test_sql_migration.py"
       - "DE/scripts/purge_ai_prompt_logs.py"
       - "DE/tests/**"
 
@@ -26,23 +32,46 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
-      timescaledb:
-        image: timescale/timescaledb:latest-pg17
+      migration-replay-db:
+        image: timescale/timescaledb:latest-pg17@sha256:909e2c7577c074517c8936b6d8799294b33f25fb5bad978a2199250665f1ce1a
         env:
-          POSTGRES_DB: quant_agent_test
+          POSTGRES_DB: p0_replay_disposable
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           TIMESCALEDB_TELEMETRY: "off"
         ports:
-          - 5432:5432
+          - 5433:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d quant_agent_test"
+          --health-cmd "pg_isready -U postgres -d p0_replay_disposable"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      audit-purge-db:
+        image: timescale/timescaledb:latest-pg17@sha256:909e2c7577c074517c8936b6d8799294b33f25fb5bad978a2199250665f1ce1a
+        env:
+          POSTGRES_DB: ai_prompt_retention_test_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          TIMESCALEDB_TELEMETRY: "off"
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_prompt_retention_test_ci"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
 
     env:
-      AI_LOGGING_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/quant_agent_test
+      AI_PROMPT_RETENTION_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5434/ai_prompt_retention_test_ci
+      SERVICE_DB_REPLAY_DSN: postgresql://postgres:postgres@127.0.0.1:5433/p0_replay_disposable?application_name=disposable
+      SERVICE_DB_REPLAY_EXPECTED_HOST: 127.0.0.1
+      SERVICE_DB_REPLAY_EXPECTED_PORT: "5433"
+      SERVICE_DB_REPLAY_EXPECTED_USER: postgres
+      SERVICE_DB_REPLAY_EXPECTED_DATABASE: p0_replay_disposable
+      SERVICE_DB_REPLAY_DISPOSABLE_MARKER: disposable
+      SERVICE_DB_REPLAY_EXTERNAL_SIGNER: ${{ secrets.SERVICE_DB_REPLAY_EXTERNAL_SIGNER }}
+      SERVICE_DB_REPLAY_SBOM: ${{ secrets.SERVICE_DB_REPLAY_SBOM }}
+      SERVICE_DB_REPLAY_TRUSTED_ROOT: ${{ secrets.SERVICE_DB_REPLAY_TRUSTED_ROOT }}
 
     steps:
       - name: Checkout
@@ -60,19 +89,54 @@ jobs:
 
       - name: Install test dependencies
         run: python -m pip install -e backtest_module -e ai -e backend pytest quantstats ruff
+      - name: Enable pgcrypto for migration replay database
+        run: >-
+          PGPASSWORD=postgres psql
+          --host=127.0.0.1
+          --port=5433
+          --username=postgres
+          --dbname=p0_replay_disposable
+          --command="CREATE EXTENSION IF NOT EXISTS pgcrypto"
+      - name: Run fixed migration replay contract tests
+        run: python -m unittest service_db/tests/test_sql_migration.py
+      - name: Run gated fixed migration replay and force-discard lifecycle
+        run: |
+          set +e
+          python service_db/scripts/run_fixed_migration_replay.py \
+            --artifact service_db/artifacts/fixed-migration-replay.json
+          replay_exit=$?
+          if [ "$replay_exit" -eq 2 ]; then
+            echo "::notice::Fixed migration replay is BLOCKED pending external signer, SBOM, and trusted root."
+            exit 0
+          fi
+          exit "$replay_exit"
+      - name: Upload fixed migration replay artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-migration-replay-contract
+          path: service_db/artifacts/fixed-migration-replay.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Lint AI logging changes
         run: >-
           python -m ruff check
           ai/ai_graph
           ai/tests
+          backend/app/core/config.py
           backend/app/db/ai_backtest_repository.py
           backend/app/schemas/ai_backtest.py
           backend/app/services/ai_backtest_flow.py
           backend/app/services/ai_backtest_runtime.py
+          backend/app/services/raw_audit_admission.py
+          backend/tests/unit/test_auth_config.py
           backend/tests/unit/test_ai_backtest_flow.py
           backend/tests/unit/test_ai_backtest_repository.py
           backend/tests/unit/test_ai_backtest_runtime.py
+          service_db/scripts/verify_fixed_migration_replay.py
+          service_db/scripts/run_fixed_migration_replay.py
+          DE/scripts/purge_ai_prompt_logs.py
 
       - name: Run AI logging tests
         run: >-
@@ -90,6 +154,7 @@ jobs:
       - name: Run backend AI logging tests
         run: >-
           python -m pytest -q
+          backend/tests/unit/test_auth_config.py
           backend/tests/unit/test_ai_backtest_flow.py
           backend/tests/unit/test_ai_backtest_repository.py
           backend/tests/unit/test_ai_backtest_runtime.py
