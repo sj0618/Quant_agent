@@ -14,7 +14,7 @@ from app.api.routes import reports_pdf_temp
 from app.core.errors import AppError
 from app.core.errors import register_exception_handlers
 from app.db.pdf_temp_repository import HankyungConsensusPdfTempSeedRecord, PdfTempFileRecord, PdfTempManifestRepository, utc_now_iso
-from app.services.pdf_temp_seed_registry import CombinedPdfTempSeedProvider, DbPdfTempSeedProvider, EnvPdfTempSeedProvider, PdfTempSeedRegistry
+from app.services.pdf_temp_seed_registry import PdfTempSeedRegistry
 from app.services.session_store import AuthSessionStore
 from tests.unit.test_hankyung_consensus_crawler import SAMPLE_ROW, crawler_response, install_fake_crawler_http
 from tests.unit.test_auth_config import valid_settings
@@ -119,7 +119,7 @@ def make_client(settings):
     app.state.redis_client = FakeRedis()
     app.state.startup_config_error = None
     app.state.startup_redis_error = None
-    return TestClient(app, base_url="https://api.example.co.kr"), app
+    return TestClient(app, base_url="https://api.example.co.kr", headers={"Origin": "https://api.example.co.kr"}), app
 
 
 class FakeCrawlerSeedRepository:
@@ -171,6 +171,32 @@ def session_cookies(app: FastAPI) -> dict[str, str]:
     return {app.state.settings.auth_session_cookie_name: session_id}
 
 
+def test_pdf_temp_ingest_rejects_missing_origin(tmp_path):
+    settings = pdf_settings(tmp_path, [])
+    _client, app = make_client(settings)
+    client = TestClient(app, base_url="https://api.example.co.kr")
+    response = client.post("/reports/pdf-temp/ingest", cookies=session_cookies(app))
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "origin_required"
+
+
+def test_pdf_temp_ingest_requires_and_accepts_csrf_token_when_enabled(tmp_path):
+    settings = pdf_settings(tmp_path, [], AUTH_CSRF_REQUIRED=True)
+    client, app = make_client(settings)
+    session_store = AuthSessionStore(app.state.redis_client, settings)
+    session_id, csrf_token = asyncio.run(session_store.create_session(user_id="user-1"))
+    cookies = {settings.auth_session_cookie_name: session_id}
+
+    denied = client.post("/reports/pdf-temp/ingest", cookies=cookies)
+    allowed = client.post("/reports/pdf-temp/ingest", cookies=cookies, headers={"X-CSRF-Token": csrf_token})
+
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "csrf_invalid"
+    assert allowed.status_code == 200
+    assert allowed.json() == {"results": []}
+
+
 def test_pdf_temp_feature_flag_fails_closed(tmp_path):
     settings = pdf_settings(tmp_path, [], PDF_TEMP_INGEST_ENABLED=False)
     client, _app = make_client(settings)
@@ -201,6 +227,46 @@ def test_pdf_temp_crawler_requires_authenticated_session(tmp_path):
     response = client.get("/reports/pdf-temp/crawler/seeds")
 
     assert response.status_code == 401
+
+def test_pdf_temp_crawler_import_rejects_missing_and_foreign_origin(tmp_path):
+    settings = pdf_settings(tmp_path, [], HANKYUNG_CONSENSUS_CRAWLER_ENABLED=True)
+    client, app = make_client(settings)
+    cookies = session_cookies(app)
+    missing_origin_client = TestClient(app, base_url="https://api.example.co.kr")
+
+    missing_origin = missing_origin_client.post("/reports/pdf-temp/crawler/import", cookies=cookies, json={})
+    foreign_origin = client.post(
+        "/reports/pdf-temp/crawler/import",
+        cookies=cookies,
+        headers={"Origin": "https://attacker.example.com"},
+        json={},
+    )
+
+    assert missing_origin.status_code == 403
+    assert missing_origin.json()["error"]["code"] == "origin_required"
+    assert foreign_origin.status_code == 403
+    assert foreign_origin.json()["error"]["code"] == "origin_not_allowed"
+
+
+def test_pdf_temp_crawler_import_rejects_missing_and_invalid_csrf_token_when_required(tmp_path):
+    settings = pdf_settings(tmp_path, [], HANKYUNG_CONSENSUS_CRAWLER_ENABLED=True, AUTH_CSRF_REQUIRED=True)
+    client, app = make_client(settings)
+    session_id, _csrf_token = asyncio.run(AuthSessionStore(app.state.redis_client, settings).create_session(user_id="user-1"))
+    cookies = {settings.auth_session_cookie_name: session_id}
+
+    missing_token = client.post("/reports/pdf-temp/crawler/import", cookies=cookies, json={})
+    invalid_token = client.post(
+        "/reports/pdf-temp/crawler/import",
+        cookies=cookies,
+        headers={"X-CSRF-Token": "invalid"},
+        json={},
+    )
+
+    assert missing_token.status_code == 403
+    assert missing_token.json()["error"]["code"] == "csrf_invalid"
+    assert invalid_token.status_code == 403
+    assert invalid_token.json()["error"]["code"] == "csrf_invalid"
+
 
 
 def test_pdf_temp_seed_list_is_safe_and_ingest_schema_rejects_arbitrary_source_fields(tmp_path):
@@ -325,7 +391,7 @@ def test_pdf_temp_crawler_seed_list_and_detail_return_safe_metadata(tmp_path, mo
     assert detail.json()["seed"]["seedId"] == "hankyung-crawl-649784"
 
 
-def test_pdf_temp_crawler_import_returns_safe_counts_and_seed_summaries(tmp_path, monkeypatch):
+def test_pdf_temp_crawler_import_accepts_valid_csrf_token_when_required(tmp_path, monkeypatch):
     repository = FakeCrawlerSeedRepository()
     monkeypatch.setattr(reports_pdf_temp, "get_pdf_temp_db_repository", lambda _request: repository)
     install_fake_crawler_http(monkeypatch, [crawler_response({"data": [SAMPLE_ROW]})])
@@ -333,13 +399,20 @@ def test_pdf_temp_crawler_import_returns_safe_counts_and_seed_summaries(tmp_path
         tmp_path,
         [],
         HANKYUNG_CONSENSUS_CRAWLER_ENABLED=True,
+        AUTH_CSRF_REQUIRED=True,
         PDF_TEMP_URL_ALLOWED_HOSTS="markets.hankyung.com",
         HANKYUNG_CONSENSUS_AUTH_HEADER="X-Hankyung-Auth: crawler-secret",
     )
     client, app = make_client(settings)
-    cookies = session_cookies(app)
+    session_id, csrf_token = asyncio.run(AuthSessionStore(app.state.redis_client, settings).create_session(user_id="user-1"))
+    cookies = {settings.auth_session_cookie_name: session_id}
 
-    response = client.post("/reports/pdf-temp/crawler/import", cookies=cookies, json={"maxPages": 1, "maxReports": 1})
+    response = client.post(
+        "/reports/pdf-temp/crawler/import",
+        cookies=cookies,
+        headers={"X-CSRF-Token": csrf_token},
+        json={"maxPages": 1, "maxReports": 1},
+    )
 
     assert response.status_code == 200
     payload = response.json()

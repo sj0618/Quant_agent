@@ -7,6 +7,7 @@ import unittest
 from quant_agent.data.config import BokConfig, DartConfig, DatabaseConfig, KisConfig, KrxConfig, PilotConfig, SeibroConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_MODULE = PROJECT_ROOT / "quant_agent" / "data" / "config.py"
 
 
 class ConfigTests(unittest.TestCase):
@@ -69,9 +70,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.api_key, "fss")
 
 
-class EntrypointSecurityTests(unittest.TestCase):
-    def test_main_does_not_load_dotenv(self):
-        tree = ast.parse((PROJECT_ROOT / "main.py").read_text(encoding="utf-8"))
+class ConfigModuleSecurityTests(unittest.TestCase):
+    def test_config_module_does_not_load_dotenv(self):
+        tree = ast.parse(CONFIG_MODULE.read_text(encoding="utf-8"))
         forbidden_calls = []
         forbidden_imports = []
 

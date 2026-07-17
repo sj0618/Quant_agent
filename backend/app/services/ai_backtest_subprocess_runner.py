@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import math
 import os
 import sys
 from datetime import UTC, date, datetime
@@ -131,6 +131,11 @@ def _execute_generated_backtest(
         montecarlo_sharpe_json=summary.get("montecarlo_sharpe") or {},
         outliers_json=summary.get("outliers") or {},
     )
+    cost_totals = _realized_cost_totals(
+        trades=engine_result.trades,
+        ohlcv_rows=ohlcv_rows,
+        cost_model=summary.get("cost_model"),
+    )
     payload = BacktestResultPayload(
         run=BacktestRunCreate(
             run_id=uuid4(),
@@ -176,9 +181,9 @@ def _execute_generated_backtest(
             signal_count=summary.get("signal_count"),
             avg_holding_days=summary.get("avg_holding_days"),
             turnover=summary.get("turnover"),
-            total_commission=(summary.get("cost_model") or {}).get("commission_pct") if isinstance(summary.get("cost_model"), dict) else None,
-            total_tax=(summary.get("cost_model") or {}).get("tax_pct") if isinstance(summary.get("cost_model"), dict) else None,
-            total_slippage=(summary.get("cost_model") or {}).get("slippage_pct") if isinstance(summary.get("cost_model"), dict) else None,
+            total_commission=cost_totals[0],
+            total_tax=cost_totals[1],
+            total_slippage=cost_totals[2],
             excluded_ticker_count=summary.get("excluded_ticker_count"),
             excluded_tickers_jsonb=summary.get("excluded_tickers") or [],
             indicator_report_jsonb=summary.get("indicator_report") or {},
@@ -244,6 +249,78 @@ def _execute_generated_backtest(
         backtest_result=payload,
     )
 
+
+def _realized_cost_totals(*, trades: list[object], ohlcv_rows: list[object], cost_model: object) -> tuple[float | None, float | None, float | None]:
+    if not isinstance(cost_model, dict):
+        return None, None, None
+
+    commission_pct = _nonnegative_finite_float(cost_model.get("commission_pct"))
+    tax_pct = _nonnegative_finite_float(cost_model.get("tax_pct"))
+    slippage_pct = _nonnegative_finite_float(cost_model.get("slippage_pct"))
+    if commission_pct is None or tax_pct is None or slippage_pct is None:
+        return None, None, None
+
+    commission_total = 0.0
+    tax_total = 0.0
+    slippage_total = 0.0
+    slippage_complete = True
+    open_prices = _open_prices_by_trade_key(ohlcv_rows)
+    exit_cost_rate = commission_pct + tax_pct
+
+    for trade in trades:
+        entry_cost = _nonnegative_finite_float(getattr(trade, "entry_cost", None))
+        exit_cost = _nonnegative_finite_float(getattr(trade, "exit_cost", None))
+        if entry_cost is None or exit_cost is None:
+            return None, None, None
+
+        commission_total += entry_cost
+        if exit_cost_rate:
+            commission_total += exit_cost * commission_pct / exit_cost_rate
+            tax_total += exit_cost * tax_pct / exit_cost_rate
+        elif exit_cost:
+            return None, None, None
+
+        quantity = _nonnegative_finite_float(getattr(trade, "quantity", None))
+        entry_price = _nonnegative_finite_float(getattr(trade, "entry_price", None))
+        exit_price = _nonnegative_finite_float(getattr(trade, "exit_price", None))
+        try:
+            entry_key = (_coerce_date(getattr(trade, "entry_date")), str(getattr(trade, "ticker")))
+            exit_key = (_coerce_date(getattr(trade, "exit_date")), str(getattr(trade, "ticker")))
+        except (TypeError, ValueError):
+            slippage_complete = False
+            continue
+        entry_open = open_prices.get(entry_key)
+        exit_open = open_prices.get(exit_key)
+        if None in (quantity, entry_price, exit_price, entry_open, exit_open):
+            slippage_complete = False
+            continue
+        slippage_total += quantity * (abs(entry_price - entry_open) + abs(exit_price - exit_open))
+
+    return commission_total, tax_total, slippage_total if slippage_complete else None
+
+
+def _open_prices_by_trade_key(ohlcv_rows: list[object]) -> dict[tuple[date, str], float]:
+    prices: dict[tuple[date, str], float] = {}
+    for row in ohlcv_rows:
+        try:
+            open_price = _nonnegative_finite_float(getattr(row, "open"))
+            row_date = _coerce_date(getattr(row, "date"))
+            ticker = str(getattr(row, "ticker"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if open_price is not None:
+            prices[(row_date, ticker)] = open_price
+    return prices
+
+
+def _nonnegative_finite_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
 
 def _coerce_date(value: str | date) -> date:
     return value if isinstance(value, date) else date.fromisoformat(str(value))

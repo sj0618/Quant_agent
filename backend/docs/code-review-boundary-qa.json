@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "kind": "test-report",
+  "scope": "G003 architecture-boundary review report",
+  "commands": [
+    "python -c \"from pathlib import Path; r=Path('backend/docs/code-review-remediation-report.md').read_text(); t='\\n'.join(r.splitlines()[19:26]); required=['ai/ai_graph/nodes/backtest.py','backend/app/services/ai_backtest_runtime.py','backend/app/main.py','backend/app/api/routes/fe_contract.py','backend/app/services/fe_contract_store.py','ai/ai_graph/api.py','ai/docs/email-digest-be-requirements.md','.github/workflows/deploy.yml','ai/ai_graph/auth.py','backtest_module/backtest.py','backtest_module/backtest_module/backtest.py','backend/app/core/config.py','backend/app/services/session_store.py']; assert t.count('| CRITICAL |') == 1 and t.count('| HIGH |') == 4 and t.count('| MEDIUM |') == 2; assert all(Path(p).exists() for p in required); assert 'backend/docs/code-review-remediation-qa.json' in r and 'backend/docs/code-review-boundary-qa.json' in r and 'PostgreSQL/Redis/OAuth/AOAI' in r; print('BLOCKED_ROWS=7; CITED_PATHS_EXIST=PASS; COMMANDS_AND_ARTIFACTS=PASS')\"",
+    "python -c \"import backtest_module.backtest as outer, backtest_module.backtest_module.backtest as inner; assert outer.__file__.endswith('/backtest_module/backtest.py'); assert inner.__file__.endswith('/backtest_module/backtest_module/backtest.py'); assert outer.BacktestEngine is not inner.BacktestEngine; print('OUTER='+outer.__file__); print('INNER='+inner.__file__); print('DUPLICATE_SYMBOLS=PASS')\"",
+    "git diff --check"
+  ],
+  "result": {
+    "blockedRows": 7,
+    "severityCounts": {"CRITICAL": 1, "HIGH": 4, "MEDIUM": 2},
+    "citedPathsExist": true,
+    "duplicateEngineProvenance": "root import resolves outer module; nested import resolves inner module; symbols differ",
+    "verificationCommandsPresent": true,
+    "qaArtifactReferencesPresent": true,
+    "externalLimitationsPresent": true
+  },
+  "contractCoverage": [
+    {"id":"C1","contractRef":"architecture-boundary-report","obligation":"Seven architecture/ambiguity findings remain explicitly BLOCKED","status":"covered","surfaceEvidenceRefs":["S1"],"adversarialCaseRefs":["A1"]},
+    {"id":"C2","contractRef":"exact-evidence-table","obligation":"Each BLOCKED row has severity, file:line/symbol/observed behavior evidence, and required approval","status":"covered","surfaceEvidenceRefs":["S1"],"adversarialCaseRefs":["A2"]},
+    {"id":"C3","contractRef":"reproducible-verification","obligation":"Report names executable focused commands and persistent QA artifacts","status":"covered","surfaceEvidenceRefs":["S1"],"adversarialCaseRefs":["A3"]}
+  ],
+  "surfaceEvidence": [
+    {"id":"S1","contractRef":"markdown-report","surface":"package","invocation":"Read-only Python assertions over report, cited paths, and duplicate import provenance","verdict":"passed","artifactRefs":["Q1"]}
+  ],
+  "adversarialCases": [
+    {"id":"A1","contractRef":"architecture-boundary-report","scenario":"Missing or extra BLOCKED row","expectedBehavior":"Exactly seven required findings are present","verdict":"passed","artifactRefs":["Q1"]},
+    {"id":"A2","contractRef":"exact-evidence-table","scenario":"Missing source path, symbol/behavior evidence, or approval decision","expectedBehavior":"All cited paths exist and every row has exact evidence/approval","verdict":"passed","artifactRefs":["Q1"]},
+    {"id":"A3","contractRef":"reproducible-verification","scenario":"Placeholder command, missing QA reference, or unverified duplicate import provenance","expectedBehavior":"Executable commands and deterministic provenance assertions are present","verdict":"passed","artifactRefs":["Q1"]}
+  ],
+  "artifactRefs": [
+    {"id":"Q1","kind":"test-report","path":"backend/docs/code-review-boundary-qa.json","description":"Static evidence QA for architecture-boundary report"}
+  ],
+  "documentedBlockers": [
+    "OS subprocess sandbox boundary requires separate architecture approval",
+    "FE mock/compat production exposure and ownership requires approval",
+    "daily-digest authentication subject requires service contract approval",
+    "backend Redis and AI authentication deployment topology requires approval",
+    "backtest_module package ownership requires approval",
+    "report resolver user ownership identifier requires contract approval",
+    "session/CSRF TTL policy requires security policy approval"
+  ],
+  "blockers": []
+}
