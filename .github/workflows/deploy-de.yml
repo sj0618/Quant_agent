@@ -33,32 +33,7 @@ jobs:
           ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
             "mkdir -p ~/mvp_sp1/quant-proj/DE"
 
-      - name: Deploy DE Environment File
-        run: |
-          cat << 'EOF' > de_env_temp.txt
-          ${{ secrets.DE_ENV_FILE_CONTENT }}
-          EOF
-          scp -i ~/.ssh/id_rsa -P 30233 de_env_temp.txt etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/DE/.env
-          rm de_env_temp.txt
-
-      - name: Repair Airflow workspace ownership
-        run: |
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
-            set -euo pipefail
-
-            if [ -f "$HOME/.bashrc" ]; then
-              set +u
-              source "$HOME/.bashrc"
-              set -u
-            fi
-
-            APP_DIR="$HOME/mvp_sp1/quant-proj"
-            cd "$APP_DIR/DE"
-
-            export AIRFLOW_UID="$(id -u)"
-            docker compose -f docker-compose-airflow-dev.yaml run --rm --no-deps airflow-init
-          REMOTE
-
+      # 1단계: 먼저 소스 코드 파일들부터 서버로 동기화합니다.
       - name: Deploy via rsync
         run: |
           rsync -rlvz --delete \
@@ -77,28 +52,33 @@ jobs:
             DE/ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/DE/
 
+      # 2단계: 파일 동기화가 끝난 후, 최신 시크릿 값이 담긴 .env 파일을 최종적으로 덮어씁니다.
+      - name: Deploy DE Environment File
+        run: |
+          cat << 'EOF' > de_env_temp.txt
+          ${{ secrets.DE_ENV_FILE_CONTENT }}
+          EOF
+          scp -i ~/.ssh/id_rsa -P 30233 de_env_temp.txt etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/DE/.env
+          rm de_env_temp.txt
+
+      # 3단계: 파일과 환경 변수가 완벽히 정렬된 상태에서 워크스페이스 권한을 수리합니다.
+      - name: Repair Airflow workspace ownership
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+            set -euo pipefail
+            APP_DIR="$HOME/mvp_sp1/quant-proj"
+            cd "$APP_DIR/DE"
+            export AIRFLOW_UID="$(id -u)"
+            docker compose -f docker-compose-airflow-dev.yaml run --rm --no-deps airflow-init
+          REMOTE
+
+      # 4단계: 마지막으로 서버를 내렸다가 새 환경 변수판으로 올립니다.
       - name: Install and restart development servers
         run: |
           ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
             set -euo pipefail
-
-            if [ -f "$HOME/.bashrc" ]; then
-              set +u
-              source "$HOME/.bashrc"
-              set -u
-            fi
-
             APP_DIR="$HOME/mvp_sp1/quant-proj"
-
-            echo "============================================="
-            echo "Deploying Data Engineering (Airflow) Stack..."
             cd "$APP_DIR/DE"
-
-            export DOCKER_BUILDKIT=0
-            export COMPOSE_DOCKER_CLI_BUILD=0
-            
             docker compose -f docker-compose-airflow-dev.yaml down
             docker compose -f docker-compose-airflow-dev.yaml up -d --build
-            echo "Airflow containers restarted."
-            echo "============================================="
           REMOTE
