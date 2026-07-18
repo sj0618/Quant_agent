@@ -21,7 +21,7 @@ type WorkspaceTab = "overview" | "trading" | "performance";
 
 const TAB_ITEMS: Array<TabItem<WorkspaceTab>> = [
   { id: "overview", label: "전체" },
-  { id: "trading", label: "매매종목 정보" },
+  { id: "trading", label: "매매종목 정보", count: 10 },
   { id: "performance", label: "수익률" },
 ];
 const CONVERSATION_HISTORY_STORAGE_KEY = "quantagent.chat-conversations.v1";

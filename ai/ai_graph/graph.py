@@ -8,7 +8,6 @@ from time import perf_counter
 from typing import Any
 from uuid import UUID
 
-from os import environ
 from ai_graph.audit import (
     AuditSession,
     AuditSink,
@@ -787,8 +786,6 @@ def strategy_candidate_cards(
     screening_candidates: list[dict[str, Any]] | None = None,
     sector: str | None = None,
 ) -> list[StrategyCandidateCard]:
-    if environ.get("AI_REQUIRE_LIVE_DATA", "").strip() == "1" and not screening_candidates:
-        return []
     cards = _static_strategy_candidate_cards(query, hits)
     if screening_candidates:
         cards = _attach_screening_matches(cards, screening_candidates, sector=sector)

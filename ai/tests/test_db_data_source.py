@@ -5,7 +5,6 @@ from decimal import Decimal
 import pytest
 
 from ai_graph.data_sources.db import (
-    AI_REQUIRE_LIVE_DATA_ENV,
     AI_DATABASE_DSN_ENV,
     DATABASE_URL_ENV,
     DEFAULT_BACKTEST_LOOKBACK_DAYS,
@@ -40,16 +39,6 @@ def test_pipeline_data_source_uses_fixture_boundary_without_dsn(monkeypatch) -> 
         DATABASE_URL_ENV,
     ]
     assert "mart.kis_adjusted_feature_frame_asof" in bundle.metadata["available_db_objects"]
-
-
-def test_pipeline_data_source_rejects_missing_dsn_in_live_mode(monkeypatch) -> None:
-    monkeypatch.delenv(AI_DATABASE_DSN_ENV, raising=False)
-    monkeypatch.delenv(QUANT_DB_DSN_ENV, raising=False)
-    monkeypatch.delenv(DATABASE_URL_ENV, raising=False)
-    monkeypatch.setenv(AI_REQUIRE_LIVE_DATA_ENV, "1")
-
-    with pytest.raises(RuntimeError, match="requires a configured PostgreSQL DSN"):
-        load_pipeline_data_from_env("RSI가 30 이하인 KOSPI200", "trace-live")
 
 
 def test_data_source_config_uses_quant_db_dsn_alias() -> None:

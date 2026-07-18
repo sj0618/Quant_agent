@@ -1,7 +1,7 @@
 # QuantAgent AI MVP
-이 디렉터리는 로컬 테스트용 fixture/mock 실행과 운영용 실데이터 실행을 모두 지원한다.
-로컬 테스트는 외부 자격증명 없이 동작하지만, 배포 MVP는 AOAI와 PostgreSQL을 필수로 사용하고
-실패 시 fixture로 대체하지 않는다.
+이 디렉터리는 QuantAgent AI/LLM MVP의 fixture/mock 기반 실행 표면이다.
+외부 LLM 키, 증권 API, 네트워크 호출 없이 자연어 전략 분석부터 최종
+API envelope 생성까지 e2e 테스트가 동작한다.
 
 ## 실행
 
@@ -75,8 +75,8 @@ env -i \
     --app-dir "$WORKTREE_ROOT/ai" --host "$AI_API_HOST" --port "$AI_API_PORT"
 ```
 
-공용 서버 PostgreSQL/TimescaleDB를 연결하려면 `AI_DATABASE_DSN`, `QUANT_DB_DSN`, 또는 `DATABASE_URL`을 child process에 전달한다.
-배포 MVP는 `AI_REQUIRE_LIVE_DATA=1`로 DB 누락·조회 실패를 오류로 처리하며 공개 fixture로 대체하지 않는다.
+공용 서버 PostgreSQL/TimescaleDB를 연결하려면 DB DSN/fixture 변수는 child process에 inline으로 전달한다.
+DSN이 없으면 공개 fixture 경로로 실행되고, `/api-status`/응답에서 비밀값 비노출이 유지되어야 한다.
 ```bash
 AI_DATABASE_DSN='postgresql://user:password@host:5432/quant_agent' \
 AI_DEFAULT_TICKER=005930 \
@@ -84,16 +84,6 @@ AI_BACKTEST_LOOKBACK_DAYS=252 \
 AI_L4_EVIDENCE_LIMIT=5 \
 "$MVP_VENV/bin/python" -m uvicorn ai_graph.api:app \
   --app-dir "$WORKTREE_ROOT/ai" --host "$AI_API_HOST" --port "$AI_API_PORT"
-```
-### 배포용 실데이터 실행
-```bash
-export AI_LLM_PROVIDER=aoai
-export AI_AOAI_RESPONSES_URL='https://<resource>.openai.azure.com/openai/responses?api-version=<version>'
-export AI_AOAI_API_KEY='...'
-export AI_AOAI_MODEL='<deployment-name>'
-export DATABASE_URL='postgresql://...'
-export AI_REQUIRE_LIVE_DATA=1
-export BACKEND_FE_DATA_SOURCE=database
 ```
 
 AI 운영 로그는 기본적으로 꺼져 있으며 현재 운영·스테이징 raw logging 활성화는

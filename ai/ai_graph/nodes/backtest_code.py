@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-import os
 
 from ai_graph.llm import LLMClient, LLMClientError, create_llm_client
 from ai_graph.llm.mock import (
@@ -107,8 +106,6 @@ def generate_loop3_candidates(
             *_candidate_violation_summaries(candidates),
             *fallback_reasons,
         ]
-        if os.environ.get("AI_REQUIRE_LIVE_DATA", "").strip() == "1":
-            raise ValueError("live AOAI candidate generation produced no valid backtest candidates")
         candidates = _validate_candidates(
             request,
             _deterministic_fallback_candidates(request.strategy, code_plan, request.max_positions),

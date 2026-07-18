@@ -45,7 +45,7 @@ AI/FE 상세 절차는 각각 `ai/README_AI.md`, `fe/README.md`에 두고, 여�
 - 저장소 바깥 작업공간 사용(안전성 상의 이유)
 
 ## MVP Spine
-`fe`(직접 Vite) → `/backend-api`·`/ai-api` 프록시 → Backend FE read API·`ai/ai_graph/api.py` → PostgreSQL·`backtest_module` → 공개 `AnalysisJob/APIEnvelope` → FE 표시
+`fe`(직접 Vite) → loopback `/ai-api` 프록시 → `ai/ai_graph/api.py` → `backtest_module` → 공개 `AnalysisJob/APIEnvelope` → 동일 브라우저 세션 FE 표시
 
 ## 실행 전제: parent/child topology
 - AI와 FE는 같은 쉘에서 섞어 실행하지 않는다.
@@ -53,10 +53,14 @@ AI/FE 상세 절차는 각각 `ai/README_AI.md`, `fe/README.md`에 두고, 여�
 - child는 canonical `FE_ROOT`와 `env -i`, bounded curl, 시간축/identity 검증을 통과해야 한다.
 - loopback 포트 점검/종료 후 listener 정리는 `ss`와 bounded `curl`만으로 수행한다.
 
-## 로컬 점검용 fixture 환경
+## 저장소 외부 venv + fixture env
 - venv는 반드시 저장소 경로 밖 생성
-- 로컬 테스트는 `AI_LLM_PROVIDER=mock`, `AI_JOB_STORE=memory`, `AI_AUDIT_SINK=noop`와 데이터 fixture를 사용한다.
-- 배포 Workflow는 이 fixture 설정을 사용하지 않으며 `AI_LLM_PROVIDER=aoai`, `AI_REQUIRE_LIVE_DATA=1`, `BACKEND_FE_DATA_SOURCE=database`, `DATABASE_URL`을 요구한다.
+- AI/FE는 아래 fixture로만 시작
+  - `AUTH_ENABLED=0`
+  - `AI_LLM_PROVIDER=mock`
+  - `AI_JOB_STORE=memory`
+  - `AI_AUDIT_SINK=noop`
+  - data-source 계열 env는 제거 (`AI_DATABASE_DSN`, `QUANT_DB_DSN`, `DATABASE_URL`, `AI_DEFAULT_TICKER`, `AI_BACKTEST_LOOKBACK_DAYS`, `AI_L4_EVIDENCE_LIMIT`, `AI_DB_CONNECT_TIMEOUT_SECONDS`, `AI_DB_STATEMENT_TIMEOUT_MS`, `AI_SCREENING_LIMIT`, `AI_SCREENING_BACKTEST_SELECTION_LIMIT`, `AI_PORTFOLIO_BACKTEST_TICKER_LIMIT`, `AI_SECTOR_CACHE_TTL_SECONDS`, `BE_JOB_STORE_MODE`, `REDIS_URL`, `AUTH_SESSION_COOKIE_NAME`, `AI_CORS_ALLOW_ORIGINS`)
 
 ## 참고
 - AI 상세 실행/테스트 가드: `ai/README_AI.md`

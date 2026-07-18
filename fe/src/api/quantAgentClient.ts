@@ -1,4 +1,8 @@
 import { AI_ENDPOINTS, appConfig } from "../config/appConfig";
+import { appOverview, analysisJobStatus, performanceSummary, tradingCandidates } from "../mocks/app.mock";
+import { landingSample } from "../mocks/landing.mock";
+import { emailDigestHistoryEntries, strategyReportDetails } from "../mocks/reportStrategies.mock";
+import { reportDetails, reportSummaries } from "../mocks/reports.mock";
 import type {
   AIBacktestMetrics,
   AIBacktestPerformance,
@@ -32,6 +36,7 @@ import type {
 } from "../types/quantagent";
 
 const APP_LOCALE = "ko-KR";
+const MOCK_LATENCY_MS = 120;
 const RECENT_REPORT_LIMIT = 4;
 const SCORE_SCALE = 10;
 const PERCENT_SCALE = 100;
@@ -86,26 +91,13 @@ interface StrategyDescriptionApiResponse {
   }>;
 }
 
-function requireBackendApiBaseUrl() {
-  if (!appConfig.backendApiBaseUrl) {
-    throw new Error("VITE_BACKEND_API_BASE_URL 설정이 필요합니다.");
-  }
-  return appConfig.backendApiBaseUrl;
+function clone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
-async function fetchBackendJson<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${requireBackendApiBaseUrl()}${path}`, {
-    credentials: "include",
-    ...init,
-    headers: {
-      ...(init.body ? { "Content-Type": "application/json" } : {}),
-      ...init.headers,
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Backend API 응답 실패: ${response.status}`);
-  }
-  return (await response.json()) as T;
+async function respond<T>(value: T): Promise<T> {
+  await new Promise((resolve) => window.setTimeout(resolve, MOCK_LATENCY_MS));
+  return clone(value);
 }
 
 function requireAiApiBaseUrl() {
@@ -176,7 +168,7 @@ async function fetchStrategyDescriptionMap(strategies: StrategyReportSummary[]) 
       return current;
     }, {});
   } catch (error) {
-    console.warn("전략 설명 AI 보강에 실패해 서버 설명을 사용합니다.", error);
+    console.warn("전략 설명 AI 보강에 실패해 seed 설명을 사용합니다.", error);
     return {};
   }
 }
@@ -272,7 +264,6 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
     ? [reportSummary, ...base.recentReports.filter((report) => report.id !== reportSummary.id)].slice(0, RECENT_REPORT_LIMIT)
     : base.recentReports;
   const performance = buildPerformanceSummaryFromAnalysisJob(job, base.performance);
-  const candidates = result?.user_payload.report ? buildTradingCandidatesFromReport(result.user_payload.report) : [];
 
   return {
     ...base,
@@ -282,7 +273,6 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
     latestRunLabel: `최신 분석 · ${formatDateTime(job.updated_at)}`,
     chatMessages: mergeChatMessages(base.chatMessages, buildAnalysisChatMessages(job)),
     performance,
-    candidates: candidates.length ? candidates : base.candidates,
     recentReports,
     envelope: result ?? base.envelope,
     jobStatus: buildWorkspaceJobStatus(job),
@@ -290,111 +280,79 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
 }
 
 export function getLandingSample(): Promise<LandingSample> {
-  return fetchBackendJson<LandingSample>("/landing-sample");
+  return respond(landingSample);
 }
 
 export async function getAppOverview(): Promise<AppOverview> {
-  const overview = await fetchBackendJson<AppOverview>("/app/overview");
+  const overview = await respond({ ...appOverview, recentReports: reportSummaries.slice(0, RECENT_REPORT_LIMIT) });
   const latestJob = await refreshLatestAnalysisJob();
   return latestJob ? mergeAnalysisJobIntoOverview(overview, latestJob) : overview;
 }
 
 export function getWorkspaceTemplate(): Promise<AppOverview> {
-  return fetchBackendJson<AppOverview>("/workspace/template");
+  return respond({
+    ...appOverview,
+    chatMessages: [],
+    recentReports: [],
+  });
 }
 
 export function getTradingCandidates(): Promise<TradingCandidate[]> {
-  return fetchBackendJson<TradingCandidate[]>("/trading-candidates");
+  return respond(tradingCandidates);
 }
 
 export function getPerformanceSummary(): Promise<PerformanceSummary> {
-  return fetchBackendJson<PerformanceSummary>("/performance/summary");
+  return respond(performanceSummary);
 }
 
 export async function getReports(): Promise<ReportSummary[]> {
-  const reports = await fetchBackendJson<ReportSummary[]>("/reports");
+  const reports = await respond(reportSummaries);
   const latestJob = await refreshLatestAnalysisJob();
   const latestReport = latestJob ? buildReportSummaryFromAnalysisJob(latestJob) : null;
   return latestReport ? [latestReport, ...reports.filter((report) => report.id !== latestReport.id)] : reports;
 }
 
-function strategyIdForReport(report: ReportSummary) {
-  return report.strategyId ?? `strategy-${encodeURIComponent(report.strategyName)}`;
-}
-
-function strategyFromReport(report: ReportSummary): StrategyReportSummary {
-  return {
-    id: strategyIdForReport(report),
-    name: report.strategyName,
-    description: report.summary,
-    universe: "서버 제공 전략",
-    timeframe: "daily",
-    entrySummary: "서버 리포트 기준",
-    exitSummary: "서버 리포트 기준",
-    riskSummary: "서버 리포트 기준",
-    latestSentAt: report.sentAt,
-    latestReportDate: report.date,
-    latestStatus: report.status,
-    latestEmailReportId: report.id,
-    recommendationScore: report.recommendationScore,
-    signals: report.signals,
-    summary: report.summary,
-    tags: [],
-  };
-}
-
 export async function getReportStrategies(): Promise<StrategyReportSummary[]> {
-  const reports = await getReports();
-  const unique = new Map<string, ReportSummary>();
-  for (const report of reports) {
-    const strategyId = strategyIdForReport(report);
-    if (!unique.has(strategyId)) {
-      unique.set(strategyId, report);
-    }
-  }
-  return hydrateStrategyDescriptions(Array.from(unique.values()).map(strategyFromReport));
+  const strategies = await hydrateStrategyDescriptions(strategyReportDetails.map((detail) => detail.strategy));
+  return respond(strategies);
 }
 
 export async function getStrategyReportById(id: string): Promise<StrategyReportDetail | null> {
-  const reports = (await getReports()).filter((report) => strategyIdForReport(report) === id);
-  if (!reports.length) {
-    return null;
+  const detail = strategyReportDetails.find((item) => item.strategy.id === id);
+  if (!detail) {
+    return respond(null);
   }
 
-  const emailReports = (
-    await Promise.all(reports.map((report) => getReportById(report.id)))
-  ).filter((report): report is ReportDetail => report !== null);
-  const [strategy] = await hydrateStrategyDescriptions([strategyFromReport(reports[0])]);
-  return { strategy, emailReports };
+  const [strategy] = await hydrateStrategyDescriptions([detail.strategy]);
+  return respond({ ...detail, strategy });
 }
 
 export async function getStrategyWorkspaceOverview(id: string): Promise<AppOverview | null> {
   const detail = await getStrategyReportById(id);
   if (!detail) {
-    return null;
+    return respond(null);
   }
 
   const latestReport =
     detail.emailReports.find((report) => report.id === detail.strategy.latestEmailReportId) ?? detail.emailReports[0];
   if (!latestReport) {
-    return null;
+    return respond(null);
   }
 
-  const base = await getAppOverview();
   const previousScore = detail.emailReports[1]?.recommendationScore;
   const latestScore = Number.parseFloat(latestReport.recommendationScore);
   const previousValue = previousScore ? Number.parseFloat(previousScore) : Number.NaN;
   const delta =
     Number.isFinite(latestScore) && Number.isFinite(previousValue)
       ? `${latestScore - previousValue >= 0 ? "+" : ""}${(latestScore - previousValue).toFixed(1)}`
-      : base.recommendationDelta;
+      : appOverview.recommendationDelta;
 
   const buyCount = latestReport.signals.BUY;
   const holdCount = latestReport.signals.HOLD;
   const dropCount = latestReport.signals.DROP;
 
-  return {
-    ...base,
+  return respond({
+    ...appOverview,
     strategy: {
       name: detail.strategy.name,
       natural_language_strategy: detail.strategy.description,
@@ -403,7 +361,7 @@ export async function getStrategyWorkspaceOverview(id: string): Promise<AppOverv
       buy_condition: detail.strategy.entrySummary,
       hold_condition: detail.strategy.riskSummary,
       drop_condition: detail.strategy.exitSummary,
-      rebalance: base.strategy.rebalance,
+      rebalance: appOverview.strategy.rebalance,
       constraints: detail.strategy.tags,
     },
     recommendationScore: `${latestReport.recommendationScore} / 10`,
@@ -415,41 +373,44 @@ export async function getStrategyWorkspaceOverview(id: string): Promise<AppOverv
     latestRunLabel: `최신 분석 · ${latestReport.date} ${latestReport.sentAt}`,
     candidates: latestReport.candidates,
     performance: {
-      ...base.performance,
+      ...performanceSummary,
       metrics: latestReport.performance.metrics,
     },
     recentReports: detail.emailReports,
-  };
+  });
 }
 
-export async function getEmailDigestHistory(): Promise<EmailDigestHistoryEntry[]> {
-  return (await getReports()).map((report) => ({
-    id: `digest-${report.id}`,
-    reportId: report.id,
-    strategyId: strategyIdForReport(report),
-    strategyName: report.strategyName,
-    reportDate: report.date,
-    sentAt: report.sentAt,
-    status: report.status,
-    title: report.title,
-  }));
+export function getEmailDigestHistory(): Promise<EmailDigestHistoryEntry[]> {
+  return respond(emailDigestHistoryEntries);
 }
 
 export async function getReportById(id: string): Promise<ReportDetail | null> {
   const latestJob = await refreshLatestAnalysisJob();
   if (latestJob && id === latestAnalysisReportId(latestJob.job_id)) {
-    const performance = await getPerformanceSummary();
-    return buildReportDetailFromAnalysisJob(latestJob, performance);
+    return buildReportDetailFromAnalysisJob(latestJob);
   }
 
-  return fetchBackendJson<ReportDetail | null>(`/reports/${encodeURIComponent(id)}`);
+  const directDetail = reportDetails.find((report) => report.id === id);
+  if (directDetail) {
+    return respond(directDetail);
+  }
+
+  const strategyEmailReport = strategyReportDetails.flatMap((detail) => detail.emailReports).find((report) => report.id === id);
+  if (strategyEmailReport) {
+    return respond(strategyEmailReport);
+  }
+
+  const summary = reportSummaries.find((report) => report.id === id);
+  if (!summary) {
+    return respond(null);
+  }
+
+  return respond({ ...reportDetails[0], ...summary });
 }
 
 export async function getAnalysisJobStatus(): Promise<AnalysisJobStatus> {
   const latestJob = await refreshLatestAnalysisJob();
-  return latestJob
-    ? buildWorkspaceJobStatus(latestJob)
-    : fetchBackendJson<AnalysisJobStatus>("/analysis-jobs/latest/status");
+  return latestJob ? buildWorkspaceJobStatus(latestJob) : respond(analysisJobStatus);
 }
 
 function mapAIStrategySpec(strategy: AIStrategySpec, query: string): StrategySpec {
@@ -585,49 +546,19 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
   };
 }
 
-function buildTradingCandidatesFromReport(report: AIReportBundle): TradingCandidate[] {
-  const section = report.web_projection.sections.find((item) => stringFromRecord(item, "id") === "screening_candidates");
-  const items = section?.items;
-  if (!Array.isArray(items)) {
-    return [];
-  }
-
-  return items.filter(isRecord).flatMap((item) => {
-    const ticker = stringFromRecord(item, "ticker");
-    if (!ticker) {
-      return [];
-    }
-    const score = numberFromRecord(item, "score") ?? 0;
-    const return20d = numberFromRecord(item, "return_20d");
-    return [{
-      id: ticker,
-      ticker,
-      name: stringFromRecord(item, "name") ?? "",
-      sector: stringFromRecord(item, "sector") ?? "",
-      signal: isSignalType(item.signal) ? item.signal : "HOLD",
-      confidence: Math.max(0, Math.min(1, score / 10)),
-      score,
-      price: numberFromRecord(item, "close")?.toFixed(2) ?? "",
-      changePercent: return20d === null ? "" : formatPercent(return20d),
-      rationale: Array.isArray(item.matched_rules) ? item.matched_rules.join(", ") : "실제 DB 스크리닝 결과",
-      evidence: [],
-      riskReasons: [],
-    }];
-  });
-}
-function buildReportDetailFromAnalysisJob(job: AnalysisJob, fallback: PerformanceSummary): ReportDetail | null {
+function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null {
   const result = job.result;
   const report = result?.user_payload.report;
   const summary = buildReportSummaryFromAnalysisJob(job);
-  if (!result || !report || !summary) {
+  const fallback = reportDetails[0];
+  if (!result || !report || !summary || !fallback) {
     return null;
   }
-  const performance = buildPerformanceSummaryFromAnalysisJob(job, fallback);
+  const performance = buildPerformanceSummaryFromAnalysisJob(job, performanceSummary);
 
   return {
     ...summary,
-    recipient: "",
-    strategyUniverse: result.strategy_spec?.universe,
+    recipient: fallback.recipient,
     marketBrief: result.user_payload.message,
     news: report.web_projection.sections.map((section, index) => ({
       rank: index + 1,
@@ -635,8 +566,8 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob, fallback: Performanc
       source: "QuantAgent AI",
       tone: toneForStatus(result.status),
     })),
-    candidates: buildTradingCandidatesFromReport(report),
-    signalAxes: [],
+    candidates: fallback.candidates,
+    signalAxes: fallback.signalAxes,
     riskManagerOverride: report.risk_adjustments.length ? describeRiskAdjustments(report.risk_adjustments) : "Risk Manager 변경 없음",
     conclusion: report.web_projection.summary,
     performance: { metrics: performance.metrics, disclaimer: performance.disclaimer },

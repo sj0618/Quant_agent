@@ -32,7 +32,6 @@ Figma MCP에서 확인한 순수 `HI-FI ·` 프레임 기준의 React + TypeScri
 | Name | Purpose |
 |---|---|
 | `VITE_AI_API_BASE_URL` | production 빌드에서만 적용되는 AI API base URL (`/ai-api`는 dev에서 고정)
-| `VITE_BACKEND_API_BASE_URL` | landing/workspace/report 등 백엔드 API base URL (`/backend-api`는 dev에서 고정) |
 | `VITE_AUTH_API_BASE_URL` | Google OAuth 시작/콜백/로그아웃 API base URL |
 | `VITE_REPORT_ACTION_API_BASE_URL` | 리포트 이메일 재발송 API base URL |
 | `VITE_STRATEGY_API_BASE_URL` | 전략 저장/분석 실행 API base URL |
@@ -60,7 +59,6 @@ FE_ROOT=$(readlink -f "$WORKTREE_ROOT/fe")
 ```
 
 - `fe/vite.config.ts`의 `server.proxy['/ai-api']`는 `http://127.0.0.1:18001`로 전달한다.
-- `fe/vite.config.ts`의 `server.proxy['/backend-api']`는 `http://127.0.0.1:8000`으로 전달한다.
 - SSH 포워딩은 `18000` 포트만 허용한다 (`-L 18000:127.0.0.1:18000`).
 - 동일 브라우저 세션을 유지한다. QA 중 page reload/restart는 수행하지 않는다.
 
@@ -95,12 +93,16 @@ console.assert(evidence.origin==="http://127.0.0.1:18000"&&evidence.values.every
 - **AI-down**: FE 자체는 200을 유지하고 새 분석 요청은 오류 UI를 표시하며 새 ready 결과를 만들지 않아야 한다.
 - Google OAuth 성공, page reload, AI process restart 뒤 복원은 이 MVP 범위 밖이다.
 
-## API 연동
-`quantAgentClient.ts`의 화면 데이터는 백엔드 API를 호출한다. 개발 환경에서는 `/backend-api` 프록시를 통해 백엔드에 연결하고, AI 분석 job은 `/ai-api`를 통해 AI API에 연결한다.
+## Mock API
+`src/api/quantAgentClient.ts`는 `appConfig.aiApiBaseUrl`를 사용한다. `import.meta.env.DEV`에서는 항상 `/ai-api`로 고정되고, production 빌드에서만 `VITE_AI_API_BASE_URL`이 적용된다.
+- **always-mock**: `getLandingSample`, `getTradingCandidates`, `getPerformanceSummary`, `getWorkspaceTemplate`, `getEmailDigestHistory`는 AI와 무관하게 fixture 데이터를 반환한다.
+- **AI create/poll**: `createAnalysisJob`/`getAnalysisJob`/`getAnalysisJobStatus`는 `/analysis-jobs` API를 직접 호출해 job 생성·조회·폴링 상태를 최신 상태로 유지한다.
+- **hybrid projection**: `getAppOverview`, `getReports`, `getReportById`는 fixture 기본값을 시작점으로 두고 최신 AI job이 있으면 결과를 overlay한다.
+- **UI evidence source**
+  - AI 유래: `result.status`, `result.trace_id`, `result.user_payload` 기반 `performance`·`report.web_projection`, stage/job 상태
+  - fixture 유래: 초깃값/목록형 템플릿(`tradingCandidates`, `performanceSummary`, `reportSummary`, `candidates`, `signalAxes`, `recipient` 등)
 
-- 백엔드: landing, workspace, 후보, 성과, 리포트, 이메일 이력
-- AI: 분석 job 생성·조회·상태, 전략 설명 보강
-- 브라우저 로컬 저장소는 마지막 분석 job 복원에만 사용한다.
+`AI API`를 실제 UI payload로 사용하지 못할 때는 fixture fallback으로 렌더링을 이어가므로 화면에서 AI-derived와 fixture-derived 필드를 구분해 보는 것이 중요하다.
 `/analysis-jobs` 응답은 화면 contract상 노출 대상인 `status`, `trace_id`, `schema_version`, `strategy_spec`, `debug_ref`, `retryable`, `user_payload`만 유지한다. `internal_payload`는 화면 노출하지 않는다.
 
 ## 검증
