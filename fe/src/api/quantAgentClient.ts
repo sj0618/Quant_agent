@@ -272,6 +272,7 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
     ? [reportSummary, ...base.recentReports.filter((report) => report.id !== reportSummary.id)].slice(0, RECENT_REPORT_LIMIT)
     : base.recentReports;
   const performance = buildPerformanceSummaryFromAnalysisJob(job, base.performance);
+  const candidates = result?.user_payload.report ? buildTradingCandidatesFromReport(result.user_payload.report) : [];
 
   return {
     ...base,
@@ -281,6 +282,7 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
     latestRunLabel: `최신 분석 · ${formatDateTime(job.updated_at)}`,
     chatMessages: mergeChatMessages(base.chatMessages, buildAnalysisChatMessages(job)),
     performance,
+    candidates: candidates.length ? candidates : base.candidates,
     recentReports,
     envelope: result ?? base.envelope,
     jobStatus: buildWorkspaceJobStatus(job),
@@ -583,6 +585,36 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
   };
 }
 
+function buildTradingCandidatesFromReport(report: AIReportBundle): TradingCandidate[] {
+  const section = report.web_projection.sections.find((item) => stringFromRecord(item, "id") === "screening_candidates");
+  const items = section?.items;
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items.filter(isRecord).flatMap((item) => {
+    const ticker = stringFromRecord(item, "ticker");
+    if (!ticker) {
+      return [];
+    }
+    const score = numberFromRecord(item, "score") ?? 0;
+    const return20d = numberFromRecord(item, "return_20d");
+    return [{
+      id: ticker,
+      ticker,
+      name: stringFromRecord(item, "name") ?? "",
+      sector: stringFromRecord(item, "sector") ?? "",
+      signal: isSignalType(item.signal) ? item.signal : "HOLD",
+      confidence: Math.max(0, Math.min(1, score / 10)),
+      score,
+      price: numberFromRecord(item, "close")?.toFixed(2) ?? "",
+      changePercent: return20d === null ? "" : formatPercent(return20d),
+      rationale: Array.isArray(item.matched_rules) ? item.matched_rules.join(", ") : "실제 DB 스크리닝 결과",
+      evidence: [],
+      riskReasons: [],
+    }];
+  });
+}
 function buildReportDetailFromAnalysisJob(job: AnalysisJob, fallback: PerformanceSummary): ReportDetail | null {
   const result = job.result;
   const report = result?.user_payload.report;
@@ -603,7 +635,7 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob, fallback: Performanc
       source: "QuantAgent AI",
       tone: toneForStatus(result.status),
     })),
-    candidates: [],
+    candidates: buildTradingCandidatesFromReport(report),
     signalAxes: [],
     riskManagerOverride: report.risk_adjustments.length ? describeRiskAdjustments(report.risk_adjustments) : "Risk Manager 변경 없음",
     conclusion: report.web_projection.summary,
