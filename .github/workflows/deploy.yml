@@ -78,6 +78,12 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
+            # This remote deployment runs the documented fixture MVP, not the production DB/OAuth stack.
+            export AUTH_ENABLED=0 AI_LLM_PROVIDER=mock AI_JOB_STORE=memory AI_AUDIT_SINK=noop
+            unset AI_DATABASE_DSN QUANT_DB_DSN DATABASE_URL REDIS_URL AUTH_SESSION_COOKIE_NAME AI_CORS_ALLOW_ORIGINS
+            unset AI_DEFAULT_TICKER AI_BACKTEST_LOOKBACK_DAYS AI_L4_EVIDENCE_LIMIT
+            unset AI_DB_CONNECT_TIMEOUT_SECONDS AI_DB_STATEMENT_TIMEOUT_MS AI_SCREENING_LIMIT
+            unset AI_SCREENING_BACKTEST_SELECTION_LIMIT AI_PORTFOLIO_BACKTEST_TICKER_LIMIT AI_SECTOR_CACHE_TTL_SECONDS
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
