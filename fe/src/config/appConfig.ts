@@ -28,6 +28,15 @@ function trimTrailingSlash(value: string | undefined) {
 function aiApiBaseUrl() {
   return import.meta.env.DEV ? "/ai-api" : trimTrailingSlash(import.meta.env.VITE_AI_API_BASE_URL);
 }
+function backendApiBaseUrl() {
+  return import.meta.env.DEV ? "/backend-api" : trimTrailingSlash(import.meta.env.VITE_BACKEND_API_BASE_URL);
+}
+
+function authApiBaseUrl() {
+  const configured = trimTrailingSlash(import.meta.env.VITE_AUTH_API_BASE_URL);
+  return configured || (import.meta.env.DEV ? "http://127.0.0.1:8000" : backendApiBaseUrl());
+}
+
 
 // TEMP(dev-auth-gate): everything below until the export, remove once BE session
 // integration ships (test login) and once the product is ready for public access
@@ -59,10 +68,11 @@ function parseSitePasswordEntries(): SitePasswordEntry[] {
 const sitePasswordEntryList = parseSitePasswordEntries();
 
 export const appConfig = {
+  backendApiBaseUrl: backendApiBaseUrl(),
   aiApiBaseUrl: aiApiBaseUrl(),
-  authApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AUTH_API_BASE_URL),
-  reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL),
-  strategyApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_STRATEGY_API_BASE_URL),
+  authApiBaseUrl: authApiBaseUrl(),
+  reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL) || backendApiBaseUrl(),
+  strategyApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_STRATEGY_API_BASE_URL) || backendApiBaseUrl(),
   testLoginEnabled: import.meta.env.DEV || import.meta.env.VITE_ENABLE_TEST_LOGIN === "1",
   sitePasswordEntries: sitePasswordEntryList,
   sitePasswordGateEnabled: sitePasswordEntryList.length > 0,
