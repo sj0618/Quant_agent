@@ -78,8 +78,8 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
-            # This remote deployment runs the documented fixture MVP, not the production DB/OAuth stack.
-            export AUTH_ENABLED=0 AI_LLM_PROVIDER=mock AI_JOB_STORE=memory AI_AUDIT_SINK=noop
+            # Auth/job/audit remain in MVP mode; AI_LLM_PROVIDER and AOAI credentials come from the remote shell environment.
+            export AUTH_ENABLED=0 AI_JOB_STORE=memory AI_AUDIT_SINK=noop
             unset AI_DATABASE_DSN QUANT_DB_DSN DATABASE_URL REDIS_URL AUTH_SESSION_COOKIE_NAME AI_CORS_ALLOW_ORIGINS
             unset AI_DEFAULT_TICKER AI_BACKTEST_LOOKBACK_DAYS AI_L4_EVIDENCE_LIMIT
             unset AI_DB_CONNECT_TIMEOUT_SECONDS AI_DB_STATEMENT_TIMEOUT_MS AI_SCREENING_LIMIT
@@ -88,6 +88,7 @@ jobs:
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
             "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/ai"
+            "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/backend"
 
             cd "$APP_DIR/fe"
             npm ci
@@ -139,8 +140,10 @@ jobs:
             }
 
             stop_listeners_on_port 18001
+            stop_listeners_on_port 8000
             stop_listeners_on_port 18000
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/fe.pid"
+            rm -f "$RUN_DIR/backend.pid"
 
             cd "$APP_DIR/ai"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn ai_graph.api:app \
@@ -149,6 +152,12 @@ jobs:
               --reload \
               > "$RUN_DIR/ai.log" 2>&1 &
             echo "$!" > "$RUN_DIR/ai.pid"
+            cd "$APP_DIR/backend"
+            nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn app.main:app \
+              --host 0.0.0.0 \
+              --port 8000 \
+              > "$RUN_DIR/backend.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/backend.pid"
 
             cd "$APP_DIR/fe"
             nohup npm run dev -- --host 0.0.0.0 --port 18000 \
@@ -172,5 +181,6 @@ jobs:
             }
 
             wait_for_url "AI API" "http://127.0.0.1:18001/health" "$RUN_DIR/ai.log"
+            wait_for_url "Backend API" "http://127.0.0.1:8000/app/overview" "$RUN_DIR/backend.log"
             wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
           REMOTE
