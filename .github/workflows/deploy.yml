@@ -86,6 +86,7 @@ jobs:
             : "${AI_AOAI_API_KEY:?AI_AOAI_API_KEY is required}"
             : "${AI_AOAI_MODEL:?AI_AOAI_MODEL is required}"
             : "${DATABASE_URL:?DATABASE_URL is required for live backend and AI data}"
+            export AI_LLM_PROVIDER AI_AOAI_RESPONSES_URL AI_AOAI_API_KEY AI_AOAI_MODEL DATABASE_URL
             unset AUTH_SESSION_COOKIE_NAME AI_CORS_ALLOW_ORIGINS
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
@@ -185,5 +186,8 @@ jobs:
 
             wait_for_url "AI API" "http://127.0.0.1:18001/health" "$RUN_DIR/ai.log"
             wait_for_url "Backend API" "http://127.0.0.1:8000/app/overview" "$RUN_DIR/backend.log"
+            backend_status="$(curl -fsS "http://127.0.0.1:8000/api-status")"
+            BACKEND_STATUS_JSON="$backend_status" python3.11 -c 'import json, os; source = json.loads(os.environ["BACKEND_STATUS_JSON"])["data_source"]; assert source["configured"] and source["price_source"] == "feature.kis_adjusted_ohlcv_daily", source'
+            echo "Backend API is using PostgreSQL-backed live data"
             wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
           REMOTE
