@@ -31,6 +31,7 @@ AI_SCREENING_LIMIT_ENV = "AI_SCREENING_LIMIT"
 AI_SCREENING_BACKTEST_SELECTION_LIMIT_ENV = "AI_SCREENING_BACKTEST_SELECTION_LIMIT"
 AI_PORTFOLIO_BACKTEST_TICKER_LIMIT_ENV = "AI_PORTFOLIO_BACKTEST_TICKER_LIMIT"
 
+AI_REQUIRE_LIVE_DATA_ENV = "AI_REQUIRE_LIVE_DATA"
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_BACKTEST_LOOKBACK_YEARS = 10
@@ -472,17 +473,25 @@ class PostgresPipelineDataSource:
 def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
+        if _require_live_data():
+            raise RuntimeError(f"{AI_REQUIRE_LIVE_DATA_ENV}=1 requires a configured PostgreSQL DSN")
         return _fixture_bundle(
             f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.",
             query=query,
         )
     try:
         return PostgresPipelineDataSource(config).load(query, trace_id)
-    except Exception as exc:
+    except Exception:
+        if _require_live_data():
+            raise
         return _fixture_bundle(
-            f"PostgreSQL data source unavailable: {type(exc).__name__}: {exc}",
+            "PostgreSQL data source unavailable",
             query=query,
         )
+
+
+def _require_live_data() -> bool:
+    return os.environ.get(AI_REQUIRE_LIVE_DATA_ENV, "").strip() == "1"
 
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:

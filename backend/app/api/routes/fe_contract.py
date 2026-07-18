@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from typing import Any
 
 from fastapi import APIRouter, Request, Response, status
@@ -16,9 +18,13 @@ from app.core.security import (
 )
 from app.db.user_queries import load_user_by_id
 from app.dependencies import get_db_engine, get_runtime_settings
-from app.services import fe_contract_store
+from app.services import fe_contract_store, fe_live_store
 
 router = APIRouter(tags=["fe-contract"])
+
+
+def _live_data_enabled() -> bool:
+    return os.environ.get("BACKEND_FE_DATA_SOURCE", "static").strip().lower() == "database"
 
 
 class CreateAnalysisJobRequest(BaseModel):
@@ -59,32 +65,44 @@ async def get_landing_sample() -> dict[str, Any]:
 
 
 @router.get("/workspace/template")
-async def get_workspace_template() -> dict[str, Any]:
+async def get_workspace_template(request: Request) -> dict[str, Any]:
+    if _live_data_enabled():
+        return await fe_live_store.workspace_template(get_db_engine(request))
     return fe_contract_store.workspace_template()
 
 
 @router.get("/app/overview")
-async def get_app_overview() -> dict[str, Any]:
+async def get_app_overview(request: Request) -> dict[str, Any]:
+    if _live_data_enabled():
+        return await fe_live_store.app_overview(get_db_engine(request))
     return fe_contract_store.app_overview()
 
 
 @router.get("/trading-candidates")
-async def get_trading_candidates() -> list[dict[str, Any]]:
+async def get_trading_candidates(request: Request) -> list[dict[str, Any]]:
+    if _live_data_enabled():
+        return await fe_live_store.trading_candidates(get_db_engine(request))
     return fe_contract_store.trading_candidates()
 
 
 @router.get("/performance/summary")
-async def get_performance_summary() -> dict[str, Any]:
+async def get_performance_summary(request: Request) -> dict[str, Any]:
+    if _live_data_enabled():
+        return await fe_live_store.performance_summary(get_db_engine(request))
     return fe_contract_store.performance_summary()
 
 
 @router.get("/reports")
-async def get_reports() -> list[dict[str, Any]]:
+async def get_reports(request: Request) -> list[dict[str, Any]]:
+    if _live_data_enabled():
+        return await fe_live_store.report_summaries(get_db_engine(request))
     return fe_contract_store.report_summaries()
 
 
 @router.get("/reports/{report_id}")
-async def get_report_by_id(report_id: str) -> JSONResponse:
+async def get_report_by_id(request: Request, report_id: str) -> JSONResponse:
+    if _live_data_enabled():
+        return JSONResponse(await fe_live_store.report_detail(get_db_engine(request), report_id))
     return JSONResponse(fe_contract_store.report_detail_or_none(report_id))
 
 
@@ -187,34 +205,35 @@ async def get_compat_report(report_id: str) -> dict[str, Any]:
 
 @router.get("/api-status")
 async def get_api_status() -> dict[str, Any]:
+    live = _live_data_enabled()
     return {
         "service": "QuantAgent Backend FE Contract API",
         "schema_version": "qa.fe_contract.v1",
         "docs_url": "/docs",
         "openapi_url": "/openapi.json",
         "data_source": {
-            "configured": True,
-            "dsn_env": "BACKEND_STATIC_FE_CONTRACT",
-            "price_source": "backend/app/data/fe_mock_contract.json",
-            "universe_source": "backend/app/data/fe_mock_contract.json",
-            "l4_evidence_source": "backend/app/data/fe_mock_contract.json",
-            "macro_source": "backend/app/data/fe_mock_contract.json",
-            "macro_usable": True,
-            "fallback_when_unset": "static_contract",
+            "configured": bool(os.environ.get("DATABASE_URL")) if live else True,
+            "dsn_env": "DATABASE_URL",
+            "price_source": "feature.kis_adjusted_ohlcv_daily" if live else "backend/app/data/fe_mock_contract.json",
+            "universe_source": "meta.view_common_stock_universe" if live else "backend/app/data/fe_mock_contract.json",
+            "l4_evidence_source": "raw.analyst_report_summary" if live else "backend/app/data/fe_mock_contract.json",
+            "macro_source": "mart.bok_macro_asof" if live else "backend/app/data/fe_mock_contract.json",
+            "macro_usable": False,
+            "fallback_when_unset": "error" if live else "static_contract",
         },
         "job_store": {
             "requested_mode": "backend_memory",
             "active_mode": "backend_memory",
             "mode_env": "BACKEND_FE_CONTRACT_JOB_STORE",
             "dsn_env": "DATABASE_URL",
-            "dsn_configured": False,
-            "fallback": True,
-            "fallback_reason": "FE contract adapter uses in-memory jobs until app.analysis_runs is introduced.",
+            "dsn_configured": bool(os.environ.get("DATABASE_URL")),
+            "fallback": False,
+            "fallback_reason": None,
         },
         "endpoints": [
-            {"method": "GET", "path": "/landing-sample", "state": "available", "summary": "Landing mock contract."},
-            {"method": "GET", "path": "/app/overview", "state": "available", "summary": "Workspace overview contract."},
-            {"method": "GET", "path": "/reports", "state": "available", "summary": "Report summary contract."},
+            {"method": "GET", "path": "/landing-sample", "state": "available", "summary": "Landing content."},
+            {"method": "GET", "path": "/app/overview", "state": "available", "summary": "Database-backed workspace overview." if live else "Workspace overview contract."},
+            {"method": "GET", "path": "/reports", "state": "available", "summary": "Database-backed report summaries." if live else "Report summary contract."},
             {"method": "POST", "path": "/analysis-jobs", "state": "available", "summary": "FE-compatible analysis job adapter."},
         ],
     }
