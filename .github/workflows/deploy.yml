@@ -85,6 +85,13 @@ jobs:
             : "${AI_AOAI_RESPONSES_URL:?AI_AOAI_RESPONSES_URL is required}"
             : "${AI_AOAI_API_KEY:?AI_AOAI_API_KEY is required}"
             : "${AI_AOAI_MODEL:?AI_AOAI_MODEL is required}"
+            # Reuse the data DB DSN injected into the Airflow worker; never use its metadata DB.
+            if [ -z "${DATABASE_URL:-}" ] && [ -n "${QUANT_DB_DSN:-}" ]; then
+              DATABASE_URL="$QUANT_DB_DSN"
+            fi
+            if [ -z "${DATABASE_URL:-}" ]; then
+              DATABASE_URL="$(docker exec de-airflow-worker-1 sh -lc 'printf "%s" "${QUANT_DB_DSN:-}"' 2>/dev/null || true)"
+            fi
             : "${DATABASE_URL:?DATABASE_URL is required for live backend and AI data}"
             export AI_LLM_PROVIDER AI_AOAI_RESPONSES_URL AI_AOAI_API_KEY AI_AOAI_MODEL DATABASE_URL
             unset AUTH_SESSION_COOKIE_NAME AI_CORS_ALLOW_ORIGINS
