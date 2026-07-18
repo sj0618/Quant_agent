@@ -1,0 +1,39 @@
+name: Create issues from CI failures
+
+on:
+  workflow_run:
+    workflows:
+      - Code checks
+      - Deploy to SSH Server
+      - Deploy DE to SSH Server
+      - Server health check
+      - AI runtime logging
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: ci-issue-bot-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  create-issue:
+    name: Create or update failure issue
+    if: >-
+      github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout bot
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Create issue for failed workflow
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/ci-issue-bot.mjs
