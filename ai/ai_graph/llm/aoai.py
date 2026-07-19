@@ -144,8 +144,14 @@ class AOAIResponsesClient:
                 if self._http_client is None:
                     with client:
                         response = client.post(self.responses_url, headers=headers, json=body)
+                        if _unsupported_parameter(response, "temperature"):
+                            body.pop("temperature", None)
+                            response = client.post(self.responses_url, headers=headers, json=body)
                 else:
                     response = client.post(self.responses_url, headers=headers, json=body)
+                    if _unsupported_parameter(response, "temperature"):
+                        body.pop("temperature", None)
+                        response = client.post(self.responses_url, headers=headers, json=body)
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts - 1:
                     _sleep_before_retry(self.retry_backoff_seconds, attempt)
                     continue
@@ -160,6 +166,17 @@ class AOAIResponsesClient:
         raise LLMClientError(
             "AOAI Responses request failed", retry_count=last_attempt
         ) from last_error
+
+
+def _unsupported_parameter(response: httpx.Response, parameter: str) -> bool:
+    if response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return isinstance(error, dict) and error.get("param") == parameter
 
 
 def _schema_format_name(schema_name: str) -> str:
