@@ -11,6 +11,7 @@ test("product screens use analysis API data without product mock overlays", asyn
   assert.match(source, /listAnalysisJobs/);
   assert.match(source, /refreshLatestAnalysisJob/);
   assert.match(source, /listAnalysisJobs\(1\)/);
+  assert.match(source, /error\.status === 404/);
   assert.match(source, /buildTradingCandidatesFromAnalysisJob/);
   assert.doesNotMatch(source, /candidates: result \? \[\] : base\.candidates/);
   assert.match(source, /AI_REQUEST_TIMEOUT_MS = 1_200_000/);
@@ -65,7 +66,8 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   assert.match(authSource, /AUTH_ENDPOINTS\.me/);
   assert.match(authSource, /finally \{\s+clearCurrentSession\(\)/);
   assert.match(appSource, /validateCurrentSession\(\)/);
-  assert.match(aiSource, /\[401, 403, 404\]\.includes\(error\.status\)/);
+  assert.match(aiSource, /\[401, 403\]\.includes\(error\.status\)/);
+  assert.match(aiSource, /error\.status === 404/);
   assert.match(profileSource, /finally \{\s+window\.location\.assign\(ROUTES\.home\)/);
 });
 

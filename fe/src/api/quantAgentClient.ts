@@ -294,9 +294,17 @@ export async function refreshLatestAnalysisJob(): Promise<AnalysisJob | null> {
     }
     return latestJob ?? null;
   } catch (error) {
-    if (error instanceof AIResponseError && [401, 403, 404].includes(error.status)) {
+    if (error instanceof AIResponseError && [401, 403].includes(error.status)) {
       clearLatestAnalysisJob();
       throw error;
+    }
+    if (error instanceof AIResponseError && error.status === 404) {
+      clearLatestAnalysisJob();
+      const [latestJob] = await listAnalysisJobs(1);
+      if (latestJob) {
+        saveLatestAnalysisJob(latestJob);
+      }
+      return latestJob ?? null;
     }
     console.warn("최신 AI 분석 job 갱신에 실패해 저장된 결과를 사용합니다.", error);
     return storedJob;
