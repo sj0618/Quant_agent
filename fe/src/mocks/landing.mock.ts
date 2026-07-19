@@ -29,7 +29,7 @@ export const landingSample: LandingSample = {
     {
       label: "STEP 4",
       title: "리포트 발송",
-      description: "매일 오전 8시 KOSPI200 추천 종목·근거를 이메일로 보내드립니다.",
+      description: "매일 오전 8시 조건 일치 추천 종목·근거를 이메일로 보내드립니다.",
       example: ["BUY 삼성전자 0.91", "DROP LG화학 0.41"],
     },
   ],
@@ -82,7 +82,7 @@ export const landingSample: LandingSample = {
     },
     { question: "왜 무료인가요?", answer: "초기 버전은 전략 입력, 백테스트, Daily 리포트 품질 검증을 위해 무료로 제공합니다." },
     { question: "내 자산 정보를 입력해야 하나요?", answer: "아니요. 현재 목업 범위는 전략 분석과 리포트 발송이며 자산 정보나 주문 권한을 요구하지 않습니다." },
-    { question: "어떤 종목을 분석하나요?", answer: "현재 기준은 KOSPI200 현물이며, 전략 조건에 맞는 섹터와 종목 후보를 선별합니다." },
+    { question: "어떤 종목을 분석하나요?", answer: "KRX 상장 보통주 중 전략 조건에 맞는 종목을 모두 평가합니다." },
     { question: "리포트는 언제 받나요?", answer: "Daily 리포트는 매일 오전 8시에 생성되며, 마이페이지 알림 설정에서 이메일 수신 여부를 바꿀 수 있습니다." },
   ],
 };

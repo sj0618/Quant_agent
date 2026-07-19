@@ -8,7 +8,7 @@ export function Footer() {
           <span className="brand__mark" />
           <span>QuantAgent</span>
         </div>
-        <p>KOSPI200 LLM 퀀트 에이전트. TA-Lib 150개 지표와 10년 시계열 백테스팅을 무료로 제공합니다.</p>
+        <p>KRX LLM 퀀트 에이전트. TA-Lib 150개 지표와 10년 시계열 백테스팅을 무료로 제공합니다.</p>
       </div>
       <div className="site-footer__links">
         <a href={ROUTES.terms}>이용약관</a>

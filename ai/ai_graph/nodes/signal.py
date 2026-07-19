@@ -149,7 +149,7 @@ def signal_node(state: dict[str, Any]) -> dict[str, Any]:
         result = _result(
             state.get("trace_id", _trace_id(str(state))),
             state["strategy_spec"]["strategy_id"],
-            "KOSPI200",
+            "KRX",
             "WATCH",
             ["no single-ticker market snapshot supplied"],
         )

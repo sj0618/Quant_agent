@@ -71,7 +71,7 @@ class CreateAnalysisJobRequest(BaseModel):
             "examples": [
                 {
                     "query": (
-                        "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, "
+                        "RSI가 30 이하로 떨어진 상장 종목을 사고, "
                         "70 이상이면 팔고 싶어"
                     )
                 }

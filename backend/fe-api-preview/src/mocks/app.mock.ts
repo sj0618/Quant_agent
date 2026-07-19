@@ -15,7 +15,7 @@ export const activeStrategySpec: StrategySpec = {
   hold_condition: "RSI 31~70 또는 주요 이벤트 대기",
   drop_condition: "RSI ≥ 70 OR 보유 30일",
   rebalance: "매일 08:00 분석 후 신호 갱신",
-  constraints: ["KOSPI200 현물만 지원", "거래비용 0.015% / 0.23% / 0.1% 반영"],
+  constraints: ["KRX 상장 보통주 지원", "거래비용 0.015% / 0.23% / 0.1% 반영"],
 };
 
 export const readyEnvelope: AIEnvelope<{ active_tab: "overview" }> = {
