@@ -148,7 +148,7 @@ def _execute_generated_backtest(
             benchmark_ticker=request.benchmark_ticker,
             data_source=(pipeline.metadata.get("source") if pipeline.metadata else request.data_source),
             strategy_snapshot_jsonb=strategy.model_dump(mode="json"),
-            universe_snapshot_jsonb={"tickers": tickers, "metadata": pipeline.metadata},
+            candidate_snapshot_jsonb={"tickers": tickers, "metadata": pipeline.metadata},
             as_of_at=ended_at,
             status="succeeded",
             started_at=started_at,

@@ -9,7 +9,6 @@
   - `UserIntentSpec`
   - `StrategySpec`
   - `ParsedReport`
-  - `CandidateSnapshot`
   - `BacktestPlan`
   - `SignalDecision`
 - `quantagent_strategy/strategy.py`
@@ -28,7 +27,7 @@
 
 - 사용자 자연어 전략 입력
 - 정형 전략 스펙 생성
-- 종목/섹터 필터링
+- 전 종목 조건 평가
 - 백테스트 코드 생성/실행
 - 결과 분석 및 리포트
 
@@ -39,25 +38,16 @@
 - **리포트는 장 마감 후 수집 시 다음 거래일 시가부터 유효**
 - **A/B 비교는 백테스트/분석용으로 남기되, 기본 사용자 리포트에는 숨김**
 
-### 3. 왜 `StrategySpec`과 `CandidateSnapshot`을 분리했는가?
+### 3. 조건 충족 종목 전체 평가
 
 `StrategySpec`은 사용자 의도와 전략 로직을 담는 **정적 명세**입니다.
-
-`CandidateSnapshot`은 특정 거래일에 유효한 후보군을 담는 **시점 의존 객체**입니다.
-
-이 둘을 분리해야 다음이 가능합니다.
-
-- 동일 전략의 조건 충족 종목 전체 백테스트
-- point-in-time / available_at 정책 적용
-- 실시간 신호와 전일 후보군 스냅샷을 분리 운영
-- 후보 선정 근거(reason trace) 저장
+별도의 점수 기반 후보군을 만들지 않고, 데이터 소스의 전 종목에 동일한 조건을 적용합니다.
 
 ## 빠른 사용 예시
 
 ```python
-from datetime import date, datetime
+from datetime import datetime
 from quantagent_strategy import (
-    CandidateSnapshot,
     Condition,
     ConditionOperator,
     MarketSnapshot,

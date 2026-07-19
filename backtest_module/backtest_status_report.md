@@ -77,12 +77,9 @@ from backtest_module import (
     ConditionOperator,
     CostModel,
     PositionSizing,
-    ResearchOverlay,
     RiskControls,
     StrategySpec,
 )
-from backtest_module.models import CandidateFilterSource
-
 spec = StrategySpec(
     strategy_id="market_cap_rsi_strategy",
     strategy_name="시총 5000억 이상 RSI 70 이상 매수",
