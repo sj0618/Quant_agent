@@ -80,6 +80,37 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
+            trim_whitespace() {
+              local value="$1"
+              value="${value#"${value%%[![:space:]]*}"}"
+              value="${value%"${value##*[![:space:]]}"}"
+              printf '%s' "$value"
+            }
+            load_env_file() {
+              local env_file="$1"
+              local line key value
+              while IFS= read -r line || [ -n "$line" ]; do
+                line="${line%$'\r'}"
+                case "$line" in
+                  '' | [[:space:]]*'#'*) continue ;;
+                esac
+                if [[ "$line" != *"="* ]]; then
+                  continue
+                fi
+                key="$(trim_whitespace "${line%%=*}")"
+                value="$(trim_whitespace "${line#*=}")"
+                case "$key" in
+                  REDIS_URL | VITE_AUTH_API_BASE_URL | AI_* | QUANT_DB_DSN | DATABASE_URL) ;;
+                  *) continue ;;
+                esac
+                if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+                  value="${value:1:${#value}-2}"
+                fi
+                printf -v "$key" '%s' "$value"
+                export "$key"
+              done < "$env_file"
+              echo "Loaded deployment environment: $env_file"
+            }
             for env_file in \
               "$APP_DIR/.env" \
               "$APP_DIR/ai/.env" \
@@ -88,10 +119,7 @@ jobs:
               "$HOME/.config/quant-agent/deploy.env"
             do
               if [ -f "$env_file" ]; then
-                set -a
-                source "$env_file"
-                set +a
-                echo "Loaded deployment environment: $env_file"
+                load_env_file "$env_file"
               fi
             done
             for required_key in REDIS_URL VITE_AUTH_API_BASE_URL AI_LLM_PROVIDER AI_AOAI_RESPONSES_URL AI_AOAI_API_KEY AI_AOAI_MODEL; do
