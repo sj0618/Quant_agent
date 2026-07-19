@@ -69,21 +69,38 @@ jobs:
           ssh -T -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
             set -euo pipefail
 
-            if [ -f "$HOME/.bashrc" ]; then
-              set +u
-              source "$HOME/.bashrc"
-              set -u
-            fi
+            set +u
+            for profile_file in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+              if [ -f "$profile_file" ]; then
+                source "$profile_file"
+              fi
+            done
+            set -u
 
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
-            ENV_FILE="$APP_DIR/.env"
-            if [ -f "$ENV_FILE" ]; then
-              set -a
-              source "$ENV_FILE"
-              set +a
-            fi
+            for env_file in \
+              "$APP_DIR/.env" \
+              "$APP_DIR/ai/.env" \
+              "$APP_DIR/backend/.env" \
+              "$APP_DIR/DE/.env" \
+              "$HOME/.config/quant-agent/deploy.env"
+            do
+              if [ -f "$env_file" ]; then
+                set -a
+                source "$env_file"
+                set +a
+                echo "Loaded deployment environment: $env_file"
+              fi
+            done
+            for required_key in REDIS_URL VITE_AUTH_API_BASE_URL AI_LLM_PROVIDER AI_AOAI_RESPONSES_URL AI_AOAI_API_KEY AI_AOAI_MODEL; do
+              if [ -n "${!required_key:-}" ]; then
+                echo "$required_key=configured"
+              else
+                echo "$required_key=missing"
+              fi
+            done
             export AUTH_ENABLED=1 AI_JOB_STORE=memory AI_AUDIT_SINK=noop
             : "${REDIS_URL:?REDIS_URL must be configured when AUTH_ENABLED=1}"
             : "${VITE_AUTH_API_BASE_URL:?VITE_AUTH_API_BASE_URL must be configured for Google login}"
