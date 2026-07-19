@@ -135,6 +135,8 @@ jobs:
               : "${REDIS_URL:?REDIS_URL must be configured when AUTH_ENABLED=1}"
               : "${VITE_AUTH_API_BASE_URL:?VITE_AUTH_API_BASE_URL must be configured for Google login}"
               export REDIS_URL VITE_AUTH_API_BASE_URL
+            else
+              export VITE_ENABLE_TEST_LOGIN=1
             fi
             export AI_LLM_PROVIDER=aoai
             : "${AI_AOAI_RESPONSES_URL:?AI_AOAI_RESPONSES_URL must be configured on the deploy server}"
