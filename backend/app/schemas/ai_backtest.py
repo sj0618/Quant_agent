@@ -10,6 +10,10 @@ ExecutionMode = Literal["engine", "ai_generated_code"]
 AICodeStatus = Literal["generated", "validated", "rejected", "executed", "failed"]
 CodeExecutionStatus = Literal["queued", "running", "succeeded", "failed", "timeout"]
 
+AI_BACKTEST_MAX_PROMPT_CHARS = 16_000
+AI_BACKTEST_MAX_TIMEOUT_SECONDS = 300
+AI_BACKTEST_MAX_MEMORY_LIMIT_MB = 512
+
 
 class AITraceCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -441,7 +445,7 @@ class AICodeBacktestPublicRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
-    natural_language_prompt: str = Field(min_length=1)
+    natural_language_prompt: str = Field(min_length=1, max_length=AI_BACKTEST_MAX_PROMPT_CHARS)
     parsed_strategy_jsonb: dict[str, Any] = Field(default_factory=dict)
     parse_confidence: float | None = None
     parse_model_name: str | None = None
@@ -451,8 +455,8 @@ class AICodeBacktestPublicRequest(BaseModel):
     benchmark_ticker: str | None = None
     data_source: str | None = None
     report_model_name: str | None = None
-    timeout_seconds: int = Field(default=300, gt=0)
-    memory_limit_mb: int = Field(default=512, gt=0)
+    timeout_seconds: int = Field(default=300, gt=0, le=AI_BACKTEST_MAX_TIMEOUT_SECONDS)
+    memory_limit_mb: int = Field(default=512, gt=0, le=AI_BACKTEST_MAX_MEMORY_LIMIT_MB)
 
 
 
@@ -469,7 +473,7 @@ class AICodeBacktestFlowRequest(BaseModel):
     fingerprint_version: str | None = Field(default=None, min_length=1, max_length=64)
     replacement_approval_id: UUID | None = None
     replacement_approval_token: SecretStr | None = Field(default=None, min_length=43, max_length=128)
-    natural_language_prompt: str = Field(min_length=1)
+    natural_language_prompt: str = Field(min_length=1, max_length=AI_BACKTEST_MAX_PROMPT_CHARS)
     parsed_strategy_jsonb: dict[str, Any] = Field(default_factory=dict)
     parse_confidence: float | None = None
     parse_model_name: str | None = None
@@ -479,8 +483,8 @@ class AICodeBacktestFlowRequest(BaseModel):
     benchmark_ticker: str | None = None
     data_source: str | None = None
     report_model_name: str | None = None
-    timeout_seconds: int = Field(default=300, gt=0)
-    memory_limit_mb: int = Field(default=512, gt=0)
+    timeout_seconds: int = Field(default=300, gt=0, le=AI_BACKTEST_MAX_TIMEOUT_SECONDS)
+    memory_limit_mb: int = Field(default=512, gt=0, le=AI_BACKTEST_MAX_MEMORY_LIMIT_MB)
 
 
 class AICodeBacktestFlowResult(BaseModel):

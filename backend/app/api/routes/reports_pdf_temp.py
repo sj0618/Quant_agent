@@ -4,6 +4,7 @@ from fastapi import APIRouter, Request
 
 from app.core.config import Settings
 from app.core.errors import AppError
+from app.core.security import csrf_token_required, require_csrf_token, validate_unsafe_request_origin
 from app.db.pdf_temp_repository import PdfTempDbRepository, PdfTempManifestRepository, PdfTempRepository
 from app.dependencies import get_db_engine, get_redis_client, get_runtime_settings
 from app.schemas.pdf_temp import (
@@ -30,6 +31,16 @@ async def require_pdf_temp_access(request: Request) -> Settings:
     settings = get_runtime_settings(request)
     _require_pdf_temp_enabled(settings)
     await _require_authenticated_session(request, settings)
+    return settings
+
+
+async def require_pdf_temp_ingest_access(request: Request) -> Settings:
+    settings = await require_pdf_temp_access(request)
+    validate_unsafe_request_origin(request, settings)
+    if csrf_token_required(settings):
+        session_id = request.cookies.get(settings.auth_session_cookie_name)
+        store = AuthSessionStore(get_redis_client(request), settings)
+        require_csrf_token(request.headers.get("X-CSRF-Token"), await store.get_csrf_token(session_id))
     return settings
 
 
@@ -90,7 +101,7 @@ async def list_pdf_temp_seeds(request: Request) -> dict[str, object]:
 
 @router.post("/ingest", response_model=PdfTempIngestResponse)
 async def ingest_pdf_temp_seeds(request: Request, payload: PdfTempIngestRequest | None = None) -> dict[str, object]:
-    settings = await require_pdf_temp_access(request)
+    settings = await require_pdf_temp_ingest_access(request)
     repository = get_pdf_temp_repository(request, settings)
     service = PdfTempIngestService(settings, repository, get_seed_provider(request, settings))
     results = await service.ingest(payload.seedIds if payload else None, force=payload.force if payload else False)
@@ -110,6 +121,11 @@ async def import_hankyung_consensus_crawler_seeds(
     payload: HankyungConsensusCrawlerImportRequest | None = None,
 ) -> dict[str, object]:
     settings = await require_pdf_temp_crawler_access(request)
+    validate_unsafe_request_origin(request, settings)
+    if csrf_token_required(settings):
+        session_id = request.cookies.get(settings.auth_session_cookie_name)
+        store = AuthSessionStore(get_redis_client(request), settings)
+        require_csrf_token(request.headers.get("X-CSRF-Token"), await store.get_csrf_token(session_id))
     request_payload = payload or HankyungConsensusCrawlerImportRequest()
     business_code = request_payload.businessCode or request_payload.ticker
     result = await HankyungConsensusCrawler(settings).import_reports(

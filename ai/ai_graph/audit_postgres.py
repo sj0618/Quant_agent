@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 import psycopg
@@ -41,15 +41,54 @@ AI_AUDIT_GATE_B_ADMISSION_TOKEN_ENV = "AI_AUDIT_GATE_B_ADMISSION_TOKEN"
 AI_AUDIT_GATE_B_ADMISSION_AUDIENCE_ENV = "AI_AUDIT_GATE_B_ADMISSION_AUDIENCE"
 AI_AUDIT_GATE_B_EVIDENCE_ID_ENV = "AI_AUDIT_GATE_B_EVIDENCE_ID"
 AI_AUDIT_GATE_B_DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
+AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE_ENV = "AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"
 DEFAULT_AUDIT_CONNECT_TIMEOUT_SECONDS = 2
 DEFAULT_AUDIT_STATEMENT_TIMEOUT_MS = 2_000
 _AUDIT_WRITER_CAPABILITY = object()
 _AUDIT_TEST_SINK_CAPABILITY = object()
 _RAW_AUDIT_ADMISSION_ISSUER = object()
+_RAW_AUDIT_HARD_DISABLED_ENVS = frozenset({"prod", "production", "stage", "staging"})
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmissionClaims:
+    key_version: str
+    evidence_id: str
+    deployment_revision: str
+    audience: str
+    issued_at: float
+    expires_at: float
+
+
+class _GateBAdmissionVerifier(Protocol):
+    def permits_write(self, admission: "_RawAuditAdmission") -> bool: ...
+
+
+class _StaticGateBAdmissionVerifier:
+    """Private deterministic verifier used only by explicit test sink helpers."""
+
+    def permits_write(self, admission: "_RawAuditAdmission") -> bool:
+        return True
+
+
+class _EnvGateBAdmissionVerifier:
+    """Revalidates the signed, environment-bound admission before every write."""
+
+    __slots__ = ("_env",)
+
+    def __init__(self, env: Mapping[str, str]) -> None:
+        self._env = env
+
+    def permits_write(self, admission: "_RawAuditAdmission") -> bool:
+        if _required_text(self._env.get(AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE_ENV)) != "active":
+            return False
+        token = _required_text(self._env.get(AI_AUDIT_GATE_B_ADMISSION_TOKEN_ENV))
+        claims = _admission_claims_from_env(self._env)
+        return token == admission._token and claims == admission._claims
 
 
 class _RawAuditAdmission:
-    __slots__ = ("_expires_at", "_issuer_token")
+    __slots__ = ("_claims", "_expires_at", "_issuer_token", "_token", "_verifier")
 
     def __init__(self) -> None:
         raise TypeError("raw audit admission is issued only after signed Gate B verification")
@@ -61,6 +100,27 @@ class _RawAuditAdmission:
             and _valid_timestamp(expires_at)
             and expires_at > time.time()
         )
+
+    def permits_write(self) -> bool:
+        verifier = getattr(self, "_verifier", None)
+        if not self.authorizes_writer() or not callable(getattr(verifier, "permits_write", None)):
+            return False
+        try:
+            return bool(verifier.permits_write(self))
+        except Exception:  # noqa: BLE001 - admission-verifier faults deny only audit writes
+            return False
+
+
+class _GateBAdmissionCapabilityGuard:
+    """Explicit write-time Gate B capability guard for a PostgreSQL audit session."""
+
+    __slots__ = ("_admission",)
+
+    def __init__(self, admission: _RawAuditAdmission) -> None:
+        self._admission = admission
+
+    def permits_write(self) -> bool:
+        return self._admission.permits_write()
 
 
 class _TestAuditSink:
@@ -94,7 +154,14 @@ class AuthorizedAuditSink:
 
 
 class _PostgresAuditWriter:
-    __slots__ = ("dsn", "admission", "connect_timeout_seconds", "statement_timeout_ms", "connector")
+    __slots__ = (
+        "dsn",
+        "admission",
+        "capability_guard",
+        "connect_timeout_seconds",
+        "statement_timeout_ms",
+        "connector",
+    )
 
     def __init__(
         self,
@@ -109,12 +176,13 @@ class _PostgresAuditWriter:
             raise PermissionError("raw audit writer requires a verified Gate B admission")
         self.dsn = dsn
         self.admission = admission
+        self.capability_guard = _GateBAdmissionCapabilityGuard(admission)
         self.connect_timeout_seconds = connect_timeout_seconds
         self.statement_timeout_ms = statement_timeout_ms
         self.connector = connector
 
     def open_session(self, correlation: AuditCorrelation) -> "_PostgresAuditSession | NoOpAuditSession":
-        if not self.admission.authorizes_writer():
+        if not self.capability_guard.permits_write():
             report_audit_failure("gate_b_admission_denied")
             return NoOpAuditSession(correlation)
         conn: Any | None = None
@@ -151,6 +219,7 @@ class _PostgresAuditWriter:
         return _PostgresAuditSession(
             correlation=correlation,
             connection=conn,
+            capability_guard=self.capability_guard,
             _capability=_AUDIT_WRITER_CAPABILITY,
         )
 
@@ -163,6 +232,7 @@ class _PostgresAuditSession:
     _closed: bool = False
     _failure_reported: bool = False
     _model_execution_ids: dict[UUID, UUID | None] = field(default_factory=dict)
+    _capability_guard: _GateBAdmissionCapabilityGuard = field(repr=False)
     _capability: object = field(default=None, repr=False)
 
     def __init__(
@@ -170,6 +240,7 @@ class _PostgresAuditSession:
         correlation: AuditCorrelation,
         connection: Any,
         *,
+        capability_guard: _GateBAdmissionCapabilityGuard,
         _capability: object,
     ) -> None:
         if _capability is not _AUDIT_WRITER_CAPABILITY:
@@ -180,6 +251,7 @@ class _PostgresAuditSession:
         self._closed = False
         self._failure_reported = False
         self._capability = _capability
+        self._capability_guard = capability_guard
         self._model_execution_ids = {}
 
     @property
@@ -510,6 +582,9 @@ class _PostgresAuditSession:
     ) -> bool:
         if self._broken or self._closed:
             return False
+        if not self._capability_guard.permits_write():
+            self._handle_failure("gate_b_admission_denied")
+            return False
         try:
             action()
             self.connection.commit()
@@ -539,6 +614,9 @@ def create_audit_sink_from_env(
     if selector != "postgres":
         report_audit_failure("invalid_sink_selector")
         return NoOpAuditSink()
+    if _raw_audit_hard_disabled(env):
+        report_audit_failure("gate_b_admission_blocked")
+        return NoOpAuditSink()
     admission = _admission_from_env(env)
     if admission is None:
         return NoOpAuditSink()
@@ -566,6 +644,8 @@ def resolve_audit_sink(
     environ: Mapping[str, str] | None = None,
 ) -> AuditSink:
     """Normalize every audit ingress to an authorized, no-op, or private test sink."""
+    if _raw_audit_hard_disabled(os.environ if environ is None else environ):
+        return NoOpAuditSink()
     if candidate is None:
         return create_audit_sink_from_env(environ)
     if isinstance(candidate, (AuthorizedAuditSink, NoOpAuditSink)):
@@ -585,7 +665,29 @@ def _create_test_audit_sink(sink: AuditSink) -> AuditSink:
     return _TestAuditSink(sink, _capability=_AUDIT_TEST_SINK_CAPABILITY)
 
 
+def _raw_audit_hard_disabled(env: Mapping[str, str]) -> bool:
+    app_env = _required_text(env.get("APP_ENV"))
+    return app_env is not None and app_env.lower() in _RAW_AUDIT_HARD_DISABLED_ENVS
+
+
 def _admission_from_env(env: Mapping[str, str]) -> _RawAuditAdmission | None:
+    if _raw_audit_hard_disabled(env):
+        report_audit_failure("gate_b_admission_blocked")
+        return None
+    claims = _admission_claims_from_env(env)
+    token = _required_text(env.get(AI_AUDIT_GATE_B_ADMISSION_TOKEN_ENV))
+    if claims is None or token is None:
+        report_audit_failure("gate_b_admission_denied")
+        return None
+    return _new_raw_audit_admission(
+        claims.expires_at,
+        verifier=_EnvGateBAdmissionVerifier(env),
+        token=token,
+        claims=claims,
+    )
+
+
+def _admission_claims_from_env(env: Mapping[str, str]) -> _AdmissionClaims | None:
     secret = _required_text(env.get(AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET_ENV))
     token = _required_text(env.get(AI_AUDIT_GATE_B_ADMISSION_TOKEN_ENV))
     key_version = _required_text(env.get(AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION_ENV))
@@ -593,25 +695,22 @@ def _admission_from_env(env: Mapping[str, str]) -> _RawAuditAdmission | None:
     deployment_revision = _required_text(env.get(AI_AUDIT_GATE_B_DEPLOYMENT_REVISION_ENV))
     audience = _required_text(env.get(AI_AUDIT_GATE_B_ADMISSION_AUDIENCE_ENV))
     if not all((secret, token, key_version, evidence_id, deployment_revision, audience)):
-        report_audit_failure("gate_b_admission_denied")
         return None
     parsed = _parse_signed_admission(token, secret)
     if parsed is None:
-        report_audit_failure("gate_b_admission_denied")
         return None
-    header, claims = parsed
+    header, signed_claims = parsed
     if (
         header.get("alg") != "HS256"
         or header.get("key_version") != key_version
-        or claims.get("key_version") != key_version
-        or claims.get("evidence_id") != evidence_id
-        or claims.get("deployment_revision") != deployment_revision
-        or claims.get("audience") != audience
+        or signed_claims.get("key_version") != key_version
+        or signed_claims.get("evidence_id") != evidence_id
+        or signed_claims.get("deployment_revision") != deployment_revision
+        or signed_claims.get("audience") != audience
     ):
-        report_audit_failure("gate_b_admission_denied")
         return None
-    issued_at = claims.get("issued_at")
-    expires_at = claims.get("expiry")
+    issued_at = signed_claims.get("issued_at")
+    expires_at = signed_claims.get("expiry")
     now = time.time()
     if (
         not _valid_timestamp(issued_at)
@@ -620,14 +719,30 @@ def _admission_from_env(env: Mapping[str, str]) -> _RawAuditAdmission | None:
         or expires_at <= now
         or expires_at <= issued_at
     ):
-        report_audit_failure("gate_b_admission_denied")
         return None
-    return _new_raw_audit_admission(expires_at)
+    return _AdmissionClaims(
+        key_version=key_version,
+        evidence_id=evidence_id,
+        deployment_revision=deployment_revision,
+        audience=audience,
+        issued_at=float(issued_at),
+        expires_at=float(expires_at),
+    )
 
-def _new_raw_audit_admission(expires_at: float) -> _RawAuditAdmission:
+
+def _new_raw_audit_admission(
+    expires_at: float,
+    *,
+    verifier: _GateBAdmissionVerifier | None = None,
+    token: str | None = None,
+    claims: _AdmissionClaims | None = None,
+) -> _RawAuditAdmission:
     admission = object.__new__(_RawAuditAdmission)
     admission._issuer_token = _RAW_AUDIT_ADMISSION_ISSUER
     admission._expires_at = expires_at
+    admission._verifier = verifier or _StaticGateBAdmissionVerifier()
+    admission._token = token
+    admission._claims = claims
     return admission
 
 
@@ -753,6 +868,7 @@ __all__ = [
     "AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION_ENV",
     "AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET_ENV",
     "AI_AUDIT_GATE_B_ADMISSION_TOKEN_ENV",
+    "AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE_ENV",
     "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION_ENV",
     "AI_AUDIT_GATE_B_EVIDENCE_ID_ENV",
     "AI_AUDIT_SINK_ENV",

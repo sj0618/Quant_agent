@@ -19,7 +19,25 @@ from ai_graph.api import (
 from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import InMemoryAnalysisJobStore
-from ai_graph.schemas import APIEnvelope, EnvelopeStatus, Stage, UserPayload
+from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
+
+DATA_SOURCE_ENV_KEYS = (
+    "AI_DATABASE_DSN",
+    "QUANT_DB_DSN",
+    "DATABASE_URL",
+    "AI_DEFAULT_TICKER",
+    "AI_BACKTEST_LOOKBACK_DAYS",
+    "AI_L4_EVIDENCE_LIMIT",
+    "AI_DB_CONNECT_TIMEOUT_SECONDS",
+    "AI_DB_STATEMENT_TIMEOUT_MS",
+    "AI_SCREENING_LIMIT",
+    "AI_SCREENING_BACKTEST_SELECTION_LIMIT",
+    "AI_PORTFOLIO_BACKTEST_TICKER_LIMIT",
+    "AI_SECTOR_CACHE_TTL_SECONDS",
+)
+MOCK_PROVIDER_CREDENTIAL_ENV = "AI_AOAI_API_KEY"
+MOCK_PROVIDER_CREDENTIAL_SENTINEL = "qa-mock-provider-sentinel-key"
+MOCK_PROVIDER_STAGES = ["interpreting", "code_generation", "backtest", "debate", "finalizing"]
 
 
 def _ready_envelope(trace_id: str) -> APIEnvelope:
@@ -163,7 +181,8 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     created_job = create_response.json()
     assert created_job["result"]["status"] == "ready"
     assert "internal_payload" not in created_job["result"]
-    assert {stage["status"] for stage in created_job["stages"]} == {"succeeded"}
+    assert [stage["stage"] for stage in created_job["stages"]] == MOCK_PROVIDER_STAGES
+    assert all(stage["status"] == "succeeded" for stage in created_job["stages"])
     performance = created_job["result"]["user_payload"]["performance"]
     assert performance["selected_candidate_id"]
     assert "metrics_by_variant" not in performance
@@ -178,6 +197,97 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert polled_job["job_id"] == created_job["job_id"]
     assert polled_job["trace_id"] == created_job["trace_id"]
 
+
+def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monkeypatch) -> None:
+    for key in DATA_SOURCE_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("BE_JOB_STORE_MODE", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("AUTH_SESSION_COOKIE_NAME", raising=False)
+    monkeypatch.delenv(AI_CORS_ALLOW_ORIGINS_ENV, raising=False)
+
+    monkeypatch.setenv("AUTH_ENABLED", "0")
+    monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
+    monkeypatch.setenv("AI_JOB_STORE", "memory")
+    monkeypatch.setenv("AI_AUDIT_SINK", "noop")
+    monkeypatch.setenv(MOCK_PROVIDER_CREDENTIAL_ENV, MOCK_PROVIDER_CREDENTIAL_SENTINEL)
+
+    client = TestClient(create_app())
+
+    api_status = client.get(API_STATUS_PATH)
+    assert api_status.status_code == 200
+    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in api_status.text
+    assert api_status.json()["data_source"]["configured"] is False
+    job_store = api_status.json()["job_store"]
+    assert job_store["requested_mode"] == "memory"
+    assert job_store["active_mode"] == "memory"
+    assert job_store["fallback"] is False
+
+    create_response = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={
+            "query": "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어"
+        },
+    )
+    assert create_response.status_code == 201
+    created_job = create_response.json()
+    created_result = created_job["result"]
+
+    assert created_result["status"] == "ready"
+    assert created_job["trace_id"] == created_result["trace_id"]
+    assert [stage["stage"] for stage in created_job["stages"]] == MOCK_PROVIDER_STAGES
+    assert all(stage["status"] == "succeeded" for stage in created_job["stages"])
+    assert "internal_payload" not in created_result
+    assert "node_outputs" not in created_result
+    assert "llm_prompts" not in created_result
+
+    assert created_result["strategy_spec"] is not None
+    assert created_result["user_payload"]["performance"] is not None
+    assert created_result["user_payload"]["report"] is not None
+    report = created_result["user_payload"]["report"]
+    assert report["web_projection"]
+    assert report["email_projection"]
+    performance = created_result["user_payload"]["performance"]
+    assert performance["selected_candidate_id"]
+    assert "metrics_by_variant" not in performance
+    assert "selected_variant" not in performance
+    assert performance["metrics"]["total_return"] > 0
+    assert performance["equity_curve"][-1]["cumulative_return"] > 0
+
+    poll_response = client.get(f"{ANALYSIS_JOBS_PATH}/{created_job['job_id']}")
+    assert poll_response.status_code == 200
+    polled_job = poll_response.json()
+    assert polled_job["job_id"] == created_job["job_id"]
+    assert polled_job["trace_id"] == created_job["trace_id"]
+    assert polled_job["result"] == created_result
+    assert polled_job["result"]["status"] == "ready"
+
+    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in create_response.text
+    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in poll_response.text
+
+    clarification_response = client.post(ANALYSIS_JOBS_PATH, json={"query": "저평가주 사줘"})
+    assert clarification_response.status_code == 201
+    clarification_job = clarification_response.json()
+    clarification_result = clarification_job["result"]
+    clarification_payload = clarification_result["user_payload"]
+
+    assert clarification_result["status"] == "need_clarification"
+    assert clarification_payload["question"]
+    assert len(clarification_payload["candidate_cards"]) == 3
+    assert len(clarification_payload["options"]) == 3
+    assert clarification_payload["report"] is None
+    assert clarification_payload["performance"] is None
+
+    clarification_poll = client.get(f"{ANALYSIS_JOBS_PATH}/{clarification_job['job_id']}")
+    assert clarification_poll.status_code == 200
+    clarification_polled = clarification_poll.json()
+    assert clarification_polled["job_id"] == clarification_job["job_id"]
+    assert clarification_polled["trace_id"] == clarification_job["trace_id"]
+    assert clarification_polled["result"] == clarification_result
+    assert clarification_polled["result"]["status"] == "need_clarification"
+
+    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in clarification_response.text
+    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in clarification_poll.text
 
 def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adapters() -> None:
     store = InMemoryAnalysisJobStore()
@@ -473,8 +583,8 @@ def test_analysis_job_route_uses_injected_store_and_preserves_polling_contract()
     assert create_response.status_code == 201
     created_job = create_response.json()
     assert store.created_requests == ["RSI strategy"]
-    assert [stage["stage"] for stage in created_job["stages"]] == [stage.value for stage in Stage]
-    assert {stage["status"] for stage in created_job["stages"]} == {"succeeded"}
+    assert [stage["stage"] for stage in created_job["stages"]] == MOCK_PROVIDER_STAGES
+    assert all(stage["status"] == "succeeded" for stage in created_job["stages"])
     assert created_job["result"]["status"] == "ready"
     assert created_job["result"]["trace_id"] == created_job["trace_id"]
 

@@ -45,15 +45,25 @@ def resolve_dsn(environ: Mapping[str, str] = os.environ) -> str:
     raise RuntimeError("AI_DATABASE_DSN, QUANT_DB_DSN, or DATABASE_URL is required")
 
 
-def purge_expired_prompt_logs(conn: Any, *, batch_size: int = BATCH_SIZE) -> int:
-    """Delete all expired rows using one database-derived cutoff and batch commits."""
+def purge_expired_prompt_logs(
+    conn: Any,
+    *,
+    batch_size: int = BATCH_SIZE,
+    cutoff: datetime | None = None,
+) -> int:
+    """Delete all expired rows using one cutoff and batch commits.
+
+    Production callers omit ``cutoff`` so PostgreSQL supplies the timestamp once.
+    The optional value exists only to make retention-boundary tests deterministic.
+    """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
 
     try:
-        with conn.cursor() as cursor:
-            cursor.execute(CUTOFF_SQL)
-            cutoff: datetime = cursor.fetchone()[0]
+        if cutoff is None:
+            with conn.cursor() as cursor:
+                cursor.execute(CUTOFF_SQL)
+                cutoff = cursor.fetchone()[0]
 
         total_deleted = 0
         while True:

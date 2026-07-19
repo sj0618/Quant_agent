@@ -14,7 +14,6 @@ from ai_graph.schemas import BacktestEquityPoint, BacktestMetrics, CandidateBack
 from ai_graph.schemas import StrategySpec as AIStrategySpec
 from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
 from ai_graph.nodes.position_sizing import (
-    DEFAULT_MAX_POSITIONS,
     applied_max_positions as _shared_applied_max_positions,
     available_ticker_count as _shared_available_ticker_count,
     requested_max_positions as _shared_requested_max_positions,
@@ -90,6 +89,20 @@ SIGNAL_METRIC_VALUES = {
     "SELL": SELL_SIGNAL_VALUE,
     "HOLD": HOLD_SIGNAL_VALUE,
 }
+
+
+def summarize_backtest(backtest: Mapping[str, Any]) -> dict[str, Any]:
+    selected = backtest.get("selected_candidate") or {}
+    selected_id = selected.get("candidate_id")
+    return {
+        "selected_candidate_id": selected_id,
+        "metrics": selected.get("metrics") or {},
+        "engine_summary": backtest.get("engine_summary")
+        or (backtest.get("engine_summaries_by_candidate") or {}).get(selected_id, {}),
+        "objective_score": (backtest.get("objective_scores_by_candidate") or {}).get(
+            selected_id
+        ),
+    }
 
 
 def _ensure_backtest_module_source_path() -> None:

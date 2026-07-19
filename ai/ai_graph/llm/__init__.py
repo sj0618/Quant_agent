@@ -5,7 +5,7 @@ from .base import (
     LLMProviderConfigError,
     LLMResponseParseError,
 )
-from .factory import create_llm_client
+from .factory import create_llm_client, is_live_llm_provider
 
 __all__ = [
     "LLMClient",
@@ -14,4 +14,5 @@ __all__ = [
     "LLMProviderConfigError",
     "LLMResponseParseError",
     "create_llm_client",
+    "is_live_llm_provider",
 ]

@@ -48,6 +48,7 @@ export function StrategyInputPanel({
   const submitQuery = async (query: string) => {
     const trimmedQuery = query.trim();
     if (!trimmedQuery) {
+      setSubmitError("분석할 자연어 전략을 입력하세요.");
       return;
     }
 
@@ -191,6 +192,7 @@ export function StrategyInputPanel({
             disabled={submitting}
             onChange={(event) => setDraft(event.target.value)}
             placeholder="전략을 자연어로 입력하세요"
+            required
             value={draft}
           />
           <button disabled={submitting} type="submit">{submitting ? "…" : "↑"}</button>

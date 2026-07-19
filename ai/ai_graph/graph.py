@@ -420,9 +420,14 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
 def data_node(state: QuantAgentState) -> dict[str, Any]:
     semantic_slots = parse_semantic_slots(state["user_query"], trace_id=state["trace_id"])
     data_requirements = plan_data_requirements(semantic_slots)
-    source_usage = build_source_usage(state["user_query"], data_requirements, trace_id=state["trace_id"])
-    evidence_refs = build_evidence_refs(source_usage, trace_id=state["trace_id"])
     pipeline_data = load_pipeline_data_from_env(state["user_query"], state["trace_id"])
+    source_usage = build_source_usage(
+        state["user_query"],
+        data_requirements,
+        trace_id=state["trace_id"],
+        pipeline_metadata=pipeline_data.metadata,
+    )
+    evidence_refs = build_evidence_refs(source_usage, trace_id=state["trace_id"])
     cards = strategy_candidate_cards(
         state["user_query"],
         screening_candidates=pipeline_data.screening_candidates,
@@ -720,19 +725,31 @@ def plan_data_requirements(semantic_slots: SemanticSlots) -> list[DataRequiremen
     return requirements
 
 
-def build_source_usage(query: str, requirements: list[DataRequirement], *, trace_id: str) -> list[SourceUsage]:
+def build_source_usage(
+    query: str,
+    requirements: list[DataRequirement],
+    *,
+    trace_id: str,
+    pipeline_metadata: Mapping[str, Any],
+) -> list[SourceUsage]:
     now = datetime.now(UTC)
     usage: list[SourceUsage] = []
     for requirement in requirements:
+        uses_postgres = (
+            pipeline_metadata.get("source") == "postgres"
+            and requirement.preferred_source == "internal_db"
+        )
+        source_ref_key = "universe_source" if requirement.family == "universe" else "price_source"
+        source_ref = pipeline_metadata.get(source_ref_key) if uses_postgres else None
         usage.append(
             SourceUsage(
-                source_type=requirement.preferred_source,
+                source_type="internal_db" if uses_postgres else "none",
                 query=f"{requirement.family}: {query}",
                 retrieved_at=now,
-                source_refs=[requirement.evidence_ref],
-                freshness_status="fresh" if requirement.availability in {"available", "derivable", "partial"} else "unknown",
-                confidence=requirement.source_confidence_floor,
-                fallback_used=False,
+                source_refs=[str(source_ref)] if source_ref else [],
+                freshness_status="unknown",
+                confidence=requirement.source_confidence_floor if uses_postgres else 0.0,
+                fallback_used=pipeline_metadata.get("source") == "fixture",
                 evidence_refs=[f"source:{trace_id}:{requirement.family}"],
             )
         )
@@ -744,9 +761,9 @@ def build_evidence_refs(source_usage: list[SourceUsage], *, trace_id: str) -> li
         EvidenceRef(
             ref_id=usage.evidence_refs[0] if usage.evidence_refs else f"source:{trace_id}:{index}",
             source_type=usage.source_type,
-            stage="data_planning",
+            stage="data_retrieval",
             retrieved_at=usage.retrieved_at,
-            sanitized_summary=f"{usage.source_type} source plan for {usage.query.split(':', 1)[0]}",
+            sanitized_summary=f"{usage.source_type} source used for {usage.query.split(':', 1)[0]}",
             confidence=usage.confidence,
         )
         for index, usage in enumerate(source_usage)
@@ -1389,7 +1406,7 @@ def build_strategy_spec(
         indicators=profile["indicators"],
         risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
         assumptions=[
-            f"fixture {universe} universe" + (f" filtered to {sector} sector" if sector else ""),
+            f"{universe} universe" + (f" filtered to {sector} sector" if sector else ""),
             "daily adjusted close data",
             *profile["assumptions"],
         ],

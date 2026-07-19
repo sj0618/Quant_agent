@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 _ISSUER_TOKEN = object()
 _RAW_AUDIT_TEST_ONLY_MARKER = object()
+_RAW_AUDIT_HARD_DISABLED_ENVS = frozenset({"prod", "production", "stage", "staging"})
 
 
 class RawAuditAdmission:
@@ -36,6 +37,11 @@ def issue_raw_audit_admission(
     from app.core.config import Settings
 
     if not isinstance(settings, Settings):
+        return None
+    app_env = getattr(settings, "app_env", "")
+    if isinstance(app_env, str) and app_env.strip().lower() in _RAW_AUDIT_HARD_DISABLED_ENVS:
+        return None
+    if getattr(settings, "ai_backtest_raw_audit_enabled", False) is not True:
         return None
     if test_marker is _RAW_AUDIT_TEST_ONLY_MARKER:
         return _issue_test_raw_audit_admission(settings)

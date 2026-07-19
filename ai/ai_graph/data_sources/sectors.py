@@ -8,7 +8,8 @@ from typing import Any, Sequence
 AI_SECTOR_CACHE_TTL_SECONDS_ENV = "AI_SECTOR_CACHE_TTL_SECONDS"
 DEFAULT_SECTOR_CACHE_TTL_SECONDS = 300
 
-UNIVERSE_VIEW = "meta.view_common_stock_universe"
+COMMON_STOCK_UNIVERSE_VIEW = "meta.view_common_stock_universe"
+SECTOR_SOURCE_TABLE = "core.symbol_master"
 
 # Static fallback for offline/fixture mode — mirrors the WICS taxonomy documented in
 # DE/docs/data_engineering_runbook.md (26 sectors ingested via DE/scripts/ingest_wics_sectors.py).
@@ -60,7 +61,7 @@ def _sector_cache_ttl_seconds() -> int:
 
 
 def get_known_sectors(conn: Any | None = None) -> list[str]:
-    """Dynamic sector list sourced from DE's `meta.view_common_stock_universe`, TTL-cached.
+    """Dynamic sector list sourced from DE's symbol master, TTL-cached.
 
     Falls back to WICS_SECTOR_FALLBACK on any DB failure (no DSN, timeout, connect error),
     mirroring the fixture-fallback philosophy used elsewhere in this data source layer.
@@ -82,7 +83,14 @@ def get_known_sectors(conn: Any | None = None) -> list[str]:
 
 
 def _fetch_sectors(conn: Any | None) -> list[str]:
-    query = f"SELECT DISTINCT sector FROM {UNIVERSE_VIEW} WHERE sector IS NOT NULL ORDER BY sector"
+    query = f"""
+        SELECT DISTINCT sm.sector
+        FROM {COMMON_STOCK_UNIVERSE_VIEW} u
+        JOIN {SECTOR_SOURCE_TABLE} sm
+          ON sm.symbol = u.symbol
+        WHERE sm.sector IS NOT NULL
+        ORDER BY sm.sector
+    """
     try:
         if conn is not None:
             rows = conn.execute(query).fetchall()

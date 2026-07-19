@@ -129,7 +129,8 @@ def _raw_admission_settings(
     claim_overrides: dict[str, object] | None = None,
 ) -> Settings:
     return Settings.model_construct(
-        app_env="production",
+        app_env="development",
+        ai_backtest_raw_audit_enabled=True,
         ai_backtest_raw_audit_admission_hmac_secret=SecretStr(_RAW_AUDIT_SECRET),
         ai_backtest_raw_audit_admission_hmac_key_version=_RAW_AUDIT_KEY_VERSION,
         ai_backtest_raw_audit_admission_token=SecretStr(token or _signed_admission_token(claim_overrides)),

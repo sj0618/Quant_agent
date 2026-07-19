@@ -1,6 +1,8 @@
+import { useEffect, useState } from "react";
 // TEMP(dev-auth-gate): this import and the wrapper below, remove once the product is
 // ready for public access.
 import { SitePasswordGate } from "./components/common/SitePasswordGate";
+import { AsyncState } from "./components/common/AsyncState";
 import { AppPage } from "./pages/AppPage";
 import { AuthCallbackPage } from "./pages/AuthCallbackPage";
 import { AuthRequiredPage } from "./pages/AuthRequiredPage";
@@ -14,8 +16,9 @@ import { ReportsPage } from "./pages/ReportsPage";
 import { SearchPage } from "./pages/SearchPage";
 import { StrategyReportDetailPage } from "./pages/StrategyReportDetailPage";
 import { UnsubscribePage } from "./pages/UnsubscribePage";
-import { getCurrentSession } from "./api/authClient";
+import { getCurrentSession, validateCurrentSession } from "./api/authClient";
 import { ROUTES, getCurrentPathWithSearch, sanitizeReturnTo } from "./config/routes";
+import type { AuthSession } from "./types/auth";
 
 function normalizePath(pathname: string) {
   return pathname.replace(/\/+$/, "") || "/";
@@ -43,7 +46,48 @@ export default function App() {
 
 function AppRoutes() {
   const path = normalizePath(window.location.pathname);
-  const session = getCurrentSession();
+  const protectedRoute = isProtectedRoute(path);
+  const [authState, setAuthState] = useState<{
+    error: Error | null;
+    loading: boolean;
+    session: AuthSession | null;
+  }>(() => {
+    const session = getCurrentSession();
+    return { error: null, loading: protectedRoute && Boolean(session), session };
+  });
+
+  useEffect(() => {
+    if (!protectedRoute) {
+      return;
+    }
+    let cancelled = false;
+    validateCurrentSession()
+      .then((session) => {
+        if (!cancelled) {
+          setAuthState({ error: null, loading: false, session });
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setAuthState({
+            error: error instanceof Error ? error : new Error("세션 확인에 실패했습니다."),
+            loading: false,
+            session: null,
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [protectedRoute]);
+
+  if (protectedRoute && authState.loading) {
+    return <AsyncState title="로그인 세션을 확인하는 중입니다" tone="loading" />;
+  }
+
+  if (protectedRoute && authState.error) {
+    return <AsyncState title="로그인 세션을 확인하지 못했습니다" description={authState.error.message} tone="error" />;
+  }
 
   if (path === ROUTES.home) {
     return <LandingPage />;
@@ -73,7 +117,7 @@ function AppRoutes() {
     return <UnsubscribePage />;
   }
 
-  if (isProtectedRoute(path) && !session) {
+  if (protectedRoute && !authState.session) {
     return <AuthRequiredPage returnTo={getCurrentPathWithSearch()} />;
   }
 

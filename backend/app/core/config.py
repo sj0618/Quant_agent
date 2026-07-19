@@ -106,6 +106,7 @@ class Settings(BaseSettings):
     pdf_temp_url_max_redirects: int = Field(default=3, alias="PDF_TEMP_URL_MAX_REDIRECTS", ge=0, le=10)
     pdf_temp_min_text_chars: int = Field(default=20, alias="PDF_TEMP_MIN_TEXT_CHARS", ge=0)
     pdf_temp_max_seed_batch_size: int = Field(default=3, alias="PDF_TEMP_MAX_SEED_BATCH_SIZE", ge=1, le=10)
+    ai_backtest_raw_audit_enabled: bool = Field(default=False, alias="AI_BACKTEST_RAW_AUDIT_ENABLED")
     ai_backtest_raw_audit_admission_hmac_secret: SecretStr | None = Field(
         default=None,
         alias="AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET",
@@ -314,24 +315,25 @@ class Settings(BaseSettings):
             missing.append(
                 "AI_BACKTEST_SCOPE_HMAC_PREVIOUS and AI_BACKTEST_SCOPE_HMAC_PREVIOUS_VERSION must be set together"
             )
-        raw_audit_values = {
-            "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET": self.ai_backtest_raw_audit_admission_hmac_secret,
-            "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_KEY_VERSION": self.ai_backtest_raw_audit_admission_hmac_key_version,
-            "AI_BACKTEST_RAW_AUDIT_ADMISSION_TOKEN": self.ai_backtest_raw_audit_admission_token,
-            "AI_BACKTEST_RAW_AUDIT_ADMISSION_AUDIENCE": self.ai_backtest_raw_audit_admission_audience,
-            "AI_BACKTEST_RAW_AUDIT_EVIDENCE_ID": self.ai_backtest_raw_audit_evidence_id,
-            "AI_BACKTEST_RAW_AUDIT_DEPLOYMENT_REVISION": self.ai_backtest_raw_audit_deployment_revision,
-        }
-        missing.extend(name for name, value in raw_audit_values.items() if value is None)
-        if (
-            self.google_client_secret is not None
-            and self.ai_backtest_raw_audit_admission_hmac_secret is not None
-            and hmac.compare_digest(
-                self.google_client_secret_value or "",
-                self.ai_backtest_raw_audit_admission_hmac_secret.get_secret_value(),
-            )
-        ):
-            missing.append("AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET must not reuse GOOGLE_CLIENT_SECRET")
+        if self.ai_backtest_raw_audit_enabled:
+            raw_audit_values = {
+                "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET": self.ai_backtest_raw_audit_admission_hmac_secret,
+                "AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_KEY_VERSION": self.ai_backtest_raw_audit_admission_hmac_key_version,
+                "AI_BACKTEST_RAW_AUDIT_ADMISSION_TOKEN": self.ai_backtest_raw_audit_admission_token,
+                "AI_BACKTEST_RAW_AUDIT_ADMISSION_AUDIENCE": self.ai_backtest_raw_audit_admission_audience,
+                "AI_BACKTEST_RAW_AUDIT_EVIDENCE_ID": self.ai_backtest_raw_audit_evidence_id,
+                "AI_BACKTEST_RAW_AUDIT_DEPLOYMENT_REVISION": self.ai_backtest_raw_audit_deployment_revision,
+            }
+            missing.extend(name for name, value in raw_audit_values.items() if value is None)
+            if (
+                self.google_client_secret is not None
+                and self.ai_backtest_raw_audit_admission_hmac_secret is not None
+                and hmac.compare_digest(
+                    self.google_client_secret_value or "",
+                    self.ai_backtest_raw_audit_admission_hmac_secret.get_secret_value(),
+                )
+            ):
+                missing.append("AI_BACKTEST_RAW_AUDIT_ADMISSION_HMAC_SECRET must not reuse GOOGLE_CLIENT_SECRET")
         if missing:
             raise ValueError(f"auth-enabled runtime requires {', '.join(missing)}")
 
@@ -421,6 +423,7 @@ class Settings(BaseSettings):
             "auth_cookie_domain": self.auth_cookie_domain,
             "auth_cookie_path": self.auth_cookie_path,
             "auth_csrf_required": self.auth_csrf_required,
+            "ai_backtest_raw_audit_enabled": self.ai_backtest_raw_audit_enabled,
             "pdf_temp_ingest_enabled": self.pdf_temp_ingest_enabled,
             "pdf_temp_storage_dir": "<configured>" if self.pdf_temp_storage_dir else None,
             "pdf_temp_seed_dir": "<configured>" if self.pdf_temp_seed_dir else None,

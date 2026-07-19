@@ -90,7 +90,18 @@ def test_backtest_code_ast_validation_failure_uses_safe_fallback_candidates() ->
 
     assert len(result.candidates) >= 6
     assert sum(candidate.validation_ok for candidate in result.candidates) >= 6
-    assert any("import 'os' is not allowed" in reason or "build_signals" in reason for reason in result.fallback_reasons)
+    assert any(
+        reason.startswith("A1: import 'os' is not allowed")
+        for reason in result.fallback_reasons
+    )
+    assert any(
+        reason.startswith("A2: ") and "build_signals" in reason
+        for reason in result.fallback_reasons
+    )
+    assert any(
+        reason.startswith("A3: ") and "build_signals" in reason
+        for reason in result.fallback_reasons
+    )
 
 
 def test_backtest_code_fallback_reason_is_available_in_internal_payload_only() -> None:

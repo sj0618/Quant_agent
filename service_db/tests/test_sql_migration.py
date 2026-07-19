@@ -1,8 +1,28 @@
-from pathlib import Path
+import importlib.util
+import json
+import os
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 
 SERVICE_DB_ROOT = Path(__file__).resolve().parents[1]
+REPLAY_VERIFIER_PATH = SERVICE_DB_ROOT / "scripts/verify_fixed_migration_replay.py"
+REPLAY_RUNNER_PATH = SERVICE_DB_ROOT / "scripts/run_fixed_migration_replay.py"
+WORKFLOW_PATH = SERVICE_DB_ROOT.parents[0] / ".github/workflows/ai-logging.yml"
+
+
+def load_replay_verifier():
+    spec = importlib.util.spec_from_file_location("service_db_replay_verifier", REPLAY_VERIFIER_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 
 
 class ServiceDbSqlMigrationTests(unittest.TestCase):
@@ -94,6 +114,82 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         self.assertIn("WHERE status = 'issued'", sql)
         self.assertNotIn("DROP ", upper_sql)
         self.assertNotIn("TRUNCATE ", upper_sql)
+    def test_fixed_replay_verifier_rejects_wrong_disposable_dsn_components(self):
+        verifier = load_replay_verifier()
+        with self.assertRaises(verifier.ReplayContractError):
+            verifier.validate_disposable_dsn(
+                "postgresql://replay:secret@127.0.0.1:5433/not_disposable"
+                "?application_name=p0_disposable",
+                expected_host="127.0.0.1",
+                expected_port="5433",
+                expected_user="replay",
+                expected_database="p0_replay_disposable",
+                disposable_marker="p0_disposable",
+            )
+        with self.assertRaises(verifier.ReplayContractError):
+            verifier.validate_disposable_dsn(
+                "postgresql://replay:secret@127.0.0.1:5433/p0_replay_disposable"
+                "?application_name=wrong_marker",
+                expected_host="127.0.0.1",
+                expected_port="5433",
+                expected_user="replay",
+                expected_database="p0_replay_disposable",
+                disposable_marker="p0_disposable",
+            )
+
+    def test_fixed_replay_verifier_blocks_before_sql_without_external_inputs(self):
+        verifier = load_replay_verifier()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            artifact = Path(temporary_directory) / "replay-artifact.json"
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(verifier.main(["--artifact", str(artifact)]), 2)
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "BLOCKED")
+        self.assertEqual(
+            payload["missing_external_inputs"], ["external_signer", "sbom", "trusted_root"]
+        )
+        self.assertIn("artifact_sha256", payload)
+        self.assertEqual(payload["markers"][-1], {"version": 1, "state": "BLOCKED"})
+        stored_hash = payload.pop("artifact_sha256")
+        self.assertEqual(stored_hash, verifier._canonical_hash(payload))
+
+    def test_fixed_replay_contract_pins_order_catalog_and_pg17_golden(self):
+        verifier = load_replay_verifier()
+        migrations = tuple(
+            path.name for path in sorted((SERVICE_DB_ROOT / "migrations").glob("*.sql"))
+        )
+        self.assertEqual(migrations, verifier.FIXED_MIGRATIONS)
+        source = REPLAY_VERIFIER_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("inet_server_addr", source)
+        self.assertIn("pgcrypto", source)
+        self.assertIn("PG17_GOLDEN_SHA256", source)
+        self.assertIn("PASS1_COMPLETE", source)
+        self.assertIn("PASS2_COMPLETE", source)
+        self.assertIn("final_catalog_union_sha256", source)
+        self.assertIn("catalog union digest parity", source)
+        self.assertIn("INTERNAL_TRANSACTION_MIGRATION", source)
+
+    def test_replay_workflow_has_separate_databases_and_artifact_discard_contract(self):
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        runner = REPLAY_RUNNER_PATH.read_text(encoding="utf-8")
+        self.assertIn("migration-replay-db:", workflow)
+        self.assertIn("audit-purge-db:", workflow)
+        self.assertIn("5433:5432", workflow)
+        self.assertIn("5434:5432", workflow)
+        self.assertIn("CREATE EXTENSION IF NOT EXISTS pgcrypto", workflow)
+        self.assertIn("--port=5433", workflow)
+        self.assertLess(
+            workflow.index("CREATE EXTENSION IF NOT EXISTS pgcrypto"),
+            workflow.index("run_fixed_migration_replay.py"),
+        )
+        self.assertIn("actions/upload-artifact@v4", workflow)
+        self.assertIn("if: always()", workflow)
+        self.assertIn("run_fixed_migration_replay.py", workflow)
+        self.assertIn("service_db/scripts/**", workflow)
+        self.assertIn("service_db/tests/test_sql_migration.py", workflow)
+        self.assertIn("DROP DATABASE IF EXISTS", runner)
+        self.assertIn("forced_discard", runner)
+        self.assertIn("missing_external_inputs", runner)
 
 if __name__ == "__main__":
     unittest.main()

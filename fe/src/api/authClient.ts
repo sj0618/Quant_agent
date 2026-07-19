@@ -1,8 +1,7 @@
 import { AUTH_ENDPOINTS, appConfig } from "../config/appConfig";
 import { ROUTES } from "../config/routes";
 import type { AuthSession } from "../types/auth";
-
-const AUTH_SESSION_STORAGE_KEY = "quantagent.auth.session.v1";
+import { AUTH_SESSION_STORAGE_KEY, clearUserScopedStorage } from "../utils/userScopedStorage";
 
 // TEMP(dev-auth-gate): test-login bypass until BE session integration ships.
 const TEST_AUTH_SESSION: AuthSession = {
@@ -24,6 +23,10 @@ interface CallbackResponse {
   accessToken?: string;
   expiresAt?: string;
   returnTo?: string;
+}
+
+interface AuthMeResponse {
+  user: AuthSession["user"];
 }
 
 function readJson<T>(value: string | null): T | null {
@@ -60,6 +63,10 @@ export function getCurrentSession(): AuthSession | null {
 }
 
 export function saveCurrentSession(session: AuthSession) {
+  const currentSession = getCurrentSession();
+  if (!currentSession || currentSession.user.id !== session.user.id) {
+    clearUserScopedStorage();
+  }
   window.localStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(session));
 }
 
@@ -74,7 +81,31 @@ export function saveTestSession() {
 }
 
 export function clearCurrentSession() {
-  window.localStorage.removeItem(AUTH_SESSION_STORAGE_KEY);
+  clearUserScopedStorage();
+}
+
+export async function validateCurrentSession(): Promise<AuthSession | null> {
+  const session = getCurrentSession();
+  if (!session) {
+    return null;
+  }
+  if (session.user.provider === "test" && appConfig.testLoginEnabled) {
+    return session;
+  }
+
+  const response = await fetch(`${requireAuthApiBaseUrl()}${AUTH_ENDPOINTS.me}`, {
+    credentials: "include",
+  });
+  if (response.status === 401 || response.status === 403) {
+    clearCurrentSession();
+    return null;
+  }
+  assertOk(response);
+
+  const payload = (await response.json()) as AuthMeResponse;
+  const validatedSession = { ...session, user: payload.user };
+  saveCurrentSession(validatedSession);
+  return validatedSession;
 }
 
 export async function startGoogleSignIn(returnTo: string) {
@@ -132,12 +163,15 @@ export async function completeGoogleSignIn(params: URLSearchParams) {
 
 export async function signOut() {
   const session = getCurrentSession();
-  if (appConfig.authApiBaseUrl && session?.user.provider !== "test") {
-    const response = await fetch(`${appConfig.authApiBaseUrl}${AUTH_ENDPOINTS.logout}`, {
-      method: "POST",
-      credentials: "include",
-    });
-    assertOk(response);
+  try {
+    if (appConfig.authApiBaseUrl && session?.user.provider !== "test") {
+      const response = await fetch(`${appConfig.authApiBaseUrl}${AUTH_ENDPOINTS.logout}`, {
+        method: "POST",
+        credentials: "include",
+      });
+      assertOk(response);
+    }
+  } finally {
+    clearCurrentSession();
   }
-  clearCurrentSession();
 }

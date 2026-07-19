@@ -3,6 +3,7 @@ from datetime import datetime
 import pytest
 from pydantic import ValidationError
 
+from ai_graph.nodes.backtest import summarize_backtest
 from ai_graph.nodes.signal import SignalCondition, build_investment_signal, generate_signal, signal_node
 
 
@@ -94,6 +95,28 @@ def test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence():
     )
 
     assert decision.l4_evidence == []
+
+
+def test_backtest_summary_excludes_generated_candidate_payloads():
+    summary = summarize_backtest(
+        {
+            "candidates": [{"code": "generated code" * 100_000}],
+            "selected_candidate": {
+                "candidate_id": "candidate-a",
+                "metrics": {"sharpe_ratio": 1.4},
+            },
+            "engine_summary": {"trades": 7},
+            "objective_scores_by_candidate": {"candidate-a": 0.81},
+        }
+    )
+
+    assert summary == {
+        "selected_candidate_id": "candidate-a",
+        "metrics": {"sharpe_ratio": 1.4},
+        "engine_summary": {"trades": 7},
+        "objective_score": 0.81,
+    }
+    assert "candidates" not in summary
 
 
 def test_signal_condition_validates_between_shape():

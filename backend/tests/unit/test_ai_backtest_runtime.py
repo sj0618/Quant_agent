@@ -6,8 +6,16 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
-from app.schemas.ai_backtest import AICodeBacktestFlowRequest, GeneratedCodeResult
+from app.schemas.ai_backtest import (
+    AI_BACKTEST_MAX_MEMORY_LIMIT_MB,
+    AI_BACKTEST_MAX_PROMPT_CHARS,
+    AI_BACKTEST_MAX_TIMEOUT_SECONDS,
+    AICodeBacktestFlowRequest,
+    AICodeBacktestPublicRequest,
+    GeneratedCodeResult,
+)
 from app.services.ai_backtest_runtime import (
     AOAICodeGenerator,
     ASTCodeValidator,
@@ -15,6 +23,48 @@ from app.services.ai_backtest_runtime import (
     SandboxedBacktestExecutor,
 )
 
+
+@pytest.mark.parametrize("request_type", [AICodeBacktestPublicRequest, AICodeBacktestFlowRequest])
+def test_backtest_request_resource_limits_accept_configured_maximums(request_type):
+    request = request_type(
+        natural_language_prompt="x" * AI_BACKTEST_MAX_PROMPT_CHARS,
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+        timeout_seconds=AI_BACKTEST_MAX_TIMEOUT_SECONDS,
+        memory_limit_mb=AI_BACKTEST_MAX_MEMORY_LIMIT_MB,
+    )
+
+    assert len(request.natural_language_prompt) == AI_BACKTEST_MAX_PROMPT_CHARS
+    assert request.timeout_seconds == AI_BACKTEST_MAX_TIMEOUT_SECONDS
+    assert request.memory_limit_mb == AI_BACKTEST_MAX_MEMORY_LIMIT_MB
+
+
+@pytest.mark.parametrize("request_type", [AICodeBacktestPublicRequest, AICodeBacktestFlowRequest])
+@pytest.mark.parametrize(
+    ("field_name", "value", "error_type"),
+    [
+        ("natural_language_prompt", "x" * (AI_BACKTEST_MAX_PROMPT_CHARS + 1), "string_too_long"),
+        ("timeout_seconds", AI_BACKTEST_MAX_TIMEOUT_SECONDS + 1, "less_than_equal"),
+        ("memory_limit_mb", AI_BACKTEST_MAX_MEMORY_LIMIT_MB + 1, "less_than_equal"),
+    ],
+)
+def test_backtest_request_resource_limits_reject_oversized_values(
+    request_type,
+    field_name,
+    value,
+    error_type,
+):
+    payload = {
+        "natural_language_prompt": "bounded request",
+        "target_runtime": "python-sandbox",
+        "code_purpose": "backtest",
+    }
+    payload[field_name] = value
+
+    with pytest.raises(ValidationError) as exc_info:
+        request_type(**payload)
+
+    assert exc_info.value.errors()[0]["type"] == error_type
 
 def test_ast_code_validator_blocks_non_runtime_imports_and_file_io_calls():
     validator = ASTCodeValidator()

@@ -1,0 +1,105 @@
+name: Code checks
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            ai/pyproject.toml
+            backtest_module/pyproject.toml
+            backend/pyproject.toml
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./backtest_module -e ./ai -e "./backend[test]" pytest ruff
+
+      - name: Compile Python sources
+        run: |
+          python -m compileall -q ai backtest_module backend service_db DE
+
+      - name: Run focused lint checks
+        run: |
+          python -m ruff check --select E9,F63,F7 ai/ai_graph ai/tests backtest_module backend/app backend/tests
+          python -m ruff check ai/tests/test_api.py
+
+      - name: Run backtest tests
+        run: python -m pytest -q backtest_module/tests
+
+      - name: Run AI contract and API tests
+        run: >-
+          python -m pytest -q
+          ai/tests/test_ai_graph_backtest_module_integration.py
+          ai/tests/test_graph_e2e.py
+          ai/tests/test_api.py
+          ai/tests/contracts
+        env:
+          AUTH_ENABLED: "0"
+          AI_LLM_PROVIDER: mock
+          AI_JOB_STORE: memory
+          AI_AUDIT_SINK: noop
+
+      - name: Run backend unit smoke tests
+        run: >-
+          python -m pytest -q
+          backend/tests/unit/test_main_smoke.py
+          backend/tests/unit/test_auth_config.py
+          backend/tests/unit/test_fe_contract_routes.py
+
+      - name: Run database contract tests
+        run: python -m pytest -q service_db/tests
+
+      - name: Run data engineering migration tests
+        working-directory: DE
+        run: python -m pytest -q tests/test_sql_migration.py
+
+  frontend:
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+          cache: npm
+          cache-dependency-path: fe/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: fe
+        run: npm ci
+
+      - name: Typecheck and production build
+        working-directory: fe
+        run: npm run test

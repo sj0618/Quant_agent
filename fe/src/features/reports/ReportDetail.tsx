@@ -12,6 +12,10 @@ interface ReportDetailProps {
 const SIGNALS: SignalType[] = ["BUY", "HOLD", "DROP"];
 
 export function ReportDetail({ report }: ReportDetailProps) {
+  const isAIReport = report.id.startsWith("ai-job:");
+  const summaryTitle = isAIReport ? "분석 요약" : "전일 시황";
+  const finalSectionTitle = isAIReport ? "다음 단계" : "면책 · 거래비용";
+
   return (
     <div className="report-detail-layout">
       <aside className="report-detail-side">
@@ -25,7 +29,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
         </Card>
         <Card className="toc-card">
           <strong>목차</strong>
-          {["헤더 · 메타", "전일 시황", "주요 뉴스 5건", "오늘의 후보 종목", "매수·보유·매도 신호", "정리 · 백테스트", "면책 · 거래비용"].map((item, index) => (
+          {["헤더 · 메타", summaryTitle, "주요 분석 항목", "오늘의 후보 종목", "매수·보유·매도 신호", "정리 · 백테스트", finalSectionTitle].map((item, index) => (
             <span className={index === 0 ? "is-active" : ""} key={item}>
               <b>{String(index + 1).padStart(2, "0")}</b> {item}
             </span>
@@ -46,9 +50,9 @@ export function ReportDetail({ report }: ReportDetailProps) {
         <section className="report-paper__section report-paper__hero">
           <div className="report-paper__meta">
             <span>
-              <Badge variant="dark">DAILY REPORT</Badge> {report.date} · {report.sentAt}
+              <Badge variant="dark">{isAIReport ? "AI ANALYSIS" : "DAILY REPORT"}</Badge> {report.date} · {report.sentAt}
             </span>
-            <span>{report.recipient}</span>
+            {report.recipient ? <span>{report.recipient}</span> : null}
           </div>
           <h1>{report.title}</h1>
           <p>{report.marketBrief}</p>
@@ -62,11 +66,11 @@ export function ReportDetail({ report }: ReportDetailProps) {
           </div>
         </section>
 
-        <Section title="전일 시황" index="02">
+        <Section title={summaryTitle} index="02">
           <p>{report.marketContext ?? report.marketBrief}</p>
         </Section>
 
-        <Section title="주요 뉴스 5건" index="03">
+        <Section title="주요 분석 항목" index="03">
           <ol className="news-list">
             {report.news.map((news) => (
               <li key={news.rank}>
@@ -79,26 +83,28 @@ export function ReportDetail({ report }: ReportDetailProps) {
         </Section>
 
         <Section title="오늘의 후보 종목" index="04">
-          <div className="report-signal-list">
+          {report.candidates.length ? <div className="report-signal-list">
             {report.candidates.map((candidate) => (
               <SignalCard candidate={candidate} key={candidate.id} />
             ))}
-          </div>
+          </div> : <p>이번 분석 응답에는 종목별 추천 데이터가 없습니다.</p>}
         </Section>
 
         <Section title="매수·보유·매도 신호 근거" index="05">
-          <p>각 신호는 정/반/합 3-agent 토론 + 매도결손 3축 보강으로 도출됩니다. 점수는 호재·악재·기관 수급의 가중 합이며, 0.7 이상은 강한 신호로 분류합니다.</p>
-          <div className="axis-grid">
-            {report.signalAxes.map((axis) => (
-              <div key={axis.label}>
-                <span><Badge variant="dark">{axis.label}</Badge> 가중치 {axis.weight}</span>
-                <strong>{axis.title}</strong>
-                <p>{axis.description}</p>
-              </div>
-            ))}
-          </div>
+          {report.signalAxes.length ? <>
+            <p>각 신호는 정/반/합 3-agent 토론 + 매도결손 3축 보강으로 도출됩니다. 점수는 호재·악재·기관 수급의 가중 합이며, 0.7 이상은 강한 신호로 분류합니다.</p>
+            <div className="axis-grid">
+              {report.signalAxes.map((axis) => (
+                <div key={axis.label}>
+                  <span><Badge variant="dark">{axis.label}</Badge> 가중치 {axis.weight}</span>
+                  <strong>{axis.title}</strong>
+                  <p>{axis.description}</p>
+                </div>
+              ))}
+            </div>
+          </> : <p>이번 분석 응답에는 종목별 신호 근거가 없습니다.</p>}
           <Card className="risk-manager">
-            <span><Badge variant="dark">RISK MANAGER</Badge> 오늘 매크로 override 없음</span>
+            <span><Badge variant="dark">RISK MANAGER</Badge> AI 리스크 조정 결과</span>
             <p>{report.riskManagerOverride}</p>
           </Card>
         </Section>
@@ -125,7 +131,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
         </Section>
 
         <section className="report-paper__section report-paper__section--cost">
-          <h2><span>07</span> 면책 · 거래비용 안내</h2>
+          <h2><span>07</span> {finalSectionTitle}</h2>
           <ul>
             {report.costNotes.map((note) => (
               <li key={note}>{note}</li>

@@ -27,6 +27,7 @@ CI/서버 환경에서는 AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_I
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, asdict
 from typing import Any
 
@@ -34,6 +35,8 @@ from azure.identity import DefaultAzureCredential
 from azure.ai.projects import AIProjectClient
 
 
+PROJECT_ENDPOINT = os.environ.get("AZURE_AI_PROJECT_ENDPOINT", "")
+AGENT_NAME = os.environ.get("AZURE_AI_AGENT_NAME", "sol-omx-0711")
 SEARCH_PROMPT = "오늘 한국 증시 어땠는지 한 줄로 알려줘."
 
 # instructions는 Agent 쪽(Foundry 포털)에 이미 설정되어 있어서 요청에

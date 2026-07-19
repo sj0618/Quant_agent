@@ -65,3 +65,14 @@ def build_signals(prices):
     return [{"date": row["date"], "action": "HOLD", "price": float(row["close"])} for row in prices]
 """
     assert validate_graph_backtest_code(source).ok
+
+
+def test_graph_validator_blocks_dunder_attribute_sandbox_escape() -> None:
+    source = """def build_signals(prices):
+    return [cls.__name__ for cls in ().__class__.__base__.__subclasses__()]
+"""
+
+    result = validate_graph_backtest_code(source)
+
+    assert not result.ok
+    assert "attribute.private" in {violation.code for violation in result.violations}

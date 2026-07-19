@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
+from ai_graph.nodes.backtest import summarize_backtest
 from ai_graph.schemas import L4Evidence, SignalDecision as InvestmentSignalDecision
 
 SignalAction = Literal["BUY", "SELL", "HOLD", "WATCH", "FILTERED_OUT"]
@@ -261,7 +262,7 @@ def build_investment_signal(
 def build_signal_debate(state: dict[str, Any]) -> dict[str, Any]:
     context = {
         "strategy": state.get("strategy_spec", {}),
-        "backtest": state.get("backtest", {}),
+        "backtest": summarize_backtest(state.get("backtest", {})),
         "l4_evidence": state.get("l4_evidence", []),
         "screening_candidates": state.get("data", {}).get("screening_candidates", []),
         "data_availability": state.get("data", {}).get("data_availability", {}),

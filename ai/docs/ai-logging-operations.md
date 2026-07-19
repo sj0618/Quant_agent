@@ -23,17 +23,21 @@ PostgreSQL에 저장하는 기능의 활성화·검증·롤백 절차다. 로그
   실패 이유를 남기되 secret이나 내부 예외 원문은 복사하지 않는다.
 - audit 테이블 저장이 한 번 실패하면 rollback 후 해당 세션의 추가 audit DB
   쓰기를 중단하고 연결을 닫으며, 안전한 stderr 이벤트와 실패 카운터만 남긴다.
-  AI 결과는 바뀌지 않는다. 반면 백테스트 결과·전략·실행 결과 같은 업무
-  데이터 저장 실패는 audit 실패가 아니므로 기존 API 실패 처리 대상이다.
+  AI 결과는 바뀌지 않는다. 각 raw write transaction 직전에는 Gate B capability
+  guard가 admission expiry, signed claim integrity, revocation state를 재검증한다.
+  guard가 거부하거나 verifier가 unavailable이면 SQL write를 실행하지 않고 같은
+  fail-open 경로로 세션을 NoOp 처리한다. 업무 데이터 저장 실패는 audit 실패가
+  아니므로 기존 API 실패 처리 대상이다.
 
 ## 1. 실행 설정
 
 | 설정 | 값 | 동작 |
 |---|---|---|
 | `AI_AUDIT_SINK` | `noop` | 기본값. AI는 정상 실행하고 DB 로그는 저장하지 않는다. |
-| `AI_AUDIT_SINK` | `postgres` | PostgreSQL 로깅을 활성화한다. DSN이 없거나 연결이 실패하면 fail-open으로 `noop`과 같이 AI 실행을 계속한다. |
+| `AI_AUDIT_SINK` | `postgres` | 코드 경로는 존재하지만 현재 운영·스테이징 활성화는 BLOCKED다. |
 | `AI_AUDIT_CONNECT_TIMEOUT_SECONDS` | 양의 정수, 기본 `2` | 로깅 DB 연결 제한 시간. |
 | `AI_AUDIT_STATEMENT_TIMEOUT_MS` | 양의 정수, 기본 `2000` | 로깅 SQL 제한 시간. |
+| `AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE` | `active`만 허용 | env-backed 결정론 verifier 상태. `revoked`, 누락, 알 수 없는 값은 write-time fail-closed deny다. 로컬 테스트 경계이며 운영 revocation provider가 아니다. |
 
 DSN은 첫 번째 비어 있지 않은 값을 아래 순서로 사용한다.
 
@@ -45,14 +49,10 @@ DSN은 첫 번째 비어 있지 않은 값을 아래 순서로 사용한다.
 동작한다. DSN과 인증 정보는 배포 환경의 secret 저장소로 주입하고 로그나
 증거 문서에 원문을 남기지 않는다.
 
-예시:
-
-```bash
-AI_AUDIT_SINK=postgres
-AI_DATABASE_DSN='postgresql://<user>:<secret>@<db-host>:5432/<db>?sslmode=verify-full&sslrootcert=/path/to/ca.pem'
-AI_AUDIT_CONNECT_TIMEOUT_SECONDS=2
-AI_AUDIT_STATEMENT_TIMEOUT_MS=2000
-```
+외부 signer와 revocation provider가 없으므로 이 문서에는 `AI_AUDIT_SINK=postgres`
+활성화 예시를 제공하지 않는다. production/staging에서 raw-on 설정 또는 canary를
+실행하지 않는다. signer가 발행한 HMAC admission과 독립적인 revocation provider의
+증거가 모두 준비되기 전에는 `AI_AUDIT_SINK=noop`을 유지한다.
 
 ## 2. 마이그레이션
 
@@ -95,53 +95,25 @@ WHERE schemaname = 'app'
 ORDER BY indexname;
 ```
 
-## 3. 스테이징 활성화와 canary
+## 3. 스테이징 활성화와 canary — BLOCKED
 
-1. Gate A 테스트와 migration 013 적용을 완료한다.
-2. 스테이징에 `sslmode=verify-full`인 DSN과 `AI_AUDIT_SINK=postgres`를 주입한다.
-3. AI 요청 한 건을 실행하고 public `trace_id`를 기록한다.
-4. 아래 read-only SQL로 trace, 실제 실행 agent, model call, prompt가 연결되고
-   terminal 상태인지 확인한다. 오류 시나리오는 error가 같은 trace/call에
-   연결되는지 확인한다.
-5. 원문 prompt/response를 인가된 운영자가 canary 입력과 직접 비교한다.
-6. 로깅 DB를 의도적으로 차단한 동일 요청에서 AI 결과가 정상으로 반환되는지
-   확인한다.
+현재 external signer/provider가 없으므로 production/staging raw-on과 canary는
+**실행 금지**다. `AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE=active`는 process
+env를 읽는 결정론 테스트 verifier일 뿐, 외부 revocation 확인이나 Gate B PASS
+증거가 아니다.
 
-```sql
-WITH target AS (
-    SELECT trace_id, status, started_at, ended_at
-    FROM app.ai_trace
-    WHERE metadata_jsonb ->> 'public_trace_id' = :'public_trace_id'
-    ORDER BY started_at DESC
-    LIMIT 1
-)
-SELECT
-    target.trace_id,
-    target.status AS trace_status,
-    agent.execution_id,
-    agent.agent_name,
-    agent.status AS agent_status,
-    model.call_id,
-    model.status AS model_status,
-    prompt.prompt_log_id,
-    prompt.masked,
-    error.error_id,
-    error.error_type
-FROM target
-LEFT JOIN app.ai_agent_execution_log AS agent USING (trace_id)
-LEFT JOIN app.ai_model_call_log AS model
-  ON model.trace_id = target.trace_id
- AND model.execution_id IS NOT DISTINCT FROM agent.execution_id
-LEFT JOIN app.ai_prompt_log AS prompt USING (call_id)
-LEFT JOIN app.ai_error_log AS error
-  ON error.trace_id = target.trace_id
- AND error.execution_id IS NOT DISTINCT FROM agent.execution_id
- AND (error.call_id IS NULL OR error.call_id = model.call_id)
-ORDER BY agent.started_at, model.created_at, error.created_at;
-```
+BLOCKED 해제에는 다음이 모두 필요하다.
 
-정상 canary에서 `masked=false`다. 이는 원문 저장 정책을 의미하며, 응답을
-받은 API가 제공된다는 의미가 아니다.
+1. signer가 audience, evidence ID, deployment revision, issued_at, expiry, key version을
+   포함한 admission을 발행한다.
+2. write-time에 조회 가능한 독립 revocation provider가 revoke/unavailable을
+   fail-closed로 응답한다.
+3. provider 장애·revoke·expiry 시 raw write 0건과 AI fail-open 결과를 증명한
+   staging evidence가 owner, reviewer, date와 함께 기록된다.
+4. Gate B의 TLS, storage, backup, 권한 증거가 모두 PASS다.
+
+이 조건이 충족되어 별도 승인되기 전에는 local/unit test 외의 raw write를 수행하지
+않는다.
 
 ## 4. 즉시 롤백과 forward schema 정책
 
@@ -186,8 +158,11 @@ ORDER BY running_since;
 
 `DE/scripts/purge_ai_prompt_logs.py`는 DB 시계로 한 번 생성한
 `now() - INTERVAL '90 days'`보다 `created_at`이 작은 prompt row만 1,000건씩
-삭제하고 batch마다 commit한다. 경계시각과 보존 기간 이내 row는 유지되며,
-여러 번 실행해도 결과가 같다. 연결은 5초, SQL은 30초 timeout으로 제한한다.
+삭제한다. 각 시도한 batch(마지막 0건 batch 포함) 뒤 commit하므로, 만료 1,001건과
+보존 10건이면 1,000건·1건·0건 batch로 총 3회 commit한다. 경계시각과 보존 기간
+이내 row는 유지되며, 재실행은 0건을 삭제한다. `SKIP LOCKED`로 동시 worker의
+선택 row는 겹치지 않고, 삭제 대상은 `app.ai_prompt_log`뿐이므로 model call·trace
+부모 row는 보존된다. 연결은 5초, SQL은 30초 timeout으로 제한한다.
 
 수동 실행:
 
@@ -234,6 +209,8 @@ Gate A는 아래 Gate B의 대체 증거가 아니다.
 - [ ] primary/replica/temp storage, snapshot, backup, archived WAL의 암호화가 확인된다.
 - [ ] backup retention/expiry와 격리 restore drill이 통과한다.
 - [ ] writer/purge/DBA 권한과 원문 log 접근 감사가 확인된다.
+- [ ] 독립 signer와 write-time revocation provider가 admission claim integrity,
+  revoke, unavailable을 fail-closed로 검증한다. 현재 이 증거는 **BLOCKED**다.
 - [ ] 모든 증거에 owner, reviewer, date, resource, observed value가 있다.
 
 Gate A만 통과하고 Gate B가 미확인이면 상태는
