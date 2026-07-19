@@ -74,7 +74,6 @@ NODE_KEY_GROUPS: list[tuple[str, list[str]]] = [
             "evidence_refs",
             "freshness_status",
             "proxy_disclosure",
-            "retrieval",
             "data",
             "price_rows",
             "l4_evidence",

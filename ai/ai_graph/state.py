@@ -17,7 +17,6 @@ class QuantAgentState(TypedDict, total=False):
     proxy_disclosure: dict[str, str] | None
     failure_cause: dict[str, Any]
     evidence_refs: list[dict[str, Any]]
-    retrieval: dict[str, Any]
     data: dict[str, Any]
     original_strategy_spec: dict[str, Any]
     strategy_spec: dict[str, Any]

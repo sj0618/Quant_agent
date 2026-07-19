@@ -29,7 +29,7 @@ def test_build_strategy_spec_propagates_sector_and_universe() -> None:
     slots = parse_semantic_slots(query, trace_id="trace-spec-sector")
 
     spec = build_strategy_spec(
-        query, variant="A", retrieval={"hits": []}, semantic_slots=slots.model_dump()
+        query, variant="A", semantic_slots=slots.model_dump()
     )
 
     assert spec.sector == "반도체"
@@ -42,7 +42,7 @@ def test_build_strategy_spec_keeps_kospi200_universe_when_mentioned() -> None:
     slots = parse_semantic_slots(query, trace_id="trace-spec-kospi200")
 
     spec = build_strategy_spec(
-        query, variant="A", retrieval={"hits": []}, semantic_slots=slots.model_dump()
+        query, variant="A", semantic_slots=slots.model_dump()
     )
 
     assert spec.sector is None
@@ -52,8 +52,8 @@ def test_build_strategy_spec_keeps_kospi200_universe_when_mentioned() -> None:
 def test_strategy_candidate_cards_without_screening_data_is_unchanged() -> None:
     query = "저평가주 사줘"
 
-    baseline = strategy_candidate_cards(query, [])
-    with_none = strategy_candidate_cards(query, [], screening_candidates=None, sector=None)
+    baseline = strategy_candidate_cards(query)
+    with_none = strategy_candidate_cards(query, screening_candidates=None, sector=None)
 
     assert [card.model_dump() for card in baseline] == [card.model_dump() for card in with_none]
 
@@ -80,7 +80,6 @@ def test_strategy_candidate_cards_attaches_sector_filtered_matches() -> None:
 
     cards = strategy_candidate_cards(
         "반도체 섹터에서 RSI 과매도 종목 찾아줘",
-        [],
         screening_candidates=screening_candidates,
         sector="반도체",
     )

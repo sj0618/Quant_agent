@@ -26,7 +26,6 @@ from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
-from ai_graph.retrieval.search import search_retrieval_corpus
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
@@ -397,7 +396,6 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
     query = state["user_query"]
     category = classify_query(query)
     status = _status_for_category(category)
-    retrieval = search_retrieval_corpus(query, top_k=3)
     clarification = build_clarification_prompt(category, query)
     ambiguity = {
         "category": category.value,
@@ -409,7 +407,6 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
         "source_resolvable": category in {AmbiguityCode.INPUT_AMBIGUOUS, AmbiguityCode.TERM_UNKNOWN},
         "needs_clarification_after_source_check": category != AmbiguityCode.READY,
         "clarification_blocker_type": _clarification_blocker_type(category),
-        "retrieved_definitions": [hit.model_dump() for hit in retrieval.hits],
         "clarification_question": clarification["question"],
         "question_reason": clarification["question_reason"],
         "options": [option.model_dump() for option in clarification["options"]],
@@ -425,11 +422,9 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
     data_requirements = plan_data_requirements(semantic_slots)
     source_usage = build_source_usage(state["user_query"], data_requirements, trace_id=state["trace_id"])
     evidence_refs = build_evidence_refs(source_usage, trace_id=state["trace_id"])
-    retrieval = search_retrieval_corpus(state["user_query"], top_k=5)
     pipeline_data = load_pipeline_data_from_env(state["user_query"], state["trace_id"])
     cards = strategy_candidate_cards(
         state["user_query"],
-        retrieval.hits,
         screening_candidates=pipeline_data.screening_candidates,
         sector=semantic_slots.sector,
     )
@@ -440,7 +435,6 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         "evidence_refs": [evidence.model_dump() for evidence in evidence_refs],
         "freshness_status": _aggregate_freshness_status(source_usage),
         "proxy_disclosure": _proxy_disclosure(data_requirements),
-        "retrieval": retrieval.model_dump(),
         "data": {
             "candidate_cards": [card.model_dump() for card in cards],
             "pipeline_data_source": pipeline_data.metadata,
@@ -462,7 +456,6 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
     strategy_a = build_strategy_spec(
         state["user_query"],
         variant="A",
-        retrieval=state["retrieval"],
         semantic_slots=state.get("semantic_slots"),
     )
     debate = build_research_debate(state, strategy_a)
@@ -471,9 +464,10 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
         update={
             "assumptions": [
                 *strategy_a.assumptions,
-                "L1/L2 검색 결과와 Research Judge 검토로 조건을 명시화함",
+                "AOAI 웹 검색 근거와 Research Judge 검토로 조건을 명시화함",
                 debate["judge"]["summary"],
             ],
+            "source_refs": _source_refs_from_debate(debate),
             "confidence": min(strategy_a.confidence + 0.03, 0.95),
         }
     )
@@ -482,6 +476,16 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
         "strategy_spec": strategy_a.model_dump(),
         "research_debate": debate,
     }
+
+
+def _source_refs_from_debate(debate: Mapping[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for role in ("bull", "bear", "judge"):
+        for citation in debate.get(role, {}).get("citations", []):
+            url = citation.get("url")
+            if url and url not in urls:
+                urls.append(url)
+    return urls
 
 
 def envelope_node(state: QuantAgentState) -> dict[str, Any]:
@@ -781,12 +785,11 @@ def _unique(values: list[str]) -> list[str]:
 
 def strategy_candidate_cards(
     query: str,
-    hits: list[Any],
     *,
     screening_candidates: list[dict[str, Any]] | None = None,
     sector: str | None = None,
 ) -> list[StrategyCandidateCard]:
-    cards = _static_strategy_candidate_cards(query, hits)
+    cards = _static_strategy_candidate_cards(query)
     if screening_candidates:
         cards = _attach_screening_matches(cards, screening_candidates, sector=sector)
     return cards
@@ -829,7 +832,7 @@ def _attach_screening_matches(
     return [primary, *cards[1:]]
 
 
-def _static_strategy_candidate_cards(query: str, hits: list[Any]) -> list[StrategyCandidateCard]:
+def _static_strategy_candidate_cards(query: str) -> list[StrategyCandidateCard]:
     lowered = query.lower()
     if any(term in query for term in ("EPS", "컨센서스", "어닝", "가이던스", "실적 발표")):
         return [
@@ -1133,7 +1136,7 @@ def build_clarification_prompt(category: AmbiguityCode, query: str) -> dict[str,
         )
     if category == AmbiguityCode.TERM_UNKNOWN:
         options = [
-            ClarificationOption(label="L1/L2 정의 적용", reason="로컬 지식베이스 정의로 조건을 보정합니다."),
+            ClarificationOption(label="표준 정의 적용", reason="시장 관행상 통용되는 정의로 조건을 보정합니다."),
             ClarificationOption(label="기술적 proxy 사용", reason="OHLCV/TA 지표로 먼저 후보를 좁힙니다."),
             ClarificationOption(label="질문으로 확정", reason="용어 정의가 투자 판단에 직접 영향을 줍니다."),
         ]
@@ -1143,10 +1146,10 @@ def build_clarification_prompt(category: AmbiguityCode, query: str) -> dict[str,
             options=options,
             recommended=0,
             confidence=0.78,
-            confidence_reason="L1/L2 문서에 정의가 있으면 질문 없이 우선 적용하는 정책입니다.",
+            confidence_reason="통용되는 정의가 확인되면 질문 없이 우선 적용하는 정책입니다.",
         )
 
-    cards = strategy_candidate_cards(query, [])
+    cards = strategy_candidate_cards(query)
     options = [
         ClarificationOption(
             label=card.title,
@@ -1368,10 +1371,8 @@ def build_strategy_spec(
     query: str,
     *,
     variant: str,
-    retrieval: dict[str, Any],
     semantic_slots: Mapping[str, Any] | None = None,
 ) -> StrategySpec:
-    source_refs = [hit["document_id"] for hit in retrieval.get("hits", [])]
     profile = _strategy_profile(query, semantic_slots=semantic_slots)
     slots = semantic_slots or {}
     universe = str(slots.get("universe") or "KOSPI200")
@@ -1392,7 +1393,6 @@ def build_strategy_spec(
             "daily adjusted close data",
             *profile["assumptions"],
         ],
-        source_refs=source_refs,
         confidence=float(profile["confidence"]),
     )
 
@@ -1401,7 +1401,6 @@ def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> d
     context = {
         "query": state.get("user_query"),
         "strategy": strategy.model_dump(),
-        "retrieval_hits": state.get("retrieval", {}).get("hits", []),
         "data_availability": state.get("data", {}).get("data_availability", {}),
         "screening_candidate_count": len(state.get("data", {}).get("screening_candidates", [])),
     }
@@ -1412,7 +1411,7 @@ def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> d
         fallback=RoleDebatePayload(
             role="RESEARCH_BULL",
             summary="가격/거래량/TA 조건은 공용 DB로 즉시 검증 가능하며 전략 후보의 실행 가능성이 높습니다.",
-            evidence=["L1/L2 retrieval matched the strategy intent.", "OHLCV/TA data source is available when AI_DATABASE_DSN is configured."],
+            evidence=["OHLCV/TA data source is available when AI_DATABASE_DSN is configured."],
             concerns=[],
             recommendation="proceed",
             confidence=0.72,
@@ -2053,7 +2052,6 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
     return InternalPayload(
         trace_id=state["trace_id"],
         node_outputs=node_outputs,
-        retrieval_hits=state.get("retrieval", {}).get("hits", []),
         llm_prompts=["research.md", "signal.md", "backtest_code.md", "report.md"],
         validation=validation,
         backtest_artifacts=state.get("backtest", {}),

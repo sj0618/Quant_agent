@@ -390,7 +390,6 @@ class InternalPayload(BaseModel):
 
     trace_id: str = Field(min_length=1)
     node_outputs: dict[str, Any] = Field(default_factory=dict)
-    retrieval_hits: list[dict[str, Any]] = Field(default_factory=list)
     llm_prompts: list[str] = Field(default_factory=list)
     validation: dict[str, Any] = Field(default_factory=dict)
     backtest_artifacts: dict[str, Any] = Field(default_factory=dict)

@@ -55,7 +55,7 @@ def test_build_research_debate_enables_web_search_for_all_three_roles(monkeypatc
 
     strategy = make_strategy()
     debate = build_research_debate(
-        {"user_query": "RSI 30 이하 KOSPI200", "retrieval": {}, "data": {}}, strategy
+        {"user_query": "RSI 30 이하 KOSPI200", "data": {}}, strategy
     )
 
     assert created_roles == ["RESEARCH_BULL", "RESEARCH_BEAR", "RESEARCH_JUDGE"]
