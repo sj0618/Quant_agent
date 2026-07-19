@@ -9,21 +9,18 @@ AmbiguityStatus = Literal["confirmed", "provisional", "rejected"]
 
 REQUIRED_FIELD_KEYWORDS: dict[str, tuple[str, ...]] = {
     "market": ("krx", "kospi", "kosdaq", "korea", "한국", "국내", "삼성", "sk하이닉스"),
-    "universe": ("top", "상위", "섹터", "반도체", "후보", "kospi200", "코스피200"),
     "entry_rule": ("rsi", "이동평균", "ma", "macd", "돌파", "breakout", "매수", "진입"),
     "risk_profile": ("보수", "중립", "공격", "손절", "risk", "위험"),
 }
 
 CLARIFICATION_QUESTIONS: dict[str, str] = {
     "market": "대상 시장은 KRX/KOSPI/KOSDAQ 중 어디인가요?",
-    "universe": "후보군은 전체 종목, 섹터, 또는 상위 N개 중 무엇인가요?",
     "entry_rule": "진입 조건은 RSI, 이동평균, MACD, 돌파 중 무엇을 사용할까요?",
     "risk_profile": "위험 성향과 손절 기준을 보수/중립/공격 중 어디에 둘까요?",
 }
 
 DEFAULT_ASSUMPTIONS: dict[str, str] = {
     "market": "시장 미지정 시 KRX 현물 주식으로 가정합니다.",
-    "universe": "후보군 미지정 시 리서치 후보 상위 30개로 가정합니다.",
     "entry_rule": "진입 조건 미지정 시 RSI 과매도 반등 전략으로 가정합니다.",
     "risk_profile": "위험 성향 미지정 시 중립 위험 프로필로 가정합니다.",
 }

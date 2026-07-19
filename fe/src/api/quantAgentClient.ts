@@ -81,7 +81,6 @@ const EMPTY_PERFORMANCE: PerformanceSummary = {
 const EMPTY_WORKSPACE: AppOverview = {
   strategy: {
     natural_language_strategy: "",
-    universe: "",
     sector: "",
     buy_condition: "",
     hold_condition: "",
@@ -108,7 +107,6 @@ const EMPTY_WORKSPACE: AppOverview = {
 interface StrategyDescriptionApiInput {
   strategy_id: string;
   name: string;
-  universe: string;
   timeframe: string;
   entry_summary: string;
   exit_summary: string;
@@ -172,7 +170,6 @@ function buildStrategyDescriptionInput(strategy: StrategyReportSummary): Strateg
   return {
     strategy_id: strategy.id,
     name: strategy.name,
-    universe: strategy.universe,
     timeframe: strategy.timeframe,
     entry_summary: strategy.entrySummary,
     exit_summary: strategy.exitSummary,
@@ -404,7 +401,6 @@ function mapAIStrategySpec(strategy: AIStrategySpec, query: string): StrategySpe
   return {
     name: strategy.name,
     natural_language_strategy: query,
-    universe: formatUniverse(strategy),
     sector: strategy.indicators.length ? strategy.indicators.join(", ") : strategy.market,
     buy_condition: describeConditions(strategy.entry_conditions),
     hold_condition: strategy.timeframe,
@@ -412,10 +408,6 @@ function mapAIStrategySpec(strategy: AIStrategySpec, query: string): StrategySpe
     rebalance: TIMEFRAME_LABELS[strategy.timeframe] ?? strategy.timeframe,
     constraints: [...riskConstraints, ...strategy.assumptions],
   };
-}
-
-function formatUniverse(strategy: AIStrategySpec) {
-  return strategy.market ? `${strategy.market} · ${strategy.universe}` : strategy.universe;
 }
 
 function describeConditions(conditions: AICondition[]) {
@@ -549,7 +541,6 @@ function buildStrategyReportSummaryFromAnalysisJob(job: AnalysisJob): StrategyRe
     id: strategy.strategy_id,
     name: strategy.name,
     description: report.summary,
-    universe: formatUniverse(strategy),
     timeframe: TIMEFRAME_LABELS[strategy.timeframe] ?? strategy.timeframe,
     entrySummary: describeConditions(strategy.entry_conditions),
     exitSummary: describeConditions(strategy.exit_conditions),
@@ -577,7 +568,6 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
   return {
     ...summary,
     recipient: "",
-    strategyUniverse: result.strategy_spec?.universe,
     marketBrief: report.web_projection.summary,
     news: report.web_projection.sections.map((section, index) => ({
       rank: index + 1,

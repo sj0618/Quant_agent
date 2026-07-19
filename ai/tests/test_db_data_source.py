@@ -168,7 +168,7 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
                 )
             if "raw.analyst_report_summary" in query:
                 return Result(rows=[])
-            if "meta.view_common_stock_universe" in query:
+            if "mart.common_stock_universe_asof" in query:
                 return Result(
                     row={
                         "symbol": "005930",
@@ -229,7 +229,8 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
             if "FROM scored" in query:
-                assert "JOIN meta.view_common_stock_universe u" in query
+                assert "FROM mart.common_stock_universe_asof" in query
+                assert "JOIN universe u" in query
                 assert "JOIN core.symbol_master sm" in query
                 assert "sm.sector" in query
                 return Result(
@@ -268,7 +269,7 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
                 return Result(rows=[])
             if "raw.analyst_report_summary" in query:
                 return Result(rows=[])
-            if "meta.view_common_stock_universe" in query:
+            if "mart.common_stock_universe_asof" in query:
                 return Result(
                     row={
                         "symbol": "000660",
@@ -368,7 +369,7 @@ def test_postgres_data_source_filters_screening_by_sector() -> None:
                 return Result(rows=[])
             if "raw.analyst_report_summary" in query:
                 return Result(rows=[])
-            if "meta.view_common_stock_universe" in query:
+            if "mart.common_stock_universe_asof" in query:
                 return Result(
                     row={
                         "symbol": "000660",
@@ -462,7 +463,7 @@ def test_postgres_data_source_screening_without_sector_has_no_sector_predicate()
                 return Result(rows=[])
             if "raw.analyst_report_summary" in query:
                 return Result(rows=[])
-            if "meta.view_common_stock_universe" in query:
+            if "mart.common_stock_universe_asof" in query:
                 return Result(
                     row={
                         "symbol": "000660",
@@ -582,7 +583,7 @@ def test_postgres_data_source_ambiguous_query_falls_back_to_screening_not_defaul
                 return Result(rows=[])
             if "raw.analyst_report_summary" in query:
                 return Result(rows=[])
-            if "meta.view_common_stock_universe" in query:
+            if "mart.common_stock_universe_asof" in query:
                 # No explicit ticker/name in the query text, so name-matching
                 # over the universe listing finds nothing either.
                 return Result(

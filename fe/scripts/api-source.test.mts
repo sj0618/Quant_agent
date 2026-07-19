@@ -16,14 +16,30 @@ test("product screens use analysis API data without product mock overlays", asyn
   assert.match(source, /id\.startsWith\(AI_REPORT_ID_PREFIX\)/);
 });
 
+test("product surfaces do not expose the retired universe concept", async () => {
+  const sources = await Promise.all(
+    [
+      "../src/features/app/OverviewTab.tsx",
+      "../src/features/reports/StrategyReportList.tsx",
+      "../src/features/reports/ReportDetail.tsx",
+      "../src/types/quantagent.ts",
+    ].map((path) => readFile(new URL(path, import.meta.url), "utf8")),
+  );
+
+  for (const source of sources) {
+    assert.doesNotMatch(source, /universe|유니버스|strategyUniverse/i);
+  }
+});
+
 
 test("deployment does not force the mock LLM profile", async () => {
   const source = await readFile(new URL("../../.github/workflows/deploy.yml", import.meta.url), "utf8");
 
   assert.doesNotMatch(source, /AI_LLM_PROVIDER=mock/);
   assert.match(source, /AI_LLM_PROVIDER.*aoai/);
-  assert.match(source, /AUTH_ENABLED=1/);
+  assert.match(source, /AUTH_ENABLED=.*AUTH_ENABLED:-0/);
   assert.match(source, /REDIS_URL must be configured/);
+  assert.match(source, /QUANT_DB_HOST\/PORT\/NAME\/USER\/PASSWORD/);
   assert.match(source, /client\.ping\(\)/);
   assert.match(source, /VITE_AUTH_API_BASE_URL%\/\}\/health/);
   assert.match(source, /npm run preview/);

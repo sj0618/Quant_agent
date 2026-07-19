@@ -52,7 +52,7 @@ TA_MOMENTUM_TICKER_TABLE = "feature.ta_momentum_ticker_daily"
 TA_TREND_TICKER_TABLE = "feature.ta_trend_ticker_daily"
 TA_VOLATILITY_TICKER_TABLE = "feature.ta_volatility_ticker_daily"
 TA_VOLUME_TICKER_TABLE = "feature.ta_volume_ticker_daily"
-UNIVERSE_VIEW = "meta.view_common_stock_universe"
+UNIVERSE_VIEW = "mart.common_stock_universe_asof"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
 
@@ -327,8 +327,10 @@ class PostgresPipelineDataSource:
         rows = conn.execute(
             """
             SELECT symbol, name
-            FROM meta.view_common_stock_universe
-            WHERE listing_status IS NULL OR listing_status = 'listed'
+            FROM mart.common_stock_universe_asof
+            WHERE as_of_date = (
+                SELECT max(as_of_date) FROM mart.common_stock_universe_asof
+            )
             """
         ).fetchall()
         for row in rows:
@@ -434,9 +436,12 @@ class PostgresPipelineDataSource:
     def _fetch_universe_status(self, conn: Any, ticker: str) -> dict[str, Any]:
         row = conn.execute(
             """
-            SELECT symbol, name, market, market_segment, listing_status
-            FROM meta.view_common_stock_universe
-            WHERE symbol = %s
+            SELECT symbol, name, market_segment AS market, market_segment, listing_status
+            FROM mart.common_stock_universe_asof
+            WHERE as_of_date = (
+                SELECT max(as_of_date) FROM mart.common_stock_universe_asof
+            )
+              AND symbol = %s
             LIMIT 1
             """,
             [ticker],
@@ -544,6 +549,19 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
             SELECT max(time) AS as_of_date
             FROM feature.kis_adjusted_ohlcv_daily
         ),
+        latest_universe_date AS (
+            SELECT max(as_of_date) AS as_of_date
+            FROM mart.common_stock_universe_asof
+        ),
+        universe AS (
+            SELECT
+                symbol,
+                name,
+                market_segment AS market,
+                market_segment
+            FROM mart.common_stock_universe_asof
+            WHERE as_of_date = (SELECT as_of_date FROM latest_universe_date)
+        ),
         prices AS (
             SELECT
                 p.time,
@@ -558,7 +576,7 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
                 p.adj_close AS close,
                 p.adj_volume AS volume
             FROM feature.kis_adjusted_ohlcv_daily p
-            JOIN meta.view_common_stock_universe u
+            JOIN universe u
               ON u.symbol = p.ticker
             JOIN core.symbol_master sm
               ON sm.symbol = u.symbol

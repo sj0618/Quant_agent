@@ -83,12 +83,12 @@ class CreateAnalysisJobRequest(BaseModel):
 
 
 class ParseStrategyRequest(BaseModel):
-    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+    # Ignore retired request keys from older frontends during the rolling deploy.
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
 
     natural_language: str | None = Field(default=None, min_length=1)
     query: str | None = Field(default=None, min_length=1)
     market: str | None = None
-    universe: str | None = None
     strategy_id: str | None = None
     selected_clarification_option_id: str | None = None
     client_request_id: str | None = None
@@ -113,11 +113,11 @@ class CreateDailyDigestRequest(BaseModel):
 
 
 class StrategyDescriptionInput(BaseModel):
-    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+    # Ignore the retired `universe` key from older frontends during the rolling deploy.
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
 
     strategy_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    universe: str = Field(min_length=1)
     timeframe: str = Field(min_length=1)
     entry_summary: str = Field(min_length=1)
     exit_summary: str = Field(min_length=1)
@@ -167,7 +167,7 @@ class DataSourceStatus(BaseModel):
     configured: bool
     dsn_env: str
     price_source: str
-    universe_source: str
+    candidate_pool_source: str
     l4_evidence_source: str
     macro_source: str
     macro_usable: bool
@@ -470,14 +470,13 @@ def create_app(
                     payload = generate_strategy_description(
                         strategy_id=strategy.strategy_id,
                         name=strategy.name,
-                        universe=strategy.universe,
                         timeframe=strategy.timeframe,
                         entry_summary=strategy.entry_summary,
                         exit_summary=strategy.exit_summary,
                         risk_summary=strategy.risk_summary,
                         tags=strategy.tags,
                         fallback=(
-                            f"{strategy.universe} 내에서 {strategy.entry_summary} 조건이 맞는 종목을 선별하고 "
+                            f"{strategy.entry_summary} 조건이 맞는 종목을 선별하고 "
                             f"{strategy.exit_summary} 기준으로 정리하는 전략입니다."
                         ),
                     )
@@ -707,7 +706,7 @@ def _data_source_status() -> DataSourceStatus:
         configured=dsn_value is not None,
         dsn_env=dsn_env,
         price_source=KIS_ADJUSTED_OHLCV_TABLE,
-        universe_source=UNIVERSE_VIEW,
+        candidate_pool_source=UNIVERSE_VIEW,
         l4_evidence_source=ANALYST_REPORT_TABLE,
         macro_source=BOK_MACRO_VIEW,
         macro_usable=False,

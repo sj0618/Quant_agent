@@ -8,7 +8,7 @@ from typing import Any, Sequence
 AI_SECTOR_CACHE_TTL_SECONDS_ENV = "AI_SECTOR_CACHE_TTL_SECONDS"
 DEFAULT_SECTOR_CACHE_TTL_SECONDS = 300
 
-COMMON_STOCK_UNIVERSE_VIEW = "meta.view_common_stock_universe"
+COMMON_STOCK_UNIVERSE_VIEW = "mart.common_stock_universe_asof"
 SECTOR_SOURCE_TABLE = "core.symbol_master"
 
 # Static fallback for offline/fixture mode — mirrors the WICS taxonomy documented in
@@ -88,7 +88,8 @@ def _fetch_sectors(conn: Any | None) -> list[str]:
         FROM {COMMON_STOCK_UNIVERSE_VIEW} u
         JOIN {SECTOR_SOURCE_TABLE} sm
           ON sm.symbol = u.symbol
-        WHERE sm.sector IS NOT NULL
+        WHERE u.as_of_date = (SELECT max(as_of_date) FROM {COMMON_STOCK_UNIVERSE_VIEW})
+          AND sm.sector IS NOT NULL
         ORDER BY sm.sector
     """
     try:

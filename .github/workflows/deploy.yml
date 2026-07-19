@@ -100,7 +100,7 @@ jobs:
                 key="$(trim_whitespace "${line%%=*}")"
                 value="$(trim_whitespace "${line#*=}")"
                 case "$key" in
-                  REDIS_URL | VITE_AUTH_API_BASE_URL | AI_* | QUANT_DB_DSN | DATABASE_URL) ;;
+                  REDIS_URL | VITE_AUTH_API_BASE_URL | AUTH_ENABLED | AI_* | QUANT_DB_* | DATABASE_URL | AZURE_OPENAI_API_KEY | AZURE_OPENAI_ENDPOINT) ;;
                   *) continue ;;
                 esac
                 if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
@@ -122,21 +122,21 @@ jobs:
                 load_env_file "$env_file"
               fi
             done
-            for required_key in REDIS_URL VITE_AUTH_API_BASE_URL AI_LLM_PROVIDER AI_AOAI_RESPONSES_URL AI_AOAI_API_KEY AI_AOAI_MODEL; do
+            for required_key in AUTH_ENABLED REDIS_URL VITE_AUTH_API_BASE_URL AI_LLM_PROVIDER AI_AOAI_RESPONSES_URL AI_AOAI_API_KEY AI_AOAI_MODEL; do
               if [ -n "${!required_key:-}" ]; then
                 echo "$required_key=configured"
               else
                 echo "$required_key=missing"
               fi
             done
-            export AUTH_ENABLED=1 AI_JOB_STORE=memory AI_AUDIT_SINK=noop
-            : "${REDIS_URL:?REDIS_URL must be configured when AUTH_ENABLED=1}"
-            : "${VITE_AUTH_API_BASE_URL:?VITE_AUTH_API_BASE_URL must be configured for Google login}"
-            export REDIS_URL VITE_AUTH_API_BASE_URL VITE_AI_API_BASE_URL=/ai-api
-            if [ "${AI_LLM_PROVIDER:-}" != "aoai" ]; then
-              echo "AI_LLM_PROVIDER=aoai must be configured on the deploy server"
-              exit 1
+            export AUTH_ENABLED="${AUTH_ENABLED:-0}" AI_JOB_STORE=memory AI_AUDIT_SINK=noop
+            export VITE_AI_API_BASE_URL=/ai-api
+            if [ "$AUTH_ENABLED" = "1" ]; then
+              : "${REDIS_URL:?REDIS_URL must be configured when AUTH_ENABLED=1}"
+              : "${VITE_AUTH_API_BASE_URL:?VITE_AUTH_API_BASE_URL must be configured for Google login}"
+              export REDIS_URL VITE_AUTH_API_BASE_URL
             fi
+            export AI_LLM_PROVIDER=aoai
             : "${AI_AOAI_RESPONSES_URL:?AI_AOAI_RESPONSES_URL must be configured on the deploy server}"
             : "${AI_AOAI_API_KEY:?AI_AOAI_API_KEY must be configured on the deploy server}"
             : "${AI_AOAI_MODEL:?AI_AOAI_MODEL must be configured on the deploy server}"
@@ -153,19 +153,29 @@ jobs:
               export QUANT_DB_DSN
             elif has_non_whitespace "${DATABASE_URL:-}"; then
               export DATABASE_URL
+            elif has_non_whitespace "${QUANT_DB_HOST:-}" \
+              && has_non_whitespace "${QUANT_DB_PORT:-}" \
+              && has_non_whitespace "${QUANT_DB_NAME:-}" \
+              && has_non_whitespace "${QUANT_DB_USER:-}" \
+              && has_non_whitespace "${QUANT_DB_PASSWORD:-}"; then
+              export QUANT_DB_HOST QUANT_DB_PORT QUANT_DB_NAME QUANT_DB_USER QUANT_DB_PASSWORD
+              AI_DATABASE_DSN="$(python3.11 -c 'import os; from urllib.parse import quote; print("postgresql://{user}:{password}@{host}:{port}/{name}".format(user=quote(os.environ["QUANT_DB_USER"], safe=""), password=quote(os.environ["QUANT_DB_PASSWORD"], safe=""), host=os.environ["QUANT_DB_HOST"], port=os.environ["QUANT_DB_PORT"], name=quote(os.environ["QUANT_DB_NAME"], safe="")))')"
+              export AI_DATABASE_DSN
             else
-              echo "AI_DATABASE_DSN, QUANT_DB_DSN, or DATABASE_URL must be configured on the deploy server"
+              echo "A database DSN or the QUANT_DB_HOST/PORT/NAME/USER/PASSWORD components must be configured on the deploy server"
               exit 1
             fi
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
             "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/backtest_module" -e "$APP_DIR/ai"
-            "$APP_DIR/ai/.venv/bin/python" -c \
-              'import os; from redis import Redis; client = Redis.from_url(os.environ["REDIS_URL"]); assert client.ping(), "Redis ping failed"; client.close()'
-            curl -fsS --max-time 15 "${VITE_AUTH_API_BASE_URL%/}/health" \
-              | "$APP_DIR/ai/.venv/bin/python" -c \
-                'import json, sys; status = json.load(sys.stdin); assert status.get("status") == "ok" and status.get("component") == "backend", "auth backend health check failed"'
+            if [ "$AUTH_ENABLED" = "1" ]; then
+              "$APP_DIR/ai/.venv/bin/python" -c \
+                'import os; from redis import Redis; client = Redis.from_url(os.environ["REDIS_URL"]); assert client.ping(), "Redis ping failed"; client.close()'
+              curl -fsS --max-time 15 "${VITE_AUTH_API_BASE_URL%/}/health" \
+                | "$APP_DIR/ai/.venv/bin/python" -c \
+                  'import json, sys; status = json.load(sys.stdin); assert status.get("status") == "ok" and status.get("component") == "backend", "auth backend health check failed"'
+            fi
             timeout 1200 "$APP_DIR/ai/.venv/bin/python" -c \
               'from ai_graph import run_analysis; result = run_analysis("005930 RSI가 30 이하이면 매수하고 70 이상이면 매도"); assert result.status == "ready", "live analysis smoke test did not finish ready"'
 

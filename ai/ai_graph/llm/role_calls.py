@@ -187,7 +187,6 @@ def generate_strategy_description(
     *,
     strategy_id: str,
     name: str,
-    universe: str,
     timeframe: str,
     entry_summary: str,
     exit_summary: str,
@@ -204,7 +203,6 @@ def generate_strategy_description(
         context={
             "strategy_id": strategy_id,
             "name": name,
-            "universe": universe,
             "timeframe": timeframe,
             "entry_summary": entry_summary,
             "exit_summary": exit_summary,
@@ -228,7 +226,7 @@ def generate_strategy_description(
 MARKET_BRIEF_SYSTEM_PROMPT = """\
 You are QuantAgent's daily market-brief writer. Use the web search tool to find
 today's Korean/global equity market news and macro headlines relevant to the
-given strategy universes. Return JSON only with a "headline" (one sentence
+given strategies. Return JSON only with a "headline" (one sentence
 market wrap-up) and "items" (3-5 objects with title, source, url, published_at,
 tone in {positive, warning, negative, neutral, info}, and a one-sentence
 summary). Only include items you found via the web search tool; never invent
@@ -251,7 +249,7 @@ def generate_market_brief(
 
     variables = {
         "report_date": report_date,
-        "strategy_universes": strategy_names,
+        "strategy_names": strategy_names,
         "expected_json_schema": MarketBrief.model_json_schema(),
     }
     request = LLMJsonRequest(

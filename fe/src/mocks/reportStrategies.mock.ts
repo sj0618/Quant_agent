@@ -12,7 +12,6 @@ type EmailReportSeed = Pick<
   | "id"
   | "strategyId"
   | "strategyName"
-  | "strategyUniverse"
   | "date"
   | "weekday"
   | "sentAt"
@@ -37,7 +36,6 @@ type StrategySeed = {
   id: string;
   name: string;
   description: string;
-  universe: string;
   timeframe: string;
   entrySummary: string;
   exitSummary: string;
@@ -74,7 +72,6 @@ const strategySeeds: StrategySeed[] = [
     id: "semiconductor-momentum",
     name: "반도체 모멘텀 + 기관 매수",
     description: "반도체 업종 내 상대강도와 외국인 순매수 흐름이 동시에 강화되는 종목에 집중하는 모멘텀 전략입니다.",
-    universe: "KOSPI200 · 반도체",
     timeframe: "daily",
     entrySummary: "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
     exitSummary: "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
@@ -85,7 +82,6 @@ const strategySeeds: StrategySeed[] = [
         id: "semiconductor-momentum-2026-04-18",
         strategyId: "semiconductor-momentum",
         strategyName: "반도체 모멘텀 + 기관 매수",
-        strategyUniverse: "KOSPI200 · 반도체",
         date: "2026.04.18",
         weekday: "목요일",
         sentAt: "오전 8:00 전송",
@@ -118,7 +114,6 @@ const strategySeeds: StrategySeed[] = [
         id: "semiconductor-momentum-2026-04-17",
         strategyId: "semiconductor-momentum",
         strategyName: "반도체 모멘텀 + 기관 매수",
-        strategyUniverse: "KOSPI200 · 반도체",
         date: "2026.04.17",
         weekday: "수요일",
         sentAt: "오전 8:07 재전송",
@@ -150,7 +145,6 @@ const strategySeeds: StrategySeed[] = [
         id: "semiconductor-momentum-2026-04-16",
         strategyId: "semiconductor-momentum",
         strategyName: "반도체 모멘텀 + 기관 매수",
-        strategyUniverse: "KOSPI200 · 반도체",
         date: "2026.04.16",
         weekday: "화요일",
         sentAt: "오전 8:00 전송",
@@ -181,7 +175,6 @@ const strategySeeds: StrategySeed[] = [
     id: "rsi-rebound",
     name: "RSI 과매도 반등 전략",
     description: "단기 과매도 종목 중 RSI 저점 이탈 이후 거래대금이 회복되는 구간만 선별하는 반등 전략입니다.",
-    universe: "KOSPI200 · 단기 반등 후보",
     timeframe: "daily",
     entrySummary: "RSI 30 이하 이탈 이후 거래량이 회복되고 종가가 전일 고점을 되찾은 종목만 진입합니다.",
     exitSummary: "RSI가 중립권으로 복귀하거나 반등 거래대금이 꺾이면 빠르게 정리합니다.",
@@ -192,7 +185,6 @@ const strategySeeds: StrategySeed[] = [
         id: "rsi-rebound-2026-04-18",
         strategyId: "rsi-rebound",
         strategyName: "RSI 과매도 반등 전략",
-        strategyUniverse: "KOSPI200 · 단기 반등 후보",
         date: "2026.04.18",
         weekday: "목요일",
         sentAt: "오전 8:00 전송",
@@ -224,7 +216,6 @@ const strategySeeds: StrategySeed[] = [
         id: "rsi-rebound-2026-04-17",
         strategyId: "rsi-rebound",
         strategyName: "RSI 과매도 반등 전략",
-        strategyUniverse: "KOSPI200 · 단기 반등 후보",
         date: "2026.04.17",
         weekday: "수요일",
         sentAt: "오전 8:02 전송 실패",
@@ -253,7 +244,6 @@ const strategySeeds: StrategySeed[] = [
         id: "rsi-rebound-2026-04-16",
         strategyId: "rsi-rebound",
         strategyName: "RSI 과매도 반등 전략",
-        strategyUniverse: "KOSPI200 · 단기 반등 후보",
         date: "2026.04.16",
         weekday: "화요일",
         sentAt: "오전 8:00 전송",
@@ -284,7 +274,6 @@ const strategySeeds: StrategySeed[] = [
     id: "dividend-defense",
     name: "배당 방어주 로테이션",
     description: "현금흐름 안정성과 배당 지속성이 높은 대형주로 방어 비중을 옮기는 로테이션 전략입니다.",
-    universe: "KOSPI 고배당 · 방어주",
     timeframe: "daily",
     entrySummary: "배당 안정성과 이익 추정치 방어력이 유지되는 종목만 편입 후보로 삼습니다.",
     exitSummary: "금리 민감도가 급격히 높아지거나 배당 매력이 약해지면 비중을 줄입니다.",
@@ -295,7 +284,6 @@ const strategySeeds: StrategySeed[] = [
         id: "dividend-defense-2026-04-18",
         strategyId: "dividend-defense",
         strategyName: "배당 방어주 로테이션",
-        strategyUniverse: "KOSPI 고배당 · 방어주",
         date: "2026.04.18",
         weekday: "목요일",
         sentAt: "오전 8:03 전송 실패",
@@ -327,7 +315,6 @@ const strategySeeds: StrategySeed[] = [
         id: "dividend-defense-2026-04-17",
         strategyId: "dividend-defense",
         strategyName: "배당 방어주 로테이션",
-        strategyUniverse: "KOSPI 고배당 · 방어주",
         date: "2026.04.17",
         weekday: "수요일",
         sentAt: "오전 8:06 재전송",
@@ -356,7 +343,6 @@ const strategySeeds: StrategySeed[] = [
         id: "dividend-defense-2026-04-16",
         strategyId: "dividend-defense",
         strategyName: "배당 방어주 로테이션",
-        strategyUniverse: "KOSPI 고배당 · 방어주",
         date: "2026.04.16",
         weekday: "화요일",
         sentAt: "오전 8:00 전송",
@@ -394,7 +380,6 @@ export const strategyReportDetails: StrategyReportDetail[] = strategySeeds.map((
       id: seed.id,
       name: seed.name,
       description: seed.description,
-      universe: seed.universe,
       timeframe: seed.timeframe,
       entrySummary: seed.entrySummary,
       exitSummary: seed.exitSummary,

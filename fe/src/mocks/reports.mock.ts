@@ -114,7 +114,6 @@ export const reportDetails: ReportDetail[] = [
   {
     ...reportSummaries[0],
     recipient: "홍길동 님께",
-    strategyUniverse: "KOSPI200 · 반도체",
     marketBrief:
       "전일 KOSPI는 메모리 사이클 회복 기대로 +0.84% 상승. 외국인 5일 연속 순매수, 환율 안정세. 반도체 섹터 전반에 매수 신호가 강화됐고, 화학 섹터 일부에서 추세 약세가 관측됩니다.",
     marketContext:

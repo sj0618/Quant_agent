@@ -18,7 +18,7 @@ export const landingSample: LandingSample = {
       label: "STEP 2",
       title: "전략 정형화",
       description: "Research 에이전트가 정/반/합 토론으로 StrategySpec을 생성합니다.",
-      example: ["universe: KOSPI200·반도체", "buy: RSI ≤ 30 AND vol > 200%"],
+      example: ["sector: 반도체", "buy: RSI ≤ 30 AND vol > 200%"],
     },
     {
       label: "STEP 3",

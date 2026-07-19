@@ -66,7 +66,7 @@ def build_report_bundle(
     )
     email = ReportProjection(
         title=f"[QuantAgent] {strategy.name}: {signal.action}",
-        summary=f"{strategy.universe} {strategy.timeframe} 전략 신호는 {signal.action}입니다.",
+        summary=f"{strategy.timeframe} 전략 신호는 {signal.action}입니다.",
         sections=[
             {"id": "summary", "title": "요약", "items": {"confidence": signal.confidence}},
             {"id": "assumptions", "title": "검증 가정", "items": strategy.assumptions},
