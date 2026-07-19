@@ -123,6 +123,15 @@ class AOAIResponsesClient:
         }
         if request.enable_web_search:
             body["tools"] = [{"type": self.web_search_tool_type}]
+        if request.response_schema is not None:
+            body["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": _schema_format_name(request.schema_name),
+                    "strict": True,
+                    "schema": request.response_schema,
+                }
+            }
         headers = {"Content-Type": "application/json", "api-key": self.api_key}
         attempts = self.max_retries + 1
         last_error: Exception | None = None
@@ -151,6 +160,14 @@ class AOAIResponsesClient:
         raise LLMClientError(
             "AOAI Responses request failed", retry_count=last_attempt
         ) from last_error
+
+
+def _schema_format_name(schema_name: str) -> str:
+    normalized = "".join(
+        character if character.isalnum() or character in {"_", "-"} else "_"
+        for character in schema_name
+    )
+    return normalized[:64] or "response"
 
 
 def extract_json_object(payload: Any) -> dict[str, Any]:

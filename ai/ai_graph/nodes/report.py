@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
+from ai_graph.nodes.backtest import summarize_backtest
 from ai_graph.schemas import ReportBundle, ReportProjection, RiskDecision, StrategySpec
 
 
@@ -53,7 +54,7 @@ def build_report_bundle(
             {
                 "id": "backtest",
                 "title": "후보 코드 백테스트",
-                "items": _public_backtest_summary(backtest),
+                "items": summarize_backtest(backtest),
             },
         )
     if debate:
@@ -77,20 +78,6 @@ def build_report_bundle(
         email_projection=email,
         risk_adjustments=risk.adjustments,
     )
-
-
-def _public_backtest_summary(backtest: dict[str, Any]) -> dict[str, Any]:
-    selected = backtest.get("selected_candidate") or {}
-    metrics = selected.get("metrics") or {}
-    return {
-        "selected_candidate_id": selected.get("candidate_id"),
-        "metrics": metrics,
-        "engine_summary": backtest.get("engine_summary")
-        or (backtest.get("engine_summaries_by_candidate") or {}).get(selected.get("candidate_id"), {}),
-        "objective_score": (backtest.get("objective_scores_by_candidate") or {}).get(
-            selected.get("candidate_id")
-        ),
-    }
 
 
 def report_node(state: dict) -> dict:
@@ -131,7 +118,7 @@ def build_report_debate(
     context = {
         "strategy": strategy.model_dump(),
         "risk": risk.model_dump(),
-        "backtest": state.get("backtest", {}),
+        "backtest": summarize_backtest(state.get("backtest", {})),
         "data_availability": state.get("data", {}).get("data_availability", {}),
     }
     bull = generate_role_debate(

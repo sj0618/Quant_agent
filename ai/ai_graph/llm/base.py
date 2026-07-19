@@ -33,6 +33,7 @@ class LLMJsonRequest(BaseModel):
     prompt_template_name: str | None = None
     prompt_version: str | None = None
     variables_jsonb: dict[str, Any] = Field(default_factory=dict)
+    response_schema: dict[str, Any] | None = None
 
 
 class LLMClient(Protocol):

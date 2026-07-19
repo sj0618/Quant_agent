@@ -9,6 +9,19 @@ interface TradingInfoTabProps {
 }
 
 export function TradingInfoTab({ candidates }: TradingInfoTabProps) {
+  if (!candidates.length) {
+    return (
+      <div className="workspace-content">
+        <Card className="list-head">
+          <div>
+            <h1>매매종목 정보 <Badge variant="soft">총 0건</Badge></h1>
+            <p>현재 AI 응답에는 종목별 추천 데이터가 없습니다.</p>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
   const counts = candidates.reduce(
     (acc, candidate) => ({ ...acc, [candidate.signal]: acc[candidate.signal] + 1 }),
     { BUY: 0, HOLD: 0, DROP: 0 },
@@ -37,10 +50,10 @@ export function TradingInfoTab({ candidates }: TradingInfoTabProps) {
       </section>
 
       <Card className="source-strip">
-        <span>신호는 매일 08:00 자동 갱신됩니다</span>
+        <span>신호는 AI 분석 API 응답 기준입니다</span>
         <span>·</span>
-        <span>출처: KIS API · DART · 한경컨센서스 · 에이전틱 서치</span>
-        <a href={ROUTES.reportDetail("2026-04-18")}>리포트로 보기 →</a>
+        <span>출처와 근거는 분석 리포트에서 확인할 수 있습니다</span>
+        <a href={ROUTES.reports}>리포트로 보기 →</a>
       </Card>
     </div>
   );

@@ -25,7 +25,8 @@ Figma MCP에서 확인한 순수 `HI-FI ·` 프레임 기준의 React + TypeScri
 - Python 3.11.13 (pytest/스크립트 동기화)
 - Node 24.15.0
 - npm 11.12.1
-- 외부 DB/Redis/OAuth/컨테이너 없이 loopback FE→AI fixture spine을 검증
+- 로컬 회귀 검사는 외부 DB/Redis/OAuth/컨테이너 없이 실행 가능
+- 실데이터 검증은 AI 서버에 PostgreSQL DSN과 AOAI Responses 설정 필요
 
 ## 환경변수
 
@@ -68,7 +69,7 @@ FE_ROOT=$(readlink -f "$WORKTREE_ROOT/fe")
 const keys=["quantagent.auth.session.v1","quantagent.latest-analysis-job.v1","quantagent.chat-conversations.v1"];
 keys.forEach((key)=>localStorage.removeItem(key));
 console.assert(keys.every((key)=>localStorage.getItem(key)===null));
-localStorage.setItem("quantagent.auth.session.v1",JSON.stringify({user:{id:"local-mvp-fixture",name:"Local MVP Fixture",email:"local-mvp@example.invalid",provider:"google"}}));
+localStorage.setItem("quantagent.auth.session.v1",JSON.stringify({user:{id:"local-mvp-fixture",name:"Local MVP Fixture",email:"local-mvp@example.invalid",provider:"test"}}));
 location.assign("/app");
 ```
 
@@ -88,21 +89,21 @@ console.assert(evidence.origin==="http://127.0.0.1:18000"&&evidence.values.every
   - Overview의 `result.strategy_spec.name`
   - Performance 탭의 `result.user_payload.performance.selected_candidate_id`와 metrics
   - recent report detail의 `web_projection.title`, summary→conclusion, `sections[*].title`
-- **표시 증거에서 제외**: `sections[*].items`, email projection, fixture recipient/candidates/signal axes
+- **표시 증거에서 제외**: `sections[*].items`, email projection, 종목별 근거 계약이 없는 recipient/candidates/signal axes
 - **clarification**: clarification 상태 메시지와 정확히 `3`개 candidate card만 확인한다. question/options UI는 요구하지 않는다.
 - **AI-down**: FE 자체는 200을 유지하고 새 분석 요청은 오류 UI를 표시하며 새 ready 결과를 만들지 않아야 한다.
 - Google OAuth 성공, page reload, AI process restart 뒤 복원은 이 MVP 범위 밖이다.
 
-## Mock API
+## 데이터/API 경계
 `src/api/quantAgentClient.ts`는 `appConfig.aiApiBaseUrl`를 사용한다. `import.meta.env.DEV`에서는 항상 `/ai-api`로 고정되고, production 빌드에서만 `VITE_AI_API_BASE_URL`이 적용된다.
-- **always-mock**: `getLandingSample`, `getTradingCandidates`, `getPerformanceSummary`, `getWorkspaceTemplate`, `getEmailDigestHistory`는 AI와 무관하게 fixture 데이터를 반환한다.
-- **AI create/poll**: `createAnalysisJob`/`getAnalysisJob`/`getAnalysisJobStatus`는 `/analysis-jobs` API를 직접 호출해 job 생성·조회·폴링 상태를 최신 상태로 유지한다.
-- **hybrid projection**: `getAppOverview`, `getReports`, `getReportById`는 fixture 기본값을 시작점으로 두고 최신 AI job이 있으면 결과를 overlay한다.
-- **UI evidence source**
-  - AI 유래: `result.status`, `result.trace_id`, `result.user_payload` 기반 `performance`·`report.web_projection`, stage/job 상태
-  - fixture 유래: 초깃값/목록형 템플릿(`tradingCandidates`, `performanceSummary`, `reportSummary`, `candidates`, `signalAxes`, `recipient` 등)
+- **정적 샘플**: 랜딩 페이지의 제품 소개용 `landingSample`만 정적 콘텐츠다. 제품 워크스페이스나 리포트 데이터로 사용하지 않는다.
+- **실제 API**: `createAnalysisJob`/`getAnalysisJob`는 `/analysis-jobs`를 호출하고, 워크스페이스·성과·리포트·전략 목록은 최신 실제 job 응답에서만 만든다.
+- **빈 상태**: 분석 전 workspace template, 실제 발송 API가 없는 이메일 이력, 실제 history API가 없는 과거 리포트는 빈 상태를 표시한다.
+- **로컬 캐시**: 최신 실제 job 한 건을 `localStorage`에 보관하고 서버 조회가 일시 실패하면 마지막 실제 응답을 표시한다. 이전 `ai-job:<job_id>` 리포트는 서버의 job 조회 API로 다시 가져오며 fixture 결과로 대체하지 않는다.
+- **사용자 격리**: 보호 route 진입 전에 backend `/auth/me`로 Redis session을 검증한다. 로그아웃·사용자 변경 시 분석/대화/알림 캐시를 함께 삭제하고, job 조회의 `401`/`403`/`404`는 캐시 fallback 없이 오류로 처리한다.
+- **동기 요청 한계**: 현재 서버가 graph를 동기 실행하므로 FE는 기본 AOAI timeout/retry의 순차 호출 예산에 맞춰 분석 요청을 최대 20분 기다린다. 비동기 queue 전환은 별도 아키텍처 작업이다.
 
-`AI API`를 실제 UI payload로 사용하지 못할 때는 fixture fallback으로 렌더링을 이어가므로 화면에서 AI-derived와 fixture-derived 필드를 구분해 보는 것이 중요하다.
+최신 AI job에 없는 종목 후보, 신호 축, 수신자, 매크로 이벤트는 채워 넣지 않고 화면에 미제공 상태를 표시한다. 랜딩의 샘플 CTA는 mock 리포트 상세 route가 아니라 실제 분석 시작 화면으로 연결된다.
 `/analysis-jobs` 응답은 화면 contract상 노출 대상인 `status`, `trace_id`, `schema_version`, `strategy_spec`, `debug_ref`, `retryable`, `user_payload`만 유지한다. `internal_payload`는 화면 노출하지 않는다.
 
 ## 검증
@@ -111,4 +112,4 @@ console.assert(evidence.origin==="http://127.0.0.1:18000"&&evidence.values.every
 npm run test
 ```
 
-`npm run test`는 `tsc -b --pretty false`와 `vite build`를 순차 실행합니다.
+`npm run test`는 Node 기본 회귀 검사, `tsc -b --pretty false`, `vite build`를 순차 실행합니다.

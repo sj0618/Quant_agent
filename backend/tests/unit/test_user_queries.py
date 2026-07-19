@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
-from app.core.errors import AppError
 from app.db.user_queries import UserSchemaReport, approval_needed_error, build_google_user_upsert_sql, build_load_user_sql
 
 

@@ -26,6 +26,10 @@ export function OverviewTab({ overview }: OverviewTabProps) {
   const currentAsset = CHART_INITIAL_ASSET * (1 + strategyReturn / PERCENT_SCALE);
   const benchmarkLabel = overview.performance.benchmarkLabel ?? "KOSPI200";
   const hasBenchmarkSeries = chartPoints.some((point) => point.benchmark !== 0);
+  const candidateCounts = overview.candidates.reduce(
+    (counts, candidate) => ({ ...counts, [candidate.signal]: counts[candidate.signal] + 1 }),
+    { BUY: 0, HOLD: 0, DROP: 0 },
+  );
 
   return (
     <div className="workspace-content">
@@ -55,7 +59,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
 
       <section className="summary-grid">
         {[
-          { label: "오늘의 권장도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "평균 7.2 대비 상승" },
+          { label: "오늘의 권장도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "최종 신호 신뢰도 기준" },
           { label: "활성 신호", value: `${overview.passCount}건`, delta: undefined, caption: `BUY ${overview.buyCount} · HOLD ${overview.holdCount} · DROP ${overview.dropCount}` },
           {
             label: "검증 누적 수익률",
@@ -85,20 +89,24 @@ export function OverviewTab({ overview }: OverviewTabProps) {
         <Card className="candidate-table" padded={false}>
           <div className="card-head">
             <div>
-              <strong>오늘의 추천 종목</strong>
-              <p>2026.04.18 · 4건</p>
+              <strong>종목별 추천 데이터</strong>
+              <p>{overview.candidates.length ? `${overview.latestRunLabel} · ${overview.candidates.length}건` : "이번 분석 응답에 포함되지 않음"}</p>
             </div>
-            <div className="filter-row">
-              <Badge variant="dark">ALL 4</Badge>
-              <Badge signal="BUY">BUY 2</Badge>
-              <Badge signal="HOLD">HOLD 1</Badge>
-              <Badge signal="DROP">DROP 1</Badge>
-            </div>
+            {overview.candidates.length ? (
+              <div className="filter-row">
+                <Badge variant="dark">ALL {overview.candidates.length}</Badge>
+                <Badge signal="BUY">BUY {candidateCounts.BUY}</Badge>
+                <Badge signal="HOLD">HOLD {candidateCounts.HOLD}</Badge>
+                <Badge signal="DROP">DROP {candidateCounts.DROP}</Badge>
+              </div>
+            ) : null}
           </div>
-          {featuredCandidates.map((candidate) => (
+          {featuredCandidates.length ? featuredCandidates.map((candidate) => (
             <SignalCard candidate={candidate} compact key={candidate.id} />
-          ))}
-          <div className="card-foot">신호는 매일 08:00 자동 갱신됩니다 <a href={`${ROUTES.app}?tab=trading`}>전체 종목 정보 보기 →</a></div>
+          )) : <p>현재 AI 응답에는 종목별 추천 데이터가 없습니다.</p>}
+          <div className="card-foot">
+            {overview.candidates.length ? <>신호는 매일 08:00 자동 갱신됩니다 <a href={`${ROUTES.app}?tab=trading`}>전체 종목 정보 보기 →</a></> : "실데이터 소스 연결 시 종목별 신호가 표시됩니다."}
+          </div>
         </Card>
 
         <Card className="recent-reports" padded={false}>
@@ -135,7 +143,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
           <div className="legend-row">
             <span><i className="line line--strategy" />내 전략</span>
             {hasBenchmarkSeries ? <span><i className="line line--benchmark" />{benchmarkLabel}</span> : null}
-            <Badge variant="soft">1Y</Badge>
+            <Badge variant="soft">{overview.performance.source === "ai" ? "전체" : "1Y"}</Badge>
           </div>
         </div>
         <div className="chart-card__numbers">

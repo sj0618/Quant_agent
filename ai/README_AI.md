@@ -1,7 +1,6 @@
 # QuantAgent AI MVP
-이 디렉터리는 QuantAgent AI/LLM MVP의 fixture/mock 기반 실행 표면이다.
-외부 LLM 키, 증권 API, 네트워크 호출 없이 자연어 전략 분석부터 최종
-API envelope 생성까지 e2e 테스트가 동작한다.
+이 디렉터리는 QuantAgent AI/LLM MVP의 로컬 결정론 프로필과 운영 실데이터 프로필을 함께 제공한다.
+로컬에서는 외부 credential 없이 e2e 테스트가 동작하고, 운영에서는 PostgreSQL과 AOAI Responses API를 사용한다.
 
 ## 실행
 
@@ -75,8 +74,10 @@ env -i \
     --app-dir "$WORKTREE_ROOT/ai" --host "$AI_API_HOST" --port "$AI_API_PORT"
 ```
 
-공용 서버 PostgreSQL/TimescaleDB를 연결하려면 DB DSN/fixture 변수는 child process에 inline으로 전달한다.
-DSN이 없으면 공개 fixture 경로로 실행되고, `/api-status`/응답에서 비밀값 비노출이 유지되어야 한다.
+공용 서버 PostgreSQL/TimescaleDB를 연결하려면 DB DSN을 child process에 전달한다.
+DSN이 없으면 로컬 fixture 경로로 실행된다. DSN이 설정된 상태에서 연결이나 조회가 실패하면 fixture로 대체하지 않고 analysis job을 실패 처리한다. `/api-status`/응답에는 비밀값이 노출되지 않는다.
+기본 연결 제한은 20초다. 대상 서버가 TLS를 제공하지 않는 것이 확인된 경우에만 DSN에
+`sslmode=disable`을 추가해 불필요한 TLS 탐색 지연을 피한다. TLS를 제공하는 서버에는 이 옵션을 사용하지 않는다.
 ```bash
 AI_DATABASE_DSN='postgresql://user:password@host:5432/quant_agent' \
 AI_DEFAULT_TICKER=005930 \
@@ -101,8 +102,8 @@ DSN은 `AI_DATABASE_DSN`, `QUANT_DB_DSN`, `DATABASE_URL` 순서로 선택된다.
 즉시 롤백은 `AI_AUDIT_SINK=noop`이며, migration, canary, TLS, backup, retention 확인과
 BLOCKED 해제 조건은 [AI 로깅 운영 런북](docs/ai-logging-operations.md)을 따른다.
 
-AOAI Responses API는 opt-in이다. 기본값은 mock LLM이며, 아래 값이 모두 있을 때만
-`httpx` 기반 AOAI client를 사용한다.
+AOAI Responses API는 opt-in이다. 기본값은 로컬 테스트용 mock LLM이며, 아래 값이 모두 있을 때
+`httpx` 기반 AOAI client를 사용한다. `AI_LLM_PROVIDER=aoai`에서는 provider 오류, schema 오류, 안전한 코드 후보 부재를 결정론 fallback으로 숨기지 않고 analysis job 실패로 남긴다.
 ```bash
 AI_LLM_PROVIDER=aoai \
 AI_AOAI_RESPONSES_URL='https://<resource>.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview' \
@@ -124,6 +125,8 @@ AI_LLM_REPORT_JUDGE_MODEL='<judge-deployment>' \
 
 AOAI 설정은 위 명시적 환경변수만 사용한다. role별 model env가 비어 있으면
 `AI_AOAI_MODEL`을 fallback으로 사용한다.
+
+공개 배포에서는 `AUTH_ENABLED=1`과 `REDIS_URL`을 설정해 backend가 기록한 `qa_session`을 검증한다. `AUTH_ENABLED=0`은 loopback 로컬 개발 전용이며 실제 AOAI/DB API를 공개하는 설정으로 사용하지 않는다.
 
 실제 AOAI 네트워크 smoke test는 기본 pytest에서 제외된다.
 ```bash
@@ -149,14 +152,14 @@ PY
 |---|---|---|
 | 9-node graph | `ai_graph/graph.py` | Supervisor, Ambiguity, Data, Research, BacktestCode, Backtest, Signal, Risk Manager, Report 순서 |
 | Swagger/API | `ai_graph/api.py` | `/docs`, `/openapi.json`, `/health`, `/api-status`, `/analysis-jobs`, `/api/strategies/parse`, `/api/strategies/descriptions`, `/api/backtests/{strategy_id}`, `/api/reports/{report_id}` |
-| DB data source | `ai_graph/data_sources/db.py` | `feature.kis_adjusted_ohlcv_daily`, `feature.ta_*_ticker_daily`, `meta.view_common_stock_universe`, `raw.analyst_report_summary` |
+| DB data source | `ai_graph/data_sources/db.py` | `feature.kis_adjusted_ohlcv_daily`, `feature.ta_*_ticker_daily`, `meta.view_common_stock_universe`, `core.symbol_master`(`symbol`/`sector` 섹터 보강), `raw.analyst_report_summary` |
 | LLM provider | `ai_graph/llm/**` | env 기반 `mock`/`aoai` 선택, role별 AOAI deployment override, AOAI Responses JSON parsing |
 | 공통 schema | `ai_graph/schemas.py`, `state.py` | StrategySpec, APIEnvelope, L4 evidence, polling stage, dual output |
 | Job/polling | `ai_graph/jobs.py` | `interpreting`, `code_generation`, `backtest`, `debate`, `finalizing` 상태 |
 | Retrieval | `ai_graph/retrieval/**` | L1 50+ 전략 KB, L2 150+ 지표 KB, Retrieve-then-Smooth 후보 카드 |
 | Code security | `ai_graph/security/ast_validator.py` | allowlist import와 금지 함수/모듈 차단 |
 | Backtest | `ai_graph/nodes/backtest_code.py`, `backtest.py` | Loop3 후보 신호를 `backtest_module` 엔진으로 실행하고 A/B 성과 최고 후보 선택 |
-| Signal | `ai_graph/nodes/signal.py` | BUY/HOLD/DROP, role별 Bull/Bear/Judge fallback, L4 evidence fixture/SEIBro raw |
+| Signal | `ai_graph/nodes/signal.py` | BUY/HOLD/DROP, mock 프로필의 결정론 fallback, L4 evidence fixture/SEIBro raw |
 | Risk | `ai_graph/nodes/risk_manager.py` | KOSPI -5%, FX 2%, VKOSPI 30 룰 |
 | Report | `ai_graph/nodes/report.py` | web_projection과 email_projection 동시 생성, 데이터 가용성/스크리닝 후보 섹션 |
 | API contract | `docs/ai-api-contract.md` | FE/BE envelope와 debug_ref 경계 |
@@ -193,7 +196,8 @@ PY
 ## Mock/Fixture 경계
 | 항목 | 동작 |
 |---|---|
-| `AI_LLM_PROVIDER=mock` | `AI_LLM_PROVIDER=aoai` + AOAI Responses env가 있어야만 AOAI 사용 |
+| `AI_LLM_PROVIDER=mock` | 로컬 결정론 fallback 허용 |
+| `AI_LLM_PROVIDER=aoai` | AOAI Responses env 필수, provider/schema 실패 시 fail-closed |
 | local markdown KB | 운영용 벡터/검색 인덱스 |
 | fixture price rows | 공용 DB `feature.kis_adjusted_ohlcv_daily` + `feature.ta_*_ticker_daily` 기반 가격/TA screening |
 | fixture L4 evidence | `raw.analyst_report_summary` 기반 SEIBro raw evidence |
@@ -229,6 +233,6 @@ PY
 
 | 항목 | 구현 | 검증 |
 |---|---|---|
-| 실제 market data adapter와 백테스트 엔진 연결 | `AI_DATABASE_DSN` 설정 시 `mart.kis_adjusted_feature_frame_asof`에서 KIS 수정주가/TA feature를 읽어 `backtest_module` 엔진 입력으로 사용 | fixture fallback 및 매핑 테스트 통과. 공용 DB live 검증은 `AI_DATABASE_DSN` 필요 |
+| 실제 market data adapter와 백테스트 엔진 연결 | `AI_DATABASE_DSN` 설정 시 KIS 수정주가/TA feature를 읽어 `backtest_module` 엔진 입력으로 사용 | 로컬 fixture·매핑·configured-DB fail-closed 테스트 통과. 공용 DB live 성공 검증은 DSN 필요 |
 | AOAI `LLMClient` 구현과 prompt/schema contract test | `ai_graph/llm` provider interface, mock client, AOAI Responses thin client, env factory, backtest-code prompt schema | `httpx.MockTransport` unit test와 prompt/schema fallback test 통과. live AOAI는 `AI_AOAI_LIVE_TEST=1` opt-in |
 | FE와 envelope field freeze 후 contract test 공유 | `AnalysisJob`, `APIEnvelope`, report projection, OpenAPI route/component contract tests | `tests/contracts/*` 통과 |
