@@ -280,15 +280,19 @@ async function listAnalysisJobs(limit = 100): Promise<AnalysisJob[]> {
 
 export async function refreshLatestAnalysisJob(): Promise<AnalysisJob | null> {
   const storedJob = readLatestAnalysisJob();
-  if (!storedJob) {
-    return null;
-  }
   if (!appConfig.aiApiBaseUrl) {
     return storedJob;
   }
 
   try {
-    return await getAnalysisJob(storedJob.job_id);
+    if (storedJob) {
+      return await getAnalysisJob(storedJob.job_id);
+    }
+    const [latestJob] = await listAnalysisJobs(1);
+    if (latestJob) {
+      saveLatestAnalysisJob(latestJob);
+    }
+    return latestJob ?? null;
   } catch (error) {
     if (error instanceof AIResponseError && [401, 403, 404].includes(error.status)) {
       clearLatestAnalysisJob();

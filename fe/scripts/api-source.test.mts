@@ -10,10 +10,18 @@ test("product screens use analysis API data without product mock overlays", asyn
   assert.match(source, /AI_ENDPOINTS\.analysisJobs/);
   assert.match(source, /listAnalysisJobs/);
   assert.match(source, /refreshLatestAnalysisJob/);
+  assert.match(source, /listAnalysisJobs\(1\)/);
   assert.match(source, /buildTradingCandidatesFromAnalysisJob/);
   assert.doesNotMatch(source, /candidates: result \? \[\] : base\.candidates/);
   assert.match(source, /AI_REQUEST_TIMEOUT_MS = 1_200_000/);
   assert.match(source, /id\.startsWith\(AI_REPORT_ID_PREFIX\)/);
+});
+
+test("workspace restores the latest server analysis on a fresh browser", async () => {
+  const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /refreshLatestAnalysisJob\(\)/);
+  assert.match(source, /setAnalysisJobs\(\(jobs\) => \(jobs\.length \? jobs : \[latestJob\]\)\)/);
 });
 
 test("product surfaces do not expose retired candidate-scope fields", async () => {
