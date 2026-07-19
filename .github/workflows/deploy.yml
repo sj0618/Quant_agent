@@ -66,7 +66,7 @@ jobs:
 
       - name: Install and restart development servers
         run: |
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+          ssh -T -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
             set -euo pipefail
 
             if [ -f "$HOME/.bashrc" ]; then
@@ -78,6 +78,12 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
+            ENV_FILE="$APP_DIR/.env"
+            if [ -f "$ENV_FILE" ]; then
+              set -a
+              source "$ENV_FILE"
+              set +a
+            fi
             export AUTH_ENABLED=1 AI_JOB_STORE=memory AI_AUDIT_SINK=noop
             : "${REDIS_URL:?REDIS_URL must be configured when AUTH_ENABLED=1}"
             : "${VITE_AUTH_API_BASE_URL:?VITE_AUTH_API_BASE_URL must be configured for Google login}"
