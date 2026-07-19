@@ -40,8 +40,8 @@ DEFAULT_L4_EVIDENCE_LIMIT = 5
 # 2000+ 종목 유니버스가 사실상 5종목(또는 1종목)만 거래되도록 잘려나갔다. 유니버스
 # 제한을 두지 않는 기획이므로 기본값은 전부 None(무제한)이며, 필요하면 아래 env로만
 # 값을 넣어 되살릴 수 있다.
-DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 5
-DEFAULT_DB_STATEMENT_TIMEOUT_MS = 10_000
+DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 20
+DEFAULT_DB_STATEMENT_TIMEOUT_MS = 30_000
 POSTGRES_TIMEOUT_UNIT = "ms"
 BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 3
 RSI_OVERSOLD_THRESHOLD = 30.0
@@ -538,7 +538,7 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
         ),
         "relative_strength": "relative_strength_20d >= 0 AND relative_strength_60d >= 0",
     }.get(profile, "technical_score > 0")
-    sector_predicate = "\n              AND u.sector = %s" if sector else ""
+    sector_predicate = "\n              AND sm.sector = %s" if sector else ""
     return f"""
         WITH latest_date AS (
             SELECT max(time) AS as_of_date
@@ -551,7 +551,7 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
                 u.name,
                 u.market,
                 u.market_segment,
-                u.sector,
+                sm.sector,
                 p.adj_open AS open,
                 p.adj_high AS high,
                 p.adj_low AS low,
@@ -560,8 +560,9 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
             FROM feature.kis_adjusted_ohlcv_daily p
             JOIN meta.view_common_stock_universe u
               ON u.symbol = p.ticker
-            WHERE p.time >= (SELECT as_of_date FROM latest_date) - INTERVAL '420 days'
-              AND (u.listing_status IS NULL OR u.listing_status = 'listed'){sector_predicate}
+            JOIN core.symbol_master sm
+              ON sm.symbol = u.symbol
+            WHERE p.time >= (SELECT as_of_date FROM latest_date) - INTERVAL '420 days'{sector_predicate}
         ),
         features AS (
             SELECT

@@ -13,6 +13,7 @@ from ai_graph.data_sources.db import (
     QUANT_DB_DSN_ENV,
     RSI_OVERSOLD_THRESHOLD,
     _price_row_from_feature_frame_record,
+    _screening_sql,
     load_pipeline_data_from_env,
     resolve_database_dsn_from_env,
 )
@@ -60,6 +61,11 @@ def test_data_source_config_uses_quant_db_dsn_alias() -> None:
 
     assert config.database_dsn == "postgresql://example"
     assert config.database_dsn_env == QUANT_DB_DSN_ENV
+    assert config.connect_timeout_seconds == 20
+    assert config.statement_timeout_ms == 30_000
+    assert config.screening_limit is None
+    assert config.screening_backtest_selection_limit is None
+    assert config.portfolio_backtest_ticker_limit is None
 
 
 def test_data_source_config_normalizes_database_url_driver_prefix() -> None:
@@ -223,7 +229,9 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
             if "FROM scored" in query:
-                assert "u.listing_status = 'listed'" in query
+                assert "JOIN meta.view_common_stock_universe u" in query
+                assert "JOIN core.symbol_master sm" in query
+                assert "sm.sector" in query
                 return Result(
                     rows=[
                         {
@@ -316,10 +324,10 @@ def test_postgres_data_source_filters_screening_by_sector() -> None:
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
             self.calls.append((query, params))
-            if "DISTINCT sector" in query:
+            if "DISTINCT sm.sector" in query:
                 return Result(rows=[{"sector": "반도체"}, {"sector": "화학"}])
             if "FROM scored" in query:
-                assert "AND u.sector = %s" in query
+                assert "AND sm.sector = %s" in query
                 # No universe cap by default: only the sector filter param, no LIMIT.
                 assert params == ["반도체"]
                 assert "LIMIT" not in query
@@ -410,10 +418,10 @@ def test_postgres_data_source_screening_without_sector_has_no_sector_predicate()
             return None
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
-            if "DISTINCT sector" in query:
+            if "DISTINCT sm.sector" in query:
                 return Result(rows=[{"sector": "반도체"}, {"sector": "화학"}])
             if "FROM scored" in query:
-                assert "AND u.sector = %s" not in query
+                assert "AND sm.sector = %s" not in query
                 # No universe cap by default: no sector predicate and no LIMIT param.
                 assert params == []
                 assert "LIMIT" not in query
@@ -477,6 +485,39 @@ def test_postgres_data_source_screening_without_sector_has_no_sector_predicate()
 
     assert bundle.screening_candidates[0]["ticker"] == "000660"
     assert bundle.screening_candidates[0]["sector"] == "반도체"
+
+
+def test_default_screening_portfolio_keeps_every_candidate() -> None:
+    class PortfolioDataSource(PostgresPipelineDataSource):
+        def _fetch_universe_status(self, conn: object, ticker: str) -> dict[str, object]:
+            return {"ticker": ticker, "included": True}
+
+        def _fetch_price_rows(
+            self, conn: object, ticker: str, universe: dict[str, object], query: str
+        ) -> tuple[list[dict[str, object]], int]:
+            return (
+                [
+                    {
+                        "date": f"2026-01-{day:02d}",
+                        "ticker": ticker,
+                        "close": float(100 + int(ticker) + day),
+                    }
+                    for day in range(1, 32)
+                ],
+                31,
+            )
+
+    source = PortfolioDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+    candidates = [{"ticker": f"{index:06d}"} for index in range(1, 13)]
+
+    tickers, universe, price_rows, _, _ = source._fetch_screening_portfolio_price_rows(
+        object(), candidates, "전체 종목을 찾아줘"
+    )
+
+    expected = {f"{index:06d}" for index in range(1, 13)}
+    assert set(tickers) == expected
+    assert {row["ticker"] for row in price_rows} == expected
+    assert set(universe["portfolio_tickers"]) == expected
 
 
 def test_postgres_data_source_ambiguous_query_falls_back_to_screening_not_default_ticker() -> None:
@@ -572,8 +613,22 @@ def test_postgres_data_source_ambiguous_query_falls_back_to_screening_not_defaul
 
 
 @pytest.mark.skipif(
-    not os.environ.get(AI_DATABASE_DSN_ENV),
-    reason=f"{AI_DATABASE_DSN_ENV} is required for common-server DB integration test.",
+    not resolve_database_dsn_from_env(os.environ)[0],
+    reason="A supported database DSN is required for common-server DB integration test.",
+)
+def test_postgres_screening_sql_plans_against_common_server() -> None:
+    source = PostgresPipelineDataSource(DataSourceConfig.from_env())
+
+    with source._connect() as conn:
+        source._set_statement_timeout(conn)
+        plan = conn.execute(f"EXPLAIN {_screening_sql('technical_proxy')}").fetchall()
+
+    assert plan
+
+
+@pytest.mark.skipif(
+    not resolve_database_dsn_from_env(os.environ)[0],
+    reason="A supported database DSN is required for common-server DB integration test.",
 )
 def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     source = PostgresPipelineDataSource(DataSourceConfig.from_env())

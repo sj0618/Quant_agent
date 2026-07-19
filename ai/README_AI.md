@@ -76,6 +76,8 @@ env -i \
 
 공용 서버 PostgreSQL/TimescaleDB를 연결하려면 DB DSN을 child process에 전달한다.
 DSN이 없으면 로컬 fixture 경로로 실행된다. DSN이 설정된 상태에서 연결이나 조회가 실패하면 fixture로 대체하지 않고 analysis job을 실패 처리한다. `/api-status`/응답에는 비밀값이 노출되지 않는다.
+기본 연결 제한은 20초다. 대상 서버가 TLS를 제공하지 않는 것이 확인된 경우에만 DSN에
+`sslmode=disable`을 추가해 불필요한 TLS 탐색 지연을 피한다. TLS를 제공하는 서버에는 이 옵션을 사용하지 않는다.
 ```bash
 AI_DATABASE_DSN='postgresql://user:password@host:5432/quant_agent' \
 AI_DEFAULT_TICKER=005930 \
@@ -150,7 +152,7 @@ PY
 |---|---|---|
 | 9-node graph | `ai_graph/graph.py` | Supervisor, Ambiguity, Data, Research, BacktestCode, Backtest, Signal, Risk Manager, Report 순서 |
 | Swagger/API | `ai_graph/api.py` | `/docs`, `/openapi.json`, `/health`, `/api-status`, `/analysis-jobs`, `/api/strategies/parse`, `/api/strategies/descriptions`, `/api/backtests/{strategy_id}`, `/api/reports/{report_id}` |
-| DB data source | `ai_graph/data_sources/db.py` | `feature.kis_adjusted_ohlcv_daily`, `feature.ta_*_ticker_daily`, `meta.view_common_stock_universe`, `raw.analyst_report_summary` |
+| DB data source | `ai_graph/data_sources/db.py` | `feature.kis_adjusted_ohlcv_daily`, `feature.ta_*_ticker_daily`, `meta.view_common_stock_universe`, `core.symbol_master`(`symbol`/`sector` 섹터 보강), `raw.analyst_report_summary` |
 | LLM provider | `ai_graph/llm/**` | env 기반 `mock`/`aoai` 선택, role별 AOAI deployment override, AOAI Responses JSON parsing |
 | 공통 schema | `ai_graph/schemas.py`, `state.py` | StrategySpec, APIEnvelope, L4 evidence, polling stage, dual output |
 | Job/polling | `ai_graph/jobs.py` | `interpreting`, `code_generation`, `backtest`, `debate`, `finalizing` 상태 |

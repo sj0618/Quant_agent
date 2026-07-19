@@ -66,7 +66,9 @@ def test_get_known_sectors_uses_injected_connection() -> None:
 
     assert sectors == ["반도체", "화학"]
     assert len(conn.calls) == 1
-    assert "DISTINCT sector" in conn.calls[0]
+    assert "DISTINCT sm.sector" in conn.calls[0]
+    assert "FROM meta.view_common_stock_universe u" in conn.calls[0]
+    assert "JOIN core.symbol_master sm" in conn.calls[0]
 
 
 def test_get_known_sectors_caches_within_ttl(monkeypatch) -> None:
