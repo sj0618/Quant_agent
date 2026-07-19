@@ -1,6 +1,7 @@
 export const AUTH_ENDPOINTS = {
   googleStart: "/auth/google/start",
   googleCallback: "/auth/google/callback",
+  me: "/auth/me",
   logout: "/auth/logout",
 } as const;
 

@@ -311,7 +311,7 @@ export function AppPage() {
             <>
               <Tabs
                 activeId={activeTab}
-                items={TAB_ITEMS}
+                items={TAB_ITEMS.map((item) => item.id === "trading" ? { ...item, count: overview.candidates.length } : item)}
                 onChange={handleTabChange}
                 rightSlot={
                   <>

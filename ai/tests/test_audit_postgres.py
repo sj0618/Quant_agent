@@ -384,6 +384,7 @@ def test_factory_create_app_and_run_analysis_deny_forged_environment_admission(m
         monkeypatch.setenv(name, value)
 
     app = create_app()
+    monkeypatch.delenv("AI_DATABASE_DSN")
     envelope = run_analysis("저평가주 사줘")
 
     assert isinstance(app.state.audit_sink, NoOpAuditSink)

@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: server-health-check
+  group: server-health-check-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,7 +24,7 @@ jobs:
       github.event_name != 'workflow_run' ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     env:
       SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
       SERVER_PORT: ${{ secrets.SERVER_PORT || '30233' }}
@@ -35,6 +35,24 @@ jobs:
       SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
     steps:
+      - name: Checkout branch for DB verification
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        uses: actions/checkout@v4
+
+      - name: Setup Python for branch DB verification
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            ai/pyproject.toml
+            backtest_module/pyproject.toml
+
+      - name: Install branch analysis packages
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: python -m pip install -e ./backtest_module -e ./ai
+
       - name: Validate required secret
         run: test -n "$SSH_PRIVATE_KEY"
 
@@ -110,3 +128,183 @@ jobs:
             printf 'deployed revision: %s\n' "$(git -C "$APP_DIR" rev-parse --short HEAD)"
           fi
           REMOTE
+
+      - name: Verify branch against server DB without deployment
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          set -Eeuo pipefail
+          SSH_ARGS=(
+            -o BatchMode=yes
+            -o ConnectTimeout=10
+            -o StrictHostKeyChecking=yes
+            -i "$HOME/.ssh/id_ed25519"
+            -p "$SERVER_PORT"
+          )
+          ssh_remote() {
+            ssh "${SSH_ARGS[@]}" "$SERVER_USER@$SERVER_HOST" "$@"
+          }
+
+          ROLE_NAME="codex_read_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          ROLE_PASSWORD="$(openssl rand -hex 24)"
+          LOCAL_DB_PORT=15432
+          echo "::add-mask::$ROLE_PASSWORD"
+          [[ "$ROLE_NAME" =~ ^[a-z0-9_]+$ ]]
+          DB_NAME="$(ssh_remote docker exec quant-agent-db printenv POSTGRES_DB)"
+          [[ "$DB_NAME" =~ ^[A-Za-z0-9_]+$ ]]
+
+          cleanup() {
+            if [ -n "${TUNNEL_PID:-}" ]; then
+              kill "$TUNNEL_PID" 2>/dev/null || true
+              wait "$TUNNEL_PID" 2>/dev/null || true
+            fi
+            if [ "${ROLE_CREATED:-0}" = 1 ]; then
+              ssh_remote bash -s -- "$ROLE_NAME" "$DB_NAME" <<'REMOTE' || true
+          set -Eeuo pipefail
+          ROLE_NAME="$1"
+          DB_NAME="$2"
+          [[ "$ROLE_NAME" =~ ^codex_read_[0-9_]+$ ]]
+          DB_USER="$(docker exec quant-agent-db printenv POSTGRES_USER)"
+          docker exec -i quant-agent-db psql -X -q -v ON_ERROR_STOP=1 \
+            -U "$DB_USER" -d "$DB_NAME" -v role_name="$ROLE_NAME" <<'SQL'
+          SELECT format('DROP ROLE IF EXISTS %I', :'role_name') \gexec
+          SQL
+          REMOTE
+            fi
+          }
+          trap cleanup EXIT
+
+          ssh_remote bash -s -- "$ROLE_NAME" "$ROLE_PASSWORD" "$DB_NAME" <<'REMOTE'
+          set -Eeuo pipefail
+          ROLE_NAME="$1"
+          ROLE_PASSWORD="$2"
+          DB_NAME="$3"
+          [[ "$ROLE_NAME" =~ ^codex_read_[0-9_]+$ ]]
+          DB_USER="$(docker exec quant-agent-db printenv POSTGRES_USER)"
+          docker exec -i quant-agent-db psql -X -q -v ON_ERROR_STOP=1 \
+            -U "$DB_USER" -d "$DB_NAME" \
+            -v role_name="$ROLE_NAME" -v role_password="$ROLE_PASSWORD" <<'SQL'
+          SELECT format(
+            'CREATE ROLE %I LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 VALID UNTIL %L',
+            :'role_name', :'role_password', now() + interval '45 minutes'
+          ) \gexec
+          SELECT format('ALTER ROLE %I SET default_transaction_read_only = on', :'role_name') \gexec
+          SELECT format('ALTER ROLE %I SET statement_timeout = %L', :'role_name', '120s') \gexec
+          SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), :'role_name') \gexec
+          SELECT format('GRANT USAGE ON SCHEMA meta, feature, raw, mart TO %I', :'role_name') \gexec
+          SELECT format(
+            'GRANT SELECT ON ALL TABLES IN SCHEMA meta, feature, raw, mart TO %I',
+            :'role_name'
+          ) \gexec
+          SQL
+          REMOTE
+          ROLE_CREATED=1
+
+          ssh "${SSH_ARGS[@]}" -o ExitOnForwardFailure=yes -N \
+            -L "127.0.0.1:$LOCAL_DB_PORT:127.0.0.1:5432" \
+            "$SERVER_USER@$SERVER_HOST" &
+          TUNNEL_PID=$!
+
+          export BRANCH_DB_USER="$ROLE_NAME"
+          export BRANCH_DB_PASSWORD="$ROLE_PASSWORD"
+          export BRANCH_DB_NAME="$DB_NAME"
+          export BRANCH_DB_PORT="$LOCAL_DB_PORT"
+          export AI_LLM_PROVIDER=mock AI_AUDIT_SINK=noop
+          export AI_BACKTEST_LOOKBACK_DAYS=252 AI_DB_STATEMENT_TIMEOUT_MS=120000
+          python - <<'PY'
+          import json
+          import os
+          import socket
+          import time
+
+          import psycopg
+          from psycopg.conninfo import make_conninfo
+
+          from ai_graph.graph import DEBUG_STORE, run_analysis
+
+          deadline = time.monotonic() + 20
+          while True:
+              try:
+                  with socket.create_connection(
+                      ("127.0.0.1", int(os.environ["BRANCH_DB_PORT"])), timeout=1
+                  ):
+                      break
+              except OSError:
+                  if time.monotonic() >= deadline:
+                      raise
+                  time.sleep(0.5)
+
+          os.environ["AI_DATABASE_DSN"] = make_conninfo(
+              host="127.0.0.1",
+              port=int(os.environ["BRANCH_DB_PORT"]),
+              dbname=os.environ["BRANCH_DB_NAME"],
+              user=os.environ["BRANCH_DB_USER"],
+              password=os.environ["BRANCH_DB_PASSWORD"],
+              options="-c default_transaction_read_only=on -c statement_timeout=120000",
+          )
+          with psycopg.connect(os.environ["AI_DATABASE_DSN"]) as connection:
+              role_status = connection.execute(
+                  """
+                  SELECT current_setting('transaction_read_only'), rolsuper,
+                         rolcreatedb, rolcreaterole, rolreplication, rolbypassrls
+                  FROM pg_roles WHERE rolname = current_user
+                  """
+              ).fetchone()
+              assert role_status == ("on", False, False, False, False, False)
+              can_insert_prices = connection.execute(
+                  """
+                  SELECT has_table_privilege(
+                      current_user,
+                      'feature.kis_adjusted_ohlcv_daily',
+                      'INSERT'
+                  )
+                  """
+              ).fetchone()[0]
+              assert not can_insert_prices
+              universe_count = connection.execute(
+                  "SELECT count(*) FROM meta.view_common_stock_universe"
+              ).fetchone()[0]
+              price_status = connection.execute(
+                  """
+                  SELECT count(*), count(DISTINCT ticker), min(time), max(time)
+                  FROM feature.kis_adjusted_ohlcv_daily
+                  """
+              ).fetchone()
+
+          assert universe_count > 1
+          assert price_status[1] > 1
+
+          query = "RSI가 35 이하인 전체 종목을 찾아줘"
+          envelope = run_analysis(query, trace_id="branch-db-analysis")
+          assert envelope.status.value == "ready"
+          assert envelope.source_usage
+          assert all(usage.source_type == "internal_db" for usage in envelope.source_usage)
+          assert not any(usage.fallback_used for usage in envelope.source_usage)
+          debug_payload = DEBUG_STORE.get(envelope.debug_ref).model_dump(mode="json")
+          pipeline_metadata = debug_payload["node_outputs"]["data"]["pipeline_data_source"]
+          backtest_payload = debug_payload["backtest_artifacts"]["backtest_payload"]
+          assert pipeline_metadata["source"] == "postgres"
+          assert len(pipeline_metadata["tickers"]) > 1
+          assert len(backtest_payload["tickers"]) > 1
+          assert pipeline_metadata["screening_candidates"] == len(pipeline_metadata["tickers"])
+          assert len(backtest_payload["tickers"]) == len(pipeline_metadata["tickers"])
+          assert all(usage.freshness_status == "unknown" for usage in envelope.source_usage)
+
+          print(json.dumps({
+              "database_configured": True,
+              "database_role_read_only": True,
+              "universe_count": universe_count,
+              "price_rows": price_status[0],
+              "price_tickers": price_status[1],
+              "price_first_date": str(price_status[2]),
+              "price_last_date": str(price_status[3]),
+              "screening_candidates": pipeline_metadata["screening_candidates"],
+              "loaded_tickers": len(pipeline_metadata["tickers"]),
+              "loaded_price_rows": pipeline_metadata["price_rows"],
+              "analysis_status": envelope.status.value,
+              "backtest_tickers": len(backtest_payload["tickers"]),
+              "backtest_price_rows": backtest_payload["price_rows"],
+              "source_types": sorted({usage.source_type for usage in envelope.source_usage}),
+              "freshness_statuses": sorted({usage.freshness_status for usage in envelope.source_usage}),
+              "fallback_used": any(usage.fallback_used for usage in envelope.source_usage),
+          }, ensure_ascii=False, indent=2))
+          PY

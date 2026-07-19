@@ -78,19 +78,49 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
-            # This remote deployment runs the documented fixture MVP, not the production DB/OAuth stack.
-            export AUTH_ENABLED=0 AI_LLM_PROVIDER=mock AI_JOB_STORE=memory AI_AUDIT_SINK=noop
-            unset AI_DATABASE_DSN QUANT_DB_DSN DATABASE_URL REDIS_URL AUTH_SESSION_COOKIE_NAME AI_CORS_ALLOW_ORIGINS
-            unset AI_DEFAULT_TICKER AI_BACKTEST_LOOKBACK_DAYS AI_L4_EVIDENCE_LIMIT
-            unset AI_DB_CONNECT_TIMEOUT_SECONDS AI_DB_STATEMENT_TIMEOUT_MS AI_SCREENING_LIMIT
-            unset AI_SCREENING_BACKTEST_SELECTION_LIMIT AI_PORTFOLIO_BACKTEST_TICKER_LIMIT AI_SECTOR_CACHE_TTL_SECONDS
+            export AUTH_ENABLED=1 AI_JOB_STORE=memory AI_AUDIT_SINK=noop
+            : "${REDIS_URL:?REDIS_URL must be configured when AUTH_ENABLED=1}"
+            : "${VITE_AUTH_API_BASE_URL:?VITE_AUTH_API_BASE_URL must be configured for Google login}"
+            export REDIS_URL VITE_AUTH_API_BASE_URL VITE_AI_API_BASE_URL=/ai-api
+            if [ "${AI_LLM_PROVIDER:-}" != "aoai" ]; then
+              echo "AI_LLM_PROVIDER=aoai must be configured on the deploy server"
+              exit 1
+            fi
+            : "${AI_AOAI_RESPONSES_URL:?AI_AOAI_RESPONSES_URL must be configured on the deploy server}"
+            : "${AI_AOAI_API_KEY:?AI_AOAI_API_KEY must be configured on the deploy server}"
+            : "${AI_AOAI_MODEL:?AI_AOAI_MODEL must be configured on the deploy server}"
+            export AI_LLM_PROVIDER AI_AOAI_RESPONSES_URL AI_AOAI_API_KEY AI_AOAI_MODEL
+            has_non_whitespace() {
+              case "$1" in
+                *[![:space:]]*) return 0 ;;
+                *) return 1 ;;
+              esac
+            }
+            if has_non_whitespace "${AI_DATABASE_DSN:-}"; then
+              export AI_DATABASE_DSN
+            elif has_non_whitespace "${QUANT_DB_DSN:-}"; then
+              export QUANT_DB_DSN
+            elif has_non_whitespace "${DATABASE_URL:-}"; then
+              export DATABASE_URL
+            else
+              echo "AI_DATABASE_DSN, QUANT_DB_DSN, or DATABASE_URL must be configured on the deploy server"
+              exit 1
+            fi
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
-            "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/ai"
+            "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/backtest_module" -e "$APP_DIR/ai"
+            "$APP_DIR/ai/.venv/bin/python" -c \
+              'import os; from redis import Redis; client = Redis.from_url(os.environ["REDIS_URL"]); assert client.ping(), "Redis ping failed"; client.close()'
+            curl -fsS --max-time 15 "${VITE_AUTH_API_BASE_URL%/}/health" \
+              | "$APP_DIR/ai/.venv/bin/python" -c \
+                'import json, sys; status = json.load(sys.stdin); assert status.get("status") == "ok" and status.get("component") == "backend", "auth backend health check failed"'
+            timeout 1200 "$APP_DIR/ai/.venv/bin/python" -c \
+              'from ai_graph import run_analysis; result = run_analysis("005930 RSI가 30 이하이면 매수하고 70 이상이면 매도"); assert result.status == "ready", "live analysis smoke test did not finish ready"'
 
             cd "$APP_DIR/fe"
             npm ci
+            npm run build
 
             stop_listeners_on_port() {
               local port="$1"
@@ -146,12 +176,11 @@ jobs:
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn ai_graph.api:app \
               --host 0.0.0.0 \
               --port 18001 \
-              --reload \
               > "$RUN_DIR/ai.log" 2>&1 &
             echo "$!" > "$RUN_DIR/ai.pid"
 
             cd "$APP_DIR/fe"
-            nohup npm run dev -- --host 0.0.0.0 --port 18000 \
+            nohup npm run preview -- --host 0.0.0.0 --port 18000 \
               > "$RUN_DIR/fe.log" 2>&1 &
             echo "$!" > "$RUN_DIR/fe.pid"
 
@@ -172,5 +201,8 @@ jobs:
             }
 
             wait_for_url "AI API" "http://127.0.0.1:18001/health" "$RUN_DIR/ai.log"
+            curl -fsS http://127.0.0.1:18001/api-status \
+              | "$APP_DIR/ai/.venv/bin/python" -c \
+                'import json, sys; status = json.load(sys.stdin); assert status["data_source"]["configured"], "database DSN is not active"'
             wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
           REMOTE

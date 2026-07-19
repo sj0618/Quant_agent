@@ -41,6 +41,20 @@ def test_pipeline_data_source_uses_fixture_boundary_without_dsn(monkeypatch) -> 
     assert "mart.kis_adjusted_feature_frame_asof" in bundle.metadata["available_db_objects"]
 
 
+def test_configured_database_failure_is_not_replaced_with_fixture(monkeypatch) -> None:
+    monkeypatch.setenv(AI_DATABASE_DSN_ENV, "postgresql://quant-db")
+    monkeypatch.delenv(QUANT_DB_DSN_ENV, raising=False)
+    monkeypatch.delenv(DATABASE_URL_ENV, raising=False)
+
+    def fail_to_load(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(PostgresPipelineDataSource, "load", fail_to_load)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        load_pipeline_data_from_env("005930 RSI", "trace-live-db")
+
+
 def test_data_source_config_uses_quant_db_dsn_alias() -> None:
     config = DataSourceConfig.from_env({QUANT_DB_DSN_ENV: "postgresql://example"})
 
@@ -154,7 +168,7 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
                         "symbol": "005930",
                         "name": "삼성전자",
                         "market_segment": "KOSPI",
-                        "listing_status": "LISTED",
+                        "listing_status": "listed",
                     }
                 )
             if "mart.bok_macro_asof" in query:
@@ -209,6 +223,7 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
             if "FROM scored" in query:
+                assert "u.listing_status = 'listed'" in query
                 return Result(
                     rows=[
                         {
@@ -251,7 +266,7 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
                         "symbol": "000660",
                         "name": "SK하이닉스",
                         "market_segment": "KOSPI",
-                        "listing_status": "LISTED",
+                        "listing_status": "listed",
                     }
                 )
             if "mart.bok_macro_asof" in query:
@@ -351,7 +366,7 @@ def test_postgres_data_source_filters_screening_by_sector() -> None:
                         "symbol": "000660",
                         "name": "SK하이닉스",
                         "market_segment": "KOSPI",
-                        "listing_status": "LISTED",
+                        "listing_status": "listed",
                     }
                 )
             if "mart.bok_macro_asof" in query:
@@ -445,7 +460,7 @@ def test_postgres_data_source_screening_without_sector_has_no_sector_predicate()
                         "symbol": "000660",
                         "name": "SK하이닉스",
                         "market_segment": "KOSPI",
-                        "listing_status": "LISTED",
+                        "listing_status": "listed",
                     }
                 )
             if "mart.bok_macro_asof" in query:
@@ -568,7 +583,7 @@ def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     assert bundle.metadata["source"] == "postgres"
     assert bundle.price_rows
     assert bundle.metadata["price_source"] == "feature.kis_adjusted_ohlcv_daily"
-    assert bundle.metadata["indicator_sources"] == ["feature.ta_momentum_ticker_daily"]
+    assert "feature.ta_momentum_ticker_daily" in bundle.metadata["indicator_sources"]
     assert bundle.metadata["l4_evidence_source"] == "raw.analyst_report_summary"
     assert bundle.metadata["backtest_lookback_days"] >= DEFAULT_BACKTEST_LOOKBACK_DAYS
     assert any(row.get("rsi", 100) <= RSI_OVERSOLD_THRESHOLD for row in bundle.price_rows)

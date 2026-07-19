@@ -31,13 +31,18 @@ def create_llm_client(
     *,
     role: str | None = None,
 ) -> LLMClient:
-    env = environ or os.environ
+    env = os.environ if environ is None else environ
     provider = env.get(AI_LLM_PROVIDER_ENV, LLM_PROVIDER_MOCK).strip().lower()
     if provider in ("", LLM_PROVIDER_MOCK):
         return MockLLMClient()
     if provider == LLM_PROVIDER_AOAI:
         return _create_aoai_client(env, role=role)
     raise LLMProviderConfigError(f"unsupported {AI_LLM_PROVIDER_ENV}: {provider}")
+
+
+def is_live_llm_provider(environ: Mapping[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    return env.get(AI_LLM_PROVIDER_ENV, LLM_PROVIDER_MOCK).strip().lower() == LLM_PROVIDER_AOAI
 
 
 def _create_aoai_client(

@@ -13,7 +13,9 @@ interface PerformanceTabProps {
 export function PerformanceTab({ performance }: PerformanceTabProps) {
   const [mode, setMode] = useState<"selected" | "baseline" | "combined">("selected");
   const [range, setRange] = useState<"1Y" | "5Y" | "10Y">("10Y");
-  const points = range === "1Y" ? performance.equityCurve.slice(-2) : range === "5Y" ? performance.equityCurve.slice(-4) : performance.equityCurve;
+  const points = performance.source === "ai"
+    ? performance.equityCurve
+    : range === "1Y" ? performance.equityCurve.slice(-2) : range === "5Y" ? performance.equityCurve.slice(-4) : performance.equityCurve;
   const benchmarkLabel = performance.benchmarkLabel ?? "KOSPI200";
   const hasBenchmarkSeries = points.some((point) => point.benchmark !== 0);
   const series: Array<keyof Pick<EquityPoint, "strategy" | "original" | "benchmark">> =
@@ -50,7 +52,7 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
             {mode !== "baseline" ? <span><i className="line line--strategy" />선택 후보</span> : null}
             {mode !== "selected" ? <span><i className="line line--original" />기준선</span> : null}
             {hasBenchmarkSeries ? <span><i className="line line--benchmark" />{benchmarkLabel}</span> : null}
-            {(["1Y", "5Y", "10Y"] as const).map((item) => (
+            {performance.source === "ai" ? <Badge variant="soft">전체</Badge> : (["1Y", "5Y", "10Y"] as const).map((item) => (
               <button className={range === item ? "is-active" : ""} key={item} onClick={() => setRange(item)} type="button">
                 {item}
               </button>
@@ -92,17 +94,17 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
           <div className="card-head">
             <div>
               <strong>주요 매크로 이벤트 매핑</strong>
-              <p>OOS 구간 내 변동성 이벤트 6건</p>
+              <p>{performance.macroEvents.length ? `OOS 구간 내 변동성 이벤트 ${performance.macroEvents.length}건` : "이번 분석 응답에 포함되지 않음"}</p>
             </div>
           </div>
           <div className="macro-list">
-            {performance.macroEvents.map((event) => (
+            {performance.macroEvents.length ? performance.macroEvents.map((event) => (
               <div key={`${event.date}-${event.label}`}>
                 <strong>{event.date}</strong>
                 <span>{event.label}</span>
                 <Badge variant={event.tone}>{event.impact}</Badge>
               </div>
-            ))}
+            )) : <p>현재 AI 응답에는 매크로 이벤트 매핑 데이터가 없습니다.</p>}
           </div>
         </Card>
       </div>

@@ -1,0 +1,55 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
+
+test("product screens use analysis API data without product mock overlays", async () => {
+  const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+
+  assert.doesNotMatch(source, /mocks\/(?:app|reports|reportStrategies)\.mock/);
+  assert.match(source, /AI_ENDPOINTS\.analysisJobs/);
+  assert.match(source, /refreshLatestAnalysisJob/);
+  assert.match(source, /AI_REQUEST_TIMEOUT_MS = 1_200_000/);
+  assert.match(source, /id\.startsWith\(AI_REPORT_ID_PREFIX\)/);
+});
+
+
+test("deployment does not force the mock LLM profile", async () => {
+  const source = await readFile(new URL("../../.github/workflows/deploy.yml", import.meta.url), "utf8");
+
+  assert.doesNotMatch(source, /AI_LLM_PROVIDER=mock/);
+  assert.match(source, /AI_LLM_PROVIDER.*aoai/);
+  assert.match(source, /AUTH_ENABLED=1/);
+  assert.match(source, /REDIS_URL must be configured/);
+  assert.match(source, /client\.ping\(\)/);
+  assert.match(source, /VITE_AUTH_API_BASE_URL%\/\}\/health/);
+  assert.match(source, /npm run preview/);
+  assert.doesNotMatch(source, /nohup npm run dev/);
+});
+
+
+test("authentication boundaries do not leak cached analysis between users", async () => {
+  const authSource = await readFile(new URL("../src/api/authClient.ts", import.meta.url), "utf8");
+  const aiSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const profileSource = await readFile(new URL("../src/pages/ProfilePage.tsx", import.meta.url), "utf8");
+
+  assert.match(authSource, /!currentSession \|\| currentSession\.user\.id !== session\.user\.id/);
+  assert.match(authSource, /AUTH_ENDPOINTS\.me/);
+  assert.match(authSource, /finally \{\s+clearCurrentSession\(\)/);
+  assert.match(appSource, /validateCurrentSession\(\)/);
+  assert.match(aiSource, /\[401, 403, 404\]\.includes\(error\.status\)/);
+  assert.match(profileSource, /finally \{\s+window\.location\.assign\(ROUTES\.home\)/);
+});
+
+
+test("user-scoped cache clearing removes every registered key", () => {
+  const removed: string[] = [];
+
+  clearUserScopedStorage({ removeItem: (key) => removed.push(key) });
+
+  assert.deepEqual(removed, [...USER_SCOPED_STORAGE_KEYS]);
+  assert.ok(removed.includes("quantagent.auth.session.v1"));
+  assert.ok(removed.includes("quantagent.latest-analysis-job.v1"));
+  assert.ok(removed.includes("quantagent.chat-conversations.v1"));
+});

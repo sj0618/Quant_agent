@@ -1,8 +1,7 @@
 import { AI_ENDPOINTS, appConfig } from "../config/appConfig";
-import { appOverview, analysisJobStatus, performanceSummary, tradingCandidates } from "../mocks/app.mock";
 import { landingSample } from "../mocks/landing.mock";
-import { emailDigestHistoryEntries, strategyReportDetails } from "../mocks/reportStrategies.mock";
-import { reportDetails, reportSummaries } from "../mocks/reports.mock";
+import { formatScoreValue, SCORE_SCALE, selectRecommendationConfidence } from "../utils/score";
+import { clearUserScopedStorage } from "../utils/userScopedStorage";
 import type {
   AIBacktestMetrics,
   AIBacktestPerformance,
@@ -32,19 +31,16 @@ import type {
   StrategyReportSummary,
   StrategySpec,
   Tone,
-  TradingCandidate,
 } from "../types/quantagent";
 
 const APP_LOCALE = "ko-KR";
-const MOCK_LATENCY_MS = 120;
 const RECENT_REPORT_LIMIT = 4;
-const SCORE_SCALE = 10;
 const PERCENT_SCALE = 100;
 const TRACE_PREVIEW_LENGTH = 8;
 const PERCENT_DISPLAY_DIGITS = 2;
 const DECIMAL_DISPLAY_DIGITS = 2;
 const BASELINE_RETURN_PERCENT = 0;
-const AI_REQUEST_TIMEOUT_MS = 45_000;
+const AI_REQUEST_TIMEOUT_MS = 1_200_000;
 const STORAGE_KEY_LATEST_ANALYSIS_JOB = "quantagent.latest-analysis-job.v1";
 const AI_REPORT_ID_PREFIX = "ai-job:";
 const TIMEFRAME_LABELS: Record<string, string> = {
@@ -72,6 +68,41 @@ const WORKSPACE_STATUS_BY_AI_STATUS: Record<AIJobStageStatus, StageStatus> = {
   succeeded: "done",
   failed: "failed",
 };
+const EMPTY_PERFORMANCE: PerformanceSummary = {
+  headline: "분석 결과 없음",
+  period: "전략을 분석하면 실제 API 백테스트 결과가 표시됩니다.",
+  metrics: [],
+  equityCurve: [],
+  comparison: [],
+  macroEvents: [],
+  disclaimer: "분석 전에는 성과 데이터를 표시하지 않습니다.",
+};
+const EMPTY_WORKSPACE: AppOverview = {
+  strategy: {
+    natural_language_strategy: "",
+    universe: "",
+    sector: "",
+    buy_condition: "",
+    hold_condition: "",
+    drop_condition: "",
+    rebalance: "",
+    constraints: [],
+  },
+  recommendationScore: "—",
+  recommendationDelta: "분석 전",
+  passCount: 0,
+  buyCount: 0,
+  holdCount: 0,
+  dropCount: 0,
+  nextRunLabel: "예약 없음",
+  latestRunLabel: "분석 전",
+  chatMessages: [],
+  candidates: [],
+  performance: EMPTY_PERFORMANCE,
+  recentReports: [],
+  envelope: null,
+  jobStatus: null,
+};
 
 interface StrategyDescriptionApiInput {
   strategy_id: string;
@@ -91,13 +122,14 @@ interface StrategyDescriptionApiResponse {
   }>;
 }
 
-function clone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
+class AIResponseError extends Error {
+  constructor(readonly status: number) {
+    super(`AI 서버 응답 실패: ${status}`);
+  }
 }
 
-async function respond<T>(value: T): Promise<T> {
-  await new Promise((resolve) => window.setTimeout(resolve, MOCK_LATENCY_MS));
-  return clone(value);
+function clone<T>(value: T): T {
+  return structuredClone(value);
 }
 
 function requireAiApiBaseUrl() {
@@ -109,7 +141,10 @@ function requireAiApiBaseUrl() {
 
 function assertOk(response: Response) {
   if (!response.ok) {
-    throw new Error(`AI 서버 응답 실패: ${response.status}`);
+    if (response.status === 401 || response.status === 403) {
+      clearUserScopedStorage();
+    }
+    throw new AIResponseError(response.status);
   }
 }
 
@@ -226,11 +261,15 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
   return job;
 }
 
-export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
+async function requestAnalysisJob(jobId: string): Promise<AnalysisJob> {
   const response = await fetchAI(AI_ENDPOINTS.analysisJob(jobId));
   assertOk(response);
 
-  const job = (await response.json()) as AnalysisJob;
+  return (await response.json()) as AnalysisJob;
+}
+
+export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
+  const job = await requestAnalysisJob(jobId);
   saveLatestAnalysisJob(job);
   return job;
 }
@@ -247,6 +286,10 @@ export async function refreshLatestAnalysisJob(): Promise<AnalysisJob | null> {
   try {
     return await getAnalysisJob(storedJob.job_id);
   } catch (error) {
+    if (error instanceof AIResponseError && [401, 403, 404].includes(error.status)) {
+      clearLatestAnalysisJob();
+      throw error;
+    }
     console.warn("최신 AI 분석 job 갱신에 실패해 저장된 결과를 사용합니다.", error);
     return storedJob;
   }
@@ -264,14 +307,25 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
     ? [reportSummary, ...base.recentReports.filter((report) => report.id !== reportSummary.id)].slice(0, RECENT_REPORT_LIMIT)
     : base.recentReports;
   const performance = buildPerformanceSummaryFromAnalysisJob(job, base.performance);
+  const signals = reportSummary?.signals ?? { BUY: 0, HOLD: 0, DROP: 0 };
+  const finalSignal = result?.user_payload.report ? extractFinalSignal(result.user_payload.report) : null;
+  const recommendationConfidence = result?.strategy_spec
+    ? selectRecommendationConfidence(finalSignal?.confidence, result.strategy_spec.confidence)
+    : null;
 
   return {
     ...base,
     strategy,
-    recommendationScore: result?.strategy_spec ? formatScore(result.strategy_spec.confidence) : base.recommendationScore,
+    recommendationScore: recommendationConfidence === null ? base.recommendationScore : formatScore(recommendationConfidence),
     recommendationDelta: result ? formatStatusDelta(result.status) : base.recommendationDelta,
+    passCount: result ? signals.BUY + signals.HOLD + signals.DROP : base.passCount,
+    buyCount: result ? signals.BUY : base.buyCount,
+    holdCount: result ? signals.HOLD : base.holdCount,
+    dropCount: result ? signals.DROP : base.dropCount,
     latestRunLabel: `최신 분석 · ${formatDateTime(job.updated_at)}`,
+    nextRunLabel: result ? "예약 없음" : base.nextRunLabel,
     chatMessages: mergeChatMessages(base.chatMessages, buildAnalysisChatMessages(job)),
+    candidates: result ? [] : base.candidates,
     performance,
     recentReports,
     envelope: result ?? base.envelope,
@@ -280,108 +334,46 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
 }
 
 export function getLandingSample(): Promise<LandingSample> {
-  return respond(landingSample);
-}
-
-export async function getAppOverview(): Promise<AppOverview> {
-  const overview = await respond({ ...appOverview, recentReports: reportSummaries.slice(0, RECENT_REPORT_LIMIT) });
-  const latestJob = await refreshLatestAnalysisJob();
-  return latestJob ? mergeAnalysisJobIntoOverview(overview, latestJob) : overview;
+  return Promise.resolve(clone(landingSample));
 }
 
 export function getWorkspaceTemplate(): Promise<AppOverview> {
-  return respond({
-    ...appOverview,
-    chatMessages: [],
-    recentReports: [],
-  });
-}
-
-export function getTradingCandidates(): Promise<TradingCandidate[]> {
-  return respond(tradingCandidates);
-}
-
-export function getPerformanceSummary(): Promise<PerformanceSummary> {
-  return respond(performanceSummary);
+  return Promise.resolve(clone(EMPTY_WORKSPACE));
 }
 
 export async function getReports(): Promise<ReportSummary[]> {
-  const reports = await respond(reportSummaries);
   const latestJob = await refreshLatestAnalysisJob();
   const latestReport = latestJob ? buildReportSummaryFromAnalysisJob(latestJob) : null;
-  return latestReport ? [latestReport, ...reports.filter((report) => report.id !== latestReport.id)] : reports;
+  return latestReport ? [latestReport] : [];
 }
 
 export async function getReportStrategies(): Promise<StrategyReportSummary[]> {
-  const strategies = await hydrateStrategyDescriptions(strategyReportDetails.map((detail) => detail.strategy));
-  return respond(strategies);
+  const latestJob = await refreshLatestAnalysisJob();
+  const strategy = latestJob ? buildStrategyReportSummaryFromAnalysisJob(latestJob) : null;
+  return strategy ? hydrateStrategyDescriptions([strategy]) : [];
 }
 
 export async function getStrategyReportById(id: string): Promise<StrategyReportDetail | null> {
-  const detail = strategyReportDetails.find((item) => item.strategy.id === id);
-  if (!detail) {
-    return respond(null);
+  const latestJob = await refreshLatestAnalysisJob();
+  const strategy = latestJob ? buildStrategyReportSummaryFromAnalysisJob(latestJob) : null;
+  const report = latestJob ? buildReportDetailFromAnalysisJob(latestJob) : null;
+  if (!strategy || strategy.id !== id || !report) {
+    return null;
   }
-
-  const [strategy] = await hydrateStrategyDescriptions([detail.strategy]);
-  return respond({ ...detail, strategy });
+  const [hydratedStrategy] = await hydrateStrategyDescriptions([strategy]);
+  return { strategy: hydratedStrategy, emailReports: [report] };
 }
 
 export async function getStrategyWorkspaceOverview(id: string): Promise<AppOverview | null> {
-  const detail = await getStrategyReportById(id);
-  if (!detail) {
-    return respond(null);
+  const latestJob = await refreshLatestAnalysisJob();
+  if (!latestJob || latestJob.result?.strategy_spec?.strategy_id !== id) {
+    return null;
   }
-
-  const latestReport =
-    detail.emailReports.find((report) => report.id === detail.strategy.latestEmailReportId) ?? detail.emailReports[0];
-  if (!latestReport) {
-    return respond(null);
-  }
-
-  const previousScore = detail.emailReports[1]?.recommendationScore;
-  const latestScore = Number.parseFloat(latestReport.recommendationScore);
-  const previousValue = previousScore ? Number.parseFloat(previousScore) : Number.NaN;
-  const delta =
-    Number.isFinite(latestScore) && Number.isFinite(previousValue)
-      ? `${latestScore - previousValue >= 0 ? "+" : ""}${(latestScore - previousValue).toFixed(1)}`
-      : appOverview.recommendationDelta;
-
-  const buyCount = latestReport.signals.BUY;
-  const holdCount = latestReport.signals.HOLD;
-  const dropCount = latestReport.signals.DROP;
-
-  return respond({
-    ...appOverview,
-    strategy: {
-      name: detail.strategy.name,
-      natural_language_strategy: detail.strategy.description,
-      universe: detail.strategy.universe,
-      sector: detail.strategy.tags.join(" · "),
-      buy_condition: detail.strategy.entrySummary,
-      hold_condition: detail.strategy.riskSummary,
-      drop_condition: detail.strategy.exitSummary,
-      rebalance: appOverview.strategy.rebalance,
-      constraints: detail.strategy.tags,
-    },
-    recommendationScore: `${latestReport.recommendationScore} / 10`,
-    recommendationDelta: delta,
-    passCount: buyCount + holdCount + dropCount,
-    buyCount,
-    holdCount,
-    dropCount,
-    latestRunLabel: `최신 분석 · ${latestReport.date} ${latestReport.sentAt}`,
-    candidates: latestReport.candidates,
-    performance: {
-      ...performanceSummary,
-      metrics: latestReport.performance.metrics,
-    },
-    recentReports: detail.emailReports,
-  });
+  return mergeAnalysisJobIntoOverview(clone(EMPTY_WORKSPACE), latestJob);
 }
 
 export function getEmailDigestHistory(): Promise<EmailDigestHistoryEntry[]> {
-  return respond(emailDigestHistoryEntries);
+  return Promise.resolve([]);
 }
 
 export async function getReportById(id: string): Promise<ReportDetail | null> {
@@ -389,28 +381,11 @@ export async function getReportById(id: string): Promise<ReportDetail | null> {
   if (latestJob && id === latestAnalysisReportId(latestJob.job_id)) {
     return buildReportDetailFromAnalysisJob(latestJob);
   }
-
-  const directDetail = reportDetails.find((report) => report.id === id);
-  if (directDetail) {
-    return respond(directDetail);
+  if (id.startsWith(AI_REPORT_ID_PREFIX)) {
+    const jobId = id.slice(AI_REPORT_ID_PREFIX.length);
+    return buildReportDetailFromAnalysisJob(await requestAnalysisJob(jobId));
   }
-
-  const strategyEmailReport = strategyReportDetails.flatMap((detail) => detail.emailReports).find((report) => report.id === id);
-  if (strategyEmailReport) {
-    return respond(strategyEmailReport);
-  }
-
-  const summary = reportSummaries.find((report) => report.id === id);
-  if (!summary) {
-    return respond(null);
-  }
-
-  return respond({ ...reportDetails[0], ...summary });
-}
-
-export async function getAnalysisJobStatus(): Promise<AnalysisJobStatus> {
-  const latestJob = await refreshLatestAnalysisJob();
-  return latestJob ? buildWorkspaceJobStatus(latestJob) : respond(analysisJobStatus);
+  return null;
 }
 
 function mapAIStrategySpec(strategy: AIStrategySpec, query: string): StrategySpec {
@@ -525,7 +500,10 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
     return null;
   }
 
-  const action = extractSignalAction(report);
+  const signal = extractFinalSignal(report);
+  const confidence = result.strategy_spec
+    ? selectRecommendationConfidence(signal?.confidence, result.strategy_spec.confidence)
+    : signal?.confidence;
   const date = new Date(job.updated_at);
   return {
     id: latestAnalysisReportId(job.job_id),
@@ -537,8 +515,8 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
     summary: report.web_projection.summary,
     status: result.status === "failed" ? "failed" : "draft",
     strategyName: result.strategy_spec?.name ?? result.user_payload.headline,
-    recommendationScore: result.strategy_spec ? formatScore(result.strategy_spec.confidence) : formatEnvelopeStatus(result.status),
-    signals: signalCounts(action),
+    recommendationScore: confidence === null || confidence === undefined ? formatEnvelopeStatus(result.status) : formatScoreValue(confidence),
+    signals: signalCounts(signal?.action ?? null),
     marketSnapshot: [
       { label: "AI 상태", value: formatEnvelopeStatus(result.status), tone: toneForStatus(result.status) },
       { label: "Trace", value: result.trace_id.slice(0, TRACE_PREVIEW_LENGTH), tone: "neutral" },
@@ -546,28 +524,58 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
   };
 }
 
+function buildStrategyReportSummaryFromAnalysisJob(job: AnalysisJob): StrategyReportSummary | null {
+  const strategy = job.result?.strategy_spec;
+  const report = buildReportSummaryFromAnalysisJob(job);
+  if (!strategy || !report) {
+    return null;
+  }
+
+  const riskSummary = Object.entries(strategy.risk_constraints)
+    .map(([key, value]) => `${key}: ${String(value)}`)
+    .join(" · ");
+  return {
+    id: strategy.strategy_id,
+    name: strategy.name,
+    description: report.summary,
+    universe: formatUniverse(strategy),
+    timeframe: TIMEFRAME_LABELS[strategy.timeframe] ?? strategy.timeframe,
+    entrySummary: describeConditions(strategy.entry_conditions),
+    exitSummary: describeConditions(strategy.exit_conditions),
+    riskSummary: riskSummary || "별도 리스크 제약 없음",
+    latestSentAt: report.sentAt,
+    latestReportDate: report.date,
+    latestStatus: report.status,
+    latestEmailReportId: report.id,
+    recommendationScore: report.recommendationScore,
+    signals: report.signals,
+    summary: report.summary,
+    tags: strategy.indicators,
+  };
+}
+
 function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null {
   const result = job.result;
   const report = result?.user_payload.report;
   const summary = buildReportSummaryFromAnalysisJob(job);
-  const fallback = reportDetails[0];
-  if (!result || !report || !summary || !fallback) {
+  if (!result || !report || !summary) {
     return null;
   }
-  const performance = buildPerformanceSummaryFromAnalysisJob(job, performanceSummary);
+  const performance = buildPerformanceSummaryFromAnalysisJob(job, EMPTY_PERFORMANCE);
 
   return {
     ...summary,
-    recipient: fallback.recipient,
-    marketBrief: result.user_payload.message,
+    recipient: "",
+    strategyUniverse: result.strategy_spec?.universe,
+    marketBrief: report.web_projection.summary,
     news: report.web_projection.sections.map((section, index) => ({
       rank: index + 1,
       title: stringFromRecord(section, "title") ?? "AI 분석 섹션",
       source: "QuantAgent AI",
       tone: toneForStatus(result.status),
     })),
-    candidates: fallback.candidates,
-    signalAxes: fallback.signalAxes,
+    candidates: [],
+    signalAxes: [],
     riskManagerOverride: report.risk_adjustments.length ? describeRiskAdjustments(report.risk_adjustments) : "Risk Manager 변경 없음",
     conclusion: report.web_projection.summary,
     performance: { metrics: performance.metrics, disclaimer: performance.disclaimer },
@@ -588,11 +596,13 @@ function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: Perf
   return {
     ...fallback,
     headline: "AI 전략 검증 결과",
+    source: "ai",
     period: `후보 코드 백테스트 · ${aiPerformance.selected_candidate_id} 선택 · ${formatDateTime(job.updated_at)}`,
     benchmarkLabel: "검증 기준선",
     metrics: buildAIMetricCards(selectedMetrics, aiPerformance.engine_summary),
-    equityCurve: equityCurve.length ? equityCurve : fallback.equityCurve,
-    comparison: comparison.length ? comparison : fallback.comparison,
+    equityCurve,
+    comparison,
+    macroEvents: [],
     disclaimer:
       `AI 백테스트 엔진이 후보 코드 중 ${aiPerformance.selected_candidate_id}를 선택했습니다. ` +
       "벤치마크 데이터가 없는 검증 응답은 0% 기준선과 함께 표시합니다.",
@@ -693,11 +703,11 @@ function buildAIEquityCurve(performance: AIBacktestPerformance): EquityPoint[] {
   }));
 }
 
-function extractSignalAction(report: AIReportBundle): SignalType | null {
+function extractFinalSignal(report: AIReportBundle) {
   const signalSection = report.web_projection.sections.find((section) => stringFromRecord(section, "id") === "signal");
   const items = signalSection?.items;
   if (isRecord(items) && isSignalType(items.action)) {
-    return items.action;
+    return { action: items.action, confidence: numberFromRecord(items, "confidence") };
   }
   return null;
 }
@@ -736,8 +746,7 @@ function isSignalType(value: unknown): value is SignalType {
 }
 
 function formatScore(confidence: number) {
-  const normalized = Math.round(confidence * SCORE_SCALE * SCORE_SCALE) / SCORE_SCALE;
-  return `${normalized.toFixed(1)} / ${SCORE_SCALE}`;
+  return `${formatScoreValue(confidence)} / ${SCORE_SCALE}`;
 }
 
 function ratioToPercent(value: number) {

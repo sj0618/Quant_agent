@@ -88,6 +88,37 @@ def test_aoai_client_parses_output_text_json_payload() -> None:
     assert result["candidates"] == ["a", "b", "c"]
 
 
+def test_aoai_client_sends_strict_responses_json_schema() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "required": ["message"],
+        "additionalProperties": False,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["text"]["format"] == {
+            "type": "json_schema",
+            "name": "unit-test_v1",
+            "strict": True,
+            "schema": schema,
+        }
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = make_request().model_copy(
+        update={"schema_name": "unit-test.v1", "response_schema": schema}
+    )
+
+    assert client.generate_json(request) == {"message": "ok"}
+
+
 def test_aoai_client_rejects_broken_output_text_json() -> None:
     client = make_client({"output_text": "{broken-json"})
 

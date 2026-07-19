@@ -9,13 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 ALLOWED_MODULES = frozenset(
     {
-        "pandas",
-        "numpy",
-        "backtrader",
         "datetime",
         "math",
-        "talib",
-        "scipy.stats",
+        "statistics",
     }
 )
 BLOCKED_MODULES = frozenset({"subprocess", "os", "sys", "importlib"})
@@ -108,6 +104,12 @@ class BacktestASTVisitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> Any:
         root_name = attribute_root(node)
+        if node.attr.startswith("_"):
+            self.reject(
+                node,
+                "attribute.private",
+                f"private attribute '{node.attr}' is not allowed",
+            )
         if root_name in BLOCKED_MODULES:
             self.reject(node, "attribute.blocked", f"attribute access on '{root_name}' is blocked")
         self.generic_visit(node)

@@ -91,6 +91,20 @@ SIGNAL_METRIC_VALUES = {
 }
 
 
+def summarize_backtest(backtest: Mapping[str, Any]) -> dict[str, Any]:
+    selected = backtest.get("selected_candidate") or {}
+    selected_id = selected.get("candidate_id")
+    return {
+        "selected_candidate_id": selected_id,
+        "metrics": selected.get("metrics") or {},
+        "engine_summary": backtest.get("engine_summary")
+        or (backtest.get("engine_summaries_by_candidate") or {}).get(selected_id, {}),
+        "objective_score": (backtest.get("objective_scores_by_candidate") or {}).get(
+            selected_id
+        ),
+    }
+
+
 def _ensure_backtest_module_source_path() -> None:
     package_root = BACKTEST_MODULE_SOURCE_ROOT / "backtest_module"
     if not package_root.is_dir():

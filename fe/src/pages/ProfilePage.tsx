@@ -37,9 +37,11 @@ export function ProfilePage() {
     setStatus(null);
     try {
       await signOut();
-      window.location.assign(ROUTES.home);
     } catch (signOutError) {
-      setError(signOutError instanceof Error ? signOutError.message : "로그아웃에 실패했습니다.");
+      const message = signOutError instanceof Error ? signOutError.message : "로그아웃에 실패했습니다.";
+      window.alert(`서버 로그아웃은 실패했지만 이 브라우저의 세션은 정리했습니다.\n${message}`);
+    } finally {
+      window.location.assign(ROUTES.home);
     }
   };
 

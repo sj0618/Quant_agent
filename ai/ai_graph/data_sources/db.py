@@ -328,7 +328,7 @@ class PostgresPipelineDataSource:
             """
             SELECT symbol, name
             FROM meta.view_common_stock_universe
-            WHERE listing_status IS NULL OR listing_status = 'LISTED'
+            WHERE listing_status IS NULL OR listing_status = 'listed'
             """
         ).fetchall()
         for row in rows:
@@ -476,13 +476,7 @@ def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle
             f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.",
             query=query,
         )
-    try:
-        return PostgresPipelineDataSource(config).load(query, trace_id)
-    except Exception as exc:
-        return _fixture_bundle(
-            f"PostgreSQL data source unavailable: {type(exc).__name__}: {exc}",
-            query=query,
-        )
+    return PostgresPipelineDataSource(config).load(query, trace_id)
 
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
@@ -567,7 +561,7 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
             JOIN meta.view_common_stock_universe u
               ON u.symbol = p.ticker
             WHERE p.time >= (SELECT as_of_date FROM latest_date) - INTERVAL '420 days'
-              AND (u.listing_status IS NULL OR u.listing_status = 'LISTED'){sector_predicate}
+              AND (u.listing_status IS NULL OR u.listing_status = 'listed'){sector_predicate}
         ),
         features AS (
             SELECT

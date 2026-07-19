@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from ai_graph.llm import LLMClientError, LLMJsonRequest, create_llm_client
+from ai_graph.llm import LLMClientError, LLMJsonRequest, create_llm_client, is_live_llm_provider
 from ai_graph.schemas import DailyDigestComparisonRow, DailyDigestStrategyInput, MarketBrief, MarketBriefItem
 
 
@@ -13,7 +13,8 @@ ROLE_DEBATE_SCHEMA_NAME = "quantagent.role_debate.v1"
 MARKET_BRIEF_SCHEMA_NAME = "quantagent.market_brief.v1"
 ROLE_DEBATE_PROMPT_TEMPLATE_NAME = "role_debate"
 MARKET_BRIEF_PROMPT_TEMPLATE_NAME = "daily_market_brief"
-PROMPT_VERSION = "v1"
+ROLE_DEBATE_PROMPT_VERSION = "v2"
+MARKET_BRIEF_PROMPT_VERSION = "v1"
 
 
 class RoleDebatePayload(BaseModel):
@@ -28,6 +29,31 @@ class RoleDebatePayload(BaseModel):
     validation_results: dict[str, Any] = Field(default_factory=dict)
     fallback_reasons: list[str] = Field(default_factory=list)
     citations: list[dict[str, str]] = Field(default_factory=list)
+
+
+class _LiveRoleCitation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    url: str
+
+
+class _LiveValidationResults(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    checks: list[str]
+
+
+class _LiveRoleDebateOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    evidence: list[str]
+    concerns: list[str]
+    recommendation: str
+    confidence: float
+    validation_results: _LiveValidationResults
+    citations: list[_LiveRoleCitation]
 
 
 class StrategyDescriptionPayload(BaseModel):
@@ -56,35 +82,52 @@ def generate_role_debate(
     ground its findings in current information instead of local retrieval only.
     """
 
+    expected_json_schema = _role_debate_output_schema()
     request = LLMJsonRequest(
         schema_name=ROLE_DEBATE_SCHEMA_NAME,
         system_prompt=_system_prompt(role, task, enable_web_search=enable_web_search),
-        user_prompt=_user_prompt(context),
+        user_prompt=_user_prompt(context, expected_json_schema),
         temperature=0.0,
         enable_web_search=enable_web_search,
         task_type=role.lower(),
         prompt_template_name=ROLE_DEBATE_PROMPT_TEMPLATE_NAME,
-        prompt_version=PROMPT_VERSION,
-        variables_jsonb={"role": role, "task": task, "context": context},
+        prompt_version=ROLE_DEBATE_PROMPT_VERSION,
+        response_schema=expected_json_schema,
+        variables_jsonb={
+            "role": role,
+            "task": task,
+            "context": context,
+            "expected_json_schema": expected_json_schema,
+        },
     )
     try:
         payload = create_llm_client(role=role).generate_json(request)
+        provider_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"role", "fallback_reasons"}
+        }
+        if is_live_llm_provider():
+            provider_payload = _LiveRoleDebateOutput.model_validate(provider_payload).model_dump()
         return RoleDebatePayload.model_validate(
             {
+                **provider_payload,
                 "role": role,
-                **payload,
             }
         )
     except (LLMClientError, ValidationError, ValueError, TypeError) as exc:
+        if is_live_llm_provider():
+            raise
         reasons = [*fallback.fallback_reasons, f"{type(exc).__name__}: {exc}"]
         return fallback.model_copy(update={"fallback_reasons": reasons})
 
 
 def _system_prompt(role: str, task: str, *, enable_web_search: bool = False) -> str:
     base = (
-        "You are a QuantAgent role-specific analyst. Return JSON only with "
+        "You are a QuantAgent role-specific analyst. Return only a JSON object that "
+        "matches EXPECTED_JSON_SCHEMA exactly. Return "
         "summary, evidence, concerns, recommendation, confidence, and "
-        f"validation_results. Role={role}. Task={task}."
+        f"validation_results; use an empty citations array unless needed. Role={role}. Task={task}."
     )
     if not enable_web_search:
         return base
@@ -97,11 +140,18 @@ def _system_prompt(role: str, task: str, *, enable_web_search: bool = False) -> 
     )
 
 
-def _user_prompt(context: dict[str, Any]) -> str:
+def _user_prompt(context: dict[str, Any], expected_json_schema: dict[str, Any]) -> str:
     return (
-        "Analyze this QuantAgent state snapshot. Keep the output concise and "
-        f"machine-readable.\nCONTEXT_JSON={context}"
+        "Analyze this QuantAgent state snapshot. Keep the output concise.\n"
+        "EXPECTED_JSON_SCHEMA="
+        f"{json.dumps(expected_json_schema, ensure_ascii=False, sort_keys=True)}\n"
+        "CONTEXT_JSON="
+        f"{json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)}"
     )
+
+
+def _role_debate_output_schema() -> dict[str, Any]:
+    return _LiveRoleDebateOutput.model_json_schema()
 
 
 def generate_daily_digest_overall_comment(
@@ -212,7 +262,7 @@ def generate_market_brief(
         enable_web_search=True,
         task_type="digest_market_brief",
         prompt_template_name=MARKET_BRIEF_PROMPT_TEMPLATE_NAME,
-        prompt_version=PROMPT_VERSION,
+        prompt_version=MARKET_BRIEF_PROMPT_VERSION,
         variables_jsonb=variables,
     )
     try:
@@ -224,5 +274,7 @@ def generate_market_brief(
             source_usage=fallback.source_usage,
         )
     except (LLMClientError, ValidationError, ValueError, TypeError, KeyError) as exc:
+        if is_live_llm_provider():
+            raise
         reasons = [*fallback.fallback_reasons, f"{type(exc).__name__}: {exc}"]
         return fallback.model_copy(update={"fallback_reasons": reasons})

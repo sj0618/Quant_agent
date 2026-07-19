@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from ai_graph.llm import LLMClient, LLMClientError, create_llm_client
+from ai_graph.llm import LLMClient, LLMClientError, create_llm_client, is_live_llm_provider
 from ai_graph.llm.mock import (
     BOLLINGER_CANDIDATES,
     BREAKOUT_VOLUME_CANDIDATES,
@@ -32,6 +32,9 @@ SMOOTHED_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[2]
 MIN_GENERATED_CANDIDATES = 6
 MAX_GENERATED_CANDIDATES = 12
 MAX_SELF_IMPROVEMENT_CANDIDATES = 36
+MAX_VALIDATION_FEEDBACK_ITEMS = 20
+MAX_VALIDATION_FEEDBACK_CHARS = 4_000
+TRUNCATED_VALIDATION_FEEDBACK = "Additional validation failures omitted."
 
 
 class FeatureMapping(BaseModel):
@@ -88,6 +91,22 @@ def generate_loop3_candidates(
     llm_candidates, ignored_legacy_count = _non_legacy_llm_candidates(
         output.candidates, request.strategy
     )
+    if is_live_llm_provider() and not _has_safe_candidate(llm_candidates):
+        validation_feedback = _candidate_validation_feedback(llm_candidates)
+        output = _generate_backtest_code_output(
+            client,
+            request,
+            validation_feedback=validation_feedback,
+        )
+        llm_candidates, retry_ignored_count = _non_legacy_llm_candidates(
+            output.candidates, request.strategy
+        )
+        ignored_legacy_count += retry_ignored_count
+        if not _has_safe_candidate(llm_candidates):
+            raise ValueError(
+                "backtest code validation failed: AOAI returned no safe backtest candidates "
+                "after one regeneration attempt"
+            )
     code_candidates = _candidate_code_pool(
         llm_candidates, request.strategy, code_plan, request.max_positions
     )
@@ -230,17 +249,64 @@ def backtest_code_node(state: dict) -> dict:
 
 
 def _generate_backtest_code_output(
-    client: LLMClient, request: Loop3Request
+    client: LLMClient,
+    request: Loop3Request,
+    *,
+    validation_feedback: list[str] | None = None,
 ) -> BacktestCodeLLMOutput:
     try:
-        llm_request = build_backtest_code_json_request(request.strategy, request.variant)
+        llm_request = build_backtest_code_json_request(
+            request.strategy,
+            request.variant,
+            validation_feedback=validation_feedback,
+        )
         raw_output = client.generate_json(llm_request)
         return BacktestCodeLLMOutput.model_validate(raw_output)
     except (LLMClientError, ValidationError) as exc:
+        if is_live_llm_provider():
+            raise
         return BacktestCodeLLMOutput.model_construct(
             candidates=[],
             fallback_reasons=[f"{type(exc).__name__}: {exc}"],
         )
+
+
+def _has_safe_candidate(candidates: list[str]) -> bool:
+    return any(validate_backtest_code(candidate).ok for candidate in candidates)
+
+
+def _candidate_validation_feedback(candidates: list[str]) -> list[str]:
+    feedback: list[str] = []
+    seen: set[str] = set()
+    feedback_chars = 0
+    truncated = False
+    content_limit = MAX_VALIDATION_FEEDBACK_CHARS - len(TRUNCATED_VALIDATION_FEEDBACK)
+    for candidate in candidates:
+        for violation in validate_backtest_code(candidate).violations:
+            message = violation.message.strip()
+            if not message or message in seen:
+                continue
+            if len(feedback) >= MAX_VALIDATION_FEEDBACK_ITEMS - 1:
+                truncated = True
+                break
+            remaining = content_limit - feedback_chars
+            if remaining <= 0:
+                truncated = True
+                break
+            clipped_message = message[:remaining]
+            feedback.append(clipped_message)
+            seen.add(message)
+            feedback_chars += len(clipped_message)
+            if clipped_message != message:
+                truncated = True
+                break
+        if truncated:
+            break
+    if truncated:
+        feedback.append(TRUNCATED_VALIDATION_FEEDBACK)
+    if not feedback:
+        return ["Return at least one non-legacy candidate that passes the requested AST contract."]
+    return feedback
 
 
 def map_strategy_features(strategy: StrategySpec) -> FeatureMapping:

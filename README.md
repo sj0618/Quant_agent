@@ -41,7 +41,8 @@ AI/FE 상세 절차는 각각 `ai/README_AI.md`, `fe/README.md`에 두고, 여�
 - Bash(권장 4.4+), Python 3.11.13, Node 24.15.0, npm 11.12.1
   (`/etc/rocky-release` 및 `--version`으로 고정값 확인)
 - Docker/Compose 미사용
-- 외부 DB/Redis/OAuth/LLM credential 사용 금지
+- 로컬 결정론 점검은 외부 DB/Redis/OAuth/LLM credential 없이 실행
+- 실제 데이터 배포는 PostgreSQL DSN과 AOAI Responses 설정 필수
 - 저장소 바깥 작업공간 사용(안전성 상의 이유)
 
 ## MVP Spine
@@ -53,14 +54,23 @@ AI/FE 상세 절차는 각각 `ai/README_AI.md`, `fe/README.md`에 두고, 여�
 - child는 canonical `FE_ROOT`와 `env -i`, bounded curl, 시간축/identity 검증을 통과해야 한다.
 - loopback 포트 점검/종료 후 listener 정리는 `ss`와 bounded `curl`만으로 수행한다.
 
-## 저장소 외부 venv + fixture env
+## 로컬 결정론 프로필: 저장소 외부 venv + fixture env
 - venv는 반드시 저장소 경로 밖 생성
-- AI/FE는 아래 fixture로만 시작
+- 로컬 AI는 아래 결정론 fixture로 시작하고 FE는 그 `/analysis-jobs` 응답을 그대로 사용
   - `AUTH_ENABLED=0`
   - `AI_LLM_PROVIDER=mock`
   - `AI_JOB_STORE=memory`
   - `AI_AUDIT_SINK=noop`
   - data-source 계열 env는 제거 (`AI_DATABASE_DSN`, `QUANT_DB_DSN`, `DATABASE_URL`, `AI_DEFAULT_TICKER`, `AI_BACKTEST_LOOKBACK_DAYS`, `AI_L4_EVIDENCE_LIMIT`, `AI_DB_CONNECT_TIMEOUT_SECONDS`, `AI_DB_STATEMENT_TIMEOUT_MS`, `AI_SCREENING_LIMIT`, `AI_SCREENING_BACKTEST_SELECTION_LIMIT`, `AI_PORTFOLIO_BACKTEST_TICKER_LIMIT`, `AI_SECTOR_CACHE_TTL_SECONDS`, `BE_JOB_STORE_MODE`, `REDIS_URL`, `AUTH_SESSION_COOKIE_NAME`, `AI_CORS_ALLOW_ORIGINS`)
+
+## 운영 실데이터 프로필
+
+- `AI_LLM_PROVIDER=aoai`
+- `AI_AOAI_RESPONSES_URL`, `AI_AOAI_API_KEY`, `AI_AOAI_MODEL`
+- `AI_DATABASE_DSN`, `QUANT_DB_DSN`, `DATABASE_URL` 중 하나
+- `AUTH_ENABLED=1`, `REDIS_URL`, `VITE_AUTH_API_BASE_URL`
+
+운영 프로필에서는 구성된 PostgreSQL 또는 AOAI 호출이 실패해도 fixture 결과로 바꾸지 않는다. `/analysis-jobs`는 실패 진단을 포함한 실패 job을 반환하며, 배포 워크플로는 인증·DB·AOAI 설정과 실제 분석 smoke test가 모두 유효한 경우에만 성공한다.
 
 ## 참고
 - AI 상세 실행/테스트 가드: `ai/README_AI.md`

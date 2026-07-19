@@ -288,6 +288,7 @@ export interface MacroEvent {
 }
 
 export interface PerformanceSummary {
+  source?: "ai";
   headline: string;
   period: string;
   benchmarkLabel?: string;
@@ -335,8 +336,8 @@ export interface AppOverview {
   candidates: TradingCandidate[];
   performance: PerformanceSummary;
   recentReports: ReportSummary[];
-  envelope: AIEnvelope<{ active_tab: "overview" } | AIUserPayload, StrategySpec | AIStrategySpec | null>;
-  jobStatus: AnalysisJobStatus;
+  envelope: AIEnvelope<{ active_tab: "overview" } | AIUserPayload, StrategySpec | AIStrategySpec | null> | null;
+  jobStatus: AnalysisJobStatus | null;
 }
 
 export interface LandingSample {
