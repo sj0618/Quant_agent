@@ -64,6 +64,7 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   const profileSource = await readFile(new URL("../src/pages/ProfilePage.tsx", import.meta.url), "utf8");
 
   assert.match(authSource, /!currentSession \|\| currentSession\.user\.id !== session\.user\.id/);
+  assert.match(authSource, /session\.user\.id === TEST_AUTH_SESSION\.user\.id/);
   assert.match(authSource, /AUTH_ENDPOINTS\.me/);
   assert.match(authSource, /finally \{\s+clearCurrentSession\(\)/);
   assert.match(appSource, /validateCurrentSession\(\)/);
