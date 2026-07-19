@@ -198,6 +198,31 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert polled_job["trace_id"] == created_job["trace_id"]
 
 
+def test_analysis_job_api_lists_only_authenticated_users_jobs_newest_first() -> None:
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store))
+
+    first = client.post(ANALYSIS_JOBS_PATH, json={"query": "첫 번째 RSI 전략"}).json()
+    second = client.post(ANALYSIS_JOBS_PATH, json={"query": "두 번째 이동평균 전략"}).json()
+    store.create_job("다른 사용자 전략", user_id="other-user")
+
+    response = client.get(ANALYSIS_JOBS_PATH)
+
+    assert response.status_code == 200
+    assert [job["job_id"] for job in response.json()] == [second["job_id"], first["job_id"]]
+
+
+def test_analysis_job_api_list_honors_limit() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+    _ = client.post(ANALYSIS_JOBS_PATH, json={"query": "첫 번째 RSI 전략"})
+    second = client.post(ANALYSIS_JOBS_PATH, json={"query": "두 번째 이동평균 전략"}).json()
+
+    response = client.get(f"{ANALYSIS_JOBS_PATH}?limit=1")
+
+    assert response.status_code == 200
+    assert [job["job_id"] for job in response.json()] == [second["job_id"]]
+
+
 def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monkeypatch) -> None:
     for key in DATA_SOURCE_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)

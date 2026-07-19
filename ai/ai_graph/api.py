@@ -5,7 +5,7 @@ from __future__ import annotations
 from os import environ
 from typing import Callable, ClassVar, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -402,6 +402,18 @@ def create_app(
             ),
         )
 
+    @app.get(
+        ANALYSIS_JOBS_PATH,
+        response_model=list[AnalysisJob],
+        tags=["Analysis Jobs"],
+    )
+    def list_analysis_jobs(
+        limit: int = Query(default=100, ge=1, le=100),
+        user_id: str = Depends(require_user),
+    ) -> list[AnalysisJob]:
+        owned_jobs = (job for job in store.list_jobs(limit=100) if job.user_id == user_id)
+        return sorted(owned_jobs, key=lambda job: job.updated_at, reverse=True)[:limit]
+
     @app.post(
         SPEC_STRATEGY_PARSE_PATH,
         response_model=AnalysisJob,
@@ -632,6 +644,12 @@ def _endpoint_statuses() -> list[EndpointStatus]:
             path=ANALYSIS_JOBS_PATH,
             state="local_sync",
             summary="Create and run an analysis job through the local graph.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=ANALYSIS_JOBS_PATH,
+            state="job_store",
+            summary="List the authenticated user's analysis job history.",
         ),
         EndpointStatus(
             method="GET",

@@ -833,6 +833,8 @@ def _attach_screening_matches(
             sector=c.get("sector"),
             score=c["score"],
             as_of_date=c["as_of_date"],
+            close=c.get("close"),
+            matched_rules=c.get("matched_rules", []),
         )
         for c in filtered[:SCREENING_MATCH_DISPLAY_LIMIT]
     ]

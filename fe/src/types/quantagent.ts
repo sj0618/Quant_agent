@@ -144,6 +144,17 @@ export interface StrategyCandidateCard {
   key_conditions: string[];
   confidence: number;
   reason?: string | null;
+  sector?: string | null;
+  matches: Array<{
+    ticker: string;
+    name: string;
+    market: string;
+    sector?: string | null;
+    score: number;
+    as_of_date: string;
+    close?: number | null;
+    matched_rules: string[];
+  }>;
 }
 
 export interface AIClarificationOption {

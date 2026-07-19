@@ -8,7 +8,10 @@ test("product screens use analysis API data without product mock overlays", asyn
 
   assert.doesNotMatch(source, /mocks\/(?:app|reports|reportStrategies)\.mock/);
   assert.match(source, /AI_ENDPOINTS\.analysisJobs/);
+  assert.match(source, /listAnalysisJobs/);
   assert.match(source, /refreshLatestAnalysisJob/);
+  assert.match(source, /buildTradingCandidatesFromAnalysisJob/);
+  assert.doesNotMatch(source, /candidates: result \? \[\] : base\.candidates/);
   assert.match(source, /AI_REQUEST_TIMEOUT_MS = 1_200_000/);
   assert.match(source, /id\.startsWith\(AI_REPORT_ID_PREFIX\)/);
 });

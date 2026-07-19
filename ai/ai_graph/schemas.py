@@ -220,6 +220,8 @@ class ScreeningMatch(BaseModel):
     sector: str | None = None
     score: float
     as_of_date: str = Field(min_length=1)
+    close: float | None = None
+    matched_rules: list[str] = Field(default_factory=list)
 
 
 class StrategyCandidateCard(BaseModel):

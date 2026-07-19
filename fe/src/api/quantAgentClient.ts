@@ -31,6 +31,7 @@ import type {
   StrategyReportSummary,
   StrategySpec,
   Tone,
+  TradingCandidate,
 } from "../types/quantagent";
 
 const APP_LOCALE = "ko-KR";
@@ -274,6 +275,12 @@ export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
   return job;
 }
 
+async function listAnalysisJobs(limit = 100): Promise<AnalysisJob[]> {
+  const response = await fetchAI(`${AI_ENDPOINTS.analysisJobs}?limit=${limit}`);
+  assertOk(response);
+  return (await response.json()) as AnalysisJob[];
+}
+
 export async function refreshLatestAnalysisJob(): Promise<AnalysisJob | null> {
   const storedJob = readLatestAnalysisJob();
   if (!storedJob) {
@@ -325,7 +332,7 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
     latestRunLabel: `최신 분석 · ${formatDateTime(job.updated_at)}`,
     nextRunLabel: result ? "예약 없음" : base.nextRunLabel,
     chatMessages: mergeChatMessages(base.chatMessages, buildAnalysisChatMessages(job)),
-    candidates: result ? [] : base.candidates,
+    candidates: result ? buildTradingCandidatesFromAnalysisJob(job) : base.candidates,
     performance,
     recentReports,
     envelope: result ?? base.envelope,
@@ -342,31 +349,35 @@ export function getWorkspaceTemplate(): Promise<AppOverview> {
 }
 
 export async function getReports(): Promise<ReportSummary[]> {
-  const latestJob = await refreshLatestAnalysisJob();
-  const latestReport = latestJob ? buildReportSummaryFromAnalysisJob(latestJob) : null;
-  return latestReport ? [latestReport] : [];
+  const jobs = await listAnalysisJobs();
+  return jobs.map(buildReportSummaryFromAnalysisJob).filter((report): report is ReportSummary => report !== null);
 }
 
 export async function getReportStrategies(): Promise<StrategyReportSummary[]> {
-  const latestJob = await refreshLatestAnalysisJob();
-  const strategy = latestJob ? buildStrategyReportSummaryFromAnalysisJob(latestJob) : null;
-  return strategy ? hydrateStrategyDescriptions([strategy]) : [];
+  const jobs = await listAnalysisJobs();
+  const strategies = jobs
+    .map(buildStrategyReportSummaryFromAnalysisJob)
+    .filter((strategy): strategy is StrategyReportSummary => strategy !== null)
+    .filter((strategy, index, all) => all.findIndex((candidate) => candidate.id === strategy.id) === index);
+  return hydrateStrategyDescriptions(strategies);
 }
 
 export async function getStrategyReportById(id: string): Promise<StrategyReportDetail | null> {
-  const latestJob = await refreshLatestAnalysisJob();
-  const strategy = latestJob ? buildStrategyReportSummaryFromAnalysisJob(latestJob) : null;
-  const report = latestJob ? buildReportDetailFromAnalysisJob(latestJob) : null;
-  if (!strategy || strategy.id !== id || !report) {
+  const jobs = (await listAnalysisJobs()).filter((job) => job.result?.strategy_spec?.strategy_id === id);
+  const strategy = jobs.length ? buildStrategyReportSummaryFromAnalysisJob(jobs[0]) : null;
+  if (!strategy) {
     return null;
   }
   const [hydratedStrategy] = await hydrateStrategyDescriptions([strategy]);
-  return { strategy: hydratedStrategy, emailReports: [report] };
+  const emailReports = jobs
+    .map(buildReportDetailFromAnalysisJob)
+    .filter((report): report is ReportDetail => report !== null);
+  return { strategy: hydratedStrategy, emailReports };
 }
 
 export async function getStrategyWorkspaceOverview(id: string): Promise<AppOverview | null> {
-  const latestJob = await refreshLatestAnalysisJob();
-  if (!latestJob || latestJob.result?.strategy_spec?.strategy_id !== id) {
+  const latestJob = (await listAnalysisJobs()).find((job) => job.result?.strategy_spec?.strategy_id === id);
+  if (!latestJob) {
     return null;
   }
   return mergeAnalysisJobIntoOverview(clone(EMPTY_WORKSPACE), latestJob);
@@ -574,13 +585,52 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
       source: "QuantAgent AI",
       tone: toneForStatus(result.status),
     })),
-    candidates: [],
+    candidates: buildTradingCandidatesFromAnalysisJob(job),
     signalAxes: [],
     riskManagerOverride: report.risk_adjustments.length ? describeRiskAdjustments(report.risk_adjustments) : "Risk Manager 변경 없음",
     conclusion: report.web_projection.summary,
     performance: { metrics: performance.metrics, disclaimer: performance.disclaimer },
     costNotes: result.user_payload.next_actions,
   };
+}
+
+function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandidate[] {
+  const result = job.result;
+  if (!result) {
+    return [];
+  }
+  const finalSignal = result.user_payload.report ? extractFinalSignal(result.user_payload.report) : null;
+  const signal = finalSignal?.action ?? "HOLD";
+  const candidates = result.user_payload.candidate_cards.flatMap((card) =>
+    (card.matches ?? []).map((match) => {
+      const matchedRules = match.matched_rules ?? [];
+      const rationale = matchedRules.length ? matchedRules.join(" · ") : card.reason ?? card.summary;
+      return {
+        id: match.ticker,
+        ticker: match.ticker,
+        name: match.name,
+        sector: match.sector ?? card.sector ?? match.market,
+        signal,
+        confidence: card.confidence,
+        score: match.score,
+        price: match.close == null ? "—" : `${new Intl.NumberFormat(APP_LOCALE).format(match.close)}원`,
+        changePercent: "—",
+        rationale,
+        evidence: [
+          {
+            provider: "QuantAgent DB screening",
+            title: card.title,
+            date: match.as_of_date,
+            summary: rationale,
+          },
+        ],
+        riskReasons: [],
+      } satisfies TradingCandidate;
+    }),
+  );
+  return candidates.filter(
+    (candidate, index, all) => all.findIndex((item) => item.ticker === candidate.ticker) === index,
+  );
 }
 
 function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: PerformanceSummary): PerformanceSummary {
