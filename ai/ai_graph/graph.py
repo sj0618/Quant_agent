@@ -634,7 +634,6 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
     else:
         action.append("find_candidates")
 
-    universe = "KOSPI200" if "KOSPI200" in query.upper() else "KRX"
     sector = extract_sector_from_query(query, get_known_sectors())
     if not indicator:
         missing_slots.append("indicator")
@@ -653,7 +652,6 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
         price_basis=_unique(price_basis),
         event=_unique(event),
         action=_unique(action),
-        universe=universe,
         sector=sector,
         slot_evidence_refs=[f"semantic:{trace_id}:deterministic"],
         missing_slots=missing_slots,
@@ -664,18 +662,7 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
 
 
 def plan_data_requirements(semantic_slots: SemanticSlots) -> list[DataRequirement]:
-    requirements: list[DataRequirement] = [
-        DataRequirement(
-            family="universe",
-            availability="available",
-            owner="ai_graph",
-            preferred_source="internal_db",
-            fallback_sources=["krx"],
-            freshness_requirement="not_time_sensitive",
-            source_confidence_floor=0.8,
-            evidence_ref="data-plan:universe",
-        )
-    ]
+    requirements: list[DataRequirement] = []
     indicators = set(semantic_slots.indicator)
     events = set(semantic_slots.event)
     if indicators & {"rsi", "bollinger", "volume", "sma_20", "sma_200"} or events & {"lower_band_reentry", "new_52w_high", "upper_band_breakout"}:
@@ -735,8 +722,7 @@ def build_source_usage(
             pipeline_metadata.get("source") == "postgres"
             and requirement.preferred_source == "internal_db"
         )
-        source_ref_key = "universe_source" if requirement.family == "universe" else "price_source"
-        source_ref = pipeline_metadata.get(source_ref_key) if uses_postgres else None
+        source_ref = pipeline_metadata.get("price_source") if uses_postgres else None
         usage.append(
             SourceUsage(
                 source_type="internal_db" if uses_postgres else "none",
@@ -768,8 +754,8 @@ def build_evidence_refs(source_usage: list[SourceUsage], *, trace_id: str) -> li
 
 def data_source_inventory() -> list[dict[str, Any]]:
     return [
-        {"source_type": "internal_db", "families": ["ohlcv_ta", "universe", "analyst_evidence"], "live_required": False},
-        {"source_type": "krx", "families": ["ohlcv_ta", "universe"], "live_required": False},
+        {"source_type": "internal_db", "families": ["ohlcv_ta", "analyst_evidence"], "live_required": False},
+        {"source_type": "krx", "families": ["ohlcv_ta"], "live_required": False},
         {"source_type": "dart", "families": ["disclosure", "event", "fundamentals"], "live_required": False},
         {"source_type": "aoai_web_search", "families": ["event", "macro_fx_rates_commodities", "consensus_guidance"], "live_required": False},
         {"source_type": "analyst_evidence", "families": ["analyst_evidence", "consensus_guidance"], "live_required": False},
@@ -809,10 +795,6 @@ def strategy_candidate_cards(
     return cards
 
 
-# 리포트/카드에 표시되는 스크리닝 매치 개수 상한(표시 전용, 백테스트 유니버스 크기와는 무관).
-SCREENING_MATCH_DISPLAY_LIMIT = 5
-
-
 def _attach_screening_matches(
     cards: list[StrategyCandidateCard],
     screening_candidates: list[dict[str, Any]],
@@ -831,12 +813,11 @@ def _attach_screening_matches(
             name=c["name"],
             market=c["market"],
             sector=c.get("sector"),
-            score=c["score"],
             as_of_date=c["as_of_date"],
             close=c.get("close"),
             matched_rules=c.get("matched_rules", []),
         )
-        for c in filtered[:SCREENING_MATCH_DISPLAY_LIMIT]
+        for c in filtered
     ]
     primary = cards[0].model_copy(
         update={
@@ -1393,12 +1374,10 @@ def build_strategy_spec(
     source_refs = [hit["document_id"] for hit in retrieval.get("hits", [])]
     profile = _strategy_profile(query, semantic_slots=semantic_slots)
     slots = semantic_slots or {}
-    universe = str(slots.get("universe") or "KOSPI200")
     sector = slots.get("sector")
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
         name=str(profile["name"]),
-        universe=universe,
         market="KRX",
         sector=sector,
         timeframe="daily",
@@ -1407,7 +1386,7 @@ def build_strategy_spec(
         indicators=profile["indicators"],
         risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
         assumptions=[
-            f"{universe} universe" + (f" filtered to {sector} sector" if sector else ""),
+            f"sector filter: {sector}" if sector else "all matching listed common stocks",
             "daily adjusted close data",
             *profile["assumptions"],
         ],

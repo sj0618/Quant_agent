@@ -105,7 +105,6 @@ def build_strategy_cards(strategies: list[DailyDigestStrategyInput]) -> list[Dai
 def _build_strategy_card(strategy: DailyDigestStrategyInput) -> DailyDigestStrategyCard:
     context = {
         "strategy_name": strategy.name,
-        "universe": strategy.universe,
         "timeframe": strategy.timeframe,
         "today_signal": strategy.today_signal,
         "metrics": strategy.metrics.model_dump(),

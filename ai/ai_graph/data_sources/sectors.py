@@ -8,7 +8,7 @@ from typing import Any, Sequence
 AI_SECTOR_CACHE_TTL_SECONDS_ENV = "AI_SECTOR_CACHE_TTL_SECONDS"
 DEFAULT_SECTOR_CACHE_TTL_SECONDS = 300
 
-COMMON_STOCK_UNIVERSE_VIEW = "mart.common_stock_universe_asof"
+CANDIDATE_POOL_VIEW = "mart.common_stock_universe_asof"
 SECTOR_SOURCE_TABLE = "core.symbol_master"
 
 # Static fallback for offline/fixture mode — mirrors the WICS taxonomy documented in
@@ -85,10 +85,10 @@ def get_known_sectors(conn: Any | None = None) -> list[str]:
 def _fetch_sectors(conn: Any | None) -> list[str]:
     query = f"""
         SELECT DISTINCT sm.sector
-        FROM {COMMON_STOCK_UNIVERSE_VIEW} u
+        FROM {CANDIDATE_POOL_VIEW} u
         JOIN {SECTOR_SOURCE_TABLE} sm
           ON sm.symbol = u.symbol
-        WHERE u.as_of_date = (SELECT max(as_of_date) FROM {COMMON_STOCK_UNIVERSE_VIEW})
+        WHERE u.as_of_date = (SELECT max(as_of_date) FROM {CANDIDATE_POOL_VIEW})
           AND sm.sector IS NOT NULL
         ORDER BY sm.sector
     """

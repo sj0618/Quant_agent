@@ -30,9 +30,6 @@ DATA_SOURCE_ENV_KEYS = (
     "AI_L4_EVIDENCE_LIMIT",
     "AI_DB_CONNECT_TIMEOUT_SECONDS",
     "AI_DB_STATEMENT_TIMEOUT_MS",
-    "AI_SCREENING_LIMIT",
-    "AI_SCREENING_BACKTEST_SELECTION_LIMIT",
-    "AI_PORTFOLIO_BACKTEST_TICKER_LIMIT",
     "AI_SECTOR_CACHE_TTL_SECONDS",
 )
 MOCK_PROVIDER_CREDENTIAL_ENV = "AI_AOAI_API_KEY"
@@ -62,7 +59,6 @@ def _daily_digest_strategy_payload(
     return {
         "strategy_id": strategy_id,
         "name": name,
-        "universe": "KOSPI200",
         "timeframe": "1d",
         "today_signal": signal,
         "targets": ["삼성전자"],
@@ -324,7 +320,6 @@ def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adap
         json={
             "natural_language": "최근 52주 신고가를 돌파했고 거래량이 20일 평균 대비 150% 이상 증가한 종목을 찾아줘.",
             "market": "KR",
-            "universe": "KOSPI200",
             "client_request_id": "client-1",
         },
     )
@@ -367,7 +362,6 @@ def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:
                 {
                     "strategy_id": "semiconductor-momentum",
                     "name": "반도체 모멘텀 + 기관 매수",
-                    "universe": "KOSPI200 · 반도체",
                     "timeframe": "daily",
                     "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
                     "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
@@ -396,7 +390,6 @@ def test_strategy_descriptions_route_records_per_item_audit_steps() -> None:
                 {
                     "strategy_id": "semiconductor-momentum",
                     "name": "반도체 모멘텀 + 기관 매수",
-                    "universe": "KOSPI200 · 반도체",
                     "timeframe": "daily",
                     "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
                     "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
@@ -406,7 +399,6 @@ def test_strategy_descriptions_route_records_per_item_audit_steps() -> None:
                 {
                     "strategy_id": "dividend-defensive",
                     "name": "배당 방어주",
-                    "universe": "KOSPI200",
                     "timeframe": "daily",
                     "entry_summary": "배당수익률과 재무안정성이 높은 종목을 찾습니다.",
                     "exit_summary": "배당 컷 또는 추세 훼손 시 비중을 줄입니다.",
@@ -455,7 +447,6 @@ def test_strategy_descriptions_route_records_sanitized_error_audit_events(monkey
                     {
                         "strategy_id": "semiconductor-momentum",
                         "name": "반도체 모멘텀 + 기관 매수",
-                        "universe": "KOSPI200 · 반도체",
                         "timeframe": "daily",
                         "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
                         "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
@@ -715,7 +706,6 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
             {
                 "strategy_id": "rsi",
                 "name": "RSI",
-                "universe": "KOSPI200",
                 "timeframe": "daily",
                 "entry_summary": "RSI 30 이하",
                 "exit_summary": "RSI 70 이상",

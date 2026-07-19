@@ -17,7 +17,6 @@ def make_strategy() -> StrategySpec:
     return StrategySpec(
         strategy_id="rsi",
         name="RSI",
-        universe="KOSPI200",
         market="KRX",
         timeframe="daily",
         entry_conditions=[Condition(left="rsi", operator="lte", right=30)],

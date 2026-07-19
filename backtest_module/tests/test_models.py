@@ -1,10 +1,9 @@
-from datetime import date, datetime, time
+from datetime import time
 
 import pytest
 from pydantic import ValidationError
 
 from backtest_module import (
-    CandidateSnapshot,
     Condition,
     ConditionOperator,
     StrategySpec,
@@ -33,14 +32,3 @@ def test_strategy_spec_defaults_and_normalization():
     assert spec.strategy_id == "mean_reversion_v1"
     assert spec.backtest.walk_forward.in_sample_months == 12
     assert spec.reporting.daily_email_time == time(8, 0)
-
-
-def test_candidate_snapshot_effective_rule():
-    snapshot = CandidateSnapshot(
-        snapshot_id="snap-1",
-        trade_date=date(2026, 4, 8),
-        effective_from=datetime(2026, 4, 8, 9, 0),
-        top_k_stocks=["005930"],
-    )
-    assert snapshot.is_effective_for(datetime(2026, 4, 8, 9, 0)) is True
-    assert snapshot.is_effective_for(datetime(2026, 4, 8, 8, 59)) is False

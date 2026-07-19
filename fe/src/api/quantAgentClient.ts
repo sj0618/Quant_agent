@@ -602,7 +602,6 @@ function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandida
         sector: match.sector ?? card.sector ?? match.market,
         signal,
         confidence: card.confidence,
-        score: match.score,
         price: match.close == null ? "—" : `${new Intl.NumberFormat(APP_LOCALE).format(match.close)}원`,
         changePercent: "—",
         rationale,

@@ -16,7 +16,6 @@ def make_strategy():
         "exit_rules": [
             {"left": "rsi", "operator": "gte", "right": 70, "description": "RSI >= 70"}
         ],
-        "use_candidate_filter": True,
     }
 
 
@@ -28,42 +27,19 @@ def make_market(ticker="005930", rsi=28):
     }
 
 
-def make_candidate():
-    return {
-        "snapshot_id": "snap-1",
-        "top_k_stocks": ["005930"],
-        "reason_trace": {"035420": ["not in top-k"]},
-    }
-
-
-def test_generate_buy_signal_after_candidate_filter():
-    result = generate_signal(
-        make_strategy(), make_market(), candidate_snapshot=make_candidate()
-    )
+def test_generate_buy_signal_when_entry_rule_matches():
+    result = generate_signal(make_strategy(), make_market())
 
     assert result.action == "BUY"
     assert result.matching_entry_rules == ["RSI <= 30"]
-    assert result.candidate_snapshot_id == "snap-1"
     assert result.debug_ref.startswith("signal:")
     assert "internal_payload" not in result.model_dump()
-
-
-def test_generate_filtered_out_for_non_candidate_before_rules():
-    result = generate_signal(
-        make_strategy(),
-        make_market(ticker="035420", rsi=10),
-        candidate_snapshot=make_candidate(),
-    )
-
-    assert result.action == "FILTERED_OUT"
-    assert result.reasons == ["not in top-k"]
 
 
 def test_generate_sell_signal_for_existing_position():
     result = generate_signal(
         make_strategy(),
         make_market(rsi=75),
-        candidate_snapshot=make_candidate(),
         has_position=True,
     )
 
@@ -77,7 +53,6 @@ def test_signal_node_public_contract_excludes_raw_internal_payload():
             "trace_id": "trace-2",
             "strategy_spec": make_strategy(),
             "market_snapshot": make_market(),
-            "candidate_snapshot": make_candidate(),
             "internal_payload": {"raw": "must stay internal"},
         }
     )

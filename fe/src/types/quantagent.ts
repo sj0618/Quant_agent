@@ -147,7 +147,6 @@ export interface StrategyCandidateCard {
     name: string;
     market: string;
     sector?: string | null;
-    score: number;
     as_of_date: string;
     close?: number | null;
     matched_rules: string[];
@@ -254,7 +253,6 @@ export interface TradingCandidate {
   sector: string;
   signal: SignalType;
   confidence: number;
-  score: number;
   price: string;
   changePercent: string;
   rationale: string;

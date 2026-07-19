@@ -35,7 +35,7 @@ def test_strategy_spec_contract_preserves_rsi_buy_sell_semantics() -> None:
     spec = StrategySpec.model_validate(envelope.strategy_spec)
     serialized = json.loads(spec.model_dump_json())
 
-    assert "KOSPI200" in serialized["universe"]
+    assert "universe" not in serialized
     assert "sector" in serialized
     assert any(
         condition.left.lower() == "rsi" and condition.operator == "lte" and condition.right == 30

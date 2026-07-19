@@ -10,7 +10,6 @@ import type {
 export const activeStrategySpec: StrategySpec = {
   name: "반도체 모멘텀 + 기관 매수 회귀",
   natural_language_strategy: "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
-  universe: "KOSPI200 · 반도체",
   sector: "반도체",
   buy_condition: "RSI ≤ 30 AND 거래량 > 200%",
   hold_condition: "RSI 31~70 또는 주요 이벤트 대기",

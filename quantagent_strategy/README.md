@@ -16,7 +16,7 @@
   - `QuantStrategy`
 - `tests/`
   - 모델 validation 테스트
-  - 후보군 필터 / buy / sell / compile 테스트
+  - buy / sell / compile 테스트
 - `MEETING_NOTE_SNIPPET.md`
   - 회의록에 바로 붙여넣을 설명
 - `GITHUB_ORG_SETUP.md`
@@ -34,7 +34,7 @@
 
 ### 2. V1 핵심 원칙
 
-- **비정형 데이터(애널리스트 리포트)는 후보군 필터로만 사용**
+- **비정형 데이터(애널리스트 리포트)는 설명 근거로만 사용**
 - **실제 매수/매도는 기술적 전략이 결정**
 - **리포트는 장 마감 후 수집 시 다음 거래일 시가부터 유효**
 - **A/B 비교는 백테스트/분석용으로 남기되, 기본 사용자 리포트에는 숨김**
@@ -47,7 +47,7 @@
 
 이 둘을 분리해야 다음이 가능합니다.
 
-- 동일 전략으로 후보군 필터 O/X A/B 백테스트
+- 동일 전략의 조건 충족 종목 전체 백테스트
 - point-in-time / available_at 정책 적용
 - 실시간 신호와 전일 후보군 스냅샷을 분리 운영
 - 후보 선정 근거(reason trace) 저장
@@ -78,22 +78,13 @@ spec = StrategySpec(
 
 strategy = QuantStrategy(spec)
 
-snapshot = CandidateSnapshot(
-    snapshot_id="snap-2026-04-08",
-    trade_date=date(2026, 4, 8),
-    effective_from=datetime(2026, 4, 8, 9, 0),
-    top_k_stocks=["005930"],
-    score_list={"005930": 82.4},
-    reason_trace={"005930": ["candidate score top-k"]},
-)
-
 market = MarketSnapshot(
     ticker="005930",
     timestamp=datetime(2026, 4, 8, 9, 5),
     metrics={"rsi": 28},
 )
 
-signal = strategy.generate_signal(market=market, has_position=False, candidate_snapshot=snapshot)
+signal = strategy.generate_signal(market=market, has_position=False)
 print(signal.action)
 ```
 

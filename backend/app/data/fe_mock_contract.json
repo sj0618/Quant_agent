@@ -33,7 +33,7 @@
         "title": "전략 정형화",
         "description": "Research 에이전트가 정/반/합 토론으로 StrategySpec을 생성합니다.",
         "example": [
-          "universe: KOSPI200·반도체",
+          "sector: 반도체",
           "buy: RSI ≤ 30 AND vol > 200%"
         ]
       },
@@ -182,7 +182,6 @@
   "activeStrategySpec": {
     "name": "반도체 모멘텀 + 기관 매수 회귀",
     "natural_language_strategy": "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
-    "universe": "KOSPI200 · 반도체",
     "sector": "반도체",
     "buy_condition": "RSI ≤ 30 AND 거래량 > 200%",
     "hold_condition": "RSI 31~70 또는 주요 이벤트 대기",
@@ -203,7 +202,6 @@
     "strategy_spec": {
       "name": "반도체 모멘텀 + 기관 매수 회귀",
       "natural_language_strategy": "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
-      "universe": "KOSPI200 · 반도체",
       "sector": "반도체",
       "buy_condition": "RSI ≤ 30 AND 거래량 > 200%",
       "hold_condition": "RSI 31~70 또는 주요 이벤트 대기",
@@ -611,7 +609,6 @@
     "strategy": {
       "name": "반도체 모멘텀 + 기관 매수 회귀",
       "natural_language_strategy": "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
-      "universe": "KOSPI200 · 반도체",
       "sector": "반도체",
       "buy_condition": "RSI ≤ 30 AND 거래량 > 200%",
       "hold_condition": "RSI 31~70 또는 주요 이벤트 대기",
@@ -1026,7 +1023,6 @@
       "strategy_spec": {
         "name": "반도체 모멘텀 + 기관 매수 회귀",
         "natural_language_strategy": "반도체 섹터에서 RSI 30 이하로 과매도된 종목 잡아줘",
-        "universe": "KOSPI200 · 반도체",
         "sector": "반도체",
         "buy_condition": "RSI ≤ 30 AND 거래량 > 200%",
         "hold_condition": "RSI 31~70 또는 주요 이벤트 대기",

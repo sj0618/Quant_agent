@@ -42,7 +42,7 @@ export function SearchPage() {
             title: "활성 전략",
             description: data.overview.strategy.natural_language_strategy,
             href: ROUTES.app,
-            meta: data.overview.strategy.universe,
+            meta: data.overview.strategy.sector,
           },
         ]
       : [];

@@ -23,7 +23,7 @@ from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
     BOK_MACRO_VIEW,
     KIS_ADJUSTED_OHLCV_TABLE,
-    UNIVERSE_VIEW,
+    CANDIDATE_POOL_VIEW,
     resolve_database_dsn_from_env,
 )
 from ai_graph.graph import run_analysis
@@ -113,7 +113,7 @@ class CreateDailyDigestRequest(BaseModel):
 
 
 class StrategyDescriptionInput(BaseModel):
-    # Ignore the retired `universe` key from older frontends during the rolling deploy.
+    # Ignore retired keys from older frontends during the rolling deploy.
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
 
     strategy_id: str = Field(min_length=1)
@@ -706,7 +706,7 @@ def _data_source_status() -> DataSourceStatus:
         configured=dsn_value is not None,
         dsn_env=dsn_env,
         price_source=KIS_ADJUSTED_OHLCV_TABLE,
-        candidate_pool_source=UNIVERSE_VIEW,
+        candidate_pool_source=CANDIDATE_POOL_VIEW,
         l4_evidence_source=ANALYST_REPORT_TABLE,
         macro_source=BOK_MACRO_VIEW,
         macro_usable=False,

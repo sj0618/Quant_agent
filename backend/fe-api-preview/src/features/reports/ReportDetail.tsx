@@ -35,7 +35,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
           <strong>기준 전략</strong>
           <h4>{report.strategyName}</h4>
           <dl>
-            <div><dt>유니버스</dt><dd>KOSPI200 · 반도체</dd></div>
+            <div><dt>평가 범위</dt><dd>조건을 충족한 전체 종목</dd></div>
             <div><dt>신호</dt><dd>BUY {report.signals.BUY} · HOLD {report.signals.HOLD} · DROP {report.signals.DROP}</dd></div>
             <div><dt>권장도</dt><dd>{report.recommendationScore} / 10</dd></div>
           </dl>

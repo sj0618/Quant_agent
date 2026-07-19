@@ -16,7 +16,7 @@ test("product screens use analysis API data without product mock overlays", asyn
   assert.match(source, /id\.startsWith\(AI_REPORT_ID_PREFIX\)/);
 });
 
-test("product surfaces do not expose the retired universe concept", async () => {
+test("product surfaces do not expose retired candidate-scope fields", async () => {
   const sources = await Promise.all(
     [
       "../src/features/app/OverviewTab.tsx",

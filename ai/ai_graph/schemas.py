@@ -70,7 +70,6 @@ class SemanticSlots(BaseModel):
     price_basis: list[str] = Field(default_factory=list)
     event: list[str] = Field(default_factory=list)
     action: list[str] = Field(default_factory=list)
-    universe: str | None = None
     sector: str | None = None
     slot_evidence_refs: list[str] = Field(default_factory=list)
     missing_slots: list[str] = Field(default_factory=list)
@@ -93,7 +92,6 @@ class DataRequirement(BaseModel):
         "macro_fx_rates_commodities",
         "event",
         "disclosure",
-        "universe",
         "analyst_evidence",
     ]
     required: bool = True
@@ -218,7 +216,6 @@ class ScreeningMatch(BaseModel):
     name: str = Field(min_length=1)
     market: str = Field(min_length=1)
     sector: str | None = None
-    score: float
     as_of_date: str = Field(min_length=1)
     close: float | None = None
     matched_rules: list[str] = Field(default_factory=list)
@@ -234,7 +231,7 @@ class StrategyCandidateCard(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str | None = None
     sector: str | None = None
-    matches: list[ScreeningMatch] = Field(default_factory=list, max_length=10)
+    matches: list[ScreeningMatch] = Field(default_factory=list)
 
 
 class ClarificationOption(BaseModel):
@@ -257,7 +254,6 @@ class StrategySpec(BaseModel):
 
     strategy_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    universe: str = Field(min_length=1)
     market: str = Field(min_length=1)
     sector: str | None = None
     timeframe: str = Field(min_length=1)
@@ -421,7 +417,6 @@ class DailyDigestStrategyInput(BaseModel):
 
     strategy_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    universe: str = Field(min_length=1)
     timeframe: str = Field(min_length=1)
     today_signal: SignalAction
     targets: list[str] = Field(default_factory=list)

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import math
 import os
 import re
-import statistics
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
@@ -27,19 +25,13 @@ AI_BACKTEST_LOOKBACK_DAYS_ENV = "AI_BACKTEST_LOOKBACK_DAYS"
 AI_L4_EVIDENCE_LIMIT_ENV = "AI_L4_EVIDENCE_LIMIT"
 AI_DB_CONNECT_TIMEOUT_SECONDS_ENV = "AI_DB_CONNECT_TIMEOUT_SECONDS"
 AI_DB_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_STATEMENT_TIMEOUT_MS"
-AI_SCREENING_LIMIT_ENV = "AI_SCREENING_LIMIT"
-AI_SCREENING_BACKTEST_SELECTION_LIMIT_ENV = "AI_SCREENING_BACKTEST_SELECTION_LIMIT"
-AI_PORTFOLIO_BACKTEST_TICKER_LIMIT_ENV = "AI_PORTFOLIO_BACKTEST_TICKER_LIMIT"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_BACKTEST_LOOKBACK_YEARS = 10
 DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * DEFAULT_BACKTEST_LOOKBACK_YEARS
 DEFAULT_L4_EVIDENCE_LIMIT = 5
-# 유니버스 스크리닝/백테스트 후보 수를 좌우하던 3단계 상한. 예전에는 10 -> 10 -> 5로
-# 2000+ 종목 유니버스가 사실상 5종목(또는 1종목)만 거래되도록 잘려나갔다. 유니버스
-# 제한을 두지 않는 기획이므로 기본값은 전부 None(무제한)이며, 필요하면 아래 env로만
-# 값을 넣어 되살릴 수 있다.
+# 조건에 일치한 종목은 점수로 다시 줄이지 않고 모두 추천 결과에 남긴다.
 DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 20
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 30_000
 POSTGRES_TIMEOUT_UNIT = "ms"
@@ -52,13 +44,13 @@ TA_MOMENTUM_TICKER_TABLE = "feature.ta_momentum_ticker_daily"
 TA_TREND_TICKER_TABLE = "feature.ta_trend_ticker_daily"
 TA_VOLATILITY_TICKER_TABLE = "feature.ta_volatility_ticker_daily"
 TA_VOLUME_TICKER_TABLE = "feature.ta_volume_ticker_daily"
-UNIVERSE_VIEW = "mart.common_stock_universe_asof"
+CANDIDATE_POOL_VIEW = "mart.common_stock_universe_asof"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
 
 TICKER_PATTERN = re.compile(r"\b\d{6}\b")
 RSI_KEYS = ("rsi", "RSI", "rsi_14", "RSI_14", "talib_rsi_14", "TA_RSI_14")
-BROAD_UNIVERSE_TERMS = (
+MARKET_SCOPE_TERMS = (
     "KOSPI200",
     "KOSPI 200",
     "코스피200",
@@ -88,12 +80,8 @@ class DataSourceConfig(BaseModel):
     default_ticker: str = Field(default=DEFAULT_BACKTEST_TICKER, min_length=6, max_length=6)
     backtest_lookback_days: int = Field(default=DEFAULT_BACKTEST_LOOKBACK_DAYS, gt=0)
     l4_evidence_limit: int = Field(default=DEFAULT_L4_EVIDENCE_LIMIT, gt=0)
-    # None = 무제한(전체 유니버스 스크리닝/백테스트). 값을 넣으면 그만큼으로 캡핑된다.
-    screening_limit: int | None = Field(default=None, gt=0)
     connect_timeout_seconds: int = Field(default=DEFAULT_DB_CONNECT_TIMEOUT_SECONDS, gt=0)
     statement_timeout_ms: int = Field(default=DEFAULT_DB_STATEMENT_TIMEOUT_MS, gt=0)
-    screening_backtest_selection_limit: int | None = Field(default=None, gt=0)
-    portfolio_backtest_ticker_limit: int | None = Field(default=None, gt=0)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "DataSourceConfig":
@@ -109,18 +97,11 @@ class DataSourceConfig(BaseModel):
             l4_evidence_limit=_int_env(
                 env, AI_L4_EVIDENCE_LIMIT_ENV, DEFAULT_L4_EVIDENCE_LIMIT
             ),
-            screening_limit=_optional_int_env(env, AI_SCREENING_LIMIT_ENV),
             connect_timeout_seconds=_int_env(
                 env, AI_DB_CONNECT_TIMEOUT_SECONDS_ENV, DEFAULT_DB_CONNECT_TIMEOUT_SECONDS
             ),
             statement_timeout_ms=_int_env(
                 env, AI_DB_STATEMENT_TIMEOUT_MS_ENV, DEFAULT_DB_STATEMENT_TIMEOUT_MS
-            ),
-            screening_backtest_selection_limit=_optional_int_env(
-                env, AI_SCREENING_BACKTEST_SELECTION_LIMIT_ENV
-            ),
-            portfolio_backtest_ticker_limit=_optional_int_env(
-                env, AI_PORTFOLIO_BACKTEST_TICKER_LIMIT_ENV
             ),
         )
 
@@ -147,14 +128,14 @@ class PostgresPipelineDataSource:
             self._set_statement_timeout(conn)
             screening_candidates = []
             ticker_resolution = "screening"
-            if _query_requests_universe_screening(query):
+            if _query_requests_screening(query):
                 screening_candidates = self._fetch_screening_candidates(conn, query)
             single_ticker: str | None = None
             if not screening_candidates:
                 single_ticker = self._resolve_ticker(conn, query)
                 if single_ticker is None:
                     # Ambiguous query (no explicit ticker, no name match): retry as
-                    # an unfiltered universe screen instead of silently trading a
+                    # a broad condition screen instead of silently trading a
                     # single hardcoded default ticker.
                     screening_candidates = self._fetch_screening_candidates(conn, query)
                     ticker_resolution = (
@@ -165,20 +146,19 @@ class PostgresPipelineDataSource:
                 else:
                     ticker_resolution = "explicit_or_name_match"
             if screening_candidates:
-                tickers, universe, price_rows, effective_lookback_days, selection_score = (
-                    self._fetch_screening_portfolio_price_rows(
-                        conn, screening_candidates, query
-                    )
-                )
+                tickers = [str(item["ticker"]).zfill(6) for item in screening_candidates]
                 ticker = tickers[0]
+                symbol_info = self._fetch_symbol_info(conn, ticker)
+                price_rows, effective_lookback_days = self._fetch_price_rows(
+                    conn, ticker, symbol_info, query
+                )
             else:
                 ticker = single_ticker or self.config.default_ticker
                 tickers = [ticker]
-                universe = self._fetch_universe_status(conn, ticker)
+                symbol_info = self._fetch_symbol_info(conn, ticker)
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, ticker, universe, query
+                    conn, ticker, symbol_info, query
                 )
-                selection_score = None
             if not price_rows:
                 raise ValueError(f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}")
             l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
@@ -204,12 +184,11 @@ class PostgresPipelineDataSource:
                 ],
                 "price_rows": len(price_rows),
                 "screening_candidates": len(screening_candidates),
-                "screening_selection_score": selection_score,
                 "backtest_lookback_days": effective_lookback_days,
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_rows": len(l4_evidence),
-                "universe_source": UNIVERSE_VIEW,
-                "universe": universe,
+                "candidate_pool_source": CANDIDATE_POOL_VIEW,
+                "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
                 "macro_status": macro_status,
             },
@@ -218,84 +197,11 @@ class PostgresPipelineDataSource:
     def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
         profile = _screening_profile(query)
         sector = extract_sector_from_query(query, get_known_sectors(conn=conn))
-        limit = self.config.screening_limit
         params: list[Any] = []
         if sector:
             params.append(sector)
-        if limit is not None:
-            params.append(limit)
-        rows = conn.execute(
-            _screening_sql(profile, sector=sector, limit=limit), params
-        ).fetchall()
+        rows = conn.execute(_screening_sql(profile, sector=sector), params).fetchall()
         return [_screening_candidate_from_row(row, profile, sector=sector) for row in rows]
-
-    def _select_screening_backtest_candidate(
-        self, conn: Any, screening_candidates: list[dict[str, Any]], query: str
-    ) -> tuple[str, dict[str, Any], list[dict[str, Any]], int, float]:
-        best: tuple[float, str, dict[str, Any], list[dict[str, Any]], int] | None = None
-        for candidate in screening_candidates[: self.config.screening_backtest_selection_limit]:
-            ticker = str(candidate["ticker"]).zfill(6)
-            universe = self._fetch_universe_status(ticker=ticker, conn=conn)
-            price_rows, effective_lookback_days = self._fetch_price_rows(
-                conn, ticker, universe, query
-            )
-            if not price_rows:
-                continue
-            score = _screening_price_quality_score(price_rows)
-            if best is None or score > best[0]:
-                best = (score, ticker, universe, price_rows, effective_lookback_days)
-        if best is None:
-            ticker = str(screening_candidates[0]["ticker"]).zfill(6)
-            universe = self._fetch_universe_status(conn, ticker)
-            price_rows, effective_lookback_days = self._fetch_price_rows(
-                conn, ticker, universe, query
-            )
-            return ticker, universe, price_rows, effective_lookback_days, 0.0
-        score, ticker, universe, price_rows, effective_lookback_days = best
-        return ticker, universe, price_rows, effective_lookback_days, round(score, 6)
-
-    def _fetch_screening_portfolio_price_rows(
-        self, conn: Any, screening_candidates: list[dict[str, Any]], query: str
-    ) -> tuple[list[str], dict[str, Any], list[dict[str, Any]], int, float]:
-        ranked: list[tuple[float, str, dict[str, Any], list[dict[str, Any]], int]] = []
-        for candidate in screening_candidates[: self.config.screening_backtest_selection_limit]:
-            ticker = str(candidate["ticker"]).zfill(6)
-            universe = self._fetch_universe_status(conn, ticker)
-            price_rows, effective_lookback_days = self._fetch_price_rows(
-                conn, ticker, universe, query
-            )
-            if not price_rows:
-                continue
-            ranked.append(
-                (
-                    _screening_price_quality_score(price_rows),
-                    ticker,
-                    universe,
-                    price_rows,
-                    effective_lookback_days,
-                )
-            )
-        if not ranked:
-            ticker, universe, price_rows, effective_lookback_days, score = (
-                self._select_screening_backtest_candidate(conn, screening_candidates, query)
-            )
-            return [ticker], universe, price_rows, effective_lookback_days, score
-
-        selected = sorted(ranked, key=lambda item: item[0], reverse=True)[
-            : self.config.portfolio_backtest_ticker_limit
-        ]
-        tickers = [item[1] for item in selected]
-        combined_rows = [
-            row
-            for _score, _ticker, _universe, rows, _lookback_days in selected
-            for row in rows
-        ]
-        combined_rows.sort(key=lambda row: (str(row["date"]), str(row["ticker"]).zfill(6)))
-        effective_lookback_days = max(item[4] for item in selected)
-        primary_universe = dict(selected[0][2])
-        primary_universe["portfolio_tickers"] = tickers
-        average_score = sum(item[0] for item in selected) / len(selected)
-        return tickers, primary_universe, combined_rows, effective_lookback_days, round(average_score, 6)
 
     def _connect(self) -> Any:
         import psycopg
@@ -315,13 +221,13 @@ class PostgresPipelineDataSource:
 
         Returning None (instead of silently defaulting to
         `self.config.default_ticker`) lets `load()` retry ambiguous queries as
-        an unfiltered universe screen rather than always trading the same
+        a broad condition screen rather than always trading the same
         single hardcoded ticker.
         """
         explicit_ticker = TICKER_PATTERN.search(query)
         if explicit_ticker:
             return explicit_ticker.group(0)
-        if _has_broad_universe_reference(query) or _has_broad_screening_reference(query):
+        if _has_market_scope_reference(query) or _has_broad_screening_reference(query):
             return None
 
         rows = conn.execute(
@@ -343,21 +249,21 @@ class PostgresPipelineDataSource:
         return None
 
     def _fetch_price_rows(
-        self, conn: Any, ticker: str, universe: Mapping[str, Any], query: str
+        self, conn: Any, ticker: str, symbol_info: Mapping[str, Any], query: str
     ) -> tuple[list[dict[str, Any]], int]:
         lookback_days = self.config.backtest_lookback_days
-        price_rows = self._fetch_price_rows_for_lookback(conn, ticker, universe, lookback_days)
+        price_rows = self._fetch_price_rows_for_lookback(conn, ticker, symbol_info, lookback_days)
         if (
             _query_requires_rsi_oversold(query)
             and lookback_days < DEFAULT_BACKTEST_LOOKBACK_DAYS
             and not _has_rsi_oversold_entry(price_rows)
         ):
             lookback_days = DEFAULT_BACKTEST_LOOKBACK_DAYS
-            price_rows = self._fetch_price_rows_for_lookback(conn, ticker, universe, lookback_days)
+            price_rows = self._fetch_price_rows_for_lookback(conn, ticker, symbol_info, lookback_days)
         return price_rows, lookback_days
 
     def _fetch_price_rows_for_lookback(
-        self, conn: Any, ticker: str, universe: Mapping[str, Any], lookback_days: int
+        self, conn: Any, ticker: str, symbol_info: Mapping[str, Any], lookback_days: int
     ) -> list[dict[str, Any]]:
         calendar_lookback_days = (
             lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
@@ -386,7 +292,7 @@ class PostgresPipelineDataSource:
         )
         return [
             _price_row_from_feature_frame_record(
-                _feature_frame_row_from_sources(row, momentum_by_date, universe)
+                _feature_frame_row_from_sources(row, momentum_by_date, symbol_info)
             )
             for row in reversed(rows)
         ]
@@ -433,7 +339,7 @@ class PostgresPipelineDataSource:
         ).fetchall()
         return [_l4_evidence_from_report(row, trace_id) for row in rows]
 
-    def _fetch_universe_status(self, conn: Any, ticker: str) -> dict[str, Any]:
+    def _fetch_symbol_info(self, conn: Any, ticker: str) -> dict[str, Any]:
         row = conn.execute(
             """
             SELECT symbol, name, market_segment AS market, market_segment, listing_status
@@ -495,18 +401,18 @@ def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
                 KIS_FEATURE_FRAME_VIEW,
                 KIS_ADJUSTED_OHLCV_TABLE,
                 TA_MOMENTUM_TICKER_TABLE,
-                UNIVERSE_VIEW,
+                CANDIDATE_POOL_VIEW,
                 ANALYST_REPORT_TABLE,
             ],
         }
     )
 
 
-def _query_requests_universe_screening(query: str) -> bool:
+def _query_requests_screening(query: str) -> bool:
     return (
         TICKER_PATTERN.search(query) is None
         and (
-            _has_broad_universe_reference(query)
+            _has_market_scope_reference(query)
             or _has_broad_screening_reference(query)
             or extract_sector_from_query(query) is not None
         )
@@ -528,7 +434,7 @@ def _screening_profile(query: str) -> str:
     return "technical_proxy"
 
 
-def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None = None) -> str:
+def _screening_sql(profile: str, *, sector: str | None = None) -> str:
     where_clause = {
         "breakout_volume": (
             "close >= high_252 * 0.995 AND volume_ratio_20 >= 1.5 "
@@ -542,25 +448,25 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
             "bb_width > 0 AND bb_width <= 0.18 AND close >= bb_upper * 0.995"
         ),
         "relative_strength": "relative_strength_20d >= 0 AND relative_strength_60d >= 0",
-    }.get(profile, "technical_score > 0")
+    }.get(profile, "close > 0")
     sector_predicate = "\n              AND sm.sector = %s" if sector else ""
     return f"""
         WITH latest_date AS (
             SELECT max(time) AS as_of_date
             FROM feature.kis_adjusted_ohlcv_daily
         ),
-        latest_universe_date AS (
+        latest_candidate_date AS (
             SELECT max(as_of_date) AS as_of_date
             FROM mart.common_stock_universe_asof
         ),
-        universe AS (
+        candidate_pool AS (
             SELECT
                 symbol,
                 name,
                 market_segment AS market,
                 market_segment
             FROM mart.common_stock_universe_asof
-            WHERE as_of_date = (SELECT as_of_date FROM latest_universe_date)
+            WHERE as_of_date = (SELECT as_of_date FROM latest_candidate_date)
         ),
         prices AS (
             SELECT
@@ -576,7 +482,7 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
                 p.adj_close AS close,
                 p.adj_volume AS volume
             FROM feature.kis_adjusted_ohlcv_daily p
-            JOIN universe u
+            JOIN candidate_pool u
               ON u.symbol = p.ticker
             JOIN core.symbol_master sm
               ON sm.symbol = u.symbol
@@ -659,26 +565,18 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
                 avg(return_60d) AS market_return_60d
             FROM latest_rows
         ),
-        scored AS (
+        matched AS (
             SELECT
                 latest_rows.*,
                 COALESCE(return_20d, 0) - COALESCE(market.market_return_20d, 0) AS relative_strength_20d,
-                COALESCE(return_60d, 0) - COALESCE(market.market_return_60d, 0) AS relative_strength_60d,
-                (
-                    CASE WHEN close >= high_252 * 0.995 THEN 3 ELSE 0 END +
-                    CASE WHEN volume_ratio_20 >= 1.5 THEN 2 ELSE 0 END +
-                    CASE WHEN close > sma20 THEN 1 ELSE 0 END +
-                    CASE WHEN close > sma200 THEN 1 ELSE 0 END +
-                    CASE WHEN rsi <= 35 THEN 1 ELSE 0 END
-                ) AS technical_score
+                COALESCE(return_60d, 0) - COALESCE(market.market_return_60d, 0) AS relative_strength_60d
             FROM latest_rows
             CROSS JOIN market
         )
         SELECT *
-        FROM scored
+        FROM matched
         WHERE {where_clause}
-        ORDER BY technical_score DESC, turnover DESC NULLS LAST
-        {"LIMIT %s" if limit is not None else ""}
+        ORDER BY ticker
     """
 
 
@@ -695,7 +593,6 @@ def _screening_candidate_from_row(
         "sector": row.get("sector") or sector,
         "as_of_date": _date_value(row.get("time")).isoformat(),
         "screening_profile": profile,
-        "score": _float_value(row.get("technical_score") or 0),
         "close": close,
         "volume_ratio_20": volume_ratio,
         "rsi": _optional_float_value(row.get("rsi")),
@@ -703,43 +600,6 @@ def _screening_candidate_from_row(
         "relative_strength_60d": _optional_float_value(row.get("relative_strength_60d")),
         "matched_rules": _matched_screening_rules(row, profile),
     }
-
-
-def _screening_price_quality_score(price_rows: list[dict[str, Any]]) -> float:
-    closes = [_optional_float_value(row.get("close")) for row in price_rows]
-    prices = [value for value in closes if value is not None and value > 0]
-    if len(prices) < 30:
-        return float("-inf")
-    returns = [
-        after / before - 1
-        for before, after in zip(prices[:-1], prices[1:])
-        if before > 0
-    ]
-    if len(returns) < 2:
-        return float("-inf")
-    volatility = statistics.stdev(returns)
-    sharpe = (
-        statistics.mean(returns) / volatility * math.sqrt(TRADING_DAYS_PER_YEAR)
-        if volatility > 0
-        else 0.0
-    )
-    total_return = prices[-1] / prices[0] - 1
-    recent_window = min(252, len(prices) - 1)
-    recent_return = prices[-1] / prices[-recent_window] - 1 if prices[-recent_window] else 0.0
-    drawdown = _price_max_drawdown(prices)
-    calmar = total_return / abs(drawdown) if drawdown < 0 else 0.0
-    return sharpe + 0.35 * calmar + 0.25 * recent_return + 0.10 * total_return
-
-
-def _price_max_drawdown(prices: list[float]) -> float:
-    peak = prices[0]
-    max_drawdown = 0.0
-    for price in prices:
-        peak = max(peak, price)
-        if peak <= 0:
-            continue
-        max_drawdown = min(max_drawdown, price / peak - 1)
-    return max_drawdown
 
 
 def _matched_screening_rules(row: Mapping[str, Any], profile: str) -> list[str]:
@@ -814,9 +674,9 @@ def _data_availability_for_query(query: str, *, source: str) -> dict[str, Any]:
     }
 
 
-def _has_broad_universe_reference(query: str) -> bool:
+def _has_market_scope_reference(query: str) -> bool:
     normalized_query = query.upper()
-    return any(term.upper() in normalized_query for term in BROAD_UNIVERSE_TERMS)
+    return any(term.upper() in normalized_query for term in MARKET_SCOPE_TERMS)
 
 
 def _has_broad_screening_reference(query: str) -> bool:
@@ -864,14 +724,14 @@ def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, An
 def _feature_frame_row_from_sources(
     row: Mapping[str, Any],
     momentum_by_date: Mapping[date, Mapping[str, Any]],
-    universe: Mapping[str, Any],
+    symbol_info: Mapping[str, Any],
 ) -> dict[str, Any]:
     trade_date = _date_value(row["as_of_date"])
     return {
         **dict(row),
         "as_of_date": trade_date,
-        "name": universe.get("name") or "",
-        "market_segment": universe.get("market_segment") or "KRX",
+        "name": symbol_info.get("name") or "",
+        "market_segment": symbol_info.get("market_segment") or "KRX",
         "trend_values": {},
         "momentum_values": momentum_by_date.get(trade_date, {}),
         "volatility_values": {},
@@ -1004,11 +864,4 @@ def _int_env(env: Mapping[str, str], key: str, default: int) -> int:
     value = env.get(key)
     if value is None or not value.strip():
         return default
-    return int(value)
-
-
-def _optional_int_env(env: Mapping[str, str], key: str) -> int | None:
-    value = env.get(key)
-    if value is None or not value.strip():
-        return None
     return int(value)

@@ -63,9 +63,6 @@ def test_data_source_config_uses_quant_db_dsn_alias() -> None:
     assert config.database_dsn_env == QUANT_DB_DSN_ENV
     assert config.connect_timeout_seconds == 20
     assert config.statement_timeout_ms == 30_000
-    assert config.screening_limit is None
-    assert config.screening_backtest_selection_limit is None
-    assert config.portfolio_backtest_ticker_limit is None
 
 
 def test_data_source_config_normalizes_database_url_driver_prefix() -> None:
@@ -228,9 +225,9 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
             return None
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
-            if "FROM scored" in query:
+            if "FROM matched" in query:
                 assert "FROM mart.common_stock_universe_asof" in query
-                assert "JOIN universe u" in query
+                assert "JOIN candidate_pool u" in query
                 assert "JOIN core.symbol_master sm" in query
                 assert "sm.sector" in query
                 return Result(
@@ -244,7 +241,6 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
                             "volume_ratio_20": Decimal("1.8"),
                             "relative_strength_20d": Decimal("0.05"),
                             "relative_strength_60d": Decimal("0.1"),
-                            "technical_score": Decimal("7"),
                             "high_252": Decimal("200000"),
                             "sma20": Decimal("180000"),
                             "sma200": Decimal("150000"),
@@ -327,9 +323,9 @@ def test_postgres_data_source_filters_screening_by_sector() -> None:
             self.calls.append((query, params))
             if "DISTINCT sm.sector" in query:
                 return Result(rows=[{"sector": "반도체"}, {"sector": "화학"}])
-            if "FROM scored" in query:
+            if "FROM matched" in query:
                 assert "AND sm.sector = %s" in query
-                # No universe cap by default: only the sector filter param, no LIMIT.
+                # All condition matches are returned: only the sector filter param, no LIMIT.
                 assert params == ["반도체"]
                 assert "LIMIT" not in query
                 return Result(
@@ -344,7 +340,6 @@ def test_postgres_data_source_filters_screening_by_sector() -> None:
                             "volume_ratio_20": Decimal("1.8"),
                             "relative_strength_20d": Decimal("0.05"),
                             "relative_strength_60d": Decimal("0.1"),
-                            "technical_score": Decimal("7"),
                             "high_252": Decimal("200000"),
                             "sma20": Decimal("180000"),
                             "sma200": Decimal("150000"),
@@ -421,9 +416,9 @@ def test_postgres_data_source_screening_without_sector_has_no_sector_predicate()
         def execute(self, query: str, params: list[object] | None = None) -> Result:
             if "DISTINCT sm.sector" in query:
                 return Result(rows=[{"sector": "반도체"}, {"sector": "화학"}])
-            if "FROM scored" in query:
+            if "FROM matched" in query:
                 assert "AND sm.sector = %s" not in query
-                # No universe cap by default: no sector predicate and no LIMIT param.
+                # All condition matches are returned: no sector predicate and no LIMIT param.
                 assert params == []
                 assert "LIMIT" not in query
                 return Result(
@@ -438,7 +433,6 @@ def test_postgres_data_source_screening_without_sector_has_no_sector_predicate()
                             "volume_ratio_20": Decimal("1.8"),
                             "relative_strength_20d": Decimal("0.05"),
                             "relative_strength_60d": Decimal("0.1"),
-                            "technical_score": Decimal("7"),
                             "high_252": Decimal("200000"),
                             "sma20": Decimal("180000"),
                             "sma200": Decimal("150000"),
@@ -488,39 +482,6 @@ def test_postgres_data_source_screening_without_sector_has_no_sector_predicate()
     assert bundle.screening_candidates[0]["sector"] == "반도체"
 
 
-def test_default_screening_portfolio_keeps_every_candidate() -> None:
-    class PortfolioDataSource(PostgresPipelineDataSource):
-        def _fetch_universe_status(self, conn: object, ticker: str) -> dict[str, object]:
-            return {"ticker": ticker, "included": True}
-
-        def _fetch_price_rows(
-            self, conn: object, ticker: str, universe: dict[str, object], query: str
-        ) -> tuple[list[dict[str, object]], int]:
-            return (
-                [
-                    {
-                        "date": f"2026-01-{day:02d}",
-                        "ticker": ticker,
-                        "close": float(100 + int(ticker) + day),
-                    }
-                    for day in range(1, 32)
-                ],
-                31,
-            )
-
-    source = PortfolioDataSource(DataSourceConfig(database_dsn="postgresql://example"))
-    candidates = [{"ticker": f"{index:06d}"} for index in range(1, 13)]
-
-    tickers, universe, price_rows, _, _ = source._fetch_screening_portfolio_price_rows(
-        object(), candidates, "전체 종목을 찾아줘"
-    )
-
-    expected = {f"{index:06d}" for index in range(1, 13)}
-    assert set(tickers) == expected
-    assert {row["ticker"] for row in price_rows} == expected
-    assert set(universe["portfolio_tickers"]) == expected
-
-
 def test_postgres_data_source_ambiguous_query_falls_back_to_screening_not_default_ticker() -> None:
     class Result:
         def __init__(
@@ -546,7 +507,7 @@ def test_postgres_data_source_ambiguous_query_falls_back_to_screening_not_defaul
             return None
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
-            if "FROM scored" in query:
+            if "FROM matched" in query:
                 return Result(
                     rows=[
                         {
@@ -558,7 +519,6 @@ def test_postgres_data_source_ambiguous_query_falls_back_to_screening_not_defaul
                             "volume_ratio_20": Decimal("1.8"),
                             "relative_strength_20d": Decimal("0.05"),
                             "relative_strength_60d": Decimal("0.1"),
-                            "technical_score": Decimal("7"),
                             "high_252": Decimal("200000"),
                             "sma20": Decimal("180000"),
                             "sma200": Decimal("150000"),
@@ -585,7 +545,7 @@ def test_postgres_data_source_ambiguous_query_falls_back_to_screening_not_defaul
                 return Result(rows=[])
             if "mart.common_stock_universe_asof" in query:
                 # No explicit ticker/name in the query text, so name-matching
-                # over the universe listing finds nothing either.
+                # over the listed-symbol records finds nothing either.
                 return Result(
                     rows=[
                         {"symbol": "000660", "name": "SK하이닉스"},
@@ -601,7 +561,7 @@ def test_postgres_data_source_ambiguous_query_falls_back_to_screening_not_defaul
 
     source = AmbiguousDataSource(DataSourceConfig(database_dsn="postgresql://example"))
 
-    # No explicit 6-digit ticker, no broad-universe/broad-screening keyword,
+    # No explicit 6-digit ticker and no broad-screening keyword,
     # no recognizable sector, and no stock name substring match: this used to
     # silently fall back to the hardcoded default ticker (005930, Samsung
     # Electronics). It should now retry as an unfiltered screening pass.

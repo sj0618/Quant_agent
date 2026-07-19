@@ -747,7 +747,6 @@ def _default_rsi_strategy() -> StrategySpec:
     return StrategySpec(
         strategy_id="rsi_rebound_a",
         name="KOSPI200 RSI 과매도 반등",
-        universe="KOSPI200",
         market="KRX",
         timeframe="daily",
         entry_conditions=[],

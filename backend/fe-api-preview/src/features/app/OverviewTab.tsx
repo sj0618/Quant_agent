@@ -39,8 +39,8 @@ export function OverviewTab({ overview }: OverviewTabProps) {
         </div>
         <dl>
           <div>
-            <dt>유니버스</dt>
-            <dd>{overview.strategy.universe}</dd>
+            <dt>섹터</dt>
+            <dd>{overview.strategy.sector}</dd>
           </div>
           <div>
             <dt>매수 조건</dt>

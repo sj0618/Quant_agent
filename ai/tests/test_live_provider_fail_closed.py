@@ -177,7 +177,6 @@ def test_aoai_backtest_schema_failure_is_not_replaced_with_generated_code(monkey
     strategy = StrategySpec(
         strategy_id="rsi_rebound_a",
         name="RSI rebound",
-        universe="KOSPI200",
         market="KRX",
         timeframe="daily",
         entry_conditions=[{"left": "rsi", "operator": "lte", "right": 30}],
@@ -201,7 +200,6 @@ def test_aoai_unsafe_code_is_not_replaced_with_generated_code(monkeypatch) -> No
     strategy = StrategySpec(
         strategy_id="custom_a",
         name="Custom strategy",
-        universe="KOSPI200",
         market="KRX",
         timeframe="daily",
         entry_conditions=[{"left": "rsi", "operator": "lte", "right": 30}],
@@ -226,7 +224,6 @@ def test_aoai_unsafe_code_is_regenerated_once_with_validation_feedback(monkeypat
     strategy = StrategySpec(
         strategy_id="custom_a",
         name="Custom strategy",
-        universe="KOSPI200",
         market="KRX",
         timeframe="daily",
         entry_conditions=[{"left": "rsi", "operator": "lte", "right": 30}],
@@ -265,7 +262,6 @@ def test_aoai_runtime_incompatible_imports_are_regenerated_before_backtest(monke
     strategy = StrategySpec(
         strategy_id="custom_a",
         name="Custom strategy",
-        universe="KOSPI200",
         market="KRX",
         timeframe="daily",
         entry_conditions=[{"left": "rsi", "operator": "lte", "right": 30}],

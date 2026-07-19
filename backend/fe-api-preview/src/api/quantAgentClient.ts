@@ -271,7 +271,6 @@ function mapAIStrategySpec(strategy: AIStrategySpec, query: string): StrategySpe
   return {
     name: strategy.name,
     natural_language_strategy: query,
-    universe: formatUniverse(strategy),
     sector: strategy.indicators.length ? strategy.indicators.join(", ") : strategy.market,
     buy_condition: describeConditions(strategy.entry_conditions),
     hold_condition: strategy.timeframe,
@@ -279,10 +278,6 @@ function mapAIStrategySpec(strategy: AIStrategySpec, query: string): StrategySpe
     rebalance: TIMEFRAME_LABELS[strategy.timeframe] ?? strategy.timeframe,
     constraints: [...riskConstraints, ...strategy.assumptions],
   };
-}
-
-function formatUniverse(strategy: AIStrategySpec) {
-  return strategy.market ? `${strategy.market} · ${strategy.universe}` : strategy.universe;
 }
 
 function describeConditions(conditions: AICondition[]) {
