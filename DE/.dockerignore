@@ -1,0 +1,9 @@
+# 도커 빌드 시 무시할 파일 및 폴더 목록
+.git
+.env
+.venv
+data/
+airflow/logs/
+airflow/airflow.db
+**/__pycache__/
+*.pyc
