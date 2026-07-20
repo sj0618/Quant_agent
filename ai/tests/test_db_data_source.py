@@ -229,8 +229,10 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
             if "FROM scored" in query:
-                assert "JOIN meta.view_common_stock_universe u" in query
-                assert "JOIN core.symbol_master sm" in query
+                # Universe membership must come from actual OHLCV presence, not the
+                # (currently broken upstream) meta.view_common_stock_universe view.
+                assert "meta.view_common_stock_universe" not in query
+                assert "LEFT JOIN core.symbol_master sm" in query
                 assert "sm.sector" in query
                 return Result(
                     rows=[

@@ -53,6 +53,11 @@ TA_TREND_TICKER_TABLE = "feature.ta_trend_ticker_daily"
 TA_VOLATILITY_TICKER_TABLE = "feature.ta_volatility_ticker_daily"
 TA_VOLUME_TICKER_TABLE = "feature.ta_volume_ticker_daily"
 UNIVERSE_VIEW = "meta.view_common_stock_universe"
+# meta.view_common_stock_universe filters on core.symbol_master.listing_status, which is
+# currently bulk-broken upstream (see _resolve_ticker/_fetch_universe_status/_screening_sql):
+# every symbol reads as 'delisted'. Universe membership is derived from symbol_master directly
+# (scoped to KOSPI/KOSDAQ common stock) or from which tickers actually have OHLCV rows, instead.
+SYMBOL_MASTER_TABLE = "core.symbol_master"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
 
@@ -171,14 +176,22 @@ class PostgresPipelineDataSource:
                     )
                 )
                 ticker = tickers[0]
-            else:
-                ticker = single_ticker or self.config.default_ticker
+            elif single_ticker:
+                ticker = single_ticker
                 tickers = [ticker]
                 universe = self._fetch_universe_status(conn, ticker)
                 price_rows, effective_lookback_days = self._fetch_price_rows(
                     conn, ticker, universe, query
                 )
                 selection_score = None
+            else:
+                # No DB screening match and no explicit/name-resolved ticker: refuse to
+                # silently substitute config.default_ticker, since that produces a
+                # report that looks real but always trades the same hardcoded stock.
+                raise ValueError(
+                    "no screening candidates or resolvable ticker found in the database "
+                    "for this query; refusing to fall back to a hardcoded default ticker"
+                )
             if not price_rows:
                 raise ValueError(f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}")
             l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
@@ -208,7 +221,7 @@ class PostgresPipelineDataSource:
                 "backtest_lookback_days": effective_lookback_days,
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_rows": len(l4_evidence),
-                "universe_source": UNIVERSE_VIEW,
+                "universe_source": SYMBOL_MASTER_TABLE,
                 "universe": universe,
                 "macro_source": BOK_MACRO_VIEW,
                 "macro_status": macro_status,
@@ -324,11 +337,15 @@ class PostgresPipelineDataSource:
         if _has_broad_universe_reference(query) or _has_broad_screening_reference(query):
             return None
 
+        # core.symbol_master.listing_status is currently unreliable (bulk-marked
+        # 'delisted' by an ingestion issue on the DE side), so meta.view_common_stock_universe
+        # (which filters on it) returns 0 rows. Query symbol_master directly, scoped to the
+        # same market_segment/security_type the view otherwise applies, without listing_status.
         rows = conn.execute(
             """
             SELECT symbol, name
-            FROM meta.view_common_stock_universe
-            WHERE listing_status IS NULL OR listing_status = 'listed'
+            FROM core.symbol_master
+            WHERE market_segment IN ('KOSPI', 'KOSDAQ') AND security_type = '보통주'
             """
         ).fetchall()
         for row in rows:
@@ -432,10 +449,14 @@ class PostgresPipelineDataSource:
         return [_l4_evidence_from_report(row, trace_id) for row in rows]
 
     def _fetch_universe_status(self, conn: Any, ticker: str) -> dict[str, Any]:
+        # See _resolve_ticker: meta.view_common_stock_universe is unusable right now because
+        # its listing_status filter is bulk-broken upstream. Query symbol_master directly and
+        # treat "included" as "known KRX symbol", not "currently listed" (listing_status is
+        # still surfaced below for visibility, but not trusted as a filter).
         row = conn.execute(
             """
             SELECT symbol, name, market, market_segment, listing_status
-            FROM meta.view_common_stock_universe
+            FROM core.symbol_master
             WHERE symbol = %s
             LIMIT 1
             """,
@@ -539,6 +560,11 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
         "relative_strength": "relative_strength_20d >= 0 AND relative_strength_60d >= 0",
     }.get(profile, "technical_score > 0")
     sector_predicate = "\n              AND sm.sector = %s" if sector else ""
+    # Universe membership comes from feature.kis_adjusted_ohlcv_daily itself (a ticker is
+    # in-scope if it has recent adjusted-price rows), not meta.view_common_stock_universe —
+    # see SYMBOL_MASTER_TABLE comment above for why that view is unusable right now.
+    # core.symbol_master is still joined (LEFT, so a missing row can't drop a ticker) purely
+    # for display fields (name/market/sector), never as a membership filter.
     return f"""
         WITH latest_date AS (
             SELECT max(time) AS as_of_date
@@ -548,9 +574,9 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
             SELECT
                 p.time,
                 p.ticker,
-                u.name,
-                u.market,
-                u.market_segment,
+                sm.name,
+                sm.market,
+                sm.market_segment,
                 sm.sector,
                 p.adj_open AS open,
                 p.adj_high AS high,
@@ -558,10 +584,8 @@ def _screening_sql(profile: str, *, sector: str | None = None, limit: int | None
                 p.adj_close AS close,
                 p.adj_volume AS volume
             FROM feature.kis_adjusted_ohlcv_daily p
-            JOIN meta.view_common_stock_universe u
-              ON u.symbol = p.ticker
-            JOIN core.symbol_master sm
-              ON sm.symbol = u.symbol
+            LEFT JOIN core.symbol_master sm
+              ON sm.symbol = p.ticker
             WHERE p.time >= (SELECT as_of_date FROM latest_date) - INTERVAL '420 days'{sector_predicate}
         ),
         features AS (
