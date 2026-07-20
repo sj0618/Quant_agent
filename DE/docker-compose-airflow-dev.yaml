@@ -91,10 +91,12 @@ x-airflow-common:
 services:
   postgres:
     image: postgres:13
+    ports:
+      - "55000:5432"
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
+      POSTGRES_USER: qt_user
+      POSTGRES_PASSWORD: qt123!
+      POSTGRES_DB: qt_db
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
