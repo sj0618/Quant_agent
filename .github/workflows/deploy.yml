@@ -78,10 +78,13 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
-            export AUTH_ENABLED=1 AI_JOB_STORE=memory AI_AUDIT_SINK=noop
-            : "${REDIS_URL:?REDIS_URL must be configured when AUTH_ENABLED=1}"
-            : "${VITE_AUTH_API_BASE_URL:?VITE_AUTH_API_BASE_URL must be configured for Google login}"
-            export REDIS_URL VITE_AUTH_API_BASE_URL VITE_AI_API_BASE_URL=/ai-api
+            export AUTH_ENABLED="${AUTH_ENABLED:-1}" AI_JOB_STORE=memory AI_AUDIT_SINK=noop
+            if [ "$AUTH_ENABLED" = "1" ]; then
+              : "${REDIS_URL:?REDIS_URL must be configured when AUTH_ENABLED=1}"
+              : "${VITE_AUTH_API_BASE_URL:?VITE_AUTH_API_BASE_URL must be configured for Google login}"
+              export REDIS_URL VITE_AUTH_API_BASE_URL
+            fi
+            export VITE_AI_API_BASE_URL=/ai-api
             if [ "${AI_LLM_PROVIDER:-}" != "aoai" ]; then
               echo "AI_LLM_PROVIDER=aoai must be configured on the deploy server"
               exit 1
@@ -110,11 +113,15 @@ jobs:
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
             "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/backtest_module" -e "$APP_DIR/ai"
-            "$APP_DIR/ai/.venv/bin/python" -c \
-              'import os; from redis import Redis; client = Redis.from_url(os.environ["REDIS_URL"]); assert client.ping(), "Redis ping failed"; client.close()'
-            curl -fsS --max-time 15 "${VITE_AUTH_API_BASE_URL%/}/health" \
-              | "$APP_DIR/ai/.venv/bin/python" -c \
-                'import json, sys; status = json.load(sys.stdin); assert status.get("status") == "ok" and status.get("component") == "backend", "auth backend health check failed"'
+            if [ "$AUTH_ENABLED" = "1" ]; then
+              "$APP_DIR/ai/.venv/bin/python" -c \
+                'import os; from redis import Redis; client = Redis.from_url(os.environ["REDIS_URL"]); assert client.ping(), "Redis ping failed"; client.close()'
+              curl -fsS --max-time 15 "${VITE_AUTH_API_BASE_URL%/}/health" \
+                | "$APP_DIR/ai/.venv/bin/python" -c \
+                  'import json, sys; status = json.load(sys.stdin); assert status.get("status") == "ok" and status.get("component") == "backend", "auth backend health check failed"'
+            else
+              echo "AUTH_ENABLED=0: skipping Redis ping and auth backend health check"
+            fi
             timeout 1200 "$APP_DIR/ai/.venv/bin/python" -c \
               'from ai_graph import run_analysis; result = run_analysis("005930 RSI가 30 이하이면 매수하고 70 이상이면 매도"); assert result.status == "ready", "live analysis smoke test did not finish ready"'
 
