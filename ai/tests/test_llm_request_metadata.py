@@ -73,5 +73,5 @@ def test_market_brief_keeps_full_prompt_variables_and_identity(monkeypatch) -> N
     assert client.request.prompt_version == "v1"
     assert client.request.enable_web_search is True
     assert client.request.variables_jsonb["report_date"] == "2026-07-13"
-    assert client.request.variables_jsonb["strategy_universes"] == ["KOSPI200 RSI"]
+    assert client.request.variables_jsonb["strategy_names"] == ["KOSPI200 RSI"]
     assert "expected_json_schema" in client.request.variables_jsonb

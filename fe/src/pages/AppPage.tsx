@@ -8,6 +8,7 @@ import {
   getAnalysisJob,
   getWorkspaceTemplate,
   mergeAnalysisJobIntoOverview,
+  refreshLatestAnalysisJob,
   saveLatestAnalysisJob,
 } from "../api/quantAgentClient";
 import { OverviewTab } from "../features/app/OverviewTab";
@@ -173,6 +174,22 @@ export function AppPage() {
   const [conversationHistory, setConversationHistory] = useState<WorkspaceConversation[]>(readConversationHistory);
   const [pendingAnalysis, setPendingAnalysis] = useState<PendingAnalysis | null>(null);
   const [progressNow, setProgressNow] = useState(Date.now());
+
+  useEffect(() => {
+    let cancelled = false;
+    void refreshLatestAnalysisJob()
+      .then((latestJob) => {
+        if (!cancelled && latestJob) {
+          setAnalysisJobs((jobs) => (jobs.length ? jobs : [latestJob]));
+        }
+      })
+      .catch((refreshError) => {
+        console.warn("최신 AI 분석을 불러오지 못했습니다.", refreshError);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     writeConversationHistory(conversationHistory);

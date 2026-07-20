@@ -11,7 +11,6 @@ export interface AISemanticSlots {
   price_basis: string[];
   event: string[];
   action: string[];
-  universe?: string | null;
   slot_evidence_refs: string[];
   missing_slots: string[];
   contradictions: string[];
@@ -106,7 +105,6 @@ export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec
 export interface StrategySpec {
   name?: string;
   natural_language_strategy: string;
-  universe: string;
   sector: string;
   buy_condition: string;
   hold_condition: string;
@@ -125,7 +123,6 @@ export interface AICondition {
 export interface AIStrategySpec {
   strategy_id: string;
   name: string;
-  universe: string;
   market: string;
   timeframe: string;
   entry_conditions: AICondition[];
@@ -142,8 +139,9 @@ export interface AIScreeningMatch {
   name: string;
   market: string;
   sector?: string | null;
-  score: number;
   as_of_date: string;
+  close?: number | null;
+  matched_rules: string[];
 }
 
 export interface StrategyCandidateCard {
@@ -154,7 +152,7 @@ export interface StrategyCandidateCard {
   confidence: number;
   reason?: string | null;
   sector?: string | null;
-  matches?: AIScreeningMatch[];
+  matches: AIScreeningMatch[];
 }
 
 export interface AIClarificationOption {
@@ -257,7 +255,6 @@ export interface TradingCandidate {
   sector: string;
   signal: SignalType;
   confidence: number;
-  score: number;
   price: string;
   changePercent: string;
   rationale: string;
@@ -441,7 +438,6 @@ export interface StrategyReportSummary {
   id: string;
   name: string;
   description: string;
-  universe: string;
   timeframe: string;
   entrySummary: string;
   exitSummary: string;
@@ -474,7 +470,6 @@ export interface EmailDigestHistoryEntry {
 
 export interface ReportDetail extends ReportSummary {
   recipient: string;
-  strategyUniverse?: string;
   marketBrief: string;
   marketContext?: string;
   news: Array<{ rank: number; title: string; source: string; tone: Tone }>;

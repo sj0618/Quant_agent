@@ -238,7 +238,6 @@ def _ai_strategy_spec(*, query: str, strategy_id: str) -> dict[str, Any]:
     return {
         "strategy_id": strategy_id,
         "name": active.get("name") or "QuantAgent 전략",
-        "universe": active.get("universe") or "KOSPI200",
         "market": "KR",
         "timeframe": "daily",
         "entry_conditions": [

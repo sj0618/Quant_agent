@@ -41,7 +41,7 @@ export function LandingPage() {
       </nav>
 
       <section className="hero" id="service">
-        <Badge variant="dark">KOSPI200 LIVE · 매일 오전 8시 자동 분석</Badge>
+        <Badge variant="dark">KRX LIVE · 매일 오전 8시 자동 분석</Badge>
         <h1>
           자연어로 입력한 전략을,
           <br />
@@ -49,7 +49,7 @@ export function LandingPage() {
         </h1>
         <p>
           TA-Lib 150개 정형 팩터 + 애널리스트·뉴스·외국인 흐름 비정형 신호. LLM 멀티 에이전트가 매일 분석해서
-          KOSPI200 추천 종목을 보내드립니다.
+          조건 일치 추천 종목을 보내드립니다.
         </p>
         <div className="hero__actions">
           <Button onClick={() => window.location.assign(loginHref)} variant="primary">Google 계정으로 시작하기 →</Button>

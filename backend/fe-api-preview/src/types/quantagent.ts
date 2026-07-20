@@ -33,7 +33,6 @@ export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec
 export interface StrategySpec {
   name?: string;
   natural_language_strategy: string;
-  universe: string;
   sector: string;
   buy_condition: string;
   hold_condition: string;
@@ -52,7 +51,6 @@ export interface AICondition {
 export interface AIStrategySpec {
   strategy_id: string;
   name: string;
-  universe: string;
   market: string;
   timeframe: string;
   entry_conditions: AICondition[];

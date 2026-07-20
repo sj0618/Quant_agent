@@ -14,7 +14,6 @@ def make_strategy(strategy_id: str, name: str) -> StrategySpec:
     return StrategySpec(
         strategy_id=strategy_id,
         name=name,
-        universe="KOSPI200",
         market="KRX",
         timeframe="daily",
         entry_conditions=[Condition(left="rsi", operator=ConditionOperator.LTE, right=30)],
@@ -29,7 +28,6 @@ def make_breakout_strategy() -> StrategySpec:
     return StrategySpec(
         strategy_id="breakout_volume_momentum",
         name="KOSPI200 거래량 돌파 모멘텀",
-        universe="KOSPI200",
         market="KRX",
         timeframe="daily",
         entry_conditions=[

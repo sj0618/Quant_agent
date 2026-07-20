@@ -6,13 +6,10 @@
   - `fit_confidence`, `missing_fields`, `ambiguity_flags`, `clarification_questions`, `assumptions` 포함
 - `StrategySpec`
   - 프로젝트의 canonical 전략 명세
-  - `universe`, `entry_rules`, `exit_rules`, `position_sizing`, `risk_controls`, `research_overlay`, `backtest`, `reporting` 포함
+  - `entry_rules`, `exit_rules`, `position_sizing`, `risk_controls`, `backtest`, `reporting` 포함
 - `ParsedReport`
   - 애널리스트 리포트 구조화 결과
   - `llm_sentiment`, `extraction_confidence`, `available_at` 포함
-- `CandidateSnapshot`
-  - 특정 거래일에 유효한 후보군 스냅샷
-  - `effective_from`, `top_k_stocks`, `score_list`, `reason_trace` 포함
 - `BacktestPlan`
   - 템플릿 기반 백테스트 실행 계획
 - `SignalDecision`
@@ -22,31 +19,20 @@
 1. **메인 플로우를 그대로 유지하기 위해**
    - 사용자 자연어 전략 입력
    - 정형 전략 스펙 생성
-   - 종목/섹터 필터링
+   - 조건을 충족한 전체 종목 평가
    - 백테스트 코드 생성/실행
    - 결과 분석 및 리포트
 
-2. **V1 원칙을 구조체에 강제하기 위해**
-   - 리포트는 direct signal이 아니라 candidate filter
-   - 실제 매수/매도는 기술적 전략이 결정
-   - 따라서 `StrategySpec`과 `CandidateSnapshot`을 분리
+2. **조건 중심 평가를 강제하기 위해**
+   - 후보 점수나 상위 N개 선별 없이 진입·청산 조건을 직접 평가
 
-3. **A/B 백테스트를 지원하기 위해**
-   - 동일 `StrategySpec`으로
-     - 후보군 필터 O
-     - 후보군 필터 X
-     를 동시에 비교 가능
-   - `BacktestConfig.compare_filtered_vs_unfiltered`로 제어
-
-4. **PIT / lookahead bias 방지를 위해**
+3. **PIT / lookahead bias 방지를 위해**
    - `ParsedReport.available_at`
-   - `CandidateSnapshot.effective_from`
    를 명시
    - 장 마감 후 수집 리포트는 다음 거래일 시가부터 유효
 
-5. **설명 가능성을 확보하기 위해**
-   - 후보군 선정 이유를 `reason_trace`에 저장
-   - 리포트에서 “왜 이 종목을 골랐는가”를 바로 설명 가능
+4. **설명 가능성을 확보하기 위해**
+   - 조건별 충족 여부를 신호와 리포트에 보존
 
 ### 채택한 기본 주기
 - 리포트 수집: 영업일 1회

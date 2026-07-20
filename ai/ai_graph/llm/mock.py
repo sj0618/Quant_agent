@@ -746,8 +746,7 @@ def _strategy_and_variant_from_request(request: LLMJsonRequest) -> tuple[Strateg
 def _default_rsi_strategy() -> StrategySpec:
     return StrategySpec(
         strategy_id="rsi_rebound_a",
-        name="KOSPI200 RSI 과매도 반등",
-        universe="KOSPI200",
+        name="RSI 과매도 반등",
         market="KRX",
         timeframe="daily",
         entry_conditions=[],

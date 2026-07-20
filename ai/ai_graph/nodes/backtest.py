@@ -754,8 +754,6 @@ def _backtest_payload(
     payload = {
         "strategy_id": strategy.strategy_id,
         "market": strategy.market,
-        "universe": strategy.universe,
-        "selected_universe": {"name": strategy.universe, "tickers": tickers},
         "tickers": tickers,
         "price_rows": len(rows),
         "first_date": str(rows[0].get("date")) if rows else None,

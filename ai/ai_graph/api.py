@@ -5,7 +5,7 @@ from __future__ import annotations
 from os import environ
 from typing import Callable, ClassVar, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -23,7 +23,7 @@ from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
     BOK_MACRO_VIEW,
     KIS_ADJUSTED_OHLCV_TABLE,
-    UNIVERSE_VIEW,
+    SYMBOL_MASTER_TABLE,
     resolve_database_dsn_from_env,
 )
 from ai_graph.graph import run_analysis
@@ -71,7 +71,7 @@ class CreateAnalysisJobRequest(BaseModel):
             "examples": [
                 {
                     "query": (
-                        "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, "
+                        "RSI가 30 이하로 떨어진 상장 종목을 사고, "
                         "70 이상이면 팔고 싶어"
                     )
                 }
@@ -83,12 +83,12 @@ class CreateAnalysisJobRequest(BaseModel):
 
 
 class ParseStrategyRequest(BaseModel):
-    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+    # Ignore retired request keys from older frontends during the rolling deploy.
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
 
     natural_language: str | None = Field(default=None, min_length=1)
     query: str | None = Field(default=None, min_length=1)
     market: str | None = None
-    universe: str | None = None
     strategy_id: str | None = None
     selected_clarification_option_id: str | None = None
     client_request_id: str | None = None
@@ -113,11 +113,11 @@ class CreateDailyDigestRequest(BaseModel):
 
 
 class StrategyDescriptionInput(BaseModel):
-    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+    # Ignore retired keys from older frontends during the rolling deploy.
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
 
     strategy_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    universe: str = Field(min_length=1)
     timeframe: str = Field(min_length=1)
     entry_summary: str = Field(min_length=1)
     exit_summary: str = Field(min_length=1)
@@ -167,7 +167,7 @@ class DataSourceStatus(BaseModel):
     configured: bool
     dsn_env: str
     price_source: str
-    universe_source: str
+    candidate_pool_source: str
     l4_evidence_source: str
     macro_source: str
     macro_usable: bool
@@ -402,6 +402,18 @@ def create_app(
             ),
         )
 
+    @app.get(
+        ANALYSIS_JOBS_PATH,
+        response_model=list[AnalysisJob],
+        tags=["Analysis Jobs"],
+    )
+    def list_analysis_jobs(
+        limit: int = Query(default=100, ge=1, le=100),
+        user_id: str = Depends(require_user),
+    ) -> list[AnalysisJob]:
+        owned_jobs = (job for job in store.list_jobs(limit=100) if job.user_id == user_id)
+        return sorted(owned_jobs, key=lambda job: job.updated_at, reverse=True)[:limit]
+
     @app.post(
         SPEC_STRATEGY_PARSE_PATH,
         response_model=AnalysisJob,
@@ -458,14 +470,13 @@ def create_app(
                     payload = generate_strategy_description(
                         strategy_id=strategy.strategy_id,
                         name=strategy.name,
-                        universe=strategy.universe,
                         timeframe=strategy.timeframe,
                         entry_summary=strategy.entry_summary,
                         exit_summary=strategy.exit_summary,
                         risk_summary=strategy.risk_summary,
                         tags=strategy.tags,
                         fallback=(
-                            f"{strategy.universe} 내에서 {strategy.entry_summary} 조건이 맞는 종목을 선별하고 "
+                            f"{strategy.entry_summary} 조건이 맞는 종목을 선별하고 "
                             f"{strategy.exit_summary} 기준으로 정리하는 전략입니다."
                         ),
                     )
@@ -635,6 +646,12 @@ def _endpoint_statuses() -> list[EndpointStatus]:
         ),
         EndpointStatus(
             method="GET",
+            path=ANALYSIS_JOBS_PATH,
+            state="job_store",
+            summary="List the authenticated user's analysis job history.",
+        ),
+        EndpointStatus(
+            method="GET",
             path=ANALYSIS_JOB_DETAIL_PATH,
             state="job_store",
             summary="Read an analysis job from the configured job store.",
@@ -689,7 +706,7 @@ def _data_source_status() -> DataSourceStatus:
         configured=dsn_value is not None,
         dsn_env=dsn_env,
         price_source=KIS_ADJUSTED_OHLCV_TABLE,
-        universe_source=UNIVERSE_VIEW,
+        candidate_pool_source=SYMBOL_MASTER_TABLE,
         l4_evidence_source=ANALYST_REPORT_TABLE,
         macro_source=BOK_MACRO_VIEW,
         macro_usable=False,

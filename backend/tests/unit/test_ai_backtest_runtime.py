@@ -98,7 +98,6 @@ def test_sandboxed_backtest_executor_enforces_timeout():
         parsed_strategy_jsonb={
             "strategy_id": "loop_strategy",
             "name": "Loop Strategy",
-            "universe": "KOSPI200",
             "market": "KRX",
             "timeframe": "daily",
             "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}],
@@ -227,7 +226,6 @@ def test_aoai_code_generator_captures_full_model_call(monkeypatch):
         parsed_strategy_jsonb={
             "strategy_id": "rsi_rebound",
             "name": "RSI 반등",
-            "universe": "KOSPI200",
             "market": "KRX",
             "timeframe": "daily",
             "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}],
@@ -304,7 +302,6 @@ def test_aoai_code_generator_marks_provider_failure_and_keeps_prompt_for_fallbac
         parsed_strategy_jsonb={
             "strategy_id": "provider_failure",
             "name": "Provider Failure",
-            "universe": "KOSPI200",
             "market": "KRX",
             "timeframe": "daily",
             "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}],
@@ -483,7 +480,6 @@ def test_aoai_code_generator_marks_response_schema_fallback_as_failed(monkeypatc
         parsed_strategy_jsonb={
             "strategy_id": "wrong_schema",
             "name": "Wrong Schema",
-            "universe": "KOSPI200",
             "market": "KRX",
             "timeframe": "daily",
             "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}],

@@ -30,9 +30,6 @@ DATA_SOURCE_ENV_KEYS = (
     "AI_L4_EVIDENCE_LIMIT",
     "AI_DB_CONNECT_TIMEOUT_SECONDS",
     "AI_DB_STATEMENT_TIMEOUT_MS",
-    "AI_SCREENING_LIMIT",
-    "AI_SCREENING_BACKTEST_SELECTION_LIMIT",
-    "AI_PORTFOLIO_BACKTEST_TICKER_LIMIT",
     "AI_SECTOR_CACHE_TTL_SECONDS",
 )
 MOCK_PROVIDER_CREDENTIAL_ENV = "AI_AOAI_API_KEY"
@@ -62,7 +59,6 @@ def _daily_digest_strategy_payload(
     return {
         "strategy_id": strategy_id,
         "name": name,
-        "universe": "KOSPI200",
         "timeframe": "1d",
         "today_signal": signal,
         "targets": ["삼성전자"],
@@ -198,6 +194,31 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert polled_job["trace_id"] == created_job["trace_id"]
 
 
+def test_analysis_job_api_lists_only_authenticated_users_jobs_newest_first() -> None:
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store))
+
+    first = client.post(ANALYSIS_JOBS_PATH, json={"query": "첫 번째 RSI 전략"}).json()
+    second = client.post(ANALYSIS_JOBS_PATH, json={"query": "두 번째 이동평균 전략"}).json()
+    store.create_job("다른 사용자 전략", user_id="other-user")
+
+    response = client.get(ANALYSIS_JOBS_PATH)
+
+    assert response.status_code == 200
+    assert [job["job_id"] for job in response.json()] == [second["job_id"], first["job_id"]]
+
+
+def test_analysis_job_api_list_honors_limit() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+    _ = client.post(ANALYSIS_JOBS_PATH, json={"query": "첫 번째 RSI 전략"})
+    second = client.post(ANALYSIS_JOBS_PATH, json={"query": "두 번째 이동평균 전략"}).json()
+
+    response = client.get(f"{ANALYSIS_JOBS_PATH}?limit=1")
+
+    assert response.status_code == 200
+    assert [job["job_id"] for job in response.json()] == [second["job_id"]]
+
+
 def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monkeypatch) -> None:
     for key in DATA_SOURCE_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
@@ -299,7 +320,6 @@ def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adap
         json={
             "natural_language": "최근 52주 신고가를 돌파했고 거래량이 20일 평균 대비 150% 이상 증가한 종목을 찾아줘.",
             "market": "KR",
-            "universe": "KOSPI200",
             "client_request_id": "client-1",
         },
     )
@@ -342,7 +362,6 @@ def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:
                 {
                     "strategy_id": "semiconductor-momentum",
                     "name": "반도체 모멘텀 + 기관 매수",
-                    "universe": "KOSPI200 · 반도체",
                     "timeframe": "daily",
                     "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
                     "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
@@ -371,7 +390,6 @@ def test_strategy_descriptions_route_records_per_item_audit_steps() -> None:
                 {
                     "strategy_id": "semiconductor-momentum",
                     "name": "반도체 모멘텀 + 기관 매수",
-                    "universe": "KOSPI200 · 반도체",
                     "timeframe": "daily",
                     "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
                     "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
@@ -381,7 +399,6 @@ def test_strategy_descriptions_route_records_per_item_audit_steps() -> None:
                 {
                     "strategy_id": "dividend-defensive",
                     "name": "배당 방어주",
-                    "universe": "KOSPI200",
                     "timeframe": "daily",
                     "entry_summary": "배당수익률과 재무안정성이 높은 종목을 찾습니다.",
                     "exit_summary": "배당 컷 또는 추세 훼손 시 비중을 줄입니다.",
@@ -430,7 +447,6 @@ def test_strategy_descriptions_route_records_sanitized_error_audit_events(monkey
                     {
                         "strategy_id": "semiconductor-momentum",
                         "name": "반도체 모멘텀 + 기관 매수",
-                        "universe": "KOSPI200 · 반도체",
                         "timeframe": "daily",
                         "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
                         "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
@@ -690,7 +706,6 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
             {
                 "strategy_id": "rsi",
                 "name": "RSI",
-                "universe": "KOSPI200",
                 "timeframe": "daily",
                 "entry_summary": "RSI 30 이하",
                 "exit_summary": "RSI 70 이상",

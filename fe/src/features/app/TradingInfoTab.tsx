@@ -32,14 +32,14 @@ export function TradingInfoTab({ candidates }: TradingInfoTabProps) {
       <Card className="list-head">
         <div>
           <h1>매매종목 정보 <Badge variant="soft">총 {candidates.length}건</Badge></h1>
-          <p>오늘 08:00 분석 · 반도체 모멘텀 + 기관 매수 회귀 전략</p>
+          <p>최신 분석 · 조건 일치 종목 전체</p>
         </div>
         <div className="filter-row">
           <Badge variant="dark">ALL {candidates.length}</Badge>
           <Badge signal="BUY">BUY {counts.BUY}</Badge>
           <Badge signal="HOLD">HOLD {counts.HOLD}</Badge>
           <Badge signal="DROP">DROP {counts.DROP}</Badge>
-          <Badge variant="soft">점수 높은 순 ▾</Badge>
+          <Badge variant="soft">종목코드 순</Badge>
         </div>
       </Card>
 

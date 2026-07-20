@@ -89,7 +89,6 @@ replaced by an SDK-backed implementation behind the same `LLMClient` interface.
     {
       "strategy_id": "semiconductor-momentum",
       "name": "반도체 모멘텀 + 기관 매수",
-      "universe": "KOSPI200 · 반도체",
       "timeframe": "daily",
       "entry_summary": "20일 상대강도 상위권이면서 외국인 순매수가 동반된 종목만 진입 후보로 올립니다.",
       "exit_summary": "상대강도 둔화 또는 외국인 수급 반전이 확인되면 비중을 축소합니다.",
@@ -196,7 +195,7 @@ those DB tables.
 
 ## StrategySpec
 
-Canonical fields: `strategy_id`, `name`, `universe`, `market`, `timeframe`,
+Canonical fields: `strategy_id`, `name`, `market`, `timeframe`,
 `entry_conditions`, `exit_conditions`, `indicators`, `risk_constraints`,
 `assumptions`, `source_refs`, `confidence`.
 

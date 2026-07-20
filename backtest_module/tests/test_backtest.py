@@ -140,14 +140,14 @@ def test_multi_ticker_buys_respect_single_and_gross_exposure_limits():
     assert result.equity_curve[-1].positions_value <= 500
 
 
-def test_full_krx_universe_of_2000_tickers_runs():
+def test_all_2000_krx_tickers_run_without_score_filtering():
     tickers = tuple(f"{index:06d}" for index in range(1, 2001))
     trade_dates = (date(2026, 1, 2), date(2026, 1, 5))
     initial_capital = 100_000_000
     result = run_backtest(
         StrategySpec(
-            strategy_id="full_krx_universe",
-            strategy_name="Full KRX Universe",
+            strategy_id="all_krx_matches",
+            strategy_name="All KRX Matches",
             entry_rules=[Condition(left="rsi_14", operator=ConditionOperator.LTE, right=30)],
             exit_rules=[Condition(left="rsi_14", operator=ConditionOperator.GTE, right=70)],
             position_sizing=PositionSizing(max_positions=len(tickers)),

@@ -13,7 +13,6 @@ def make_strategy(risk_constraints: dict | None = None) -> StrategySpec:
     return StrategySpec(
         strategy_id="rsi_rebound_test",
         name="RSI Rebound Test",
-        universe="KOSPI200",
         market="KRX",
         timeframe="daily",
         entry_conditions=[

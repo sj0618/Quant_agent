@@ -1175,7 +1175,8 @@ class SqlAIBacktestRepository:
                         "benchmark_ticker": run.benchmark_ticker,
                         "data_source": run.data_source,
                         "strategy_snapshot_jsonb": _json_dumps(run.strategy_snapshot_jsonb),
-                        "universe_snapshot_jsonb": _json_dumps(run.universe_snapshot_jsonb),
+                        # The database column keeps its legacy name for migration compatibility.
+                        "universe_snapshot_jsonb": _json_dumps(run.candidate_snapshot_jsonb),
                         "as_of_at": run.as_of_at,
                         "status": run.status,
                         "started_at": run.started_at,

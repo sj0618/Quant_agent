@@ -196,7 +196,7 @@ async def get_api_status() -> dict[str, Any]:
             "configured": True,
             "dsn_env": "BACKEND_STATIC_FE_CONTRACT",
             "price_source": "backend/app/data/fe_mock_contract.json",
-            "universe_source": "backend/app/data/fe_mock_contract.json",
+            "candidate_pool_source": "backend/app/data/fe_mock_contract.json",
             "l4_evidence_source": "backend/app/data/fe_mock_contract.json",
             "macro_source": "backend/app/data/fe_mock_contract.json",
             "macro_usable": True,

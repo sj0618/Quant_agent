@@ -19,7 +19,6 @@
         {
           "strategy_id": "string",
           "name": "string",
-          "universe": "string",
           "timeframe": "string",
           "today_signal": "BUY | HOLD | DROP",
           "targets": ["종목명", "..."],

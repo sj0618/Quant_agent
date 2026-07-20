@@ -82,7 +82,6 @@ const EMPTY_PERFORMANCE: PerformanceSummary = {
 const EMPTY_WORKSPACE: AppOverview = {
   strategy: {
     natural_language_strategy: "",
-    universe: "",
     sector: "",
     buy_condition: "",
     hold_condition: "",
@@ -109,7 +108,6 @@ const EMPTY_WORKSPACE: AppOverview = {
 interface StrategyDescriptionApiInput {
   strategy_id: string;
   name: string;
-  universe: string;
   timeframe: string;
   entry_summary: string;
   exit_summary: string;
@@ -173,7 +171,6 @@ function buildStrategyDescriptionInput(strategy: StrategyReportSummary): Strateg
   return {
     strategy_id: strategy.id,
     name: strategy.name,
-    universe: strategy.universe,
     timeframe: strategy.timeframe,
     entry_summary: strategy.entrySummary,
     exit_summary: strategy.exitSummary,
@@ -276,21 +273,39 @@ export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
   return job;
 }
 
+async function listAnalysisJobs(limit = 100): Promise<AnalysisJob[]> {
+  const response = await fetchAI(`${AI_ENDPOINTS.analysisJobs}?limit=${limit}`);
+  assertOk(response);
+  return (await response.json()) as AnalysisJob[];
+}
+
 export async function refreshLatestAnalysisJob(): Promise<AnalysisJob | null> {
   const storedJob = readLatestAnalysisJob();
-  if (!storedJob) {
-    return null;
-  }
   if (!appConfig.aiApiBaseUrl) {
     return storedJob;
   }
 
   try {
-    return await getAnalysisJob(storedJob.job_id);
+    if (storedJob) {
+      return await getAnalysisJob(storedJob.job_id);
+    }
+    const [latestJob] = await listAnalysisJobs(1);
+    if (latestJob) {
+      saveLatestAnalysisJob(latestJob);
+    }
+    return latestJob ?? null;
   } catch (error) {
-    if (error instanceof AIResponseError && [401, 403, 404].includes(error.status)) {
+    if (error instanceof AIResponseError && [401, 403].includes(error.status)) {
       clearLatestAnalysisJob();
       throw error;
+    }
+    if (error instanceof AIResponseError && error.status === 404) {
+      clearLatestAnalysisJob();
+      const [latestJob] = await listAnalysisJobs(1);
+      if (latestJob) {
+        saveLatestAnalysisJob(latestJob);
+      }
+      return latestJob ?? null;
     }
     console.warn("최신 AI 분석 job 갱신에 실패해 저장된 결과를 사용합니다.", error);
     return storedJob;
@@ -344,31 +359,35 @@ export function getWorkspaceTemplate(): Promise<AppOverview> {
 }
 
 export async function getReports(): Promise<ReportSummary[]> {
-  const latestJob = await refreshLatestAnalysisJob();
-  const latestReport = latestJob ? buildReportSummaryFromAnalysisJob(latestJob) : null;
-  return latestReport ? [latestReport] : [];
+  const jobs = await listAnalysisJobs();
+  return jobs.map(buildReportSummaryFromAnalysisJob).filter((report): report is ReportSummary => report !== null);
 }
 
 export async function getReportStrategies(): Promise<StrategyReportSummary[]> {
-  const latestJob = await refreshLatestAnalysisJob();
-  const strategy = latestJob ? buildStrategyReportSummaryFromAnalysisJob(latestJob) : null;
-  return strategy ? hydrateStrategyDescriptions([strategy]) : [];
+  const jobs = await listAnalysisJobs();
+  const strategies = jobs
+    .map(buildStrategyReportSummaryFromAnalysisJob)
+    .filter((strategy): strategy is StrategyReportSummary => strategy !== null)
+    .filter((strategy, index, all) => all.findIndex((candidate) => candidate.id === strategy.id) === index);
+  return hydrateStrategyDescriptions(strategies);
 }
 
 export async function getStrategyReportById(id: string): Promise<StrategyReportDetail | null> {
-  const latestJob = await refreshLatestAnalysisJob();
-  const strategy = latestJob ? buildStrategyReportSummaryFromAnalysisJob(latestJob) : null;
-  const report = latestJob ? buildReportDetailFromAnalysisJob(latestJob) : null;
-  if (!strategy || strategy.id !== id || !report) {
+  const jobs = (await listAnalysisJobs()).filter((job) => job.result?.strategy_spec?.strategy_id === id);
+  const strategy = jobs.length ? buildStrategyReportSummaryFromAnalysisJob(jobs[0]) : null;
+  if (!strategy) {
     return null;
   }
   const [hydratedStrategy] = await hydrateStrategyDescriptions([strategy]);
-  return { strategy: hydratedStrategy, emailReports: [report] };
+  const emailReports = jobs
+    .map(buildReportDetailFromAnalysisJob)
+    .filter((report): report is ReportDetail => report !== null);
+  return { strategy: hydratedStrategy, emailReports };
 }
 
 export async function getStrategyWorkspaceOverview(id: string): Promise<AppOverview | null> {
-  const latestJob = await refreshLatestAnalysisJob();
-  if (!latestJob || latestJob.result?.strategy_spec?.strategy_id !== id) {
+  const latestJob = (await listAnalysisJobs()).find((job) => job.result?.strategy_spec?.strategy_id === id);
+  if (!latestJob) {
     return null;
   }
   return mergeAnalysisJobIntoOverview(clone(EMPTY_WORKSPACE), latestJob);
@@ -395,7 +414,6 @@ function mapAIStrategySpec(strategy: AIStrategySpec, query: string): StrategySpe
   return {
     name: strategy.name,
     natural_language_strategy: query,
-    universe: formatUniverse(strategy),
     sector: strategy.indicators.length ? strategy.indicators.join(", ") : strategy.market,
     buy_condition: describeConditions(strategy.entry_conditions),
     hold_condition: strategy.timeframe,
@@ -403,10 +421,6 @@ function mapAIStrategySpec(strategy: AIStrategySpec, query: string): StrategySpe
     rebalance: TIMEFRAME_LABELS[strategy.timeframe] ?? strategy.timeframe,
     constraints: [...riskConstraints, ...strategy.assumptions],
   };
-}
-
-function formatUniverse(strategy: AIStrategySpec) {
-  return strategy.market ? `${strategy.market} · ${strategy.universe}` : strategy.universe;
 }
 
 function describeConditions(conditions: AICondition[]) {
@@ -540,29 +554,25 @@ function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandida
   const byTicker = new Map<string, { match: AIScreeningMatch; card: (typeof result.user_payload.candidate_cards)[number] }>();
   for (const card of result.user_payload.candidate_cards) {
     for (const match of card.matches ?? []) {
-      const existing = byTicker.get(match.ticker);
-      if (!existing || match.score > existing.match.score) {
+      if (!byTicker.has(match.ticker)) {
         byTicker.set(match.ticker, { match, card });
       }
     }
   }
 
-  return Array.from(byTicker.values())
-    .sort((a, b) => b.match.score - a.match.score)
-    .map(({ match, card }) => ({
-      id: `${job.job_id}-${match.ticker}`,
-      ticker: match.ticker,
-      name: match.name,
-      sector: match.sector ?? card.sector ?? "",
-      signal: signal.action,
-      confidence: signal.confidence ?? 0,
-      score: match.score,
-      price: "—",
-      changePercent: "—",
-      rationale: card.reason ?? card.summary,
-      evidence: [],
-      riskReasons: [],
-    }));
+  return Array.from(byTicker.values()).map(({ match, card }) => ({
+    id: `${job.job_id}-${match.ticker}`,
+    ticker: match.ticker,
+    name: match.name,
+    sector: match.sector ?? card.sector ?? "",
+    signal: signal.action,
+    confidence: signal.confidence ?? 0,
+    price: "—",
+    changePercent: "—",
+    rationale: card.reason ?? card.summary,
+    evidence: [],
+    riskReasons: [],
+  }));
 }
 
 function buildStrategyReportSummaryFromAnalysisJob(job: AnalysisJob): StrategyReportSummary | null {
@@ -579,7 +589,6 @@ function buildStrategyReportSummaryFromAnalysisJob(job: AnalysisJob): StrategyRe
     id: strategy.strategy_id,
     name: strategy.name,
     description: report.summary,
-    universe: formatUniverse(strategy),
     timeframe: TIMEFRAME_LABELS[strategy.timeframe] ?? strategy.timeframe,
     entrySummary: describeConditions(strategy.entry_conditions),
     exitSummary: describeConditions(strategy.exit_conditions),
@@ -607,7 +616,6 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
   return {
     ...summary,
     recipient: "",
-    strategyUniverse: result.strategy_spec?.universe,
     marketBrief: report.web_projection.summary,
     news: report.web_projection.sections.map((section, index) => ({
       rank: index + 1,
@@ -615,13 +623,51 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
       source: "QuantAgent AI",
       tone: toneForStatus(result.status),
     })),
-    candidates: [],
+    candidates: buildTradingCandidatesFromAnalysisJob(job),
     signalAxes: [],
     riskManagerOverride: report.risk_adjustments.length ? describeRiskAdjustments(report.risk_adjustments) : "Risk Manager 변경 없음",
     conclusion: report.web_projection.summary,
     performance: { metrics: performance.metrics, disclaimer: performance.disclaimer },
     costNotes: result.user_payload.next_actions,
   };
+}
+
+function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandidate[] {
+  const result = job.result;
+  if (!result) {
+    return [];
+  }
+  const finalSignal = result.user_payload.report ? extractFinalSignal(result.user_payload.report) : null;
+  const signal = finalSignal?.action ?? "HOLD";
+  const candidates = result.user_payload.candidate_cards.flatMap((card) =>
+    (card.matches ?? []).map((match) => {
+      const matchedRules = match.matched_rules ?? [];
+      const rationale = matchedRules.length ? matchedRules.join(" · ") : card.reason ?? card.summary;
+      return {
+        id: match.ticker,
+        ticker: match.ticker,
+        name: match.name,
+        sector: match.sector ?? card.sector ?? match.market,
+        signal,
+        confidence: card.confidence,
+        price: match.close == null ? "—" : `${new Intl.NumberFormat(APP_LOCALE).format(match.close)}원`,
+        changePercent: "—",
+        rationale,
+        evidence: [
+          {
+            provider: "QuantAgent DB screening",
+            title: card.title,
+            date: match.as_of_date,
+            summary: rationale,
+          },
+        ],
+        riskReasons: [],
+      } satisfies TradingCandidate;
+    }),
+  );
+  return candidates.filter(
+    (candidate, index, all) => all.findIndex((item) => item.ticker === candidate.ticker) === index,
+  );
 }
 
 function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: PerformanceSummary): PerformanceSummary {

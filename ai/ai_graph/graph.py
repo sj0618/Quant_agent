@@ -643,7 +643,6 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
     else:
         action.append("find_candidates")
 
-    universe = "KOSPI200" if "KOSPI200" in query.upper() else "KRX"
     sector = extract_sector_from_query(query, get_known_sectors())
     if not indicator:
         missing_slots.append("indicator")
@@ -662,7 +661,6 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
         price_basis=_unique(price_basis),
         event=_unique(event),
         action=_unique(action),
-        universe=universe,
         sector=sector,
         slot_evidence_refs=[f"semantic:{trace_id}:deterministic"],
         missing_slots=missing_slots,
@@ -673,18 +671,7 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
 
 
 def plan_data_requirements(semantic_slots: SemanticSlots) -> list[DataRequirement]:
-    requirements: list[DataRequirement] = [
-        DataRequirement(
-            family="universe",
-            availability="available",
-            owner="ai_graph",
-            preferred_source="internal_db",
-            fallback_sources=["krx"],
-            freshness_requirement="not_time_sensitive",
-            source_confidence_floor=0.8,
-            evidence_ref="data-plan:universe",
-        )
-    ]
+    requirements: list[DataRequirement] = []
     indicators = set(semantic_slots.indicator)
     events = set(semantic_slots.event)
     if indicators & {"rsi", "bollinger", "volume", "sma_20", "sma_200"} or events & {"lower_band_reentry", "new_52w_high", "upper_band_breakout"}:
@@ -744,8 +731,7 @@ def build_source_usage(
             pipeline_metadata.get("source") == "postgres"
             and requirement.preferred_source == "internal_db"
         )
-        source_ref_key = "universe_source" if requirement.family == "universe" else "price_source"
-        source_ref = pipeline_metadata.get(source_ref_key) if uses_postgres else None
+        source_ref = pipeline_metadata.get("price_source") if uses_postgres else None
         usage.append(
             SourceUsage(
                 source_type="internal_db" if uses_postgres else "none",
@@ -777,8 +763,8 @@ def build_evidence_refs(source_usage: list[SourceUsage], *, trace_id: str) -> li
 
 def data_source_inventory() -> list[dict[str, Any]]:
     return [
-        {"source_type": "internal_db", "families": ["ohlcv_ta", "universe", "analyst_evidence"], "live_required": False},
-        {"source_type": "krx", "families": ["ohlcv_ta", "universe"], "live_required": False},
+        {"source_type": "internal_db", "families": ["ohlcv_ta", "analyst_evidence"], "live_required": False},
+        {"source_type": "krx", "families": ["ohlcv_ta"], "live_required": False},
         {"source_type": "dart", "families": ["disclosure", "event", "fundamentals"], "live_required": False},
         {"source_type": "aoai_web_search", "families": ["event", "macro_fx_rates_commodities", "consensus_guidance"], "live_required": False},
         {"source_type": "analyst_evidence", "families": ["analyst_evidence", "consensus_guidance"], "live_required": False},
@@ -817,10 +803,6 @@ def strategy_candidate_cards(
     return cards
 
 
-# 리포트/카드에 표시되는 스크리닝 매치 개수 상한(표시 전용, 백테스트 유니버스 크기와는 무관).
-SCREENING_MATCH_DISPLAY_LIMIT = 5
-
-
 def _attach_screening_matches(
     cards: list[StrategyCandidateCard],
     screening_candidates: list[dict[str, Any]],
@@ -839,10 +821,11 @@ def _attach_screening_matches(
             name=c["name"],
             market=c["market"],
             sector=c.get("sector"),
-            score=c["score"],
             as_of_date=c["as_of_date"],
+            close=c.get("close"),
+            matched_rules=c.get("matched_rules", []),
         )
-        for c in filtered[:SCREENING_MATCH_DISPLAY_LIMIT]
+        for c in filtered
     ]
     primary = cards[0].model_copy(
         update={
@@ -1104,7 +1087,7 @@ def _static_strategy_candidate_cards(query: str) -> list[StrategyCandidateCard]:
             strategy_id="rsi_mean_reversion",
             title="RSI 평균회귀",
             summary="RSI 30 이하 매수, 70 이상 청산.",
-            key_conditions=["KOSPI200", "RSI <= 30", "RSI >= 70"],
+            key_conditions=["RSI <= 30", "RSI >= 70"],
             confidence=0.86,
             reason="과매도/과매수 기준이 명확한 기본 후보입니다.",
         ),
@@ -1397,7 +1380,6 @@ def build_strategy_spec(
 ) -> StrategySpec:
     profile = _strategy_profile(query, semantic_slots=semantic_slots)
     slots = semantic_slots or {}
-    universe = str(slots.get("universe") or "KOSPI200")
     sector = slots.get("sector")
     conditions = generate_strategy_conditions(
         query=query,
@@ -1412,7 +1394,6 @@ def build_strategy_spec(
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
         name=str(profile["name"]),
-        universe=universe,
         market="KRX",
         sector=sector,
         timeframe="daily",
@@ -1421,7 +1402,7 @@ def build_strategy_spec(
         indicators=conditions.indicators or profile["indicators"],
         risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
         assumptions=[
-            f"{universe} universe" + (f" filtered to {sector} sector" if sector else ""),
+            f"sector filter: {sector}" if sector else "all matching listed common stocks",
             "daily adjusted close data",
             *profile["assumptions"],
         ],
@@ -1509,7 +1490,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if _is_pullback_rsi_volume_query(query):
         return {
             "strategy_id": "pullback_rsi_volume",
-            "name": "KOSPI200 RSI40 거래량 눌림목",
+            "name": "RSI40 거래량 눌림목",
             "entry_conditions": [
                 Condition(left="close_above_sma_200", operator="eq", right=1, description="주가가 200일선 위"),
                 Condition(left="rsi", operator="lte", right=40, description="RSI(14) <= 40 눌림"),
@@ -1530,7 +1511,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "dividend_defensive" in lowered or "배당 방어주" in query:
         return {
             "strategy_id": "dividend_defensive",
-            "name": "KOSPI200 배당 방어주",
+            "name": "배당 방어주",
             "entry_conditions": [
                 Condition(left="dividend_yield", operator="gte", right=0.04, description="배당수익률 4% 이상"),
                 Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
@@ -1550,7 +1531,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "value_quality" in lowered or "저평가 퀄리티" in query:
         return {
             "strategy_id": "value_quality",
-            "name": "KOSPI200 저평가 퀄리티",
+            "name": "저평가 퀄리티",
             "entry_conditions": [
                 Condition(left="per_percentile", operator="lte", right=0.4, description="PER 업종/시장 하위권"),
                 Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
@@ -1567,7 +1548,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "reasonable_growth" in lowered or "합리적 성장주" in query:
         return {
             "strategy_id": "reasonable_growth",
-            "name": "KOSPI200 합리적 성장주",
+            "name": "합리적 성장주",
             "entry_conditions": [
                 Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
                 Condition(left="sales_growth", operator="gte", right=0.1, description="매출 성장률 10% 이상"),
@@ -1584,7 +1565,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("순현금", "자사주", "PBR 1배")):
         return {
             "strategy_id": "asset_value_catalyst",
-            "name": "KOSPI200 자산가치 촉매",
+            "name": "자산가치 촉매",
             "entry_conditions": [
                 Condition(left="pbr", operator="lte", right=1, description="PBR 1배 이하"),
                 Condition(left="net_cash", operator="gte", right=1, description="순현금 보유"),
@@ -1601,7 +1582,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in lowered or term in query for term in ("저per", "per", "pbr", "저평가", "가치주")):
         return {
             "strategy_id": "value_quality",
-            "name": "KOSPI200 저평가 퀄리티",
+            "name": "저평가 퀄리티",
             "entry_conditions": [
                 Condition(left="per_percentile", operator="lte", right=0.4, description="PER 업종/시장 하위권"),
                 Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
@@ -1618,7 +1599,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("저변동성", "방어주")) and "배당" in query:
         return {
             "strategy_id": "low_vol_defensive",
-            "name": "KOSPI200 저변동 배당 방어주",
+            "name": "저변동 배당 방어주",
             "entry_conditions": [
                 Condition(left="realized_volatility_20d", operator="lte", right=0.25, description="20일 변동성 낮음"),
                 Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 시장 대비 우위"),
@@ -1635,7 +1616,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("금리", "리츠", "유틸리티")):
         return {
             "strategy_id": "rate_sensitive_income",
-            "name": "KOSPI200 금리 민감 인컴주",
+            "name": "금리 민감 인컴주",
             "entry_conditions": [
                 Condition(left="rate_down_proxy", operator="eq", right=1, description="금리 하락기 강세 업종 후보"),
                 Condition(left="dividend_yield", operator="gte", right=0.04, description="배당 또는 인컴 성격"),
@@ -1651,7 +1632,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "배당" in query:
         return {
             "strategy_id": "dividend_defensive",
-            "name": "KOSPI200 배당 방어주",
+            "name": "배당 방어주",
             "entry_conditions": [
                 Condition(left="dividend_yield", operator="gte", right=0.04, description="배당수익률 4% 이상"),
                 Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
@@ -1671,7 +1652,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("원달러", "환율", "수출주")):
         return {
             "strategy_id": "fx_exporter_revision",
-            "name": "KOSPI200 환율 수혜 이익상향",
+            "name": "환율 수혜 이익상향",
             "entry_conditions": [
                 Condition(left="fx_benefit_proxy", operator="eq", right=1, description="환율 상승 수혜 업종 후보"),
                 Condition(left="earnings_revision_3m", operator="gte", right=0, description="이익 전망 상향"),
@@ -1687,7 +1668,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("원자재", "마진 개선", "화학", "운송", "소비재")):
         return {
             "strategy_id": "margin_improvement",
-            "name": "KOSPI200 원가하락 마진 개선",
+            "name": "원가하락 마진 개선",
             "entry_conditions": [
                 Condition(left="input_cost_tailwind_proxy", operator="eq", right=1, description="원자재 가격 하락 수혜 후보"),
                 Condition(left="operating_margin_improving", operator="eq", right=1, description="영업이익률 개선"),
@@ -1703,7 +1684,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("매출총이익률", "재고자산", "재고")):
         return {
             "strategy_id": "margin_inventory_quality",
-            "name": "KOSPI200 마진·재고 퀄리티",
+            "name": "마진·재고 퀄리티",
             "entry_conditions": [
                 Condition(left="gross_margin_streak", operator="gte", right=3, description="매출총이익률 3개 분기 개선"),
                 Condition(left="inventory_growth_vs_sales", operator="lte", right=1, description="재고 증가율이 매출 증가율 이하"),
@@ -1719,7 +1700,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in lowered or term in query for term in ("fcf", "현금흐름", "현금흐름이 안정")):
         return {
             "strategy_id": "fcf_recovery",
-            "name": "KOSPI200 FCF 회복주",
+            "name": "FCF 회복주",
             "entry_conditions": [
                 Condition(left="fcf_yield", operator="gte", right=0.05, description="FCF 수익률 양호"),
                 Condition(left="cashflow_stability", operator="eq", right=1, description="현금흐름 안정"),
@@ -1735,7 +1716,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "4분기" in query or ("영업이익" in query and "60일 고점" in query):
         return {
             "strategy_id": "operating_profit_pullback",
-            "name": "KOSPI200 이익성장 조정주",
+            "name": "이익성장 조정주",
             "entry_conditions": [
                 Condition(left="operating_profit_growth_streak", operator="gte", right=4, description="4분기 연속 영업이익 증가"),
                 Condition(left="drawdown_60d", operator="lte", right=-0.1, description="60일 고점 대비 10% 이상 조정"),
@@ -1752,7 +1733,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
         if any(term in query for term in ("60거래일", "20% 이상 하락", "과매도 우량주")):
             return {
                 "strategy_id": "oversold_quality",
-                "name": "KOSPI200 과매도 우량주",
+                "name": "과매도 우량주",
                 "entry_conditions": [
                     Condition(left="drawdown_60d", operator="lte", right=-0.2, description="60일 고점 대비 20% 이상 하락"),
                     Condition(left="earnings_revision_3m", operator="gte", right=0, description="실적 컨센서스 유지"),
@@ -1767,10 +1748,10 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             }
         if "어닝" in query or "가이던스" in query or "실적 발표" in query:
             strategy_id = "earnings_surprise_guidance"
-            name = "KOSPI200 어닝 서프라이즈 가이던스"
+            name = "어닝 서프라이즈 가이던스"
         else:
             strategy_id = "earnings_momentum"
-            name = "KOSPI200 실적 모멘텀"
+            name = "실적 모멘텀"
         return {
             "strategy_id": strategy_id,
             "name": name,
@@ -1789,7 +1770,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("기관", "외국인")):
         return {
             "strategy_id": "flow_accumulation",
-            "name": "KOSPI200 기관·외국인 수급 모멘텀",
+            "name": "기관·외국인 수급 모멘텀",
             "entry_conditions": [
                 Condition(left="net_buy_streak_5d", operator="gte", right=5, description="기관·외국인 5거래일 순매수"),
                 Condition(left="close_above_sma_20", operator="eq", right=1, description="주가 20일선 위"),
@@ -1805,7 +1786,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "공매도" in query or "숏커버링" in query:
         return {
             "strategy_id": "short_covering_proxy",
-            "name": "KOSPI200 숏커버링 proxy",
+            "name": "숏커버링 proxy",
             "entry_conditions": [
                 Condition(left="short_balance_high", operator="eq", right=1, description="공매도 잔고 높은 후보"),
                 Condition(left="volume_ratio_20", operator="gte", right=1.5, description="거래량 증가"),
@@ -1821,7 +1802,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "갭" in query or "수급" in query:
         return {
             "strategy_id": "gap_hold_momentum",
-            "name": "KOSPI200 갭 유지 수급 모멘텀",
+            "name": "갭 유지 수급 모멘텀",
             "entry_conditions": [
                 Condition(left="gap_up", operator="eq", right=1, description="최근 갭 상승"),
                 Condition(left="gap_unfilled", operator="eq", right=1, description="갭 미충족 횡보"),
@@ -1838,7 +1819,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
         lower_reentry = "lower_band_reentry" in slot_event or any(term in query for term in ("하단", "재진입", "반등"))
         return {
             "strategy_id": "bollinger_lower_reentry" if lower_reentry else "bollinger_squeeze_breakout",
-            "name": "KOSPI200 볼린저 하단 재진입" if lower_reentry else "KOSPI200 볼린저 스퀴즈 돌파",
+            "name": "볼린저 하단 재진입" if lower_reentry else "볼린저 스퀴즈 돌파",
             "entry_conditions": [
                 Condition(left="close_below_lower_band_recent", operator="eq", right=1, description="최근 종가가 볼린저 하단 밴드 아래를 확인"),
                 Condition(left="close_cross_above_lower_band", operator="eq", right=1, description="종가가 하단 밴드 위로 재진입"),
@@ -1859,7 +1840,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "200일" in query and "rsi" in lowered:
         return {
             "strategy_id": "trend_rsi_volume_pullback",
-            "name": "KOSPI200 추세 내 RSI 눌림목",
+            "name": "추세 내 RSI 눌림목",
             "entry_conditions": [
                 Condition(left="close_above_sma_200", operator="eq", right=1, description="200일선 위 상승추세"),
                 Condition(left="rsi", operator="lte", right=40, description="RSI 40 이하 눌림"),
@@ -1875,7 +1856,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "1개월" in query and "6개월" in query:
         return {
             "strategy_id": "midterm_pullback",
-            "name": "KOSPI200 중기 상승추세 눌림목",
+            "name": "중기 상승추세 눌림목",
             "entry_conditions": [
                 Condition(left="relative_strength_20d", operator="lt", right=0, description="최근 1개월 시장 대비 약세"),
                 Condition(left="relative_strength_120d", operator="gte", right=0, description="6개월 시장 대비 강세"),
@@ -1891,7 +1872,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "120일" in query and "20일선" in query:
         return {
             "strategy_id": "breakout_pullback",
-            "name": "KOSPI200 신고가 돌파 후 되돌림",
+            "name": "신고가 돌파 후 되돌림",
             "entry_conditions": [
                 Condition(left="breakout_high", operator="eq", right=1, description="120일 신고가 돌파 이력"),
                 Condition(left="pullback_to_sma_20", operator="eq", right=1, description="20일선까지 되돌림"),
@@ -1907,7 +1888,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "돌파 대기" in query or "횡보" in query:
         return {
             "strategy_id": "breakout_setup",
-            "name": "KOSPI200 돌파 대기",
+            "name": "돌파 대기",
             "entry_conditions": [
                 Condition(left="near_recent_high", operator="eq", right=1, description="최근 신고가 근처"),
                 Condition(left="volume_dry_up", operator="eq", right=1, description="거래량 감소 횡보"),
@@ -1924,7 +1905,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
         if "ROE 15%" in query or "합리적 성장주" in query or "PER" in query:
             return {
                 "strategy_id": "reasonable_growth",
-                "name": "KOSPI200 합리적 성장주",
+                "name": "합리적 성장주",
                 "entry_conditions": [
                     Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
                     Condition(left="sales_growth", operator="gte", right=0.1, description="매출 성장률 10% 이상"),
@@ -1941,7 +1922,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
         strategy_id = "quality_growth" if "ROE" in query or "업종 평균" in query else "growth_momentum"
         return {
             "strategy_id": strategy_id,
-            "name": "KOSPI200 퀄리티 성장주" if strategy_id == "quality_growth" else "KOSPI200 성장 모멘텀",
+            "name": "퀄리티 성장주" if strategy_id == "quality_growth" else "성장 모멘텀",
             "entry_conditions": [
                 Condition(left="sales_growth", operator="gte", right=0.2 if "20%" in query else 0.1, description="매출 성장률 양호"),
                 Condition(left="operating_margin_improving", operator="eq", right=1, description="영업이익률 개선"),
@@ -1958,7 +1939,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "rsi" in lowered or "rsi" in slot_indicator or "과매도" in query or "반등" in query:
         return {
             "strategy_id": "rsi_rebound",
-            "name": "KOSPI200 RSI 과매도 반등",
+            "name": "RSI 과매도 반등",
             "entry_conditions": [
                 Condition(left="rsi", operator="lte", right=30, description="RSI <= 30 또는 30 상향 회복")
             ],
@@ -1972,7 +1953,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("52주", "120일", "신고가", "거래량", "돌파", "갭")):
         return {
             "strategy_id": "breakout_volume_momentum",
-            "name": "KOSPI200 거래량 돌파 모멘텀",
+            "name": "거래량 돌파 모멘텀",
             "entry_conditions": [
                 Condition(left="breakout_high", operator="eq", right=1, description="신고가 또는 상단 돌파"),
                 Condition(left="volume_ratio_20", operator="gte", right=1.5, description="20일 평균 대비 거래량 150% 이상"),
@@ -1989,7 +1970,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("눌림목", "200일", "20일선", "20일 이동평균")):
         return {
             "strategy_id": "pullback_trend",
-            "name": "KOSPI200 상승추세 눌림목",
+            "name": "상승추세 눌림목",
             "entry_conditions": [
                 Condition(left="close_above_sma_200", operator="eq", right=1, description="주가가 200일선 위"),
                 Condition(left="pullback_to_sma_20", operator="eq", right=1, description="20일선 근처 조정"),
@@ -2004,7 +1985,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if "볼린저" in query or "변동성" in query:
         return {
             "strategy_id": "bollinger_squeeze_breakout",
-            "name": "KOSPI200 볼린저 스퀴즈 돌파",
+            "name": "볼린저 스퀴즈 돌파",
             "entry_conditions": [
                 Condition(left="bb_width_percentile", operator="lte", right=0.25, description="밴드 폭 축소"),
                 Condition(left="bollinger_breakout", operator="eq", right=1, description="상단 돌파 또는 밴드 재진입"),
@@ -2019,7 +2000,7 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     if any(term in query for term in ("상대강도", "주도주", "시장보다", "섹터")):
         return {
             "strategy_id": "relative_strength_leader",
-            "name": "KOSPI200 상대강도 주도주",
+            "name": "상대강도 주도주",
             "entry_conditions": [
                 Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 시장 대비 초과수익"),
                 Condition(left="relative_strength_60d", operator="gte", right=0, description="60일 시장 대비 초과수익"),
@@ -2028,12 +2009,12 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
                 Condition(left="relative_strength_20d", operator="lt", right=0, description="단기 상대강도 약화")
             ],
             "indicators": ["relative_strength_20d", "relative_strength_60d"],
-            "assumptions": ["시장 벤치마크는 KOSPI200 proxy로 해석"],
+            "assumptions": ["시장 대표 수익률을 비교 기준으로 해석"],
             "confidence": 0.76,
         }
     return {
         "strategy_id": "rsi_rebound",
-        "name": "KOSPI200 RSI 과매도 반등",
+        "name": "RSI 과매도 반등",
         "entry_conditions": [
             Condition(left="rsi", operator="lte", right=30, description="RSI <= 30")
         ],

@@ -66,29 +66,79 @@ jobs:
 
       - name: Install and restart development servers
         run: |
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+          ssh -T -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
             set -euo pipefail
 
-            if [ -f "$HOME/.bashrc" ]; then
-              set +u
-              source "$HOME/.bashrc"
-              set -u
-            fi
+            set +u
+            for profile_file in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+              if [ -f "$profile_file" ]; then
+                source "$profile_file"
+              fi
+            done
+            set -u
 
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
-            export AUTH_ENABLED="${AUTH_ENABLED:-1}" AI_JOB_STORE=memory AI_AUDIT_SINK=noop
+            trim_whitespace() {
+              local value="$1"
+              value="${value#"${value%%[![:space:]]*}"}"
+              value="${value%"${value##*[![:space:]]}"}"
+              printf '%s' "$value"
+            }
+            load_env_file() {
+              local env_file="$1"
+              local line key value
+              while IFS= read -r line || [ -n "$line" ]; do
+                line="${line%$'\r'}"
+                case "$line" in
+                  '' | [[:space:]]*'#'*) continue ;;
+                esac
+                if [[ "$line" != *"="* ]]; then
+                  continue
+                fi
+                key="$(trim_whitespace "${line%%=*}")"
+                value="$(trim_whitespace "${line#*=}")"
+                case "$key" in
+                  REDIS_URL | VITE_AUTH_API_BASE_URL | AUTH_ENABLED | AI_* | QUANT_DB_* | DATABASE_URL | AZURE_OPENAI_API_KEY | AZURE_OPENAI_ENDPOINT) ;;
+                  *) continue ;;
+                esac
+                if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+                  value="${value:1:${#value}-2}"
+                fi
+                printf -v "$key" '%s' "$value"
+                export "$key"
+              done < "$env_file"
+              echo "Loaded deployment environment: $env_file"
+            }
+            for env_file in \
+              "$APP_DIR/.env" \
+              "$APP_DIR/ai/.env" \
+              "$APP_DIR/backend/.env" \
+              "$APP_DIR/DE/.env" \
+              "$HOME/.config/quant-agent/deploy.env"
+            do
+              if [ -f "$env_file" ]; then
+                load_env_file "$env_file"
+              fi
+            done
+            for required_key in AUTH_ENABLED REDIS_URL VITE_AUTH_API_BASE_URL AI_LLM_PROVIDER AI_AOAI_RESPONSES_URL AI_AOAI_API_KEY AI_AOAI_MODEL; do
+              if [ -n "${!required_key:-}" ]; then
+                echo "$required_key=configured"
+              else
+                echo "$required_key=missing"
+              fi
+            done
+            export AUTH_ENABLED="${AUTH_ENABLED:-0}" AI_JOB_STORE=memory AI_AUDIT_SINK=noop
+            export VITE_AI_API_BASE_URL=/ai-api
             if [ "$AUTH_ENABLED" = "1" ]; then
               : "${REDIS_URL:?REDIS_URL must be configured when AUTH_ENABLED=1}"
               : "${VITE_AUTH_API_BASE_URL:?VITE_AUTH_API_BASE_URL must be configured for Google login}"
               export REDIS_URL VITE_AUTH_API_BASE_URL
+            else
+              export VITE_ENABLE_TEST_LOGIN=1
             fi
-            export VITE_AI_API_BASE_URL=/ai-api
-            if [ "${AI_LLM_PROVIDER:-}" != "aoai" ]; then
-              echo "AI_LLM_PROVIDER=aoai must be configured on the deploy server"
-              exit 1
-            fi
+            export AI_LLM_PROVIDER=aoai
             : "${AI_AOAI_RESPONSES_URL:?AI_AOAI_RESPONSES_URL must be configured on the deploy server}"
             : "${AI_AOAI_API_KEY:?AI_AOAI_API_KEY must be configured on the deploy server}"
             : "${AI_AOAI_MODEL:?AI_AOAI_MODEL must be configured on the deploy server}"
@@ -105,8 +155,16 @@ jobs:
               export QUANT_DB_DSN
             elif has_non_whitespace "${DATABASE_URL:-}"; then
               export DATABASE_URL
+            elif has_non_whitespace "${QUANT_DB_HOST:-}" \
+              && has_non_whitespace "${QUANT_DB_PORT:-}" \
+              && has_non_whitespace "${QUANT_DB_NAME:-}" \
+              && has_non_whitespace "${QUANT_DB_USER:-}" \
+              && has_non_whitespace "${QUANT_DB_PASSWORD:-}"; then
+              export QUANT_DB_HOST QUANT_DB_PORT QUANT_DB_NAME QUANT_DB_USER QUANT_DB_PASSWORD
+              AI_DATABASE_DSN="$(python3.11 -c 'import os; from urllib.parse import quote; print("postgresql://{user}:{password}@{host}:{port}/{name}".format(user=quote(os.environ["QUANT_DB_USER"], safe=""), password=quote(os.environ["QUANT_DB_PASSWORD"], safe=""), host=os.environ["QUANT_DB_HOST"], port=os.environ["QUANT_DB_PORT"], name=quote(os.environ["QUANT_DB_NAME"], safe="")))')"
+              export AI_DATABASE_DSN
             else
-              echo "AI_DATABASE_DSN, QUANT_DB_DSN, or DATABASE_URL must be configured on the deploy server"
+              echo "A database DSN or the QUANT_DB_HOST/PORT/NAME/USER/PASSWORD components must be configured on the deploy server"
               exit 1
             fi
 
@@ -119,8 +177,6 @@ jobs:
               curl -fsS --max-time 15 "${VITE_AUTH_API_BASE_URL%/}/health" \
                 | "$APP_DIR/ai/.venv/bin/python" -c \
                   'import json, sys; status = json.load(sys.stdin); assert status.get("status") == "ok" and status.get("component") == "backend", "auth backend health check failed"'
-            else
-              echo "AUTH_ENABLED=0: skipping Redis ping and auth backend health check"
             fi
             timeout 1200 "$APP_DIR/ai/.venv/bin/python" -c \
               'from ai_graph import run_analysis; result = run_analysis("005930 RSI가 30 이하이면 매수하고 70 이상이면 매도"); assert result.status == "ready", "live analysis smoke test did not finish ready"'

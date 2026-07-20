@@ -24,12 +24,6 @@ class AssetType(str, Enum):
     INDEX = "index"
 
 
-class UniverseMode(str, Enum):
-    CANDIDATE_TOP_K = "candidate_top_k"
-    TOP_K_SECTOR = "top_k_sector"
-    FULL_UNIVERSE = "full_universe"
-
-
 class LogicMode(str, Enum):
     ALL = "all"
     ANY = "any"
@@ -56,11 +50,6 @@ class PositionSizingMethod(str, Enum):
 class ExecutionTiming(str, Enum):
     NEXT_OPEN = "next_open"
     NEXT_CLOSE = "next_close"
-
-
-class CandidateFilterSource(str, Enum):
-    ANALYST_REPORT = "analyst_report"
-    NONE = "none"
 
 
 class ReportSummaryMode(str, Enum):
@@ -129,19 +118,6 @@ class Condition(BaseModel):
         return self
 
 
-class UniverseSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    mode: UniverseMode = UniverseMode.CANDIDATE_TOP_K
-    market: Market = Market.KRX
-    asset_type: AssetType = AssetType.EQUITY
-    benchmark: str = "KOSPI200"
-    sector_codes: list[str] = Field(default_factory=list)
-    top_k: int = Field(default=30, ge=1)
-    respect_historical_index_membership: bool = True
-    enforce_tradability_guard: bool = True
-
-
 class PositionSizing(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -170,19 +146,6 @@ class RiskControls(BaseModel):
     exclude_listing_risk: bool = True
 
 
-class ResearchOverlay(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    source: CandidateFilterSource = CandidateFilterSource.ANALYST_REPORT
-    score_formula_version: str = "v1"
-    compare_with_unfiltered: bool = True
-    apply_reports_from: ExecutionTiming = ExecutionTiming.NEXT_OPEN
-    notes: str | None = Field(
-        default="장 마감 후 수집된 리포트는 다음 거래일 시가부터 유효"
-    )
-
-
 class WalkForwardConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -204,8 +167,6 @@ class BacktestConfig(BaseModel):
 
     execution_timing: ExecutionTiming = ExecutionTiming.NEXT_OPEN
     use_adjusted_price: bool = True
-    use_candidate_filter: bool = True
-    compare_filtered_vs_unfiltered: bool = True
     walk_forward: WalkForwardConfig = Field(default_factory=WalkForwardConfig)
     cost_model: CostModel = Field(default_factory=CostModel)
 
@@ -232,14 +193,12 @@ class StrategySpec(BaseModel):
     market: Market = Market.KRX
     asset_type: AssetType = AssetType.EQUITY
     user_intent: UserIntentSpec | None = None
-    universe: UniverseSpec = Field(default_factory=UniverseSpec)
     entry_rules: list[Condition]
     entry_logic: LogicMode = LogicMode.ALL
     exit_rules: list[Condition] = Field(default_factory=list)
     exit_logic: LogicMode = LogicMode.ANY
     position_sizing: PositionSizing = Field(default_factory=PositionSizing)
     risk_controls: RiskControls = Field(default_factory=RiskControls)
-    research_overlay: ResearchOverlay = Field(default_factory=ResearchOverlay)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
 
@@ -250,11 +209,6 @@ class StrategySpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_strategy_spec(self) -> "StrategySpec":
-        if self.research_overlay.enabled and self.research_overlay.source == CandidateFilterSource.NONE:
-            raise ValueError("research_overlay.enabled=True이면 source가 NONE일 수 없습니다.")
-        if self.universe.mode == UniverseMode.FULL_UNIVERSE and self.research_overlay.enabled:
-            # 허용은 하되, compare 실험용일 수 있어 경고 대신 설명 유지
-            pass
         if not self.entry_rules:
             raise ValueError("entry_rules는 최소 1개 이상 필요합니다.")
         return self
@@ -280,24 +234,6 @@ class ParsedReport(BaseModel):
     reasoning: str | None = None
 
 
-class CandidateSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    snapshot_id: str
-    trade_date: date
-    effective_from: datetime
-    top_k_stocks: list[str] = Field(default_factory=list)
-    top_k_sectors: list[str] = Field(default_factory=list)
-    score_list: dict[str, float] = Field(default_factory=dict)
-    reason_trace: dict[str, list[str]] = Field(default_factory=dict)
-
-    def is_effective_for(self, when: datetime) -> bool:
-        return when >= self.effective_from
-
-    def contains_ticker(self, ticker: str) -> bool:
-        return ticker in self.top_k_stocks
-
-
 class MarketSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -312,7 +248,6 @@ class SignalAction(str, Enum):
     SELL = "sell"
     HOLD = "hold"
     WATCH = "watch"
-    FILTERED_OUT = "filtered_out"
 
 
 class SignalDecision(BaseModel):
@@ -325,7 +260,6 @@ class SignalDecision(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     matching_entry_rules: list[str] = Field(default_factory=list)
     matching_exit_rules: list[str] = Field(default_factory=list)
-    candidate_snapshot_id: str | None = None
 
 
 class BacktestPlan(BaseModel):
@@ -337,12 +271,8 @@ class BacktestPlan(BaseModel):
     asset_type: AssetType
     allowed_modules: list[str]
     network_access_allowed: bool = False
-    use_candidate_filter: bool
-    compare_filtered_vs_unfiltered: bool
     execution_timing: ExecutionTiming
     use_adjusted_price: bool
-    respect_historical_index_membership: bool
-    apply_reports_from: ExecutionTiming
     walk_forward: WalkForwardConfig
     cost_model: CostModel
     notes: list[str] = Field(default_factory=list)

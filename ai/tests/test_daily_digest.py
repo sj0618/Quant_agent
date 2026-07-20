@@ -16,7 +16,6 @@ def make_strategy(
     return DailyDigestStrategyInput(
         strategy_id=strategy_id,
         name=name,
-        universe="KOSPI200",
         timeframe="1d",
         today_signal=signal,
         targets=["삼성전자"],

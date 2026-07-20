@@ -119,6 +119,38 @@ def test_aoai_client_sends_strict_responses_json_schema() -> None:
     assert client.generate_json(request) == {"message": "ok"}
 
 
+def test_aoai_client_retries_without_unsupported_temperature() -> None:
+    request_bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        request_bodies.append(body)
+        if len(request_bodies) == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "Unsupported parameter: 'temperature' is not supported with this model.",
+                        "type": "invalid_request_error",
+                        "param": "temperature",
+                        "code": None,
+                    }
+                },
+            )
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_json(make_request()) == {"message": "ok"}
+    assert request_bodies[0]["temperature"] == 0.0
+    assert "temperature" not in request_bodies[1]
+
+
 def test_aoai_client_rejects_broken_output_text_json() -> None:
     client = make_client({"output_text": "{broken-json"})
 

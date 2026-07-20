@@ -13,9 +13,8 @@
 현재 백테스트는 **정형화된 전략 입력이 들어오면 정상 실행**됩니다.  
 다만 아래 제약은 아직 그대로입니다.
 
-1. `QuantStrategy`의 후보군 필터는 현재 런타임에서 비활성화됨
-2. `execution_timing='next_close'`는 미지원
-3. `cross_above` / `cross_below`는 `previous_metrics`가 없으면 기대한 BUY/SELL이 아니라 `WATCH`가 나올 수 있음
+1. `execution_timing='next_close'`는 미지원
+2. `cross_above` / `cross_below`는 `previous_metrics`가 없으면 기대한 BUY/SELL이 아니라 `WATCH`가 나올 수 있음
 
 즉, **엔진은 동작하지만 전략 변환/필터링/체결 타이밍 쪽은 아직 완성형이 아닙니다.**
 
@@ -27,7 +26,7 @@
 
 | 입력 | 역할 | 예시 |
 |---|---|---|
-| `StrategySpec` | 전략 규칙과 백테스트 설정을 담는 핵심 구조체 | `entry_rules`, `exit_rules`, `backtest`, `research_overlay` |
+| `StrategySpec` | 전략 규칙과 백테스트 설정을 담는 핵심 구조체 | `entry_rules`, `exit_rules`, `backtest` |
 | `OhlcvBar[]` | 일봉 가격/거래량 원천 데이터 | `date`, `ticker`, `open`, `high`, `low`, `close`, `volume` |
 | `metric_rows` | 외부/보조 지표 | `market_cap`, `rsi_14` |
 | `BacktestRunConfig` | 초기자본, 출력 저장 여부, TA-Lib 계산 방식 | `initial_capital=1000`, `write_outputs=False` |
@@ -43,7 +42,7 @@
 | `trades` | 실제 체결된 거래 목록 |
 | `signals` | 날짜별 BUY / SELL / HOLD / WATCH 기록 |
 | `ValueError` | 현재 엔진이 지원하지 않는 설정일 때 나는 오류 |
-| `WATCH` / `FILTERED_OUT` | 실행은 되지만 기대한 매수/매도가 아닌 결과 |
+| `WATCH` | 실행은 되지만 기대한 매수/매도가 아닌 결과 |
 
 ---
 
@@ -51,7 +50,7 @@
 
 ### 3-1. `QuantStrategy` 쪽 현재 상태
 
-- `compile_backtest_plan()`은 계획을 만들지만, 내부 `_uses_candidate_filter()`가 현재 `False`를 반환해서 **후보군 필터는 실제로 꺼져 있음**
+- `compile_backtest_plan()`은 점수 기반 선별 없이 조건을 충족한 모든 종목을 평가하는 계획을 만듦
 - `generate_signal()`은 `entry_rules` / `exit_rules` 를 평가해서 BUY / SELL / HOLD / WATCH 를 결정함
 - `CROSS_ABOVE` / `CROSS_BELOW` 는 `previous_metrics`가 있어야 crossing 판정이 가능함
 - `MarketSnapshot.metrics`에 있는 숫자는 그대로 조건 평가에 사용됨
@@ -78,12 +77,9 @@ from backtest_module import (
     ConditionOperator,
     CostModel,
     PositionSizing,
-    ResearchOverlay,
     RiskControls,
     StrategySpec,
 )
-from backtest_module.models import CandidateFilterSource
-
 spec = StrategySpec(
     strategy_id="market_cap_rsi_strategy",
     strategy_name="시총 5000억 이상 RSI 70 이상 매수",
@@ -112,8 +108,7 @@ spec = StrategySpec(
     ],
     position_sizing=PositionSizing(max_positions=1),
     risk_controls=RiskControls(stop_loss_pct=0.5, take_profit_pct=None),
-    backtest=BacktestConfig(use_candidate_filter=True, compare_filtered_vs_unfiltered=True),
-    research_overlay=ResearchOverlay(enabled=True, source=CandidateFilterSource.ANALYST_REPORT),
+    backtest=BacktestConfig(),
 )
 ```
 
@@ -127,8 +122,6 @@ spec = StrategySpec(
   "asset_type": "equity",
   "allowed_modules": ["math", "statistics", "datetime", "pandas", "numpy"],
   "network_access_allowed": false,
-  "use_candidate_filter": false,
-  "compare_filtered_vs_unfiltered": false,
   "execution_timing": "next_open",
   "use_adjusted_price": true,
   "respect_historical_index_membership": true,
@@ -297,16 +290,7 @@ ValueError BacktestEngine currently supports execution_timing='next_open' only
 ---
 
 ## 6. 실제 실행 검증 3: 작동은 하지만 원하던 결과가 아닌 경우
-### 6-1. 후보군 필터를 요청해도 실제로는 꺼지는 경우
-
-`research_overlay.enabled=True`, `use_candidate_filter=True`로 넣어도, 현재 `QuantStrategy.compile_backtest_plan()`은 아래처럼 고정됩니다.
-
-- `use_candidate_filter = false`
-- `compare_filtered_vs_unfiltered = false`
-
-즉, **입력은 후보군 필터를 원했지만, 현재 런타임에서는 필터가 실제로 적용되지 않습니다.**
-
-### 6-2. `cross_above`는 `previous_metrics`가 없으면 BUY가 아니라 WATCH가 됨
+### 6-1. `cross_above`는 `previous_metrics`가 없으면 BUY가 아니라 WATCH가 됨
 
 #### 입력
 
@@ -314,7 +298,6 @@ ValueError BacktestEngine currently supports execution_timing='next_open' only
 signal_spec = StrategySpec(
     strategy_id="cross_without_prev",
     strategy_name="Cross without previous metrics",
-    research_overlay={"enabled": False},
     entry_rules=[
         Condition(
             left="rsi_14",
@@ -368,10 +351,9 @@ market = MarketSnapshot(
 ### 아직 안 되는 것
 
 1. `next_close` 체결
-2. 후보군 필터 실제 적용
-3. 자연어에서 전략 구조체로의 안정적 변환
-4. 실서버 / 실DB / 실시간 연동
-5. intraday / partial fill / walk-forward 고도화
+2. 자연어에서 전략 구조체로의 안정적 변환
+3. 실서버 / 실DB / 실시간 연동
+4. intraday / partial fill / walk-forward 고도화
 
 ---
 
@@ -409,11 +391,10 @@ market = MarketSnapshot(
 ## 9. 최종 결론
 
 현재 백테스트는 **정형화된 `StrategySpec`를 직접 넣으면 결과를 안정적으로 뽑을 수 있는 상태**입니다.  
-다만 **후보군 필터, `next_close` 체결, cross 조건의 이전 시점 데이터 처리**는 아직 기대대로 동작하지 않거나 아예 막혀 있습니다.
+다만 **`next_close` 체결과 cross 조건의 이전 시점 데이터 처리**는 아직 기대대로 동작하지 않거나 아예 막혀 있습니다.
 
 가장 중요한 우선순위는 아래 순서입니다.
 
-1. `QuantStrategy`의 후보군 필터 실제 활성화
-2. 자연어 → `StrategySpec` 변환 고도화
-3. `next_close` / intraday 체결 확장
-4. 실서버 / 실데이터 연동
+1. 자연어 → `StrategySpec` 변환 고도화
+2. `next_close` / intraday 체결 확장
+3. 실서버 / 실데이터 연동

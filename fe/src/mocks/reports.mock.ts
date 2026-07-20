@@ -114,7 +114,6 @@ export const reportDetails: ReportDetail[] = [
   {
     ...reportSummaries[0],
     recipient: "홍길동 님께",
-    strategyUniverse: "KOSPI200 · 반도체",
     marketBrief:
       "전일 KOSPI는 메모리 사이클 회복 기대로 +0.84% 상승. 외국인 5일 연속 순매수, 환율 안정세. 반도체 섹터 전반에 매수 신호가 강화됐고, 화학 섹터 일부에서 추세 약세가 관측됩니다.",
     marketContext:
@@ -144,7 +143,7 @@ export const reportDetails: ReportDetail[] = [
     costNotes: [
       "본 리포트는 과거 시계열 데이터 기반 시뮬레이션이며 미래 수익을 보장하지 않습니다. 투자 결정과 손익은 사용자 본인에게 귀속됩니다.",
       "거래비용 반영: 수수료 0.015%, 거래세 0.23%, 슬리피지 0.1%. 실제 시장에선 호가 잔량·체결 지연으로 인한 추가 비용이 발생할 수 있습니다.",
-      "KOSPI200 현물만 지원하며, 파생상품·옵션 전략은 제공하지 않습니다.",
+      "KRX 상장 보통주를 지원하며, 파생상품·옵션 전략은 제공하지 않습니다.",
     ],
   },
 ];

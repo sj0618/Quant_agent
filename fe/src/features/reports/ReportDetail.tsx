@@ -39,7 +39,6 @@ export function ReportDetail({ report }: ReportDetailProps) {
           <strong>기준 전략</strong>
           <h4>{report.strategyName}</h4>
           <dl>
-            <div><dt>유니버스</dt><dd>{report.strategyUniverse ?? "전략 유니버스 정보 없음"}</dd></div>
             <div><dt>신호</dt><dd>BUY {report.signals.BUY} · HOLD {report.signals.HOLD} · DROP {report.signals.DROP}</dd></div>
             <div><dt>권장도</dt><dd>{report.recommendationScore} / 10</dd></div>
           </dl>

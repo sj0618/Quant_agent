@@ -89,7 +89,10 @@ export async function validateCurrentSession(): Promise<AuthSession | null> {
   if (!session) {
     return null;
   }
-  if (session.user.provider === "test" && appConfig.testLoginEnabled) {
+  if (
+    appConfig.testLoginEnabled &&
+    (session.user.provider === "test" || session.user.id === TEST_AUTH_SESSION.user.id)
+  ) {
     return session;
   }
 

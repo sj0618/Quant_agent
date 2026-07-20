@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from typing import Iterable, Union
-
 from .models import (
     BacktestPlan,
-    CandidateSnapshot,
     Condition,
     ConditionOperator,
     LogicMode,
@@ -45,26 +42,19 @@ METRIC_ALIASES = {
 class QuantStrategy:
     """최종 StrategySpec을 엔진에서 사용하기 위한 canonical strategy runtime.
 
-    설계 원칙
-    - 비정형 데이터는 직접 매수/매도 신호가 아니라 후보군 필터로 사용
-    - 기술적 신호는 entry/exit rules로 판단
-    - 백테스트에서는 동일 StrategySpec으로 filtered / unfiltered 비교 가능
+    기술적 신호는 entry/exit rules로 판단합니다.
     """
 
     def __init__(self, spec: StrategySpec):
         self.spec = spec
 
     def compile_backtest_plan(self) -> BacktestPlan:
-        use_candidate_filter = self._uses_candidate_filter()
         notes = [
             "template compile only",
             "new external libraries are forbidden",
             "network calls are forbidden during code execution",
+            "all condition matches are evaluated without score-based candidate filtering",
         ]
-        if use_candidate_filter:
-            notes.append("candidate snapshot is applied as a universe filter")
-        else:
-            notes.append("candidate filter disabled")
 
         return BacktestPlan(
             strategy_id=self.spec.strategy_id,
@@ -72,75 +62,18 @@ class QuantStrategy:
             market=self.spec.market,
             asset_type=self.spec.asset_type,
             allowed_modules=ALLOWED_BACKTEST_MODULES,
-            use_candidate_filter=use_candidate_filter,
-            compare_filtered_vs_unfiltered=(
-                use_candidate_filter and self.spec.backtest.compare_filtered_vs_unfiltered
-            ),
             execution_timing=self.spec.backtest.execution_timing,
             use_adjusted_price=self.spec.backtest.use_adjusted_price,
-            respect_historical_index_membership=self.spec.universe.respect_historical_index_membership,
-            apply_reports_from=self.spec.research_overlay.apply_reports_from,
             walk_forward=self.spec.backtest.walk_forward,
             cost_model=self.spec.backtest.cost_model,
             notes=notes,
         )
 
-    def effective_universe(
-        self,
-        full_universe: Iterable[str],
-        candidate_snapshot: Union[CandidateSnapshot, None] = None,
-        when=None,
-    ) -> list[str]:
-        full_universe = list(full_universe)
-        if not self._uses_candidate_filter():
-            return full_universe
-
-        if candidate_snapshot is None:
-            return []
-
-        if when is not None and not candidate_snapshot.is_effective_for(when):
-            return []
-
-        if self.spec.universe.mode.value == "full_universe":
-            return full_universe
-
-        return [ticker for ticker in full_universe if candidate_snapshot.contains_ticker(ticker)]
-
     def generate_signal(
         self,
         market: MarketSnapshot,
         has_position: bool = False,
-        candidate_snapshot: Union[CandidateSnapshot, None] = None,
     ) -> SignalDecision:
-        if self._uses_candidate_filter():
-            if candidate_snapshot is None:
-                return SignalDecision(
-                    strategy_id=self.spec.strategy_id,
-                    ticker=market.ticker,
-                    action=SignalAction.FILTERED_OUT,
-                    confidence=1.0,
-                    reasons=["candidate snapshot is required but missing"],
-                )
-            if not candidate_snapshot.is_effective_for(market.timestamp):
-                return SignalDecision(
-                    strategy_id=self.spec.strategy_id,
-                    ticker=market.ticker,
-                    action=SignalAction.FILTERED_OUT,
-                    confidence=1.0,
-                    reasons=["candidate snapshot is not effective yet"],
-                    candidate_snapshot_id=candidate_snapshot.snapshot_id,
-                )
-            if not candidate_snapshot.contains_ticker(market.ticker):
-                reason = candidate_snapshot.reason_trace.get(market.ticker, ["ticker not in candidate universe"])
-                return SignalDecision(
-                    strategy_id=self.spec.strategy_id,
-                    ticker=market.ticker,
-                    action=SignalAction.FILTERED_OUT,
-                    confidence=1.0,
-                    reasons=reason,
-                    candidate_snapshot_id=candidate_snapshot.snapshot_id,
-                )
-
         entry_hits = self._evaluate_rules(
             rules=self.spec.entry_rules,
             logic=self.spec.entry_logic,
@@ -160,7 +93,6 @@ class QuantStrategy:
                 confidence=1.0,
                 reasons=["exit condition matched"],
                 matching_exit_rules=exit_hits,
-                candidate_snapshot_id=candidate_snapshot.snapshot_id if candidate_snapshot else None,
             )
 
         if not has_position and entry_hits:
@@ -171,7 +103,6 @@ class QuantStrategy:
                 confidence=1.0,
                 reasons=["entry condition matched"],
                 matching_entry_rules=entry_hits,
-                candidate_snapshot_id=candidate_snapshot.snapshot_id if candidate_snapshot else None,
             )
 
         return SignalDecision(
@@ -180,7 +111,6 @@ class QuantStrategy:
             action=SignalAction.HOLD if has_position else SignalAction.WATCH,
             confidence=1.0,
             reasons=["no actionable rule matched"],
-            candidate_snapshot_id=candidate_snapshot.snapshot_id if candidate_snapshot else None,
         )
 
     def _evaluate_rules(
@@ -269,8 +199,3 @@ class QuantStrategy:
             low, high = rule.right  # type: ignore[misc]
             return f"{rule.left} between {low} and {high}"
         return f"{rule.left} {rule.operator.value} {rule.right}"
-
-    def _uses_candidate_filter(self) -> bool:
-        # Candidate filtering is intentionally disabled for the current parser/runtime path.
-        # The O/X comparison path can re-enable this method when that experiment is wired back in.
-        return False

@@ -189,10 +189,6 @@ export function StrategyReportList({
 
                   <div className="strategy-report-card__meta">
                     <div className="strategy-report-card__meta-item">
-                      <small>유니버스</small>
-                      <strong>{strategy.universe}</strong>
-                    </div>
-                    <div className="strategy-report-card__meta-item">
                       <small>진입 기준</small>
                       <strong>{strategy.entrySummary}</strong>
                     </div>

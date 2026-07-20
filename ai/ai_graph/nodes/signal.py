@@ -11,7 +11,7 @@ from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
 from ai_graph.nodes.backtest import summarize_backtest
 from ai_graph.schemas import L4Evidence, SignalDecision as InvestmentSignalDecision
 
-SignalAction = Literal["BUY", "SELL", "HOLD", "WATCH", "FILTERED_OUT"]
+SignalAction = Literal["BUY", "SELL", "HOLD", "WATCH"]
 
 
 class ConditionOperator(str, Enum):
@@ -52,15 +52,6 @@ class SignalStrategy(BaseModel):
     exit_rules: list[SignalCondition] = Field(default_factory=list)
     entry_logic: Literal["all", "any"] = "all"
     exit_logic: Literal["all", "any"] = "any"
-    use_candidate_filter: bool = True
-
-
-class CandidateSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    snapshot_id: str
-    top_k_stocks: list[str] = Field(default_factory=list)
-    reason_trace: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class MarketSnapshot(BaseModel):
@@ -83,14 +74,12 @@ class SignalResult(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     matching_entry_rules: list[str] = Field(default_factory=list)
     matching_exit_rules: list[str] = Field(default_factory=list)
-    candidate_snapshot_id: str | None = None
 
 
 def generate_signal(
     strategy: SignalStrategy | dict[str, Any],
     market: MarketSnapshot | dict[str, Any],
     *,
-    candidate_snapshot: CandidateSnapshot | dict[str, Any] | None = None,
     has_position: bool = False,
     trace_id: str | None = None,
 ) -> SignalResult:
@@ -104,32 +93,9 @@ def generate_signal(
         if isinstance(market, MarketSnapshot)
         else MarketSnapshot.model_validate(market)
     )
-    candidate = _coerce_candidate(candidate_snapshot)
     trace = trace_id or _trace_id(
         f"{spec.strategy_id}:{market_snapshot.ticker}:{market_snapshot.timestamp.isoformat()}"
     )
-
-    if spec.use_candidate_filter:
-        if candidate is None:
-            return _result(
-                trace,
-                spec.strategy_id,
-                market_snapshot.ticker,
-                "FILTERED_OUT",
-                ["candidate snapshot is required but missing"],
-            )
-        if market_snapshot.ticker not in candidate.top_k_stocks:
-            return _result(
-                trace,
-                spec.strategy_id,
-                market_snapshot.ticker,
-                "FILTERED_OUT",
-                candidate.reason_trace.get(
-                    market_snapshot.ticker,
-                    ["ticker not in research candidate universe"],
-                ),
-                candidate_snapshot_id=candidate.snapshot_id,
-            )
 
     entry_matches = _matching_rules(
         spec.entry_rules, spec.entry_logic, market_snapshot.metrics
@@ -137,8 +103,6 @@ def generate_signal(
     exit_matches = _matching_rules(
         spec.exit_rules, spec.exit_logic, market_snapshot.metrics
     )
-    candidate_snapshot_id = candidate.snapshot_id if candidate else None
-
     if has_position and exit_matches:
         return _result(
             trace,
@@ -147,7 +111,6 @@ def generate_signal(
             "SELL",
             ["exit condition matched"],
             matching_exit_rules=exit_matches,
-            candidate_snapshot_id=candidate_snapshot_id,
         )
     if not has_position and entry_matches:
         return _result(
@@ -157,7 +120,6 @@ def generate_signal(
             "BUY",
             ["entry condition matched"],
             matching_entry_rules=entry_matches,
-            candidate_snapshot_id=candidate_snapshot_id,
         )
     return _result(
         trace,
@@ -165,17 +127,15 @@ def generate_signal(
         market_snapshot.ticker,
         "HOLD" if has_position else "WATCH",
         ["no actionable rule matched"],
-        candidate_snapshot_id=candidate_snapshot_id,
     )
 
 
 def signal_node(state: dict[str, Any]) -> dict[str, Any]:
     debate = build_signal_debate(state)
-    if "market_snapshot" in state and "candidate_snapshot" in state:
+    if "market_snapshot" in state:
         result = generate_signal(
             state["strategy_spec"],
             state["market_snapshot"],
-            candidate_snapshot=state.get("candidate_snapshot"),
             has_position=bool(state.get("has_position", False)),
             trace_id=state.get("trace_id"),
         )
@@ -189,7 +149,7 @@ def signal_node(state: dict[str, Any]) -> dict[str, Any]:
         result = _result(
             state.get("trace_id", _trace_id(str(state))),
             state["strategy_spec"]["strategy_id"],
-            "KOSPI200",
+            "KRX",
             "WATCH",
             ["no single-ticker market snapshot supplied"],
         )
@@ -332,18 +292,6 @@ def default_l4_evidence(trace_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def _coerce_candidate(
-    value: CandidateSnapshot | dict[str, Any] | None,
-) -> CandidateSnapshot | None:
-    if value is None:
-        return None
-    return (
-        value
-        if isinstance(value, CandidateSnapshot)
-        else CandidateSnapshot.model_validate(value)
-    )
-
-
 def _matching_rules(
     rules: list[SignalCondition], logic: str, metrics: dict[str, float]
 ) -> list[str]:
@@ -389,7 +337,6 @@ def _result(
     *,
     matching_entry_rules: list[str] | None = None,
     matching_exit_rules: list[str] | None = None,
-    candidate_snapshot_id: str | None = None,
 ) -> SignalResult:
     return SignalResult(
         trace_id=trace_id,
@@ -401,7 +348,6 @@ def _result(
         reasons=reasons,
         matching_entry_rules=matching_entry_rules or [],
         matching_exit_rules=matching_exit_rules or [],
-        candidate_snapshot_id=candidate_snapshot_id,
     )
 
 

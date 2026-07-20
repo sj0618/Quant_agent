@@ -43,10 +43,6 @@ export function OverviewTab({ overview }: OverviewTabProps) {
         </div>
         <dl>
           <div>
-            <dt>유니버스</dt>
-            <dd>{overview.strategy.universe}</dd>
-          </div>
-          <div>
             <dt>매수 조건</dt>
             <dd>{overview.strategy.buy_condition}</dd>
           </div>

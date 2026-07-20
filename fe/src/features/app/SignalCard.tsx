@@ -17,8 +17,8 @@ export function SignalCard({ candidate, compact = false }: SignalCardProps) {
           <small>{candidate.sector}</small>
         </div>
         <div className="signal-card__score">
-          <strong>{candidate.score.toFixed(2)}</strong>
-          <small>score</small>
+          <strong>{Math.round(candidate.confidence * 100)}%</strong>
+          <small>신뢰도</small>
         </div>
       </div>
       <p>{candidate.rationale}</p>

@@ -196,7 +196,7 @@ export function StrategyInputPanel({
           <button disabled={submitting} type="submit">{submitting ? "…" : "↑"}</button>
         </div>
         {submitError ? <small className="chat-panel__error">{submitError}</small> : null}
-        <small>거래비용 0.015% / 0.23% / 0.1% 반영 · KOSPI200 현물만 지원</small>
+        <small>거래비용 0.015% / 0.23% / 0.1% 반영 · KRX 상장 보통주 지원</small>
       </form>
     </aside>
   );

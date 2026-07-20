@@ -106,7 +106,7 @@ def test_generate_and_run_backtest_route_uses_bound_service(monkeypatch):
         "/ai/backtests/generate-and-run",
         json={
             "natural_language_prompt": "RSI 반등 전략을 코드 생성해서 실행해줘",
-            "parsed_strategy_jsonb": {"strategy_id": "rsi_rebound", "name": "RSI 반등", "universe": "KOSPI200", "market": "KRX", "timeframe": "daily", "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}], "exit_conditions": [], "indicators": ["RSI"], "risk_constraints": {"max_position_pct": 0.1}, "assumptions": [], "source_refs": [], "confidence": 0.9},
+            "parsed_strategy_jsonb": {"strategy_id": "rsi_rebound", "name": "RSI 반등", "market": "KRX", "timeframe": "daily", "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}], "exit_conditions": [], "indicators": ["RSI"], "risk_constraints": {"max_position_pct": 0.1}, "assumptions": [], "source_refs": [], "confidence": 0.9},
             "strategy_id": "rsi_rebound",
             "target_runtime": "python-sandbox",
             "code_purpose": "backtest"

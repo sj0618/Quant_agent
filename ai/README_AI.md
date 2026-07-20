@@ -33,8 +33,7 @@ DATA_SOURCE_ENV_KEYS=(
   AI_DATABASE_DSN QUANT_DB_DSN DATABASE_URL
   AI_DEFAULT_TICKER AI_BACKTEST_LOOKBACK_DAYS AI_L4_EVIDENCE_LIMIT
   AI_DB_CONNECT_TIMEOUT_SECONDS AI_DB_STATEMENT_TIMEOUT_MS
-  AI_SCREENING_LIMIT AI_SCREENING_BACKTEST_SELECTION_LIMIT
-  AI_PORTFOLIO_BACKTEST_TICKER_LIMIT AI_SECTOR_CACHE_TTL_SECONDS
+  AI_SECTOR_CACHE_TTL_SECONDS
 )
 for key in "${DATA_SOURCE_ENV_KEYS[@]}" BE_JOB_STORE_MODE REDIS_URL AUTH_SESSION_COOKIE_NAME AI_CORS_ALLOW_ORIGINS; do
   unset "$key"
@@ -167,7 +166,7 @@ PY
 ## API status / ready / clarification 계약 (MVP 고정)
 - `GET /api-status`는 공용/민감값을 숨긴 상태계약을 반환한다.
   - `data_source.configured`, `data_source.dsn_env`, `data_source.price_source`,
-    `data_source.universe_source`, `data_source.l4_evidence_source`, `data_source.macro_usable` 확인.
+    `data_source.l4_evidence_source`, `data_source.macro_usable` 확인.
   - `job_store.requested_mode`, `job_store.active_mode`, `job_store.mode_env`,
     `job_store.dsn_configured`, `job_store.fallback`, `job_store.fallback_reason` 확인.
   - DSN/secret 값은 응답 본문에 노출되지 않는다.

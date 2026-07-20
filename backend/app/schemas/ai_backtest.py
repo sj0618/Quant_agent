@@ -238,7 +238,7 @@ class BacktestRunCreate(BaseModel):
     benchmark_ticker: str | None = None
     data_source: str | None = None
     strategy_snapshot_jsonb: dict[str, Any] = Field(default_factory=dict)
-    universe_snapshot_jsonb: dict[str, Any] = Field(default_factory=dict)
+    candidate_snapshot_jsonb: dict[str, Any] = Field(default_factory=dict)
     as_of_at: datetime | None = None
     status: str = Field(default="succeeded", min_length=1)
     started_at: datetime | None = None
