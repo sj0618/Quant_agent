@@ -11,6 +11,7 @@ import type {
   AIJobStageStatus,
   AIReportBundle,
   AIRiskAdjustment,
+  AIScreeningMatch,
   AIStrategySpec,
   AnalysisJob,
   AnalysisJobStatus,
@@ -31,6 +32,7 @@ import type {
   StrategyReportSummary,
   StrategySpec,
   Tone,
+  TradingCandidate,
 } from "../types/quantagent";
 
 const APP_LOCALE = "ko-KR";
@@ -325,7 +327,7 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
     latestRunLabel: `최신 분석 · ${formatDateTime(job.updated_at)}`,
     nextRunLabel: result ? "예약 없음" : base.nextRunLabel,
     chatMessages: mergeChatMessages(base.chatMessages, buildAnalysisChatMessages(job)),
-    candidates: result ? [] : base.candidates,
+    candidates: result ? buildTradingCandidatesFromAnalysisJob(job) : base.candidates,
     performance,
     recentReports,
     envelope: result ?? base.envelope,
@@ -522,6 +524,45 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
       { label: "Trace", value: result.trace_id.slice(0, TRACE_PREVIEW_LENGTH), tone: "neutral" },
     ],
   };
+}
+
+function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandidate[] {
+  const result = job.result;
+  if (!result || result.status !== "ready") {
+    return [];
+  }
+
+  const signal = result.user_payload.report ? extractFinalSignal(result.user_payload.report) : null;
+  if (!signal) {
+    return [];
+  }
+
+  const byTicker = new Map<string, { match: AIScreeningMatch; card: (typeof result.user_payload.candidate_cards)[number] }>();
+  for (const card of result.user_payload.candidate_cards) {
+    for (const match of card.matches ?? []) {
+      const existing = byTicker.get(match.ticker);
+      if (!existing || match.score > existing.match.score) {
+        byTicker.set(match.ticker, { match, card });
+      }
+    }
+  }
+
+  return Array.from(byTicker.values())
+    .sort((a, b) => b.match.score - a.match.score)
+    .map(({ match, card }) => ({
+      id: `${job.job_id}-${match.ticker}`,
+      ticker: match.ticker,
+      name: match.name,
+      sector: match.sector ?? card.sector ?? "",
+      signal: signal.action,
+      confidence: signal.confidence ?? 0,
+      score: match.score,
+      price: "—",
+      changePercent: "—",
+      rationale: card.reason ?? card.summary,
+      evidence: [],
+      riskReasons: [],
+    }));
 }
 
 function buildStrategyReportSummaryFromAnalysisJob(job: AnalysisJob): StrategyReportSummary | null {

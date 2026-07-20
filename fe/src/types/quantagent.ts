@@ -137,6 +137,15 @@ export interface AIStrategySpec {
   confidence: number;
 }
 
+export interface AIScreeningMatch {
+  ticker: string;
+  name: string;
+  market: string;
+  sector?: string | null;
+  score: number;
+  as_of_date: string;
+}
+
 export interface StrategyCandidateCard {
   strategy_id: string;
   title: string;
@@ -144,6 +153,8 @@ export interface StrategyCandidateCard {
   key_conditions: string[];
   confidence: number;
   reason?: string | null;
+  sector?: string | null;
+  matches?: AIScreeningMatch[];
 }
 
 export interface AIClarificationOption {
