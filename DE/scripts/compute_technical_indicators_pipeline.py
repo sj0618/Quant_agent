@@ -550,7 +550,6 @@ def main() -> int:
     parser.add_argument("--output", default=None, help="Optional JSON summary artifact path.")
     args = parser.parse_args()
 
-    require_pandas_ta()
     require_talib()
 
     config = DatabaseConfig.from_env()
@@ -661,16 +660,6 @@ def main() -> int:
     return 0
 
 
-def require_pandas_ta() -> None:
-    try:
-        import pandas_ta  # noqa: F401
-    except ImportError as exc:
-        raise SystemExit(
-            "pandas-ta is required by the TA interface specification. "
-            "Install it with: python -m pip install pandas-ta"
-        ) from exc
-
-
 def require_talib() -> None:
     try:
         import talib  # noqa: F401
@@ -749,7 +738,7 @@ def ensure_feature_tables(client: DockerPsqlClient) -> None:
         CREATE SCHEMA IF NOT EXISTS mart;
         ALTER TABLE meta.lineage_event ADD COLUMN IF NOT EXISTS metadata_jsonb JSONB NOT NULL DEFAULT '{{}}'::jsonb;
         INSERT INTO meta.data_source (source_id, name, base_url_key, version, is_primary)
-        VALUES ('TA', 'Pandas-TA/TA-Lib technical indicator transform', 'TA_TRANSFORM_VERSION', 'pandas-ta-talib-v1', FALSE)
+        VALUES ('TA', 'TA-Lib technical indicator transform', 'TA_TRANSFORM_VERSION', 'pandas-ta-talib-v1', FALSE)
         ON CONFLICT (source_id) DO UPDATE SET
           name = EXCLUDED.name,
           version = EXCLUDED.version,
@@ -1163,8 +1152,6 @@ def apply_adjusted_price_continuity(frame: pd.DataFrame) -> tuple[pd.DataFrame, 
 
 
 def compute_indicator_frames(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    import pandas_ta  # noqa: F401
-
     ta_input = pd.DataFrame(
         {
             "open": frame["adj_open"],
