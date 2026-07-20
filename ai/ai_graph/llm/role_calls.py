@@ -6,15 +6,25 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.llm import LLMClientError, LLMJsonRequest, create_llm_client, is_live_llm_provider
-from ai_graph.schemas import DailyDigestComparisonRow, DailyDigestStrategyInput, MarketBrief, MarketBriefItem
+from ai_graph.schemas import (
+    Condition,
+    ConditionOperator,
+    DailyDigestComparisonRow,
+    DailyDigestStrategyInput,
+    MarketBrief,
+    MarketBriefItem,
+)
 
 
 ROLE_DEBATE_SCHEMA_NAME = "quantagent.role_debate.v1"
 MARKET_BRIEF_SCHEMA_NAME = "quantagent.market_brief.v1"
+STRATEGY_CONDITIONS_SCHEMA_NAME = "quantagent.strategy_conditions.v1"
 ROLE_DEBATE_PROMPT_TEMPLATE_NAME = "role_debate"
 MARKET_BRIEF_PROMPT_TEMPLATE_NAME = "daily_market_brief"
+STRATEGY_CONDITIONS_PROMPT_TEMPLATE_NAME = "strategy_conditions"
 ROLE_DEBATE_PROMPT_VERSION = "v2"
 MARKET_BRIEF_PROMPT_VERSION = "v1"
+STRATEGY_CONDITIONS_PROMPT_VERSION = "v1"
 
 
 class RoleDebatePayload(BaseModel):
@@ -62,6 +72,41 @@ class StrategyDescriptionPayload(BaseModel):
     strategy_id: str = Field(min_length=1)
     description: str = Field(min_length=1)
     fallback_reasons: list[str] = Field(default_factory=list)
+
+
+class StrategyConditionsPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    entry_conditions: list[Condition] = Field(default_factory=list)
+    exit_conditions: list[Condition] = Field(default_factory=list)
+    indicators: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    fallback_reasons: list[str] = Field(default_factory=list)
+
+
+class _LiveCondition(BaseModel):
+    """Strict-schema twin of Condition: AOAI's structured-output mode requires every
+    property to be listed in the JSON schema's "required" array, but Condition.description
+    has a default (None) so pydantic omits it from "required" — Azure then rejects the
+    schema outright. Keeping this separate from Condition (used elsewhere with an
+    optional description) avoids forcing every other caller to always supply one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: str
+    operator: ConditionOperator
+    right: float | str | list[float]
+    description: str
+
+
+class _LiveStrategyConditionsOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entry_conditions: list[_LiveCondition]
+    exit_conditions: list[_LiveCondition]
+    indicators: list[str]
+    confidence: float
 
 
 def generate_role_debate(
@@ -223,6 +268,70 @@ def generate_strategy_description(
         description=payload.summary,
         fallback_reasons=payload.fallback_reasons,
     )
+
+
+STRATEGY_CONDITIONS_SYSTEM_PROMPT = (
+    "You are a QuantAgent strategy analyst. Convert the user's Korean natural-language "
+    "trading strategy into structured JSON that matches EXPECTED_JSON_SCHEMA exactly: "
+    '"entry_conditions" and "exit_conditions" (each a non-empty array of objects with '
+    "left, operator, right, description — operator one of lt/lte/gt/gte/eq/ne/between/"
+    'cross_above/cross_below), "indicators" (array of indicator names referenced), and '
+    '"confidence" (0-1). Use the web search tool to confirm current market-standard '
+    "definitions and thresholds for any named indicator or strategy pattern when the query "
+    "alone is insufficient. Return JSON only, no prose.\n\n"
+    "Condition value format (required, no exceptions):\n"
+    "- lt/lte/gt/gte/eq/ne: `right` MUST be a number (int or float). Never a ticker, "
+    "company name, or any other non-numeric string.\n"
+    "- between: `right` MUST be a 2-item [low, high] number array.\n"
+    "- cross_above/cross_below: `right` MUST be a string naming the other metric/line "
+    "being crossed (e.g. \"sma_20\"), not a company or ticker.\n"
+    "Entry/exit conditions describe technical trading logic only (price, indicators, "
+    "volume, moving averages, etc.) — never instrument selection. If the user names a "
+    "specific stock or ticker (e.g. 삼성전자, 005930), do not emit a condition for it; "
+    "stock/universe selection is resolved separately by the data layer, outside this call. "
+    "Only describe the trading logic that applies once a stock is already selected."
+)
+
+
+def generate_strategy_conditions(
+    *,
+    query: str,
+    semantic_slots: dict[str, Any],
+    fallback: StrategyConditionsPayload,
+) -> StrategyConditionsPayload:
+    """Interpret the natural-language strategy into structured entry/exit conditions
+    via the AOAI web search tool instead of the static keyword-matched templates.
+
+    Falls back to the deterministic template profile only when the live provider is
+    not configured (mock/tests); with a live provider, a bad response raises instead
+    of silently masking the failure, matching generate_role_debate.
+    """
+
+    expected_json_schema = _LiveStrategyConditionsOutput.model_json_schema()
+    context = {"query": query, "semantic_slots": semantic_slots}
+    request = LLMJsonRequest(
+        schema_name=STRATEGY_CONDITIONS_SCHEMA_NAME,
+        system_prompt=STRATEGY_CONDITIONS_SYSTEM_PROMPT,
+        user_prompt=_user_prompt(context, expected_json_schema),
+        temperature=0.0,
+        enable_web_search=True,
+        task_type="strategy_conditions",
+        prompt_template_name=STRATEGY_CONDITIONS_PROMPT_TEMPLATE_NAME,
+        prompt_version=STRATEGY_CONDITIONS_PROMPT_VERSION,
+        response_schema=expected_json_schema,
+        variables_jsonb={**context, "expected_json_schema": expected_json_schema},
+    )
+    try:
+        payload = create_llm_client(role="STRATEGY_CONDITIONS").generate_json(request)
+        parsed = _LiveStrategyConditionsOutput.model_validate(payload)
+        if not parsed.entry_conditions or not parsed.exit_conditions:
+            raise ValueError("strategy_conditions response missing entry/exit conditions")
+        return StrategyConditionsPayload(**parsed.model_dump())
+    except (LLMClientError, ValidationError, ValueError, TypeError) as exc:
+        if is_live_llm_provider():
+            raise
+        reasons = [*fallback.fallback_reasons, f"{type(exc).__name__}: {exc}"]
+        return fallback.model_copy(update={"fallback_reasons": reasons})
 
 
 MARKET_BRIEF_SYSTEM_PROMPT = """\

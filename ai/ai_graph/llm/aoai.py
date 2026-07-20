@@ -38,6 +38,11 @@ class AOAIResponsesClient:
         self.retry_backoff_seconds = retry_backoff_seconds
         self.web_search_tool_type = web_search_tool_type
         self._http_client = http_client
+        # Some deployed models (reasoning-tier: o1/o3/gpt-5 family) reject the
+        # "temperature" parameter outright rather than just ignoring it. Detected
+        # lazily from the first 400 response and cached so later calls on this
+        # client instance skip straight to the supported request shape.
+        self._temperature_unsupported = False
 
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
         call_id = begin_model_call(
@@ -112,15 +117,16 @@ class AOAIResponsesClient:
         )
         return result
 
-    def _post_with_retries(self, request: LLMJsonRequest) -> tuple[httpx.Response, int]:
+    def _build_body(self, request: LLMJsonRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.model,
             "input": [
                 {"role": "system", "content": request.system_prompt},
                 {"role": "user", "content": request.user_prompt},
             ],
-            "temperature": request.temperature,
         }
+        if not self._temperature_unsupported:
+            body["temperature"] = request.temperature
         if request.enable_web_search:
             body["tools"] = [{"type": self.web_search_tool_type}]
         if request.response_schema is not None:
@@ -132,6 +138,10 @@ class AOAIResponsesClient:
                     "schema": request.response_schema,
                 }
             }
+        return body
+
+    def _post_with_retries(self, request: LLMJsonRequest) -> tuple[httpx.Response, int]:
+        body = self._build_body(request)
         headers = {"Content-Type": "application/json", "api-key": self.api_key}
         attempts = self.max_retries + 1
         last_error: Exception | None = None
@@ -146,6 +156,14 @@ class AOAIResponsesClient:
                         response = client.post(self.responses_url, headers=headers, json=body)
                 else:
                     response = client.post(self.responses_url, headers=headers, json=body)
+                if (
+                    response.status_code == 400
+                    and not self._temperature_unsupported
+                    and _is_temperature_unsupported_error(response)
+                ):
+                    self._temperature_unsupported = True
+                    body = self._build_body(request)
+                    continue
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts - 1:
                     _sleep_before_retry(self.retry_backoff_seconds, attempt)
                     continue
@@ -310,6 +328,18 @@ def _strip_code_fence(text: str) -> str:
     if lines and lines[-1].startswith("```"):
         lines = lines[:-1]
     return "\n".join(lines).strip()
+
+
+def _is_temperature_unsupported_error(response: httpx.Response) -> bool:
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    message = error.get("message") if isinstance(error, dict) else None
+    return isinstance(message, str) and "temperature" in message.lower() and "not supported" in message.lower()
 
 
 def _should_retry(exc: Exception) -> bool:

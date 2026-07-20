@@ -20,7 +20,12 @@ from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_s
 from ai_graph.data_sources import load_pipeline_data_from_env
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
-from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
+from ai_graph.llm.role_calls import (
+    RoleDebatePayload,
+    StrategyConditionsPayload,
+    generate_role_debate,
+    generate_strategy_conditions,
+)
 from ai_graph.nodes.backtest import backtest_node
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
@@ -1394,6 +1399,16 @@ def build_strategy_spec(
     slots = semantic_slots or {}
     universe = str(slots.get("universe") or "KOSPI200")
     sector = slots.get("sector")
+    conditions = generate_strategy_conditions(
+        query=query,
+        semantic_slots=dict(slots),
+        fallback=StrategyConditionsPayload(
+            entry_conditions=profile["entry_conditions"],
+            exit_conditions=profile["exit_conditions"],
+            indicators=profile["indicators"],
+            confidence=float(profile["confidence"]),
+        ),
+    )
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
         name=str(profile["name"]),
@@ -1401,16 +1416,16 @@ def build_strategy_spec(
         market="KRX",
         sector=sector,
         timeframe="daily",
-        entry_conditions=profile["entry_conditions"],
-        exit_conditions=profile["exit_conditions"],
-        indicators=profile["indicators"],
+        entry_conditions=conditions.entry_conditions,
+        exit_conditions=conditions.exit_conditions,
+        indicators=conditions.indicators or profile["indicators"],
         risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
         assumptions=[
             f"{universe} universe" + (f" filtered to {sector} sector" if sector else ""),
             "daily adjusted close data",
             *profile["assumptions"],
         ],
-        confidence=float(profile["confidence"]),
+        confidence=float(conditions.confidence),
     )
 
 
