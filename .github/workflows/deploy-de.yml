@@ -69,7 +69,7 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             cd "$APP_DIR/DE"
             export AIRFLOW_UID="$(id -u)"
-            docker compose -f docker-compose-airflow-dev.yaml run --rm --no-deps airflow-init
+            docker compose -f docker-compose-airflow-dev.yaml run --rm airflow-init
           REMOTE
 
       # 4단계: 마지막으로 서버를 내렸다가 새 환경 변수판으로 올립니다.
