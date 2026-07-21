@@ -37,6 +37,19 @@ MOCK_PROVIDER_CREDENTIAL_SENTINEL = "qa-mock-provider-sentinel-key"
 MOCK_PROVIDER_STAGES = ["interpreting", "code_generation", "backtest", "debate", "finalizing"]
 
 
+def _poll_job(client, job_id: str) -> dict:
+    """Read a job back through the polling endpoint.
+
+    POST /analysis-jobs only queues the analysis, so the finished envelope is never
+    on the create response - this is the same create-then-poll path the FE takes.
+    TestClient drains the background task before returning, so one poll is enough.
+    """
+
+    response = client.get(f"{ANALYSIS_JOBS_PATH}/{job_id}")
+    assert response.status_code == 200
+    return response.json()
+
+
 def _ready_envelope(trace_id: str) -> APIEnvelope:
     return APIEnvelope(
         status=EnvelopeStatus.READY,
@@ -175,23 +188,22 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
 
     assert create_response.status_code == 201
     created_job = create_response.json()
-    assert created_job["result"]["status"] == "ready"
-    assert "internal_payload" not in created_job["result"]
-    assert [stage["stage"] for stage in created_job["stages"]] == MOCK_PROVIDER_STAGES
-    assert all(stage["status"] == "succeeded" for stage in created_job["stages"])
-    performance = created_job["result"]["user_payload"]["performance"]
+    assert created_job["result"] is None
+
+    polled_job = _poll_job(client, created_job["job_id"])
+
+    assert polled_job["job_id"] == created_job["job_id"]
+    assert polled_job["trace_id"] == created_job["trace_id"]
+    assert polled_job["result"]["status"] == "ready"
+    assert "internal_payload" not in polled_job["result"]
+    assert [stage["stage"] for stage in polled_job["stages"]] == MOCK_PROVIDER_STAGES
+    assert all(stage["status"] == "succeeded" for stage in polled_job["stages"])
+    performance = polled_job["result"]["user_payload"]["performance"]
     assert performance["selected_candidate_id"]
     assert "metrics_by_variant" not in performance
     assert "selected_variant" not in performance
     assert performance["metrics"]["total_return"] > 0
     assert performance["equity_curve"][-1]["cumulative_return"] > 0
-
-    poll_response = client.get(f"{ANALYSIS_JOBS_PATH}/{created_job['job_id']}")
-
-    assert poll_response.status_code == 200
-    polled_job = poll_response.json()
-    assert polled_job["job_id"] == created_job["job_id"]
-    assert polled_job["trace_id"] == created_job["trace_id"]
 
 
 def test_analysis_job_api_lists_only_authenticated_users_jobs_newest_first() -> None:
@@ -252,12 +264,15 @@ def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monk
     )
     assert create_response.status_code == 201
     created_job = create_response.json()
-    created_result = created_job["result"]
+    assert created_job["result"] is None
+
+    polled_job = _poll_job(client, created_job["job_id"])
+    created_result = polled_job["result"]
 
     assert created_result["status"] == "ready"
     assert created_job["trace_id"] == created_result["trace_id"]
-    assert [stage["stage"] for stage in created_job["stages"]] == MOCK_PROVIDER_STAGES
-    assert all(stage["status"] == "succeeded" for stage in created_job["stages"])
+    assert [stage["stage"] for stage in polled_job["stages"]] == MOCK_PROVIDER_STAGES
+    assert all(stage["status"] == "succeeded" for stage in polled_job["stages"])
     assert "internal_payload" not in created_result
     assert "node_outputs" not in created_result
     assert "llm_prompts" not in created_result
@@ -288,7 +303,7 @@ def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monk
 
     clarification_response = client.post(ANALYSIS_JOBS_PATH, json={"query": "저평가주 사줘"})
     assert clarification_response.status_code == 201
-    clarification_job = clarification_response.json()
+    clarification_job = _poll_job(client, clarification_response.json()["job_id"])
     clarification_result = clarification_job["result"]
     clarification_payload = clarification_result["user_payload"]
 
@@ -599,15 +614,15 @@ def test_analysis_job_route_uses_injected_store_and_preserves_polling_contract()
     assert create_response.status_code == 201
     created_job = create_response.json()
     assert store.created_requests == ["RSI strategy"]
-    assert [stage["stage"] for stage in created_job["stages"]] == MOCK_PROVIDER_STAGES
-    assert all(stage["status"] == "succeeded" for stage in created_job["stages"])
-    assert created_job["result"]["status"] == "ready"
-    assert created_job["result"]["trace_id"] == created_job["trace_id"]
+    assert created_job["result"] is None
 
-    poll_response = client.get(f"{ANALYSIS_JOBS_PATH}/{created_job['job_id']}")
+    polled_job = _poll_job(client, created_job["job_id"])
 
-    assert poll_response.status_code == 200
-    assert poll_response.json()["job_id"] == created_job["job_id"]
+    assert polled_job["job_id"] == created_job["job_id"]
+    assert [stage["stage"] for stage in polled_job["stages"]] == MOCK_PROVIDER_STAGES
+    assert all(stage["status"] == "succeeded" for stage in polled_job["stages"])
+    assert polled_job["result"]["status"] == "ready"
+    assert polled_job["result"]["trace_id"] == created_job["trace_id"]
 
 
 def test_analysis_job_route_records_audit_events_with_real_runner() -> None:
@@ -677,8 +692,12 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
     normal = client(NoOpAuditSink())
     broken = client(_create_test_audit_sink(FailingOpenAuditSink()))
 
-    def stable_job_payload(response):
+    def stable_job_payload(client, response):
         body = response.json()
+        # /analysis-jobs queues the run and answers before a result exists; the spec
+        # parse adapter still resolves synchronously.
+        if body["result"] is None:
+            body = _poll_job(client, body["job_id"])
         result = dict(body["result"])
         result.pop("trace_id")
         result.pop("debug_ref")
@@ -699,7 +718,9 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
         normal_response = normal.post(path, json=payload)
         broken_response = broken.post(path, json=payload)
         assert broken_response.status_code == normal_response.status_code
-        assert stable_job_payload(broken_response) == stable_job_payload(normal_response)
+        assert stable_job_payload(broken, broken_response) == stable_job_payload(
+            normal, normal_response
+        )
 
     descriptions_payload = {
         "strategies": [
@@ -789,7 +810,11 @@ def test_failed_analysis_job_returns_error_contract() -> None:
     response = client.post(ANALYSIS_JOBS_PATH, json={"query": "broken strategy"})
 
     assert response.status_code == 201
-    failed_job = response.json()
+    queued_job = response.json()
+    assert queued_job["result"] is None
+
+    failed_job = _poll_job(client, queued_job["job_id"])
+
     assert failed_job["result"]["status"] == "failed"
     assert failed_job["result"]["failure_cause"]["subcause"] == "unknown"
     assert "runner failed" not in failed_job["result"]["user_payload"]["message"]

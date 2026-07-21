@@ -303,7 +303,10 @@ def test_analysis_api_returns_failed_job_when_configured_database_is_down(monkey
     )
 
     assert response.status_code == 201
-    payload = response.json()
+    # POST queues the analysis; the failed envelope surfaces through polling.
+    polled = client.get(f"/analysis-jobs/{response.json()['job_id']}")
+    assert polled.status_code == 200
+    payload = polled.json()
     assert payload["result"]["status"] == "failed"
     assert payload["result"]["failure_cause"] is not None
     assert payload["result"]["user_payload"]["performance"] is None

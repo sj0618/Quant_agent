@@ -5,7 +5,7 @@ from __future__ import annotations
 from os import environ
 from typing import Callable, ClassVar, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -386,10 +386,21 @@ def create_app(
     )
     def create_analysis_job(
         request: CreateAnalysisJobRequest,
+        background_tasks: BackgroundTasks,
         user_id: str = Depends(require_user),
     ) -> AnalysisJob:
+        """Queue the analysis and return the job immediately.
+
+        Against a live provider the graph runs for minutes - far past any reverse
+        proxy's read timeout - so running it inside the request turned every real
+        analysis into a 504. The job store, the per-stage progress on AnalysisJob and
+        GET /analysis-jobs/{job_id} already exist for exactly this shape: the client
+        polls the queued job instead of holding one long request open.
+        """
+
         job = store.create_job(request.query, user_id=user_id)
-        return run_job_sync(
+        background_tasks.add_task(
+            run_job_sync,
             store,
             job.job_id,
             _build_analysis_runner_with_audit(
@@ -401,6 +412,7 @@ def create_app(
                 user_id=user_id,
             ),
         )
+        return job
 
     @app.get(
         ANALYSIS_JOBS_PATH,
