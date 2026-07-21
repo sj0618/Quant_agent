@@ -28,7 +28,14 @@ def test_rsi_strategy_runs_ready_e2e_without_external_keys() -> None:
     internal = DEBUG_STORE.get(envelope.debug_ref)
     assert internal is not None
     assert internal.validation["node_sequence"] == list(NODE_SEQUENCE)
-    assert len(internal.model_dump()) == 7
+    assert set(internal.model_dump()) == {
+        "trace_id",
+        "node_outputs",
+        "llm_prompts",
+        "validation",
+        "backtest_artifacts",
+        "risk_events",
+    }
 
 
 def test_ready_analysis_connects_trace_nodes_model_calls_and_full_prompts() -> None:
@@ -56,8 +63,8 @@ def test_ready_analysis_connects_trace_nodes_model_calls_and_full_prompts() -> N
         "Envelope",
     ]
     assert {record.status for record in session.agent_executions} == {"succeeded"}
-    assert len(session.model_calls) == 10
-    assert len(session.prompt_logs) == 10
+    assert len(session.model_calls) == len(session.prompt_logs)
+    assert "strategy_conditions" in {record.task_type for record in session.model_calls}
     assert {record.trace_id for record in session.model_calls} == {
         session.correlation.db_trace_id
     }

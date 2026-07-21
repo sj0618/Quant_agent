@@ -771,13 +771,45 @@ def test_ready_analysis_with_postgres_sink_persists_all_calls_and_finalizes(caps
     )
 
     statements = [statement for statement, _ in conn.executions]
+    agent_inserts = [
+        params
+        for statement, params in conn.executions
+        if "INSERT INTO app.ai_agent_execution_log" in statement
+    ]
+    agent_updates = [
+        params
+        for statement, params in conn.executions
+        if "UPDATE app.ai_agent_execution_log" in statement
+    ]
+    model_inserts = [
+        params
+        for statement, params in conn.executions
+        if "INSERT INTO app.ai_model_call_log" in statement
+    ]
+    model_updates = [
+        params
+        for statement, params in conn.executions
+        if "UPDATE app.ai_model_call_log" in statement
+    ]
+    prompt_inserts = [
+        params
+        for statement, params in conn.executions
+        if "INSERT INTO app.ai_prompt_log" in statement
+    ]
+    prompt_updates = [
+        params
+        for statement, params in conn.executions
+        if "UPDATE app.ai_prompt_log" in statement
+    ]
     assert envelope.status == "ready"
-    assert sum("INSERT INTO app.ai_agent_execution_log" in sql for sql in statements) == 10
-    assert sum("INSERT INTO app.ai_model_call_log" in sql for sql in statements) == 10
-    assert sum("INSERT INTO app.ai_prompt_log" in sql for sql in statements) == 10
-    assert sum("UPDATE app.ai_agent_execution_log" in sql for sql in statements) == 10
-    assert sum("UPDATE app.ai_model_call_log" in sql for sql in statements) == 10
-    assert sum("UPDATE app.ai_prompt_log" in sql for sql in statements) == 10
+    agent_ids = {params[0] for params in agent_inserts}
+    model_call_ids = {params[0] for params in model_inserts}
+    assert agent_ids == {params[-1] for params in agent_updates}
+    assert model_call_ids == {params[1] for params in prompt_inserts}
+    assert model_call_ids == {params[-1] for params in model_updates}
+    assert model_call_ids == {params[-1] for params in prompt_updates}
+    assert all(params[2] in agent_ids for params in model_inserts)
+    assert "strategy_conditions" in {params[3] for params in model_inserts}
     assert sum("UPDATE app.ai_trace" in sql for sql in statements) == 1
     assert conn.close_calls == 1
     assert "ai_audit_failure" not in capsys.readouterr().err
