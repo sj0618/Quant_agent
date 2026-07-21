@@ -501,19 +501,21 @@ def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[st
             "해당 조건을 빼고 검증할까요?"
         ),
         "question_reason": "검증 불가한 조건을 가격 지표로 대체하면 확인되지 않은 결과가 사실처럼 보입니다.",
+        # ClarificationOption takes label and reason only, and forbids extras - the
+        # envelope validates these, so an option shaped any other way turns an honest
+        # refusal into a failed analysis.
         "options": [
             {
-                "option_id": "drop_unverifiable",
                 "label": f"{joined} 조건을 빼고 나머지만 검증",
-                "description": "검증 가능한 조건만으로 다시 요청해 주세요.",
+                "reason": "검증 가능한 조건만으로 다시 요청하면 결과의 신뢰도를 유지할 수 있습니다.",
             },
             {
-                "option_id": "keep_waiting",
                 "label": "데이터가 연결될 때까지 보류",
-                "description": "해당 데이터 소스가 적재되면 그대로 검증할 수 있습니다.",
+                "reason": "해당 데이터 소스가 적재되면 원래 조건 그대로 검증할 수 있습니다.",
             },
         ],
-        "recommended_option": "drop_unverifiable",
+        # An index into options, not a label - UserPayload.recommended is int|None.
+        "recommended_option": 0,
         "recommendation_confidence": 0.7,
         "recommendation_confidence_reason": "검증 가능한 조건만 남기면 결과의 신뢰도를 유지할 수 있습니다.",
     }
