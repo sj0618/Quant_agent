@@ -9,7 +9,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+import logging
+
 from .sectors import extract_sector_from_query, get_known_sectors
+
+_logger = logging.getLogger(__name__)
 
 
 AI_DATABASE_DSN_ENV = "AI_DATABASE_DSN"
@@ -249,6 +253,42 @@ class PostgresPipelineDataSource:
     def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
         return self._screen_with_relaxation(conn, query)[0]
 
+    def _screen_via_llm(
+        self, conn: Any, query: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+        """Let the model write the screen against the real schema.
+
+        Returns None when that path is unavailable - no live provider, or it could not
+        produce a usable query - so screening falls back to the deterministic profiles
+        rather than failing the analysis.
+        """
+
+        try:
+            from ai_graph.data_sources.llm_screen import screen_with_llm
+
+            result = screen_with_llm(conn, query)
+        except Exception:
+            _logger.exception("LLM screening failed; falling back to profile screening")
+            return None
+        if not result or not result.get("rows"):
+            return None
+
+        sector = None
+        candidates = [
+            _llm_screening_candidate(row, sector=sector) for row in result["rows"]
+        ]
+        trace = {
+            "mode": "llm_authored_sql",
+            "attempts": result.get("attempts") or [],
+            "metrics": result.get("metrics") or [],
+            "unmet_requirements": result.get("unmet_requirements") or [],
+            "research": result.get("research"),
+            "matched_count": len(candidates),
+            "relaxed": len(result.get("attempts") or []) > 1,
+            "relaxation_rounds": max(len(result.get("attempts") or []) - 1, 0),
+        }
+        return candidates, trace
+
     def _screen_with_relaxation(
         self, conn: Any, query: str
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -259,6 +299,10 @@ class PostgresPipelineDataSource:
         giving up we re-ask for a looser screen and retry - recording every round so
         the report can disclose that the conditions were widened.
         """
+
+        llm_result = self._screen_via_llm(conn, query)
+        if llm_result is not None:
+            return llm_result
 
         profile = _screening_profile(query)
         sector = extract_sector_from_query(query, get_known_sectors(conn=conn))
@@ -741,6 +785,40 @@ def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
         "quality_growth": quality_growth,
         "growth_momentum": growth_momentum,
     }.get(profile, lambda row: _above(row.get("close"), 0))
+
+
+def _llm_screening_candidate(row: Mapping[str, Any], *, sector: str | None) -> dict[str, Any]:
+    """Shape an LLM-screened row into a candidate card.
+
+    The query chose its own metric columns, so anything beyond the identifiers is
+    carried through as-is under `metrics` instead of being forced into a fixed set.
+    """
+
+    reserved = {"ticker", "name", "market", "market_segment", "sector", "as_of_date", "time"}
+    metrics = {
+        key: _optional_float_value(value) if _numeric(value) is not None else value
+        for key, value in row.items()
+        if key not in reserved
+    }
+    return {
+        "ticker": str(row.get("ticker") or "").zfill(6),
+        "name": row.get("name") or "",
+        "market": row.get("market_segment") or row.get("market") or "KRX",
+        "sector": row.get("sector") or sector,
+        "as_of_date": _date_value(row.get("as_of_date") or row.get("time") or datetime.now(UTC)).isoformat(),
+        "screening_profile": "llm_authored_sql",
+        "close": _optional_float_value(row.get("close")),
+        "volume_ratio_20": _optional_float_value(row.get("volume_ratio_20")),
+        "rsi": _optional_float_value(row.get("rsi")),
+        "relative_strength_20d": _optional_float_value(row.get("relative_strength_20d")),
+        "relative_strength_60d": _optional_float_value(row.get("relative_strength_60d")),
+        "roe": _optional_float_value(row.get("roe")),
+        "debt_to_equity": _optional_float_value(row.get("debt_to_equity")),
+        "operating_margin": _optional_float_value(row.get("operating_margin")),
+        "revenue_growth_yoy": _optional_float_value(row.get("revenue_growth_yoy")),
+        "metrics": metrics,
+        "matched_rules": [f"{key}={value}" for key, value in list(metrics.items())[:6]],
+    }
 
 
 def _backtest_ticker_pool(
