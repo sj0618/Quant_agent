@@ -1,16 +1,19 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AsyncState } from "../components/common/AsyncState";
 import { Tabs, type TabItem } from "../components/common/Tabs";
 import { AppLayout } from "../components/layout/AppLayout";
 import {
   clearLatestAnalysisJob,
   createAnalysisJob,
+  aiResponseStatus,
   getAnalysisJob,
   getWorkspaceTemplate,
   mergeAnalysisJobIntoOverview,
   refreshLatestAnalysisJob,
   saveLatestAnalysisJob,
 } from "../api/quantAgentClient";
+import { useAnalysisActivity, type ActivityState } from "../api/analysisActivity";
+import { DebateActivityPanel } from "../features/app/DebateActivityPanel";
 import { OverviewTab } from "../features/app/OverviewTab";
 import { PerformanceTab } from "../features/app/PerformanceTab";
 import { StrategyInputPanel } from "../features/app/StrategyInputPanel";
@@ -28,6 +31,10 @@ const TAB_ITEMS: Array<TabItem<WorkspaceTab>> = [
 const CONVERSATION_HISTORY_STORAGE_KEY = "quantagent.chat-conversations.v1";
 const CONVERSATION_HISTORY_LIMIT = 8;
 const ANALYSIS_JOB_POLL_INTERVAL_MS = 2000;
+// Transient blips should not kill a running analysis, but repeated failures mean the
+// job will never resolve on its own and the user needs to be told rather than left
+// watching a progress bar that can no longer move.
+const MAX_POLL_FAILURES = 3;
 const PROGRESS_TICK_INTERVAL_MS = 250;
 const CLIENT_PROGRESS_DURATION_MS = 90_000;
 const CLIENT_PROGRESS_START_PERCENT = 6;
@@ -58,6 +65,7 @@ interface WorkspaceProgress {
   percent: number;
   activeLabel: string;
   steps: Array<{ label: string; status: AIJobStageStatus }>;
+  error?: string;
 }
 
 function getInitialTab(): WorkspaceTab {
@@ -122,7 +130,25 @@ function conversationPreview(conversation: WorkspaceConversation, template: AppO
   };
 }
 
-function WorkspaceEmptyState({ hasConversation, progress }: { hasConversation: boolean; progress?: WorkspaceProgress | null }) {
+function WorkspaceEmptyState({
+  hasConversation,
+  progress,
+  activity,
+}: {
+  hasConversation: boolean;
+  progress?: WorkspaceProgress | null;
+  activity?: ActivityState;
+}) {
+  if (progress?.error) {
+    return (
+      <section className="workspace-empty workspace-empty--error">
+        <strong>분석을 이어갈 수 없습니다</strong>
+        <p>{progress.error}</p>
+        <p className="workspace-empty__query">{progress.query}</p>
+      </section>
+    );
+  }
+
   if (progress) {
     return (
       <section className="workspace-empty workspace-empty--progress">
@@ -150,6 +176,7 @@ function WorkspaceEmptyState({ hasConversation, progress }: { hasConversation: b
               </li>
             ))}
           </ol>
+          {activity ? <DebateActivityPanel activity={activity} /> : null}
         </div>
       </section>
     );
@@ -174,6 +201,10 @@ export function AppPage() {
   const [conversationHistory, setConversationHistory] = useState<WorkspaceConversation[]>(readConversationHistory);
   const [pendingAnalysis, setPendingAnalysis] = useState<PendingAnalysis | null>(null);
   const [progressNow, setProgressNow] = useState(Date.now());
+  const [jobErrors, setJobErrors] = useState<Record<string, string>>({});
+  // Consecutive polling failures per job; a kept ref so retry counting does not
+  // itself retrigger the polling effect.
+  const pollAttemptsRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -209,18 +240,34 @@ export function AppPage() {
   }, [analysisJobs, pendingAnalysis]);
 
   useEffect(() => {
-    const pollingJobs = analysisJobs.filter((job) => !job.result);
+    const pollingJobs = analysisJobs.filter((job) => !job.result && !jobErrors[job.job_id]);
     if (!pollingJobs.length) {
       return undefined;
     }
 
     let cancelled = false;
     const timeoutId = window.setTimeout(async () => {
+      const failures: Record<string, string> = {};
       const refreshedJobs = await Promise.all(
         pollingJobs.map(async (job) => {
           try {
             return await getAnalysisJob(job.job_id);
           } catch (error) {
+            // Swallowing this used to leave the job stuck at result: null forever, so
+            // the UI polled and showed "진행 중" indefinitely. A missing job is gone for
+            // good (the in-memory store is cleared on restart); anything else is only
+            // treated as fatal once it keeps failing, to ride out a brief blip.
+            const status = aiResponseStatus(error);
+            const attempts = (pollAttemptsRef.current[job.job_id] ?? 0) + 1;
+            pollAttemptsRef.current[job.job_id] = attempts;
+            if (status === 404) {
+              failures[job.job_id] =
+                "분석 job을 서버에서 찾을 수 없습니다. 서버가 재시작되었을 수 있습니다.";
+            } else if (attempts >= MAX_POLL_FAILURES) {
+              failures[job.job_id] = status
+                ? `분석 진행 상태를 불러오지 못했습니다. (서버 응답 ${status})`
+                : "분석 진행 상태를 불러오지 못했습니다. 네트워크 연결을 확인해 주세요.";
+            }
             console.warn("AI 분석 job 진행률 갱신에 실패했습니다.", error);
             return job;
           }
@@ -229,6 +276,15 @@ export function AppPage() {
 
       if (cancelled) {
         return;
+      }
+
+      for (const job of refreshedJobs) {
+        if (!failures[job.job_id]) {
+          delete pollAttemptsRef.current[job.job_id];
+        }
+      }
+      if (Object.keys(failures).length) {
+        setJobErrors((current) => ({ ...current, ...failures }));
       }
 
       setAnalysisJobs((jobs) =>
@@ -240,7 +296,7 @@ export function AppPage() {
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [analysisJobs]);
+  }, [analysisJobs, jobErrors]);
 
   const handleTabChange = (tab: WorkspaceTab) => {
     const url = new URL(window.location.href);
@@ -273,7 +329,13 @@ export function AppPage() {
     : { ...data.strategy, natural_language_strategy: latestJob?.query ?? data.strategy.natural_language_strategy };
   const historyPreviews = conversationHistory.map((conversation) => conversationPreview(conversation, data));
   const runningJob = [...analysisJobs].reverse().find((job) => !job.result);
-  const workspaceProgress = buildWorkspaceProgress({ job: runningJob, pendingAnalysis, now: progressNow });
+  const analysisActivity = useAnalysisActivity(runningJob?.job_id ?? null);
+  const workspaceProgress = buildWorkspaceProgress({
+    job: runningJob,
+    pendingAnalysis,
+    now: progressNow,
+    error: runningJob ? jobErrors[runningJob.job_id] : undefined,
+  });
 
   const handleNewConversation = () => {
     if (analysisJobs.length) {
@@ -342,7 +404,7 @@ export function AppPage() {
               {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
             </>
           ) : (
-            <WorkspaceEmptyState hasConversation={hasCurrentConversation} progress={workspaceProgress} />
+            <WorkspaceEmptyState activity={analysisActivity} hasConversation={hasCurrentConversation} progress={workspaceProgress} />
           )}
         </main>
       </div>
@@ -354,10 +416,12 @@ function buildWorkspaceProgress({
   job,
   pendingAnalysis,
   now,
+  error,
 }: {
   job?: AnalysisJob;
   pendingAnalysis: PendingAnalysis | null;
   now: number;
+  error?: string;
 }): WorkspaceProgress | null {
   if (job) {
     const steps = WORKSPACE_PROGRESS_STEPS.map(({ stage, label }) => ({
@@ -371,6 +435,7 @@ function buildWorkspaceProgress({
       percent,
       activeLabel: activeProgressLabel(steps),
       steps,
+      error,
     };
   }
 

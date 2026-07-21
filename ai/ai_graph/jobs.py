@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -15,7 +16,8 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_graph.data_sources.db import resolve_database_dsn_from_env
-from ai_graph.progress import stage_reporter
+from ai_graph.job_events import JobEventBuffer
+from ai_graph.progress import activity_reporter, stage_reporter
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
 
 
@@ -299,7 +301,13 @@ class InMemoryAnalysisJobStore:
         return job
 
 
-def run_job_sync(store: AnalysisJobStore, job_id: str, runner: AnalysisRunner) -> AnalysisJob:
+def run_job_sync(
+    store: AnalysisJobStore,
+    job_id: str,
+    runner: AnalysisRunner,
+    *,
+    events: JobEventBuffer | None = None,
+) -> AnalysisJob:
     job = store.get_job(job_id)
     if job is None:
         raise KeyError(f"analysis job not found: {job_id}")
@@ -311,9 +319,16 @@ def run_job_sync(store: AnalysisJobStore, job_id: str, runner: AnalysisRunner) -
 
     def report_stage(stage_value: str) -> None:
         store.update_job_status(job_id, AnalysisJobStatus.RUNNING, Stage(stage_value))
+        if events is not None:
+            events.publish(job_id, {"kind": "stage", "stage": stage_value})
 
     try:
-        with stage_reporter(report_stage):
+        with ExitStack() as scope:
+            scope.enter_context(stage_reporter(report_stage))
+            if events is not None:
+                scope.enter_context(
+                    activity_reporter(lambda event: events.publish(job_id, event))
+                )
             result = runner(job.query, job.trace_id)
     except Exception as exc:
         diagnostic = classify_failure(exc, stage=Stage.FINALIZING.value)
@@ -333,6 +348,11 @@ def run_job_sync(store: AnalysisJobStore, job_id: str, runner: AnalysisRunner) -
             diagnostic.safe_message,
             result_envelope=_failure_envelope(job, diagnostic.safe_message, failure_cause=diagnostic),
         )
+    finally:
+        # Readers must be released whether the analysis succeeded or failed, otherwise
+        # an SSE connection hangs until its own timeout.
+        if events is not None:
+            events.close(job_id)
     return store.complete_job(job_id, result)
 
 

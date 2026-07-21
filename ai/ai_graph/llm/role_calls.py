@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.llm import LLMClientError, LLMJsonRequest, create_llm_client, is_live_llm_provider
+from ai_graph.progress import activity_role, report_activity
 from ai_graph.schemas import (
     Condition,
     ConditionOperator,
@@ -149,7 +150,11 @@ def generate_role_debate(
         },
     )
     try:
-        payload = create_llm_client(role=role).generate_json(request)
+        # Tagging the call lets the live view group provider activity under the voice
+        # that produced it without the provider client knowing about debates at all.
+        with activity_role(role):
+            report_activity("role_started", task=task)
+            payload = create_llm_client(role=role).generate_json(request)
         provider_payload = {
             key: value
             for key, value in payload.items()
@@ -157,12 +162,24 @@ def generate_role_debate(
         }
         if is_live_llm_provider():
             provider_payload = _LiveRoleDebateOutput.model_validate(provider_payload).model_dump()
-        return RoleDebatePayload.model_validate(
+        debate = RoleDebatePayload.model_validate(
             {
                 **provider_payload,
                 "role": role,
             }
         )
+        with activity_role(role):
+            # The provider's own fields, restructured but not reworded, so the view can
+            # show a readable opinion instead of the raw JSON the deltas spell out.
+            report_activity(
+                "role_completed",
+                summary=debate.summary,
+                evidence=list(debate.evidence),
+                concerns=list(debate.concerns),
+                recommendation=debate.recommendation,
+                confidence=debate.confidence,
+            )
+        return debate
     except (LLMClientError, ValidationError, ValueError, TypeError) as exc:
         if is_live_llm_provider():
             raise
