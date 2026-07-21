@@ -70,6 +70,7 @@ DART_ACCOUNTS = {
     "profit_loss": "ifrs-full_ProfitLoss",
     "revenue": "ifrs-full_Revenue",
     "operating_income": "dart_OperatingIncomeLoss",
+    "eps": "ifrs-full_BasicEarningsLossPerShare",
 }
 
 TICKER_PATTERN = re.compile(r"\b\d{6}\b")
@@ -210,12 +211,15 @@ class PostgresPipelineDataSource:
                 raise ValueError(f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}")
             l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
+            capability_availability = measure_capabilities(conn)
 
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
-            data_availability=_data_availability_for_query(query, source="postgres"),
+            data_availability=_data_availability_for_query(
+                query, source="postgres", available=capability_availability
+            ),
             metadata={
                 "source": "postgres",
                 "dsn_env": self.config.database_dsn_env,
@@ -873,7 +877,8 @@ def _financial_cte() -> str:
                 {_dart_amount('liabilities')} AS liabilities,
                 {_dart_amount('profit_loss')} AS profit_loss,
                 {_dart_amount('revenue')} AS revenue,
-                {_dart_amount('operating_income')} AS operating_income
+                {_dart_amount('operating_income')} AS operating_income,
+                {_dart_amount('eps')} AS eps
             FROM {DART_FINANCIAL_TABLE}
             WHERE available_from <= (SELECT as_of_date FROM latest_date)
         ),
@@ -901,7 +906,8 @@ def _financial_cte() -> str:
                 CASE
                     WHEN current_filing.revenue > 0 AND prior_filing.revenue > 0
                     THEN current_filing.revenue / prior_filing.revenue - 1
-                END AS revenue_growth_yoy
+                END AS revenue_growth_yoy,
+                current_filing.eps
             FROM financial_latest current_filing
             LEFT JOIN financial_raw prior_filing
               ON prior_filing.symbol = current_filing.symbol
@@ -1032,6 +1038,8 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 fin.debt_to_equity,
                 fin.operating_margin,
                 fin.revenue_growth_yoy,
+                -- PER needs no share count: DART reports basic EPS directly.
+                CASE WHEN fin.eps > 0 THEN close / fin.eps END AS per,
                 fin.financial_period_end
             FROM features f
             LEFT JOIN momentum_with_prev mwp
@@ -1132,7 +1140,121 @@ def _compare(left: Any, right: Any, *, factor: float = 1.0) -> bool:
     return left_value >= right_value * factor
 
 
-def _data_availability_for_query(query: str, *, source: str) -> dict[str, Any]:
+# What each kind of condition needs, and how to tell whether we actually have it.
+# `probe` is a table that must contain rows; `supported=False` marks something the
+# warehouse cannot express at all, regardless of what is loaded.
+DATA_CAPABILITIES: dict[str, dict[str, Any]] = {
+    "price_ta": {
+        "label": "가격·기술지표",
+        "probe": KIS_ADJUSTED_OHLCV_TABLE,
+        "terms": (),
+    },
+    "financial_statements": {
+        "label": "재무제표(ROE·부채비율·영업이익률·매출성장률)",
+        "probe": DART_FINANCIAL_TABLE,
+        "terms": ("roe", "부채", "영업이익", "매출", "재무", "순이익", "이익률"),
+    },
+    "per": {
+        "label": "PER",
+        # Derived as price / basic EPS; DART reports EPS per share, so no share count
+        # is needed. An earlier version assumed otherwise and wrongly blocked PER.
+        "probe": DART_FINANCIAL_TABLE,
+        "terms": ("per", "주가수익비율"),
+    },
+    "book_value_multiples": {
+        "label": "PBR·배당수익률",
+        # Both need a per-share book value or per-share dividend, and only aggregate
+        # equity and total dividends paid are loaded.
+        "supported": False,
+        "reason": "주당순자산·주당배당금이 없어 PBR·배당수익률을 계산할 수 없습니다.",
+        "terms": ("pbr", "배당수익률", "주당순자산"),
+    },
+    "institutional_flow": {
+        "label": "기관·외국인 수급",
+        "probe": "feature.seibro_universe_daily",
+        "reason": "수급 데이터가 적재되어 있지 않습니다.",
+        "terms": ("기관", "외국인", "순매수", "수급"),
+    },
+    "short_interest": {
+        "label": "공매도 잔고",
+        "supported": False,
+        "reason": "공매도 잔고 데이터 소스가 연결되어 있지 않습니다.",
+        "terms": ("공매도", "숏커버", "대차잔고"),
+    },
+    "earnings_revision": {
+        "label": "실적 컨센서스 변화·가이던스",
+        "supported": False,
+        "reason": "컨센서스 추정치 시계열이 없어 상향/하향 판정이 불가능합니다.",
+        "terms": ("컨센서스", "가이던스", "어닝 서프라이즈", "어닝서프라이즈", "eps 추정", "이익 전망"),
+    },
+    "analyst_reports": {
+        "label": "애널리스트 리포트",
+        "probe": ANALYST_REPORT_TABLE,
+        "terms": ("리포트", "투자의견", "목표주가"),
+    },
+    "macro": {
+        "label": "거시지표",
+        "probe": BOK_MACRO_VIEW,
+        "terms": ("금리", "환율", "원달러", "원자재"),
+    },
+}
+
+
+def _required_capabilities(query: str) -> list[str]:
+    lowered = query.lower()
+    required = ["price_ta"]
+    for name, spec in DATA_CAPABILITIES.items():
+        terms = spec.get("terms") or ()
+        if terms and any(term.lower() in lowered for term in terms):
+            required.append(name)
+    return required
+
+
+def measure_capabilities(conn: Any) -> dict[str, bool]:
+    """Check which capabilities the warehouse can actually serve right now.
+
+    Availability used to be a hardcoded string, and it had drifted from reality in
+    both directions - it claimed OpenDART was missing while 73k filings were loaded,
+    and claimed macro was pilot-only while it was current.
+    """
+
+    available: dict[str, bool] = {}
+    for name, spec in DATA_CAPABILITIES.items():
+        if spec.get("supported") is False:
+            available[name] = False
+            continue
+        probe = spec.get("probe")
+        if not probe:
+            available[name] = True
+            continue
+        try:
+            row = conn.execute(f"SELECT EXISTS (SELECT 1 FROM {probe} LIMIT 1) AS present").fetchone()
+            available[name] = bool(row and row.get("present"))
+        except Exception:
+            # A missing or unreadable table is simply an unavailable capability.
+            available[name] = False
+    return available
+
+
+def unsupported_capabilities(query: str, available: Mapping[str, bool]) -> list[dict[str, str]]:
+    unsupported = []
+    for name in _required_capabilities(query):
+        if available.get(name, True):
+            continue
+        spec = DATA_CAPABILITIES.get(name, {})
+        unsupported.append(
+            {
+                "capability": name,
+                "label": str(spec.get("label") or name),
+                "reason": str(spec.get("reason") or "필요한 데이터가 적재되어 있지 않습니다."),
+            }
+        )
+    return unsupported
+
+
+def _data_availability_for_query(
+    query: str, *, source: str, available: Mapping[str, bool] | None = None
+) -> dict[str, Any]:
     query_text = query.lower()
     needs_financials = any(
         term in query_text or term in query
@@ -1161,15 +1283,28 @@ def _data_availability_for_query(query: str, *, source: str) -> dict[str, Any]:
         proxy_used.append("BOK macro mart 파일럿 상태: 거시 조건은 설명용 availability로만 표시")
     if needs_reports:
         proxy_used.append("SEIBro feature mart 미적재: raw analyst report evidence만 사용")
+    measured = dict(available or {})
+    unsupported = unsupported_capabilities(query, measured) if measured else []
     return {
         "source": source,
         "price_ta": "available" if source == "postgres" else "fixture",
-        "open_dart": "unavailable",
-        "bok_macro": "pilot_only",
-        "seibro_report": "raw_available" if source == "postgres" else "fixture",
+        "open_dart": _availability_word(measured.get("financial_statements")),
+        "bok_macro": _availability_word(measured.get("macro")),
+        "seibro_report": _availability_word(measured.get("analyst_reports")),
         "agentic_web_search": "not_connected",
+        "capabilities": {
+            name: _availability_word(measured.get(name)) for name in DATA_CAPABILITIES
+        },
+        "required_capabilities": _required_capabilities(query),
+        "unsupported_capabilities": unsupported,
         "proxy_used": proxy_used,
     }
+
+
+def _availability_word(value: bool | None) -> str:
+    if value is None:
+        return "unknown"
+    return "available" if value else "unavailable"
 
 
 def _has_market_scope_reference(query: str) -> bool:

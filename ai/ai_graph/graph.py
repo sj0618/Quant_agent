@@ -463,7 +463,53 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         output["l4_evidence"] = pipeline_data.l4_evidence
     if pipeline_data.macro_snapshot:
         output["macro_snapshot"] = pipeline_data.macro_snapshot
+
+    # Stop rather than screen on whatever data happens to exist. Conditions we cannot
+    # evaluate used to fall through to a price-only profile, so a flow or short-interest
+    # strategy came back with a full report built from unrelated names - a result that
+    # reads as verified but never tested what the user asked for.
+    unsupported = pipeline_data.data_availability.get("unsupported_capabilities") or []
+    if unsupported:
+        output["status"] = EnvelopeStatus.NEED_CLARIFICATION.value
+        output["ambiguity"] = _unverifiable_ambiguity(unsupported)
     return output
+
+
+def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    labels = [str(item.get("label")) for item in unsupported]
+    reasons = [f"{item.get('label')}: {item.get('reason')}" for item in unsupported]
+    joined = ", ".join(labels)
+    return {
+        "category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+        "ambiguity_category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+        "safety_priority": False,
+        "reason": f"현재 데이터로 검증할 수 없는 조건이 있습니다: {joined}",
+        "ambiguity_reasons": reasons,
+        "ambiguity_dimensions": ["data_availability"],
+        "source_resolvable": False,
+        "needs_clarification_after_source_check": True,
+        "clarification_blocker_type": "missing_data_source",
+        "clarification_question": (
+            f"{joined} 조건은 현재 적재된 데이터로 검증할 수 없습니다. "
+            "해당 조건을 빼고 검증할까요?"
+        ),
+        "question_reason": "검증 불가한 조건을 가격 지표로 대체하면 확인되지 않은 결과가 사실처럼 보입니다.",
+        "options": [
+            {
+                "option_id": "drop_unverifiable",
+                "label": f"{joined} 조건을 빼고 나머지만 검증",
+                "description": "검증 가능한 조건만으로 다시 요청해 주세요.",
+            },
+            {
+                "option_id": "keep_waiting",
+                "label": "데이터가 연결될 때까지 보류",
+                "description": "해당 데이터 소스가 적재되면 그대로 검증할 수 있습니다.",
+            },
+        ],
+        "recommended_option": "drop_unverifiable",
+        "recommendation_confidence": 0.7,
+        "recommendation_confidence_reason": "검증 가능한 조건만 남기면 결과의 신뢰도를 유지할 수 있습니다.",
+    }
 
 
 def research_node(state: QuantAgentState) -> dict[str, Any]:
