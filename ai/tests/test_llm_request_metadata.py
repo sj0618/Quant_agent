@@ -7,12 +7,17 @@ from ai_graph.schemas import MarketBrief
 class CapturingClient:
     def __init__(self, response: dict | None = None) -> None:
         self.request: LLMJsonRequest | None = None
+        # Must satisfy _LiveRoleDebateOutput in full: with a live provider configured,
+        # generate_role_debate re-raises a parse failure instead of falling back, so an
+        # incomplete stub would fail these prompt-identity assertions for the wrong reason.
         self.response = response or {
             "summary": "summary",
             "evidence": [],
             "concerns": [],
             "recommendation": "HOLD",
             "confidence": 0.5,
+            "validation_results": {"checks": []},
+            "citations": [],
         }
 
     def generate_json(self, request: LLMJsonRequest) -> dict:

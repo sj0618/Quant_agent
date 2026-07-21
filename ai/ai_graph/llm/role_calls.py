@@ -25,6 +25,9 @@ STRATEGY_CONDITIONS_PROMPT_TEMPLATE_NAME = "strategy_conditions"
 ROLE_DEBATE_PROMPT_VERSION = "v2"
 MARKET_BRIEF_PROMPT_VERSION = "v1"
 STRATEGY_CONDITIONS_PROMPT_VERSION = "v1"
+SCREENING_RELAXATION_SCHEMA_NAME = "quantagent.screening_relaxation.v1"
+SCREENING_RELAXATION_PROMPT_TEMPLATE_NAME = "screening_relaxation"
+SCREENING_RELAXATION_PROMPT_VERSION = "v1"
 
 
 class RoleDebatePayload(BaseModel):
@@ -330,6 +333,91 @@ def generate_strategy_conditions(
             raise
         reasons = [*fallback.fallback_reasons, f"{type(exc).__name__}: {exc}"]
         return fallback.model_copy(update={"fallback_reasons": reasons})
+
+
+SCREENING_RELAXATION_SYSTEM_PROMPT = """\
+You are QuantAgent's screening-threshold tuner. A stock screen built from the
+user's strategy returned zero matches against the whole listed universe, which
+usually means the thresholds are too strict for this particular trading day -
+not that the strategy is wrong.
+
+Return JSON only: the same threshold object, loosened just enough to admit a
+small number of candidates while still expressing the user's intent. Loosen the
+conditions the query cares least about first, and keep the ones it states
+explicitly as close to the original as you can. Never tighten a threshold.
+
+Every value must stay inside these inclusive ranges:
+  high_252_ratio 0.50..1.0, volume_ratio_min 0.5..10.0,
+  relative_strength_20d_min -1.0..1.0, relative_strength_60d_min -1.0..1.0,
+  rsi_max 5.0..70.0, rsi_cross_floor 5.0..70.0, sma20_band 0.005..0.50,
+  bb_width_max 0.02..1.0, bb_upper_ratio 0.50..1.0.
+require_close_above_sma20 is a boolean; set it false to drop the trend filter.
+"""
+
+
+class _LiveScreeningThresholds(BaseModel):
+    """Strict-schema threshold payload: AOAI structured output requires every property
+    to be listed as required, so no field carries a default here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    high_252_ratio: float
+    volume_ratio_min: float
+    require_close_above_sma20: bool
+    relative_strength_20d_min: float
+    relative_strength_60d_min: float
+    rsi_max: float
+    rsi_cross_floor: float
+    sma20_band: float
+    bb_width_max: float
+    bb_upper_ratio: float
+    rationale: str
+
+
+def generate_relaxed_screening_thresholds(
+    *,
+    query: str,
+    profile: str,
+    current: dict[str, Any],
+    fallback: dict[str, Any],
+    round_index: int,
+    universe_rows: int,
+) -> dict[str, Any]:
+    """Propose looser screening thresholds after a screen returned no candidates.
+
+    Returns a plain mapping rather than the caller's model so ai_graph.data_sources
+    stays importable without the LLM stack; the caller re-validates and clamps it.
+    Unlike the other role calls this never raises on a live provider - screening has
+    a deterministic ladder to fall back on, and failing the whole analysis because a
+    relaxation hint was unavailable would be worse than widening the screen blindly.
+    """
+
+    expected_json_schema = _LiveScreeningThresholds.model_json_schema()
+    context = {
+        "query": query,
+        "screening_profile": profile,
+        "current_thresholds": current,
+        "relaxation_round": round_index + 1,
+        "universe_size": universe_rows,
+        "matched_count": 0,
+    }
+    request = LLMJsonRequest(
+        schema_name=SCREENING_RELAXATION_SCHEMA_NAME,
+        system_prompt=SCREENING_RELAXATION_SYSTEM_PROMPT,
+        user_prompt=_user_prompt(context, expected_json_schema),
+        temperature=0.0,
+        task_type="screening_relaxation",
+        prompt_template_name=SCREENING_RELAXATION_PROMPT_TEMPLATE_NAME,
+        prompt_version=SCREENING_RELAXATION_PROMPT_VERSION,
+        response_schema=expected_json_schema,
+        variables_jsonb={**context, "expected_json_schema": expected_json_schema},
+    )
+    try:
+        payload = create_llm_client(role="SCREENING_RELAXATION").generate_json(request)
+        parsed = _LiveScreeningThresholds.model_validate(payload)
+    except (LLMClientError, ValidationError, ValueError, TypeError):
+        return dict(fallback)
+    return parsed.model_dump(exclude={"rationale"})
 
 
 MARKET_BRIEF_SYSTEM_PROMPT = """\

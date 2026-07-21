@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -37,6 +37,10 @@ DEFAULT_DB_STATEMENT_TIMEOUT_MS = 30_000
 POSTGRES_TIMEOUT_UNIT = "ms"
 BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 3
 RSI_OVERSOLD_THRESHOLD = 30.0
+# Sentinel profile whose WHERE clause is the permissive `close > 0` baseline: screening
+# selects the whole universe once and filters it per relaxation round in-process.
+SCREENING_BASELINE_PROFILE = "__baseline__"
+MAX_SCREENING_RELAXATION_ROUNDS = 3
 
 KIS_FEATURE_FRAME_VIEW = "mart.kis_adjusted_feature_frame_asof"
 KIS_ADJUSTED_OHLCV_TABLE = "feature.kis_adjusted_ohlcv_daily"
@@ -132,9 +136,10 @@ class PostgresPipelineDataSource:
         with self._connect() as conn:
             self._set_statement_timeout(conn)
             screening_candidates = []
+            screening_relaxation: dict[str, Any] = {}
             ticker_resolution = "screening"
             if _query_requests_screening(query):
-                screening_candidates = self._fetch_screening_candidates(conn, query)
+                screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
             single_ticker: str | None = None
             if not screening_candidates:
                 single_ticker = self._resolve_ticker(conn, query)
@@ -142,7 +147,9 @@ class PostgresPipelineDataSource:
                     # Ambiguous query (no explicit ticker, no name match): retry as
                     # a broad condition screen instead of silently trading a
                     # single hardcoded default ticker.
-                    screening_candidates = self._fetch_screening_candidates(conn, query)
+                    screening_candidates, screening_relaxation = self._screen_with_relaxation(
+                        conn, query
+                    )
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
                         if screening_candidates
@@ -170,7 +177,8 @@ class PostgresPipelineDataSource:
                 # report that looks real but always trades the same hardcoded stock.
                 raise ValueError(
                     "no screening candidates or resolvable ticker found in the database "
-                    "for this query; refusing to fall back to a hardcoded default ticker"
+                    f"for this query after {screening_relaxation.get('relaxation_rounds', 0)} "
+                    "relaxation round(s); refusing to fall back to a hardcoded default ticker"
                 )
             if not price_rows:
                 raise ValueError(f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}")
@@ -197,6 +205,7 @@ class PostgresPipelineDataSource:
                 ],
                 "price_rows": len(price_rows),
                 "screening_candidates": len(screening_candidates),
+                "screening_relaxation": screening_relaxation,
                 "backtest_lookback_days": effective_lookback_days,
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_rows": len(l4_evidence),
@@ -208,13 +217,54 @@ class PostgresPipelineDataSource:
         )
 
     def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
+        return self._screen_with_relaxation(conn, query)[0]
+
+    def _screen_with_relaxation(
+        self, conn: Any, query: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Screen for candidates, progressively loosening the thresholds until some match.
+
+        An empty strict screen is a normal market outcome (on a given day nothing may
+        sit at a 52-week high *and* on a volume surge), not a failure, so instead of
+        giving up we re-ask for a looser screen and retry - recording every round so
+        the report can disclose that the conditions were widened.
+        """
+
         profile = _screening_profile(query)
         sector = extract_sector_from_query(query, get_known_sectors(conn=conn))
-        params: list[Any] = []
-        if sector:
-            params.append(sector)
-        rows = conn.execute(_screening_sql(profile, sector=sector), params).fetchall()
-        return [_screening_candidate_from_row(row, profile, sector=sector) for row in rows]
+        params: list[Any] = [sector] if sector else []
+        # The window-function CTE is the expensive part, so it runs once and every
+        # relaxation round re-filters these rows in-process.
+        rows = conn.execute(_screening_sql(SCREENING_BASELINE_PROFILE, sector=sector), params).fetchall()
+
+        thresholds = ScreeningThresholds()
+        rounds: list[dict[str, Any]] = []
+        for round_index in range(MAX_SCREENING_RELAXATION_ROUNDS + 1):
+            matches = _screening_matcher(profile, thresholds)
+            matched = [row for row in rows if matches(row)]
+            rounds.append(
+                {
+                    "round": round_index,
+                    "relaxed": round_index > 0,
+                    "thresholds": thresholds.model_dump(),
+                    "matched_count": len(matched),
+                }
+            )
+            if matched:
+                candidates = [
+                    _screening_candidate_from_row(row, profile, sector=sector) for row in matched
+                ]
+                return candidates, _relaxation_trace(profile, rounds, len(rows))
+            if round_index == MAX_SCREENING_RELAXATION_ROUNDS:
+                break
+            thresholds = _propose_relaxed_thresholds(
+                query=query,
+                profile=profile,
+                thresholds=thresholds,
+                round_index=round_index,
+                universe_rows=len(rows),
+            )
+        return [], _relaxation_trace(profile, rounds, len(rows))
 
     def _connect(self) -> Any:
         import psycopg
@@ -317,11 +367,11 @@ class PostgresPipelineDataSource:
     ) -> dict[date, Mapping[str, Any]]:
         rows = conn.execute(
             """
-            SELECT time, values_jsonb
+            SELECT DISTINCT ON (time) time, values_jsonb
             FROM feature.ta_momentum_ticker_daily
-            WHERE ticker = %s
+            WHERE split_part(ticker, '#', 1) = %s
               AND time >= CURRENT_DATE - make_interval(days => %s)
-            ORDER BY time DESC
+            ORDER BY time DESC, ticker
             LIMIT %s
             """,
             [ticker, calendar_lookback_days, lookback_days],
@@ -435,6 +485,187 @@ def _query_requests_screening(query: str) -> bool:
     )
 
 
+class ScreeningThresholds(BaseModel):
+    """Numeric knobs the screening filter is built from.
+
+    Every relaxation proposal - including an LLM-generated one - is applied through
+    this model, so a proposed value is always a bounded number and never reaches the
+    filter as free text. Out-of-range proposals fail validation and the caller falls
+    back to the deterministic ladder instead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    high_252_ratio: float = Field(default=0.995, ge=0.50, le=1.0)
+    volume_ratio_min: float = Field(default=1.5, ge=0.5, le=10.0)
+    require_close_above_sma20: bool = Field(default=True)
+    relative_strength_20d_min: float = Field(default=0.0, ge=-1.0, le=1.0)
+    relative_strength_60d_min: float = Field(default=0.0, ge=-1.0, le=1.0)
+    rsi_max: float = Field(default=35.0, ge=5.0, le=70.0)
+    rsi_cross_floor: float = Field(default=30.0, ge=5.0, le=70.0)
+    sma20_band: float = Field(default=0.04, ge=0.005, le=0.50)
+    bb_width_max: float = Field(default=0.18, ge=0.02, le=1.0)
+    bb_upper_ratio: float = Field(default=0.995, ge=0.50, le=1.0)
+
+
+def _clamped(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> ScreeningThresholds:
+    """Deterministic widening ladder, used when no live LLM is configured and as the
+    fallback whenever an LLM relaxation proposal is unusable."""
+
+    step = round_index + 1
+    return base.model_copy(
+        update={
+            "high_252_ratio": _clamped(base.high_252_ratio - 0.02 * step, 0.50, 1.0),
+            "volume_ratio_min": _clamped(base.volume_ratio_min - 0.30 * step, 0.5, 10.0),
+            # The trend filter is the most restrictive of the breakout rules, so it is
+            # the first whole condition dropped rather than merely loosened.
+            "require_close_above_sma20": step < 2,
+            "relative_strength_20d_min": _clamped(
+                base.relative_strength_20d_min - 0.05 * step, -1.0, 1.0
+            ),
+            "relative_strength_60d_min": _clamped(
+                base.relative_strength_60d_min - 0.05 * step, -1.0, 1.0
+            ),
+            "rsi_max": _clamped(base.rsi_max + 5.0 * step, 5.0, 70.0),
+            "sma20_band": _clamped(base.sma20_band + 0.02 * step, 0.005, 0.50),
+            "bb_width_max": _clamped(base.bb_width_max + 0.06 * step, 0.02, 1.0),
+            "bb_upper_ratio": _clamped(base.bb_upper_ratio - 0.02 * step, 0.50, 1.0),
+        }
+    )
+
+
+def _numeric(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _at_least(left: Any, right: Any) -> bool:
+    """`left >= right`, treating a missing operand as a non-match (SQL NULL semantics)."""
+
+    left_value, right_value = _numeric(left), _numeric(right)
+    return left_value is not None and right_value is not None and left_value >= right_value
+
+
+def _above(left: Any, right: Any) -> bool:
+    left_value, right_value = _numeric(left), _numeric(right)
+    return left_value is not None and right_value is not None and left_value > right_value
+
+
+def _scaled(value: Any, factor: float) -> float | None:
+    numeric = _numeric(value)
+    return None if numeric is None else numeric * factor
+
+
+def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
+    """Row predicate mirroring the profile's SQL WHERE clause.
+
+    Screening runs the expensive window-function CTE once and then re-filters the
+    returned rows here, so a relaxation round costs nothing at the database.
+    """
+
+    def breakout_volume(row: Mapping[str, Any]) -> bool:
+        close = row.get("close")
+        if not _at_least(close, _scaled(row.get("high_252"), thresholds.high_252_ratio)):
+            return False
+        if not _at_least(row.get("volume_ratio_20"), thresholds.volume_ratio_min):
+            return False
+        if thresholds.require_close_above_sma20 and not _above(close, row.get("sma20")):
+            return False
+        return _at_least(row.get("relative_strength_20d"), thresholds.relative_strength_20d_min)
+
+    def rsi_rebound(row: Mapping[str, Any]) -> bool:
+        rsi = _numeric(row.get("rsi"))
+        if rsi is None:
+            return False
+        if rsi <= thresholds.rsi_max:
+            return True
+        previous = _numeric(row.get("prev_rsi"))
+        return previous is not None and previous < thresholds.rsi_cross_floor <= rsi
+
+    def pullback_trend(row: Mapping[str, Any]) -> bool:
+        close = _numeric(row.get("close"))
+        sma20 = _numeric(row.get("sma20"))
+        if close is None or sma20 is None or sma20 <= 0:
+            return False
+        if not _above(close, row.get("sma200")):
+            return False
+        return abs(close / sma20 - 1) <= thresholds.sma20_band
+
+    def bollinger_squeeze(row: Mapping[str, Any]) -> bool:
+        width = _numeric(row.get("bb_width"))
+        if width is None or width <= 0 or width > thresholds.bb_width_max:
+            return False
+        return _at_least(row.get("close"), _scaled(row.get("bb_upper"), thresholds.bb_upper_ratio))
+
+    def relative_strength(row: Mapping[str, Any]) -> bool:
+        return _at_least(
+            row.get("relative_strength_20d"), thresholds.relative_strength_20d_min
+        ) and _at_least(row.get("relative_strength_60d"), thresholds.relative_strength_60d_min)
+
+    return {
+        "breakout_volume": breakout_volume,
+        "rsi_rebound": rsi_rebound,
+        "pullback_trend": pullback_trend,
+        "bollinger_squeeze": bollinger_squeeze,
+        "relative_strength": relative_strength,
+    }.get(profile, lambda row: _above(row.get("close"), 0))
+
+
+def _relaxation_trace(
+    profile: str, rounds: list[dict[str, Any]], universe_rows: int
+) -> dict[str, Any]:
+    final = rounds[-1] if rounds else {}
+    return {
+        "profile": profile,
+        "universe_rows": universe_rows,
+        "rounds": rounds,
+        "relaxation_rounds": max(len(rounds) - 1, 0),
+        "relaxed": bool(final.get("relaxed")) and bool(final.get("matched_count")),
+        "matched_count": int(final.get("matched_count") or 0),
+    }
+
+
+def _propose_relaxed_thresholds(
+    *,
+    query: str,
+    profile: str,
+    thresholds: ScreeningThresholds,
+    round_index: int,
+    universe_rows: int,
+) -> ScreeningThresholds:
+    """Ask the LLM to loosen the screen, falling back to the deterministic ladder."""
+
+    deterministic = _relaxed_thresholds(thresholds, round_index)
+    try:
+        # Imported lazily: ai_graph.llm pulls in the provider stack, which must stay
+        # optional for fixture-only runs of this module.
+        from ai_graph.llm.role_calls import generate_relaxed_screening_thresholds
+    except ImportError:
+        return deterministic
+
+    proposal = generate_relaxed_screening_thresholds(
+        query=query,
+        profile=profile,
+        current=thresholds.model_dump(),
+        fallback=deterministic.model_dump(),
+        round_index=round_index,
+        universe_rows=universe_rows,
+    )
+    known = {key: value for key, value in proposal.items() if key in ScreeningThresholds.model_fields}
+    try:
+        return ScreeningThresholds.model_validate(known)
+    except ValidationError:
+        return deterministic
+
+
 def _screening_profile(query: str) -> str:
     lowered = query.lower()
     if "rsi" in lowered or "과매도" in query or "반등" in query:
@@ -518,9 +749,14 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 w252 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)
         ),
         momentum_raw AS (
-            SELECT
+            -- ta_momentum_ticker_daily keys tickers as '000020#S05' (6-digit code plus a
+            -- security-type suffix) while kis_adjusted_ohlcv_daily keys them as '000020',
+            -- so joining the raw columns matches nothing and every rsi comes back NULL.
+            -- Strip the suffix here; DISTINCT ON keeps one row per (ticker, time) when
+            -- several security types collapse onto the same 6-digit code.
+            SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
                 time,
-                ticker,
+                split_part(ticker, '#', 1) AS ticker,
                 COALESCE(
                     values_jsonb->>'RSI_14',
                     values_jsonb->>'rsi_14',
@@ -529,6 +765,7 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 ) AS rsi_text
             FROM feature.ta_momentum_ticker_daily
             WHERE time >= (SELECT as_of_date FROM latest_date) - INTERVAL '90 days'
+            ORDER BY split_part(ticker, '#', 1), time, ticker
         ),
         momentum AS (
             SELECT
