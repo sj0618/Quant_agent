@@ -47,13 +47,21 @@ REPORT_FIELDS = {"web_projection", "email_projection", "risk_adjustments"}
 PROJECTION_FIELDS = {"title", "summary", "sections"}
 
 
+def _create_and_poll_job(client) -> dict:
+    """POST queues the analysis, so the envelope is read back through polling."""
+
+    response = client.post(ANALYSIS_JOBS_PATH, json={"query": QUERY})
+    assert response.status_code == 201
+    polled = client.get(f"{ANALYSIS_JOBS_PATH}/{response.json()['job_id']}")
+    assert polled.status_code == 200
+    return polled.json()
+
+
 def test_analysis_job_and_api_envelope_public_fields_are_frozen() -> None:
     client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
-    response = client.post(ANALYSIS_JOBS_PATH, json={"query": QUERY})
+    job = _create_and_poll_job(client)
 
-    assert response.status_code == 201
-    job = response.json()
     result = job["result"]
     user_payload = result["user_payload"]
     report = user_payload["report"]
@@ -78,9 +86,8 @@ def test_analysis_job_and_api_envelope_public_fields_are_frozen() -> None:
 def test_public_envelope_keeps_debug_ref_but_excludes_internal_payload() -> None:
     client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
-    response = client.post(ANALYSIS_JOBS_PATH, json={"query": QUERY})
+    result = _create_and_poll_job(client)["result"]
 
-    result = response.json()["result"]
     assert result["debug_ref"]
     assert "internal_payload" not in result
     assert "node_outputs" not in result

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # pyright: reportUnannotatedClassAttribute=false
 
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -16,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from ai_graph.data_sources.db import resolve_database_dsn_from_env
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
 
+
+_logger = logging.getLogger(__name__)
 
 AI_JOB_STORE_ENV = "AI_JOB_STORE"
 BE_JOB_STORE_MODE_ENV = "BE_JOB_STORE_MODE"
@@ -305,6 +308,17 @@ def run_job_sync(store: AnalysisJobStore, job_id: str, runner: AnalysisRunner) -
         result = runner(job.query, job.trace_id)
     except Exception as exc:
         diagnostic = classify_failure(exc, stage=Stage.FINALIZING.value)
+        # The public envelope deliberately hides the original error behind debug_ref,
+        # so this is the only place it is ever recorded. Without it a failure is
+        # untraceable - doubly so now that jobs run as a background task, where the
+        # exception never reaches a request handler either.
+        _logger.exception(
+            "analysis job failed: job_id=%s trace_id=%s debug_ref=job-error:%s category=%s",
+            job_id,
+            job.trace_id,
+            job_id,
+            diagnostic.category,
+        )
         return store.fail_job(
             job_id,
             diagnostic.safe_message,
