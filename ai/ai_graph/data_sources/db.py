@@ -958,7 +958,10 @@ def _financial_cte() -> str:
                 {_dart_amount('operating_income')} AS operating_income,
                 {_dart_amount('eps')} AS eps
             FROM {DART_FINANCIAL_TABLE}
+            -- Only the newest filing per symbol is used, and a year-ago comparison for
+            -- growth, so there is no reason to scan back to 2016.
             WHERE available_from <= (SELECT as_of_date FROM latest_date)
+              AND available_from >= (SELECT as_of_date FROM latest_date) - INTERVAL '3 years'
         ),
         financial_latest AS (
             SELECT DISTINCT ON (symbol) *
@@ -1018,8 +1021,13 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
     # for display fields (name/market/sector), never as a membership filter.
     return f"""
         WITH latest_date AS (
+            -- The window is what makes this affordable: the table has 531 date
+            -- partitions and an unbounded max() locks every one of them. With
+            -- max_locks_per_transaction at 64 the whole statement then dies with
+            -- "out of shared memory" before it reads a single row.
             SELECT max(time) AS as_of_date
             FROM feature.kis_adjusted_ohlcv_daily
+            WHERE time >= CURRENT_DATE - INTERVAL '90 days'
         ),
         prices AS (
             SELECT

@@ -261,13 +261,35 @@ def screen_with_llm(conn: Any, query: str) -> dict[str, Any] | None:
     """
 
     from ai_graph.llm.role_calls import generate_screening_sql, research_screening_terms
+    from ai_graph.progress import report_activity
 
+    # This stage runs for minutes behind a single "전략 해석 중" label, and its provider
+    # calls carry no debate role, so nothing reached the live view without these.
+    report_activity("step", label="전략 용어 리서치", detail="지표 정의와 계산식을 웹에서 확인 중")
     research = research_screening_terms(query=query)
+    if research:
+        metric_names = [
+            str(metric.get("name")) for metric in research.get("metrics") or [] if metric
+        ]
+        report_activity(
+            "step",
+            label="용어 해석 완료",
+            detail=(", ".join(metric_names[:5]) or research.get("strategy_reading", ""))[:160],
+        )
+
+    report_activity("step", label="스키마 확인", detail="적재된 테이블과 컬럼을 읽는 중")
     schema_context = build_schema_context(conn)
     known_tickers = fetch_known_tickers(conn)
 
     attempts: list[dict[str, Any]] = []
     for attempt_index in range(MAX_SCREEN_ATTEMPTS):
+        report_activity(
+            "step",
+            label=f"스크리닝 질의 작성 {attempt_index + 1}차",
+            detail="스키마에 맞춰 조건을 SQL로 옮기는 중"
+            if attempt_index == 0
+            else "직전 시도 결과를 반영해 다시 작성 중",
+        )
         plan = generate_screening_sql(
             query=query,
             schema_context=schema_context,
@@ -290,12 +312,18 @@ def screen_with_llm(conn: Any, query: str) -> dict[str, Any] | None:
             accepted, notes = validate_screen_rows(rows, known_tickers=known_tickers)
         except ScreenSQLRejected as exc:
             record["outcome"] = f"rejected: {exc}"
+            report_activity("step", label=f"질의 거부 {attempt_index + 1}차", detail=str(exc))
             attempts.append(record)
             continue
         except Exception as exc:
             # Database errors are the most useful feedback of all - the next attempt
             # sees the exact complaint rather than guessing what went wrong.
             record["outcome"] = f"database error: {type(exc).__name__}: {exc}"
+            report_activity(
+                "step",
+                label=f"질의 오류 {attempt_index + 1}차",
+                detail=f"{type(exc).__name__}: {exc}"[:160],
+            )
             attempts.append(record)
             _rollback_quietly(conn)
             continue
@@ -304,6 +332,11 @@ def screen_with_llm(conn: Any, query: str) -> dict[str, Any] | None:
         record["validation_notes"] = notes
         if accepted:
             record["outcome"] = "ok"
+            report_activity(
+                "step",
+                label=f"스크리닝 완료 · {len(accepted)}종목",
+                detail=" · ".join(notes) if notes else ", ".join(plan.get("metrics") or [])[:160],
+            )
             attempts.append(record)
             return {
                 "rows": accepted,
@@ -314,6 +347,11 @@ def screen_with_llm(conn: Any, query: str) -> dict[str, Any] | None:
             }
 
         record["outcome"] = "matched 0 rows - conditions too strict for this date"
+        report_activity(
+            "step",
+            label=f"매칭 0건 {attempt_index + 1}차",
+            detail="조건이 이 날짜에는 너무 좁습니다. 완화해 재작성합니다.",
+        )
         attempts.append(record)
 
     return {

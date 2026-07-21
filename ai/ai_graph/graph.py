@@ -23,6 +23,7 @@ from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_s
 from pydantic import ValidationError
 
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
+from ai_graph.memory import AnalysisMemory, summarize_recall
 from ai_graph.progress import report_node_stage
 from ai_graph.llm.role_calls import (
     RoleDebatePayload,
@@ -678,7 +679,45 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         failure_cause=state.get("failure_cause"),
         evidence_refs=state.get("evidence_refs"),
     )
+    _record_analysis_memory(state, status)
     return {"envelope": envelope.model_dump()}
+
+
+def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> None:
+    """Note how this run turned out, for the next analysis of the same strategy."""
+
+    memory = AnalysisMemory.from_env()
+    if not memory.enabled:
+        return
+    strategy = state.get("strategy_spec") or {}
+    strategy_id = str(strategy.get("strategy_id") or "")
+    if not strategy_id:
+        return
+
+    data = state.get("data") or {}
+    pipeline = data.get("pipeline_data_source") or {}
+    relaxation = pipeline.get("screening_relaxation") or {}
+    availability = data.get("data_availability") or {}
+    performance = build_public_backtest_performance(state.get("backtest")) or {}
+    metrics = performance.get("metrics") if isinstance(performance, dict) else None
+
+    try:
+        memory.record(
+            strategy_id,
+            query=str(state.get("user_query") or ""),
+            outcome=status.value,
+            candidate_count=len(data.get("screening_candidates") or []),
+            metrics=metrics or {},
+            relaxation_rounds=int(relaxation.get("relaxation_rounds") or 0),
+            unmet_requirements=[
+                str(item.get("label"))
+                for item in availability.get("unsupported_capabilities") or []
+            ],
+            note=(state.get("strategy_revision") or {}).get("rationale"),
+        )
+    except Exception:
+        # Memory is an optimisation; never let it take down a completed analysis.
+        _logger.warning("could not record analysis memory", exc_info=True)
 
 
 def classify_query(query: str) -> AmbiguityCode:
@@ -1541,6 +1580,11 @@ def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> d
         "data_availability": state.get("data", {}).get("data_availability", {}),
         "screening_candidate_count": len(state.get("data", {}).get("screening_candidates", [])),
     }
+    # What earlier runs of this same strategy ran into, so the debate can weigh it
+    # instead of rediscovering it.
+    recalled = summarize_recall(AnalysisMemory.from_env().recall(strategy.strategy_id))
+    if recalled:
+        context["previous_runs"] = recalled
     bull = generate_role_debate(
         role="RESEARCH_BULL",
         task="Collect only supportive evidence for the strategy specification.",
