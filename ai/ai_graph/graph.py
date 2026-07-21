@@ -24,7 +24,7 @@ from pydantic import ValidationError
 
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.memory import AnalysisMemory, summarize_recall
-from ai_graph.progress import report_node_stage
+from ai_graph.progress import raise_if_cancelled, report_node_stage
 from ai_graph.llm.role_calls import (
     RoleDebatePayload,
     StrategyConditionsPayload,
@@ -217,6 +217,9 @@ def instrument_node(
     node: Callable[[QuantAgentState], QuantAgentState | dict[str, Any]],
 ) -> Callable[[QuantAgentState], QuantAgentState | dict[str, Any]]:
     def wrapped(state: QuantAgentState) -> QuantAgentState | dict[str, Any]:
+        # Node boundaries are the checkpoints: a cancelled run stops here rather than
+        # paying for the remaining nodes.
+        raise_if_cancelled()
         # Announce the stage before the node runs so a polling client sees the work
         # it is actually waiting on, not the stage it already finished.
         report_node_stage(name)

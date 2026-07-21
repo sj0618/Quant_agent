@@ -98,6 +98,35 @@ def report_activity(kind: str, **fields: Any) -> None:
         _logger.exception("failed to report activity kind=%s", kind)
 
 
+class AnalysisCancelled(RuntimeError):
+    """Raised at a checkpoint when the run has been cancelled."""
+
+
+_CANCEL_CHECK: ContextVar[Callable[[], bool] | None] = ContextVar("cancel_check", default=None)
+
+
+@contextmanager
+def cancellation_check(is_cancelled: Callable[[], bool]) -> Iterator[None]:
+    token = _CANCEL_CHECK.set(is_cancelled)
+    try:
+        yield
+    finally:
+        _CANCEL_CHECK.reset(token)
+
+
+def raise_if_cancelled() -> None:
+    """Stop at the next checkpoint if the run was cancelled.
+
+    A provider call already in flight cannot be recalled, so cancellation cannot refund
+    what is already spent - it prevents the run from paying for everything after this
+    point, which is where the cost actually is.
+    """
+
+    check = _CANCEL_CHECK.get()
+    if check is not None and check():
+        raise AnalysisCancelled("analysis cancelled by user")
+
+
 def report_node_stage(node_name: str) -> None:
     """Publish the stage `node_name` belongs to, if anyone is listening."""
 

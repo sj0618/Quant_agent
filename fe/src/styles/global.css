@@ -225,6 +225,8 @@ p, h1, h2, h3, h4 { margin: 0; }
 .activity-log__line.is-stream { max-height: 34px; overflow: hidden; color: var(--subdued); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
 .activity-log__line.is-citations { display: flex; flex-wrap: wrap; gap: 10px; }
 .activity-log__line.is-citations a { color: var(--cornflower); font-size: 10px; }
+.chat-panel__input button.is-stop { background: var(--sell); border-color: var(--sell); color: #fff; font-size: 11px; line-height: 1; }
+
 .workspace-empty--error strong { color: var(--sell); }
 .workspace-empty__query { color: var(--subdued); font-size: 12px; }
 .workspace-progress__step.is-failed { color: var(--drop); }

@@ -7,6 +7,9 @@ interface StrategyInputPanelProps {
   strategy: StrategySpec;
   messages: ChatMessage[];
   onAnalyze: (query: string) => Promise<void>;
+  /** Set while an analysis is running, so the submit control becomes a stop control. */
+  onCancel?: () => Promise<void>;
+  running?: boolean;
   onNewConversation: () => void;
   onRestoreConversation: (conversationId: string) => void;
 }
@@ -35,6 +38,8 @@ export function StrategyInputPanel({
   strategy,
   messages,
   onAnalyze,
+  onCancel,
+  running = false,
   onNewConversation,
   onRestoreConversation,
 }: StrategyInputPanelProps) {
@@ -195,7 +200,24 @@ export function StrategyInputPanel({
             required
             value={draft}
           />
-          <button disabled={submitting} type="submit">{submitting ? "…" : "↑"}</button>
+          {running && onCancel ? (
+          // While a run is in flight the same control stops it: an analysis costs money
+          // for every node it completes, so leaving the user no way out is expensive.
+          <button
+            aria-label="분석 중단"
+            className="is-stop"
+            onClick={() => {
+              void onCancel();
+            }}
+            type="button"
+          >
+            ■
+          </button>
+        ) : (
+          <button aria-label="분석 요청" disabled={submitting} type="submit">
+            {submitting ? "…" : "↑"}
+          </button>
+        )}
         </div>
         {submitError ? <small className="chat-panel__error">{submitError}</small> : null}
         <small>거래비용 0.015% / 0.23% / 0.1% 반영 · KRX 상장 보통주 지원</small>

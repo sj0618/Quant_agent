@@ -682,6 +682,29 @@ class MockLLMClient:
                     "candidates": self.generate_backtest_candidates(strategy, variant),
                     "fallback_reasons": [],
                 }
+            elif request.schema_name.startswith("quantagent.report_writeup"):
+                # Mock has to answer the schemas the pipeline actually asks for, or the
+                # deterministic path silently falls back everywhere and mock-mode tests
+                # stop exercising the code they are supposed to cover.
+                result = _mock_role_debate_payload(
+                    "리포트 작성(mock): 백테스트 결과와 데이터 가용성을 함께 제시합니다."
+                )
+            elif request.schema_name.startswith("quantagent.screening_research"):
+                result = {
+                    "strategy_reading": "mock 모드에서는 용어 리서치를 수행하지 않습니다.",
+                    "metrics": [],
+                    "citations": [],
+                }
+            elif request.schema_name.startswith("quantagent.strategy_revision"):
+                # Nothing to revise deterministically; report no change.
+                result = {
+                    "changed": False,
+                    "rationale": "mock 모드에서는 조건을 수정하지 않습니다.",
+                    "entry_conditions": [],
+                    "exit_conditions": [],
+                    "indicators": [],
+                    "confidence": 0.5,
+                }
             else:
                 result = {"fallback_reasons": [f"unsupported mock schema: {request.schema_name}"]}
         except Exception as exc:
@@ -730,6 +753,18 @@ class MockBacktestCodeLLM(MockLLMClient):
         if strategy.strategy_id.startswith(("flow_accumulation", "short_covering_proxy", "gap_hold_momentum", "breakout_setup")):
             return list(BREAKOUT_VOLUME_CANDIDATES)
         return list(MOCK_BACKTEST_CODE_CANDIDATES)
+
+
+def _mock_role_debate_payload(summary: str) -> dict[str, Any]:
+    return {
+        "summary": summary,
+        "evidence": [],
+        "concerns": [],
+        "recommendation": "HOLD",
+        "confidence": 0.5,
+        "validation_results": {"checks": []},
+        "citations": [],
+    }
 
 
 def _strategy_and_variant_from_request(request: LLMJsonRequest) -> tuple[StrategySpec, str]:

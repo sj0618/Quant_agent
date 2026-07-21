@@ -6,6 +6,7 @@ import {
   clearLatestAnalysisJob,
   createAnalysisJob,
   aiResponseStatus,
+  cancelAnalysisJob,
   getAnalysisJob,
   getWorkspaceTemplate,
   mergeAnalysisJobIntoOverview,
@@ -373,6 +374,20 @@ export function AppPage() {
         <StrategyInputPanel
           history={historyPreviews}
           messages={hasCurrentConversation ? overview.chatMessages : []}
+          onCancel={async () => {
+            if (!runningJob) {
+              return;
+            }
+            try {
+              const cancelled = await cancelAnalysisJob(runningJob.job_id);
+              setAnalysisJobs((jobs) =>
+                jobs.map((job) => (job.job_id === cancelled.job_id ? cancelled : job)),
+              );
+            } catch (error) {
+              console.warn("분석 중단 요청에 실패했습니다.", error);
+            }
+          }}
+          running={Boolean(runningJob) || Boolean(pendingAnalysis)}
           onNewConversation={handleNewConversation}
           onAnalyze={async (query) => {
             const pending = { query, startedAt: Date.now() };

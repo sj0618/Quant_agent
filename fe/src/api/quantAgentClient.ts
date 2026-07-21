@@ -264,6 +264,15 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
   return job;
 }
 
+export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
+  const response = await fetchAI(AI_ENDPOINTS.analysisJobCancel(jobId), { method: "POST" });
+  assertOk(response);
+
+  const job = (await response.json()) as AnalysisJob;
+  saveLatestAnalysisJob(job);
+  return job;
+}
+
 async function requestAnalysisJob(jobId: string): Promise<AnalysisJob> {
   const response = await fetchAI(AI_ENDPOINTS.analysisJob(jobId));
   assertOk(response);

@@ -36,6 +36,7 @@ from ai_graph.jobs import (
     AnalysisJob,
     AnalysisJobStore,
     AnalysisRunner,
+    CancellationRegistry,
     JobStoreRuntime,
     create_analysis_job_store_from_env,
     run_job_sync,
@@ -59,6 +60,7 @@ API_STATUS_PATH = "/api-status"
 ANALYSIS_JOBS_PATH = "/analysis-jobs"
 ANALYSIS_JOB_DETAIL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}"
 ANALYSIS_JOB_EVENTS_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}/events"
+ANALYSIS_JOB_CANCEL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}/cancel"
 # How long an idle SSE reader waits before checking for new provider activity.
 ANALYSIS_EVENT_POLL_SECONDS = 0.25
 # Idle gap after which a comment line is sent so intermediaries keep the stream open.
@@ -370,6 +372,7 @@ def create_app(
     app.state.job_store = store
     app.state.job_store_runtime = runtime
     app.state.job_events = JobEventBuffer()
+    app.state.job_cancellations = CancellationRegistry()
     app.state.audit_sink = resolve_audit_sink(audit_sink)
     app.state.report_resolver = report_resolver
 
@@ -423,7 +426,35 @@ def create_app(
                 user_id=user_id,
             ),
             events=app.state.job_events,
+            cancellations=app.state.job_cancellations,
         )
+        return job
+
+    @app.post(
+        ANALYSIS_JOB_CANCEL_PATH,
+        response_model=AnalysisJob,
+        tags=["Analysis Jobs"],
+    )
+    def cancel_analysis_job(
+        job_id: str,
+        user_id: str = Depends(require_user),
+    ) -> AnalysisJob:
+        """Ask a running analysis to stop at its next node boundary.
+
+        Requests already sent to the provider cannot be recalled, so this does not undo
+        what the run has already spent - it stops it before paying for the rest.
+        """
+
+        job = _owned_job(store, job_id, user_id)
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="analysis job not found",
+            )
+        if job.result is not None:
+            # Already finished - nothing to stop, and the result stands.
+            return job
+        app.state.job_cancellations.cancel(job_id)
         return job
 
     @app.get(ANALYSIS_JOB_EVENTS_PATH, tags=["Analysis Jobs"])

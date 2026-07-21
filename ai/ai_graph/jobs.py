@@ -3,6 +3,7 @@ from __future__ import annotations
 # pyright: reportUnannotatedClassAttribute=false
 
 import logging
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -17,7 +18,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ai_graph.data_sources.db import resolve_database_dsn_from_env
 from ai_graph.job_events import JobEventBuffer
-from ai_graph.progress import activity_reporter, stage_reporter
+from ai_graph.progress import (
+    AnalysisCancelled,
+    activity_reporter,
+    cancellation_check,
+    stage_reporter,
+)
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
 
 
@@ -301,12 +307,37 @@ class InMemoryAnalysisJobStore:
         return job
 
 
+class CancellationRegistry:
+    """Job ids the user asked to stop.
+
+    An in-flight provider call cannot be recalled, so cancelling does not undo what is
+    already spent; it stops the run before it pays for the nodes that remain.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled: set[str] = set()
+
+    def cancel(self, job_id: str) -> None:
+        with self._lock:
+            self._cancelled.add(job_id)
+
+    def is_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            return job_id in self._cancelled
+
+    def forget(self, job_id: str) -> None:
+        with self._lock:
+            self._cancelled.discard(job_id)
+
+
 def run_job_sync(
     store: AnalysisJobStore,
     job_id: str,
     runner: AnalysisRunner,
     *,
     events: JobEventBuffer | None = None,
+    cancellations: CancellationRegistry | None = None,
 ) -> AnalysisJob:
     job = store.get_job(job_id)
     if job is None:
@@ -329,7 +360,31 @@ def run_job_sync(
                 scope.enter_context(
                     activity_reporter(lambda event: events.publish(job_id, event))
                 )
+            if cancellations is not None:
+                scope.enter_context(
+                    cancellation_check(lambda: cancellations.is_cancelled(job_id))
+                )
             result = runner(job.query, job.trace_id)
+    except AnalysisCancelled:
+        _logger.info("analysis job cancelled: job_id=%s", job_id)
+        message = "사용자가 분석을 중단했습니다."
+        return store.fail_job(
+            job_id,
+            message,
+            result_envelope=_failure_envelope(
+                job,
+                message,
+                failure_cause=FailureDiagnostic(
+                    category="cancelled",
+                    subcause="user_cancelled",
+                    failure_stage=Stage.FINALIZING.value,
+                    owner="user",
+                    retryable=True,
+                    safe_message=message,
+                    evidence_refs=["failure:cancelled"],
+                ),
+            ),
+        )
     except Exception as exc:
         diagnostic = classify_failure(exc, stage=Stage.FINALIZING.value)
         # The public envelope deliberately hides the original error behind debug_ref,
