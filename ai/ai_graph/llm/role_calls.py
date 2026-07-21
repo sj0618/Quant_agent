@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -16,6 +17,8 @@ from ai_graph.schemas import (
     MarketBriefItem,
 )
 
+
+_logger = logging.getLogger(__name__)
 
 ROLE_DEBATE_SCHEMA_NAME = "quantagent.role_debate.v1"
 MARKET_BRIEF_SCHEMA_NAME = "quantagent.market_brief.v1"
@@ -739,8 +742,11 @@ def generate_report_writeup(
             )
         return written
     except (LLMClientError, ValidationError, ValueError, TypeError) as exc:
-        if is_live_llm_provider():
-            raise
+        # Unlike the debates, this never re-raises on a live provider. By the time the
+        # report is written the screen, backtest and risk decision are all done; losing
+        # the entire analysis because the write-up failed its schema check throws away
+        # everything that did work. The fallback still carries the real decision.
+        _logger.warning("report write-up failed; using deterministic fallback: %s", exc)
         reasons = [*fallback.fallback_reasons, f"{type(exc).__name__}: {exc}"]
         return fallback.model_copy(update={"fallback_reasons": reasons})
 

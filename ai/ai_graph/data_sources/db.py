@@ -794,6 +794,7 @@ def _llm_screening_candidate(row: Mapping[str, Any], *, sector: str | None) -> d
     carried through as-is under `metrics` instead of being forced into a fixed set.
     """
 
+    ticker = str(row.get("ticker") or "").zfill(6)
     reserved = {"ticker", "name", "market", "market_segment", "sector", "as_of_date", "time"}
     metrics = {
         key: _optional_float_value(value) if _numeric(value) is not None else value
@@ -801,8 +802,11 @@ def _llm_screening_candidate(row: Mapping[str, Any], *, sector: str | None) -> d
         if key not in reserved
     }
     return {
-        "ticker": str(row.get("ticker") or "").zfill(6),
-        "name": row.get("name") or "",
+        # ScreeningMatch requires a non-empty name and market, and the generated SQL is
+        # only asked for a ticker and its metrics - fall back to the code rather than
+        # letting a blank identity fail validation and take the analysis with it.
+        "ticker": ticker,
+        "name": row.get("name") or ticker,
         "market": row.get("market_segment") or row.get("market") or "KRX",
         "sector": row.get("sector") or sector,
         "as_of_date": _date_value(row.get("as_of_date") or row.get("time") or datetime.now(UTC)).isoformat(),

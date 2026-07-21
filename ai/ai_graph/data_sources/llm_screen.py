@@ -71,6 +71,17 @@ Known pitfalls in this warehouse - getting these wrong yields silently wrong res
 7. Several tables exist but were never loaded - the row counts in the schema listing
    say which. A condition that depends on an empty table cannot be screened; report it
    under unmet_requirements rather than substituting a different column for it.
+
+8. EVERY read of a *_daily table must carry a bounded date filter. They are partitioned
+   by date - 531 partitions each - and the server allows only 64 locks per transaction,
+   so an unbounded scan dies with "out of shared memory / max_locks_per_transaction"
+   before returning a single row. This bites hardest where it looks innocent:
+     BAD   (SELECT max(time) FROM feature.kis_adjusted_ohlcv_daily)
+     GOOD  (SELECT max(time) FROM feature.kis_adjusted_ohlcv_daily
+            WHERE time >= CURRENT_DATE - INTERVAL '90 days')
+   Anchor to the latest trading date that way, then window every other daily table off
+   it - 420 days is enough for a year of indicators, 90 for short lookbacks. Multi-year
+   history is only affordable for one ticker at a time, never across the universe.
 """
 
 REQUIRED_OUTPUT_CONTRACT = f"""
@@ -319,6 +330,11 @@ def screen_with_llm(conn: Any, query: str) -> dict[str, Any] | None:
             # Database errors are the most useful feedback of all - the next attempt
             # sees the exact complaint rather than guessing what went wrong.
             record["outcome"] = f"database error: {type(exc).__name__}: {exc}"
+            hint = _repair_hint(exc)
+            if hint:
+                # The raw Postgres text names a symptom, not the cause. Saying which
+                # part of the query to change turns a wasted retry into a fix.
+                record["how_to_fix"] = hint
             report_activity(
                 "step",
                 label=f"질의 오류 {attempt_index + 1}차",
@@ -331,6 +347,7 @@ def screen_with_llm(conn: Any, query: str) -> dict[str, Any] | None:
         record["matched"] = len(accepted)
         record["validation_notes"] = notes
         if accepted:
+            accepted = enrich_with_symbol_master(conn, accepted)
             record["outcome"] = "ok"
             report_activity(
                 "step",
@@ -363,6 +380,26 @@ def screen_with_llm(conn: Any, query: str) -> dict[str, Any] | None:
     }
 
 
+def _repair_hint(exc: Exception) -> str | None:
+    """Translate a database complaint into the edit that fixes it."""
+
+    message = str(exc).lower()
+    if "shared memory" in message or "max_locks_per_transaction" in message:
+        return (
+            "A daily table was read without a bounded date filter, so all 531 date "
+            "partitions were locked. Add a date window to every *_daily table read - "
+            "including the max(time) subquery used to find the latest trading date."
+        )
+    if "statement timeout" in message or "canceling statement" in message:
+        return (
+            "The query was too slow. Narrow the date window, screen on the latest date "
+            "only, and avoid joining several multi-million-row daily tables at once."
+        )
+    if "does not exist" in message:
+        return "A referenced table or column is not in the schema listing; use only what is listed."
+    return None
+
+
 def _rollback_quietly(conn: Any) -> None:
     """A failed statement poisons the transaction; reset so the next attempt can run."""
 
@@ -370,6 +407,49 @@ def _rollback_quietly(conn: Any) -> None:
         conn.rollback()
     except Exception:
         _logger.debug("could not roll back after failed screening SQL", exc_info=True)
+
+
+def enrich_with_symbol_master(conn: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fill in name, market and sector for the matched tickers.
+
+    The screen is asked for tickers and the metrics behind its conditions - identity
+    fields are the warehouse's job, not something to make the query carry. Downstream
+    ScreeningMatch requires a non-empty name, so leaving this to the generated SQL meant
+    a query that simply did not select `name` failed the whole analysis.
+    """
+
+    if not rows:
+        return rows
+    tickers = sorted({str(row.get("ticker") or "") for row in rows if row.get("ticker")})
+    if not tickers:
+        return rows
+    found = conn.execute(
+        """
+        SELECT symbol, name, market, market_segment, sector
+        FROM core.symbol_master
+        WHERE symbol = ANY(%s)
+        """,
+        [tickers],
+    ).fetchall()
+    by_ticker = {str(row["symbol"]).zfill(6): row for row in found}
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        ticker = str(row.get("ticker") or "").zfill(6)
+        master = by_ticker.get(ticker) or {}
+        enriched.append(
+            {
+                **row,
+                # A ticker with no master row still trades; showing its code is better
+                # than dropping it.
+                "name": row.get("name") or master.get("name") or ticker,
+                "market": row.get("market")
+                or master.get("market_segment")
+                or master.get("market")
+                or "KRX",
+                "sector": row.get("sector") or master.get("sector"),
+            }
+        )
+    return enriched
 
 
 def fetch_known_tickers(conn: Any) -> set[str]:
