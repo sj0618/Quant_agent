@@ -25,12 +25,17 @@ AI_BACKTEST_LOOKBACK_DAYS_ENV = "AI_BACKTEST_LOOKBACK_DAYS"
 AI_L4_EVIDENCE_LIMIT_ENV = "AI_L4_EVIDENCE_LIMIT"
 AI_DB_CONNECT_TIMEOUT_SECONDS_ENV = "AI_DB_CONNECT_TIMEOUT_SECONDS"
 AI_DB_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_STATEMENT_TIMEOUT_MS"
+AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_BACKTEST_LOOKBACK_YEARS = 10
 DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * DEFAULT_BACKTEST_LOOKBACK_YEARS
 DEFAULT_L4_EVIDENCE_LIMIT = 5
+# Screening can match hundreds of names; every extra ticker multiplies the price rows
+# pulled for the backtest (lookback_days each), so the pool is capped rather than
+# loading the whole match set.
+DEFAULT_BACKTEST_MAX_TICKERS = 20
 # 조건에 일치한 종목은 점수로 다시 줄이지 않고 모두 추천 결과에 남긴다.
 DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 20
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 30_000
@@ -91,6 +96,7 @@ class DataSourceConfig(BaseModel):
     l4_evidence_limit: int = Field(default=DEFAULT_L4_EVIDENCE_LIMIT, gt=0)
     connect_timeout_seconds: int = Field(default=DEFAULT_DB_CONNECT_TIMEOUT_SECONDS, gt=0)
     statement_timeout_ms: int = Field(default=DEFAULT_DB_STATEMENT_TIMEOUT_MS, gt=0)
+    backtest_max_tickers: int = Field(default=DEFAULT_BACKTEST_MAX_TICKERS, gt=0)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "DataSourceConfig":
@@ -111,6 +117,9 @@ class DataSourceConfig(BaseModel):
             ),
             statement_timeout_ms=_int_env(
                 env, AI_DB_STATEMENT_TIMEOUT_MS_ENV, DEFAULT_DB_STATEMENT_TIMEOUT_MS
+            ),
+            backtest_max_tickers=_int_env(
+                env, AI_BACKTEST_MAX_TICKERS_ENV, DEFAULT_BACKTEST_MAX_TICKERS
             ),
         )
 
@@ -158,18 +167,25 @@ class PostgresPipelineDataSource:
                 else:
                     ticker_resolution = "explicit_or_name_match"
             if screening_candidates:
-                tickers = [str(item["ticker"]).zfill(6) for item in screening_candidates]
+                # Every match is a tradable name, so the backtest gets the whole pool
+                # (capped) instead of only the first ticker - loading one ticker forced
+                # applied_max_positions down to a single position no matter what the
+                # strategy asked for.
+                tickers = _backtest_ticker_pool(
+                    screening_candidates, self.config.backtest_max_tickers
+                )
                 ticker = tickers[0]
-                symbol_info = self._fetch_symbol_info(conn, ticker)
+                symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
+                symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, ticker, symbol_info, query
+                    conn, tickers, symbol_info_by_ticker, query
                 )
             elif single_ticker:
                 ticker = single_ticker
                 tickers = [ticker]
                 symbol_info = self._fetch_symbol_info(conn, ticker)
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, ticker, symbol_info, query
+                    conn, tickers, {ticker: symbol_info}, query
                 )
             else:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
@@ -314,73 +330,105 @@ class PostgresPipelineDataSource:
         return None
 
     def _fetch_price_rows(
-        self, conn: Any, ticker: str, symbol_info: Mapping[str, Any], query: str
+        self,
+        conn: Any,
+        tickers: Sequence[str],
+        symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
+        query: str,
     ) -> tuple[list[dict[str, Any]], int]:
         lookback_days = self.config.backtest_lookback_days
-        price_rows = self._fetch_price_rows_for_lookback(conn, ticker, symbol_info, lookback_days)
+        price_rows = self._fetch_price_rows_for_lookback(
+            conn, tickers, symbol_info_by_ticker, lookback_days
+        )
         if (
             _query_requires_rsi_oversold(query)
             and lookback_days < DEFAULT_BACKTEST_LOOKBACK_DAYS
             and not _has_rsi_oversold_entry(price_rows)
         ):
             lookback_days = DEFAULT_BACKTEST_LOOKBACK_DAYS
-            price_rows = self._fetch_price_rows_for_lookback(conn, ticker, symbol_info, lookback_days)
+            price_rows = self._fetch_price_rows_for_lookback(
+                conn, tickers, symbol_info_by_ticker, lookback_days
+            )
         return price_rows, lookback_days
 
     def _fetch_price_rows_for_lookback(
-        self, conn: Any, ticker: str, symbol_info: Mapping[str, Any], lookback_days: int
+        self,
+        conn: Any,
+        tickers: Sequence[str],
+        symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
+        lookback_days: int,
     ) -> list[dict[str, Any]]:
         calendar_lookback_days = (
             lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
         )
+        ticker_list = list(tickers)
+        # row_number keeps the lookback per ticker: a plain LIMIT would spend the whole
+        # budget on whichever ticker sorted first and starve the rest.
         rows = conn.execute(
             """
-            SELECT
-                time AS as_of_date,
-                ticker,
-                adj_open AS open,
-                adj_high AS high,
-                adj_low AS low,
-                adj_close AS close,
-                adj_volume AS volume,
-                quality_flags AS adjusted_ohlcv_quality_flags
-            FROM feature.kis_adjusted_ohlcv_daily
-            WHERE ticker = %s
-              AND time >= CURRENT_DATE - make_interval(days => %s)
-            ORDER BY time DESC
-            LIMIT %s
+            SELECT as_of_date, ticker, open, high, low, close, volume,
+                   adjusted_ohlcv_quality_flags
+            FROM (
+                SELECT
+                    time AS as_of_date,
+                    ticker,
+                    adj_open AS open,
+                    adj_high AS high,
+                    adj_low AS low,
+                    adj_close AS close,
+                    adj_volume AS volume,
+                    quality_flags AS adjusted_ohlcv_quality_flags,
+                    row_number() OVER (PARTITION BY ticker ORDER BY time DESC) AS ticker_rank
+                FROM feature.kis_adjusted_ohlcv_daily
+                WHERE ticker = ANY(%s)
+                  AND time >= CURRENT_DATE - make_interval(days => %s)
+            ) ranked
+            WHERE ticker_rank <= %s
+            ORDER BY ticker, as_of_date
             """,
-            [ticker, calendar_lookback_days, lookback_days],
+            [ticker_list, calendar_lookback_days, lookback_days],
         ).fetchall()
-        momentum_by_date = self._fetch_momentum_values_by_date(
-            conn, ticker, calendar_lookback_days, lookback_days
+        momentum_by_ticker = self._fetch_momentum_values_by_date(
+            conn, ticker_list, calendar_lookback_days, lookback_days
         )
         return [
             _price_row_from_feature_frame_record(
-                _feature_frame_row_from_sources(row, momentum_by_date, symbol_info)
+                _feature_frame_row_from_sources(
+                    row,
+                    momentum_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
+                    symbol_info_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
+                )
             )
-            for row in reversed(rows)
+            for row in rows
         ]
 
     def _fetch_momentum_values_by_date(
-        self, conn: Any, ticker: str, calendar_lookback_days: int, lookback_days: int
-    ) -> dict[date, Mapping[str, Any]]:
+        self, conn: Any, tickers: Sequence[str], calendar_lookback_days: int, lookback_days: int
+    ) -> dict[str, dict[date, Mapping[str, Any]]]:
         rows = conn.execute(
             """
-            SELECT DISTINCT ON (time) time, values_jsonb
-            FROM feature.ta_momentum_ticker_daily
-            WHERE split_part(ticker, '#', 1) = %s
-              AND time >= CURRENT_DATE - make_interval(days => %s)
-            ORDER BY time DESC, ticker
-            LIMIT %s
+            SELECT base_ticker, time, values_jsonb
+            FROM (
+                SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
+                    split_part(ticker, '#', 1) AS base_ticker,
+                    time,
+                    values_jsonb
+                FROM feature.ta_momentum_ticker_daily
+                WHERE split_part(ticker, '#', 1) = ANY(%s)
+                  AND time >= CURRENT_DATE - make_interval(days => %s)
+                ORDER BY split_part(ticker, '#', 1), time, ticker
+            ) deduped
             """,
-            [ticker, calendar_lookback_days, lookback_days],
+            [list(tickers), calendar_lookback_days],
         ).fetchall()
-        values_by_date: dict[date, Mapping[str, Any]] = {}
+        values_by_ticker: dict[str, dict[date, Mapping[str, Any]]] = {}
         for row in rows:
             values = row.get("values_jsonb")
-            values_by_date[_date_value(row["time"])] = values if isinstance(values, Mapping) else {}
-        return values_by_date
+            ticker_key = str(row.get("base_ticker") or "").zfill(6)
+            values_by_ticker.setdefault(ticker_key, {})[_date_value(row["time"])] = (
+                values if isinstance(values, Mapping) else {}
+            )
+        return values_by_ticker
 
     def _fetch_l4_evidence(self, conn: Any, ticker: str, trace_id: str) -> list[dict[str, Any]]:
         rows = conn.execute(
@@ -427,6 +475,35 @@ class PostgresPipelineDataSource:
             "market": row.get("market"),
             "market_segment": row.get("market_segment"),
             "listing_status": row.get("listing_status"),
+        }
+
+    def _fetch_symbol_info_map(
+        self, conn: Any, tickers: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT symbol, name, market, market_segment, listing_status
+            FROM core.symbol_master
+            WHERE symbol = ANY(%s)
+            """,
+            [list(tickers)],
+        ).fetchall()
+        found = {
+            str(row.get("symbol") or "").zfill(6): {
+                "ticker": str(row.get("symbol") or "").zfill(6),
+                "included": True,
+                "name": row.get("name"),
+                "market": row.get("market"),
+                "market_segment": row.get("market_segment"),
+                "listing_status": row.get("listing_status"),
+            }
+            for row in rows
+        }
+        # symbol_master is a display-only join (see _screening_sql), so a ticker missing
+        # from it still trades - it just has no name/market to show.
+        return {
+            ticker: found.get(ticker, {"ticker": ticker, "included": False})
+            for ticker in tickers
         }
 
     def _fetch_macro_status(self, conn: Any) -> dict[str, Any]:
@@ -617,6 +694,32 @@ def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
         "bollinger_squeeze": bollinger_squeeze,
         "relative_strength": relative_strength,
     }.get(profile, lambda row: _above(row.get("close"), 0))
+
+
+def _backtest_ticker_pool(
+    screening_candidates: Sequence[Mapping[str, Any]], max_tickers: int
+) -> list[str]:
+    """Pick which matched names the backtest actually trades.
+
+    The screen returns rows ordered by ticker code, so truncating it as-is would select
+    by numeric code - meaningless. Rank by 20-day relative strength (already computed
+    for every row) so the cap keeps the strongest matches, and keep the order stable for
+    rows that share a score.
+    """
+
+    ranked = sorted(
+        screening_candidates,
+        key=lambda item: (
+            _numeric(item.get("relative_strength_20d")) is None,
+            -(_numeric(item.get("relative_strength_20d")) or 0.0),
+        ),
+    )
+    pool: list[str] = []
+    for item in ranked[:max_tickers]:
+        ticker = str(item.get("ticker") or "").zfill(6)
+        if ticker and ticker not in pool:
+            pool.append(ticker)
+    return pool
 
 
 def _relaxation_trace(
