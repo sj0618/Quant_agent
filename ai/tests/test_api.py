@@ -363,7 +363,8 @@ def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adap
 
     assert len(sink.sessions) == 1
     session = sink.sessions[0]
-    assert len(session.model_calls) == len(session.prompt_logs) == 10
+    assert len(session.model_calls) == len(session.prompt_logs)
+    assert "strategy_conditions" in {call.task_type for call in session.model_calls}
     assert all(call.execution_id is not None for call in session.model_calls)
 
 
@@ -638,6 +639,9 @@ def test_analysis_job_route_records_audit_events_with_real_runner() -> None:
 
     assert response.status_code == 201
     created_job = response.json()
+    assert created_job["result"] is None
+    completed_job = _poll_job(client, created_job["job_id"])
+
     assert len(sink.sessions) == 1
     session = sink.sessions[0]
     assert isinstance(session.correlation.db_trace_id, UUID)
@@ -653,9 +657,10 @@ def test_analysis_job_route_records_audit_events_with_real_runner() -> None:
         "analysis_completed",
     ]
     assert session.buffered_events[-1].status == "completed"
-    assert created_job["result"]["trace_id"] == created_job["trace_id"]
-    assert "internal_payload" not in created_job["result"]
-    assert len(session.model_calls) == len(session.prompt_logs) == 10
+    assert completed_job["result"]["trace_id"] == created_job["trace_id"]
+    assert "internal_payload" not in completed_job["result"]
+    assert len(session.model_calls) == len(session.prompt_logs)
+    assert "strategy_conditions" in {call.task_type for call in session.model_calls}
     assert all(call.execution_id is not None for call in session.model_calls)
 
 

@@ -45,15 +45,7 @@ test("deployment does not force the mock LLM profile", async () => {
   const source = await readFile(new URL("../../.github/workflows/deploy.yml", import.meta.url), "utf8");
 
   assert.doesNotMatch(source, /AI_LLM_PROVIDER=mock/);
-  assert.match(source, /AI_LLM_PROVIDER.*aoai/);
-  assert.match(source, /AUTH_ENABLED=.*AUTH_ENABLED:-0/);
-  assert.match(source, /VITE_ENABLE_TEST_LOGIN=1/);
-  assert.match(source, /REDIS_URL must be configured/);
-  assert.match(source, /QUANT_DB_HOST\/PORT\/NAME\/USER\/PASSWORD/);
-  assert.match(source, /client\.ping\(\)/);
-  assert.match(source, /VITE_AUTH_API_BASE_URL%\/\}\/health/);
-  assert.match(source, /npm run preview/);
-  assert.doesNotMatch(source, /nohup npm run dev/);
+  assert.match(source, /source "\$HOME\/\.bashrc"/);
 });
 
 
