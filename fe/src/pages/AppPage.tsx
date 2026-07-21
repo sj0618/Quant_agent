@@ -298,6 +298,11 @@ export function AppPage() {
     };
   }, [analysisJobs, jobErrors]);
 
+  // Derived above the loading/error returns below: hooks must run on every render, and
+  // useAnalysisActivity would otherwise be skipped while the workspace template loads.
+  const runningJob = [...analysisJobs].reverse().find((job) => !job.result);
+  const analysisActivity = useAnalysisActivity(runningJob?.job_id ?? null);
+
   const handleTabChange = (tab: WorkspaceTab) => {
     const url = new URL(window.location.href);
     if (tab === "overview") {
@@ -328,8 +333,6 @@ export function AppPage() {
     ? overview.strategy
     : { ...data.strategy, natural_language_strategy: latestJob?.query ?? data.strategy.natural_language_strategy };
   const historyPreviews = conversationHistory.map((conversation) => conversationPreview(conversation, data));
-  const runningJob = [...analysisJobs].reverse().find((job) => !job.result);
-  const analysisActivity = useAnalysisActivity(runningJob?.job_id ?? null);
   const workspaceProgress = buildWorkspaceProgress({
     job: runningJob,
     pendingAnalysis,
