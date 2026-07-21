@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
+from ai_graph.llm.role_calls import RoleDebatePayload, generate_report_writeup
 from ai_graph.nodes.backtest import summarize_backtest
 from ai_graph.schemas import ReportBundle, ReportProjection, RiskDecision, StrategySpec
 
@@ -115,52 +115,35 @@ def build_report_debate(
     strategy: StrategySpec,
     risk: RiskDecision,
 ) -> dict[str, Any]:
+    """Write the report's interpretation of an already-decided outcome.
+
+    This used to be a third bull/bear/judge debate, after the ones in research and
+    signal. It re-argued a settled decision - its judge fallback just echoed
+    risk.signal.action - for three provider calls. The opposing views are now taken
+    from the debates that already ran and handed to a single writing call.
+    """
+
+    signal_debate = (state.get("signal") or {}).get("debate") or state.get("signal_debate") or {}
     context = {
         "strategy": strategy.model_dump(),
         "risk": risk.model_dump(),
         "backtest": summarize_backtest(state.get("backtest", {})),
         "data_availability": state.get("data", {}).get("data_availability", {}),
+        # Opposing material from the debates that already ran, rather than new ones.
+        "supporting_case": signal_debate.get("bull") or {},
+        "objections": signal_debate.get("bear") or {},
+        "research_judgement": (state.get("research_debate") or {}).get("judge") or {},
     }
-    bull = generate_role_debate(
-        role="REPORT_BULL",
-        task="Interpret the backtest and signal in a supportive but evidence-grounded way.",
+    writeup = generate_report_writeup(
         context=context,
         fallback=RoleDebatePayload(
-            role="REPORT_BULL",
-            summary="선택된 백테스트 후보와 Risk Manager 결과를 기준으로 실행 가능한 장점을 요약했습니다.",
-            evidence=["Candidate-code backtest result is available.", "Risk Manager output is attached."],
-            recommendation=risk.signal.action,
-            confidence=risk.signal.confidence,
-        ),
-    )
-    bear = generate_role_debate(
-        role="REPORT_BEAR",
-        task="Identify weaknesses, missing data, and over-interpretation risk.",
-        context=context,
-        fallback=RoleDebatePayload(
-            role="REPORT_BEAR",
-            summary="재무/뉴스/공시 조건이 포함된 경우 현재 DB 가용성을 함께 표시해야 합니다.",
-            concerns=["Report must not imply unavailable data was fully validated."],
-            recommendation="paper_trade_or_review",
-            confidence=0.68,
-        ),
-    )
-    judge = generate_role_debate(
-        role="REPORT_JUDGE",
-        task="Produce the final beginner-friendly recommendation from bull and bear interpretations.",
-        context={**context, "bull": bull.model_dump(), "bear": bear.model_dump()},
-        fallback=RoleDebatePayload(
-            role="REPORT_JUDGE",
+            role="REPORT_WRITER",
             summary="성과 수치와 데이터 가용성을 함께 노출하는 균형 리포트로 확정합니다.",
-            evidence=["Bull/Bear report passes were evaluated."],
-            concerns=bear.concerns,
+            evidence=["Backtest metrics and Risk Manager inputs are available."],
+            concerns=["Report must not imply unavailable data was fully validated."],
             recommendation=risk.signal.action,
             confidence=risk.signal.confidence,
             validation_results={"over_optimism_check": "pass", "proxy_disclosure": "pass"},
         ),
     )
-    return {
-        "bull": bull.model_dump(),
-        "bear": bear.model_dump(),
-        "judge": judge.model_dump(),
-    }
+    return {"writeup": writeup.model_dump()}

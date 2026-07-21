@@ -35,6 +35,9 @@ SCREENING_RESEARCH_PROMPT_VERSION = "v1"
 SCREENING_SQL_SCHEMA_NAME = "quantagent.screening_sql.v1"
 SCREENING_SQL_PROMPT_TEMPLATE_NAME = "screening_sql"
 SCREENING_SQL_PROMPT_VERSION = "v1"
+REPORT_WRITEUP_SCHEMA_NAME = "quantagent.report_writeup.v1"
+REPORT_WRITEUP_PROMPT_TEMPLATE_NAME = "report_writeup"
+REPORT_WRITEUP_PROMPT_VERSION = "v1"
 
 
 class RoleDebatePayload(BaseModel):
@@ -586,6 +589,78 @@ def generate_screening_sql(
         return _LiveScreeningSQL.model_validate(payload).model_dump()
     except (LLMClientError, ValidationError, ValueError, TypeError):
         return None
+
+
+REPORT_WRITEUP_SYSTEM_PROMPT = """\
+You are QuantAgent's report writer for retail investors.
+
+The decision has already been made upstream: research judged the strategy, the signal
+stage judged BUY/HOLD/DROP, and the risk manager set the final action. Do not re-decide
+any of it. Your job is to explain that outcome faithfully.
+
+Write a balanced account from the material given - the supporting case, the objections,
+the backtest numbers and what data was actually available. State the strengths and the
+limitations with equal candour; if a condition could not be verified, say so rather than
+implying it was. Never present an unverified condition as validated.
+
+Return JSON only with summary, evidence, concerns, recommendation, confidence,
+validation_results and citations.
+"""
+
+
+def generate_report_writeup(
+    *,
+    context: dict[str, Any],
+    fallback: RoleDebatePayload,
+) -> RoleDebatePayload:
+    """Write the report's interpretation in one call.
+
+    This replaced a three-way bull/bear/judge debate. That debate re-argued a decision
+    the signal stage had already reached - its own fallback simply echoed the risk
+    manager's action - so it cost three provider calls to restate a settled conclusion.
+    The opposing views it needed are already in state from the research and signal
+    debates and are passed in as material.
+    """
+
+    expected_json_schema = _role_debate_output_schema()
+    request = LLMJsonRequest(
+        schema_name=REPORT_WRITEUP_SCHEMA_NAME,
+        system_prompt=REPORT_WRITEUP_SYSTEM_PROMPT,
+        user_prompt=_user_prompt(context, expected_json_schema),
+        temperature=0.0,
+        task_type="report_writeup",
+        prompt_template_name=REPORT_WRITEUP_PROMPT_TEMPLATE_NAME,
+        prompt_version=REPORT_WRITEUP_PROMPT_VERSION,
+        response_schema=expected_json_schema,
+        variables_jsonb={**context, "expected_json_schema": expected_json_schema},
+    )
+    try:
+        with activity_role("REPORT_WRITER"):
+            report_activity("role_started", task="report writeup")
+            payload = create_llm_client(role="REPORT_WRITER").generate_json(request)
+        provider_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"role", "fallback_reasons"}
+        }
+        if is_live_llm_provider():
+            provider_payload = _LiveRoleDebateOutput.model_validate(provider_payload).model_dump()
+        written = RoleDebatePayload.model_validate({**provider_payload, "role": "REPORT_WRITER"})
+        with activity_role("REPORT_WRITER"):
+            report_activity(
+                "role_completed",
+                summary=written.summary,
+                evidence=list(written.evidence),
+                concerns=list(written.concerns),
+                recommendation=written.recommendation,
+                confidence=written.confidence,
+            )
+        return written
+    except (LLMClientError, ValidationError, ValueError, TypeError) as exc:
+        if is_live_llm_provider():
+            raise
+        reasons = [*fallback.fallback_reasons, f"{type(exc).__name__}: {exc}"]
+        return fallback.model_copy(update={"fallback_reasons": reasons})
 
 
 MARKET_BRIEF_SYSTEM_PROMPT = """\

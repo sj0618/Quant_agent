@@ -103,8 +103,10 @@ def test_non_research_role_debate_does_not_enable_web_search(monkeypatch) -> Non
 
 
 def test_report_node_surfaces_deduplicated_research_citations(monkeypatch) -> None:
+    # The report stage now writes its interpretation in one call instead of running a
+    # third bull/bear/judge debate; this test only needs that call stubbed out.
     monkeypatch.setattr(
-        "ai_graph.nodes.report.generate_role_debate",
+        "ai_graph.nodes.report.generate_report_writeup",
         lambda **kwargs: kwargs["fallback"],
     )
 

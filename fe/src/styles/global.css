@@ -200,33 +200,31 @@ p, h1, h2, h3, h4 { margin: 0; }
 .workspace-progress__step.is-succeeded > span { background: var(--buy); border-color: var(--buy); }
 
 /* 정·반·합 live debate trace, shown under the progress bar while an analysis runs. */
-.debate-activity { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
-/* Computation milestones (backtest, self-improvement) - the small running trace. */
-.debate-activity__steps { list-style: none; margin: 0 0 16px; padding: 0; display: grid; gap: 4px; }
-.debate-activity__steps li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; color: var(--subdued); font-size: 11px; line-height: 1.45; }
-.debate-activity__steps li strong { color: var(--muted); font-size: 11px; font-weight: 700; }
-.debate-activity__steps li span { overflow-wrap: anywhere; }
-.debate-activity__steps li.is-latest strong { color: var(--ink); }
-.debate-activity__steps li.is-latest { color: var(--muted); }
-.debate-activity__caption { margin: 0 0 12px; color: var(--subdued); font-size: 11px; font-weight: 800; letter-spacing: 0.04em; }
-.debate-activity__voices { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-.debate-activity__voice { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--soft); }
-.debate-activity__voice.is-running { border-color: var(--cornflower); background: rgba(135, 151, 246, 0.08); }
-.debate-activity__voice.is-done { border-color: var(--buy); }
-.debate-activity__voice-head { display: flex; align-items: baseline; gap: 6px; margin-bottom: 8px; }
-.debate-activity__voice-head strong { color: var(--ink); font-size: 12px; font-weight: 800; }
-.debate-activity__phase { color: var(--subdued); font-size: 10px; font-weight: 700; }
-.debate-activity__idle { margin: 0; color: var(--subdued); font-size: 11px; }
-.debate-activity__searching { margin: 0 0 6px; color: var(--cornflower); font-size: 11px; font-weight: 700; }
-.debate-activity__queries { list-style: none; margin: 0 0 8px; padding: 0; display: grid; gap: 3px; }
-.debate-activity__queries li { color: var(--muted); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
-.debate-activity__queries li::before { content: "🔍 "; }
-/* The raw provider stream is the model's JSON being written out, so it stays a small
-   monospaced trace; the readable opinion is the summary that replaces it on completion. */
-.debate-activity__stream { margin: 0; max-height: 60px; overflow: hidden; color: var(--subdued); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
-.debate-activity__summary { margin: 0; color: var(--ink); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
-.debate-activity__citations { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 3px; }
-.debate-activity__citations a { color: var(--cornflower); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+
+/* Live activity log: one full-width row per event, stacked under the progress bar.
+   Cards side by side wasted most of the width on margins and cropped the text that
+   matters, so this reads like a terminal log instead. */
+.activity-log { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+.activity-log__rows { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.activity-log__row { display: grid; grid-template-columns: 3px minmax(0, 1fr); gap: 10px; padding: 6px 0; border-radius: 4px; }
+.activity-log__gutter { border-radius: 2px; background: var(--line); }
+.activity-log__row.is-running > .activity-log__gutter { background: var(--cornflower); }
+.activity-log__row.is-done > .activity-log__gutter { background: var(--buy); }
+.activity-log__row.is-step.is-latest > .activity-log__gutter { background: var(--cornflower); }
+.activity-log__body { min-width: 0; }
+.activity-log__head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin: 0 0 2px; }
+.activity-log__head strong { color: var(--ink); font-size: 11px; font-weight: 800; }
+.activity-log__phase, .activity-log__status { color: var(--subdued); font-size: 10px; font-weight: 700; }
+.activity-log__status.is-done { color: var(--buy); }
+.activity-log__line { margin: 0; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.activity-log__line.is-muted { color: var(--subdued); }
+.activity-log__line.is-search { color: var(--cornflower); }
+.activity-log__line.is-summary { color: var(--muted); }
+/* The raw stream is the model's JSON being written out, so it stays a dim monospaced
+   trace and never wraps past two lines. */
+.activity-log__line.is-stream { max-height: 34px; overflow: hidden; color: var(--subdued); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
+.activity-log__line.is-citations { display: flex; flex-wrap: wrap; gap: 10px; }
+.activity-log__line.is-citations a { color: var(--cornflower); font-size: 10px; }
 .workspace-empty--error strong { color: var(--sell); }
 .workspace-empty__query { color: var(--subdued); font-size: 12px; }
 .workspace-progress__step.is-failed { color: var(--drop); }
@@ -530,7 +528,6 @@ p, h1, h2, h3, h4 { margin: 0; }
   .workspace-main { min-height: auto; }
   .workspace-progress { padding: 18px; }
   .workspace-progress__steps { grid-template-columns: 1fr; }
-  .debate-activity__voices { grid-template-columns: 1fr; }
   .summary-grid, .metric-grid, .signal-grid, .step-grid, .principle-grid, .hero__stats, .sample-market-grid, .axis-grid, .report-metrics, .form-grid, .legal-grid, .search-form, .search-result-row { grid-template-columns: 1fr; }
   .landing-section, .landing-cta, .site-footer { padding: 56px 24px; }
   .reports-page, .report-detail-layout, .strategy-report-page, .auth-page, .legal-page, .settings-page, .search-page, .strategy-page { padding: 24px; }
