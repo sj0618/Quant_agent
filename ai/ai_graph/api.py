@@ -2,11 +2,15 @@ from __future__ import annotations
 
 # pyright: reportUnannotatedClassAttribute=false, reportUnusedFunction=false
 
+import asyncio
+import json
+from collections.abc import AsyncIterator
 from os import environ
 from typing import Callable, ClassVar, Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ai_graph.audit import (
@@ -36,6 +40,7 @@ from ai_graph.jobs import (
     create_analysis_job_store_from_env,
     run_job_sync,
 )
+from ai_graph.job_events import JobEventBuffer
 from ai_graph.llm.role_calls import generate_strategy_description
 from ai_graph.nodes.daily_digest import MAX_DIGEST_STRATEGIES, build_daily_digest
 from ai_graph.schemas import SCHEMA_VERSION
@@ -53,6 +58,9 @@ HEALTH_PATH = "/health"
 API_STATUS_PATH = "/api-status"
 ANALYSIS_JOBS_PATH = "/analysis-jobs"
 ANALYSIS_JOB_DETAIL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}"
+ANALYSIS_JOB_EVENTS_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}/events"
+# How long an idle SSE reader waits before checking for new provider activity.
+ANALYSIS_EVENT_POLL_SECONDS = 0.25
 SPEC_STRATEGY_PARSE_PATH = "/api/strategies/parse"
 STRATEGY_DESCRIPTIONS_PATH = "/api/strategies/descriptions"
 SPEC_ANALYSIS_JOB_DETAIL_PATH = "/api/analysis-jobs/{job_id}"
@@ -359,6 +367,7 @@ def create_app(
         )
     app.state.job_store = store
     app.state.job_store_runtime = runtime
+    app.state.job_events = JobEventBuffer()
     app.state.audit_sink = resolve_audit_sink(audit_sink)
     app.state.report_resolver = report_resolver
 
@@ -411,8 +420,49 @@ def create_app(
                 feature="analysis_job",
                 user_id=user_id,
             ),
+            events=app.state.job_events,
         )
         return job
+
+    @app.get(ANALYSIS_JOB_EVENTS_PATH, tags=["Analysis Jobs"])
+    async def stream_analysis_job_events(
+        job_id: str,
+        user_id: str = Depends(require_user),
+    ) -> StreamingResponse:
+        """Stream the running analysis's provider activity as Server-Sent Events.
+
+        Ownership is checked once up front: the job must exist and belong to the
+        caller before any events are handed out.
+        """
+
+        if _owned_job(store, job_id, user_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="analysis job not found",
+            )
+
+        async def event_source() -> AsyncIterator[str]:
+            cursor = 0
+            while True:
+                events, cursor, closed = app.state.job_events.read_since(job_id, cursor)
+                for event in events:
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if closed and not events:
+                    yield "event: done\ndata: {}\n\n"
+                    return
+                if not events:
+                    await asyncio.sleep(ANALYSIS_EVENT_POLL_SECONDS)
+
+        return StreamingResponse(
+            event_source(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                # Reverse proxies buffer by default, which would hold the whole stream
+                # until the analysis finished and defeat the point of streaming.
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get(
         ANALYSIS_JOBS_PATH,
