@@ -15,6 +15,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_graph.data_sources.db import resolve_database_dsn_from_env
+from ai_graph.progress import stage_reporter
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
 
 
@@ -302,10 +303,18 @@ def run_job_sync(store: AnalysisJobStore, job_id: str, runner: AnalysisRunner) -
     job = store.get_job(job_id)
     if job is None:
         raise KeyError(f"analysis job not found: {job_id}")
-    for stage in Stage:
-        job = store.update_job_status(job_id, AnalysisJobStatus.RUNNING, stage)
+
+    # Previously every stage was marked RUNNING up front, so a polling client saw the
+    # job jump straight to the last stage and sit there for the entire run. Advance
+    # the stage only as the graph actually reaches it.
+    store.update_job_status(job_id, AnalysisJobStatus.RUNNING, Stage.INTERPRETING)
+
+    def report_stage(stage_value: str) -> None:
+        store.update_job_status(job_id, AnalysisJobStatus.RUNNING, Stage(stage_value))
+
     try:
-        result = runner(job.query, job.trace_id)
+        with stage_reporter(report_stage):
+            result = runner(job.query, job.trace_id)
     except Exception as exc:
         diagnostic = classify_failure(exc, stage=Stage.FINALIZING.value)
         # The public envelope deliberately hides the original error behind debug_ref,
