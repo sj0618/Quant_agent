@@ -345,6 +345,11 @@ def test_postgres_data_source_filters_screening_by_sector() -> None:
                             "high_252": Decimal("200000"),
                             "sma20": Decimal("180000"),
                             "sma200": Decimal("150000"),
+                            # This query screens the rsi_rebound profile, so the row has to
+                            # carry an oversold rsi to be a candidate at all - a NULL rsi
+                            # would be filtered out by the profile's own predicate.
+                            "rsi": Decimal("28"),
+                            "prev_rsi": Decimal("25"),
                         }
                     ]
                 )
