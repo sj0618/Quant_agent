@@ -38,6 +38,9 @@ SCREENING_SQL_PROMPT_VERSION = "v1"
 REPORT_WRITEUP_SCHEMA_NAME = "quantagent.report_writeup.v1"
 REPORT_WRITEUP_PROMPT_TEMPLATE_NAME = "report_writeup"
 REPORT_WRITEUP_PROMPT_VERSION = "v1"
+STRATEGY_REVISION_SCHEMA_NAME = "quantagent.strategy_revision.v1"
+STRATEGY_REVISION_PROMPT_TEMPLATE_NAME = "strategy_revision"
+STRATEGY_REVISION_PROMPT_VERSION = "v1"
 
 
 class RoleDebatePayload(BaseModel):
@@ -589,6 +592,85 @@ def generate_screening_sql(
         return _LiveScreeningSQL.model_validate(payload).model_dump()
     except (LLMClientError, ValidationError, ValueError, TypeError):
         return None
+
+
+STRATEGY_REVISION_SYSTEM_PROMPT = """\
+You are QuantAgent's Research Judge, acting on your own verdict.
+
+You have just reviewed a strategy and raised concerns. Now act on them: revise the
+entry and exit conditions so the concerns are addressed, and say what you changed.
+
+Revise only what your concerns justify. Keep every condition the user stated explicitly
+unless it is unusable as written - their intent outranks your preference. If the
+concerns do not warrant any change, return the conditions unchanged and set changed to
+false; an unnecessary edit is worse than none.
+
+Return JSON only:
+  changed          - whether you altered anything
+  rationale        - what you changed and which concern it answers
+  entry_conditions - the full revised entry condition list
+  exit_conditions  - the full revised exit condition list
+  indicators       - indicators the revised conditions rely on
+  confidence       - your confidence in the revised specification
+"""
+
+
+def revise_strategy_conditions(
+    *,
+    query: str,
+    strategy: dict[str, Any],
+    judge: dict[str, Any],
+    fallback: StrategyConditionsPayload,
+) -> dict[str, Any] | None:
+    """Let the Research Judge actually change the strategy it just criticised.
+
+    The judge's verdict used to land only as a sentence appended to `assumptions` and a
+    +0.03 confidence bump - the conditions that get code-generated and backtested were
+    never touched, so four web-search calls produced commentary and nothing else.
+
+    Returns None when the judge changed nothing or the revision was unusable, leaving
+    the original specification in place.
+    """
+
+    if not is_live_llm_provider():
+        return None
+
+    expected_json_schema = _LiveStrategyRevision.model_json_schema()
+    context = {
+        "query": query,
+        "current_strategy": strategy,
+        "judge_verdict": judge,
+    }
+    request = LLMJsonRequest(
+        schema_name=STRATEGY_REVISION_SCHEMA_NAME,
+        system_prompt=STRATEGY_REVISION_SYSTEM_PROMPT,
+        user_prompt=_user_prompt(context, expected_json_schema),
+        temperature=0.0,
+        task_type="strategy_revision",
+        prompt_template_name=STRATEGY_REVISION_PROMPT_TEMPLATE_NAME,
+        prompt_version=STRATEGY_REVISION_PROMPT_VERSION,
+        response_schema=expected_json_schema,
+        variables_jsonb={**context, "expected_json_schema": expected_json_schema},
+    )
+    try:
+        payload = create_llm_client(role="STRATEGY_REVISION").generate_json(request)
+        parsed = _LiveStrategyRevision.model_validate(payload)
+    except (LLMClientError, ValidationError, ValueError, TypeError):
+        return None
+    if not parsed.changed or not parsed.entry_conditions:
+        return None
+    return parsed.model_dump()
+
+
+class _LiveStrategyRevision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    changed: bool
+    rationale: str
+    entry_conditions: list[_LiveCondition]
+    exit_conditions: list[_LiveCondition]
+    indicators: list[str]
+    confidence: float
 
 
 REPORT_WRITEUP_SYSTEM_PROMPT = """\

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import logging
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -19,6 +20,8 @@ from ai_graph.audit import (
 from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_sink
 from ai_graph.data_sources import load_pipeline_data_from_env
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
+from pydantic import ValidationError
+
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.progress import report_node_stage
 from ai_graph.llm.role_calls import (
@@ -26,6 +29,7 @@ from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
     generate_role_debate,
     generate_strategy_conditions,
+    revise_strategy_conditions,
 )
 from ai_graph.nodes.backtest import backtest_node
 from ai_graph.nodes.backtest_code import backtest_code_node
@@ -51,6 +55,8 @@ from ai_graph.schemas import (
 )
 from ai_graph.state import QuantAgentState
 
+
+_logger = logging.getLogger(__name__)
 
 DEBUG_STORE = InMemoryDebugStore()
 NODE_SEQUENCE = (
@@ -531,10 +537,78 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
             "confidence": min(strategy_a.confidence + 0.03, 0.95),
         }
     )
-    return {
+    strategy_a, revision = _apply_research_revision(
+        state["user_query"], strategy_a, debate.get("judge") or {}
+    )
+    output: dict[str, Any] = {
         "original_strategy_spec": original_strategy.model_dump(),
         "strategy_spec": strategy_a.model_dump(),
         "research_debate": debate,
+    }
+    if revision:
+        output["strategy_revision"] = revision
+    return output
+
+
+def _apply_research_revision(
+    query: str, strategy: StrategySpec, judge: Mapping[str, Any]
+) -> tuple[StrategySpec, dict[str, Any] | None]:
+    """Let the Research Judge's verdict change the conditions, not just annotate them.
+
+    The verdict previously only appended a sentence to `assumptions`, so the conditions
+    that get code-generated and backtested were identical whether the judge approved or
+    objected. A revision that fails validation is discarded rather than partially
+    applied - a half-rewritten specification is worse than the original.
+    """
+
+    if not judge.get("concerns"):
+        return strategy, None
+
+    revision = revise_strategy_conditions(
+        query=query,
+        strategy=strategy.model_dump(),
+        judge=dict(judge),
+        fallback=StrategyConditionsPayload(
+            entry_conditions=list(strategy.entry_conditions),
+            exit_conditions=list(strategy.exit_conditions),
+            indicators=list(strategy.indicators),
+            confidence=strategy.confidence,
+        ),
+    )
+    if not revision:
+        return strategy, None
+
+    try:
+        revised = strategy.model_copy(
+            update={
+                "entry_conditions": [
+                    Condition.model_validate(item) for item in revision["entry_conditions"]
+                ],
+                "exit_conditions": [
+                    Condition.model_validate(item) for item in revision["exit_conditions"]
+                ],
+                "indicators": list(revision.get("indicators") or strategy.indicators),
+                "assumptions": [
+                    *strategy.assumptions,
+                    f"Research Judge 조건 수정: {revision['rationale']}",
+                ],
+                "confidence": float(revision.get("confidence", strategy.confidence)),
+            }
+        )
+    except ValidationError:
+        _logger.warning("research judge revision failed validation; keeping original spec")
+        return strategy, None
+
+    return revised, {
+        "rationale": revision["rationale"],
+        "before": {
+            "entry_conditions": [item.model_dump() for item in strategy.entry_conditions],
+            "exit_conditions": [item.model_dump() for item in strategy.exit_conditions],
+        },
+        "after": {
+            "entry_conditions": [item.model_dump() for item in revised.entry_conditions],
+            "exit_conditions": [item.model_dump() for item in revised.exit_conditions],
+        },
     }
 
 
