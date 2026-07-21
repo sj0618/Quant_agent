@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any
@@ -61,6 +61,16 @@ UNIVERSE_VIEW = "meta.view_common_stock_universe"
 SYMBOL_MASTER_TABLE = "core.symbol_master"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
+DART_FINANCIAL_TABLE = "mart.dart_financial_asof"
+# DART accounts are stored as objects, with the figure under "amount" and the prior
+# period under raw.frmtrm_amount. Values are text and not always numeric.
+DART_ACCOUNTS = {
+    "equity": "ifrs-full_Equity",
+    "liabilities": "ifrs-full_Liabilities",
+    "profit_loss": "ifrs-full_ProfitLoss",
+    "revenue": "ifrs-full_Revenue",
+    "operating_income": "dart_OperatingIncomeLoss",
+}
 
 TICKER_PATTERN = re.compile(r"\b\d{6}\b")
 RSI_KEYS = ("rsi", "RSI", "rsi_14", "RSI_14", "talib_rsi_14", "TA_RSI_14")
@@ -583,6 +593,11 @@ class ScreeningThresholds(BaseModel):
     sma20_band: float = Field(default=0.04, ge=0.005, le=0.50)
     bb_width_max: float = Field(default=0.18, ge=0.02, le=1.0)
     bb_upper_ratio: float = Field(default=0.995, ge=0.50, le=1.0)
+    # Fundamentals, from the latest DART filing available as of the screening date.
+    roe_min: float = Field(default=0.08, ge=-1.0, le=1.0)
+    debt_to_equity_max: float = Field(default=2.0, ge=0.1, le=20.0)
+    operating_margin_min: float = Field(default=0.05, ge=-1.0, le=1.0)
+    revenue_growth_min: float = Field(default=0.10, ge=-1.0, le=10.0)
 
 
 def _clamped(value: float, low: float, high: float) -> float:
@@ -611,6 +626,12 @@ def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> Screenin
             "sma20_band": _clamped(base.sma20_band + 0.02 * step, 0.005, 0.50),
             "bb_width_max": _clamped(base.bb_width_max + 0.06 * step, 0.02, 1.0),
             "bb_upper_ratio": _clamped(base.bb_upper_ratio - 0.02 * step, 0.50, 1.0),
+            "roe_min": _clamped(base.roe_min - 0.02 * step, -1.0, 1.0),
+            "debt_to_equity_max": _clamped(base.debt_to_equity_max + 0.5 * step, 0.1, 20.0),
+            "operating_margin_min": _clamped(
+                base.operating_margin_min - 0.02 * step, -1.0, 1.0
+            ),
+            "revenue_growth_min": _clamped(base.revenue_growth_min - 0.03 * step, -1.0, 10.0),
         }
     )
 
@@ -687,12 +708,34 @@ def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
             row.get("relative_strength_20d"), thresholds.relative_strength_20d_min
         ) and _at_least(row.get("relative_strength_60d"), thresholds.relative_strength_60d_min)
 
+    def value_quality(row: Mapping[str, Any]) -> bool:
+        return (
+            _at_least(row.get("roe"), thresholds.roe_min)
+            and _numeric(row.get("debt_to_equity")) is not None
+            and _numeric(row["debt_to_equity"]) <= thresholds.debt_to_equity_max
+        )
+
+    def quality_growth(row: Mapping[str, Any]) -> bool:
+        return (
+            _at_least(row.get("roe"), thresholds.roe_min)
+            and _at_least(row.get("operating_margin"), thresholds.operating_margin_min)
+            and _at_least(row.get("revenue_growth_yoy"), thresholds.revenue_growth_min)
+        )
+
+    def growth_momentum(row: Mapping[str, Any]) -> bool:
+        return _at_least(row.get("revenue_growth_yoy"), thresholds.revenue_growth_min) and _above(
+            row.get("close"), row.get("sma50")
+        )
+
     return {
         "breakout_volume": breakout_volume,
         "rsi_rebound": rsi_rebound,
         "pullback_trend": pullback_trend,
         "bollinger_squeeze": bollinger_squeeze,
         "relative_strength": relative_strength,
+        "value_quality": value_quality,
+        "quality_growth": quality_growth,
+        "growth_momentum": growth_momentum,
     }.get(profile, lambda row: _above(row.get("close"), 0))
 
 
@@ -769,8 +812,23 @@ def _propose_relaxed_thresholds(
         return deterministic
 
 
+def _mentions_fundamentals(query: str, terms: Sequence[str]) -> bool:
+    lowered = query.lower()
+    return any(term.lower() in lowered for term in terms)
+
+
 def _screening_profile(query: str) -> str:
     lowered = query.lower()
+    # Fundamental intent is checked first and on stronger evidence than the technical
+    # keywords below. Without this a query like "저PER·고ROE·부채비율" fell through to a
+    # price-only profile and silently returned the same names as an unrelated momentum
+    # screen - different strategies, identical candidates.
+    if _mentions_fundamentals(query, ("roe", "per", "pbr", "부채비율", "저평가", "가치주")):
+        return "value_quality"
+    if _mentions_fundamentals(query, ("영업이익률", "퀄리티", "이익률")):
+        return "quality_growth"
+    if _mentions_fundamentals(query, ("매출 성장", "매출성장", "성장률", "성장주")):
+        return "growth_momentum"
     if "rsi" in lowered or "과매도" in query or "반등" in query:
         return "rsi_rebound"
     if "볼린저" in query or "밴드" in query or "변동성" in query:
@@ -782,6 +840,75 @@ def _screening_profile(query: str) -> str:
     if "신고가" in query or "거래량" in query or "돌파" in query or "모멘텀" in query:
         return "breakout_volume"
     return "technical_proxy"
+
+
+def _dart_amount(field: str, *, prior: bool = False) -> str:
+    """SQL for one DART figure, guarded so non-numeric text yields NULL rather than erroring."""
+
+    account = DART_ACCOUNTS[field]
+    path = (
+        f"accounts_jsonb->'{account}'->'raw'->>'frmtrm_amount'"
+        if prior
+        else f"accounts_jsonb->'{account}'->>'amount'"
+    )
+    return f"CASE WHEN {path} ~ '^-?[0-9]+$' THEN ({path})::numeric END"
+
+
+def _financial_cte() -> str:
+    """Latest DART filing per symbol, as ratios, joined into screening.
+
+    Filings are selected on available_from - the date the statement became public -
+    rather than period_end, so a screen never sees numbers that were not yet filed.
+    Revenue growth compares against the same report_code roughly a year earlier;
+    raw.frmtrm_amount is present too rarely (4% of symbols) to rely on.
+    """
+
+    return f"""financial_raw AS (
+            SELECT
+                symbol,
+                period_end,
+                available_from,
+                report_code,
+                {_dart_amount('equity')} AS equity,
+                {_dart_amount('liabilities')} AS liabilities,
+                {_dart_amount('profit_loss')} AS profit_loss,
+                {_dart_amount('revenue')} AS revenue,
+                {_dart_amount('operating_income')} AS operating_income
+            FROM {DART_FINANCIAL_TABLE}
+            WHERE available_from <= (SELECT as_of_date FROM latest_date)
+        ),
+        financial_latest AS (
+            SELECT DISTINCT ON (symbol) *
+            FROM financial_raw
+            ORDER BY symbol, available_from DESC, period_end DESC
+        ),
+        financials AS (
+            SELECT
+                current_filing.symbol,
+                current_filing.period_end AS financial_period_end,
+                CASE
+                    WHEN current_filing.equity > 0
+                    THEN current_filing.profit_loss / current_filing.equity
+                END AS roe,
+                CASE
+                    WHEN current_filing.equity > 0
+                    THEN current_filing.liabilities / current_filing.equity
+                END AS debt_to_equity,
+                CASE
+                    WHEN current_filing.revenue > 0
+                    THEN current_filing.operating_income / current_filing.revenue
+                END AS operating_margin,
+                CASE
+                    WHEN current_filing.revenue > 0 AND prior_filing.revenue > 0
+                    THEN current_filing.revenue / prior_filing.revenue - 1
+                END AS revenue_growth_yoy
+            FROM financial_latest current_filing
+            LEFT JOIN financial_raw prior_filing
+              ON prior_filing.symbol = current_filing.symbol
+             AND prior_filing.report_code = current_filing.report_code
+             AND prior_filing.period_end BETWEEN current_filing.period_end - INTERVAL '400 days'
+                                             AND current_filing.period_end - INTERVAL '330 days'
+        )"""
 
 
 def _screening_sql(profile: str, *, sector: str | None = None) -> str:
@@ -851,6 +978,7 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 w200 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 199 PRECEDING AND CURRENT ROW),
                 w252 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)
         ),
+        {_financial_cte()},
         momentum_raw AS (
             -- ta_momentum_ticker_daily keys tickers as '000020#S05' (6-digit code plus a
             -- security-type suffix) while kis_adjusted_ohlcv_daily keys them as '000020',
@@ -899,10 +1027,18 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 CASE WHEN close_120d_ago > 0 THEN close / close_120d_ago - 1 ELSE NULL END AS return_120d,
                 (sma20 + 2 * COALESCE(std20, 0)) AS bb_upper,
                 CASE WHEN sma20 > 0 THEN (4 * COALESCE(std20, 0)) / sma20 ELSE NULL END AS bb_width,
-                close * volume AS turnover
+                close * volume AS turnover,
+                fin.roe,
+                fin.debt_to_equity,
+                fin.operating_margin,
+                fin.revenue_growth_yoy,
+                fin.financial_period_end
             FROM features f
             LEFT JOIN momentum_with_prev mwp
               ON mwp.ticker = f.ticker AND mwp.time = f.time
+            -- LEFT so a ticker without filings still screens on price alone; the
+            -- fundamental predicates simply will not match it.
+            LEFT JOIN financials fin ON fin.symbol = f.ticker
             WHERE f.time = (SELECT as_of_date FROM latest_date)
         ),
         market AS (
@@ -944,6 +1080,10 @@ def _screening_candidate_from_row(
         "rsi": _optional_float_value(row.get("rsi")),
         "relative_strength_20d": relative_strength,
         "relative_strength_60d": _optional_float_value(row.get("relative_strength_60d")),
+        "roe": _optional_float_value(row.get("roe")),
+        "debt_to_equity": _optional_float_value(row.get("debt_to_equity")),
+        "operating_margin": _optional_float_value(row.get("operating_margin")),
+        "revenue_growth_yoy": _optional_float_value(row.get("revenue_growth_yoy")),
         "matched_rules": _matched_screening_rules(row, profile),
     }
 
@@ -969,6 +1109,18 @@ def _matched_screening_rules(row: Mapping[str, Any], profile: str) -> list[str]:
         rules.append("RSI 30 상향 돌파")
     if profile == "bollinger_squeeze" and _compare(row.get("bb_upper"), close):
         rules.append("볼린저 상단 근접/돌파")
+    roe = _optional_float_value(row.get("roe"))
+    if roe is not None:
+        rules.append(f"ROE {roe:.1%}")
+    debt_to_equity = _optional_float_value(row.get("debt_to_equity"))
+    if debt_to_equity is not None:
+        rules.append(f"부채비율 {debt_to_equity:.0%}")
+    operating_margin = _optional_float_value(row.get("operating_margin"))
+    if operating_margin is not None:
+        rules.append(f"영업이익률 {operating_margin:.1%}")
+    revenue_growth = _optional_float_value(row.get("revenue_growth_yoy"))
+    if revenue_growth is not None:
+        rules.append(f"매출성장률 {revenue_growth:+.1%}")
     return rules
 
 
