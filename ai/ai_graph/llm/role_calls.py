@@ -29,6 +29,12 @@ STRATEGY_CONDITIONS_PROMPT_VERSION = "v1"
 SCREENING_RELAXATION_SCHEMA_NAME = "quantagent.screening_relaxation.v1"
 SCREENING_RELAXATION_PROMPT_TEMPLATE_NAME = "screening_relaxation"
 SCREENING_RELAXATION_PROMPT_VERSION = "v1"
+SCREENING_RESEARCH_SCHEMA_NAME = "quantagent.screening_research.v1"
+SCREENING_RESEARCH_PROMPT_TEMPLATE_NAME = "screening_research"
+SCREENING_RESEARCH_PROMPT_VERSION = "v1"
+SCREENING_SQL_SCHEMA_NAME = "quantagent.screening_sql.v1"
+SCREENING_SQL_PROMPT_TEMPLATE_NAME = "screening_sql"
+SCREENING_SQL_PROMPT_VERSION = "v1"
 
 
 class RoleDebatePayload(BaseModel):
@@ -435,6 +441,151 @@ def generate_relaxed_screening_thresholds(
     except (LLMClientError, ValidationError, ValueError, TypeError):
         return dict(fallback)
     return parsed.model_dump(exclude={"rationale"})
+
+
+SCREENING_RESEARCH_SYSTEM_PROMPT = """\
+You are QuantAgent's investment-terminology researcher.
+
+Before any query is written, work out what the user's strategy actually asks for. Use
+the web search tool for any metric, indicator or concept whose definition you are not
+certain of - do not rely on memory for formulas. Korean market terms are in scope.
+
+For every quantity the strategy depends on, give its standard definition, the formula,
+and the raw inputs the formula consumes (e.g. PER = price / earnings per share, inputs:
+price, EPS). Where a term is ambiguous in practice, say which reading you took.
+
+Return JSON only:
+  strategy_reading - one paragraph on what the strategy screens for
+  metrics          - each with name, definition, formula, required_inputs
+  citations        - sources you actually consulted, title and url
+"""
+
+
+class _LiveScreeningMetric(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    definition: str
+    formula: str
+    required_inputs: list[str]
+
+
+class _LiveScreeningResearch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_reading: str
+    metrics: list[_LiveScreeningMetric]
+    citations: list[_LiveRoleCitation]
+
+
+def research_screening_terms(*, query: str) -> dict[str, Any] | None:
+    """Resolve the strategy's terminology before any SQL is attempted.
+
+    Formulas are researched rather than recalled: the previous design hardcoded how each
+    metric is computed and blocked PER on a wrong assumption about needing a share
+    count. Returns None with no live provider so mock mode keeps its deterministic path.
+    """
+
+    if not is_live_llm_provider():
+        return None
+
+    expected_json_schema = _LiveScreeningResearch.model_json_schema()
+    context = {"query": query}
+    request = LLMJsonRequest(
+        schema_name=SCREENING_RESEARCH_SCHEMA_NAME,
+        system_prompt=SCREENING_RESEARCH_SYSTEM_PROMPT,
+        user_prompt=_user_prompt(context, expected_json_schema),
+        temperature=0.0,
+        enable_web_search=True,
+        task_type="screening_research",
+        prompt_template_name=SCREENING_RESEARCH_PROMPT_TEMPLATE_NAME,
+        prompt_version=SCREENING_RESEARCH_PROMPT_VERSION,
+        response_schema=expected_json_schema,
+        variables_jsonb={**context, "expected_json_schema": expected_json_schema},
+    )
+    try:
+        payload = create_llm_client(role="SCREENING_RESEARCH").generate_json(request)
+        return _LiveScreeningResearch.model_validate(payload).model_dump()
+    except (LLMClientError, ValidationError, ValueError, TypeError):
+        return None
+
+
+SCREENING_SQL_SYSTEM_PROMPT = """\
+You are QuantAgent's stock screening engineer for a Korean equity warehouse.
+
+Translate the strategy into ONE PostgreSQL SELECT returning the stocks that satisfy it.
+You are given the real schema, how full each table is, and the warehouse's known
+pitfalls - follow them exactly.
+
+Reason before writing: name each quantity the strategy needs, map it onto columns, then
+compose the query. If a quantity cannot be derived from this schema, leave it out of the
+conditions and report it under unmet_requirements naming the missing input. Never
+substitute an unrelated column for a condition you cannot express.
+
+If earlier attempts are supplied, fix precisely what they got wrong. When a previous
+attempt matched nothing, the conditions were too tight for this particular date -
+loosen the least load-bearing one rather than abandoning the strategy.
+
+Return JSON only:
+  reasoning          - how each condition maps onto columns
+  sql                - the SELECT (single statement, no semicolon, no DDL/DML)
+  metrics            - metric column names the SELECT returns
+  unmet_requirements - conditions you could not express, each naming the missing input
+"""
+
+
+class _LiveScreeningSQL(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reasoning: str
+    sql: str
+    metrics: list[str]
+    unmet_requirements: list[str]
+
+
+def generate_screening_sql(
+    *,
+    query: str,
+    schema_context: str,
+    schema_notes: str,
+    output_contract: str,
+    research: dict[str, Any] | None = None,
+    previous_attempts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Ask the model to author the screening SELECT."""
+
+    if not is_live_llm_provider():
+        return None
+
+    expected_json_schema = _LiveScreeningSQL.model_json_schema()
+    context: dict[str, Any] = {
+        "query": query,
+        "schema": schema_context,
+        "pitfalls": schema_notes,
+        "output_contract": output_contract,
+    }
+    if research:
+        context["terminology"] = research
+    if previous_attempts:
+        # Each retry sees what the previous SQL did and why it was unusable, so it
+        # corrects that specific failure instead of guessing again.
+        context["previous_attempts"] = previous_attempts
+    request = LLMJsonRequest(
+        schema_name=SCREENING_SQL_SCHEMA_NAME,
+        system_prompt=SCREENING_SQL_SYSTEM_PROMPT,
+        user_prompt=_user_prompt(context, expected_json_schema),
+        temperature=0.0,
+        task_type="screening_sql",
+        prompt_template_name=SCREENING_SQL_PROMPT_TEMPLATE_NAME,
+        prompt_version=SCREENING_SQL_PROMPT_VERSION,
+        response_schema=expected_json_schema,
+        variables_jsonb={**context, "expected_json_schema": expected_json_schema},
+    )
+    try:
+        payload = create_llm_client(role="SCREENING_SQL").generate_json(request)
+        return _LiveScreeningSQL.model_validate(payload).model_dump()
+    except (LLMClientError, ValidationError, ValueError, TypeError):
+        return None
 
 
 MARKET_BRIEF_SYSTEM_PROMPT = """\
