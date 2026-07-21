@@ -543,10 +543,20 @@ def _sleep_before_retry(
 
     delay = backoff_seconds * (attempt + 1)
     retry_after = _retry_after_seconds(response)
-    if retry_after is not None:
-        delay = max(delay, min(retry_after, MAX_RETRY_AFTER_SECONDS))
+    rate_limited = retry_after is not None
+    if rate_limited:
+        delay = max(delay, min(retry_after or 0.0, MAX_RETRY_AFTER_SECONDS))
     if delay <= 0:
         return
+    if rate_limited:
+        # Honouring Retry-After can mean a full minute of silence per attempt, which
+        # reads as a hang. Say so instead of leaving the view frozen.
+        _logger.warning("AOAI rate limited; waiting %.0fs before retry", delay)
+        report_activity(
+            "step",
+            label="AOAI 호출 제한 대기",
+            detail=f"{delay:.0f}초 후 재시도합니다 (요청 한도 초과)",
+        )
     time.sleep(delay)
 
 
