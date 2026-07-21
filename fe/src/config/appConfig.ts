@@ -19,6 +19,7 @@ export const AI_ENDPOINTS = {
   apiStatus: "/api-status",
   analysisJobs: "/analysis-jobs",
   analysisJob: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}`,
+  analysisJobEvents: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/events`,
   strategyDescriptions: "/api/strategies/descriptions",
 } as const;
 

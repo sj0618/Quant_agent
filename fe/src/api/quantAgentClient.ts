@@ -127,6 +127,11 @@ class AIResponseError extends Error {
   }
 }
 
+/** HTTP status behind a failed AI call, or null if it never reached the server. */
+export function aiResponseStatus(error: unknown): number | null {
+  return error instanceof AIResponseError ? error.status : null;
+}
+
 function clone<T>(value: T): T {
   return structuredClone(value);
 }
