@@ -1,40 +1,35 @@
-import {
-  DEBATE_VOICES,
-  DEBATE_VOICE_LABELS,
-  type ActivityState,
-  type VoiceActivity,
-} from "../../api/analysisActivity";
+import type { ActivityEntry, ActivityState } from "../../api/analysisActivity";
 
-/** How much of the raw provider stream to keep on screen. The stream is the model's
- * JSON being written out, so it is shown as a small live trace rather than prose -
- * the readable opinion is the summary that lands when the voice finishes. */
-const STREAM_TAIL_LENGTH = 220;
+/** How much of the raw provider stream to keep on screen. It is the model's JSON being
+ * written out, so it reads as a live trace until the finished summary replaces it. */
+const STREAM_TAIL_LENGTH = 200;
 
-function VoiceRow({ activity }: { activity: VoiceActivity }) {
-  const { status, phase, searching, searchQueries, citations, streamingText, summary } = activity;
-  const streamTail = streamingText.slice(-STREAM_TAIL_LENGTH);
-  const latestQuery = searchQueries[searchQueries.length - 1];
+function EntryRow({ entry, isLatest }: { entry: ActivityEntry; isLatest: boolean }) {
+  const streamTail = (entry.streamingText ?? "").slice(-STREAM_TAIL_LENGTH);
+  const latestQuery = entry.searchQueries?.[entry.searchQueries.length - 1];
+  const citations = entry.citations ?? [];
 
   return (
-    <li className={`activity-log__row is-${status}`}>
+    <li
+      className={`activity-log__row is-${entry.status}${entry.kind === "voice" ? " is-voice" : ""}${
+        isLatest ? " is-latest" : ""
+      }`}
+    >
       <span className="activity-log__gutter" aria-hidden="true" />
       <div className="activity-log__body">
         <p className="activity-log__head">
-          <strong>{DEBATE_VOICE_LABELS[activity.voice]}</strong>
-          {phase ? <span className="activity-log__phase">{phase.toLowerCase()}</span> : null}
-          {status === "running" ? <span className="activity-log__status">진행 중</span> : null}
-          {status === "done" ? <span className="activity-log__status is-done">완료</span> : null}
+          <strong>{entry.label}</strong>
+          {entry.phase ? <span className="activity-log__phase">{entry.phase.toLowerCase()}</span> : null}
+          {entry.status === "running" ? <span className="activity-log__status">진행 중</span> : null}
         </p>
 
-        {searching ? <p className="activity-log__line is-search">웹 검색 중…</p> : null}
+        {entry.searching ? <p className="activity-log__line is-search">웹 검색 중…</p> : null}
         {latestQuery ? <p className="activity-log__line is-search">🔍 {latestQuery}</p> : null}
 
-        {summary ? (
-          <p className="activity-log__line is-summary">{summary}</p>
+        {entry.detail ? (
+          <p className="activity-log__line is-summary">{entry.detail}</p>
         ) : streamTail ? (
           <p className="activity-log__line is-stream">{streamTail}</p>
-        ) : status === "idle" ? (
-          <p className="activity-log__line is-muted">대기 중</p>
         ) : null}
 
         {citations.length > 0 ? (
@@ -52,37 +47,20 @@ function VoiceRow({ activity }: { activity: VoiceActivity }) {
 }
 
 export function DebateActivityPanel({ activity }: { activity: ActivityState }) {
-  const hasDebate = DEBATE_VOICES.some((voice) => activity.voices[voice].status !== "idle");
-  const hasSteps = activity.steps.length > 0;
-  if (!hasDebate && !hasSteps) {
+  if (activity.entries.length === 0) {
     return null;
   }
 
   return (
     <section className="activity-log">
       <ul className="activity-log__rows">
-        {activity.steps.map((step, index) => (
-          <li
-            className={`activity-log__row is-step${
-              index === activity.steps.length - 1 ? " is-latest" : ""
-            }`}
-            key={`${step.label}-${index}`}
-          >
-            <span className="activity-log__gutter" aria-hidden="true" />
-            <div className="activity-log__body">
-              <p className="activity-log__head">
-                <strong>{step.label}</strong>
-              </p>
-              {step.detail ? <p className="activity-log__line is-muted">{step.detail}</p> : null}
-            </div>
-          </li>
+        {activity.entries.map((entry, index) => (
+          <EntryRow
+            entry={entry}
+            isLatest={index === activity.entries.length - 1}
+            key={`${entry.id}-${index}`}
+          />
         ))}
-
-        {hasDebate
-          ? DEBATE_VOICES.map((voice) => (
-              <VoiceRow activity={activity.voices[voice]} key={voice} />
-            ))
-          : null}
       </ul>
     </section>
   );

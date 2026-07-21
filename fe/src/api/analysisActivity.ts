@@ -2,49 +2,50 @@ import { useEffect, useReducer } from "react";
 
 import { appConfig, AI_ENDPOINTS } from "../config/appConfig";
 
-/** 정/반/합. Roles arrive phase-qualified (RESEARCH_BULL, SIGNAL_BEAR, ...), and every
- * phase debates the same three ways, so activity is grouped by the voice and the panel
- * shows whichever phase is currently speaking. */
+/** 정/반/합. Roles arrive phase-qualified (RESEARCH_BULL, SIGNAL_BEAR, ...). */
 export type DebateVoice = "BULL" | "BEAR" | "JUDGE";
 
-export const DEBATE_VOICES: DebateVoice[] = ["BULL", "BEAR", "JUDGE"];
-
-const MAX_STEPS = 6;
+const DEBATE_VOICES: DebateVoice[] = ["BULL", "BEAR", "JUDGE"];
 
 export const DEBATE_VOICE_LABELS: Record<DebateVoice, string> = {
-  BULL: "정 · 지지 근거",
-  BEAR: "반 · 반론과 위험",
-  JUDGE: "합 · 종합 판단",
+  BULL: "정 · 지지",
+  BEAR: "반 · 반론",
+  JUDGE: "합 · 판단",
 };
+
+/** The log is a tail, not an audit trail - old entries scroll out of view. */
+const MAX_ENTRIES = 14;
 
 export interface Citation {
   title: string;
   url: string;
 }
 
-export interface VoiceActivity {
-  voice: DebateVoice;
-  phase: string | null;
-  status: "idle" | "running" | "done";
-  searchQueries: string[];
-  citations: Citation[];
-  streamingText: string;
-  summary: string | null;
-  evidence: string[];
-  concerns: string[];
-  searching: boolean;
-}
-
-export interface ProgressStep {
+/** One line of the run, in the order it happened.
+ *
+ * Debate voices used to live in three fixed slots updated in place while computation
+ * steps appended to a list, so the two never shared an ordering: the screen showed a
+ * backtest step above a debate that had finished before it. Everything is one sequence
+ * now, and a voice's own entry is updated in place as its text streams in.
+ */
+export interface ActivityEntry {
+  id: string;
+  kind: "step" | "voice";
   label: string;
   detail: string | null;
+  status: "running" | "done";
+  /** Voice entries only. */
+  voice?: DebateVoice;
+  phase?: string | null;
+  searching?: boolean;
+  searchQueries?: string[];
+  citations?: Citation[];
+  streamingText?: string;
 }
 
 export interface ActivityState {
   stage: string | null;
-  voices: Record<DebateVoice, VoiceActivity>;
-  /** Computation milestones (backtest and friends) that have no provider stream. */
-  steps: ProgressStep[];
+  entries: ActivityEntry[];
 }
 
 interface ActivityEvent {
@@ -62,31 +63,8 @@ interface ActivityEvent {
   concerns?: string[];
 }
 
-function emptyVoice(voice: DebateVoice): VoiceActivity {
-  return {
-    voice,
-    phase: null,
-    status: "idle",
-    searchQueries: [],
-    citations: [],
-    streamingText: "",
-    summary: null,
-    evidence: [],
-    concerns: [],
-    searching: false,
-  };
-}
-
 export function emptyActivityState(): ActivityState {
-  return {
-    stage: null,
-    voices: {
-      BULL: emptyVoice("BULL"),
-      BEAR: emptyVoice("BEAR"),
-      JUDGE: emptyVoice("JUDGE"),
-    },
-    steps: [],
-  };
+  return { stage: null, entries: [] };
 }
 
 function splitRole(role: string | null | undefined) {
@@ -101,6 +79,31 @@ function splitRole(role: string | null | undefined) {
   return { voice, phase: separator >= 0 ? role.slice(0, separator) : null };
 }
 
+/** The open entry for a role, so streamed text lands on the line it belongs to. */
+function findOpenVoice(entries: ActivityEntry[], role: string): number {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.kind === "voice" && entry.id === role && entry.status === "running") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function replaceAt(
+  entries: ActivityEntry[],
+  index: number,
+  update: Partial<ActivityEntry>,
+): ActivityEntry[] {
+  const next = [...entries];
+  next[index] = { ...next[index], ...update };
+  return next;
+}
+
+function append(entries: ActivityEntry[], entry: ActivityEntry): ActivityEntry[] {
+  return [...entries, entry].slice(-MAX_ENTRIES);
+}
+
 function reduce(state: ActivityState, event: ActivityEvent): ActivityState {
   if (event.kind === "stage") {
     return { ...state, stage: event.stage ?? state.stage };
@@ -110,69 +113,97 @@ function reduce(state: ActivityState, event: ActivityEvent): ActivityState {
     if (!event.label) {
       return state;
     }
-    // Only the tail is kept: this is a running trace, not a full audit log.
-    const steps = [...state.steps, { label: event.label, detail: event.detail ?? null }];
-    return { ...state, steps: steps.slice(-MAX_STEPS) };
+    return {
+      ...state,
+      entries: append(state.entries, {
+        id: `step-${state.entries.length}-${event.label}`,
+        kind: "step",
+        label: event.label,
+        detail: event.detail ?? null,
+        status: "done",
+      }),
+    };
   }
 
   const parsed = splitRole(event.role);
   if (!parsed) {
-    // Provider calls outside the debate (strategy conditions, market brief) still
-    // stream; they have no section to belong to, so they are not shown.
+    // Provider calls outside the debate (screening SQL, terminology research) stream
+    // too; their progress is reported as steps instead.
     return state;
   }
 
+  const role = String(event.role);
   const { voice, phase } = parsed;
-  const current = state.voices[voice];
-  let next: VoiceActivity;
+  const index = findOpenVoice(state.entries, role);
+
+  if (event.kind === "role_started") {
+    return {
+      ...state,
+      entries: append(state.entries, {
+        id: role,
+        kind: "voice",
+        voice,
+        phase,
+        label: DEBATE_VOICE_LABELS[voice],
+        detail: null,
+        status: "running",
+        searching: false,
+        searchQueries: [],
+        citations: [],
+        streamingText: "",
+      }),
+    };
+  }
+
+  if (index < 0) {
+    return state;
+  }
+  const current = state.entries[index];
 
   switch (event.kind) {
-    case "role_started":
-      // A new phase reuses the section, so its prior content is cleared rather than
-      // appended to - otherwise research and report opinions would run together.
-      next = { ...emptyVoice(voice), phase, status: "running" };
-      break;
     case "search_started":
-      next = { ...current, searching: true };
-      break;
+      return { ...state, entries: replaceAt(state.entries, index, { searching: true }) };
     case "search_queries":
-      next = {
-        ...current,
-        searching: false,
-        searchQueries: [...current.searchQueries, ...(event.queries ?? [])],
+      return {
+        ...state,
+        entries: replaceAt(state.entries, index, {
+          searching: false,
+          searchQueries: [...(current.searchQueries ?? []), ...(event.queries ?? [])],
+        }),
       };
-      break;
     case "citation": {
-      if (!event.url) {
+      if (!event.url || (current.citations ?? []).some((item) => item.url === event.url)) {
         return state;
       }
-      const known = current.citations.some((item) => item.url === event.url);
-      next = known
-        ? current
-        : {
-            ...current,
-            citations: [...current.citations, { title: event.title || event.url, url: event.url }],
-          };
-      break;
+      return {
+        ...state,
+        entries: replaceAt(state.entries, index, {
+          citations: [
+            ...(current.citations ?? []),
+            { title: event.title || event.url, url: event.url },
+          ],
+        }),
+      };
     }
     case "text_delta":
-      next = { ...current, streamingText: current.streamingText + (event.text ?? "") };
-      break;
-    case "role_completed":
-      next = {
-        ...current,
-        status: "done",
-        searching: false,
-        summary: event.summary ?? null,
-        evidence: event.evidence ?? [],
-        concerns: event.concerns ?? [],
+      return {
+        ...state,
+        entries: replaceAt(state.entries, index, {
+          streamingText: (current.streamingText ?? "") + (event.text ?? ""),
+        }),
       };
-      break;
+    case "role_completed":
+      return {
+        ...state,
+        entries: replaceAt(state.entries, index, {
+          status: "done",
+          searching: false,
+          detail: event.summary ?? current.detail,
+        }),
+      };
     default:
       return state;
   }
-
-  return { ...state, voices: { ...state.voices, [voice]: next } };
 }
 
 type Action = { type: "event"; event: ActivityEvent } | { type: "reset" };
@@ -207,10 +238,9 @@ export function useAnalysisActivity(jobId: string | null | undefined): ActivityS
       }
     };
     source.addEventListener("done", () => source.close());
-    // Deliberately no onerror handler that closes: EventSource reconnects on its own,
-    // and the server replays from Last-Event-ID, so a dropped connection resumes instead
-    // of killing the live view for the rest of the run. Closing here was why one network
-    // blip left the panel permanently blank.
+    // Deliberately no close on error: EventSource reconnects on its own and the server
+    // replays from Last-Event-ID, so a dropped connection resumes instead of leaving
+    // the panel blank for the rest of the run.
     source.onerror = () => {
       console.warn("분석 활동 스트림이 끊겨 재연결을 시도합니다.");
     };

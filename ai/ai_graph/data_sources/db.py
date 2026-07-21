@@ -270,6 +270,12 @@ class PostgresPipelineDataSource:
         except Exception:
             _logger.exception("LLM screening failed; falling back to profile screening")
             return None
+        finally:
+            # statement_timeout is set transaction-locally, and this path rolls back
+            # after a failed query - which discards it. Without this the rest of the
+            # load runs with no timeout at all, so one bad plan hangs the analysis
+            # instead of erroring out.
+            self._set_statement_timeout(conn)
         if not result or not result.get("rows"):
             return None
 
