@@ -108,83 +108,92 @@ class ScreenSQLRejected(RuntimeError):
 def build_schema_context(conn: Any) -> str:
     """Describe every screenable table from information_schema, with how full it is.
 
-    Row counts come along because emptiness is the thing a screen most needs to know:
-    several tables exist but were never loaded, and a query written against one of them
-    returns nothing for reasons that have nothing to do with the strategy.
+    Two set-based queries, no per-table probing. The earlier version looped over ~35
+    tables issuing a column query and a row-count probe for each; one failure inside
+    that loop aborted the transaction and every later statement failed with it, so a
+    single unreadable table took out the whole schema listing.
+
+    How full a table is comes from the planner's own statistics rather than count(*) -
+    the prompt only needs to tell "loaded" from "never loaded", and counting rows on the
+    seven-million-row indicator tables costs more than everything else here combined.
     """
 
     # %% because this SQL also carries a psycopg placeholder, which claims a bare %.
     excluded = " AND ".join(
-        f"table_name NOT LIKE '%%{pattern}%%'" for pattern in EXCLUDED_TABLE_PATTERNS
+        f"c.table_name NOT LIKE '%%{pattern}%%'" for pattern in EXCLUDED_TABLE_PATTERNS
     )
-    tables = conn.execute(
+    columns = conn.execute(
         f"""
-        SELECT table_schema, table_name
-        FROM information_schema.tables
-        WHERE table_schema = ANY(%s) AND {excluded}
-        ORDER BY table_schema, table_name
+        SELECT c.table_schema, c.table_name, c.column_name, c.data_type
+        FROM information_schema.columns c
+        WHERE c.table_schema = ANY(%s) AND {excluded}
+        ORDER BY c.table_schema, c.table_name, c.ordinal_position
         """,
         [list(SCREENABLE_SCHEMAS)],
     ).fetchall()
 
+    # Partitioned parents hold no rows of their own, so their own statistics read as
+    # empty however full the table is. Roll the partitions up into the parent, or every
+    # daily table - the ones that matter most - is advertised as unusable.
+    stats = conn.execute(
+        """
+        SELECT n.nspname AS table_schema,
+               c.relname AS table_name,
+               c.relkind,
+               (c.reltuples + COALESCE(parts.child_tuples, 0))::bigint AS estimate,
+               (c.relpages + COALESCE(parts.child_pages, 0))::bigint AS pages
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN LATERAL (
+            SELECT sum(child.reltuples) AS child_tuples,
+                   sum(child.relpages) AS child_pages
+            FROM pg_inherits i
+            JOIN pg_class child ON child.oid = i.inhrelid
+            WHERE i.inhparent = c.oid
+        ) parts ON TRUE
+        WHERE n.nspname = ANY(%s)
+        """,
+        [list(SCREENABLE_SCHEMAS)],
+    ).fetchall()
+    population_by_table = {
+        (row["table_schema"], row["table_name"]): _population_label(
+            int(row["estimate"] or 0), int(row["pages"] or 0), str(row["relkind"])
+        )
+        for row in stats
+    }
+
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for column in columns:
+        key = (column["table_schema"], column["table_name"])
+        grouped.setdefault(key, []).append(
+            f"{column['column_name']} {column['data_type']}"
+        )
+
     lines: list[str] = []
-    for table in tables:
-        schema_name = table["table_schema"]
-        table_name = table["table_name"]
-        columns = conn.execute(
-            """
-            SELECT column_name, data_type
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
-            ORDER BY ordinal_position
-            """,
-            [schema_name, table_name],
-        ).fetchall()
-        if not columns:
-            continue
-        population = _describe_population(conn, schema_name, table_name)
-        rendered = ", ".join(f"{col['column_name']} {col['data_type']}" for col in columns)
-        lines.append(f"{schema_name}.{table_name} [{population}]\n    ({rendered})")
+    for (schema_name, table_name), rendered in grouped.items():
+        population = population_by_table.get((schema_name, table_name), "unknown")
+        joined = ", ".join(rendered)
+        lines.append(f"{schema_name}.{table_name} [{population}]\n    ({joined})")
     return "\n".join(lines)
 
 
-def _describe_population(conn: Any, schema_name: str, table_name: str) -> str:
-    """How full a table is, cheaply.
+def _population_label(estimate: int, pages: int, relkind: str) -> str:
+    """Turn planner statistics into the one distinction the prompt needs.
 
-    The planner's estimate is enough - the prompt only needs to distinguish "loaded"
-    from "empty", and count(*) on the seven-million-row indicator tables costs more than
-    the whole rest of this function. Empty is confirmed with a bounded existence check,
-    because a table that was never analysed also estimates as zero.
+    A table with no rows and no pages was never written to. A zero estimate with pages
+    on disk only means it was never analysed, which is not the same thing - saying so
+    keeps the model from writing off data that is actually there.
     """
 
-    estimate = 0
-    # A savepoint keeps one unreadable table from aborting the transaction and taking
-    # every later lookup down with it.
-    conn.execute("SAVEPOINT table_probe")
-    try:
-        row = conn.execute(
-            """
-            SELECT COALESCE(c.reltuples, 0)::bigint AS estimate
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = %s AND c.relname = %s
-            """,
-            [schema_name, table_name],
-        ).fetchone()
-        estimate = int(row["estimate"]) if row else 0
-        if estimate <= 0:
-            present = conn.execute(
-                f"SELECT EXISTS (SELECT 1 FROM {schema_name}.{table_name} LIMIT 1) AS present"
-            ).fetchone()
-            if present and present["present"]:
-                return "loaded (size unknown)"
-            conn.execute("RELEASE SAVEPOINT table_probe")
-            return "EMPTY - do not use"
-        conn.execute("RELEASE SAVEPOINT table_probe")
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT table_probe")
-        return "unknown"
-    return f"~{estimate:,} rows"
+    if estimate > 0:
+        return f"~{estimate:,} rows"
+    if relkind == "v":
+        # Views carry no statistics of their own, and the whole mart layer is views over
+        # populated tables - reading that zero as empty writes off usable data.
+        return "view (size unknown - reflects its source tables)"
+    if pages == 0:
+        return "EMPTY - do not use"
+    return "loaded, size unknown (never analysed)"
 
 
 def guard_screen_sql(sql: str) -> str:
