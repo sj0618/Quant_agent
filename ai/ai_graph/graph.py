@@ -20,6 +20,7 @@ from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_s
 from ai_graph.data_sources import load_pipeline_data_from_env
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
+from ai_graph.progress import report_node_stage
 from ai_graph.llm.role_calls import (
     RoleDebatePayload,
     StrategyConditionsPayload,
@@ -208,10 +209,13 @@ def instrument_node(
     name: str,
     node: Callable[[QuantAgentState], QuantAgentState | dict[str, Any]],
 ) -> Callable[[QuantAgentState], QuantAgentState | dict[str, Any]]:
-    if session is None:
-        return node
-
     def wrapped(state: QuantAgentState) -> QuantAgentState | dict[str, Any]:
+        # Announce the stage before the node runs so a polling client sees the work
+        # it is actually waiting on, not the stage it already finished.
+        report_node_stage(name)
+        if session is None:
+            return node(state)
+
         execution_id = _start_agent_execution(session, name, state)
         started = perf_counter()
         try:
