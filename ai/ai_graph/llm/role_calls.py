@@ -44,6 +44,9 @@ REPORT_WRITEUP_PROMPT_VERSION = "v1"
 STRATEGY_REVISION_SCHEMA_NAME = "quantagent.strategy_revision.v1"
 STRATEGY_REVISION_PROMPT_TEMPLATE_NAME = "strategy_revision"
 STRATEGY_REVISION_PROMPT_VERSION = "v1"
+STRATEGY_REVIEW_SCHEMA_NAME = "quantagent.strategy_review.v1"
+STRATEGY_REVIEW_PROMPT_TEMPLATE_NAME = "strategy_review"
+STRATEGY_REVIEW_PROMPT_VERSION = "v1"
 
 
 class RoleDebatePayload(BaseModel):
@@ -450,6 +453,101 @@ def generate_relaxed_screening_thresholds(
     except (LLMClientError, ValidationError, ValueError, TypeError):
         return dict(fallback)
     return parsed.model_dump(exclude={"rationale"})
+
+
+STRATEGY_REVIEW_SYSTEM_PROMPT = """\
+You are QuantAgent's Research Judge.
+
+Review the strategy specification against what the screen actually returned, and act on
+what you find - you may rewrite the entry and exit conditions, not merely comment on
+them.
+
+Revise only where a concern justifies it. Conditions the user stated explicitly stay as
+they are unless they cannot be executed as written; their intent outranks your
+preference. If nothing needs changing, say so and leave the conditions untouched - an
+unnecessary edit is worse than none.
+
+Terminology has already been researched upstream and is given to you; do not re-derive
+it.
+
+Return JSON only:
+  summary           - your verdict in one paragraph
+  concerns          - what is weak or unverified, each as one sentence
+  changed           - whether you rewrote any condition
+  rationale         - what you changed and which concern it answers
+  entry_conditions  - the full entry condition list after your review
+  exit_conditions   - the full exit condition list after your review
+  indicators        - indicators the conditions rely on
+  confidence        - your confidence in the reviewed specification
+"""
+
+
+class _LiveStrategyReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    concerns: list[str]
+    changed: bool
+    rationale: str
+    entry_conditions: list[_LiveCondition]
+    exit_conditions: list[_LiveCondition]
+    indicators: list[str]
+    confidence: float
+
+
+def review_strategy_spec(
+    *,
+    query: str,
+    strategy: dict[str, Any],
+    screening: dict[str, Any],
+    research: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Judge the strategy once, with the authority to rewrite its conditions.
+
+    This replaced a three-way bull/bear/judge debate that cost three web-searching
+    calls and changed nothing: its verdict was appended to `assumptions` and the
+    conditions that got code-generated were identical either way. One reviewer that can
+    actually edit the specification is worth more than three that only comment.
+
+    No web search here - screening research already resolved the terminology, and this
+    call reasons about the strategy against the screen's own results.
+    """
+
+    if not is_live_llm_provider():
+        return None
+
+    expected_json_schema = _LiveStrategyReview.model_json_schema()
+    context = {"query": query, "strategy": strategy, "screening": screening}
+    if research:
+        context["terminology"] = research
+    request = LLMJsonRequest(
+        schema_name=STRATEGY_REVIEW_SCHEMA_NAME,
+        system_prompt=STRATEGY_REVIEW_SYSTEM_PROMPT,
+        user_prompt=_user_prompt(context, expected_json_schema),
+        temperature=0.0,
+        task_type="strategy_review",
+        prompt_template_name=STRATEGY_REVIEW_PROMPT_TEMPLATE_NAME,
+        prompt_version=STRATEGY_REVIEW_PROMPT_VERSION,
+        response_schema=expected_json_schema,
+        variables_jsonb={**context, "expected_json_schema": expected_json_schema},
+    )
+    try:
+        with activity_role("RESEARCH_JUDGE"):
+            report_activity("role_started", task="strategy review")
+            payload = create_llm_client(role="STRATEGY_REVIEW").generate_json(request)
+        parsed = _LiveStrategyReview.model_validate(payload)
+    except (LLMClientError, ValidationError, ValueError, TypeError):
+        return None
+    with activity_role("RESEARCH_JUDGE"):
+        report_activity(
+            "role_completed",
+            summary=parsed.summary,
+            evidence=[],
+            concerns=list(parsed.concerns),
+            recommendation="revised" if parsed.changed else "approved",
+            confidence=parsed.confidence,
+        )
+    return parsed.model_dump()
 
 
 SCREENING_RESEARCH_SYSTEM_PROMPT = """\

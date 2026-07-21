@@ -90,23 +90,29 @@ def report_node(state: dict) -> dict:
         state.get("backtest"),
         data=state.get("data"),
         debate=debate,
-        citations=_research_citations(state.get("research_debate")),
+        citations=_screening_citations(state),
     )
     return {"report": report.model_dump(), "report_debate": debate}
 
 
-def _research_citations(research_debate: dict[str, Any] | None) -> list[dict[str, str]]:
-    if not research_debate:
-        return []
+def _screening_citations(state: dict[str, Any]) -> list[dict[str, str]]:
+    """Sources behind the report.
+
+    These used to come from the research debate. That debate is gone, and the sources
+    that actually informed the run are the ones the screening stage consulted while
+    working out what the strategy's terms mean.
+    """
+
+    pipeline = (state.get("data") or {}).get("pipeline_data_source") or {}
+    research = (pipeline.get("screening_relaxation") or {}).get("research") or {}
     seen: set[str] = set()
     citations: list[dict[str, str]] = []
-    for role in ("judge", "bull", "bear"):
-        for citation in research_debate.get(role, {}).get("citations", []):
-            url = citation.get("url")
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            citations.append(citation)
+    for citation in research.get("citations") or []:
+        url = citation.get("url")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        citations.append(citation)
     return citations
 
 
@@ -132,7 +138,7 @@ def build_report_debate(
         # Opposing material from the debates that already ran, rather than new ones.
         "supporting_case": signal_debate.get("bull") or {},
         "objections": signal_debate.get("bear") or {},
-        "research_judgement": (state.get("research_debate") or {}).get("judge") or {},
+        "research_review": state.get("research_review") or {},
     }
     writeup = generate_report_writeup(
         context=context,

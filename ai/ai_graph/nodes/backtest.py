@@ -32,8 +32,13 @@ MIN_RETURNS_FOR_SPLIT = 4
 BACKTEST_SPLIT_FRACTION = 0.5
 PUBLIC_EQUITY_CURVE_POINTS = 12
 MIN_OBJECTIVE_TRADES = 5
-MIN_OBJECTIVE_SHARPE = 1.0
-MAX_OBJECTIVE_DRAWDOWN = -0.10
+# A long-only equity portfolio held through a decade of Korean market drawdowns does
+# not keep Sharpe above 1.0 or cap losses at 10% - those are hedge-fund thresholds, and
+# requiring them meant every run "missed the objective" and paid for two self-improvement
+# rounds no matter how well it did. A run returning 72% cumulative still scored negative.
+# These are floors for "worth showing", not for "excellent".
+MIN_OBJECTIVE_SHARPE = 0.3
+MAX_OBJECTIVE_DRAWDOWN = -0.35
 GENERATED_SIGNAL_METRIC = "generated_signal"
 BUY_SIGNAL_VALUE = 1.0
 SELL_SIGNAL_VALUE = -1.0
@@ -731,11 +736,16 @@ def _objective_score(
     if trade_count < MIN_OBJECTIVE_TRADES:
         score -= (MIN_OBJECTIVE_TRADES - trade_count) * 0.05
     if metrics.max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
-        score -= abs(metrics.max_drawdown - MAX_OBJECTIVE_DRAWDOWN) * 2
+        # Was 2x, which let a single deep drawdown swamp every other term and drove the
+        # score negative for otherwise strong candidates.
+        score -= abs(metrics.max_drawdown - MAX_OBJECTIVE_DRAWDOWN)
     if metrics.sharpe_ratio < MIN_OBJECTIVE_SHARPE:
         score -= (MIN_OBJECTIVE_SHARPE - metrics.sharpe_ratio) * 0.25
     if metrics.total_return <= benchmark_return:
-        score -= abs(benchmark_return - metrics.total_return) + 0.05
+        # Trailing the benchmark should cost something, but the raw return gap is on a
+        # different scale from the Sharpe term that leads this score - a 50-point gap
+        # used to dominate everything else. Cap what it can take away.
+        score -= min(abs(benchmark_return - metrics.total_return), 0.5) + 0.05
     return round(score, METRIC_ROUND_DIGITS)
 
 

@@ -30,7 +30,6 @@ from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
     generate_role_debate,
     generate_strategy_conditions,
-    revise_strategy_conditions,
 )
 from ai_graph.nodes.backtest import backtest_node
 from ai_graph.nodes.backtest_code import backtest_code_node
@@ -525,107 +524,24 @@ def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[st
 
 
 def research_node(state: QuantAgentState) -> dict[str, Any]:
+    """Turn the query into a StrategySpec.
+
+    There is no debate and no separate review here any more. The screening stage already
+    researches the strategy's terminology and reasons its conditions into SQL, judging
+    its own work when a query returns nothing and rewriting it; a second panel arguing
+    over the same specification produced commentary, not changes - its verdict was
+    appended to `assumptions` while the conditions that got backtested stayed identical.
+    """
+
     strategy_a = build_strategy_spec(
         state["user_query"],
         variant="A",
         semantic_slots=state.get("semantic_slots"),
     )
-    debate = build_research_debate(state, strategy_a)
-    original_strategy = strategy_a
-    strategy_a = strategy_a.model_copy(
-        update={
-            "assumptions": [
-                *strategy_a.assumptions,
-                "AOAI 웹 검색 근거와 Research Judge 검토로 조건을 명시화함",
-                debate["judge"]["summary"],
-            ],
-            "source_refs": _source_refs_from_debate(debate),
-            "confidence": min(strategy_a.confidence + 0.03, 0.95),
-        }
-    )
-    strategy_a, revision = _apply_research_revision(
-        state["user_query"], strategy_a, debate.get("judge") or {}
-    )
-    output: dict[str, Any] = {
-        "original_strategy_spec": original_strategy.model_dump(),
+    return {
+        "original_strategy_spec": strategy_a.model_dump(),
         "strategy_spec": strategy_a.model_dump(),
-        "research_debate": debate,
     }
-    if revision:
-        output["strategy_revision"] = revision
-    return output
-
-
-def _apply_research_revision(
-    query: str, strategy: StrategySpec, judge: Mapping[str, Any]
-) -> tuple[StrategySpec, dict[str, Any] | None]:
-    """Let the Research Judge's verdict change the conditions, not just annotate them.
-
-    The verdict previously only appended a sentence to `assumptions`, so the conditions
-    that get code-generated and backtested were identical whether the judge approved or
-    objected. A revision that fails validation is discarded rather than partially
-    applied - a half-rewritten specification is worse than the original.
-    """
-
-    if not judge.get("concerns"):
-        return strategy, None
-
-    revision = revise_strategy_conditions(
-        query=query,
-        strategy=strategy.model_dump(),
-        judge=dict(judge),
-        fallback=StrategyConditionsPayload(
-            entry_conditions=list(strategy.entry_conditions),
-            exit_conditions=list(strategy.exit_conditions),
-            indicators=list(strategy.indicators),
-            confidence=strategy.confidence,
-        ),
-    )
-    if not revision:
-        return strategy, None
-
-    try:
-        revised = strategy.model_copy(
-            update={
-                "entry_conditions": [
-                    Condition.model_validate(item) for item in revision["entry_conditions"]
-                ],
-                "exit_conditions": [
-                    Condition.model_validate(item) for item in revision["exit_conditions"]
-                ],
-                "indicators": list(revision.get("indicators") or strategy.indicators),
-                "assumptions": [
-                    *strategy.assumptions,
-                    f"Research Judge 조건 수정: {revision['rationale']}",
-                ],
-                "confidence": float(revision.get("confidence", strategy.confidence)),
-            }
-        )
-    except ValidationError:
-        _logger.warning("research judge revision failed validation; keeping original spec")
-        return strategy, None
-
-    return revised, {
-        "rationale": revision["rationale"],
-        "before": {
-            "entry_conditions": [item.model_dump() for item in strategy.entry_conditions],
-            "exit_conditions": [item.model_dump() for item in strategy.exit_conditions],
-        },
-        "after": {
-            "entry_conditions": [item.model_dump() for item in revised.entry_conditions],
-            "exit_conditions": [item.model_dump() for item in revised.exit_conditions],
-        },
-    }
-
-
-def _source_refs_from_debate(debate: Mapping[str, Any]) -> list[str]:
-    urls: list[str] = []
-    for role in ("bull", "bear", "judge"):
-        for citation in debate.get(role, {}).get("citations", []):
-            url = citation.get("url")
-            if url and url not in urls:
-                urls.append(url)
-    return urls
 
 
 def envelope_node(state: QuantAgentState) -> dict[str, Any]:
@@ -1578,72 +1494,6 @@ def build_strategy_spec(
     )
 
 
-def build_research_debate(state: Mapping[str, Any], strategy: StrategySpec) -> dict[str, Any]:
-    context = {
-        "query": state.get("user_query"),
-        "strategy": strategy.model_dump(),
-        "data_availability": state.get("data", {}).get("data_availability", {}),
-        "screening_candidate_count": len(state.get("data", {}).get("screening_candidates", [])),
-    }
-    # What earlier runs of this same strategy ran into, so the debate can weigh it
-    # instead of rediscovering it.
-    recalled = summarize_recall(AnalysisMemory.from_env().recall(strategy.strategy_id))
-    if recalled:
-        context["previous_runs"] = recalled
-    bull = generate_role_debate(
-        role="RESEARCH_BULL",
-        task="Collect only supportive evidence for the strategy specification.",
-        context=context,
-        fallback=RoleDebatePayload(
-            role="RESEARCH_BULL",
-            summary="가격/거래량/TA 조건은 공용 DB로 즉시 검증 가능하며 전략 후보의 실행 가능성이 높습니다.",
-            evidence=["OHLCV/TA data source is available when AI_DATABASE_DSN is configured."],
-            concerns=[],
-            recommendation="proceed",
-            confidence=0.72,
-        ),
-        enable_web_search=True,
-    )
-    bear = generate_role_debate(
-        role="RESEARCH_BEAR",
-        task="Collect only limitations and missing-data risks for the strategy specification.",
-        context=context,
-        fallback=RoleDebatePayload(
-            role="RESEARCH_BEAR",
-            summary="재무·컨센서스·공시·실시간 뉴스 조건은 현재 DB 상태에 따라 proxy 또는 availability 표시가 필요합니다.",
-            evidence=[],
-            concerns=["OpenDART feature mart is empty.", "BOK macro mart is pilot-only."],
-            recommendation="proceed_with_proxy_disclosure",
-            confidence=0.7,
-        ),
-        enable_web_search=True,
-    )
-    judge = generate_role_debate(
-        role="RESEARCH_JUDGE",
-        task="Judge source sufficiency and produce the final StrategySpec decision.",
-        context={**context, "bull": bull.model_dump(), "bear": bear.model_dump()},
-        fallback=RoleDebatePayload(
-            role="RESEARCH_JUDGE",
-            summary="기술 조건은 ready로 진행하고, 미적재 데이터 조건은 proxy와 data_availability에 명시합니다.",
-            evidence=["Role-separated research completed with deterministic fallback when AOAI is unavailable."],
-            concerns=bear.concerns,
-            recommendation="ready",
-            confidence=0.74,
-            validation_results={
-                "source_sufficiency": "partial",
-                "source_diversity": "local_db_only",
-                "proxy_disclosure": "required",
-            },
-        ),
-        enable_web_search=True,
-    )
-    return {
-        "bull": bull.model_dump(),
-        "bear": bear.model_dump(),
-        "judge": judge.model_dump(),
-    }
-
-
 def _strategy_profile(query: str, *, semantic_slots: Mapping[str, Any] | None = None) -> dict[str, Any]:
     profile = _strategy_profile_base(query, semantic_slots=semantic_slots)
     sector = semantic_slots.get("sector") if semantic_slots else None
@@ -2213,7 +2063,7 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
             "data",
             "strategy_spec",
             "original_strategy_spec",
-            "research_debate",
+            "research_review",
             "backtest_code",
             "backtest",
             "signal",
