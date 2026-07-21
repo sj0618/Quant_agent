@@ -55,21 +55,38 @@ function VoiceSection({ activity }: { activity: VoiceActivity }) {
 }
 
 export function DebateActivityPanel({ activity }: { activity: ActivityState }) {
-  const hasActivity = DEBATE_VOICES.some(
-    (voice) => activity.voices[voice].status !== "idle",
-  );
-  if (!hasActivity) {
+  const hasDebate = DEBATE_VOICES.some((voice) => activity.voices[voice].status !== "idle");
+  const hasSteps = activity.steps.length > 0;
+  if (!hasDebate && !hasSteps) {
     return null;
   }
 
   return (
     <section className="debate-activity">
-      <p className="debate-activity__caption">정·반·합 토론 진행 상황</p>
-      <ul className="debate-activity__voices">
-        {DEBATE_VOICES.map((voice) => (
-          <VoiceSection activity={activity.voices[voice]} key={voice} />
-        ))}
-      </ul>
+      {hasSteps ? (
+        <ol className="debate-activity__steps">
+          {activity.steps.map((step, index) => (
+            <li
+              className={index === activity.steps.length - 1 ? "is-latest" : undefined}
+              key={`${step.label}-${index}`}
+            >
+              <strong>{step.label}</strong>
+              {step.detail ? <span>{step.detail}</span> : null}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+
+      {hasDebate ? (
+        <>
+          <p className="debate-activity__caption">정·반·합 토론 진행 상황</p>
+          <ul className="debate-activity__voices">
+            {DEBATE_VOICES.map((voice) => (
+              <VoiceSection activity={activity.voices[voice]} key={voice} />
+            ))}
+          </ul>
+        </>
+      ) : null}
     </section>
   );
 }

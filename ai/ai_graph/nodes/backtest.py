@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ai_graph.schemas import BacktestEquityPoint, BacktestMetrics, CandidateBacktestResult, CodeCandidate
 from ai_graph.schemas import StrategySpec as AIStrategySpec
 from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
+from ai_graph.progress import report_activity
 from ai_graph.nodes.position_sizing import (
     applied_max_positions as _shared_applied_max_positions,
     available_ticker_count as _shared_available_ticker_count,
@@ -270,8 +271,15 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         for candidate in state["backtest_code"]["candidates"]
     ]
     price_rows = state["price_rows"] if "price_rows" in state else state.get("market_prices")
-    max_positions = _applied_max_positions(
-        strategy_a, _available_ticker_count(_price_rows(price_rows))
+    ticker_count = _available_ticker_count(_price_rows(price_rows))
+    max_positions = _applied_max_positions(strategy_a, ticker_count)
+
+    # Backtesting is pure computation with no provider stream behind it, so without
+    # these the live view has nothing to show for the minutes this node runs.
+    report_activity(
+        "step",
+        label=f"백테스트 실행 · 후보 {len(candidates)}개",
+        detail=f"종목 {ticker_count}개 · 최대 보유 {max_positions}종목",
     )
     result = run_candidate_backtest(
         strategy_a,
@@ -279,6 +287,11 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         price_rows=price_rows,
         feature_coverage=state.get("backtest_code", {}).get("feature_mapping", {}),
         fallback_reasons=state.get("backtest_code", {}).get("fallback_reasons", []),
+    )
+    report_activity(
+        "step",
+        label="백테스트 1차 완료",
+        detail=_selected_candidate_detail(result),
     )
     all_candidates = candidates
     fallback_reasons = list(state.get("backtest_code", {}).get("fallback_reasons", []))
@@ -296,6 +309,11 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         fallback_reasons.append(
             f"self-improvement iteration {iteration}: generated {len(improved)} threshold-adjusted candidates"
         )
+        report_activity(
+            "step",
+            label=f"목표 미달 · 자가개선 {iteration}차",
+            detail=f"임계값 조정 후보 {len(improved)}개 추가 (누적 {len(all_candidates)}개) 재실행",
+        )
         next_result = run_candidate_backtest(
             strategy_a,
             all_candidates,
@@ -305,7 +323,22 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         )
         if _selected_objective_score(next_result) >= _selected_objective_score(result):
             result = next_result
+        report_activity(
+            "step",
+            label=f"자가개선 {iteration}차 완료",
+            detail=_selected_candidate_detail(result),
+        )
     return {"backtest": result.model_dump()}
+
+
+def _selected_candidate_detail(result: CandidateBacktestResult) -> str:
+    parts = [f"선택 후보 {result.selected_candidate.candidate_id}"]
+    score = _selected_objective_score(result)
+    if math.isfinite(score):
+        parts.append(f"목표점수 {score:.3f}")
+    if result.equity_curve:
+        parts.append(f"누적수익 {result.equity_curve[-1].cumulative_return:.2%}")
+    return " · ".join(parts)
 def _run_candidate_backtest(
     strategy: AIStrategySpec,
     candidate: CodeCandidate,

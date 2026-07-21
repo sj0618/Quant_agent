@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
@@ -15,7 +16,16 @@ RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504})
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.25
+# Used when a 429 arrives without a Retry-After header, and as the cap when it has one.
+DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 5.0
+MAX_RETRY_AFTER_SECONDS = 60.0
 DEFAULT_WEB_SEARCH_TOOL_TYPE = "web_search_preview"
+# Stream events that carry the finished response object.
+TERMINAL_STREAM_EVENTS = frozenset(
+    {"response.completed", "response.incomplete", "response.failed"}
+)
+
+_logger = logging.getLogger(__name__)
 
 
 class AOAIResponsesClient:
@@ -39,6 +49,9 @@ class AOAIResponsesClient:
         self.retry_backoff_seconds = retry_backoff_seconds
         self.web_search_tool_type = web_search_tool_type
         self._http_client = http_client
+        # Some deployments reject `temperature` outright. The first 400 tells us, and
+        # remembering it stops every later call from burning a round-trip to relearn it.
+        self._temperature_supported = True
 
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
         call_id = begin_model_call(
@@ -149,21 +162,28 @@ class AOAIResponsesClient:
                         if response.status_code >= 400:
                             response.read()
                             if _unsupported_parameter(response, "temperature"):
+                                self._temperature_supported = False
                                 body.pop("temperature", None)
                                 continue
                             if (
                                 response.status_code in RETRYABLE_STATUS_CODES
                                 and attempt < attempts - 1
                             ):
-                                _sleep_before_retry(self.retry_backoff_seconds, attempt)
+                                _sleep_before_retry(self.retry_backoff_seconds, attempt, response)
                                 continue
                             response.raise_for_status()
-                        payload = self._consume_stream(response)
-                        if payload is None:
-                            raise LLMResponseParseError(
-                                "AOAI stream ended without a response.completed event"
-                            )
-                        return payload, attempt
+                        payload, terminal = self._consume_stream(response)
+                        if terminal == "response.completed" and payload is not None:
+                            return payload, attempt
+                        # Either the stream stopped early (transport hiccup) or the run
+                        # ended incomplete/failed. Neither yields a parseable answer, so
+                        # retry instead of handing the caller a response with no message.
+                        last_error = LLMResponseParseError(
+                            _stream_failure_reason(terminal, payload)
+                        )
+                        if attempt < attempts - 1:
+                            _sleep_before_retry(self.retry_backoff_seconds, attempt)
+                            continue
                 finally:
                     if owns_client:
                         client.close()
@@ -171,14 +191,39 @@ class AOAIResponsesClient:
                 last_error = exc
                 if not _should_retry(exc) or attempt >= attempts - 1:
                     break
-                _sleep_before_retry(self.retry_backoff_seconds, attempt)
+                _sleep_before_retry(
+                    self.retry_backoff_seconds,
+                    attempt,
+                    exc.response if isinstance(exc, httpx.HTTPStatusError) else None,
+                )
 
-        raise LLMClientError(
-            "AOAI Responses stream failed", retry_count=last_attempt
-        ) from last_error
+        # Streaming only exists to feed the live view; losing it must not cost the whole
+        # analysis, so fall back to the plain request the client used before streaming.
+        _logger.warning(
+            "AOAI streaming failed after %d attempt(s); falling back to a non-streamed "
+            "request, so this call produces no live activity. last_error=%s",
+            attempts,
+            last_error,
+        )
+        response, retry_count = self._post_with_retries(request)
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise LLMResponseParseError("AOAI response body is not valid JSON") from exc
+        return payload, last_attempt + retry_count + 1
 
-    def _consume_stream(self, response: httpx.Response) -> dict[str, Any] | None:
+    def _consume_stream(
+        self, response: httpx.Response
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Drain the stream, returning its final response object and terminal event type.
+
+        The terminal type is reported separately because only `response.completed`
+        carries a usable answer: an incomplete or failed run still repeats the response
+        object, but without the message the caller is trying to parse.
+        """
+
         final_payload: dict[str, Any] | None = None
+        terminal_type: str | None = None
         for line in response.iter_lines():
             if not line.startswith("data:"):
                 continue
@@ -192,13 +237,14 @@ class AOAIResponsesClient:
             if not isinstance(event, dict):
                 continue
             event_type = event.get("type")
-            if event_type == "response.completed":
+            if event_type in TERMINAL_STREAM_EVENTS:
+                terminal_type = str(event_type)
                 completed = event.get("response")
                 if isinstance(completed, dict):
                     final_payload = completed
             else:
                 _publish_stream_activity(event_type, event)
-        return final_payload
+        return final_payload, terminal_type
 
     def _request_body(self, request: LLMJsonRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -207,8 +253,9 @@ class AOAIResponsesClient:
                 {"role": "system", "content": request.system_prompt},
                 {"role": "user", "content": request.user_prompt},
             ],
-            "temperature": request.temperature,
         }
+        if self._temperature_supported:
+            body["temperature"] = request.temperature
         if request.enable_web_search:
             body["tools"] = [{"type": self.web_search_tool_type}]
         if request.response_schema is not None:
@@ -237,15 +284,17 @@ class AOAIResponsesClient:
                     with client:
                         response = client.post(self.responses_url, headers=headers, json=body)
                         if _unsupported_parameter(response, "temperature"):
+                            self._temperature_supported = False
                             body.pop("temperature", None)
                             response = client.post(self.responses_url, headers=headers, json=body)
                 else:
                     response = client.post(self.responses_url, headers=headers, json=body)
                     if _unsupported_parameter(response, "temperature"):
+                        self._temperature_supported = False
                         body.pop("temperature", None)
                         response = client.post(self.responses_url, headers=headers, json=body)
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts - 1:
-                    _sleep_before_retry(self.retry_backoff_seconds, attempt)
+                    _sleep_before_retry(self.retry_backoff_seconds, attempt, response)
                     continue
                 response.raise_for_status()
                 return response, attempt
@@ -253,11 +302,24 @@ class AOAIResponsesClient:
                 last_error = exc
                 if not _should_retry(exc) or attempt >= attempts - 1:
                     break
-                _sleep_before_retry(self.retry_backoff_seconds, attempt)
+                _sleep_before_retry(
+                    self.retry_backoff_seconds,
+                    attempt,
+                    exc.response if isinstance(exc, httpx.HTTPStatusError) else None,
+                )
 
         raise LLMClientError(
             "AOAI Responses request failed", retry_count=last_attempt
         ) from last_error
+
+
+def _stream_failure_reason(terminal: str | None, payload: dict[str, Any] | None) -> str:
+    if terminal is None:
+        return "AOAI stream ended without a terminal response event"
+    detail: Any = None
+    if isinstance(payload, dict):
+        detail = payload.get("incomplete_details") or payload.get("error")
+    return f"AOAI stream ended as {terminal}" + (f": {detail}" if detail else "")
 
 
 def _publish_stream_activity(event_type: Any, event: dict[str, Any]) -> None:
@@ -469,7 +531,33 @@ def _should_retry(exc: Exception) -> bool:
     return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
 
 
-def _sleep_before_retry(backoff_seconds: float, attempt: int) -> None:
-    if backoff_seconds <= 0:
+def _sleep_before_retry(
+    backoff_seconds: float, attempt: int, response: httpx.Response | None = None
+) -> None:
+    """Back off before retrying, preferring the provider's own Retry-After.
+
+    A rate-limited deployment needs seconds, not the sub-second linear backoff that
+    suits a transient 5xx - retrying too early just burns the remaining attempts and
+    fails the whole analysis.
+    """
+
+    delay = backoff_seconds * (attempt + 1)
+    retry_after = _retry_after_seconds(response)
+    if retry_after is not None:
+        delay = max(delay, min(retry_after, MAX_RETRY_AFTER_SECONDS))
+    if delay <= 0:
         return
-    time.sleep(backoff_seconds * (attempt + 1))
+    time.sleep(delay)
+
+
+def _retry_after_seconds(response: httpx.Response | None) -> float | None:
+    if response is None or response.status_code != 429:
+        return None
+    raw = response.headers.get("retry-after")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    # No usable header: still wait meaningfully rather than hammering the quota.
+    return DEFAULT_RATE_LIMIT_BACKOFF_SECONDS

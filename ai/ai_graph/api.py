@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from os import environ
 from typing import Callable, ClassVar, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -61,6 +61,8 @@ ANALYSIS_JOB_DETAIL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}"
 ANALYSIS_JOB_EVENTS_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}/events"
 # How long an idle SSE reader waits before checking for new provider activity.
 ANALYSIS_EVENT_POLL_SECONDS = 0.25
+# Idle gap after which a comment line is sent so intermediaries keep the stream open.
+ANALYSIS_EVENT_KEEPALIVE_SECONDS = 15.0
 SPEC_STRATEGY_PARSE_PATH = "/api/strategies/parse"
 STRATEGY_DESCRIPTIONS_PATH = "/api/strategies/descriptions"
 SPEC_ANALYSIS_JOB_DETAIL_PATH = "/api/analysis-jobs/{job_id}"
@@ -428,11 +430,17 @@ def create_app(
     async def stream_analysis_job_events(
         job_id: str,
         user_id: str = Depends(require_user),
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
     ) -> StreamingResponse:
         """Stream the running analysis's provider activity as Server-Sent Events.
 
         Ownership is checked once up front: the job must exist and belong to the
         caller before any events are handed out.
+
+        Every event carries its cursor as the SSE id, so a browser that reconnects
+        sends Last-Event-ID and resumes where it left off. Without that a reconnect
+        would replay the whole run - megabytes into a long analysis - which is enough
+        traffic to trigger the next drop.
         """
 
         if _owned_job(store, job_id, user_id) is None:
@@ -441,17 +449,33 @@ def create_app(
                 detail="analysis job not found",
             )
 
-        async def event_source() -> AsyncIterator[str]:
+        try:
+            cursor = max(int(last_event_id), 0) if last_event_id else 0
+        except ValueError:
             cursor = 0
+
+        async def event_source() -> AsyncIterator[str]:
+            nonlocal cursor
+            idle_polls = 0
             while True:
                 events, cursor, closed = app.state.job_events.read_since(job_id, cursor)
-                for event in events:
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                first_id = cursor - len(events) + 1
+                for offset, event in enumerate(events):
+                    payload = json.dumps(event, ensure_ascii=False)
+                    yield f"id: {first_id + offset}\ndata: {payload}\n\n"
                 if closed and not events:
                     yield "event: done\ndata: {}\n\n"
                     return
                 if not events:
+                    idle_polls += 1
+                    # A quiet stream looks dead to intermediaries; a comment line keeps
+                    # the connection warm without reaching the EventSource consumer.
+                    if idle_polls * ANALYSIS_EVENT_POLL_SECONDS >= ANALYSIS_EVENT_KEEPALIVE_SECONDS:
+                        idle_polls = 0
+                        yield ": keepalive\n\n"
                     await asyncio.sleep(ANALYSIS_EVENT_POLL_SECONDS)
+                else:
+                    idle_polls = 0
 
         return StreamingResponse(
             event_source(),

@@ -201,6 +201,13 @@ p, h1, h2, h3, h4 { margin: 0; }
 
 /* 정·반·합 live debate trace, shown under the progress bar while an analysis runs. */
 .debate-activity { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+/* Computation milestones (backtest, self-improvement) - the small running trace. */
+.debate-activity__steps { list-style: none; margin: 0 0 16px; padding: 0; display: grid; gap: 4px; }
+.debate-activity__steps li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; color: var(--subdued); font-size: 11px; line-height: 1.45; }
+.debate-activity__steps li strong { color: var(--muted); font-size: 11px; font-weight: 700; }
+.debate-activity__steps li span { overflow-wrap: anywhere; }
+.debate-activity__steps li.is-latest strong { color: var(--ink); }
+.debate-activity__steps li.is-latest { color: var(--muted); }
 .debate-activity__caption { margin: 0 0 12px; color: var(--subdued); font-size: 11px; font-weight: 800; letter-spacing: 0.04em; }
 .debate-activity__voices { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .debate-activity__voice { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--soft); }

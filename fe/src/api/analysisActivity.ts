@@ -9,6 +9,8 @@ export type DebateVoice = "BULL" | "BEAR" | "JUDGE";
 
 export const DEBATE_VOICES: DebateVoice[] = ["BULL", "BEAR", "JUDGE"];
 
+const MAX_STEPS = 6;
+
 export const DEBATE_VOICE_LABELS: Record<DebateVoice, string> = {
   BULL: "정 · 지지 근거",
   BEAR: "반 · 반론과 위험",
@@ -33,15 +35,24 @@ export interface VoiceActivity {
   searching: boolean;
 }
 
+export interface ProgressStep {
+  label: string;
+  detail: string | null;
+}
+
 export interface ActivityState {
   stage: string | null;
   voices: Record<DebateVoice, VoiceActivity>;
+  /** Computation milestones (backtest and friends) that have no provider stream. */
+  steps: ProgressStep[];
 }
 
 interface ActivityEvent {
   kind: string;
   role?: string | null;
   stage?: string;
+  label?: string;
+  detail?: string;
   text?: string;
   queries?: string[];
   title?: string;
@@ -74,6 +85,7 @@ export function emptyActivityState(): ActivityState {
       BEAR: emptyVoice("BEAR"),
       JUDGE: emptyVoice("JUDGE"),
     },
+    steps: [],
   };
 }
 
@@ -92,6 +104,15 @@ function splitRole(role: string | null | undefined) {
 function reduce(state: ActivityState, event: ActivityEvent): ActivityState {
   if (event.kind === "stage") {
     return { ...state, stage: event.stage ?? state.stage };
+  }
+
+  if (event.kind === "step") {
+    if (!event.label) {
+      return state;
+    }
+    // Only the tail is kept: this is a running trace, not a full audit log.
+    const steps = [...state.steps, { label: event.label, detail: event.detail ?? null }];
+    return { ...state, steps: steps.slice(-MAX_STEPS) };
   }
 
   const parsed = splitRole(event.role);
@@ -186,9 +207,13 @@ export function useAnalysisActivity(jobId: string | null | undefined): ActivityS
       }
     };
     source.addEventListener("done", () => source.close());
-    // The stream also ends when the job finishes; an error here just means no more
-    // live updates, and the polled job still carries the final result.
-    source.onerror = () => source.close();
+    // Deliberately no onerror handler that closes: EventSource reconnects on its own,
+    // and the server replays from Last-Event-ID, so a dropped connection resumes instead
+    // of killing the live view for the rest of the run. Closing here was why one network
+    // blip left the panel permanently blank.
+    source.onerror = () => {
+      console.warn("분석 활동 스트림이 끊겨 재연결을 시도합니다.");
+    };
 
     return () => source.close();
   }, [jobId]);
