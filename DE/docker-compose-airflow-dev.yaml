@@ -68,10 +68,10 @@ x-airflow-common:
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
     # yamllint enable rule:line-length
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
-    QUANT_DB_DSN: postgresql://${QUANT_DB_USER}:${QUANT_DB_PASSWORD}@postgres/${QUANT_DB_NAME}
-    DATABASE_URL: postgresql://${QUANT_DB_USER}:${QUANT_DB_PASSWORD}@postgres/${QUANT_DB_NAME}
-    QUANT_DB_HOST: ${QUANT_DB_HOST}
-    QUANT_DB_PORT: '5432'
+    QUANT_DB_DSN: postgresql://${QUANT_DB_USER}:${QUANT_DB_PASSWORD}@${QUANT_DB_HOST:-postgres}:${QUANT_DB_PORT:-5432}/${QUANT_DB_NAME}
+    DATABASE_URL: postgresql://${QUANT_DB_USER}:${QUANT_DB_PASSWORD}@${QUANT_DB_HOST:-postgres}:${QUANT_DB_PORT:-5432}/${QUANT_DB_NAME}
+    QUANT_DB_HOST: ${QUANT_DB_HOST:-postgres}
+    QUANT_DB_PORT: ${QUANT_DB_PORT:-5432}
     QUANT_DB_EXECUTION_MODE: psycopg
     QUANT_AIRFLOW_LOAD_DOTENV: 'false'
     QUANT_TA_MAX_WORKERS: '2'
