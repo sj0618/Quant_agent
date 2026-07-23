@@ -20,7 +20,7 @@ from ai_graph.nodes.position_sizing import (
     max_position_pct_from_risk_constraints,
 )
 from ai_graph.schemas import CodeCandidate, StrategySpec
-from ai_graph.nodes.condition_compiler import compile_entry_expression
+from ai_graph.nodes.condition_compiler import CompiledConditions, compile_conditions
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
@@ -30,9 +30,14 @@ CONSERVATIVE_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[1]
 SMOOTHED_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[2]
 
 
-MIN_GENERATED_CANDIDATES = 6
-MAX_GENERATED_CANDIDATES = 12
-MAX_SELF_IMPROVEMENT_CANDIDATES = 36
+# Kept small on purpose. Twelve threshold variants over 200 names × 10 years was slow
+# (interpreted Python per candidate) and, worse, invited overfitting - picking the best
+# of many variants fitted to the same history is a multiple-comparisons trap. The
+# compiled condition candidate is the strategy's actual rule; a couple of profile
+# variants around it are enough to check robustness.
+MIN_GENERATED_CANDIDATES = 1
+MAX_GENERATED_CANDIDATES = 3
+MAX_SELF_IMPROVEMENT_CANDIDATES = 6
 MAX_VALIDATION_FEEDBACK_ITEMS = 20
 MAX_VALIDATION_FEEDBACK_CHARS = 4_000
 TRUNCATED_VALIDATION_FEEDBACK = "Additional validation failures omitted."
@@ -450,18 +455,22 @@ def _deterministic_fallback_candidates(
 
 
 def _render_condition_signal_code(
-    strategy: StrategySpec, entry_expr: str, max_positions: int
+    strategy: StrategySpec, compiled: "CompiledConditions", max_positions: int
 ) -> str:
     """build_signals whose entry test is the strategy's own compiled conditions.
 
     Unlike the profile templates, which pick a generic momentum/breakout shape, this
-    trades exactly the rule the screen used - the same structured conditions, compiled
-    to a boolean over each stock's rolling history. Exits fall back to stop/target on the
-    entry price so a position is not held forever; entry is the strategy itself.
+    trades exactly the rule the screen used - the per-stock conditions compiled to a
+    boolean over each stock's history/financials, plus any cross-sectional cut applied
+    against the day's universe. Exits fall back to stop/target on the entry price so a
+    position is not held forever; entry is the strategy itself.
     """
 
     stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", 0.08))
     take_profit = float(strategy.risk_constraints.get("take_profit_pct", 0.2))
+    entry_expr = compiled.per_stock
+    # (metric, pct, top) triples, evaluated against the day's universe below.
+    rank_filters = list(compiled.rank_filters)
     return f'''def build_signals(prices):
     def _avg(xs):
         return sum(xs) / len(xs) if xs else 0.0
@@ -470,6 +479,9 @@ def _render_condition_signal_code(
         # None (not yet filed) becomes a sentinel that fails every numeric comparison,
         # so a name with no filing on this date simply does not match the condition.
         return value if isinstance(value, (int, float)) else float("-inf")
+    def _num(value):
+        return value if isinstance(value, (int, float)) else None
+    rank_filters = {rank_filters!r}
     signals = []
     rows_by_date = {{}}
     for row in sorted(prices, key=lambda item: (item["date"], item.get("ticker", "000000"))):
@@ -482,6 +494,7 @@ def _render_condition_signal_code(
     strategy_id = {strategy.strategy_id!r}
     for current_date in sorted(rows_by_date):
         entries = []
+        universe_metrics = {{}}
         for row in rows_by_date[current_date]:
             ticker = row.get("ticker", "000000")
             open_price = float(row.get("open", row.get("close", 0)))
@@ -518,11 +531,29 @@ def _render_condition_signal_code(
                     state["entry_price"] = 0.0
             elif entry_ok:
                 entries.append((ticker, close))
+            # The percentile cut ranks the whole day's universe, not just today's
+            # candidates - otherwise buying the leaders shrinks the pool and lets the
+            # next names drift into the "top". Collect every stock's metric here.
+            for metric, _pct, _top in rank_filters:
+                value = _num(row.get(metric))
+                if value is not None:
+                    universe_metrics.setdefault(metric, []).append((ticker, value))
             opens.append(open_price)
             highs.append(high_price)
             lows.append(low_price)
             closes.append(close)
             volumes.append(volume)
+        # Cross-sectional cuts against the full universe: keep only candidates inside the
+        # requested top/bottom percentile of that day's ranking on each metric.
+        for metric, pct, top in rank_filters:
+            scored = universe_metrics.get(metric, [])
+            if not scored:
+                entries = []
+                break
+            scored.sort(key=lambda item: item[1], reverse=top)
+            cutoff = max(1, int(len(scored) * pct))
+            kept = {{t for t, _v in scored[:cutoff]}}
+            entries = [e for e in entries if e[0] in kept]
         held = sum(1 for s in states.values() if s["in_position"])
         for ticker, price in entries:
             if held >= max_positions:
@@ -541,12 +572,12 @@ def _generated_strategy_candidates(
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[str]:
     codes: list[str] = []
-    # If the strategy's conditions compile to a price-series rule, trade exactly that
-    # first - it is the screen's own rule, not a generic profile. Non-price conditions
-    # (financial, cross-sectional) do not compile and fall through to the profiles.
-    entry_expr = compile_entry_expression(strategy.entry_conditions)
-    if entry_expr is not None:
-        codes.append(_render_condition_signal_code(strategy, entry_expr, max_positions))
+    # If the strategy's conditions compile - a per-stock rule and/or cross-sectional
+    # cuts - trade exactly that first: it is the screen's own rule, not a generic
+    # profile. Conditions that do not compile fall through to the profiles.
+    compiled = compile_conditions(strategy.entry_conditions)
+    if compiled is not None:
+        codes.append(_render_condition_signal_code(strategy, compiled, max_positions))
     profiles = _candidate_profiles(plan)
     lookbacks = [*plan.lookbacks, 75, 100, 125, 150, 200, 252]
     thresholds = [*plan.thresholds, 0.12, 0.18, 0.25, 0.35, 0.5, 0.75]

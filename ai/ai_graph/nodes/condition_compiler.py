@@ -68,28 +68,83 @@ _AGGREGATE: dict[str, str] = {
 }
 
 
-def compile_entry_expression(conditions: Sequence[Condition]) -> str | None:
-    """AND the conditions into one boolean expression, or None if any cannot compile.
+class CompiledConditions:
+    """A strategy's entry rule split into the two kinds build_signals evaluates.
 
-    All-or-nothing on purpose: a partially compiled rule would trade on a subset of the
-    strategy and look validated while testing something else.
+    per_stock: a boolean expression judged on one stock's own bars/financials.
+    rank_filters: cross-sectional cuts (top-percentile on a metric) that can only be
+        judged against the whole day's universe, applied by build_signals separately.
+    """
+
+    def __init__(self, per_stock: str, rank_filters: list[tuple[str, float, bool]]):
+        self.per_stock = per_stock
+        self.rank_filters = rank_filters
+
+
+def compile_conditions(conditions: Sequence[Condition]) -> CompiledConditions | None:
+    """Split conditions into a per-stock expression and cross-sectional rank cuts.
+
+    All-or-nothing: if any condition compiles to neither, return None so the caller keeps
+    its template profiles rather than trading a subset of the rule that looks validated
+    while testing something else.
     """
 
     if not conditions:
         return None
     parts: list[str] = []
+    rank_filters: list[tuple[str, float, bool]] = []
     for condition in conditions:
+        rank = _rank_filter(condition)
+        if rank is not None:
+            rank_filters.append(rank)
+            continue
         expr = _compile_one(condition)
         if expr is None:
             return None
         parts.append(expr)
-    return " and ".join(parts)
+    # A rule made only of rank cuts still needs a per-stock expression; "True" lets the
+    # ranking do the selecting.
+    per_stock = " and ".join(parts) if parts else "True"
+    return CompiledConditions(per_stock, rank_filters)
+
+
+def _rank_filter(condition: Condition) -> tuple[str, float, bool] | None:
+    """A cross-sectional top/bottom-percentile cut, or None if this is not one.
+
+    Returns (metric, pct, top) - top True selects the highest pct of the universe on the
+    metric (e.g. revenue growth in the top 20%), False the lowest.
+    """
+
+    if condition.universe_rank_pct is None:
+        return None
+    metric = condition.left.strip().lower()
+    if metric not in _CURRENT and metric not in _FINANCIAL_METRICS:
+        return None
+    # gt/gte -> want the top of the distribution; lt/lte -> the bottom.
+    top = condition.operator in {ConditionOperator.GT, ConditionOperator.GTE}
+    return (metric, float(condition.universe_rank_pct), top)
+
+
+def compile_entry_expression(conditions: Sequence[Condition]) -> str | None:
+    """Back-compat: the per-stock expression only, or None if a rank cut is present.
+
+    Callers that cannot apply cross-sectional cuts fall back to templates when one
+    appears, rather than silently dropping it.
+    """
+
+    compiled = compile_conditions(conditions)
+    if compiled is None or compiled.rank_filters:
+        return None
+    return compiled.per_stock
 
 
 def _compile_one(condition: Condition) -> str | None:
-    if condition.consecutive is not None or condition.universe_rank_pct is not None:
-        # Consecutive-period and cross-sectional tests need financial/ranked series the
-        # price-only backtest does not hold.
+    if condition.consecutive is not None:
+        # Consecutive-period tests need per-quarter history the per-bar expression does
+        # not hold; handled separately (not yet compiled here).
+        return None
+    if condition.universe_rank_pct is not None:
+        # Cross-sectional cuts are pulled out by _rank_filter before this point.
         return None
     if condition.operator not in _OPERATOR:
         return None
