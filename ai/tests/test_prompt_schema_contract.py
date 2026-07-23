@@ -58,13 +58,26 @@ def test_backtest_code_prompt_declares_expected_json_schema() -> None:
     assert request.schema_name == "backtest_strategy_candidates.v2"
     assert request.task_type == "backtest_code_generation"
     assert request.prompt_template_name == "backtest_strategy_generation"
-    assert request.prompt_version == "v2"
+    assert request.prompt_version == "v3"
     assert request.variables_jsonb == prompt_payload
     assert request.response_schema == schema
     assert "strategy_ir" in schema["properties"]
     assert "candidates" in schema["properties"]
     assert schema["properties"]["candidates"]["minItems"] == 3
     assert schema["properties"]["candidates"]["maxItems"] == 3
+
+    performance = prompt_payload["fallback_code_performance_contract"]
+    assert performance["target"] == "O(N) time for N supplied rows"
+    assert performance["input_passes"] == (
+        "exactly one forward pass over prices in supplied order"
+    )
+    forbidden = " ".join(performance["forbidden"])
+    required = " ".join(performance["required"])
+    assert "sorted(prices)" in forbidden
+    assert "history slicing" in forbidden
+    assert "nested scan" in forbidden
+    assert "incrementally" in required
+    assert "future row" in required
 
 
 def test_backtest_code_schema_validation_failure_records_fallback_reason() -> None:

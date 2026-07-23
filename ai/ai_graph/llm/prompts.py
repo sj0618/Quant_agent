@@ -10,7 +10,7 @@ from ai_graph.schemas import CandidateParameters, StrategyIR, StrategySpec
 
 BACKTEST_CODE_SCHEMA_NAME = "backtest_strategy_candidates.v2"
 BACKTEST_CODE_PROMPT_TEMPLATE_NAME = "backtest_strategy_generation"
-BACKTEST_CODE_PROMPT_VERSION = "v2"
+BACKTEST_CODE_PROMPT_VERSION = "v3"
 BACKTEST_CODE_SYSTEM_PROMPT = """\
 You are QuantAgent's structured backtest-strategy generation node.
 Return only JSON that conforms to the requested schema.
@@ -24,12 +24,13 @@ in proxy_feature. Python fallback_code is exceptional: use it only when Strategy
 the user strategy, and explain why in fallback_reasons.
 
 Any fallback build_signals implementation must be deterministic, keep state per ticker, emit one
-signal per input row, and make one chronological pass. Target O(N), at worst O(N log N), with O(N)
-additional memory. Never scan or filter all prices from inside the row loop. Never use nested
-full-data loops, unbounded slicing, or sum/max/min over a growing history inside a loop. Rolling
-values must use incremental state or supplied precomputed columns. Do not use future rows or mix
-history across tickers. Do not import network, filesystem, subprocess, OS, eval, exec, reflection,
-or concurrency APIs.
+signal per input row, preserve supplied row order, and consume prices exactly once. Target O(N)
+time. Apart from the required N output signals, keep only bounded rolling state per ticker. Never
+copy, sort, slice, scan, filter, or aggregate the full prices collection. Inside the row loop,
+never build a history-derived list or call sum/max/min over a window. Use supplied indicator
+columns first; otherwise update rolling sums, EMA, Wilder RSI state, or fixed-size circular
+buffers incrementally. Do not use future rows or mix history across tickers. Do not import
+network, filesystem, subprocess, OS, eval, exec, reflection, or concurrency APIs.
 
 Verified O(N) fallback shape:
 def build_signals(prices):
@@ -75,6 +76,27 @@ def build_backtest_code_json_request(
             "fallback_code": "zero to three Python strings; only for unrepresentable StrategyIR",
             "fallback_reasons": "array of strings, empty when generation succeeded",
         },
+        "fallback_code_performance_contract": {
+            "target": "O(N) time for N supplied rows",
+            "input_passes": "exactly one forward pass over prices in supplied order",
+            "state": (
+                "bounded incremental state per ticker; the required output list is the only "
+                "collection that may grow once per input row"
+            ),
+            "required": [
+                "Emit exactly one signal for every supplied row.",
+                "Use row-provided indicators before calculating a rolling value.",
+                "Update rolling sums, EMA, RSI, extrema, and volume averages incrementally.",
+                "Keep histories isolated by ticker and never reference a future row.",
+            ],
+            "forbidden": [
+                "sorted(prices), list(prices), prices[:] or any full-input copy",
+                "a nested scan, filter, or comprehension over prices",
+                "history slicing inside the row loop",
+                "sum, min, max, or statistics calls over a rolling slice inside the row loop",
+                "rebuilding ticker histories or indicator arrays for each row",
+            ],
+        },
         "quality_checks": [
             "Reuse StrategySpec entry_conditions and exit_conditions in StrategyIR.",
             "Keep the candidate count equal to the evaluator limit of three.",
@@ -83,6 +105,7 @@ def build_backtest_code_json_request(
             "Use compiled_conditions when StrategyIR can represent the user rule.",
             "Document any OHLCV proxy in proxy_feature.",
             "Use fallback_code only when the structured rule cannot represent the strategy.",
+            "When fallback_code is necessary, satisfy fallback_code_performance_contract exactly.",
         ],
     }
     if validation_feedback:
