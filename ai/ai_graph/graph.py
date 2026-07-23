@@ -538,6 +538,30 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
         variant="A",
         semantic_slots=state.get("semantic_slots"),
     )
+
+    # If the screen already expressed the rule as structured conditions, adopt them as
+    # the spec's entry/exit conditions. That makes the screen and the spec one
+    # definition instead of two independently-derived ones - the drift this whole change
+    # is about. The spec's other fields (indicators, risk) stay as built.
+    screening = state.get("data", {}).get("pipeline_data_source", {}) or {}
+    relaxation = screening.get("screening_relaxation") or {}
+    screen_entry = relaxation.get("entry_conditions") or []
+    screen_exit = relaxation.get("exit_conditions") or []
+    if screen_entry:
+        try:
+            strategy_a = strategy_a.model_copy(
+                update={
+                    "entry_conditions": [Condition.model_validate(c) for c in screen_entry],
+                    "exit_conditions": [Condition.model_validate(c) for c in screen_exit],
+                    "assumptions": [
+                        *strategy_a.assumptions,
+                        "entry/exit 조건을 스크리닝 SQL과 동일한 구조 정의로 통일함",
+                    ],
+                }
+            )
+        except ValidationError:
+            _logger.warning("screening conditions failed spec validation; keeping built spec")
+
     return {
         "original_strategy_spec": strategy_a.model_dump(),
         "strategy_spec": strategy_a.model_dump(),

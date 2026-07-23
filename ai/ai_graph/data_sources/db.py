@@ -325,6 +325,10 @@ class PostgresPipelineDataSource:
             "matched_count": len(candidates),
             "relaxed": len(result.get("attempts") or []) > 1,
             "relaxation_rounds": max(len(result.get("attempts") or []) - 1, 0),
+            # The screen's rule as structured conditions, carried so the strategy spec
+            # (and eventually the backtest) can reuse the exact same definition.
+            "entry_conditions": result.get("entry_conditions") or [],
+            "exit_conditions": result.get("exit_conditions") or [],
         }
         return candidates, trace
 

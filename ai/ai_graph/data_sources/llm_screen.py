@@ -370,6 +370,10 @@ def screen_with_llm(conn: Any, query: str) -> dict[str, Any] | None:
                 "attempts": attempts,
                 "metrics": plan.get("metrics") or [],
                 "unmet_requirements": record["unmet_requirements"],
+                # The structured form of the rule the SQL just ran, so the backtest can
+                # compile the same conditions instead of the LLM re-deriving them.
+                "entry_conditions": plan.get("entry_conditions") or [],
+                "exit_conditions": plan.get("exit_conditions") or [],
             }
 
         record["outcome"] = "matched 0 rows - conditions too strict for this date"

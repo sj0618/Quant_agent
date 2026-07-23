@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -633,12 +633,51 @@ If earlier attempts are supplied, fix precisely what they got wrong. When a prev
 attempt matched nothing, the conditions were too tight for this particular date -
 loosen the least load-bearing one rather than abandoning the strategy.
 
+Also express the same conditions in a structured form, so the screen (run today) and
+the backtest (run over history) share one definition instead of drifting apart. Each
+entry/exit condition has:
+  left            - the metric being tested (a column or a metric you named)
+  operator        - one of lt, lte, gt, gte, eq, ne, between, cross_above, cross_below
+  right           - a number, or another metric name for a relative comparison
+  window          - rolling window in trading days, if the metric is over a window
+                    (52-week high -> left "high", window 252, aggregate "max")
+  aggregate       - max | min | avg | sum | last, how the window is reduced
+  scale           - multiplier on the right side (volume >= 1.5x its 20d average ->
+                    right "volume", window 20, aggregate "avg", scale 1.5)
+  consecutive     - number of periods the condition must hold in a row (4 quarters up)
+  universe_rank_pct - top-percentile cross-sectional cut instead of an absolute value
+                    (top 20% by revenue growth -> 0.2)
+Leave the optional fields null when a plain comparison suffices. The SQL and the
+structured conditions MUST describe the same rule.
+
 Return JSON only:
   reasoning          - how each condition maps onto columns
   sql                - the SELECT (single statement, no semicolon, no DDL/DML)
   metrics            - metric column names the SELECT returns
+  entry_conditions   - structured entry conditions (as above)
+  exit_conditions    - structured exit conditions, if the strategy implies any
   unmet_requirements - conditions you could not express, each naming the missing input
 """
+
+
+class _LiveStructuredCondition(BaseModel):
+    """Strict-schema twin of Condition for AOAI structured output.
+
+    Azure requires every property in `required`, so the optional windowing fields are
+    present-but-nullable here; _structured_condition() below drops the nulls before
+    validating against the real Condition.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: str
+    operator: ConditionOperator
+    right: float | str | list[float]
+    window: int | None
+    aggregate: Literal["max", "min", "avg", "sum", "last"] | None
+    scale: float | None
+    consecutive: int | None
+    universe_rank_pct: float | None
 
 
 class _LiveScreeningSQL(BaseModel):
@@ -647,6 +686,8 @@ class _LiveScreeningSQL(BaseModel):
     reasoning: str
     sql: str
     metrics: list[str]
+    entry_conditions: list[_LiveStructuredCondition]
+    exit_conditions: list[_LiveStructuredCondition]
     unmet_requirements: list[str]
 
 
@@ -690,9 +731,30 @@ def generate_screening_sql(
     )
     try:
         payload = create_llm_client(role="SCREENING_SQL").generate_json(request)
-        return _LiveScreeningSQL.model_validate(payload).model_dump()
+        parsed = _LiveScreeningSQL.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
         return None
+    result = parsed.model_dump()
+    # Validate the structured conditions against the real Condition (dropping the AOAI
+    # nulls). A malformed structure must not sink the screen - the SQL still ran - so bad
+    # conditions are simply omitted, and the SQL remains the source of truth until the
+    # backtest compiler consumes these.
+    result["entry_conditions"] = _clean_structured_conditions(parsed.entry_conditions)
+    result["exit_conditions"] = _clean_structured_conditions(parsed.exit_conditions)
+    return result
+
+
+def _clean_structured_conditions(
+    conditions: list["_LiveStructuredCondition"],
+) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for condition in conditions:
+        fields = {key: value for key, value in condition.model_dump().items() if value is not None}
+        try:
+            cleaned.append(Condition.model_validate(fields).model_dump(exclude_none=True))
+        except ValidationError:
+            _logger.warning("screening returned an invalid structured condition; dropping it")
+    return cleaned
 
 
 STRATEGY_REVISION_SYSTEM_PROMPT = """\

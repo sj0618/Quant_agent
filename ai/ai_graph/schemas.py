@@ -164,6 +164,26 @@ class Condition(BaseModel):
     right: float | str | list[float]
     description: str | None = None
 
+    # --- Optional structure so one condition list can express the strategies that used
+    # to be encoded twice (SQL for today's screen, Python for the backtest) and drift
+    # apart. All default to None, so a plain comparison is unchanged; a compiler that
+    # does not understand a field can fall back to raw SQL for that condition.
+    #
+    # window: evaluate `left` over a rolling window of this many trading days
+    # (e.g. 52-week high -> left="high", window=252, aggregate="max").
+    window: int | None = Field(default=None, gt=0)
+    # aggregate: how to reduce `left` (and a metric `right`) across the window.
+    aggregate: Literal["max", "min", "avg", "sum", "last"] | None = None
+    # scale: multiply the right-hand side, so "volume >= 1.5x its 20-day average" is
+    # right="volume", window=20, aggregate="avg", scale=1.5 - no separate metric needed.
+    scale: float | None = None
+    # consecutive: the condition must hold this many periods in a row
+    # (e.g. operating income up YoY for 4 quarters -> consecutive=4).
+    consecutive: int | None = Field(default=None, gt=0)
+    # universe_rank: cross-sectional selection instead of an absolute cut, as a top
+    # percentile of the universe on `left` (e.g. revenue growth in the top 20% -> 0.2).
+    universe_rank_pct: float | None = Field(default=None, gt=0.0, le=1.0)
+
     @model_validator(mode="after")
     def validate_right_shape(self) -> "Condition":
         if self.operator == ConditionOperator.BETWEEN:
@@ -175,7 +195,12 @@ class Condition(BaseModel):
             if not isinstance(self.right, str):
                 raise ValueError("cross operators require a metric name")
         elif not isinstance(self.right, (int, float)):
-            raise ValueError("scalar operators require a numeric right side")
+            # A metric name on the right is allowed once the condition compares against a
+            # windowed/derived series - "close >= 252-day max of high", "operating_income
+            # > its previous quarter". Absolute comparisons still require a number.
+            structured = self.window is not None or self.consecutive is not None
+            if not (structured and isinstance(self.right, str)):
+                raise ValueError("scalar operators require a numeric right side")
         return self
 
 
