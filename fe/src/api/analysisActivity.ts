@@ -13,6 +13,14 @@ export const DEBATE_VOICE_LABELS: Record<DebateVoice, string> = {
   JUDGE: "합 · 판단",
 };
 
+/** Single-lane provider calls that aren't a 정/반/합 debate but still stream live
+ * activity (search, text deltas, citations) worth showing while they run. */
+const SOLO_ROLE_LABELS: Record<string, string> = {
+  BACKTEST_CODE: "코드 생성",
+  STRATEGY_CONDITIONS: "매수/매도 조건 생성",
+  REPORT_WRITER: "리포트 작성",
+};
+
 /** The log is a tail, not an audit trail - old entries scroll out of view. */
 const MAX_ENTRIES = 14;
 
@@ -72,11 +80,19 @@ function splitRole(role: string | null | undefined) {
     return null;
   }
   const separator = role.lastIndexOf("_");
-  const voice = (separator >= 0 ? role.slice(separator + 1) : role) as DebateVoice;
-  if (!DEBATE_VOICES.includes(voice)) {
+  const suffix = (separator >= 0 ? role.slice(separator + 1) : role) as DebateVoice;
+  if (DEBATE_VOICES.includes(suffix)) {
+    return {
+      voice: suffix as DebateVoice | null,
+      phase: separator >= 0 ? role.slice(0, separator) : null,
+      label: DEBATE_VOICE_LABELS[suffix],
+    };
+  }
+  const soloLabel = SOLO_ROLE_LABELS[role];
+  if (!soloLabel) {
     return null;
   }
-  return { voice, phase: separator >= 0 ? role.slice(0, separator) : null };
+  return { voice: null, phase: null, label: soloLabel };
 }
 
 /** The open entry for a role, so streamed text lands on the line it belongs to. */
@@ -133,7 +149,7 @@ function reduce(state: ActivityState, event: ActivityEvent): ActivityState {
   }
 
   const role = String(event.role);
-  const { voice, phase } = parsed;
+  const { voice, phase, label } = parsed;
   const index = findOpenVoice(state.entries, role);
 
   if (event.kind === "role_started") {
@@ -142,9 +158,9 @@ function reduce(state: ActivityState, event: ActivityEvent): ActivityState {
       entries: append(state.entries, {
         id: role,
         kind: "voice",
-        voice,
+        voice: voice ?? undefined,
         phase,
-        label: DEBATE_VOICE_LABELS[voice],
+        label,
         detail: null,
         status: "running",
         searching: false,

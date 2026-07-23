@@ -358,11 +358,19 @@ def generate_strategy_conditions(
         variables_jsonb={**context, "expected_json_schema": expected_json_schema},
     )
     try:
-        payload = create_llm_client(role="STRATEGY_CONDITIONS").generate_json(request)
+        with activity_role("STRATEGY_CONDITIONS"):
+            report_activity("role_started", task="매수/매도 조건 생성")
+            payload = create_llm_client(role="STRATEGY_CONDITIONS").generate_json(request)
         parsed = _LiveStrategyConditionsOutput.model_validate(payload)
         if not parsed.entry_conditions or not parsed.exit_conditions:
             raise ValueError("strategy_conditions response missing entry/exit conditions")
-        return StrategyConditionsPayload(**parsed.model_dump())
+        result = StrategyConditionsPayload(**parsed.model_dump())
+        with activity_role("STRATEGY_CONDITIONS"):
+            report_activity(
+                "role_completed",
+                summary=f"매수 조건 {len(result.entry_conditions)}개, 매도 조건 {len(result.exit_conditions)}개 생성 완료",
+            )
+        return result
     except (LLMClientError, ValidationError, ValueError, TypeError) as exc:
         if is_live_llm_provider():
             raise

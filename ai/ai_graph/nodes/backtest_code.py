@@ -13,6 +13,7 @@ from ai_graph.llm.mock import (
     VALUE_QUALITY_CANDIDATES,
 )
 from ai_graph.llm.prompts import BacktestCodeLLMOutput, build_backtest_code_json_request
+from ai_graph.progress import activity_role, report_activity
 from ai_graph.nodes.position_sizing import (
     DEFAULT_MAX_POSITIONS,
     applied_max_positions,
@@ -260,17 +261,28 @@ def _generate_backtest_code_output(
     *,
     validation_feedback: list[str] | None = None,
 ) -> BacktestCodeLLMOutput:
+    task = "후보 코드 재생성 (검증 피드백 반영)" if validation_feedback else "후보 코드 생성"
     try:
         llm_request = build_backtest_code_json_request(
             request.strategy,
             request.variant,
             validation_feedback=validation_feedback,
         )
-        raw_output = client.generate_json(llm_request)
-        return BacktestCodeLLMOutput.model_validate(raw_output)
+        with activity_role("BACKTEST_CODE"):
+            report_activity("role_started", task=task)
+            raw_output = client.generate_json(llm_request)
+        output = BacktestCodeLLMOutput.model_validate(raw_output)
+        with activity_role("BACKTEST_CODE"):
+            report_activity(
+                "role_completed",
+                summary=f"후보 코드 {len(output.candidates)}개 생성 완료",
+            )
+        return output
     except (LLMClientError, ValidationError) as exc:
         if is_live_llm_provider():
             raise
+        with activity_role("BACKTEST_CODE"):
+            report_activity("role_completed", summary=f"{type(exc).__name__}: {exc}")
         return BacktestCodeLLMOutput.model_construct(
             candidates=[],
             fallback_reasons=[f"{type(exc).__name__}: {exc}"],
