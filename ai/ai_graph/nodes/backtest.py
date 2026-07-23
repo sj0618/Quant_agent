@@ -32,6 +32,9 @@ MIN_RETURNS_FOR_SPLIT = 4
 BACKTEST_SPLIT_FRACTION = 0.5
 PUBLIC_EQUITY_CURVE_POINTS = 12
 MIN_OBJECTIVE_TRADES = 5
+# Below this many matched names, a backtest describes the names, not the strategy, and
+# tuning dozens of rule variants against them is fitting noise. Warn rather than pretend.
+MIN_RELIABLE_TICKERS = 5
 # A long-only equity portfolio held through a decade of Korean market drawdowns does
 # not keep Sharpe above 1.0 or cap losses at 10% - those are hedge-fund thresholds, and
 # requiring them meant every run "missed the objective" and paid for two self-improvement
@@ -286,6 +289,18 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         label=f"백테스트 실행 · 후보 {len(candidates)}개",
         detail=f"종목 {ticker_count}개 · 최대 보유 {max_positions}종목",
     )
+    if ticker_count < MIN_RELIABLE_TICKERS:
+        # A backtest over a handful of names measures those names, not the strategy - the
+        # result rides on their idiosyncratic history and does not generalise. Say so
+        # rather than presenting a two-stock curve as if it validated the rule.
+        report_activity(
+            "step",
+            label="표본 부족 경고",
+            detail=(
+                f"조건에 맞는 종목이 {ticker_count}개뿐이라 백테스트 신뢰도가 낮습니다. "
+                "결과는 이 종목들의 과거에 크게 좌우됩니다."
+            ),
+        )
     result = run_candidate_backtest(
         strategy_a,
         candidates,
@@ -326,13 +341,24 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
             feature_coverage=state.get("backtest_code", {}).get("feature_mapping", {}),
             fallback_reasons=fallback_reasons,
         )
-        if _selected_objective_score(next_result) >= _selected_objective_score(result):
+        improved_score = _selected_objective_score(next_result)
+        if improved_score > _selected_objective_score(result):
             result = next_result
-        report_activity(
-            "step",
-            label=f"자가개선 {iteration}차 완료",
-            detail=_selected_candidate_detail(result),
-        )
+            report_activity(
+                "step",
+                label=f"자가개선 {iteration}차 완료",
+                detail=_selected_candidate_detail(result),
+            )
+        else:
+            # No improvement from another 36 variants means more of them will not help
+            # either - they just add rules fitted to the same noise. Stop rather than
+            # grind through a third round that can only overfit further.
+            report_activity(
+                "step",
+                label=f"자가개선 {iteration}차 · 개선 없음",
+                detail="추가 변형이 성과를 높이지 못해 최적화를 중단합니다.",
+            )
+            break
     return {"backtest": result.model_dump()}
 
 
@@ -725,13 +751,20 @@ def _objective_score(
     calmar = _calmar_ratio(metrics.total_return, metrics.max_drawdown)
     profit_factor = _profit_factor(engine_summary)
     turnover_penalty = min(1.0, trade_count / max(1.0, len(price_rows)))
+    # Selection is driven by out-of-sample performance, not the full-period Sharpe.
+    # With dozens of threshold variants scored on the same history, the highest
+    # full-period Sharpe is usually the one that best fit the noise - it proves nothing
+    # about the half of the data it was not chosen on. Leading with out_sample_sharpe,
+    # and penalising the in-sample-to-out-sample drop far more heavily, makes the winner
+    # the candidate that generalised rather than the one that memorised.
     score = (
-        1.00 * metrics.sharpe_ratio
+        0.70 * metrics.out_sample_sharpe
+        + 0.30 * metrics.sharpe_ratio
         + 0.05 * calmar
         + 0.03 * profit_factor
         + 0.02 * metrics.total_return
         - 0.08 * turnover_penalty
-        - 0.10 * metrics.degradation
+        - 0.30 * metrics.degradation
     )
     if trade_count < MIN_OBJECTIVE_TRADES:
         score -= (MIN_OBJECTIVE_TRADES - trade_count) * 0.05
