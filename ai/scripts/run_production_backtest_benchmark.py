@@ -117,7 +117,7 @@ class _ProcessTreeSampler:
                     int(statm[1]) * page_size,
                     int(tail[11]) + int(tail[12]),
                 )
-            except (FileNotFoundError, PermissionError, IndexError, ValueError):
+            except (OSError, IndexError, ValueError):
                 continue
 
         descendants = {root_pid}
