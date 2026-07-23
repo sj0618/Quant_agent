@@ -48,6 +48,20 @@ class ComputeTechnicalIndicatorsPipelineTests(unittest.TestCase):
         self.assertIn("sm.sector", sql)
         self.assertIn("CREATE OR REPLACE VIEW mart.symbol_feature_frame_asof", sql)
 
+    def test_combine_pattern_outputs_skips_short_frame_bug(self):
+        frame = pd.DataFrame(
+            {
+                "open": [1, 2, 3, 4, 5],
+                "high": [2, 3, 4, 5, 6],
+                "low": [0, 1, 2, 3, 4],
+                "close": [1.5, 2.5, 3.5, 4.5, 5.5],
+            }
+        )
+        result = pipeline.combine_pattern_outputs(frame, pipeline.PATTERN_NAMES)
+        self.assertIn("CDL_HAMMER", result.columns)
+        self.assertIn("CDL_PIERCING", result.columns)
+        self.assertNotIn("CDL_DOJI_10_0.1", result.columns)
+
 
 if __name__ == "__main__":
     unittest.main()

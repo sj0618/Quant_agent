@@ -1243,12 +1243,7 @@ def compute_indicator_frames(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
                 ("cmf", {"length": 20}),
             ],
         ),
-        "Pattern": combine_outputs(
-            ta_input,
-            [
-                ("cdl_pattern", {"name": PATTERN_NAMES}),
-            ],
-        ),
+        "Pattern": combine_pattern_outputs(ta_input, PATTERN_NAMES),
     }
 
 
@@ -1257,6 +1252,28 @@ def combine_outputs(frame: pd.DataFrame, calls: list[tuple[str, dict[str, Any]]]
     for method_name, kwargs in calls:
         method = getattr(frame.ta, method_name)
         result = method(**kwargs)
+        if result is None:
+            continue
+        if isinstance(result, pd.Series):
+            outputs.append(result.to_frame())
+        else:
+            outputs.append(result)
+    if not outputs:
+        return pd.DataFrame(index=frame.index)
+    combined = pd.concat(outputs, axis=1)
+    combined = combined.loc[:, ~combined.columns.duplicated()].copy()
+    return combined.replace([np.inf, -np.inf], np.nan)
+
+
+def combine_pattern_outputs(frame: pd.DataFrame, pattern_names: list[str]) -> pd.DataFrame:
+    outputs = []
+    for pattern_name in pattern_names:
+        try:
+            result = frame.ta.cdl_pattern(name=[pattern_name])
+        except AttributeError as exc:
+            if "'NoneType' object has no attribute 'name'" not in str(exc):
+                raise
+            continue
         if result is None:
             continue
         if isinstance(result, pd.Series):
