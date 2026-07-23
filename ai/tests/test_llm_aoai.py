@@ -219,6 +219,111 @@ def test_aoai_client_retries_without_unsupported_priority_service_tier() -> None
     assert "service_tier" not in request_bodies[1]
 
 
+def test_aoai_client_normalizes_pydantic_schema_for_strict_outputs() -> None:
+    schema = {
+        "title": "GeneratedResult",
+        "type": "object",
+        "properties": {
+            "name": {"title": "Name", "type": "string", "minLength": 1},
+            "score": {
+                "default": 0.0,
+                "type": "number",
+                "minimum": -1.0,
+                "maximum": 1.0,
+            },
+            "tags": {
+                "default": [],
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 3,
+            },
+        },
+        "required": ["name"],
+        "additionalProperties": False,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        normalized = body["text"]["format"]["schema"]
+        assert normalized == {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "score": {"type": "number"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["name", "score", "tags"],
+            "additionalProperties": False,
+        }
+        return httpx.Response(
+            200,
+            json={"output_text": '{"name":"ok","score":0.0,"tags":[]}'},
+        )
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = make_request().model_copy(update={"response_schema": schema})
+
+    assert client.generate_json(request)["name"] == "ok"
+
+
+def test_aoai_compatibility_adjustments_do_not_consume_transport_retry() -> None:
+    request_bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        request_bodies.append(body)
+        call_number = len(request_bodies)
+        if call_number == 1:
+            return httpx.Response(
+                400,
+                json={"error": {"param": "temperature", "message": "unsupported"}},
+            )
+        if call_number == 2:
+            return httpx.Response(
+                400,
+                json={"error": {"param": "service_tier", "message": "unsupported"}},
+            )
+        if call_number == 3:
+            return httpx.Response(
+                400,
+                json={"error": {"param": "text.format.schema", "message": "invalid schema"}},
+            )
+        if call_number == 4:
+            return httpx.Response(429, text="retry")
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        max_retries=1,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = make_request().model_copy(
+        update={
+            "response_schema": {
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+                "additionalProperties": False,
+            }
+        }
+    )
+
+    assert client.generate_json(request) == {"message": "ok"}
+    assert len(request_bodies) == 5
+    assert "temperature" not in request_bodies[1]
+    assert "service_tier" not in request_bodies[2]
+    assert "text" not in request_bodies[3]
+    assert client.last_call_timings["physical_http_posts"] == 5
+
+
 def test_aoai_client_rejects_broken_output_text_json() -> None:
     client = make_client({"output_text": "{broken-json"})
 

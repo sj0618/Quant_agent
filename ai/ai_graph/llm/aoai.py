@@ -22,6 +22,38 @@ DEFAULT_SERVICE_TIER = "priority"
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 5.0
 MAX_RETRY_AFTER_SECONDS = 60.0
 DEFAULT_WEB_SEARCH_TOOL_TYPE = "web_search_preview"
+MAX_COMPATIBILITY_ADJUSTMENTS = 3
+UNSUPPORTED_STRICT_SCHEMA_KEYWORDS = frozenset(
+    {
+        "$id",
+        "$schema",
+        "default",
+        "deprecated",
+        "examples",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "format",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "maximum",
+        "minContains",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "minimum",
+        "multipleOf",
+        "pattern",
+        "patternProperties",
+        "propertyNames",
+        "readOnly",
+        "title",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "uniqueItems",
+        "writeOnly",
+    }
+)
 # Stream events that carry the finished response object.
 TERMINAL_STREAM_EVENTS = frozenset(
     {"response.completed", "response.incomplete", "response.failed"}
@@ -59,6 +91,7 @@ class AOAIResponsesClient:
         # remembering it stops every later call from burning a round-trip to relearn it.
         self._temperature_supported = True
         self._service_tier_supported = True
+        self._structured_outputs_supported = True
         self.logical_call_count = 0
         self.physical_http_post_count = 0
         self.last_call_timings: dict[str, float | int | None] = {}
@@ -169,12 +202,11 @@ class AOAIResponsesClient:
         body = self._request_body(request)
         body["stream"] = True
         headers = {"Content-Type": "application/json", "api-key": self.api_key}
-        attempts = self.max_retries + 1
+        max_posts = self.max_retries + MAX_COMPATIBILITY_ADJUSTMENTS + 1
         last_error: Exception | None = None
-        last_attempt = 0
+        retry_count = 0
 
-        for attempt in range(attempts):
-            last_attempt = attempt
+        for _ in range(max_posts):
             attempt_started = time.perf_counter()
             client = self._http_client or httpx.Client(timeout=self.timeout_seconds)
             owns_client = self._http_client is None
@@ -208,11 +240,22 @@ class AOAIResponsesClient:
                                 self._service_tier_supported = False
                                 body.pop("service_tier", None)
                                 continue
+                            if "text" in body:
+                                # Azure deployments differ in their structured-output
+                                # support. Keep the JSON contract in the prompt and let
+                                # Pydantic validate it when this deployment rejects the
+                                # provider-side schema.
+                                self._structured_outputs_supported = False
+                                body.pop("text", None)
+                                continue
                             if (
                                 response.status_code in RETRYABLE_STATUS_CODES
-                                and attempt < attempts - 1
+                                and retry_count < self.max_retries
                             ):
-                                _sleep_before_retry(self.retry_backoff_seconds, attempt, response)
+                                _sleep_before_retry(
+                                    self.retry_backoff_seconds, retry_count, response
+                                )
+                                retry_count += 1
                                 continue
                             response.raise_for_status()
                         if "text/event-stream" not in response.headers.get(
@@ -225,7 +268,7 @@ class AOAIResponsesClient:
                             response.request.extensions["timeout"]["read"] = self.timeout_seconds
                             return (
                                 None,
-                                attempt,
+                                retry_count,
                                 response.text,
                                 _provider_request_id(None, response),
                             )
@@ -239,7 +282,7 @@ class AOAIResponsesClient:
                         if terminal == "response.completed" and payload is not None:
                             return (
                                 payload,
-                                attempt,
+                                retry_count,
                                 None,
                                 _provider_request_id(payload, response),
                             )
@@ -249,24 +292,27 @@ class AOAIResponsesClient:
                         last_error = LLMResponseParseError(
                             _stream_failure_reason(terminal, payload)
                         )
-                        if attempt < attempts - 1:
-                            _sleep_before_retry(self.retry_backoff_seconds, attempt)
+                        if retry_count < self.max_retries:
+                            _sleep_before_retry(self.retry_backoff_seconds, retry_count)
+                            retry_count += 1
                             continue
+                        break
                 finally:
                     if owns_client:
                         client.close()
             except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
                 last_error = exc
-                if not _should_retry(exc) or attempt >= attempts - 1:
+                if not _should_retry(exc) or retry_count >= self.max_retries:
                     break
                 _sleep_before_retry(
                     self.retry_backoff_seconds,
-                    attempt,
+                    retry_count,
                     exc.response if isinstance(exc, httpx.HTTPStatusError) else None,
                 )
+                retry_count += 1
 
         raise LLMClientError(
-            "AOAI Responses request failed", retry_count=last_attempt
+            "AOAI Responses request failed", retry_count=retry_count
         ) from last_error
 
     def _consume_stream(
@@ -357,16 +403,45 @@ class AOAIResponsesClient:
             body["service_tier"] = self.service_tier
         if request.enable_web_search:
             body["tools"] = [{"type": self.web_search_tool_type}]
-        if request.response_schema is not None:
+        if request.response_schema is not None and self._structured_outputs_supported:
             body["text"] = {
                 "format": {
                     "type": "json_schema",
                     "name": _schema_format_name(request.schema_name),
                     "strict": True,
-                    "schema": request.response_schema,
+                    "schema": _strict_response_schema(request.response_schema),
                 }
             }
         return body
+
+
+def _strict_response_schema(value: Any) -> Any:
+    """Return the Azure/OpenAI strict JSON Schema subset.
+
+    Pydantic intentionally emits validation constraints that remain useful for
+    local validation but are rejected by strict structured outputs. Provider-side
+    schemas require every object property and reject those type-specific keywords.
+    """
+
+    if isinstance(value, list):
+        return [_strict_response_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    normalized: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in UNSUPPORTED_STRICT_SCHEMA_KEYWORDS:
+            continue
+        if key == "const":
+            normalized["enum"] = [_strict_response_schema(item)]
+            continue
+        normalized[key] = _strict_response_schema(item)
+
+    properties = normalized.get("properties")
+    if isinstance(properties, dict):
+        normalized["additionalProperties"] = False
+        normalized["required"] = list(properties)
+    return normalized
 
 def _stream_failure_reason(terminal: str | None, payload: dict[str, Any] | None) -> str:
     if terminal is None:
