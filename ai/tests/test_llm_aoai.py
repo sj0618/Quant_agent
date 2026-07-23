@@ -36,6 +36,7 @@ def make_client(response_payload: dict) -> AOAIResponsesClient:
         assert request.headers["api-key"] == "test-api-key"
         assert body["model"] == "test-model"
         assert body["temperature"] == 0.0
+        assert body["stream"] is True
         assert body["input"][0]["role"] == "system"
         assert body["input"][1]["role"] == "user"
         return httpx.Response(200, json=response_payload)
@@ -117,6 +118,39 @@ def test_aoai_client_sends_strict_responses_json_schema() -> None:
     )
 
     assert client.generate_json(request) == {"message": "ok"}
+
+
+def test_aoai_client_separates_response_start_and_body_idle_timeouts() -> None:
+    response_start_timeouts: list[float] = []
+    body_idle_timeouts: list[float] = []
+
+    class TimeoutObservingStream(httpx.SyncByteStream):
+        def __init__(self, request: httpx.Request) -> None:
+            self.request = request
+
+        def __iter__(self):
+            body_idle_timeouts.append(self.request.extensions["timeout"]["read"])
+            yield b'{"output_text":"{\\"message\\":\\"ok\\"}"}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response_start_timeouts.append(request.extensions["timeout"]["read"])
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=TimeoutObservingStream(request),
+        )
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        timeout_seconds=120.0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_json(make_request()) == {"message": "ok"}
+    assert response_start_timeouts == [10.0]
+    assert body_idle_timeouts == [120.0]
 
 
 def test_aoai_client_retries_without_unsupported_temperature() -> None:
