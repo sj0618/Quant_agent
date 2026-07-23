@@ -4,11 +4,15 @@ import argparse
 from hashlib import sha256
 import json
 import os
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
 import time
 
-import psutil
+try:
+    import psutil
+except ModuleNotFoundError:  # Production keeps benchmark-only dependencies optional.
+    psutil = None
 
 from ai_graph.data_sources import load_pipeline_data_from_env
 from ai_graph.llm.mock import MockLLMClient
@@ -74,8 +78,12 @@ class _ProcessTreeSampler:
         self.thread.join(timeout=5)
 
     def _run(self) -> None:
+        if psutil is None:
+            self._run_procfs()
+            return
+
         root = psutil.Process()
-        known: dict[int, psutil.Process] = {}
+        known: dict[int, object] = {}
         while not self.stop_event.wait(0.1):
             processes = [root, *root.children(recursive=True)]
             rss = 0
@@ -92,6 +100,60 @@ class _ProcessTreeSampler:
                     continue
             self.peak_rss = max(self.peak_rss, rss)
             self.cpu_samples.append(cpu)
+
+    @staticmethod
+    def _procfs_snapshot(root_pid: int) -> tuple[int, int]:
+        entries: dict[int, tuple[int, int, int]] = {}
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        for proc_dir in Path("/proc").iterdir():
+            if not proc_dir.name.isdigit():
+                continue
+            try:
+                stat = (proc_dir / "stat").read_text(encoding="utf-8")
+                tail = stat.rsplit(")", 1)[1].strip().split()
+                statm = (proc_dir / "statm").read_text(encoding="utf-8").split()
+                entries[int(proc_dir.name)] = (
+                    int(tail[1]),
+                    int(statm[1]) * page_size,
+                    int(tail[11]) + int(tail[12]),
+                )
+            except (FileNotFoundError, PermissionError, IndexError, ValueError):
+                continue
+
+        descendants = {root_pid}
+        changed = True
+        while changed:
+            changed = False
+            for pid, (parent_pid, _, _) in entries.items():
+                if parent_pid in descendants and pid not in descendants:
+                    descendants.add(pid)
+                    changed = True
+        rss = sum(entries[pid][1] for pid in descendants if pid in entries)
+        cpu_ticks = sum(entries[pid][2] for pid in descendants if pid in entries)
+        return rss, cpu_ticks
+
+    def _run_procfs(self) -> None:
+        if not Path("/proc").is_dir():
+            return
+        root_pid = os.getpid()
+        clock_ticks = float(os.sysconf("SC_CLK_TCK"))
+        previous_ticks: int | None = None
+        previous_time = time.perf_counter()
+        while not self.stop_event.wait(0.1):
+            rss, cpu_ticks = self._procfs_snapshot(root_pid)
+            sampled_at = time.perf_counter()
+            cpu = 0.0
+            if previous_ticks is not None and sampled_at > previous_time:
+                cpu = (
+                    (cpu_ticks - previous_ticks)
+                    / clock_ticks
+                    / (sampled_at - previous_time)
+                    * 100.0
+                )
+            previous_ticks = cpu_ticks
+            previous_time = sampled_at
+            self.peak_rss = max(self.peak_rss, rss)
+            self.cpu_samples.append(max(cpu, 0.0))
 
 
 def main() -> int:
