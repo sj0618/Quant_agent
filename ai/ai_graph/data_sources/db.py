@@ -182,14 +182,14 @@ class PostgresPipelineDataSource:
                 else:
                     ticker_resolution = "explicit_or_name_match"
             if screening_candidates:
-                # Every match is a tradable name, so the backtest gets the whole pool
-                # (capped) instead of only the first ticker - loading one ticker forced
-                # applied_max_positions down to a single position no matter what the
-                # strategy asked for.
-                tickers = _backtest_ticker_pool(
-                    screening_candidates, self.config.backtest_max_tickers
-                )
-                ticker = tickers[0]
+                # The matched names are the recommendation ("buy these today"). The
+                # backtest, though, runs over a liquidity-selected universe so build_signals
+                # can enter and exit per date across many names instead of replaying the
+                # past of whichever handful is at a high right now. Recommendation and
+                # backtest universe are deliberately different things.
+                recommended = [str(item["ticker"]).zfill(6) for item in screening_candidates]
+                tickers = self._fetch_backtest_universe(conn, recommended)
+                ticker = recommended[0]
                 symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
                 price_rows, effective_lookback_days = self._fetch_price_rows(
@@ -249,6 +249,39 @@ class PostgresPipelineDataSource:
                 "macro_status": macro_status,
             },
         )
+
+    def _fetch_backtest_universe(self, conn: Any, recommended: Sequence[str]) -> list[str]:
+        """The universe the backtest actually trades over: KOSPI 200.
+
+        The screen answers "which names meet the condition today"; using that as the
+        backtest universe means trading only the two stocks that happen to be at a
+        52-week high right now, then judging the strategy on their past - which is
+        look-ahead, since being at a high today is exactly "went up in the past". The
+        generated build_signals already decides entries per date from each stock's own
+        history, so it just needs a fixed, outcome-independent market to trade in.
+
+        KOSPI 200 is that market. There is no index-membership table, so it is
+        approximated the standard way - the 200 largest KOSPI common stocks by market
+        cap (MKTCAP on symbol_master). The strategy's recommended names are unioned in so
+        they remain tradable even if one sits just outside the top 200.
+        """
+
+        rows = conn.execute(
+            """
+            SELECT symbol
+            FROM core.symbol_master
+            WHERE market = 'KOSPI'
+              AND security_type = '보통주'
+              AND metadata_jsonb->>'MKTCAP' ~ '^[0-9]+$'
+            ORDER BY (metadata_jsonb->>'MKTCAP')::numeric DESC
+            LIMIT 200
+            """
+        ).fetchall()
+        universe = [str(row["symbol"]).zfill(6) for row in rows]
+        seen = set(universe)
+        # Recommended names first, then KOSPI 200, so a recommendation is never dropped.
+        extra = [t for t in (str(x).zfill(6) for x in recommended) if t not in seen]
+        return [*extra, *universe]
 
     def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
         return self._screen_with_relaxation(conn, query)[0]

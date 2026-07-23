@@ -18,17 +18,20 @@ def requested_max_positions(max_position_pct: float | None) -> int:
 def applied_max_positions(
     max_position_pct: float | None, available_ticker_count: int | None = None
 ) -> int:
-    """How many positions the backtest may hold at once.
+    """How many positions may be held at once.
 
-    Every screened name is a candidate the strategy asked for, so the backtest holds as
-    many as the screen returned. Capping this at a fixed default (or, worse, showing
-    "최대 보유 2종목" because only two names matched) throttled the strategy to a slice of
-    its own universe for no reason the user expressed. The screen size already bounds it.
+    Driven by the strategy's own max_position_pct (10% -> 10 names), capped by how many
+    names are actually available. The backtest now runs over a wide liquidity universe,
+    so "최대 보유 2종목" - the symptom that motivated removing this cap - is gone at its
+    source: it came from backtesting only the two names the screen matched today, not
+    from the cap itself. Holding every one of a 120-name universe at once is not a
+    portfolio, so the cap stays.
     """
 
+    requested = requested_max_positions(max_position_pct)
     if available_ticker_count is None or available_ticker_count <= 0:
-        return requested_max_positions(max_position_pct)
-    return max(1, available_ticker_count)
+        return requested
+    return max(1, min(requested, available_ticker_count))
 
 
 def available_ticker_count(price_rows: Sequence[Mapping[str, Any]]) -> int:
