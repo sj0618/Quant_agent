@@ -27,8 +27,12 @@ else:
     DE_ROOT = Path(__file__).resolve().parents[2]  # 로컬의 Quant-agent/DE 폴더
     REPO_ROOT = DE_ROOT.parent                     # 로컬의 Quant-agent 최상위 폴더
 
+
+def _airflow_dotenv_disabled() -> bool:
+    return os.getenv("QUANT_AIRFLOW_LOAD_DOTENV", "true").lower() in {"0", "false", "no", "off"}
+
 def _load_airflow_dotenv() -> None:
-    if os.getenv("QUANT_AIRFLOW_LOAD_DOTENV", "true").lower() in {"0", "false", "no", "off"}:
+    if _airflow_dotenv_disabled():
         return
     try:
         from dotenv import load_dotenv
@@ -111,6 +115,16 @@ def _symbols_from_env() -> tuple[str, ...]:
 
 def _bok_series_json() -> str:
     return os.getenv("BOK_SERIES_JSON") or os.getenv("BOK_DAILY_SERIES_JSON") or DEFAULT_BOK_SERIES_JSON
+
+
+def _ta_worker_count() -> int | None:
+    raw = os.getenv("QUANT_TA_MAX_WORKERS")
+    if raw is None or raw.strip() == "":
+        return None
+    workers = int(raw)
+    if workers < 1:
+        raise ValueError("QUANT_TA_MAX_WORKERS must be >= 1.")
+    return workers
 
 
 if dag and task:  # pragma: no branch
@@ -346,9 +360,14 @@ def _technical_indicator_args(*, start_date: date, end_date: date) -> list[str]:
         start_date.isoformat(),
         "--end-date",
         end_date.isoformat(),
+    ]
+    workers = _ta_worker_count()
+    if workers is not None:
+        args.extend(["--workers", str(workers)])
+    args.extend([
         "--input-price-source",
         "kis-adjusted",
-    ]
+    ])
     symbols = _symbols_from_env()
     if symbols:
         args.extend(["--tickers", ",".join(symbols)])
@@ -394,6 +413,8 @@ def _dart_bok_ingest_args(
             args.append("--dart-refresh-corp-codes")
     elif source == "bok" and bok_series_json:
         args.extend(["--bok-series-json", bok_series_json])
+    if _airflow_dotenv_disabled():
+        args.extend(["--dotenv-path", ""])
     return args
 
 

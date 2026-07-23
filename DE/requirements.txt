@@ -1,6 +1,7 @@
-# --- [1. 퀀트 / 데이터 수집 핵심 패키지] ---
-numpy==1.26.4
-pandas==2.1.4
+# --- [1. Core quant / data packages] ---
+numpy==2.2.6
+pandas==2.3.2
+pandas-ta-classic==0.6.52
 psycopg[binary]==3.2.13
 requests==2.32.5
 python-dotenv==1.2.2
@@ -8,19 +9,17 @@ tqdm==4.67.3
 
 TA-Lib==0.6.8
 
-# --- [2. LLM / 멀티에이전트 Stack] ---
+# --- [2. LLM / multi-agent stack] ---
 openai==2.29.0
 google-genai==1.68.0
 google-generativeai==0.8.6
 pydantic==2.12.5
 tenacity==9.1.4
 
-# --- [3. 기타 유틸리티] ---
+# --- [3. Utilities] ---
 slack_sdk==3.41.0
 anyio==4.12.1
 websockets==16.0
 
-# --- [4. 에어플로우 호환성을 위해 버전 지정을 해제하거나 제외할 패키지] ---
-# numpy, jinja2 등은 에어플로우 자체 버전을 따르도록 버전을 적지 않거나 제외합니다.
-numpy
+# --- [4. Tests] ---
 pytest
