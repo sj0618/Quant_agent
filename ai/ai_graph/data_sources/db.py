@@ -324,13 +324,15 @@ class PostgresPipelineDataSource:
             result = screen_with_llm(conn, query)
         except Exception:
             _logger.exception("LLM screening failed; falling back to profile screening")
-            return None
-        finally:
-            # statement_timeout is set transaction-locally, and this path rolls back
-            # after a failed query - which discards it. Without this the rest of the
-            # load runs with no timeout at all, so one bad plan hangs the analysis
-            # instead of erroring out.
-            self._set_statement_timeout(conn)
+            result = None
+        if not result or not result.get("rows"):
+            # A PostgreSQL statement failure aborts the whole transaction. The LLM
+            # screen normally rolls back failed attempts itself, but this boundary
+            # also catches failures outside that inner try/except.
+            self._rollback_quietly(conn)
+        # statement_timeout is transaction-local, so a rollback above (or inside the
+        # LLM retry loop) discards it. Restore it before any profile/fetch query.
+        self._set_statement_timeout(conn)
         if not result or not result.get("rows"):
             return None
 
@@ -370,7 +372,14 @@ class PostgresPipelineDataSource:
             return llm_result
 
         profile = _screening_profile(query)
-        sector = extract_sector_from_query(query, get_known_sectors(conn=conn))
+        known_sectors = get_known_sectors(conn=conn)
+        # The sector helper deliberately converts an unavailable optional view into a
+        # static taxonomy fallback. PostgreSQL still leaves the shared transaction in
+        # INERROR, and that detail is hidden by the fallback, so reset unconditionally
+        # before the baseline query.
+        self._rollback_quietly(conn)
+        self._set_statement_timeout(conn)
+        sector = extract_sector_from_query(query, known_sectors)
         params: list[Any] = [sector] if sector else []
         # The window-function CTE is the expensive part, so it runs once and every
         # relaxation round re-filters these rows in-process.
@@ -420,6 +429,16 @@ class PostgresPipelineDataSource:
         # is_local=true: scoped to the current transaction, so the caller can widen the
         # budget for a heavy fetch and have it revert on the next transaction on its own.
         _ = conn.execute("SELECT set_config('statement_timeout', %s, true)", [timeout_value])
+
+    @staticmethod
+    def _rollback_quietly(conn: Any) -> None:
+        try:
+            conn.rollback()
+        except Exception:
+            # Test doubles and already-closed connections may not support rollback.
+            # The following timeout query will still surface an unusable real
+            # connection instead of hiding the failure.
+            _logger.debug("could not reset screening transaction", exc_info=True)
 
     def _resolve_ticker(self, conn: Any, query: str) -> str | None:
         """Resolve a single explicit ticker for `query`, or None if ambiguous.

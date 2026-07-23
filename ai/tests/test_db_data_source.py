@@ -297,6 +297,68 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
     assert bundle.data_availability["price_ta"] == "available"
 
 
+def test_profile_screening_recovers_when_dynamic_sector_view_is_missing(monkeypatch) -> None:
+    class Result:
+        def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
+            self.rows = rows or []
+
+        def fetchall(self) -> list[dict[str, object]]:
+            return self.rows
+
+    class MissingSectorViewConnection:
+        def __init__(self) -> None:
+            self.aborted = False
+            self.rollbacks = 0
+            self.calls: list[str] = []
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+            self.aborted = False
+
+        def execute(
+            self, query: str, params: list[object] | None = None
+        ) -> Result:
+            self.calls.append(query)
+            if "FROM mart.common_stock_universe_asof u" in query:
+                self.aborted = True
+                raise RuntimeError('relation "mart.common_stock_universe_asof" does not exist')
+            if self.aborted:
+                raise RuntimeError("current transaction is aborted")
+            if "set_config('statement_timeout'" in query:
+                return Result()
+            return Result(
+                rows=[
+                    {
+                        "time": date(2026, 5, 20),
+                        "ticker": "000660",
+                        "name": "SK하이닉스",
+                        "market_segment": "KOSPI",
+                        "sector": "반도체",
+                        "close": Decimal("200000"),
+                        "volume_ratio_20": Decimal("1.8"),
+                        "relative_strength_20d": Decimal("0.05"),
+                        "relative_strength_60d": Decimal("0.1"),
+                        "high_252": Decimal("200000"),
+                        "sma20": Decimal("180000"),
+                        "sma200": Decimal("150000"),
+                    }
+                ]
+            )
+
+    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+    conn = MissingSectorViewConnection()
+    monkeypatch.setattr(source, "_screen_via_llm", lambda _conn, _query: None)
+
+    candidates, trace = source._screen_with_relaxation(
+        conn, "최근 52주 신고가 거래량 종목을 찾아줘"
+    )
+
+    assert conn.rollbacks == 1
+    assert any("set_config('statement_timeout'" in query for query in conn.calls)
+    assert candidates[0]["ticker"] == "000660"
+    assert trace["matched_count"] == 1
+
+
 def test_postgres_data_source_filters_screening_by_sector() -> None:
     class Result:
         def __init__(
