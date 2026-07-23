@@ -50,6 +50,7 @@ from ai_graph.schemas import (
     ScreeningMatch,
     SemanticSlots,
     SourceUsage,
+    RecommendationGate,
     StrategyCandidateCard,
     StrategySpec,
 )
@@ -576,9 +577,19 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         for card in state.get("data", {}).get("candidate_cards", [])
     ]
     if status == EnvelopeStatus.READY:
+        gate = _recommendation_gate(state)
+        validated = gate is None or gate.validated
         payload = {
-            "headline": "전략 분석이 완료되었습니다.",
-            "message": "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다.",
+            "headline": (
+                "전략 분석이 완료되었습니다."
+                if validated
+                else "전략이 백테스트 검증을 통과하지 못했습니다."
+            ),
+            "message": (
+                "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다."
+                if validated
+                else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
+            ),
             "next_actions": [
                 "web_projection 확인",
                 "email_projection 예약",
@@ -588,6 +599,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             "candidate_cards": cards,
             "report": report,
             "performance": build_public_backtest_performance(state.get("backtest")),
+            "recommendation_gate": gate,
         }
     elif status == EnvelopeStatus.REJECTED:
         clarification = _clarification_from_ambiguity(state["ambiguity"])
@@ -2133,6 +2145,25 @@ def build_public_backtest_performance(
         equity_curve=result.equity_curve,
         engine_summary=result.engine_summary,
     )
+
+
+def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
+    """Gate today's picks on the backtest of the strategy that produced them.
+
+    Returns None when there was no backtest to gate against (no picks, or the backtest
+    node never ran). Otherwise validated mirrors whether the backtest cleared the
+    objective floor, so a strategy that failed history is not dressed up as a buy list.
+    """
+
+    if state.get("backtest") is None:
+        return None
+    validated = bool(state.get("strategy_validated"))
+    reason = (
+        "백테스트가 목표 기준(샤프·MDD·벤치마크 초과)을 충족했습니다."
+        if validated
+        else "백테스트가 목표 기준(샤프·MDD·벤치마크 초과)에 미달해 참고용입니다."
+    )
+    return RecommendationGate(validated=validated, reason=reason)
 
 
 def _status_for_category(category: AmbiguityCode) -> EnvelopeStatus:

@@ -443,6 +443,21 @@ class InternalPayload(BaseModel):
     risk_events: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class RecommendationGate(BaseModel):
+    """Whether the backtest validated the strategy that produced today's picks.
+
+    The screen names "the stocks to buy today", but that recommendation is only as
+    trustworthy as the strategy behind it. When the backtest of that same rule does not
+    clear the objective floor, the picks are still shown - hiding them loses information -
+    but flagged not-validated so the UI presents them as reference, not a call to act.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    validated: bool
+    reason: str = Field(min_length=1)
+
+
 class UserPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -452,6 +467,7 @@ class UserPayload(BaseModel):
     candidate_cards: list[StrategyCandidateCard] = Field(default_factory=list)
     report: ReportBundle | None = None
     performance: BacktestPerformance | None = None
+    recommendation_gate: RecommendationGate | None = None
     question: str | None = None
     options: list[ClarificationOption] = Field(default_factory=list, max_length=3)
     recommended: int | None = Field(default=None, ge=0, le=2)

@@ -201,6 +201,11 @@ export interface AIBacktestPerformance {
   engine_summary?: Record<string, unknown>;
 }
 
+export interface AIRecommendationGate {
+  validated: boolean;
+  reason: string;
+}
+
 export interface AIUserPayload {
   headline: string;
   message: string;
@@ -208,6 +213,7 @@ export interface AIUserPayload {
   candidate_cards: StrategyCandidateCard[];
   report: AIReportBundle | null;
   performance?: AIBacktestPerformance | null;
+  recommendation_gate?: AIRecommendationGate | null;
   question?: string | null;
   options?: AIClarificationOption[];
   recommended?: number | null;
