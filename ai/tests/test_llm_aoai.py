@@ -36,6 +36,7 @@ def make_client(response_payload: dict) -> AOAIResponsesClient:
         assert request.headers["api-key"] == "test-api-key"
         assert body["model"] == "test-model"
         assert body["temperature"] == 0.0
+        assert body["service_tier"] == "priority"
         assert body["stream"] is True
         assert body["input"][0]["role"] == "system"
         assert body["input"][1]["role"] == "user"
@@ -183,6 +184,38 @@ def test_aoai_client_retries_without_unsupported_temperature() -> None:
     assert client.generate_json(make_request()) == {"message": "ok"}
     assert request_bodies[0]["temperature"] == 0.0
     assert "temperature" not in request_bodies[1]
+
+
+def test_aoai_client_retries_without_unsupported_priority_service_tier() -> None:
+    request_bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        request_bodies.append(body)
+        if len(request_bodies) == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "Unsupported parameter: 'service_tier'.",
+                        "type": "invalid_request_error",
+                        "param": "service_tier",
+                        "code": None,
+                    }
+                },
+            )
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_json(make_request()) == {"message": "ok"}
+    assert request_bodies[0]["service_tier"] == "priority"
+    assert "service_tier" not in request_bodies[1]
 
 
 def test_aoai_client_rejects_broken_output_text_json() -> None:

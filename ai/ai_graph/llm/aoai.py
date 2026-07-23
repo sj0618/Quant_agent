@@ -17,6 +17,7 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_RESPONSE_START_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.25
+DEFAULT_SERVICE_TIER = "priority"
 # Used when a 429 arrives without a Retry-After header, and as the cap when it has one.
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 5.0
 MAX_RETRY_AFTER_SECONDS = 60.0
@@ -40,6 +41,7 @@ class AOAIResponsesClient:
         response_start_timeout_seconds: float = DEFAULT_RESPONSE_START_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+        service_tier: str = DEFAULT_SERVICE_TIER,
         web_search_tool_type: str = DEFAULT_WEB_SEARCH_TOOL_TYPE,
         http_client: httpx.Client | None = None,
     ) -> None:
@@ -50,11 +52,13 @@ class AOAIResponsesClient:
         self.response_start_timeout_seconds = response_start_timeout_seconds
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
+        self.service_tier = service_tier
         self.web_search_tool_type = web_search_tool_type
         self._http_client = http_client
         # Some deployments reject `temperature` outright. The first 400 tells us, and
         # remembering it stops every later call from burning a round-trip to relearn it.
         self._temperature_supported = True
+        self._service_tier_supported = True
 
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
         call_id = begin_model_call(
@@ -179,6 +183,10 @@ class AOAIResponsesClient:
                                 self._temperature_supported = False
                                 body.pop("temperature", None)
                                 continue
+                            if _unsupported_parameter(response, "service_tier"):
+                                self._service_tier_supported = False
+                                body.pop("service_tier", None)
+                                continue
                             if (
                                 response.status_code in RETRYABLE_STATUS_CODES
                                 and attempt < attempts - 1
@@ -278,6 +286,8 @@ class AOAIResponsesClient:
         }
         if self._temperature_supported:
             body["temperature"] = request.temperature
+        if self._service_tier_supported:
+            body["service_tier"] = self.service_tier
         if request.enable_web_search:
             body["tools"] = [{"type": self.web_search_tool_type}]
         if request.response_schema is not None:
