@@ -20,6 +20,7 @@ from ai_graph.nodes.position_sizing import (
     max_position_pct_from_risk_constraints,
 )
 from ai_graph.schemas import CodeCandidate, StrategySpec
+from ai_graph.nodes.condition_compiler import compile_entry_expression
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
@@ -448,12 +449,97 @@ def _deterministic_fallback_candidates(
     return (generated + templates)[:MAX_GENERATED_CANDIDATES]
 
 
+def _render_condition_signal_code(
+    strategy: StrategySpec, entry_expr: str, max_positions: int
+) -> str:
+    """build_signals whose entry test is the strategy's own compiled conditions.
+
+    Unlike the profile templates, which pick a generic momentum/breakout shape, this
+    trades exactly the rule the screen used - the same structured conditions, compiled
+    to a boolean over each stock's rolling history. Exits fall back to stop/target on the
+    entry price so a position is not held forever; entry is the strategy itself.
+    """
+
+    stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", 0.08))
+    take_profit = float(strategy.risk_constraints.get("take_profit_pct", 0.2))
+    return f'''def build_signals(prices):
+    def _avg(xs):
+        return sum(xs) / len(xs) if xs else 0.0
+    signals = []
+    rows_by_date = {{}}
+    for row in sorted(prices, key=lambda item: (item["date"], item.get("ticker", "000000"))):
+        rows_by_date.setdefault(row["date"], []).append(row)
+    histories = {{}}
+    states = {{}}
+    stop_loss = {stop_loss!r}
+    take_profit = {take_profit!r}
+    max_positions = {int(max_positions)}
+    strategy_id = {strategy.strategy_id!r}
+    for current_date in sorted(rows_by_date):
+        entries = []
+        for row in rows_by_date[current_date]:
+            ticker = row.get("ticker", "000000")
+            open_price = float(row.get("open", row.get("close", 0)))
+            high_price = float(row.get("high", row.get("close", 0)))
+            low_price = float(row.get("low", row.get("close", 0)))
+            close = float(row["close"])
+            volume = float(row.get("volume", 0))
+            rsi = float(row.get("rsi", row.get("RSI_14", 50)))
+            hist = histories.setdefault(
+                ticker, {{"opens": [], "highs": [], "lows": [], "closes": [], "volumes": []}}
+            )
+            state = states.setdefault(ticker, {{"in_position": False, "entry_price": 0.0}})
+            opens = hist["opens"]
+            highs = hist["highs"]
+            lows = hist["lows"]
+            closes = hist["closes"]
+            volumes = hist["volumes"]
+            # Enough history for the longest window before the rule can be judged.
+            ready = len(closes) >= 1
+            entry_ok = False
+            if ready:
+                try:
+                    entry_ok = bool({entry_expr})
+                except (ValueError, ZeroDivisionError, IndexError):
+                    entry_ok = False
+            if state["in_position"]:
+                entry_price = state["entry_price"]
+                gain = (close / entry_price - 1) if entry_price else 0.0
+                if gain <= -stop_loss or gain >= take_profit:
+                    signals.append({{"date": current_date, "ticker": ticker, "action": "SELL", "price": close}})
+                    state["in_position"] = False
+                    state["entry_price"] = 0.0
+            elif entry_ok:
+                entries.append((ticker, close))
+            opens.append(open_price)
+            highs.append(high_price)
+            lows.append(low_price)
+            closes.append(close)
+            volumes.append(volume)
+        held = sum(1 for s in states.values() if s["in_position"])
+        for ticker, price in entries:
+            if held >= max_positions:
+                break
+            signals.append({{"date": current_date, "ticker": ticker, "action": "BUY", "price": price}})
+            states[ticker]["in_position"] = True
+            states[ticker]["entry_price"] = price
+            held += 1
+    return signals
+'''
+
+
 def _generated_strategy_candidates(
     strategy: StrategySpec,
     plan: CodeGenerationPlan,
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[str]:
     codes: list[str] = []
+    # If the strategy's conditions compile to a price-series rule, trade exactly that
+    # first - it is the screen's own rule, not a generic profile. Non-price conditions
+    # (financial, cross-sectional) do not compile and fall through to the profiles.
+    entry_expr = compile_entry_expression(strategy.entry_conditions)
+    if entry_expr is not None:
+        codes.append(_render_condition_signal_code(strategy, entry_expr, max_positions))
     profiles = _candidate_profiles(plan)
     lookbacks = [*plan.lookbacks, 75, 100, 125, 150, 200, 252]
     thresholds = [*plan.thresholds, 0.12, 0.18, 0.25, 0.35, 0.5, 0.75]
