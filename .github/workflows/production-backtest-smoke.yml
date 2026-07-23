@@ -1,0 +1,65 @@
+name: Production backtest smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-backtest-smoke
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    name: Run deployed full analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT || '30233' }}
+      SERVER_USER: ${{ secrets.SERVER_USER || 'etluser' }}
+      SERVER_APP_DIR: ${{ secrets.SERVER_APP_DIR || '/home/etluser/mvp_sp1/quant-proj' }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    steps:
+      - name: Validate required secret
+        run: test -n "$SSH_PRIVATE_KEY"
+
+      - name: Configure SSH
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Run production analysis with two workers
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$1"
+          if [ -f "$HOME/.bashrc" ]; then
+            set +u
+            source "$HOME/.bashrc"
+            set -u
+          fi
+
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          test -f "$APP_DIR/ai/scripts/run_production_analysis_smoke.py"
+
+          cd "$APP_DIR/ai"
+          export AI_BACKTEST_WORKERS=2
+          export AI_BACKTEST_WALL_BUDGET_SECONDS=540
+          export AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS=180
+          "$APP_DIR/ai/.venv/bin/python" \
+            "$APP_DIR/ai/scripts/run_production_analysis_smoke.py" \
+            --max-wall-seconds 600
+          REMOTE
