@@ -38,6 +38,8 @@ jobs:
         run: |
           ssh -o BatchMode=yes \
             -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
             -o StrictHostKeyChecking=yes \
             -i "$HOME/.ssh/id_ed25519" \
             -p "$SERVER_PORT" \
