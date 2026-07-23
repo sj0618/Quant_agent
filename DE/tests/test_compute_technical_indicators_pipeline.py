@@ -43,6 +43,11 @@ class ComputeTechnicalIndicatorsPipelineTests(unittest.TestCase):
         self.assertIn("CDL_HAMMER", result.columns)
         self.assertIn("CDL_PIERCING", result.columns)
 
+    def test_mart_feature_view_sql_includes_sector_column(self):
+        sql = pipeline.mart_feature_view_sql()
+        self.assertIn("sm.sector", sql)
+        self.assertIn("CREATE OR REPLACE VIEW mart.symbol_feature_frame_asof", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

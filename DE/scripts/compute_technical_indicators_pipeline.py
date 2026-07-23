@@ -853,7 +853,8 @@ def mart_feature_view_sql() -> str:
             tv.values_jsonb AS volatility_values,
             tvol.values_jsonb AS volume_values,
             tp.values_jsonb AS pattern_values,
-            a.run_id AS adjusted_ohlcv_run_id
+            a.run_id AS adjusted_ohlcv_run_id,
+            sm.sector
         FROM {ADJUSTED_OHLCV_TABLE} a
         JOIN core.symbol_master sm ON sm.symbol = a.base_ticker
         LEFT JOIN {CATEGORY_TABLES["Trend"]} tt
