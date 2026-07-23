@@ -7,7 +7,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ai_graph.llm.role_calls import RoleDebatePayload, generate_role_debate
 from ai_graph.nodes.backtest import summarize_backtest
 from ai_graph.schemas import L4Evidence, SignalDecision as InvestmentSignalDecision
 
@@ -131,19 +130,22 @@ def generate_signal(
 
 
 def signal_node(state: dict[str, Any]) -> dict[str, Any]:
-    debate = build_signal_debate(state)
+    """Turn the backtest into a BUY/HOLD/DROP signal - by rule, not by debate.
+
+    This used to run a three-way bull/bear/judge LLM debate whose verdict never changed
+    the decision: the signal is a function of the backtest's Sharpe and drawdown, and the
+    debate only appended commentary. Anything the debate flagged that a rule cannot -
+    a tiny universe, say - is already surfaced by the backtest's own sample-size warning.
+    So the LLM calls are gone; build_investment_signal derives the signal from the
+    backtest, and the Report node does the interpreting for the reader.
+    """
+
     if "market_snapshot" in state:
         result = generate_signal(
             state["strategy_spec"],
             state["market_snapshot"],
             has_position=bool(state.get("has_position", False)),
             trace_id=state.get("trace_id"),
-        )
-        investment_signal = build_investment_signal(
-            state.get("backtest", {}),
-            trace_id=state.get("trace_id"),
-            l4_evidence=state.get("l4_evidence"),
-            debate=debate,
         )
     else:
         result = _result(
@@ -153,16 +155,14 @@ def signal_node(state: dict[str, Any]) -> dict[str, Any]:
             "WATCH",
             ["no single-ticker market snapshot supplied"],
         )
-        investment_signal = build_investment_signal(
-            state.get("backtest", {}),
-            trace_id=state.get("trace_id"),
-            l4_evidence=state.get("l4_evidence"),
-            debate=debate,
-        )
+    investment_signal = build_investment_signal(
+        state.get("backtest", {}),
+        trace_id=state.get("trace_id"),
+        l4_evidence=state.get("l4_evidence"),
+    )
     return {
         "signal": result.model_dump(),
         "investment_signal": investment_signal.model_dump(),
-        "signal_debate": debate,
         "trace_id": result.trace_id,
         "debug_ref": result.debug_ref,
     }
@@ -217,63 +217,6 @@ def build_investment_signal(
         judge_reason=judge_reason,
         l4_evidence=evidence,
     )
-
-
-def build_signal_debate(state: dict[str, Any]) -> dict[str, Any]:
-    context = {
-        "strategy": state.get("strategy_spec", {}),
-        "backtest": summarize_backtest(state.get("backtest", {})),
-        "l4_evidence": state.get("l4_evidence", []),
-        "screening_candidates": state.get("data", {}).get("screening_candidates", []),
-        "data_availability": state.get("data", {}).get("data_availability", {}),
-    }
-    bull = generate_role_debate(
-        role="SIGNAL_BULL",
-        task="Collect supportive signal evidence only.",
-        context=context,
-        fallback=RoleDebatePayload(
-            role="SIGNAL_BULL",
-            summary="후보 코드 백테스트와 공용 DB 후보가 있으면 BUY/HOLD 판단의 긍정 근거로 사용합니다.",
-            evidence=["Selected code candidate metrics are available.", "SEIBro raw evidence is attached when DB is configured."],
-            recommendation="BUY_OR_HOLD",
-            confidence=0.72,
-        ),
-    )
-    bear = generate_role_debate(
-        role="SIGNAL_BEAR",
-        task="Collect negative signal evidence and sell-deficiency gaps only.",
-        context=context,
-        fallback=RoleDebatePayload(
-            role="SIGNAL_BEAR",
-            summary="매도 의견 감소, 외국인 순매도, 영문 IB downgrade 축은 production adapter가 필요합니다.",
-            concerns=["Sell-deficiency three-axis data is not fully connected.", "External web search is disabled."],
-            recommendation="confidence_cap_if_missing",
-            confidence=0.66,
-        ),
-    )
-    judge = generate_role_debate(
-        role="SIGNAL_JUDGE",
-        task="Judge signal sufficiency and final BUY/HOLD/DROP confidence.",
-        context={**context, "bull": bull.model_dump(), "bear": bear.model_dump()},
-        fallback=RoleDebatePayload(
-            role="SIGNAL_JUDGE",
-            summary="백테스트 성과를 우선하되, 누락된 수급/뉴스 축은 confidence에서 보수적으로 반영합니다.",
-            evidence=["Backtest metrics and Risk Manager inputs are available."],
-            concerns=bear.concerns,
-            recommendation="use_backtest_with_missing_data_disclosure",
-            confidence=0.7,
-            validation_results={
-                "source_sufficiency": "partial",
-                "source_diversity": "db_and_fixture",
-                "sell_deficiency_axes": "not_fully_connected",
-            },
-        ),
-    )
-    return {
-        "bull": bull.model_dump(),
-        "bear": bear.model_dump(),
-        "judge": judge.model_dump(),
-    }
 
 
 def default_l4_evidence(trace_id: str) -> list[dict[str, Any]]:

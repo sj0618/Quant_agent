@@ -2067,7 +2067,6 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
             "backtest_code",
             "backtest",
             "signal",
-            "signal_debate",
             "investment_signal",
             "risk",
             "report_debate",

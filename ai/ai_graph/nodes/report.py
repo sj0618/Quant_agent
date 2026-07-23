@@ -129,15 +129,21 @@ def build_report_debate(
     from the debates that already ran and handed to a single writing call.
     """
 
-    signal_debate = (state.get("signal") or {}).get("debate") or state.get("signal_debate") or {}
+    # The signal is now derived from the backtest by rule (no debate), so the opposing
+    # material comes from that decision's own bull/bear case rather than three LLM calls.
+    investment_signal = state.get("investment_signal") or {}
     context = {
         "strategy": strategy.model_dump(),
         "risk": risk.model_dump(),
         "backtest": summarize_backtest(state.get("backtest", {})),
         "data_availability": state.get("data", {}).get("data_availability", {}),
-        # Opposing material from the debates that already ran, rather than new ones.
-        "supporting_case": signal_debate.get("bull") or {},
-        "objections": signal_debate.get("bear") or {},
+        "signal_decision": {
+            "action": investment_signal.get("action"),
+            "confidence": investment_signal.get("confidence"),
+            "reason": investment_signal.get("judge_reason"),
+        },
+        "supporting_case": investment_signal.get("bull_case") or [],
+        "objections": investment_signal.get("bear_case") or [],
         "research_review": state.get("research_review") or {},
     }
     writeup = generate_report_writeup(
