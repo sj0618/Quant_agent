@@ -351,11 +351,35 @@ class RiskAdjustment(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class PortfolioRisk(BaseModel):
+    """Concentration and correlation of the names the strategy trades.
+
+    All measured from the portfolio itself - sector mix and pairwise return correlation
+    - with no fixed thresholds; the fields are continuous so the risk step can scale its
+    response rather than trip a hardcoded line.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name_count: int = Field(ge=0)
+    sector_count: int = Field(ge=0)
+    # Effective number of sectors (1/HHI of sector weights): near 1 = one sector,
+    # near sector_count = evenly spread.
+    effective_sectors: float = Field(ge=0.0)
+    top_sector_weight: float = Field(ge=0.0, le=1.0)
+    # Average pairwise correlation of daily returns; high = the names move together, so
+    # holding several of them buys little diversification.
+    average_correlation: float | None = None
+    # 0 (fully concentrated / perfectly correlated) .. 1 (well spread / uncorrelated).
+    diversification_score: float = Field(ge=0.0, le=1.0)
+
+
 class RiskDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     signal: SignalDecision
     adjustments: list[RiskAdjustment] = Field(default_factory=list)
+    portfolio_risk: PortfolioRisk | None = None
 
 
 class ReportProjection(BaseModel):

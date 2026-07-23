@@ -142,6 +142,8 @@ def build_report_debate(
             "confidence": investment_signal.get("confidence"),
             "reason": investment_signal.get("judge_reason"),
         },
+        # Surfaced explicitly so the write-up addresses concentration, not just returns.
+        "portfolio_risk": (risk.portfolio_risk.model_dump() if risk.portfolio_risk else None),
         "supporting_case": investment_signal.get("bull_case") or [],
         "objections": investment_signal.get("bear_case") or [],
         "research_review": state.get("research_review") or {},
