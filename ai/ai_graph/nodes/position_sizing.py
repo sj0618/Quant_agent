@@ -18,10 +18,17 @@ def requested_max_positions(max_position_pct: float | None) -> int:
 def applied_max_positions(
     max_position_pct: float | None, available_ticker_count: int | None = None
 ) -> int:
-    requested = requested_max_positions(max_position_pct)
+    """How many positions the backtest may hold at once.
+
+    Every screened name is a candidate the strategy asked for, so the backtest holds as
+    many as the screen returned. Capping this at a fixed default (or, worse, showing
+    "최대 보유 2종목" because only two names matched) throttled the strategy to a slice of
+    its own universe for no reason the user expressed. The screen size already bounds it.
+    """
+
     if available_ticker_count is None or available_ticker_count <= 0:
-        return requested
-    return max(1, min(requested, available_ticker_count))
+        return requested_max_positions(max_position_pct)
+    return max(1, available_ticker_count)
 
 
 def available_ticker_count(price_rows: Sequence[Mapping[str, Any]]) -> int:
