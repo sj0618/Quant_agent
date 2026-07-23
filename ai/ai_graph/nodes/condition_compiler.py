@@ -31,6 +31,13 @@ _CURRENT: dict[str, str] = {
     "close": "close",
     "volume": "volume",
     "rsi": "rsi",
+    # Point-in-time financials forward-filled onto each row (see db.py). Current-bar
+    # only - a filing has no meaningful rolling window here.
+    "roe": "roe",
+    "debt_to_equity": "debt_to_equity",
+    "operating_margin": "operating_margin",
+    "operating_income": "operating_income",
+    "revenue": "revenue",
 }
 _HISTORY: dict[str, str] = {
     "open": "opens",
@@ -39,6 +46,11 @@ _HISTORY: dict[str, str] = {
     "close": "closes",
     "volume": "volumes",
 }
+# Financials are forward-filled and may be missing on early dates; a condition on them
+# must treat "not yet filed" as not-matched rather than erroring.
+_FINANCIAL_METRICS = frozenset(
+    {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"}
+)
 
 _OPERATOR: dict[ConditionOperator, str] = {
     ConditionOperator.LT: "<",
@@ -115,6 +127,10 @@ def _series_value(metric: str, window: int | None, aggregate: str | None) -> str
         if agg is None:
             return None
         return f"{agg}({window_slice})"
+    if metric in _FINANCIAL_METRICS:
+        # Forward-filled from filings and absent before the first one; _fin() returns a
+        # sentinel that fails any numeric comparison so an un-filed name never matches.
+        return f"_fin(fin, '{metric}')"
     return _CURRENT.get(metric)
 
 

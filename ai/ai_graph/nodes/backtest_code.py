@@ -465,6 +465,11 @@ def _render_condition_signal_code(
     return f'''def build_signals(prices):
     def _avg(xs):
         return sum(xs) / len(xs) if xs else 0.0
+    def _fin(row, key):
+        value = row.get(key)
+        # None (not yet filed) becomes a sentinel that fails every numeric comparison,
+        # so a name with no filing on this date simply does not match the condition.
+        return value if isinstance(value, (int, float)) else float("-inf")
     signals = []
     rows_by_date = {{}}
     for row in sorted(prices, key=lambda item: (item["date"], item.get("ticker", "000000"))):
@@ -485,6 +490,8 @@ def _render_condition_signal_code(
             close = float(row["close"])
             volume = float(row.get("volume", 0))
             rsi = float(row.get("rsi", row.get("RSI_14", 50)))
+            # The forward-filled financials live on the row itself; _fin() reads them.
+            fin = row
             hist = histories.setdefault(
                 ticker, {{"opens": [], "highs": [], "lows": [], "closes": [], "volumes": []}}
             )

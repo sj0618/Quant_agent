@@ -492,7 +492,8 @@ class PostgresPipelineDataSource:
         momentum_by_ticker = self._fetch_momentum_values_by_date(
             conn, ticker_list, calendar_lookback_days, lookback_days
         )
-        return [
+        financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
+        price_rows = [
             _price_row_from_feature_frame_record(
                 _feature_frame_row_from_sources(
                     row,
@@ -502,6 +503,71 @@ class PostgresPipelineDataSource:
             )
             for row in rows
         ]
+        _attach_pointintime_financials(price_rows, financials_by_ticker)
+        return price_rows
+
+    def _fetch_financial_timeline(
+        self, conn: Any, tickers: Sequence[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Each ticker's filings as a time-ordered list of (filed_date, ratios).
+
+        Loaded small (tens of filings per name) and forward-filled onto trading days in
+        Python; the SQL as-of join was ~30 minutes over the universe, this is seconds.
+
+        The filing date is the DART receipt number's date (rcept_no's first 8 digits),
+        NOT available_from - that column is the warehouse load date (mostly 2026-06), so
+        joining on it would hide every filing before the load and make the whole backtest
+        look-ahead or empty.
+        """
+
+        rows = conn.execute(
+            f"""
+            WITH filings AS (
+                SELECT
+                    symbol,
+                    to_date(left(accounts_jsonb->'ifrs-full_Equity'->'raw'->>'rcept_no', 8),
+                            'YYYYMMDD') AS filed,
+                    {_dart_amount('equity')} AS equity,
+                    {_dart_amount('liabilities')} AS liabilities,
+                    {_dart_amount('profit_loss')} AS profit_loss,
+                    {_dart_amount('revenue')} AS revenue,
+                    {_dart_amount('operating_income')} AS operating_income
+                FROM {DART_FINANCIAL_TABLE}
+                WHERE symbol = ANY(%s)
+                  AND left(accounts_jsonb->'ifrs-full_Equity'->'raw'->>'rcept_no', 8) ~ '^[0-9]{{8}}$'
+            )
+            SELECT symbol, filed, equity, liabilities, profit_loss, revenue, operating_income
+            FROM filings
+            WHERE filed IS NOT NULL
+            ORDER BY symbol, filed
+            """,
+            [list(tickers)],
+        ).fetchall()
+
+        timelines: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            ticker = str(row.get("symbol") or "").zfill(6)
+            equity = _optional_float_value(row.get("equity"))
+            liabilities = _optional_float_value(row.get("liabilities"))
+            profit = _optional_float_value(row.get("profit_loss"))
+            revenue = _optional_float_value(row.get("revenue"))
+            operating = _optional_float_value(row.get("operating_income"))
+            ratios: dict[str, float] = {}
+            if equity and equity > 0:
+                if profit is not None:
+                    ratios["roe"] = profit / equity
+                if liabilities is not None:
+                    ratios["debt_to_equity"] = liabilities / equity
+            if revenue and revenue > 0 and operating is not None:
+                ratios["operating_margin"] = operating / revenue
+            if operating is not None:
+                ratios["operating_income"] = operating
+            if revenue is not None:
+                ratios["revenue"] = revenue
+            timelines.setdefault(ticker, []).append(
+                {"filed": _date_value(row["filed"]), "ratios": ratios}
+            )
+        return timelines
 
     def _fetch_momentum_values_by_date(
         self, conn: Any, tickers: Sequence[str], calendar_lookback_days: int, lookback_days: int
@@ -1465,6 +1531,38 @@ def _normalize_postgres_dsn(value: str) -> str:
     if normalized.startswith("postgresql+psycopg://"):
         return "postgresql://" + normalized.removeprefix("postgresql+psycopg://")
     return normalized
+
+
+def _attach_pointintime_financials(
+    price_rows: list[dict[str, Any]],
+    financials_by_ticker: Mapping[str, list[dict[str, Any]]],
+) -> None:
+    """Forward-fill each trading day with the most recent filing available by that date.
+
+    Point-in-time: a day sees only filings whose receipt date is on or before it, so the
+    backtest never reads a number that had not yet been disclosed. Rows are grouped by
+    ticker and walked in date order, advancing a pointer through that ticker's filings -
+    O(rows + filings), not a per-row scan.
+    """
+
+    by_ticker: dict[str, list[dict[str, Any]]] = {}
+    for row in price_rows:
+        by_ticker.setdefault(str(row.get("ticker") or "").zfill(6), []).append(row)
+
+    for ticker, rows in by_ticker.items():
+        filings = financials_by_ticker.get(ticker) or []
+        if not filings:
+            continue
+        rows.sort(key=lambda item: str(item.get("date") or ""))
+        pointer = 0
+        current: dict[str, float] = {}
+        for row in rows:
+            row_date = _date_value(row.get("date"))
+            while pointer < len(filings) and filings[pointer]["filed"] <= row_date:
+                current = filings[pointer]["ratios"]
+                pointer += 1
+            for metric, value in current.items():
+                row.setdefault(metric, value)
 
 
 def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, Any]:
