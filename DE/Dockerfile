@@ -24,7 +24,7 @@ USER airflow
 ENV PIP_CONSTRAINT=""
 
 # 1. 고정할 핵심 뼈대 선설치
-RUN pip install --no-cache-dir numpy==1.26.4
+RUN pip install --no-cache-dir numpy==2.2.6
 RUN pip install --no-cache-dir --no-build-isolation TA-Lib==0.6.8
 
 # 2. 깨끗해진 requirements.txt 패키지들 정상 설치

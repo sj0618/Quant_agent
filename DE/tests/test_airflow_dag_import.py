@@ -71,6 +71,23 @@ class AirflowDagImportTests(unittest.TestCase):
         self.assertEqual(args[args.index("--start-date") + 1], start_date.isoformat())
         self.assertEqual(args[args.index("--end-date") + 1], "2026-05-21")
 
+    def test_ta_args_include_configured_worker_cap(self):
+        previous = os.environ.get("QUANT_TA_MAX_WORKERS")
+        os.environ["QUANT_TA_MAX_WORKERS"] = "2"
+        try:
+            module = _load_dag_module("quant_agent_data_engineering_dag_ta_worker_cap")
+            target_date = date(2026, 5, 21)
+            start_date = module._warmup_start_date(target_date)
+            args = module._technical_indicator_args(start_date=start_date, end_date=target_date)
+        finally:
+            if previous is None:
+                os.environ.pop("QUANT_TA_MAX_WORKERS", None)
+            else:
+                os.environ["QUANT_TA_MAX_WORKERS"] = previous
+
+        self.assertIn("--workers", args)
+        self.assertEqual(args[args.index("--workers") + 1], "2")
+
     def test_daily_dag_orders_kis_adjusted_before_ta(self):
         source = Path("airflow/dags/quant_agent_data_engineering.py").read_text(encoding="utf-8")
 

@@ -1,4 +1,7 @@
+import os
+import tempfile
 from datetime import date
+from pathlib import Path
 import unittest
 
 from scripts.ingest_dart_bok_history import (
@@ -84,6 +87,24 @@ class DartBokHistoryIngestTests(unittest.TestCase):
         self.assertEqual(configs[0].stat_code, "722Y001")
         self.assertEqual(configs[0].item_code1, "0101000")
         self.assertIn("731Y003", {config.stat_code for config in configs})
+
+    def test_load_runtime_dotenv_skips_when_airflow_disables_it(self):
+        from scripts import ingest_dart_bok_history as module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dotenv_path = Path(tmpdir) / "runtime.env"
+            dotenv_path.write_text("SENTINEL_DOTENV_SHOULD_NOT_APPEAR=loaded\n", encoding="utf-8")
+            previous = os.environ.get("QUANT_AIRFLOW_LOAD_DOTENV")
+            os.environ["QUANT_AIRFLOW_LOAD_DOTENV"] = "false"
+            try:
+                module.load_runtime_dotenv(str(dotenv_path))
+            finally:
+                if previous is None:
+                    os.environ.pop("QUANT_AIRFLOW_LOAD_DOTENV", None)
+                else:
+                    os.environ["QUANT_AIRFLOW_LOAD_DOTENV"] = previous
+
+        self.assertIsNone(os.environ.get("SENTINEL_DOTENV_SHOULD_NOT_APPEAR"))
 
 
 if __name__ == "__main__":

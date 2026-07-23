@@ -37,6 +37,11 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 
+try:
+    import pandas_ta_classic as ta  # noqa: F401
+except ImportError:  # pragma: no cover - fallback for environments that still carry the legacy package
+    import pandas_ta as ta  # noqa: F401
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -50,6 +55,7 @@ DEFAULT_FLUSH_ROWS = 50_000
 DEFAULT_HALT_FFILL_DAYS = 5
 DEFAULT_RELIST_GAP_DAYS = 30
 DEFAULT_WORKER_RESERVE = 1
+DEFAULT_TA_WORKER_CAP = 4
 TA_SOURCE_ID = "TA"
 TA_TRANSFORM_VERSION = "pandas-ta-talib-v1"
 ADJUSTED_OHLCV_TRANSFORM_VERSION = "adjusted-ohlcv-v1"
@@ -64,6 +70,30 @@ CATEGORY_TABLES = {
     "Pattern": "feature.ta_pattern_ticker_daily",
 }
 ADJUSTED_OHLCV_TABLE = "feature.adjusted_ohlcv_daily"
+
+
+def _configured_worker_cap() -> int:
+    raw = os.getenv("QUANT_TA_MAX_WORKERS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_TA_WORKER_CAP
+    worker_cap = int(raw)
+    if worker_cap < 1:
+        raise ValueError("QUANT_TA_MAX_WORKERS must be >= 1.")
+    return worker_cap
+
+
+def resolve_worker_count(
+    requested_workers: int | None = None,
+    *,
+    cpu_count: int | None = None,
+    worker_cap: int | None = None,
+) -> int:
+    cpu_total = cpu_count or os.cpu_count() or 2
+    cpu_workers = max(1, cpu_total - DEFAULT_WORKER_RESERVE)
+    cap = worker_cap if worker_cap is not None else _configured_worker_cap()
+    if requested_workers is None:
+        return max(1, min(cpu_workers, cap))
+    return max(1, min(requested_workers, cap))
 
 PATTERN_NAMES = [
     "doji",
@@ -527,7 +557,12 @@ def main() -> int:
     parser.add_argument("--end-date", default=None, help="YYYY-MM-DD. Defaults to max core.ohlcv_daily date.")
     parser.add_argument("--tickers", default="", help="Optional comma-separated ticker subset.")
     parser.add_argument("--limit-tickers", type=int, default=None, help="Optional deterministic ticker limit for smoke runs.")
-    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - DEFAULT_WORKER_RESERVE))
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=resolve_worker_count(),
+        help="Requested worker count; actual execution is capped by QUANT_TA_MAX_WORKERS.",
+    )
     parser.add_argument("--ticker-batch-size", type=int, default=DEFAULT_TICKER_BATCH_SIZE)
     parser.add_argument("--flush-rows", type=int, default=DEFAULT_FLUSH_ROWS)
     parser.add_argument("--halt-ffill-days", type=int, default=DEFAULT_HALT_FFILL_DAYS)
@@ -558,6 +593,7 @@ def main() -> int:
     requested_db_mode = args.db_mode or os.getenv("QUANT_DB_EXECUTION_MODE")
     db_mode = resolve_execution_mode(config, requested_db_mode)
     client: TaDbClient = DockerPsqlClient(config) if db_mode == "docker" else PsycopgClient(config)
+    workers = resolve_worker_count(args.workers)
 
     start_date, end_date = resolve_date_window(client, args.start_date, args.end_date)
     options = RuntimeOptions(
@@ -579,7 +615,7 @@ def main() -> int:
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "dry_run": args.dry_run,
-        "workers": args.workers,
+        "workers": workers,
         "ticker_batch_size": args.ticker_batch_size,
         "input_price_source": args.input_price_source,
         "adjusted_ohlcv_table": ADJUSTED_OHLCV_TABLE,
@@ -598,7 +634,7 @@ def main() -> int:
 
         pending_rows: dict[str, list[dict[str, Any]]] = {category: [] for category in CATEGORY_TABLES}
         pending_adjusted_rows: list[dict[str, Any]] = []
-        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
             for batch in chunked(tickers, args.ticker_batch_size):
                 frames = load_ohlcv_frames(client, start_date, end_date, batch, args.input_price_source)
                 tasks = [

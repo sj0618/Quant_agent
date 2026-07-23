@@ -342,6 +342,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def load_runtime_dotenv(dotenv_path: str | None) -> None:
+    if os.getenv("QUANT_AIRFLOW_LOAD_DOTENV", "true").lower() in {"0", "false", "no", "off"}:
+        return
     if not dotenv_path:
         return
     if load_dotenv is None:
