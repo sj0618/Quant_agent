@@ -151,7 +151,8 @@ def test_aoai_client_separates_response_start_and_body_idle_timeouts() -> None:
 
     assert client.generate_json(make_request()) == {"message": "ok"}
     assert response_start_timeouts == [10.0]
-    assert body_idle_timeouts == [120.0]
+    # Header arrival is not response start; the 10-second limit remains until text arrives.
+    assert body_idle_timeouts == [10.0]
 
 
 def test_aoai_client_retries_without_unsupported_temperature() -> None:
@@ -463,6 +464,10 @@ def test_aoai_retry_is_one_logical_call() -> None:
     assert attempts == 2
     assert len(session.model_calls) == len(session.prompt_logs) == 1
     assert session.model_calls[0].retry_count == 1
+    assert client.logical_call_count == 1
+    assert client.physical_http_post_count == 2
+    assert client.last_call_timings["physical_http_posts"] == 2
+    assert client.last_call_timings["completion_seconds"] >= 0
 
 
 def test_aoai_retry_count_survives_parse_failure_after_retry() -> None:

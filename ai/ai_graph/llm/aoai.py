@@ -59,8 +59,12 @@ class AOAIResponsesClient:
         # remembering it stops every later call from burning a round-trip to relearn it.
         self._temperature_supported = True
         self._service_tier_supported = True
+        self.logical_call_count = 0
+        self.physical_http_post_count = 0
+        self.last_call_timings: dict[str, float | int | None] = {}
 
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
+        self.logical_call_count += 1
         call_id = begin_model_call(
             task_type=request.task_type or request.schema_name,
             provider="aoai",
@@ -82,6 +86,7 @@ class AOAIResponsesClient:
         prompt_tokens: int | None = None
         completion_tokens: int | None = None
         total_tokens: int | None = None
+        physical_before = self.physical_http_post_count
         try:
             # Always stream, even when no activity listener is installed. A non-streamed
             # Responses request does not expose when generation starts, so it cannot
@@ -122,6 +127,12 @@ class AOAIResponsesClient:
                 error_type=type(exc).__name__,
                 error_message=_safe_model_failure_message(exc),
             )
+            self.last_call_timings = {
+                **self.last_call_timings,
+                "logical_call_count": self.logical_call_count,
+                "physical_http_posts": self.physical_http_post_count - physical_before,
+                "completion_seconds": round(time.perf_counter() - started_at, 6),
+            }
             raise
 
         finish_model_call(
@@ -136,6 +147,12 @@ class AOAIResponsesClient:
             latency_ms=(time.perf_counter() - started_at) * 1000,
             retry_count=retry_count,
         )
+        self.last_call_timings = {
+            **self.last_call_timings,
+            "logical_call_count": self.logical_call_count,
+            "physical_http_posts": self.physical_http_post_count - physical_before,
+            "completion_seconds": round(time.perf_counter() - started_at, 6),
+        }
         return result
 
     def _stream_with_retries(
@@ -158,6 +175,7 @@ class AOAIResponsesClient:
 
         for attempt in range(attempts):
             last_attempt = attempt
+            attempt_started = time.perf_counter()
             client = self._http_client or httpx.Client(timeout=self.timeout_seconds)
             owns_client = self._http_client is None
             try:
@@ -166,6 +184,7 @@ class AOAIResponsesClient:
                         self.timeout_seconds,
                         read=self.response_start_timeout_seconds,
                     )
+                    self.physical_http_post_count += 1
                     with client.stream(
                         "POST",
                         self.responses_url,
@@ -173,10 +192,12 @@ class AOAIResponsesClient:
                         json=body,
                         timeout=response_start_timeout,
                     ) as response:
-                        # Entering the stream context means response headers have arrived.
-                        # Restore the normal idle-read timeout before consuming the body;
-                        # completion itself is deliberately not limited to ten seconds.
-                        response.request.extensions["timeout"]["read"] = self.timeout_seconds
+                        self.last_call_timings = {
+                            "first_header_seconds": round(
+                                time.perf_counter() - attempt_started, 6
+                            ),
+                            "first_meaningful_text_seconds": None,
+                        }
                         if response.status_code >= 400:
                             response.read()
                             if _unsupported_parameter(response, "temperature"):
@@ -198,13 +219,23 @@ class AOAIResponsesClient:
                             "content-type", ""
                         ).lower():
                             response.read()
+                            self.last_call_timings["first_meaningful_text_seconds"] = round(
+                                time.perf_counter() - attempt_started, 6
+                            )
+                            response.request.extensions["timeout"]["read"] = self.timeout_seconds
                             return (
                                 None,
                                 attempt,
                                 response.text,
                                 _provider_request_id(None, response),
                             )
-                        payload, terminal = self._consume_stream(response)
+                        payload, terminal, first_text_seconds = self._consume_stream(
+                            response,
+                            attempt_started=attempt_started,
+                        )
+                        self.last_call_timings[
+                            "first_meaningful_text_seconds"
+                        ] = first_text_seconds
                         if terminal == "response.completed" and payload is not None:
                             return (
                                 payload,
@@ -239,21 +270,25 @@ class AOAIResponsesClient:
         ) from last_error
 
     def _consume_stream(
-        self, response: httpx.Response
-    ) -> tuple[dict[str, Any] | None, str | None]:
+        self,
+        response: httpx.Response,
+        *,
+        attempt_started: float,
+    ) -> tuple[dict[str, Any] | None, str | None, float | None]:
         """Drain the stream, returning its final response object and terminal event type.
 
         The terminal type is reported separately because only `response.completed`
         carries a usable answer: an incomplete or failed run still repeats the response
         object, but without the message the caller is trying to parse.
 
-        The ten-second response-start timeout has already been satisfied before this
-        method runs. The normal timeout now applies only when the provider stops sending
-        body data; it is not a wall-clock limit on response completion.
+        Headers alone do not satisfy the response-start deadline. Until the first
+        non-empty text delta arrives, both the short socket read timeout and the
+        wall-clock check below remain active. The normal timeout applies afterwards.
         """
 
         final_payload: dict[str, Any] | None = None
         terminal_type: str | None = None
+        first_text_seconds: float | None = None
         for line in response.iter_lines():
             if not line.startswith("data:"):
                 continue
@@ -267,14 +302,46 @@ class AOAIResponsesClient:
             if not isinstance(event, dict):
                 continue
             event_type = event.get("type")
+            if event_type == "response.output_text.delta":
+                delta = event.get("delta")
+                if (
+                    first_text_seconds is None
+                    and isinstance(delta, str)
+                    and delta.strip()
+                ):
+                    first_text_seconds = round(
+                        time.perf_counter() - attempt_started, 6
+                    )
+                    response.request.extensions["timeout"][
+                        "read"
+                    ] = self.timeout_seconds
+            if (
+                first_text_seconds is None
+                and time.perf_counter() - attempt_started
+                > self.response_start_timeout_seconds
+            ):
+                raise httpx.ReadTimeout(
+                    "AOAI produced no meaningful text before the response-start deadline",
+                    request=response.request,
+                )
             if event_type in TERMINAL_STREAM_EVENTS:
                 terminal_type = str(event_type)
                 completed = event.get("response")
                 if isinstance(completed, dict):
                     final_payload = completed
+                    if (
+                        first_text_seconds is None
+                        and _raw_assistant_output(completed, "").strip()
+                    ):
+                        first_text_seconds = round(
+                            time.perf_counter() - attempt_started, 6
+                        )
+                        response.request.extensions["timeout"][
+                            "read"
+                        ] = self.timeout_seconds
             else:
                 _publish_stream_activity(event_type, event)
-        return final_payload, terminal_type
+        return final_payload, terminal_type, first_text_seconds
 
     def _request_body(self, request: LLMJsonRequest) -> dict[str, Any]:
         body: dict[str, Any] = {

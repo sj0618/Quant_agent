@@ -327,6 +327,51 @@ class BacktestEquityPoint(BaseModel):
     cumulative_return: float
 
 
+StructuredProfile = Literal[
+    "compiled_conditions",
+    "long_regime_momentum",
+    "quality_trend_hold",
+    "volatility_breakout_hold",
+    "rolling_sharpe_momentum",
+    "dual_sma_trend",
+    "low_vol_momentum",
+    "breakout_volume",
+    "rsi_trend_rebound",
+    "mean_reversion_band",
+    "return_to_volatility",
+    "cash_preserving_trend",
+    "adaptive_trend",
+]
+
+
+class StrategyIR(BaseModel):
+    """Canonical rule description shared by every parameter candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal["strategy-ir.v1"] = "strategy-ir.v1"
+    strategy_id: str = Field(min_length=1)
+    entry_feature: str = Field(min_length=1)
+    exit_feature: str = Field(min_length=1)
+    proxy_feature: str = Field(min_length=1)
+    entry_conditions: list[Condition] = Field(default_factory=list)
+    exit_conditions: list[Condition] = Field(default_factory=list)
+    ranking: Literal["score_desc_ticker_desc", "none"] = "score_desc_ticker_desc"
+
+
+class CandidateParameters(BaseModel):
+    """Small bounded search surface executed by the verified signal engine."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile: StructuredProfile
+    lookback: int = Field(ge=3, le=252)
+    threshold: float = Field(ge=-1.0, le=100.0)
+    stop_loss_pct: float = Field(gt=0.0, le=1.0)
+    take_profit_pct: float = Field(gt=0.0, le=10.0)
+    max_positions: int = Field(gt=0, le=1000)
+
+
 class CodeCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -336,6 +381,17 @@ class CodeCandidate(BaseModel):
     validation_ok: bool
     violations: list[str] = Field(default_factory=list)
     metrics: BacktestMetrics | None = None
+    representation: Literal["structured", "python_fallback"] = "python_fallback"
+    strategy_ir: StrategyIR | None = None
+    parameters: CandidateParameters | None = None
+
+    @model_validator(mode="after")
+    def validate_representation(self) -> "CodeCandidate":
+        if self.representation == "structured" and (
+            self.strategy_ir is None or self.parameters is None
+        ):
+            raise ValueError("structured candidates require strategy_ir and parameters")
+        return self
 
 
 class CandidateBacktestResult(BaseModel):
@@ -351,6 +407,7 @@ class CandidateBacktestResult(BaseModel):
     backtest_payload: dict[str, Any] = Field(default_factory=dict)
     feature_coverage: dict[str, Any] = Field(default_factory=dict)
     fallback_reasons: list[str] = Field(default_factory=list)
+    execution_stats: dict[str, Any] = Field(default_factory=dict)
 
 
 SignalAction = Literal["BUY", "HOLD", "DROP"]

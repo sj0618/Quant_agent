@@ -1,0 +1,351 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+from hashlib import sha256
+import json
+
+from ai_graph.nodes import backtest as backtest_node
+from ai_graph.nodes.backtest_code import (
+    Loop3Request,
+    _render_adaptive_signal_code,
+    build_code_generation_plan,
+    generate_loop3_candidates,
+    generate_self_improvement_candidates,
+    map_strategy_features,
+)
+from ai_graph.nodes.backtest_features import PreparedFeatureStore
+from ai_graph.schemas import (
+    CandidateParameters,
+    CodeCandidate,
+    Condition,
+    ConditionOperator,
+    StrategyIR,
+    StrategySpec,
+)
+
+
+def _strategy() -> StrategySpec:
+    return StrategySpec(
+        strategy_id="optimized-rsi",
+        name="Optimized RSI",
+        market="KRX",
+        timeframe="daily",
+        entry_conditions=[
+            Condition(left="rsi", operator=ConditionOperator.LTE, right=40.0)
+        ],
+        exit_conditions=[
+            Condition(left="rsi", operator=ConditionOperator.GTE, right=70.0)
+        ],
+        indicators=["rsi"],
+        risk_constraints={
+            "max_position_pct": 0.2,
+            "stop_loss_pct": 0.08,
+            "take_profit_pct": 0.3,
+        },
+        confidence=0.9,
+    )
+
+
+def _rows(days: int = 80, tickers: int = 6) -> list[dict[str, object]]:
+    start = date(2024, 1, 1)
+    rows: list[dict[str, object]] = []
+    for day_index in range(days):
+        row_date = (start + timedelta(days=day_index)).isoformat()
+        for ticker_index in range(tickers):
+            close = (
+                100.0
+                + ticker_index * 7.0
+                + day_index * (ticker_index + 1) * 0.04
+                + ((day_index % 9) - 4) * 0.25
+            )
+            rows.append(
+                {
+                    "date": row_date,
+                    "ticker": f"{ticker_index + 1:06d}",
+                    "open": close * 0.997,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": 1_000_000.0
+                    + day_index * 1_000.0
+                    + (250_000.0 if day_index % 13 == 0 else 0.0),
+                    "rsi": 30.0 + float(day_index % 50),
+                }
+            )
+    return rows
+
+
+def _canonical_hash(result) -> str:
+    payload = {
+        "selected_candidate": result.selected_candidate.model_dump(mode="json"),
+        "equity_curve": [
+            point.model_dump(mode="json") for point in result.equity_curve
+        ],
+        "engine_summary": result.engine_summary,
+        "objective_scores": result.objective_scores_by_candidate,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def test_structured_features_do_not_read_future_rows() -> None:
+    strategy = _strategy()
+    generated = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="no-lookahead")
+    )
+    parameters = generated.candidates[1].parameters
+    strategy_ir = generated.strategy_ir
+    assert parameters is not None
+    full_rows = _rows(days=60)
+    prefix_length = 6 * 35
+
+    full_actions = PreparedFeatureStore(full_rows).build_actions(strategy_ir, parameters)
+    prefix_actions = PreparedFeatureStore(full_rows[:prefix_length]).build_actions(
+        strategy_ir, parameters
+    )
+
+    assert list(full_actions[:prefix_length]) == list(prefix_actions)
+
+
+def test_generic_rolling_features_are_prior_only_and_ignore_missing_values() -> None:
+    rows = _rows(days=4, tickers=1)
+    rows[0]["factor"] = 1.0
+    rows[1]["factor"] = None
+    rows[2]["factor"] = 3.0
+    rows[3]["factor"] = 4.0
+    store = PreparedFeatureStore(rows)
+
+    average = store._rolling_metric("factor", 2, "avg")
+    maximum = store._rolling_metric("factor", 2, "max")
+    last = store._rolling_metric("factor", 2, "last")
+
+    assert list(average[1:]) == [1.0, 1.0, 3.0]
+    assert list(maximum[1:]) == [1.0, 1.0, 3.0]
+    assert list(last[1:]) == [1.0, 1.0, 3.0]
+
+
+def test_rank_only_and_consecutive_conditions_emit_compiled_actions() -> None:
+    rows = _rows(days=4, tickers=2)
+    rank_ir = StrategyIR(
+        strategy_id="rank-only",
+        entry_feature="close",
+        exit_feature="close",
+        proxy_feature="close",
+        entry_conditions=[
+            Condition(
+                left="close",
+                operator=ConditionOperator.GTE,
+                right=0.0,
+                universe_rank_pct=0.5,
+            )
+        ],
+    )
+    parameters = CandidateParameters(
+        profile="compiled_conditions",
+        lookback=3,
+        threshold=0.0,
+        stop_loss_pct=0.5,
+        take_profit_pct=5.0,
+        max_positions=1,
+    )
+    rank_actions = PreparedFeatureStore(rows).build_actions(rank_ir, parameters)
+    assert rank_actions[1] == 1
+    assert sum(action == 1 for action in rank_actions) == 1
+
+    consecutive_ir = rank_ir.model_copy(
+        update={
+            "strategy_id": "consecutive",
+            "entry_conditions": [
+                Condition(
+                    left="close",
+                    operator=ConditionOperator.GTE,
+                    right=0.0,
+                    consecutive=2,
+                )
+            ],
+        }
+    )
+    consecutive_actions = PreparedFeatureStore(rows).build_actions(
+        consecutive_ir, parameters
+    )
+    assert sum(action == 1 for action in consecutive_actions) == 1
+    assert consecutive_actions[2] == 1
+
+
+def test_structured_profile_actions_match_legacy_reference() -> None:
+    strategy = _strategy()
+    plan = build_code_generation_plan(strategy, map_strategy_features(strategy))
+    rows = _rows(days=80, tickers=3)
+    profiles = [
+        "long_regime_momentum",
+        "quality_trend_hold",
+        "volatility_breakout_hold",
+        "rolling_sharpe_momentum",
+        "dual_sma_trend",
+        "low_vol_momentum",
+        "breakout_volume",
+        "rsi_trend_rebound",
+        "mean_reversion_band",
+        "return_to_volatility",
+        "cash_preserving_trend",
+    ]
+    action_values = {"BUY": 1, "SELL": -1, "HOLD": 0}
+    store = PreparedFeatureStore(rows)
+    strategy_ir = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="legacy-equivalence")
+    ).strategy_ir
+
+    for profile in profiles:
+        parameters = CandidateParameters(
+            profile=profile,  # type: ignore[arg-type]
+            lookback=20,
+            threshold=0.05,
+            stop_loss_pct=0.08,
+            take_profit_pct=0.3,
+            max_positions=2,
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            _render_adaptive_signal_code(
+                strategy_id=strategy.strategy_id,
+                plan=plan,
+                profile=profile,
+                lookback=parameters.lookback,
+                threshold=parameters.threshold,
+                stop_loss=parameters.stop_loss_pct,
+                take_profit=parameters.take_profit_pct,
+                max_positions=parameters.max_positions,
+            ),
+            namespace,
+        )
+        legacy_signals = namespace["build_signals"](rows)  # type: ignore[operator]
+        legacy_actions = [
+            action_values[str(signal["action"])] for signal in legacy_signals
+        ]
+
+        assert list(store.build_actions(strategy_ir, parameters)) == legacy_actions
+
+
+def test_worker_count_and_disk_cache_are_deterministic(monkeypatch, tmp_path) -> None:
+    strategy = _strategy()
+    rows = _rows(days=45)
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="deterministic")
+    ).candidates
+    monkeypatch.setattr(backtest_node, "SERIAL_EVALUATION_WORK_ITEMS", 0)
+
+    cache_one = tmp_path / "worker-one"
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(cache_one))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
+    result_one = backtest_node.run_candidate_backtest(
+        strategy, candidates, price_rows=rows
+    )
+
+    cache_two = tmp_path / "worker-two"
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(cache_two))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "2")
+    result_two = backtest_node.run_candidate_backtest(
+        strategy, candidates, price_rows=rows
+    )
+
+    assert _canonical_hash(result_one) == _canonical_hash(result_two)
+
+
+def test_fresh_and_disk_cache_results_are_identical(monkeypatch, tmp_path) -> None:
+    strategy = _strategy()
+    rows = _rows(days=35)
+    candidate = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="disk-cache")
+    ).candidates[0]
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "cache"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
+
+    with backtest_node._CandidateBacktestSession(strategy, rows) as first:
+        fresh = first.evaluate([candidate])[0]
+        assert not fresh.diagnostics["cache_hit"]
+    with backtest_node._CandidateBacktestSession(strategy, rows) as second:
+        cached = second.evaluate([candidate])[0]
+        assert cached.diagnostics["cache_hit"]
+        assert cached.diagnostics["cache_level"] == "disk"
+
+    fresh_payload = {
+        "candidate": fresh.candidate.model_dump(mode="json"),
+        "summary": fresh.engine_summary,
+        "equity": [item.model_dump(mode="json") for item in fresh.equity_curve or []],
+        "score": fresh.objective_score,
+    }
+    cached_payload = {
+        "candidate": cached.candidate.model_dump(mode="json"),
+        "summary": cached.engine_summary,
+        "equity": [item.model_dump(mode="json") for item in cached.equity_curve or []],
+        "score": cached.objective_score,
+    }
+    assert fresh_payload == cached_payload
+
+
+def test_improvement_candidates_are_bounded_and_normalized() -> None:
+    strategy = _strategy()
+    generated = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="bounded")
+    )
+    improved = generate_self_improvement_candidates(
+        strategy,
+        generated.code_plan.model_dump(mode="python"),
+        start_index=4,
+        iteration=1,
+        max_positions=5,
+    )
+    identities = {backtest_node._candidate_identity(candidate) for candidate in improved}
+
+    assert 1 <= len(improved) <= 6
+    assert len(identities) == len(improved)
+
+
+def test_repeated_round_submits_no_completed_candidate(monkeypatch, tmp_path) -> None:
+    strategy = _strategy()
+    rows = _rows(days=25)
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="round-cache")
+    ).candidates
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "round-cache"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
+
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        session.evaluate(candidates)
+        cached = session.evaluate(candidates)
+        rounds = session.execution_stats()["rounds"]
+
+    assert rounds[0]["new_candidates"] == 3
+    assert rounds[1]["new_candidates"] == 0
+    assert rounds[1]["cached_candidates"] == 3
+    assert cached[0].diagnostics["cache_hit"]
+    assert cached[0].diagnostics["cache_level"] == "memory"
+
+
+def test_python_fallback_timeout_terminates_worker(monkeypatch, tmp_path) -> None:
+    strategy = _strategy()
+    candidate = CodeCandidate(
+        candidate_id="infinite-fallback",
+        variant="A",
+        code="""def build_signals(prices):
+    total = 0
+    for left in range(10000):
+        for right in range(10000):
+            total += left + right
+    return []
+""",
+        validation_ok=True,
+    )
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "timeout"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_CANDIDATE_TIMEOUT_ENV, "0.5")
+
+    with backtest_node._CandidateBacktestSession(strategy, _rows(days=3)) as session:
+        evaluation = session.evaluate([candidate])[0]
+        assert not evaluation.candidate.validation_ok
+        assert any("timeout" in item for item in evaluation.candidate.violations)
+        assert session._executor is None

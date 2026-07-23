@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import date
 from hashlib import sha256
-from multiprocessing import get_context
+from multiprocessing import get_all_start_methods, get_context
 from pathlib import Path
+from tempfile import gettempdir
+import time
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,6 +25,7 @@ from ai_graph.schemas import (
 )
 from ai_graph.schemas import StrategySpec as AIStrategySpec
 from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
+from ai_graph.nodes.backtest_features import FEATURE_DEFINITION_VERSION, PreparedFeatureStore
 from ai_graph.progress import report_activity
 from ai_graph.nodes.position_sizing import (
     applied_max_positions as _shared_applied_max_positions,
@@ -57,7 +61,20 @@ SELL_SIGNAL_VALUE = -1.0
 HOLD_SIGNAL_VALUE = 0.0
 EXECUTION_AUDIT_TAIL_LIMIT = 20
 AI_BACKTEST_WORKERS_ENV = "AI_BACKTEST_WORKERS"
-DEFAULT_BACKTEST_WORKERS = 4
+DEFAULT_BACKTEST_WORKERS = 2
+AI_BACKTEST_CANDIDATE_TIMEOUT_ENV = "AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS"
+DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 180.0
+AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
+DEFAULT_WALL_BUDGET_SECONDS = 540.0
+MAX_SELF_IMPROVEMENT_ROUNDS = 2
+SERIAL_EVALUATION_WORK_ITEMS = 250_000
+BACKTEST_ENGINE_VERSION = "candidate-engine.v2"
+BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v2"
+BACKTEST_CACHE_DIR_ENV = "AI_BACKTEST_CACHE_DIR"
+BACKTEST_CACHE_TTL_ENV = "AI_BACKTEST_CACHE_TTL_SECONDS"
+BACKTEST_CACHE_MAX_BYTES_ENV = "AI_BACKTEST_CACHE_MAX_BYTES"
+DEFAULT_CACHE_TTL_SECONDS = 86_400
+DEFAULT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
 PRICE_FIELD_NAMES = frozenset(
     {"date", "ticker", "name", "market", "open", "high", "low", "close", "volume"}
 )
@@ -128,8 +145,9 @@ def _ensure_backtest_module_source_path() -> None:
     if not package_root.is_dir():
         return
     source_path = str(BACKTEST_MODULE_SOURCE_ROOT)
-    if source_path not in sys.path:
-        sys.path.insert(0, source_path)
+    while source_path in sys.path:
+        sys.path.remove(source_path)
+    sys.path.insert(0, source_path)
 
 
 try:
@@ -143,7 +161,9 @@ try:
     from backtest_module.backtest import (
         BacktestRunConfig as EngineBacktestRunConfig,
         OhlcvBar as EngineOhlcvBar,
+        PreparedMarketData as EnginePreparedMarketData,
         TalibIndicatorConfig as EngineTalibIndicatorConfig,
+        prepare_market_data as prepare_engine_market_data,
         run_backtest as run_engine_backtest,
     )
     from backtest_module.performance import (
@@ -153,7 +173,9 @@ try:
     )
 except ImportError:
     _ensure_backtest_module_source_path()
-    sys.modules.pop("backtest_module", None)
+    for module_name in list(sys.modules):
+        if module_name == "backtest_module" or module_name.startswith("backtest_module."):
+            sys.modules.pop(module_name, None)
     from backtest_module import (
         Condition as EngineCondition,
         ConditionOperator as EngineConditionOperator,
@@ -164,7 +186,9 @@ except ImportError:
     from backtest_module.backtest import (
         BacktestRunConfig as EngineBacktestRunConfig,
         OhlcvBar as EngineOhlcvBar,
+        PreparedMarketData as EnginePreparedMarketData,
         TalibIndicatorConfig as EngineTalibIndicatorConfig,
+        prepare_market_data as prepare_engine_market_data,
         run_backtest as run_engine_backtest,
     )
     from backtest_module.performance import (
@@ -190,43 +214,198 @@ class _CandidateEvaluation:
     equity_curve: list[BacktestEquityPoint] | None = None
     objective_score: float | None = None
     quantstats_dependency_error: bool = False
+    diagnostics: dict[str, Any] | None = None
 
 
 _WORKER_STRATEGY: AIStrategySpec | None = None
 _WORKER_PRICE_ROWS: Sequence[Mapping[str, Any]] | None = None
+_WORKER_PREPARED_MARKET: EnginePreparedMarketData | None = None
 
 
 def _initialize_candidate_worker(
     strategy_payload: Mapping[str, Any],
     price_rows: Sequence[Mapping[str, Any]],
+    prepared_market: EnginePreparedMarketData,
 ) -> None:
-    global _WORKER_STRATEGY, _WORKER_PRICE_ROWS
+    global _WORKER_STRATEGY, _WORKER_PRICE_ROWS, _WORKER_PREPARED_MARKET
     _WORKER_STRATEGY = AIStrategySpec.model_validate(strategy_payload)
     _WORKER_PRICE_ROWS = price_rows
+    _WORKER_PREPARED_MARKET = prepared_market
 
 
-def _evaluate_candidate_worker(candidate_payload: Mapping[str, Any]) -> _CandidateEvaluation:
-    if _WORKER_STRATEGY is None or _WORKER_PRICE_ROWS is None:
+def _evaluate_candidate_worker(
+    task: tuple[Mapping[str, Any], Sequence[int] | None, str],
+) -> _CandidateEvaluation:
+    if (
+        _WORKER_STRATEGY is None
+        or _WORKER_PRICE_ROWS is None
+        or _WORKER_PREPARED_MARKET is None
+    ):
         raise RuntimeError("candidate worker was not initialized")
+    candidate_payload, actions, metrics_mode = task
     return _evaluate_candidate(
         _WORKER_STRATEGY,
         CodeCandidate.model_validate(candidate_payload),
         _WORKER_PRICE_ROWS,
+        prepared_market=_WORKER_PREPARED_MARKET,
+        generated_actions=actions,
+        metrics_mode=metrics_mode,
     )
 
 
+class _DiskEvaluationCache:
+    def __init__(self) -> None:
+        configured = os.getenv(BACKTEST_CACHE_DIR_ENV)
+        self.root = Path(configured) if configured else Path(gettempdir()) / "quantagent-backtest-v2"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.ttl_seconds = _positive_int_env(
+            BACKTEST_CACHE_TTL_ENV, DEFAULT_CACHE_TTL_SECONDS
+        )
+        self.max_bytes = _positive_int_env(
+            BACKTEST_CACHE_MAX_BYTES_ENV, DEFAULT_CACHE_MAX_BYTES
+        )
+        self._cleanup()
+
+    def load(
+        self,
+        key: str,
+        candidate: CodeCandidate,
+    ) -> _CandidateEvaluation | None:
+        path = self.root / f"{key}.json"
+        try:
+            if not path.is_file():
+                return None
+            if time.time() - path.stat().st_mtime > self.ttl_seconds:
+                path.unlink(missing_ok=True)
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("schema_version") != BACKTEST_CACHE_SCHEMA_VERSION:
+                path.unlink(missing_ok=True)
+                return None
+            stored = CodeCandidate.model_validate(payload["candidate"])
+            rebound = candidate.model_copy(
+                update={
+                    "validation_ok": stored.validation_ok,
+                    "violations": stored.violations,
+                    "metrics": stored.metrics,
+                }
+            )
+            diagnostics = dict(payload.get("diagnostics") or {})
+            diagnostics["cache_hit"] = True
+            diagnostics["cache_level"] = "disk"
+            return _CandidateEvaluation(
+                candidate=rebound,
+                engine_summary=payload.get("engine_summary"),
+                equity_curve=[
+                    BacktestEquityPoint.model_validate(item)
+                    for item in payload.get("equity_curve") or []
+                ]
+                or None,
+                objective_score=payload.get("objective_score"),
+                quantstats_dependency_error=bool(
+                    payload.get("quantstats_dependency_error", False)
+                ),
+                diagnostics=diagnostics,
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            path.unlink(missing_ok=True)
+            return None
+
+    def store(self, key: str, evaluation: _CandidateEvaluation) -> int:
+        path = self.root / f"{key}.json"
+        temporary = self.root / f".{key}.{os.getpid()}.tmp"
+        payload = {
+            "schema_version": BACKTEST_CACHE_SCHEMA_VERSION,
+            "candidate": evaluation.candidate.model_dump(mode="json"),
+            "engine_summary": evaluation.engine_summary,
+            "equity_curve": [
+                point.model_dump(mode="json") for point in evaluation.equity_curve or []
+            ],
+            "objective_score": evaluation.objective_score,
+            "quantstats_dependency_error": evaluation.quantstats_dependency_error,
+            "diagnostics": evaluation.diagnostics or {},
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        try:
+            temporary.write_text(encoded, encoding="utf-8")
+            os.replace(temporary, path)
+            return path.stat().st_size
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _cleanup(self) -> None:
+        now = time.time()
+        files: list[tuple[float, int, Path]] = []
+        for path in self.root.glob("*.json"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if now - stat.st_mtime > self.ttl_seconds:
+                path.unlink(missing_ok=True)
+                continue
+            files.append((stat.st_mtime, stat.st_size, path))
+        total = sum(size for _, size, _ in files)
+        for _, size, path in sorted(files):
+            if total <= self.max_bytes:
+                break
+            path.unlink(missing_ok=True)
+            total -= size
+
+
 class _CandidateBacktestSession:
-    """Reuse one worker pool and completed candidate results across improvement rounds."""
+    """Reuse prepared columns, one worker pool, and candidate results across rounds."""
 
     def __init__(
         self,
         strategy: AIStrategySpec,
         price_rows: Sequence[Mapping[str, Any]],
     ) -> None:
+        prep_started = time.perf_counter()
         self.strategy = strategy
-        self.price_rows = price_rows
-        self._cache: dict[tuple[str, str, bool], _CandidateEvaluation] = {}
+        self.feature_store = PreparedFeatureStore(price_rows)
+        self.price_rows = self.feature_store.rows
+        ohlcv_rows, metric_rows = _engine_market_rows(self.price_rows)
+        preparation_candidate = CodeCandidate(
+            candidate_id="prepare",
+            variant="A",
+            code="def build_signals(prices):\n    return []\n",
+            validation_ok=True,
+        )
+        preparation_spec = _engine_strategy_spec(
+            strategy,
+            preparation_candidate,
+            available_ticker_count=_available_ticker_count(self.price_rows),
+        )
+        engine_config = EngineBacktestRunConfig(
+            initial_capital=DEFAULT_INITIAL_CAPITAL,
+            write_outputs=False,
+            talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
+            metrics_mode="selection",
+        )
+        self.prepared_market = prepare_engine_market_data(
+            preparation_spec,
+            ohlcv_rows=ohlcv_rows,
+            metric_rows=metric_rows,
+            config=engine_config,
+        )
+        self.data_fingerprint, self.data_descriptor = _data_fingerprint(self.price_rows)
+        self.strategy_fingerprint = _strategy_fingerprint(strategy)
+        self.preparation_seconds = time.perf_counter() - prep_started
+        self._cache: dict[tuple[str, bool, str], _CandidateEvaluation] = {}
+        self._disk_cache = _DiskEvaluationCache()
         self._executor: ProcessPoolExecutor | None = None
+        self._executor_workers = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.disk_cache_bytes_written = 0
+        self.evaluation_rounds: list[dict[str, Any]] = []
 
     def __enter__(self) -> _CandidateBacktestSession:
         return self
@@ -238,76 +417,458 @@ class _CandidateBacktestSession:
         if self._executor is not None:
             self._executor.shutdown(wait=True, cancel_futures=True)
             self._executor = None
+            self._executor_workers = 0
 
-    def evaluate(self, candidates: Sequence[CodeCandidate]) -> list[_CandidateEvaluation]:
+    def evaluate(
+        self,
+        candidates: Sequence[CodeCandidate],
+        *,
+        metrics_mode: str = "selection",
+    ) -> list[_CandidateEvaluation]:
+        round_started = time.perf_counter()
         missing: list[CodeCandidate] = []
+        missing_keys: set[tuple[str, bool, str]] = set()
+        cache_levels: dict[tuple[str, bool, str], str] = {}
+        memory_hits = 0
+        disk_hits = 0
         for candidate in candidates:
-            key = _candidate_cache_key(candidate)
-            if key not in self._cache:
+            memory_key = _candidate_cache_key(candidate, metrics_mode)
+            if memory_key in self._cache:
+                cache_levels[memory_key] = "memory"
+                memory_hits += 1
+                self.cache_hits += 1
+                continue
+            disk_key = self._disk_cache_key(candidate, metrics_mode)
+            cached = self._disk_cache.load(disk_key, candidate)
+            if cached is not None:
+                self._cache[memory_key] = cached
+                cache_levels[memory_key] = "disk"
+                disk_hits += 1
+                self.cache_hits += 1
+                continue
+            if memory_key not in missing_keys:
                 missing.append(candidate)
+                missing_keys.add(memory_key)
+            self.cache_misses += 1
+
+        actions_by_identity: dict[str, Sequence[int] | None] = {}
+        for candidate in missing:
+            identity = _candidate_identity(candidate)
+            if identity in actions_by_identity:
+                continue
+            actions_by_identity[identity] = (
+                self.feature_store.build_actions(
+                    candidate.strategy_ir,
+                    candidate.parameters,
+                )
+                if candidate.representation == "structured"
+                and candidate.strategy_ir is not None
+                and candidate.parameters is not None
+                else None
+            )
 
         if missing:
-            worker_count = _candidate_worker_count(len(missing))
-            if worker_count == 1:
+            worker_count = _candidate_worker_count(
+                len(missing),
+                row_count=len(self.price_rows),
+            )
+            tasks = [
+                (
+                    candidate.model_dump(mode="python"),
+                    actions_by_identity[_candidate_identity(candidate)],
+                    metrics_mode,
+                )
+                for candidate in missing
+            ]
+            requires_isolation = any(
+                candidate.representation == "python_fallback"
+                for candidate in missing
+            )
+            reuse_executor = self._executor is not None
+            if worker_count == 1 and not requires_isolation and not reuse_executor:
                 evaluations = [
-                    _evaluate_candidate(self.strategy, candidate, self.price_rows)
+                    _evaluate_candidate(
+                        self.strategy,
+                        candidate,
+                        self.price_rows,
+                        prepared_market=self.prepared_market,
+                        generated_actions=actions_by_identity[
+                            _candidate_identity(candidate)
+                        ],
+                        metrics_mode=metrics_mode,
+                    )
                     for candidate in missing
                 ]
             else:
-                if self._executor is None:
-                    self._executor = ProcessPoolExecutor(
-                        max_workers=worker_count,
-                        mp_context=get_context("spawn"),
-                        initializer=_initialize_candidate_worker,
-                        initargs=(self.strategy.model_dump(mode="python"), self.price_rows),
-                    )
-                evaluations = list(
-                    self._executor.map(
-                        _evaluate_candidate_worker,
-                        [candidate.model_dump(mode="python") for candidate in missing],
-                        chunksize=1,
-                    )
+                evaluations = self._evaluate_parallel(
+                    tasks,
+                    missing,
+                    self._executor_workers if reuse_executor else max(1, worker_count),
                 )
             for candidate, evaluation in zip(missing, evaluations, strict=True):
-                self._cache[_candidate_cache_key(candidate)] = evaluation
+                memory_key = _candidate_cache_key(candidate, metrics_mode)
+                self._cache[memory_key] = evaluation
+                disk_key = self._disk_cache_key(candidate, metrics_mode)
+                try:
+                    self.disk_cache_bytes_written += self._disk_cache.store(
+                        disk_key, evaluation
+                    )
+                except (OSError, TypeError, ValueError):
+                    pass
 
-        return [self._cache[_candidate_cache_key(candidate)] for candidate in candidates]
+        self.evaluation_rounds.append(
+            {
+                "metrics_mode": metrics_mode,
+                "requested_candidates": len(candidates),
+                "new_candidates": len(missing),
+                "cached_candidates": memory_hits + disk_hits,
+                "memory_cache_hits": memory_hits,
+                "disk_cache_hits": disk_hits,
+                "cumulative_candidates": len(
+                    {
+                        key[0]
+                        for key in self._cache
+                        if key[2] == "selection"
+                    }
+                ),
+                "wall_seconds": round(time.perf_counter() - round_started, 6),
+            }
+        )
+        return [
+            _rebind_evaluation(
+                self._cache[_candidate_cache_key(candidate, metrics_mode)],
+                candidate,
+                cache_level=cache_levels.get(
+                    _candidate_cache_key(candidate, metrics_mode)
+                ),
+            )
+            for candidate in candidates
+        ]
+
+    def _evaluate_parallel(
+        self,
+        tasks: list[tuple[Mapping[str, Any], Sequence[int] | None, str]],
+        candidates: list[CodeCandidate],
+        worker_count: int,
+    ) -> list[_CandidateEvaluation]:
+        if self._executor is not None and self._executor_workers != worker_count:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
+            self._executor_workers = 0
+        if self._executor is None:
+            start_method = "fork" if "fork" in get_all_start_methods() else "spawn"
+            self._executor = ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=get_context(start_method),
+                initializer=_initialize_candidate_worker,
+                initargs=(
+                    self.strategy.model_dump(mode="python"),
+                    self.price_rows,
+                    self.prepared_market,
+                ),
+            )
+            self._executor_workers = worker_count
+        futures = [self._executor.submit(_evaluate_candidate_worker, task) for task in tasks]
+        timeout = _candidate_timeout_seconds()
+        evaluations: list[_CandidateEvaluation] = []
+        timed_out = False
+        for index, (future, candidate) in enumerate(zip(futures, candidates, strict=True)):
+            if timed_out:
+                evaluations.append(_timeout_evaluation(candidate, timeout))
+                continue
+            try:
+                evaluations.append(future.result(timeout=timeout))
+            except FutureTimeoutError:
+                timed_out = True
+                evaluations.append(_timeout_evaluation(candidate, timeout))
+                self._terminate_executor()
+                for remaining in futures[index + 1 :]:
+                    remaining.cancel()
+        return evaluations
+
+    def _terminate_executor(self) -> None:
+        executor = self._executor
+        if executor is None:
+            return
+        processes = list(getattr(executor, "_processes", {}).values())
+        executor.shutdown(wait=False, cancel_futures=True)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+        self._executor = None
+        self._executor_workers = 0
+
+    def _disk_cache_key(self, candidate: CodeCandidate, metrics_mode: str) -> str:
+        payload = {
+            "cache_schema": BACKTEST_CACHE_SCHEMA_VERSION,
+            "engine_version": BACKTEST_ENGINE_VERSION,
+            "feature_version": FEATURE_DEFINITION_VERSION,
+            "data_version": self.data_fingerprint,
+            "universe": self.data_descriptor,
+            "strategy_sha": self.strategy_fingerprint,
+            "candidate_sha": _candidate_identity(candidate),
+            "validation_ok": candidate.validation_ok,
+            "metrics_mode": metrics_mode,
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        return sha256(encoded.encode("utf-8")).hexdigest()
+
+    def execution_stats(self) -> dict[str, Any]:
+        feature_stats = self.feature_store.stats()
+        return {
+            "engine_version": BACKTEST_ENGINE_VERSION,
+            "feature_version": FEATURE_DEFINITION_VERSION,
+            "data_fingerprint": self.data_fingerprint,
+            "feature_preparation_seconds": round(self.preparation_seconds, 6),
+            "feature_estimated_bytes": feature_stats.estimated_bytes,
+            "feature_cached_lookbacks": list(feature_stats.cached_lookbacks),
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "disk_cache_bytes_written": self.disk_cache_bytes_written,
+            "rounds": list(self.evaluation_rounds),
+        }
 
 
-def _candidate_worker_count(candidate_count: int) -> int:
+def _candidate_worker_count(candidate_count: int, *, row_count: int = 0) -> int:
+    requested = _configured_worker_limit()
+    available_cpus = os.cpu_count() or 1
+    if candidate_count * row_count < SERIAL_EVALUATION_WORK_ITEMS:
+        return 1
+    return max(1, min(candidate_count, requested, available_cpus))
+
+
+def _configured_worker_limit() -> int:
     configured = os.getenv(AI_BACKTEST_WORKERS_ENV)
     try:
         requested = int(configured) if configured is not None else DEFAULT_BACKTEST_WORKERS
     except ValueError:
         requested = DEFAULT_BACKTEST_WORKERS
-    available_cpus = os.cpu_count() or 1
-    return max(1, min(candidate_count, requested, available_cpus))
+    return max(1, requested)
 
 
-def _candidate_cache_key(candidate: CodeCandidate) -> tuple[str, str, bool]:
-    code_hash = sha256(candidate.code.encode("utf-8")).hexdigest()
-    return candidate.candidate_id, code_hash, candidate.validation_ok
+def _candidate_cache_key(
+    candidate: CodeCandidate, metrics_mode: str = "selection"
+) -> tuple[str, bool, str]:
+    return _candidate_identity(candidate), candidate.validation_ok, metrics_mode
+
+
+def _candidate_identity(candidate: CodeCandidate) -> str:
+    if (
+        candidate.representation == "structured"
+        and candidate.strategy_ir is not None
+        and candidate.parameters is not None
+    ):
+        payload: Any = {
+            "strategy_ir": candidate.strategy_ir.model_dump(mode="json"),
+            "parameters": candidate.parameters.model_dump(mode="json"),
+        }
+    else:
+        payload = {"code_sha": sha256(candidate.code.encode("utf-8")).hexdigest()}
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _rebind_evaluation(
+    evaluation: _CandidateEvaluation,
+    candidate: CodeCandidate,
+    *,
+    cache_level: str | None = None,
+) -> _CandidateEvaluation:
+    rebound = candidate.model_copy(
+        update={
+            "validation_ok": evaluation.candidate.validation_ok,
+            "violations": evaluation.candidate.violations,
+            "metrics": evaluation.candidate.metrics,
+        }
+    )
+    diagnostics = dict(evaluation.diagnostics or {})
+    diagnostics["candidate_id"] = candidate.candidate_id
+    if cache_level is not None:
+        diagnostics["cache_hit"] = True
+        diagnostics["cache_level"] = cache_level
+    return _CandidateEvaluation(
+        candidate=rebound,
+        engine_summary=evaluation.engine_summary,
+        equity_curve=evaluation.equity_curve,
+        objective_score=evaluation.objective_score,
+        quantstats_dependency_error=evaluation.quantstats_dependency_error,
+        diagnostics=diagnostics,
+    )
+
+
+def _data_fingerprint(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    digest = sha256()
+    tickers: set[str] = set()
+    first_date: str | None = None
+    last_date: str | None = None
+    for row in rows:
+        ticker = str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
+        row_date = str(row.get("date") or "")
+        tickers.add(ticker)
+        first_date = row_date if first_date is None else min(first_date, row_date)
+        last_date = row_date if last_date is None else max(last_date, row_date)
+        encoded = json.dumps(
+            dict(row),
+            ensure_ascii=True,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        digest.update(encoded.encode("utf-8"))
+        digest.update(b"\n")
+    descriptor = {
+        "row_count": len(rows),
+        "ticker_count": len(tickers),
+        "tickers_sha": sha256(",".join(sorted(tickers)).encode("utf-8")).hexdigest(),
+        "first_date": first_date,
+        "last_date": last_date,
+    }
+    return digest.hexdigest(), descriptor
+
+
+def _strategy_fingerprint(strategy: AIStrategySpec) -> str:
+    payload = json.dumps(
+        strategy.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _candidate_timeout_seconds() -> float:
+    try:
+        value = float(
+            os.getenv(
+                AI_BACKTEST_CANDIDATE_TIMEOUT_ENV,
+                str(DEFAULT_CANDIDATE_TIMEOUT_SECONDS),
+            )
+        )
+    except ValueError:
+        return DEFAULT_CANDIDATE_TIMEOUT_SECONDS
+    return value if value > 0.0 else DEFAULT_CANDIDATE_TIMEOUT_SECONDS
+
+
+def _wall_budget_seconds() -> float:
+    try:
+        value = float(
+            os.getenv(
+                AI_BACKTEST_WALL_BUDGET_ENV,
+                str(DEFAULT_WALL_BUDGET_SECONDS),
+            )
+        )
+    except ValueError:
+        return DEFAULT_WALL_BUDGET_SECONDS
+    return value if value > 0.0 else DEFAULT_WALL_BUDGET_SECONDS
+
+
+def _timeout_evaluation(
+    candidate: CodeCandidate,
+    timeout_seconds: float,
+) -> _CandidateEvaluation:
+    message = f"candidate execution exceeded {timeout_seconds:g}s timeout"
+    return _CandidateEvaluation(
+        candidate=candidate.model_copy(
+            update={
+                "validation_ok": False,
+                "violations": [*candidate.violations, message],
+            }
+        ),
+        diagnostics={
+            "candidate_id": candidate.candidate_id,
+            "stage": "candidate_evaluation",
+            "cache_hit": False,
+            "error_type": "TimeoutError",
+            "timeout_seconds": timeout_seconds,
+        },
+    )
+
+
+def _peak_rss_bytes() -> int | None:
+    try:
+        import psutil
+
+        process = psutil.Process()
+        total = int(process.memory_info().rss)
+        for child in process.children(recursive=True):
+            try:
+                total += int(child.memory_info().rss)
+            except psutil.Error:
+                continue
+        return total
+    except (ImportError, OSError):
+        return None
 
 
 def _evaluate_candidate(
     strategy_a: AIStrategySpec,
     candidate: CodeCandidate,
     rows: Sequence[Mapping[str, Any]],
+    *,
+    prepared_market: EnginePreparedMarketData,
+    generated_actions: Sequence[int] | None,
+    metrics_mode: str,
 ) -> _CandidateEvaluation:
+    wall_started = time.perf_counter()
+    cpu_started = time.process_time()
     if not candidate.validation_ok:
-        return _CandidateEvaluation(candidate=candidate)
+        return _CandidateEvaluation(
+            candidate=candidate,
+            diagnostics={
+                "candidate_id": candidate.candidate_id,
+                "stage": "validation",
+                "input_rows": len(rows),
+                "generated_signals": 0,
+                "cache_hit": False,
+                "wall_seconds": 0.0,
+                "cpu_seconds": 0.0,
+            },
+        )
     try:
-        engine_result = _run_candidate_backtest(strategy_a, candidate, rows)
+        engine_result = _run_candidate_backtest(
+            strategy_a,
+            candidate,
+            rows,
+            prepared_market=prepared_market,
+            generated_actions=generated_actions,
+            metrics_mode=metrics_mode,
+        )
     except Exception as exc:
+        diagnostics = {
+            "candidate_id": candidate.candidate_id,
+            "stage": "candidate_evaluation",
+            "input_rows": len(rows),
+            "generated_signals": len(generated_actions or ()),
+            "cache_hit": False,
+            "wall_seconds": round(time.perf_counter() - wall_started, 6),
+            "cpu_seconds": round(time.process_time() - cpu_started, 6),
+            "error_type": type(exc).__name__,
+        }
         if _is_quantstats_dependency_error(exc):
-            return _CandidateEvaluation(candidate=candidate, quantstats_dependency_error=True)
+            return _CandidateEvaluation(
+                candidate=candidate,
+                quantstats_dependency_error=True,
+                diagnostics=diagnostics,
+            )
         return _CandidateEvaluation(
             candidate=candidate.model_copy(
                 update={
                     "validation_ok": False,
                     "violations": [*candidate.violations, f"engine backtest failed: {exc}"],
                 }
-            )
+            ),
+            diagnostics=diagnostics,
         )
 
     metrics = _metrics_from_engine_result(engine_result)
@@ -335,6 +896,17 @@ def _evaluate_candidate(
         engine_summary=engine_summary,
         equity_curve=_public_equity_curve(engine_result),
         objective_score=_objective_score(metrics, engine_summary, rows),
+        diagnostics={
+            "candidate_id": candidate.candidate_id,
+            "stage": "candidate_evaluation",
+            "metrics_mode": metrics_mode,
+            "input_rows": len(rows),
+            "generated_signals": len(generated_actions or ()),
+            "cache_hit": False,
+            "wall_seconds": round(time.perf_counter() - wall_started, 6),
+            "cpu_seconds": round(time.process_time() - cpu_started, 6),
+            "peak_rss_bytes": _peak_rss_bytes(),
+        },
     )
 
 
@@ -357,6 +929,7 @@ def run_candidate_backtest(
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
     equity_curves_by_candidate: dict[str, list[BacktestEquityPoint]] = {}
     objective_scores_by_candidate: dict[str, float] = {}
+    diagnostics_by_candidate: dict[str, dict[str, Any]] = {}
 
     try:
         evaluations = session.evaluate(candidates)
@@ -365,6 +938,8 @@ def run_candidate_backtest(
                 raise ModuleNotFoundError(QUANTSTATS_REQUIRED_MESSAGE)
             candidate = evaluation.candidate
             enriched_candidates.append(candidate)
+            if evaluation.diagnostics is not None:
+                diagnostics_by_candidate[candidate.candidate_id] = evaluation.diagnostics
             if (
                 not candidate.validation_ok
                 or candidate.metrics is None
@@ -376,9 +951,10 @@ def run_candidate_backtest(
             engine_summaries_by_candidate[candidate.candidate_id] = evaluation.engine_summary
             equity_curves_by_candidate[candidate.candidate_id] = evaluation.equity_curve
             objective_scores_by_candidate[candidate.candidate_id] = evaluation.objective_score
-    finally:
+    except BaseException:
         if owns_session:
             session.close()
+        raise
 
     valid_candidates = [
         candidate
@@ -391,7 +967,11 @@ def run_candidate_backtest(
             for candidate in enriched_candidates
             for violation in getattr(candidate, "violations", [])
         ):
+            if owns_session:
+                session.close()
             raise ModuleNotFoundError(QUANTSTATS_REQUIRED_MESSAGE)
+        if owns_session:
+            session.close()
         raise ValueError("at least one candidate must pass validation and engine backtest")
 
     selected = max(
@@ -401,22 +981,58 @@ def run_candidate_backtest(
             *_candidate_rank(candidate),
         ),
     )
+    try:
+        detailed = session.evaluate([selected], metrics_mode="full")[0]
+    except BaseException:
+        if owns_session:
+            session.close()
+        raise
+    if detailed.quantstats_dependency_error:
+        if owns_session:
+            session.close()
+        raise ModuleNotFoundError(QUANTSTATS_REQUIRED_MESSAGE)
+    if (
+        detailed.candidate.validation_ok
+        and detailed.candidate.metrics is not None
+        and detailed.engine_summary is not None
+        and detailed.equity_curve is not None
+        and detailed.objective_score is not None
+    ):
+        selected = detailed.candidate
+        enriched_candidates = [
+            selected if item.candidate_id == selected.candidate_id else item
+            for item in enriched_candidates
+        ]
+        engine_summaries_by_candidate[selected.candidate_id] = detailed.engine_summary
+        equity_curves_by_candidate[selected.candidate_id] = detailed.equity_curve
+        objective_scores_by_candidate[selected.candidate_id] = detailed.objective_score
+        if detailed.diagnostics is not None:
+            diagnostics_by_candidate[selected.candidate_id] = detailed.diagnostics
 
-    return CandidateBacktestResult(
-        strategy_a=strategy_a,
-        candidates=enriched_candidates,
-        selected_candidate=selected,
-        equity_curve=equity_curves_by_candidate[selected.candidate_id],
-        engine_summary=engine_summaries_by_candidate[selected.candidate_id],
-        engine_summaries_by_candidate=engine_summaries_by_candidate,
-        objective_scores_by_candidate=objective_scores_by_candidate,
-        backtest_payload=_backtest_payload(strategy_a, rows),
-        feature_coverage=dict(feature_coverage or {}),
-        fallback_reasons=list(fallback_reasons or ()),
-    )
+    try:
+        return CandidateBacktestResult(
+            strategy_a=strategy_a,
+            candidates=enriched_candidates,
+            selected_candidate=selected,
+            equity_curve=equity_curves_by_candidate[selected.candidate_id],
+            engine_summary=engine_summaries_by_candidate[selected.candidate_id],
+            engine_summaries_by_candidate=engine_summaries_by_candidate,
+            objective_scores_by_candidate=objective_scores_by_candidate,
+            backtest_payload=_backtest_payload(strategy_a, rows),
+            feature_coverage=dict(feature_coverage or {}),
+            fallback_reasons=list(fallback_reasons or ()),
+            execution_stats={
+                **session.execution_stats(),
+                "candidates": diagnostics_by_candidate,
+            },
+        )
+    finally:
+        if owns_session:
+            session.close()
 
 
 def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
+    node_started = time.perf_counter()
     strategy_a = AIStrategySpec.model_validate(state["strategy_spec"])
     candidates = [
         CodeCandidate.model_validate(candidate)
@@ -461,17 +1077,37 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
             detail=_selected_candidate_detail(result),
         )
         all_candidates = candidates
+        seen_candidates = {_candidate_identity(candidate) for candidate in all_candidates}
         fallback_reasons = list(state.get("backtest_code", {}).get("fallback_reasons", []))
-        for iteration in range(1, 3):
+        for iteration in range(1, MAX_SELF_IMPROVEMENT_ROUNDS + 1):
             if _passes_objective_floor(result):
                 break
-            improved = generate_self_improvement_candidates(
+            if time.perf_counter() - node_started >= _wall_budget_seconds():
+                fallback_reasons.append(
+                    f"self-improvement stopped after exceeding {_wall_budget_seconds():g}s wall budget"
+                )
+                break
+            proposed = generate_self_improvement_candidates(
                 strategy_a,
                 state.get("backtest_code", {}).get("code_plan", {}),
                 start_index=len(all_candidates) + 1,
                 iteration=iteration,
                 max_positions=max_positions,
             )
+            improved = []
+            for candidate in proposed:
+                identity = _candidate_identity(candidate)
+                if identity in seen_candidates:
+                    continue
+                seen_candidates.add(identity)
+                improved.append(candidate)
+                if len(improved) >= 6:
+                    break
+            if not improved:
+                fallback_reasons.append(
+                    f"self-improvement iteration {iteration}: no distinct candidates"
+                )
+                break
             all_candidates = [*all_candidates, *improved]
             fallback_reasons.append(
                 f"self-improvement iteration {iteration}: generated {len(improved)} threshold-adjusted candidates"
@@ -507,6 +1143,21 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                     detail="추가 변형이 성과를 높이지 못해 최적화를 중단합니다.",
                 )
                 break
+        result = result.model_copy(
+            update={
+                "fallback_reasons": fallback_reasons,
+                "execution_stats": {
+                    **result.execution_stats,
+                    **session.execution_stats(),
+                    "total_backtest_wall_seconds": round(
+                        time.perf_counter() - node_started, 6
+                    ),
+                    "configured_workers": _configured_worker_limit(),
+                    "candidate_timeout_seconds": _candidate_timeout_seconds(),
+                    "wall_budget_seconds": _wall_budget_seconds(),
+                },
+            }
+        )
     # The recommendation gate downstream needs to know whether this strategy's backtest
     # actually cleared the objective floor, not just what its metrics were.
     return {
@@ -529,10 +1180,15 @@ def _run_candidate_backtest(
     strategy: AIStrategySpec,
     candidate: CodeCandidate,
     price_rows: Sequence[Mapping[str, Any]],
+    *,
+    prepared_market: EnginePreparedMarketData,
+    generated_actions: Sequence[int] | None,
+    metrics_mode: str,
 ):
-    generated_signals = _execute_candidate_code(candidate, price_rows)
-    ohlcv_rows, base_metric_rows = _engine_market_rows(price_rows)
-    metric_rows = _merge_generated_signals(base_metric_rows, generated_signals)
+    actions = generated_actions
+    if actions is None:
+        generated_signals = _execute_candidate_code(candidate, price_rows)
+        actions = _compact_actions_from_signals(prepared_market, generated_signals)
     engine_spec = _engine_strategy_spec(
         strategy,
         candidate,
@@ -540,14 +1196,42 @@ def _run_candidate_backtest(
     )
     return run_engine_backtest(
         engine_spec,
-        ohlcv_rows=ohlcv_rows,
-        metric_rows=metric_rows,
         config=EngineBacktestRunConfig(
             initial_capital=DEFAULT_INITIAL_CAPITAL,
             write_outputs=False,
             talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
+            metrics_mode=metrics_mode,
         ),
+        prepared_market_data=prepared_market,
+        generated_actions=actions,
     )
+
+
+def _compact_actions_from_signals(
+    prepared_market: EnginePreparedMarketData,
+    generated_signals: Sequence[GeneratedSignal],
+) -> list[int]:
+    actions = [0] * len(prepared_market.ohlcv_rows)
+    tickers_by_date: dict[str, list[str]] = {}
+    for bar in prepared_market.ohlcv_rows:
+        tickers_by_date.setdefault(bar.date.isoformat(), []).append(bar.ticker)
+    for signal in generated_signals:
+        ticker = signal.ticker
+        if ticker is None:
+            tickers = tickers_by_date.get(signal.date, [])
+            if len(tickers) != 1:
+                raise ValueError(
+                    f"generated signal date {signal.date} is ambiguous without ticker"
+                )
+            ticker = tickers[0]
+        key = (date.fromisoformat(signal.date), ticker)
+        index = prepared_market.row_index_by_key.get(key)
+        if index is None:
+            raise ValueError(
+                f"generated signal {signal.date}/{ticker} is not present in price rows"
+            )
+        actions[index] = int(SIGNAL_METRIC_VALUES[signal.action])
+    return actions
 
 
 def _execute_candidate_code(
@@ -774,11 +1458,20 @@ def _execution_audit(engine_result: Any) -> dict[str, Any]:
 def _metrics_from_engine_result(engine_result) -> BacktestMetrics:
     summary = engine_result.summary
     metric_warnings = _summary_warning_list(summary)
-    daily_returns = returns_from_equity_curve(engine_result.equity_curve)
+    selection_mode = summary.get("metrics_mode") == "selection"
+    daily_returns = (
+        _native_returns_from_equity_curve(engine_result.equity_curve)
+        if selection_mode
+        else returns_from_equity_curve(engine_result.equity_curve)
+    )
     sharpe = _summary_float_default(
         summary, "sharpe", _summary_float_default(summary, "daily_sharpe_like", 0.0)
     )
-    in_sample_sharpe, out_sample_sharpe = _split_sharpes(daily_returns, metric_warnings)
+    in_sample_sharpe, out_sample_sharpe = _split_sharpes(
+        daily_returns,
+        metric_warnings,
+        native=selection_mode,
+    )
     degradation = _degradation(in_sample_sharpe, out_sample_sharpe)
     return BacktestMetrics(
         sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
@@ -830,21 +1523,25 @@ def _sample_points(points: Sequence[Any], max_points: int) -> list[Any]:
 
 
 def _split_sharpes(
-    daily_returns: list[float], metric_warnings: list[dict[str, str]]
+    daily_returns: list[float],
+    metric_warnings: list[dict[str, str]],
+    *,
+    native: bool = False,
 ) -> tuple[float, float]:
+    sharpe_function = _native_sharpe_like if native else _sharpe_like
     if len(daily_returns) < MIN_RETURNS_FOR_SPLIT:
-        full_sample = _sharpe_like(
+        full_sample = sharpe_function(
             daily_returns, metric_name="full_sample_sharpe", metric_warnings=metric_warnings
         )
         return full_sample, full_sample
     split_index = max(1, int(len(daily_returns) * BACKTEST_SPLIT_FRACTION))
     return (
-        _sharpe_like(
+        sharpe_function(
             daily_returns[:split_index],
             metric_name="in_sample_sharpe",
             metric_warnings=metric_warnings,
         ),
-        _sharpe_like(
+        sharpe_function(
             daily_returns[split_index:],
             metric_name="out_sample_sharpe",
             metric_warnings=metric_warnings,
@@ -863,6 +1560,31 @@ def _sharpe_like(
         metric_name=metric_name,
         metric_warnings=metric_warnings,
     )
+
+
+def _native_returns_from_equity_curve(equity_curve: Sequence[Any]) -> list[float]:
+    values = [float(point.total_equity) for point in equity_curve]
+    return [
+        current / previous - 1.0
+        for previous, current in zip(values, values[1:])
+        if previous != 0.0
+    ]
+
+
+def _native_sharpe_like(
+    daily_returns: list[float],
+    *,
+    metric_name: str = "sharpe",
+    metric_warnings: list[dict[str, str]] | None = None,
+) -> float:
+    del metric_name, metric_warnings
+    if len(daily_returns) < 2:
+        return 0.0
+    mean_return = sum(daily_returns) / len(daily_returns)
+    variance = sum(
+        (value - mean_return) ** 2 for value in daily_returns
+    ) / (len(daily_returns) - 1)
+    return mean_return / math.sqrt(variance) * math.sqrt(252.0) if variance > 0.0 else 0.0
 
 
 def _degradation(in_sample_sharpe: float, out_sample_sharpe: float) -> float:

@@ -55,14 +55,16 @@ def test_backtest_code_prompt_declares_expected_json_schema() -> None:
     prompt_payload = json.loads(request.user_prompt)
     schema = prompt_payload["expected_json_schema"]
 
-    assert request.schema_name == "backtest_code_candidates.v1"
+    assert request.schema_name == "backtest_strategy_candidates.v2"
     assert request.task_type == "backtest_code_generation"
-    assert request.prompt_template_name == "backtest_code_generation"
-    assert request.prompt_version == "v1"
+    assert request.prompt_template_name == "backtest_strategy_generation"
+    assert request.prompt_version == "v2"
     assert request.variables_jsonb == prompt_payload
+    assert request.response_schema == schema
+    assert "strategy_ir" in schema["properties"]
     assert "candidates" in schema["properties"]
     assert schema["properties"]["candidates"]["minItems"] == 3
-    assert schema["properties"]["candidates"]["maxItems"] == 12
+    assert schema["properties"]["candidates"]["maxItems"] == 3
 
 
 def test_backtest_code_schema_validation_failure_records_fallback_reason() -> None:
@@ -74,7 +76,8 @@ def test_backtest_code_schema_validation_failure_records_fallback_reason() -> No
         llm_client=InvalidSchemaLLMClient(),
     )
 
-    assert len(result.candidates) >= 6
+    assert len(result.candidates) == 3
+    assert all(candidate.representation == "structured" for candidate in result.candidates)
     assert result.fallback_reasons
     assert "ValidationError" in result.fallback_reasons[0]
 
@@ -88,20 +91,10 @@ def test_backtest_code_ast_validation_failure_uses_safe_fallback_candidates() ->
         llm_client=UnsafeCodeLLMClient(),
     )
 
-    assert len(result.candidates) >= 6
-    assert sum(candidate.validation_ok for candidate in result.candidates) >= 6
-    assert any(
-        reason.startswith("A1: import 'os' is not allowed")
-        for reason in result.fallback_reasons
-    )
-    assert any(
-        reason.startswith("A2: ") and "build_signals" in reason
-        for reason in result.fallback_reasons
-    )
-    assert any(
-        reason.startswith("A3: ") and "build_signals" in reason
-        for reason in result.fallback_reasons
-    )
+    assert len(result.candidates) == 3
+    assert all(candidate.validation_ok for candidate in result.candidates)
+    assert all(candidate.representation == "structured" for candidate in result.candidates)
+    assert any("ValidationError" in reason for reason in result.fallback_reasons)
 
 
 def test_backtest_code_fallback_reason_is_available_in_internal_payload_only() -> None:

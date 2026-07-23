@@ -180,6 +180,21 @@ class BacktestRunConfig:
     max_tickers: int | None = None
     write_outputs: bool = True
     talib: TalibIndicatorConfig = field(default_factory=TalibIndicatorConfig)
+    metrics_mode: Literal["selection", "full"] = "full"
+
+
+@dataclass(frozen=True)
+class PreparedMarketData:
+    """Read-only market indexes that can be reused by many strategy candidates."""
+
+    ohlcv_rows: tuple[OhlcvBar, ...]
+    bars_by_ticker: Mapping[str, tuple[OhlcvBar, ...]]
+    bars_by_date: Mapping[date, Mapping[str, OhlcvBar]]
+    metrics_by_key: Mapping[tuple[date, str], Mapping[str, float]]
+    previous_metrics_by_key: Mapping[tuple[date, str], Mapping[str, float] | None]
+    dates: tuple[date, ...]
+    row_index_by_key: Mapping[tuple[date, str], int]
+    indicator_report: Mapping[str, object]
 
 
 def _open_text(path: Path):
@@ -639,12 +654,22 @@ class BacktestEngine:
             | None
         ) = None,
         config: BacktestRunConfig | None = None,
+        prepared_market_data: PreparedMarketData | None = None,
+        generated_actions: Sequence[int] | None = None,
     ):
         self.spec = spec
         self.strategy = QuantStrategy(spec)
-        self.ohlcv_rows = sorted(ohlcv_rows, key=lambda row: (row.date, row.ticker))
-        self.metric_rows = normalize_metric_rows(metric_rows)
         self.config = config or BacktestRunConfig()
+        self.prepared_market_data = prepared_market_data
+        self.generated_actions = generated_actions
+        if prepared_market_data is None:
+            self.ohlcv_rows = sorted(ohlcv_rows, key=lambda row: (row.date, row.ticker))
+            self.metric_rows = normalize_metric_rows(metric_rows)
+        else:
+            self.ohlcv_rows = list(prepared_market_data.ohlcv_rows)
+            self.metric_rows = {}
+            if generated_actions is not None and len(generated_actions) != len(self.ohlcv_rows):
+                raise ValueError("generated_actions must align one-to-one with prepared OHLCV rows")
         self.indicator_report: dict[str, object] = {}
         if self.config.max_tickers is not None:
             allowed = sorted({row.ticker for row in self.ohlcv_rows})[: self.config.max_tickers]
@@ -656,13 +681,17 @@ class BacktestEngine:
         if self.spec.backtest.execution_timing != ExecutionTiming.NEXT_OPEN:
             raise ValueError("BacktestEngine currently supports execution_timing='next_open' only")
 
-        bars_by_ticker, bars_by_date, metrics_by_key, previous_metrics_by_key = self._prepare_market_data()
+        prepared = self._prepare_market_data()
+        bars_by_ticker = prepared.bars_by_ticker
+        bars_by_date = prepared.bars_by_date
+        metrics_by_key = prepared.metrics_by_key
+        previous_metrics_by_key = prepared.previous_metrics_by_key
         included_tickers, exclusions = self._select_tickers(bars_by_ticker, metrics_by_key)
         bars_by_date = {
             day: {ticker: bar for ticker, bar in by_ticker.items() if ticker in included_tickers}
             for day, by_ticker in bars_by_date.items()
         }
-        dates = sorted(day for day, by_ticker in bars_by_date.items() if by_ticker)
+        dates = [day for day in prepared.dates if bars_by_date.get(day)]
 
         cash = float(self.config.initial_capital)
         positions: dict[str, Position] = {}
@@ -726,6 +755,10 @@ class BacktestEngine:
         return result
 
     def _prepare_market_data(self):
+        if self.prepared_market_data is not None:
+            self.indicator_report = dict(self.prepared_market_data.indicator_report)
+            return self.prepared_market_data
+
         bars_by_ticker: dict[str, list[OhlcvBar]] = {}
         bars_by_date: dict[date, dict[str, OhlcvBar]] = {}
         metrics_by_key: dict[tuple[date, str], dict[str, float]] = {}
@@ -788,10 +821,36 @@ class BacktestEngine:
         except Exception as exc:  # pragma: no cover
             report["catalog_error"] = f"{type(exc).__name__}: {exc}"
         self.indicator_report = report
-        return bars_by_ticker, bars_by_date, metrics_by_key, previous_metrics_by_key
+        dates = tuple(sorted(day for day, by_ticker in bars_by_date.items() if by_ticker))
+        sorted_rows = tuple(
+            bar
+            for day in dates
+            for _, bar in sorted(bars_by_date[day].items())
+        )
+        row_index_by_key = {
+            (bar.date, bar.ticker): index for index, bar in enumerate(sorted_rows)
+        }
+        return PreparedMarketData(
+            ohlcv_rows=sorted_rows,
+            bars_by_ticker={
+                ticker: tuple(sorted(bars, key=lambda item: item.date))
+                for ticker, bars in bars_by_ticker.items()
+            },
+            bars_by_date={
+                day: dict(sorted(by_ticker.items()))
+                for day, by_ticker in bars_by_date.items()
+            },
+            metrics_by_key=metrics_by_key,
+            previous_metrics_by_key=previous_metrics_by_key,
+            dates=dates,
+            row_index_by_key=row_index_by_key,
+            indicator_report=dict(report),
+        )
 
     def _select_tickers(self, bars_by_ticker, metrics_by_key):
         required = sorted(required_metric_names(self.spec))
+        if self.generated_actions is not None:
+            required = [name for name in required if name != "generated_signal"]
         included: set[str] = set()
         exclusions: list[ExcludedTicker] = []
         for ticker, bars in bars_by_ticker.items():
@@ -972,6 +1031,14 @@ class BacktestEngine:
         previous_metrics_by_key,
         pending_orders,
     ):
+        if self.generated_actions is not None and self.prepared_market_data is not None:
+            return self._generate_compact_signals_for_date(
+                current_date,
+                today_bars,
+                positions,
+                pending_orders,
+            )
+
         pending_tickers = {(order.side, order.ticker) for order in pending_orders}
         orders: list[PendingOrder] = []
         signals: list[SignalRecord] = []
@@ -1064,6 +1131,124 @@ class BacktestEngine:
                     )
         return orders, signals, audit
 
+    def _generate_compact_signals_for_date(
+        self,
+        current_date,
+        today_bars,
+        positions,
+        pending_orders,
+    ):
+        """Consume aligned int8-style actions without MarketSnapshot/SignalDecision churn."""
+
+        pending_tickers = {(order.side, order.ticker) for order in pending_orders}
+        orders: list[PendingOrder] = []
+        signals: list[SignalRecord] = []
+        audit: list[OrderAuditRecord] = []
+        row_index_by_key = self.prepared_market_data.row_index_by_key
+        for ticker in sorted(today_bars):
+            action_value = int(self.generated_actions[row_index_by_key[(current_date, ticker)]])
+            has_position = ticker in positions
+            if action_value == 1 and not has_position:
+                action = "buy"
+                reason = "generated BUY signal"
+                if ("buy", ticker) not in pending_tickers:
+                    orders.append(
+                        PendingOrder(
+                            ticker=ticker,
+                            side="buy",
+                            signal_date=current_date,
+                            reason=reason,
+                        )
+                    )
+                    audit.append(
+                        OrderAuditRecord(
+                            date=current_date.isoformat(),
+                            ticker=ticker,
+                            side="buy",
+                            status="submitted",
+                            signal_date=current_date.isoformat(),
+                            reason=reason,
+                            detail="Queued for the next available open.",
+                        )
+                    )
+                    pending_tickers.add(("buy", ticker))
+            elif action_value == -1 and has_position:
+                action = "sell"
+                reason = "generated SELL signal"
+                if ("sell", ticker) not in pending_tickers:
+                    orders.append(
+                        PendingOrder(
+                            ticker=ticker,
+                            side="sell",
+                            signal_date=current_date,
+                            reason=reason,
+                        )
+                    )
+                    audit.append(
+                        OrderAuditRecord(
+                            date=current_date.isoformat(),
+                            ticker=ticker,
+                            side="sell",
+                            status="submitted",
+                            signal_date=current_date.isoformat(),
+                            reason=reason,
+                            detail="Queued for the next available open.",
+                        )
+                    )
+                    pending_tickers.add(("sell", ticker))
+            else:
+                action = "hold" if has_position else "watch"
+
+            signals.append(
+                SignalRecord(
+                    date=current_date.isoformat(),
+                    ticker=ticker,
+                    action=action,
+                    reasons=(
+                        "generated BUY signal"
+                        if action == "buy"
+                        else "generated SELL signal"
+                        if action == "sell"
+                        else "no actionable rule matched"
+                    ),
+                    matching_entry_rules="generated BUY signal" if action == "buy" else "",
+                    matching_exit_rules="generated SELL signal" if action == "sell" else "",
+                )
+            )
+            if has_position and ("sell", ticker) not in pending_tickers:
+                risk_reason = self._risk_exit_reason(positions[ticker], today_bars[ticker])
+                if risk_reason:
+                    orders.append(
+                        PendingOrder(
+                            ticker=ticker,
+                            side="sell",
+                            signal_date=current_date,
+                            reason=risk_reason,
+                        )
+                    )
+                    signals.append(
+                        SignalRecord(
+                            date=current_date.isoformat(),
+                            ticker=ticker,
+                            action="sell",
+                            reasons=risk_reason,
+                            matching_entry_rules="",
+                            matching_exit_rules=risk_reason,
+                        )
+                    )
+                    audit.append(
+                        OrderAuditRecord(
+                            date=current_date.isoformat(),
+                            ticker=ticker,
+                            side="sell",
+                            status="submitted",
+                            signal_date=current_date.isoformat(),
+                            reason=risk_reason,
+                            detail="Risk control queued the exit for the next available open.",
+                        )
+                    )
+        return orders, signals, audit
+
     def _risk_exit_reason(self, position: Position, bar: OhlcvBar) -> str | None:
         stop_loss = self.spec.risk_controls.stop_loss_pct
         if stop_loss and bar.close <= position.entry_price * (1 - stop_loss):
@@ -1105,7 +1290,10 @@ class BacktestEngine:
         return total
 
     def _summary(self, cash, positions, trades, equity_curve, signals, exclusions, final_equity):
-        metrics = calculate_quantstats_metrics(equity_curve, include_montecarlo=True)
+        if self.config.metrics_mode == "selection":
+            metrics = _calculate_selection_metrics(equity_curve)
+        else:
+            metrics = calculate_quantstats_metrics(equity_curve, include_montecarlo=True)
         winners = [trade for trade in trades if trade.net_pnl > 0]
         trade_win_rate = round(len(winners) / len(trades), 10) if trades else 0.0
         holding_days = [
@@ -1119,6 +1307,7 @@ class BacktestEngine:
         return {
             "strategy_id": self.spec.strategy_id,
             "strategy_name": self.spec.strategy_name,
+            "metrics_mode": self.config.metrics_mode,
             "initial_capital": self.config.initial_capital,
             "final_equity": round(final_equity, 6),
             "cash": round(cash, 6),
@@ -1267,6 +1456,69 @@ def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames) -> None:
         writer.writerows(rows)
 
 
+def _calculate_selection_metrics(equity_curve: Sequence[EquityPoint]) -> dict[str, object]:
+    """Cheap deterministic metrics used to rank candidates before full post-processing."""
+
+    if not equity_curve:
+        return {
+            "total_return": 0.0,
+            "cagr": 0.0,
+            "sharpe": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "metric_warnings": [],
+        }
+
+    initial = float(equity_curve[0].total_equity)
+    final = float(equity_curve[-1].total_equity)
+    total_return = final / initial - 1.0 if initial else 0.0
+    returns = [float(point.daily_return) for point in equity_curve]
+    usable = returns[1:] if len(returns) > 1 else []
+    mean_return = sum(usable) / len(usable) if usable else 0.0
+    variance = (
+        sum((value - mean_return) ** 2 for value in usable) / (len(usable) - 1)
+        if len(usable) > 1
+        else 0.0
+    )
+    volatility = math.sqrt(variance)
+    sharpe = mean_return / volatility * math.sqrt(252.0) if volatility > 0.0 else 0.0
+
+    peak = float(equity_curve[0].total_equity)
+    max_drawdown = 0.0
+    for point in equity_curve:
+        value = float(point.total_equity)
+        peak = max(peak, value)
+        drawdown = value / peak - 1.0 if peak else 0.0
+        max_drawdown = min(max_drawdown, drawdown)
+
+    positive = sum(value for value in usable if value > 0.0)
+    negative = -sum(value for value in usable if value < 0.0)
+    profit_factor = positive / negative if negative > 0.0 else (1.0 if positive > 0.0 else 0.0)
+    elapsed_days = max(
+        1,
+        (date.fromisoformat(equity_curve[-1].date) - date.fromisoformat(equity_curve[0].date)).days,
+    )
+    cagr = (final / initial) ** (365.0 / elapsed_days) - 1.0 if initial > 0.0 and final > 0.0 else 0.0
+    win_rate = (
+        sum(1 for value in usable if value > 0.0) / len(usable)
+        if usable
+        else 0.0
+    )
+    return {
+        "total_return": round(total_return, 10),
+        "cagr": round(cagr, 10),
+        "sharpe": round(sharpe, 10),
+        "sharpe_ratio": round(sharpe, 10),
+        "max_drawdown": round(max_drawdown, 10),
+        "win_rate": round(win_rate, 10),
+        "profit_factor": round(profit_factor, 10),
+        "volatility": round(volatility * math.sqrt(252.0), 10),
+        "metric_warnings": [],
+    }
+
+
 def run_backtest(
     spec: StrategySpec,
     *,
@@ -1275,13 +1527,40 @@ def run_backtest(
     metric_rows: Mapping[tuple[date | str, str], Mapping[str, object]] | Iterable[Mapping[str, object]] | None = None,
     metrics_path: str | Path | None = None,
     config: BacktestRunConfig | None = None,
+    prepared_market_data: PreparedMarketData | None = None,
+    generated_actions: Sequence[int] | None = None,
 ) -> BacktestResult:
-    if ohlcv_rows is None:
+    if ohlcv_rows is None and prepared_market_data is None:
         ohlcv_rows = load_ohlcv_csv(ohlcv_path or DEFAULT_OHLCV_PATH)
     merged_metrics = normalize_metric_rows(metric_rows)
     if metrics_path is not None:
         merged_metrics.update(load_metric_csv(metrics_path))
-    return BacktestEngine(spec, ohlcv_rows, metric_rows=merged_metrics, config=config).run()
+    return BacktestEngine(
+        spec,
+        ohlcv_rows or (),
+        metric_rows=merged_metrics,
+        config=config,
+        prepared_market_data=prepared_market_data,
+        generated_actions=generated_actions,
+    ).run()
+
+
+def prepare_market_data(
+    spec: StrategySpec,
+    *,
+    ohlcv_rows: Sequence[OhlcvBar],
+    metric_rows: Mapping[tuple[date | str, str], Mapping[str, object]] | Iterable[Mapping[str, object]] | None = None,
+    config: BacktestRunConfig | None = None,
+) -> PreparedMarketData:
+    """Normalize, sort, index, and calculate common metrics once for many candidates."""
+
+    engine = BacktestEngine(
+        spec,
+        ohlcv_rows,
+        metric_rows=metric_rows,
+        config=config,
+    )
+    return engine._prepare_market_data()
 
 
 def build_sample_spec() -> StrategySpec:

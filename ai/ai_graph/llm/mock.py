@@ -678,10 +678,7 @@ class MockLLMClient:
         try:
             if request.schema_name == BACKTEST_CODE_SCHEMA_NAME:
                 strategy, variant = _strategy_and_variant_from_request(request)
-                result = {
-                    "candidates": self.generate_backtest_candidates(strategy, variant),
-                    "fallback_reasons": [],
-                }
+                result = _mock_structured_backtest_payload(strategy)
             elif request.schema_name.startswith("quantagent.report_writeup"):
                 # Mock has to answer the schemas the pipeline actually asks for, or the
                 # deterministic path silently falls back everywhere and mock-mode tests
@@ -753,6 +750,68 @@ class MockBacktestCodeLLM(MockLLMClient):
         if strategy.strategy_id.startswith(("flow_accumulation", "short_covering_proxy", "gap_hold_momentum", "breakout_setup")):
             return list(BREAKOUT_VOLUME_CANDIDATES)
         return list(MOCK_BACKTEST_CODE_CANDIDATES)
+
+
+def _mock_structured_backtest_payload(strategy: StrategySpec) -> dict[str, Any]:
+    requested = " ".join(
+        [
+            strategy.strategy_id,
+            *strategy.indicators,
+            *(condition.left for condition in strategy.entry_conditions),
+        ]
+    ).lower()
+    if "rsi" in requested:
+        entry_feature = "rsi_rebound"
+        exit_feature = "rsi_overbought_or_stop"
+        proxy_feature = "rsi"
+        profiles = ["compiled_conditions", "rsi_trend_rebound", "mean_reversion_band"]
+        lookbacks = [14, 20, 30]
+        thresholds = [30.0, 35.0, 40.0]
+    elif "volume" in requested or "breakout" in requested:
+        entry_feature = "breakout_volume"
+        exit_feature = "sma_or_stop"
+        proxy_feature = "volume_accumulation_proxy"
+        profiles = ["compiled_conditions", "breakout_volume", "volatility_breakout_hold"]
+        lookbacks = [20, 30, 60]
+        thresholds = [1.2, 1.35, 1.5]
+    else:
+        entry_feature = "adaptive_trend"
+        exit_feature = "sma_or_stop"
+        proxy_feature = "technical_proxy"
+        profiles = ["compiled_conditions", "quality_trend_hold", "long_regime_momentum"]
+        lookbacks = [20, 30, 60]
+        thresholds = [0.0, 0.02, 0.05]
+    stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", 0.08))
+    take_profit = float(strategy.risk_constraints.get("take_profit_pct", 0.45))
+    return {
+        "strategy_ir": {
+            "version": "strategy-ir.v1",
+            "strategy_id": strategy.strategy_id,
+            "entry_feature": entry_feature,
+            "exit_feature": exit_feature,
+            "proxy_feature": proxy_feature,
+            "entry_conditions": [
+                condition.model_dump(mode="json") for condition in strategy.entry_conditions
+            ],
+            "exit_conditions": [
+                condition.model_dump(mode="json") for condition in strategy.exit_conditions
+            ],
+            "ranking": "score_desc_ticker_desc",
+        },
+        "candidates": [
+            {
+                "profile": profile,
+                "lookback": lookback,
+                "threshold": threshold,
+                "stop_loss_pct": stop_loss,
+                "take_profit_pct": take_profit,
+                "max_positions": 10,
+            }
+            for profile, lookback, threshold in zip(profiles, lookbacks, thresholds)
+        ],
+        "fallback_code": [],
+        "fallback_reasons": [],
+    }
 
 
 def _mock_role_debate_payload(summary: str) -> dict[str, Any]:

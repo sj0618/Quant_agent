@@ -52,7 +52,8 @@ def test_backtest_node_metrics_are_computed_by_backtest_module_engine() -> None:
     )
 
     assert all(candidate.metrics is None for candidate in result_a.candidates)
-    assert len(result_a.candidates) >= 6
+    assert len(result_a.candidates) == 3
+    assert all(candidate.representation == "structured" for candidate in result_a.candidates)
 
     result = run_candidate_backtest(strategy_a, result_a.candidates)
 
@@ -120,8 +121,12 @@ def test_breakout_volume_strategy_uses_strategy_specific_candidates() -> None:
     )
 
     assert all(candidate.validation_ok for candidate in result_a.candidates)
-    assert len(result_a.candidates) >= 6
-    assert any("volume_ratio" in candidate.code for candidate in result_a.candidates)
+    assert len(result_a.candidates) == 3
+    assert any(
+        candidate.parameters is not None
+        and candidate.parameters.profile == "breakout_volume"
+        for candidate in result_a.candidates
+    )
 
     result = run_candidate_backtest(strategy_a, result_a.candidates)
 
@@ -321,16 +326,9 @@ def test_metrics_from_engine_result_uses_equity_pct_change_for_split_sharpes(mon
 
 def test_candidate_backtest_surfaces_quantstats_install_error(monkeypatch) -> None:
     strategy_a = make_strategy("missing-quantstats", "Missing QuantStats")
-    candidates = [
-        CodeCandidate(
-            candidate_id="missing-quantstats-a",
-            variant="A",
-            code="""def build_signals(prices):
-    return [{"date": row["date"], "action": "HOLD", "price": float(row["close"])} for row in prices]
-""",
-            validation_ok=True,
-        )
-    ]
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy_a, variant="A", trace_id="missing-quantstats")
+    ).candidates[:1]
 
     def raise_missing_dependency(*args, **kwargs):
         raise ModuleNotFoundError(QUANTSTATS_REQUIRED_MESSAGE)
@@ -341,7 +339,7 @@ def test_candidate_backtest_surfaces_quantstats_install_error(monkeypatch) -> No
         run_candidate_backtest(strategy_a, candidates)
 
 
-def test_candidate_backtest_session_only_evaluates_new_candidates(monkeypatch) -> None:
+def test_candidate_backtest_session_only_evaluates_new_candidates(monkeypatch, tmp_path) -> None:
     strategy_a = make_strategy("cached-candidates", "Cached Candidates")
     code = """def build_signals(prices):
     return [
@@ -364,24 +362,19 @@ def test_candidate_backtest_session_only_evaluates_new_candidates(monkeypatch) -
         code=code,
         validation_ok=True,
     )
-    original_run = backtest_node._run_candidate_backtest
-    executed_candidate_ids: list[str] = []
-
-    def tracking_run(strategy, candidate, rows):
-        executed_candidate_ids.append(candidate.candidate_id)
-        return original_run(strategy, candidate, rows)
-
     monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
-    monkeypatch.setattr(backtest_node, "_run_candidate_backtest", tracking_run)
+    monkeypatch.setenv(
+        backtest_node.BACKTEST_CACHE_DIR_ENV,
+        str(tmp_path / "candidate-cache"),
+    )
     rows = backtest_node._price_rows(None)
 
     with backtest_node._CandidateBacktestSession(strategy_a, rows) as session:
-        run_candidate_backtest(strategy_a, initial, price_rows=rows, _session=session)
-        run_candidate_backtest(
-            strategy_a,
-            [*initial, improved],
-            price_rows=rows,
-            _session=session,
-        )
+        session.evaluate(initial)
+        session.evaluate([*initial, improved])
+        rounds = session.execution_stats()["rounds"]
 
-    assert executed_candidate_ids == ["cached-1", "cached-2", "cached-3"]
+    # All three IDs carry the same normalized code representation, so it is evaluated once.
+    assert rounds[0]["new_candidates"] == 1
+    assert rounds[1]["new_candidates"] == 0
+    assert rounds[1]["cached_candidates"] == 3

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from hashlib import sha256
+import json
+
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.llm import LLMClient, LLMClientError, create_llm_client, is_live_llm_provider
@@ -20,7 +23,7 @@ from ai_graph.nodes.position_sizing import (
     available_ticker_count,
     max_position_pct_from_risk_constraints,
 )
-from ai_graph.schemas import CodeCandidate, StrategySpec
+from ai_graph.schemas import CandidateParameters, CodeCandidate, StrategyIR, StrategySpec
 from ai_graph.nodes.condition_compiler import CompiledConditions, compile_conditions
 from ai_graph.security.ast_validator import validate_backtest_code
 
@@ -36,7 +39,7 @@ SMOOTHED_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[2]
 # of many variants fitted to the same history is a multiple-comparisons trap. The
 # compiled condition candidate is the strategy's actual rule; a couple of profile
 # variants around it are enough to check robustness.
-MIN_GENERATED_CANDIDATES = 1
+MIN_GENERATED_CANDIDATES = 3
 MAX_GENERATED_CANDIDATES = 3
 MAX_SELF_IMPROVEMENT_CANDIDATES = 6
 MAX_VALIDATION_FEEDBACK_ITEMS = 20
@@ -84,6 +87,7 @@ class Loop3Result(BaseModel):
     selected_candidate: CodeCandidate
     feature_mapping: FeatureMapping
     code_plan: CodeGenerationPlan
+    strategy_ir: StrategyIR
     fallback_reasons: list[str] = Field(default_factory=list)
 
 
@@ -95,59 +99,212 @@ def generate_loop3_candidates(
 
     client = llm_client or create_llm_client(role="BACKTEST_CODE")
     output = _generate_backtest_code_output(client, request)
-    llm_candidates, ignored_legacy_count = _non_legacy_llm_candidates(
-        output.candidates, request.strategy
-    )
-    if is_live_llm_provider() and not _has_safe_candidate(llm_candidates):
-        validation_feedback = _candidate_validation_feedback(llm_candidates)
-        output = _generate_backtest_code_output(
-            client,
-            request,
-            validation_feedback=validation_feedback,
-        )
-        llm_candidates, retry_ignored_count = _non_legacy_llm_candidates(
-            output.candidates, request.strategy
-        )
-        ignored_legacy_count += retry_ignored_count
-        if not _has_safe_candidate(llm_candidates):
-            raise ValueError(
-                "backtest code validation failed: AOAI returned no safe backtest candidates "
-                "after one regeneration attempt"
-            )
-    code_candidates = _candidate_code_pool(
-        llm_candidates, request.strategy, code_plan, request.max_positions
-    )
-    candidates = _validate_candidates(request, code_candidates)
-    valid_candidates = [candidate for candidate in candidates if candidate.validation_ok]
+    strategy_ir = _normalized_strategy_ir(output.strategy_ir, request.strategy, code_plan)
     fallback_reasons = list(output.fallback_reasons)
-    if ignored_legacy_count:
-        fallback_reasons.append(
-            f"ignored {ignored_legacy_count} legacy template candidates from LLM output"
+    if len(output.fallback_code) >= MIN_GENERATED_CANDIDATES:
+        candidates = _validate_candidates(request, output.fallback_code)
+    else:
+        parameter_sets = _normalized_parameter_sets(
+            output.candidates,
+            request.strategy,
+            code_plan,
+            request.max_positions,
         )
-    if any(candidate.violations for candidate in candidates):
-        fallback_reasons.extend(_candidate_violation_summaries(candidates))
-    if not valid_candidates:
-        fallback_reasons = [
-            "all generated candidates failed AST validation",
-            *_candidate_violation_summaries(candidates),
-            *fallback_reasons,
+        candidates = _structured_candidates(request, strategy_ir, parameter_sets)
+        invalid_fallbacks = [
+            violation.message
+            for code in output.fallback_code
+            for violation in validate_backtest_code(code).violations
         ]
-        candidates = _validate_candidates(
-            request,
-            _deterministic_fallback_candidates(request.strategy, code_plan, request.max_positions),
-        )
-        valid_candidates = [candidate for candidate in candidates if candidate.validation_ok]
-        if not valid_candidates:
-            raise ValueError("safe fallback candidates failed AST validation")
-    selected = valid_candidates[0]
+        if invalid_fallbacks:
+            fallback_reasons.append(
+                "LLM Python fallback rejected: " + "; ".join(invalid_fallbacks[:10])
+            )
+    try:
+        selected = next(candidate for candidate in candidates if candidate.validation_ok)
+    except StopIteration as exc:
+        raise ValueError("no safe backtest candidates") from exc
     return Loop3Result(
         variant=request.variant,
         candidates=candidates,
         selected_candidate=selected,
         feature_mapping=feature_mapping,
         code_plan=code_plan,
+        strategy_ir=strategy_ir,
         fallback_reasons=fallback_reasons,
     )
+
+
+def _normalized_strategy_ir(
+    proposed: StrategyIR | None,
+    strategy: StrategySpec,
+    plan: CodeGenerationPlan,
+) -> StrategyIR:
+    """Preserve screening semantics even when a model omits or rewrites conditions."""
+
+    base = StrategyIR(
+        strategy_id=strategy.strategy_id,
+        entry_feature=plan.entry_feature,
+        exit_feature=plan.exit_feature,
+        proxy_feature=plan.proxy_feature,
+        entry_conditions=strategy.entry_conditions,
+        exit_conditions=strategy.exit_conditions,
+    )
+    if proposed is None or proposed.strategy_id != strategy.strategy_id:
+        return base
+    return proposed.model_copy(
+        update={
+            "entry_conditions": strategy.entry_conditions,
+            "exit_conditions": strategy.exit_conditions,
+        }
+    )
+
+
+def _normalized_parameter_sets(
+    proposed: list[CandidateParameters],
+    strategy: StrategySpec,
+    plan: CodeGenerationPlan,
+    max_positions: int,
+) -> list[CandidateParameters]:
+    compiled = compile_conditions(strategy.entry_conditions) is not None
+    defaults = _default_parameter_sets(strategy, plan, max_positions)
+    pool = [*proposed, *defaults]
+    normalized: list[CandidateParameters] = []
+    seen: set[str] = set()
+    for index, item in enumerate(pool):
+        profile = item.profile
+        if profile == "compiled_conditions" and not compiled:
+            profile = defaults[min(index, len(defaults) - 1)].profile
+        candidate = item.model_copy(
+            update={
+                "profile": profile,
+                "max_positions": max_positions,
+                "stop_loss_pct": float(
+                    strategy.risk_constraints.get("stop_loss_pct", item.stop_loss_pct)
+                ),
+                "take_profit_pct": float(
+                    strategy.risk_constraints.get("take_profit_pct", item.take_profit_pct)
+                ),
+            }
+        )
+        identity = _parameter_identity(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(candidate)
+        if len(normalized) >= MAX_GENERATED_CANDIDATES:
+            break
+    if len(normalized) < MIN_GENERATED_CANDIDATES:
+        raise ValueError("unable to create three distinct structured candidates")
+    return normalized
+
+
+def _default_parameter_sets(
+    strategy: StrategySpec,
+    plan: CodeGenerationPlan,
+    max_positions: int,
+) -> list[CandidateParameters]:
+    profiles = _candidate_profiles(plan)
+    compiled = compile_conditions(strategy.entry_conditions) is not None
+    selected_profiles = [
+        "compiled_conditions" if compiled else profiles[0],
+        profiles[0] if not compiled or profiles[0] != "compiled_conditions" else profiles[1],
+        profiles[1] if not compiled else profiles[2],
+    ]
+    stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct))
+    take_profit = float(strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct))
+    return [
+        CandidateParameters(
+            profile=profile,  # type: ignore[arg-type]
+            lookback=max(3, min(252, int(plan.lookbacks[index % len(plan.lookbacks)]))),
+            threshold=float(plan.thresholds[index % len(plan.thresholds)]),
+            stop_loss_pct=stop_loss,
+            take_profit_pct=take_profit,
+            max_positions=max_positions,
+        )
+        for index, profile in enumerate(selected_profiles)
+    ]
+
+
+def _structured_candidates(
+    request: Loop3Request,
+    strategy_ir: StrategyIR,
+    parameter_sets: list[CandidateParameters],
+) -> list[CodeCandidate]:
+    candidates: list[CodeCandidate] = []
+    for index, parameters in enumerate(parameter_sets[:MAX_GENERATED_CANDIDATES], start=1):
+        code = _render_structured_reference_code(strategy_ir, parameters)
+        validation = validate_backtest_code(code)
+        candidates.append(
+            CodeCandidate(
+                candidate_id=f"{request.variant}{index}",
+                variant=request.variant,  # type: ignore[arg-type]
+                code=code,
+                validation_ok=validation.ok,
+                violations=[violation.message for violation in validation.violations],
+                representation="structured",
+                strategy_ir=strategy_ir,
+                parameters=parameters,
+            )
+        )
+    if len(candidates) < MIN_GENERATED_CANDIDATES:
+        raise ValueError(f"Loop3 requires at least {MIN_GENERATED_CANDIDATES} candidates")
+    return candidates
+
+
+def _parameter_identity(parameters: CandidateParameters) -> str:
+    payload = json.dumps(
+        parameters.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _render_structured_reference_code(
+    strategy_ir: StrategyIR,
+    parameters: CandidateParameters,
+) -> str:
+    """Auditable O(N) reference; production executes the equivalent fixed runtime."""
+
+    return f'''def build_signals(prices):
+    signals = []
+    states = {{}}
+    profile = {parameters.profile!r}
+    threshold = {float(parameters.threshold)!r}
+    max_positions = {parameters.max_positions}
+    strategy_id = {strategy_ir.strategy_id!r}
+    for row in prices:
+        ticker = str(row.get("ticker", "000000"))
+        close = float(row["close"])
+        volume = float(row.get("volume", 0.0) or 0.0)
+        rsi = float(row.get("rsi", row.get("RSI_14", 50.0)))
+        state = states.get(ticker)
+        if state is None:
+            states[ticker] = {{"previous": close, "ema": close, "volume_ema": volume}}
+            action = "HOLD"
+        else:
+            previous = state["previous"]
+            ema = state["ema"] + 0.2 * (close - state["ema"])
+            volume_ema = state["volume_ema"]
+            volume_ok = volume_ema <= 0.0 or volume >= volume_ema
+            if profile == "rsi_trend_rebound":
+                buy = 35.0 <= rsi <= 62.0 and close >= previous
+                sell = rsi >= 72.0 or close < ema
+            elif profile == "breakout_volume":
+                buy = close >= previous and volume_ok
+                sell = close < ema
+            else:
+                buy = close >= ema and close >= previous and (close / previous - 1.0) >= threshold
+                sell = close < ema
+            action = "BUY" if buy else "SELL" if sell else "HOLD"
+            state["previous"] = close
+            state["ema"] = ema
+            state["volume_ema"] = volume if volume_ema <= 0.0 else volume_ema * 0.8 + volume * 0.2
+        signals.append({{"date": row["date"], "ticker": ticker, "action": action, "price": close}})
+    return signals
+'''
 
 
 def _validate_candidates(request: Loop3Request, code_candidates: list[str]) -> list[CodeCandidate]:
@@ -250,6 +407,7 @@ def backtest_code_node(state: dict) -> dict:
             "selected_candidate": selected.model_dump(),
             "feature_mapping": result_a.feature_mapping.model_dump(),
             "code_plan": result_a.code_plan.model_dump(),
+            "strategy_ir": result_a.strategy_ir.model_dump(mode="json"),
             "fallback_reasons": result_a.fallback_reasons,
         }
     }
@@ -271,11 +429,42 @@ def _generate_backtest_code_output(
         with activity_role("BACKTEST_CODE"):
             report_activity("role_started", task=task)
             raw_output = client.generate_json(llm_request)
-        output = BacktestCodeLLMOutput.model_validate(raw_output)
+        legacy_candidates = raw_output.get("candidates") if isinstance(raw_output, dict) else None
+        if (
+            isinstance(legacy_candidates, list)
+            and len(legacy_candidates) >= MIN_GENERATED_CANDIDATES
+            and all(isinstance(candidate, str) for candidate in legacy_candidates)
+        ):
+            legacy_code = [str(candidate) for candidate in legacy_candidates]
+            if not _has_safe_candidate(legacy_code):
+                if not is_live_llm_provider():
+                    output = BacktestCodeLLMOutput.model_validate(raw_output)
+                    raise AssertionError("unreachable after invalid legacy response")
+                if validation_feedback is not None:
+                    raise ValueError("no safe backtest candidates after one regeneration")
+                return _generate_backtest_code_output(
+                    client,
+                    request,
+                    validation_feedback=_candidate_validation_feedback(legacy_code),
+                )
+            feature_mapping = map_strategy_features(request.strategy)
+            plan = build_code_generation_plan(request.strategy, feature_mapping)
+            output = BacktestCodeLLMOutput.model_construct(
+                strategy_ir=_normalized_strategy_ir(None, request.strategy, plan),
+                candidates=_default_parameter_sets(
+                    request.strategy,
+                    plan,
+                    request.max_positions,
+                ),
+                fallback_code=legacy_code[:MAX_GENERATED_CANDIDATES],
+                fallback_reasons=["Accepted legacy v1 response through the isolated Python fallback."],
+            )
+        else:
+            output = BacktestCodeLLMOutput.model_validate(raw_output)
         with activity_role("BACKTEST_CODE"):
             report_activity(
                 "role_completed",
-                summary=f"후보 코드 {len(output.candidates)}개 생성 완료",
+                summary=f"구조화 후보 {len(output.candidates)}개 생성 완료",
             )
         return output
     except (LLMClientError, ValidationError) as exc:
@@ -283,8 +472,16 @@ def _generate_backtest_code_output(
             raise
         with activity_role("BACKTEST_CODE"):
             report_activity("role_completed", summary=f"{type(exc).__name__}: {exc}")
+        feature_mapping = map_strategy_features(request.strategy)
+        plan = build_code_generation_plan(request.strategy, feature_mapping)
         return BacktestCodeLLMOutput.model_construct(
-            candidates=[],
+            strategy_ir=_normalized_strategy_ir(None, request.strategy, plan),
+            candidates=_default_parameter_sets(
+                request.strategy,
+                plan,
+                request.max_positions,
+            ),
+            fallback_code=[],
             fallback_reasons=[f"{type(exc).__name__}: {exc}"],
         )
 
@@ -850,50 +1047,41 @@ def generate_self_improvement_candidates(
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[CodeCandidate]:
     plan = CodeGenerationPlan.model_validate(code_plan)
-    adjusted_plans = [
-        plan.model_copy(
-            update={
-                "thresholds": [
-                    _adjust_threshold(float(value), plan.entry_feature, iteration)
-                    for value in plan.thresholds
-                ],
-                "lookbacks": [max(3, int(value) - iteration * 2) for value in plan.lookbacks],
-            }
-        ),
-        plan.model_copy(
-            update={
-                "thresholds": [
-                    _selective_threshold(float(value), plan.entry_feature, iteration)
-                    for value in plan.thresholds
-                ],
-                "lookbacks": [min(252, int(value) + iteration * 10) for value in plan.lookbacks],
-            }
-        ),
+    strategy_ir = _normalized_strategy_ir(None, strategy, plan)
+    profiles = _candidate_profiles(plan)
+    lookbacks = [
+        max(3, int(value) - iteration * 2) for value in plan.lookbacks
+    ] + [
+        min(252, int(value) + iteration * 10) for value in plan.lookbacks
     ]
+    thresholds = [
+        _adjust_threshold(float(value), plan.entry_feature, iteration)
+        for value in plan.thresholds
+    ] + [
+        _selective_threshold(float(value), plan.entry_feature, iteration)
+        for value in plan.thresholds
+    ]
+    stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct))
+    take_profit = float(strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct))
     candidates: list[CodeCandidate] = []
     seen: set[str] = set()
-    for adjusted in adjusted_plans:
-        for code in _generated_strategy_candidates(strategy, adjusted, max_positions)[:6]:
-            if code in seen:
-                continue
-            seen.add(code)
-            validation = validate_backtest_code(code)
-            candidates.append(
-                CodeCandidate(
-                    candidate_id=f"A{start_index + len(candidates)}",
-                    variant="A",
-                    code=code,
-                    validation_ok=validation.ok,
-                    violations=[violation.message for violation in validation.violations],
-                    metrics=None,
-                )
-            )
-    for code in _self_improvement_grid_codes(strategy, plan, iteration, max_positions):
+    search_size = max(len(profiles), len(lookbacks), len(thresholds))
+    for index in range(search_size):
         if len(candidates) >= MAX_SELF_IMPROVEMENT_CANDIDATES:
             break
-        if code in seen:
+        parameters = CandidateParameters(
+            profile=profiles[index % len(profiles)],  # type: ignore[arg-type]
+            lookback=lookbacks[index % len(lookbacks)],
+            threshold=thresholds[index % len(thresholds)],
+            stop_loss_pct=stop_loss,
+            take_profit_pct=take_profit,
+            max_positions=max_positions,
+        )
+        identity = _parameter_identity(parameters)
+        if identity in seen:
             continue
-        seen.add(code)
+        seen.add(identity)
+        code = _render_structured_reference_code(strategy_ir, parameters)
         validation = validate_backtest_code(code)
         candidates.append(
             CodeCandidate(
@@ -903,6 +1091,9 @@ def generate_self_improvement_candidates(
                 validation_ok=validation.ok,
                 violations=[violation.message for violation in validation.violations],
                 metrics=None,
+                representation="structured",
+                strategy_ir=strategy_ir,
+                parameters=parameters,
             )
         )
     return candidates

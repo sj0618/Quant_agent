@@ -17,6 +17,13 @@ ALLOWED_MODULES = frozenset(
 BLOCKED_MODULES = frozenset({"subprocess", "os", "sys", "importlib"})
 BLOCKED_CALLS = frozenset({"eval", "exec", "__import__", "open", "getattr", "setattr"})
 ALLOWED_ENTRYPOINTS = frozenset({"build_signals"})
+MAX_SOURCE_CHARS = 20_000
+MAX_AST_NODES = 1_500
+MAX_AST_DEPTH = 40
+MAX_LOOP_NODES = 8
+MAX_NESTED_LOOP_DEPTH = 2
+MAX_LITERAL_RANGE = 10_000
+ROLLING_AGGREGATORS = frozenset({"sum", "max", "min"})
 
 
 class ASTViolation(BaseModel):
@@ -44,6 +51,8 @@ class BacktestASTVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.violations: list[ASTViolation] = []
         self._function_depth = 0
+        self._loop_depth = 0
+        self._loop_count = 0
 
     def reject(self, node: ast.AST, code: str, message: str) -> None:
         self.violations.append(
@@ -100,6 +109,29 @@ class BacktestASTVisitor(ast.NodeVisitor):
         root_name = call_name.split(".", 1)[0]
         if root_name in BLOCKED_MODULES:
             self.reject(node, "call.module_blocked", f"call '{call_name}' is not allowed")
+        if (
+            self._loop_depth
+            and call_name in ROLLING_AGGREGATORS
+            and any(_contains_slice(argument) for argument in node.args)
+        ):
+            self.reject(
+                node,
+                "performance.rolling_slice",
+                f"call '{call_name}' over a slice inside a loop is not allowed",
+            )
+        if call_name == "range" and node.args:
+            literal_bounds = [
+                argument.value
+                for argument in node.args
+                if isinstance(argument, ast.Constant)
+                and isinstance(argument.value, int)
+            ]
+            if literal_bounds and max(abs(value) for value in literal_bounds) > MAX_LITERAL_RANGE:
+                self.reject(
+                    node,
+                    "performance.range_limit",
+                    f"literal range exceeds {MAX_LITERAL_RANGE}",
+                )
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> Any:
@@ -114,11 +146,79 @@ class BacktestASTVisitor(ast.NodeVisitor):
             self.reject(node, "attribute.blocked", f"attribute access on '{root_name}' is blocked")
         self.generic_visit(node)
 
+    def visit_While(self, node: ast.While) -> Any:
+        self.reject(node, "performance.while_loop", "while loops are not allowed")
+        self.generic_visit(node)
+
+    def visit_For(self, node: ast.For) -> Any:
+        self._loop_count += 1
+        if self._loop_count > MAX_LOOP_NODES:
+            self.reject(
+                node,
+                "performance.loop_count",
+                f"loop count exceeds {MAX_LOOP_NODES}",
+            )
+        if self._loop_depth >= MAX_NESTED_LOOP_DEPTH:
+            self.reject(
+                node,
+                "performance.nested_loop",
+                f"nested loop depth exceeds {MAX_NESTED_LOOP_DEPTH}",
+            )
+        self.visit(node.target)
+        self.visit(node.iter)
+        self._loop_depth += 1
+        for statement in node.body:
+            self.visit(statement)
+        self._loop_depth -= 1
+        for statement in node.orelse:
+            self.visit(statement)
+
+    def visit_ListComp(self, node: ast.ListComp) -> Any:
+        self._visit_comprehension(node, node.generators)
+
+    def visit_SetComp(self, node: ast.SetComp) -> Any:
+        self._visit_comprehension(node, node.generators)
+
+    def visit_DictComp(self, node: ast.DictComp) -> Any:
+        self._visit_comprehension(node, node.generators)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> Any:
+        self._visit_comprehension(node, node.generators)
+
+    def _visit_comprehension(
+        self,
+        node: ast.AST,
+        generators: list[ast.comprehension],
+    ) -> None:
+        self._loop_count += len(generators)
+        if self._loop_count > MAX_LOOP_NODES:
+            self.reject(
+                node,
+                "performance.loop_count",
+                f"loop count exceeds {MAX_LOOP_NODES}",
+            )
+        if self._loop_depth + len(generators) > MAX_NESTED_LOOP_DEPTH:
+            self.reject(
+                node,
+                "performance.nested_loop",
+                f"nested loop depth exceeds {MAX_NESTED_LOOP_DEPTH}",
+            )
+        self.generic_visit(node)
+
 
 def validate_backtest_code(
     source: str, *, required_functions: Iterable[str] = ("build_signals",)
 ) -> ASTValidationResult:
     violations: list[ASTViolation] = []
+    if len(source) > MAX_SOURCE_CHARS:
+        violations.append(
+            ASTViolation(
+                line=0,
+                column=0,
+                code="performance.source_size",
+                message=f"source exceeds {MAX_SOURCE_CHARS} characters",
+            )
+        )
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
@@ -134,6 +234,25 @@ def validate_backtest_code(
             ),
         )
 
+    nodes = list(ast.walk(tree))
+    if len(nodes) > MAX_AST_NODES:
+        violations.append(
+            ASTViolation(
+                line=0,
+                column=0,
+                code="performance.ast_nodes",
+                message=f"AST node count exceeds {MAX_AST_NODES}",
+            )
+        )
+    if _ast_depth(tree) > MAX_AST_DEPTH:
+        violations.append(
+            ASTViolation(
+                line=0,
+                column=0,
+                code="performance.ast_depth",
+                message=f"AST depth exceeds {MAX_AST_DEPTH}",
+            )
+        )
     visitor = BacktestASTVisitor()
     visitor.visit(tree)
     violations.extend(visitor.violations)
@@ -173,3 +292,17 @@ def attribute_root(node: ast.Attribute) -> str:
     if isinstance(cursor, ast.Name):
         return cursor.id
     return "<dynamic>"
+
+
+def _contains_slice(node: ast.AST) -> bool:
+    return any(
+        isinstance(item, ast.Subscript) and isinstance(item.slice, ast.Slice)
+        for item in ast.walk(node)
+    )
+
+
+def _ast_depth(node: ast.AST) -> int:
+    children = list(ast.iter_child_nodes(node))
+    if not children:
+        return 1
+    return 1 + max(_ast_depth(child) for child in children)

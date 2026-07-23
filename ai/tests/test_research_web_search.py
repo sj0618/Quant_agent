@@ -1,7 +1,13 @@
-from ai_graph.graph import build_research_debate
 from ai_graph.llm.base import LLMJsonRequest
+from ai_graph.llm.role_calls import research_screening_terms
 from ai_graph.nodes.report import report_node
-from ai_graph.schemas import Condition, ConditionOperator, RiskDecision, SignalDecision, StrategySpec
+from ai_graph.schemas import (
+    Condition,
+    ConditionOperator,
+    RiskDecision,
+    SignalDecision,
+    StrategySpec,
+)
 
 
 class RecordingWebSearchLLMClient:
@@ -14,16 +20,11 @@ class RecordingWebSearchLLMClient:
     def generate_json(self, request: LLMJsonRequest) -> dict:
         self.requests.append(request)
         return {
-            "summary": f"{self.role} summary grounded via web search.",
-            "evidence": ["web search finding"],
-            "concerns": [],
-            "recommendation": "proceed",
-            "confidence": 0.8,
-            "citations": (
-                [{"title": "Example source", "url": "https://example.com/a"}]
-                if request.enable_web_search
-                else []
-            ),
+            "strategy_reading": f"{self.role} summary grounded via web search.",
+            "metrics": [],
+            "citations": [
+                {"title": "Example source", "url": "https://example.com/a"}
+            ],
         }
 
 
@@ -34,35 +35,45 @@ def make_strategy() -> StrategySpec:
         market="KRX",
         timeframe="daily",
         entry_conditions=[
-            Condition(left="rsi", operator=ConditionOperator.LTE, right=30, description="RSI <= 30")
+            Condition(
+                left="rsi",
+                operator=ConditionOperator.LTE,
+                right=30,
+                description="RSI <= 30",
+            )
         ],
         confidence=0.8,
     )
 
 
-def test_build_research_debate_enables_web_search_for_all_three_roles(monkeypatch) -> None:
+def test_screening_research_enables_web_search(monkeypatch) -> None:
     created_roles: list[str] = []
     clients: dict[str, RecordingWebSearchLLMClient] = {}
 
     def fake_create_llm_client(environ=None, *, role=None):
+        del environ
         created_roles.append(role)
         client = RecordingWebSearchLLMClient(role)
         clients[role] = client
         return client
 
-    monkeypatch.setattr("ai_graph.llm.role_calls.create_llm_client", fake_create_llm_client)
-
-    strategy = make_strategy()
-    debate = build_research_debate(
-        {"user_query": "RSI 30 이하 KOSPI200", "data": {}}, strategy
+    monkeypatch.setattr(
+        "ai_graph.llm.role_calls.create_llm_client",
+        fake_create_llm_client,
+    )
+    monkeypatch.setattr(
+        "ai_graph.llm.role_calls.is_live_llm_provider",
+        lambda: True,
     )
 
-    assert created_roles == ["RESEARCH_BULL", "RESEARCH_BEAR", "RESEARCH_JUDGE"]
-    for role in ("RESEARCH_BULL", "RESEARCH_BEAR", "RESEARCH_JUDGE"):
-        assert clients[role].requests[0].enable_web_search is True
+    research = research_screening_terms(query="RSI 30 이하 KOSPI200")
 
-    assert debate["bull"]["citations"] == [{"title": "Example source", "url": "https://example.com/a"}]
-    assert debate["judge"]["citations"] == [{"title": "Example source", "url": "https://example.com/a"}]
+    assert created_roles == ["SCREENING_RESEARCH"]
+    assert clients["SCREENING_RESEARCH"].requests[0].enable_web_search is True
+    assert research is not None
+    assert research["citations"] == [
+        {"title": "Example source", "url": "https://example.com/a"}
+    ]
 
 
 def test_non_research_role_debate_does_not_enable_web_search(monkeypatch) -> None:
@@ -81,7 +92,8 @@ def test_non_research_role_debate_does_not_enable_web_search(monkeypatch) -> Non
             }
 
     monkeypatch.setattr(
-        "ai_graph.llm.role_calls.create_llm_client", lambda *a, **k: CapturingClient()
+        "ai_graph.llm.role_calls.create_llm_client",
+        lambda *args, **kwargs: CapturingClient(),
     )
 
     generate_daily_digest_overall_comment(
@@ -103,8 +115,6 @@ def test_non_research_role_debate_does_not_enable_web_search(monkeypatch) -> Non
 
 
 def test_report_node_surfaces_deduplicated_research_citations(monkeypatch) -> None:
-    # The report stage now writes its interpretation in one call instead of running a
-    # third bull/bear/judge debate; this test only needs that call stubbed out.
     monkeypatch.setattr(
         "ai_graph.nodes.report.generate_report_writeup",
         lambda **kwargs: kwargs["fallback"],
@@ -119,10 +129,18 @@ def test_report_node_surfaces_deduplicated_research_citations(monkeypatch) -> No
     state = {
         "strategy_spec": strategy.model_dump(),
         "risk": risk.model_dump(),
-        "research_debate": {
-            "bull": {"citations": [duplicate]},
-            "bear": {"citations": [{"title": "Bear source", "url": "https://example.com/bear"}]},
-            "judge": {"citations": [duplicate]},
+        "data": {
+            "pipeline_data_source": {
+                "screening_relaxation": {
+                    "research": {
+                        "citations": [
+                            duplicate,
+                            {"title": "Bear source", "url": "https://example.com/bear"},
+                            duplicate,
+                        ]
+                    }
+                }
+            }
         },
     }
 

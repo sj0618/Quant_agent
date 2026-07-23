@@ -39,6 +39,7 @@ USER_PAYLOAD_FIELDS = {
     "candidate_cards",
     "report",
     "performance",
+    "recommendation_gate",
     "question",
     "options",
     "recommended",

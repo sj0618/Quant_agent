@@ -76,3 +76,35 @@ def test_graph_validator_blocks_dunder_attribute_sandbox_escape() -> None:
 
     assert not result.ok
     assert "attribute.private" in {violation.code for violation in result.violations}
+
+
+def test_graph_validator_blocks_unbounded_and_superlinear_loop_shapes() -> None:
+    while_loop = """def build_signals(prices):
+    while True:
+        pass
+    return []
+"""
+    rolling_slice = """def build_signals(prices):
+    values = []
+    for row in prices:
+        values.append(float(row["close"]))
+        average = sum(values[-20:]) / len(values[-20:])
+    return []
+"""
+    nested = """def build_signals(prices):
+    for row in prices:
+        for other in prices:
+            for third in prices:
+                pass
+    return []
+"""
+
+    assert "performance.while_loop" in {
+        item.code for item in validate_graph_backtest_code(while_loop).violations
+    }
+    assert "performance.rolling_slice" in {
+        item.code for item in validate_graph_backtest_code(rolling_slice).violations
+    }
+    assert "performance.nested_loop" in {
+        item.code for item in validate_graph_backtest_code(nested).violations
+    }
