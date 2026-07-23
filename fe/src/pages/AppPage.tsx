@@ -36,6 +36,12 @@ const ANALYSIS_JOB_POLL_INTERVAL_MS = 2000;
 // job will never resolve on its own and the user needs to be told rather than left
 // watching a progress bar that can no longer move.
 const MAX_POLL_FAILURES = 3;
+// Wall-clock safety net. Polling only gives up when the request itself keeps failing;
+// a job that stays RUNNING forever (e.g. the server died mid-run, or a failure never got
+// recorded) returns clean 200s with result:null and would otherwise spin the progress bar
+// indefinitely. Past this age we surface a timeout instead of leaving the user watching
+// forever. Generous on purpose - a 200-name universe backtest legitimately takes minutes.
+const MAX_ANALYSIS_DURATION_MS = 10 * 60_000;
 const PROGRESS_TICK_INTERVAL_MS = 250;
 const CLIENT_PROGRESS_DURATION_MS = 90_000;
 const CLIENT_PROGRESS_START_PERCENT = 6;
@@ -282,6 +288,15 @@ export function AppPage() {
       for (const job of refreshedJobs) {
         if (!failures[job.job_id]) {
           delete pollAttemptsRef.current[job.job_id];
+        }
+        // A job the server keeps reporting as still-running past the wall-clock cap is
+        // treated as stuck: successful polls alone would never end the loading state.
+        if (!job.result && !failures[job.job_id]) {
+          const startedAt = Date.parse(job.created_at);
+          if (Number.isFinite(startedAt) && Date.now() - startedAt > MAX_ANALYSIS_DURATION_MS) {
+            failures[job.job_id] =
+              "분석이 시간 내에 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.";
+          }
         }
       }
       if (Object.keys(failures).length) {

@@ -29,6 +29,7 @@ AI_BACKTEST_LOOKBACK_DAYS_ENV = "AI_BACKTEST_LOOKBACK_DAYS"
 AI_L4_EVIDENCE_LIMIT_ENV = "AI_L4_EVIDENCE_LIMIT"
 AI_DB_CONNECT_TIMEOUT_SECONDS_ENV = "AI_DB_CONNECT_TIMEOUT_SECONDS"
 AI_DB_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_STATEMENT_TIMEOUT_MS"
+AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS"
 AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 
 DEFAULT_BACKTEST_TICKER = "005930"
@@ -40,9 +41,17 @@ DEFAULT_L4_EVIDENCE_LIMIT = 5
 # pulled for the backtest (lookback_days each), so the pool is capped rather than
 # loading the whole match set.
 DEFAULT_BACKTEST_MAX_TICKERS = 20
+# Financial metrics we track a consecutive-rise count for (for "N quarters rising"
+# strategies). Computed sequentially per filing; see _fetch_financial_timeline.
+_STREAK_METRICS = ("revenue", "operating_income", "operating_margin", "roe")
 # 조건에 일치한 종목은 점수로 다시 줄이지 않고 모두 추천 결과에 남긴다.
 DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 20
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 30_000
+# The universe backtest load (200-name KOSPI200 price/momentum/financial history) is a
+# genuinely heavy analytical scan and needs a longer budget than a quick screening SELECT.
+# Expanding the backtest universe from ~20 to 200 names is what pushed it past the 30s
+# default and started timing out; screening queries keep the tight default.
+DEFAULT_DB_BACKTEST_STATEMENT_TIMEOUT_MS = 120_000
 POSTGRES_TIMEOUT_UNIT = "ms"
 BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 3
 RSI_OVERSOLD_THRESHOLD = 30.0
@@ -111,6 +120,9 @@ class DataSourceConfig(BaseModel):
     l4_evidence_limit: int = Field(default=DEFAULT_L4_EVIDENCE_LIMIT, gt=0)
     connect_timeout_seconds: int = Field(default=DEFAULT_DB_CONNECT_TIMEOUT_SECONDS, gt=0)
     statement_timeout_ms: int = Field(default=DEFAULT_DB_STATEMENT_TIMEOUT_MS, gt=0)
+    backtest_statement_timeout_ms: int = Field(
+        default=DEFAULT_DB_BACKTEST_STATEMENT_TIMEOUT_MS, gt=0
+    )
     backtest_max_tickers: int = Field(default=DEFAULT_BACKTEST_MAX_TICKERS, gt=0)
 
     @classmethod
@@ -132,6 +144,11 @@ class DataSourceConfig(BaseModel):
             ),
             statement_timeout_ms=_int_env(
                 env, AI_DB_STATEMENT_TIMEOUT_MS_ENV, DEFAULT_DB_STATEMENT_TIMEOUT_MS
+            ),
+            backtest_statement_timeout_ms=_int_env(
+                env,
+                AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS_ENV,
+                DEFAULT_DB_BACKTEST_STATEMENT_TIMEOUT_MS,
             ),
             backtest_max_tickers=_int_env(
                 env, AI_BACKTEST_MAX_TICKERS_ENV, DEFAULT_BACKTEST_MAX_TICKERS
@@ -192,9 +209,14 @@ class PostgresPipelineDataSource:
                 ticker = recommended[0]
                 symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
+                # Widen the statement timeout for the universe price/momentum/financial
+                # scan - it is far heavier than the screening SELECTs above and 30s is not
+                # enough once the backtest universe is 200 names.
+                self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
                 price_rows, effective_lookback_days = self._fetch_price_rows(
                     conn, tickers, symbol_info_by_ticker, query
                 )
+                self._set_statement_timeout(conn)
             elif single_ticker:
                 ticker = single_ticker
                 tickers = [ticker]
@@ -392,8 +414,11 @@ class PostgresPipelineDataSource:
             row_factory=dict_row,
         )
 
-    def _set_statement_timeout(self, conn: Any) -> None:
-        timeout_value = f"{self.config.statement_timeout_ms}{POSTGRES_TIMEOUT_UNIT}"
+    def _set_statement_timeout(self, conn: Any, timeout_ms: int | None = None) -> None:
+        effective_ms = self.config.statement_timeout_ms if timeout_ms is None else timeout_ms
+        timeout_value = f"{effective_ms}{POSTGRES_TIMEOUT_UNIT}"
+        # is_local=true: scoped to the current transaction, so the caller can widen the
+        # budget for a heavy fetch and have it revert on the next transaction on its own.
         _ = conn.execute("SELECT set_config('statement_timeout', %s, true)", [timeout_value])
 
     def _resolve_ticker(self, conn: Any, query: str) -> str | None:
@@ -567,6 +592,26 @@ class PostgresPipelineDataSource:
             timelines.setdefault(ticker, []).append(
                 {"filed": _date_value(row["filed"]), "ratios": ratios}
             )
+
+        # Consecutive-rise counts for "N quarters of rising revenue/profit" strategies.
+        # Sequential (each filing vs the one before), not year-over-year: we don't carry
+        # report_code here to line up the same quarter across years, so seasonal drops
+        # (Q1 < prior Q4) can break a streak that a YoY view would keep. Documented so the
+        # backtest treats these as sequential-rise, not calendar-quarter-YoY.
+        for filings in timelines.values():
+            previous: dict[str, float] = {}
+            streaks: dict[str, int] = {}
+            for filing in filings:  # already ordered oldest-first (ORDER BY symbol, filed)
+                ratios = filing["ratios"]
+                for metric in _STREAK_METRICS:
+                    value = ratios.get(metric)
+                    if value is None:
+                        continue
+                    prior = previous.get(metric)
+                    if prior is not None:
+                        streaks[metric] = streaks.get(metric, 0) + 1 if value > prior else 0
+                    ratios[f"{metric}_up_streak"] = streaks.get(metric, 0)
+                    previous[metric] = value
         return timelines
 
     def _fetch_momentum_values_by_date(

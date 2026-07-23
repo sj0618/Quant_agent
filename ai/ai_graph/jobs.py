@@ -398,11 +398,15 @@ def run_job_sync(
             job_id,
             diagnostic.category,
         )
-        return store.fail_job(
-            job_id,
-            diagnostic.safe_message,
-            result_envelope=_failure_envelope(job, diagnostic.safe_message, failure_cause=diagnostic),
-        )
+        try:
+            envelope = _failure_envelope(job, diagnostic.safe_message, failure_cause=diagnostic)
+        except Exception:
+            # Building the rich failure envelope must never itself leave the job stuck in
+            # RUNNING - that is exactly what makes the UI spin forever. fail_job builds its
+            # own minimal envelope when none is passed, so fall back to that.
+            _logger.exception("failed to build failure envelope: job_id=%s", job_id)
+            envelope = None
+        return store.fail_job(job_id, diagnostic.safe_message, result_envelope=envelope)
     finally:
         # Readers must be released whether the analysis succeeded or failed, otherwise
         # an SSE connection hangs until its own timeout.

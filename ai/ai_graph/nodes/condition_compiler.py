@@ -51,6 +51,10 @@ _HISTORY: dict[str, str] = {
 _FINANCIAL_METRICS = frozenset(
     {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"}
 )
+# Metrics for which db.py attaches a `{metric}_up_streak` consecutive-rise count. Must
+# stay in sync with _STREAK_METRICS there; a consecutive condition on anything else has no
+# streak column to read, so it falls back to templates rather than silently never matching.
+_STREAK_METRICS = frozenset({"revenue", "operating_income", "operating_margin", "roe"})
 
 _OPERATOR: dict[ConditionOperator, str] = {
     ConditionOperator.LT: "<",
@@ -140,9 +144,16 @@ def compile_entry_expression(conditions: Sequence[Condition]) -> str | None:
 
 def _compile_one(condition: Condition) -> str | None:
     if condition.consecutive is not None:
-        # Consecutive-period tests need per-quarter history the per-bar expression does
-        # not hold; handled separately (not yet compiled here).
-        return None
+        # "N consecutive quarters of rising revenue/profit". db.py forward-fills a
+        # {metric}_up_streak count onto each bar (see _fetch_financial_timeline), so the
+        # test is just: streak >= N. Only rising streaks are tracked, so a falling
+        # (lt/lte) direction has no column and falls back to templates.
+        metric = condition.left.strip().lower()
+        if metric not in _STREAK_METRICS:
+            return None
+        if condition.operator not in {ConditionOperator.GT, ConditionOperator.GTE}:
+            return None
+        return f"(_fin(fin, '{metric}_up_streak') >= {int(condition.consecutive)})"
     if condition.universe_rank_pct is not None:
         # Cross-sectional cuts are pulled out by _rank_filter before this point.
         return None
