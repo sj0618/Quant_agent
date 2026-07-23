@@ -172,7 +172,9 @@ class AOAIResponsesClient:
                                 _sleep_before_retry(self.retry_backoff_seconds, attempt, response)
                                 continue
                             response.raise_for_status()
-                        payload, terminal = self._consume_stream(response)
+                        payload, terminal = self._consume_stream(
+                            response, deadline=time.monotonic() + self.timeout_seconds
+                        )
                         if terminal == "response.completed" and payload is not None:
                             return payload, attempt
                         # Either the stream stopped early (transport hiccup) or the run
@@ -213,18 +215,26 @@ class AOAIResponsesClient:
         return payload, last_attempt + retry_count + 1
 
     def _consume_stream(
-        self, response: httpx.Response
+        self, response: httpx.Response, *, deadline: float
     ) -> tuple[dict[str, Any] | None, str | None]:
         """Drain the stream, returning its final response object and terminal event type.
 
         The terminal type is reported separately because only `response.completed`
         carries a usable answer: an incomplete or failed run still repeats the response
         object, but without the message the caller is trying to parse.
+
+        httpx's timeout is per-read - it only fires when no byte arrives for that long.
+        A provider that keeps dribbling reasoning or keepalive events never trips it, so
+        the whole call could hang forever (this is what stalled the debate). A wall-clock
+        deadline across the entire stream bounds it: past the deadline we stop reading and
+        let the caller retry, then fall back to the non-streamed request.
         """
 
         final_payload: dict[str, Any] | None = None
         terminal_type: str | None = None
         for line in response.iter_lines():
+            if time.monotonic() > deadline:
+                raise httpx.ReadTimeout("AOAI stream exceeded wall-clock deadline")
             if not line.startswith("data:"):
                 continue
             data = line[len("data:") :].strip()
