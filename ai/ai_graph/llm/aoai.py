@@ -9,13 +9,15 @@ import httpx
 
 from ai_graph.audit import begin_model_call, finish_model_call
 from ai_graph.llm.base import LLMClientError, LLMJsonRequest, LLMResponseParseError
-from ai_graph.progress import activity_listener_installed, report_activity
+from ai_graph.progress import report_activity
 
 
 RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504})
 DEFAULT_TIMEOUT_SECONDS = 120.0
+DEFAULT_RESPONSE_START_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.25
+DEFAULT_SERVICE_TIER = "priority"
 # Used when a 429 arrives without a Retry-After header, and as the cap when it has one.
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 5.0
 MAX_RETRY_AFTER_SECONDS = 60.0
@@ -36,8 +38,10 @@ class AOAIResponsesClient:
         api_key: str,
         model: str,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        response_start_timeout_seconds: float = DEFAULT_RESPONSE_START_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+        service_tier: str = DEFAULT_SERVICE_TIER,
         web_search_tool_type: str = DEFAULT_WEB_SEARCH_TOOL_TYPE,
         http_client: httpx.Client | None = None,
     ) -> None:
@@ -45,13 +49,16 @@ class AOAIResponsesClient:
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.response_start_timeout_seconds = response_start_timeout_seconds
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
+        self.service_tier = service_tier
         self.web_search_tool_type = web_search_tool_type
         self._http_client = http_client
         # Some deployments reject `temperature` outright. The first 400 tells us, and
         # remembering it stops every later call from burning a round-trip to relearn it.
         self._temperature_supported = True
+        self._service_tier_supported = True
 
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
         call_id = begin_model_call(
@@ -76,26 +83,23 @@ class AOAIResponsesClient:
         completion_tokens: int | None = None
         total_tokens: int | None = None
         try:
-            if activity_listener_installed():
-                # Streaming exists purely so the live view has something to show; the
-                # terminal response.completed event carries the same response object the
-                # non-streaming call returns, so everything below is identical either way.
-                payload, retry_count = self._stream_with_retries(request)
-                response = None
-                provider_request_id = _provider_request_id(payload, None)
-            else:
-                response, retry_count = self._post_with_retries(request)
-                provider_request_id = _provider_request_id(None, response)
+            # Always stream, even when no activity listener is installed. A non-streamed
+            # Responses request does not expose when generation starts, so it cannot
+            # enforce a response-start timeout independently from response completion.
+            payload, retry_count, direct_body, provider_request_id = (
+                self._stream_with_retries(request)
+            )
+            if direct_body is not None:
                 try:
-                    payload = response.json()
+                    payload = json.loads(direct_body)
                 except json.JSONDecodeError as exc:
-                    assistant_response = response.text
+                    assistant_response = direct_body
                     raise LLMResponseParseError("AOAI response body is not valid JSON") from exc
-                provider_request_id = _provider_request_id(payload, response)
+            provider_request_id = _provider_request_id(payload, None) or provider_request_id
 
             response_model = _response_model(payload) or self.model
             prompt_tokens, completion_tokens, total_tokens = _usage(payload)
-            raw_output = _raw_assistant_output(payload, response.text if response else "")
+            raw_output = _raw_assistant_output(payload, direct_body or "")
             try:
                 result = extract_json_object(payload)
             except LLMResponseParseError:
@@ -134,7 +138,9 @@ class AOAIResponsesClient:
         )
         return result
 
-    def _stream_with_retries(self, request: LLMJsonRequest) -> tuple[dict[str, Any], int]:
+    def _stream_with_retries(
+        self, request: LLMJsonRequest
+    ) -> tuple[dict[str, Any] | None, int, str | None, str | None]:
         """Stream the response, publishing provider activity, and return its final payload.
 
         Only the terminal `response.completed` event is used as the result: it repeats
@@ -156,14 +162,30 @@ class AOAIResponsesClient:
             owns_client = self._http_client is None
             try:
                 try:
+                    response_start_timeout = httpx.Timeout(
+                        self.timeout_seconds,
+                        read=self.response_start_timeout_seconds,
+                    )
                     with client.stream(
-                        "POST", self.responses_url, headers=headers, json=body
+                        "POST",
+                        self.responses_url,
+                        headers=headers,
+                        json=body,
+                        timeout=response_start_timeout,
                     ) as response:
+                        # Entering the stream context means response headers have arrived.
+                        # Restore the normal idle-read timeout before consuming the body;
+                        # completion itself is deliberately not limited to ten seconds.
+                        response.request.extensions["timeout"]["read"] = self.timeout_seconds
                         if response.status_code >= 400:
                             response.read()
                             if _unsupported_parameter(response, "temperature"):
                                 self._temperature_supported = False
                                 body.pop("temperature", None)
+                                continue
+                            if _unsupported_parameter(response, "service_tier"):
+                                self._service_tier_supported = False
+                                body.pop("service_tier", None)
                                 continue
                             if (
                                 response.status_code in RETRYABLE_STATUS_CODES
@@ -172,11 +194,24 @@ class AOAIResponsesClient:
                                 _sleep_before_retry(self.retry_backoff_seconds, attempt, response)
                                 continue
                             response.raise_for_status()
-                        payload, terminal = self._consume_stream(
-                            response, deadline=time.monotonic() + self.timeout_seconds
-                        )
+                        if "text/event-stream" not in response.headers.get(
+                            "content-type", ""
+                        ).lower():
+                            response.read()
+                            return (
+                                None,
+                                attempt,
+                                response.text,
+                                _provider_request_id(None, response),
+                            )
+                        payload, terminal = self._consume_stream(response)
                         if terminal == "response.completed" and payload is not None:
-                            return payload, attempt
+                            return (
+                                payload,
+                                attempt,
+                                None,
+                                _provider_request_id(payload, response),
+                            )
                         # Either the stream stopped early (transport hiccup) or the run
                         # ended incomplete/failed. Neither yields a parseable answer, so
                         # retry instead of handing the caller a response with no message.
@@ -199,23 +234,12 @@ class AOAIResponsesClient:
                     exc.response if isinstance(exc, httpx.HTTPStatusError) else None,
                 )
 
-        # Streaming only exists to feed the live view; losing it must not cost the whole
-        # analysis, so fall back to the plain request the client used before streaming.
-        _logger.warning(
-            "AOAI streaming failed after %d attempt(s); falling back to a non-streamed "
-            "request, so this call produces no live activity. last_error=%s",
-            attempts,
-            last_error,
-        )
-        response, retry_count = self._post_with_retries(request)
-        try:
-            payload = response.json()
-        except json.JSONDecodeError as exc:
-            raise LLMResponseParseError("AOAI response body is not valid JSON") from exc
-        return payload, last_attempt + retry_count + 1
+        raise LLMClientError(
+            "AOAI Responses request failed", retry_count=last_attempt
+        ) from last_error
 
     def _consume_stream(
-        self, response: httpx.Response, *, deadline: float
+        self, response: httpx.Response
     ) -> tuple[dict[str, Any] | None, str | None]:
         """Drain the stream, returning its final response object and terminal event type.
 
@@ -223,18 +247,14 @@ class AOAIResponsesClient:
         carries a usable answer: an incomplete or failed run still repeats the response
         object, but without the message the caller is trying to parse.
 
-        httpx's timeout is per-read - it only fires when no byte arrives for that long.
-        A provider that keeps dribbling reasoning or keepalive events never trips it, so
-        the whole call could hang forever (this is what stalled the debate). A wall-clock
-        deadline across the entire stream bounds it: past the deadline we stop reading and
-        let the caller retry, then fall back to the non-streamed request.
+        The ten-second response-start timeout has already been satisfied before this
+        method runs. The normal timeout now applies only when the provider stops sending
+        body data; it is not a wall-clock limit on response completion.
         """
 
         final_payload: dict[str, Any] | None = None
         terminal_type: str | None = None
         for line in response.iter_lines():
-            if time.monotonic() > deadline:
-                raise httpx.ReadTimeout("AOAI stream exceeded wall-clock deadline")
             if not line.startswith("data:"):
                 continue
             data = line[len("data:") :].strip()
@@ -266,6 +286,8 @@ class AOAIResponsesClient:
         }
         if self._temperature_supported:
             body["temperature"] = request.temperature
+        if self._service_tier_supported:
+            body["service_tier"] = self.service_tier
         if request.enable_web_search:
             body["tools"] = [{"type": self.web_search_tool_type}]
         if request.response_schema is not None:
@@ -278,50 +300,6 @@ class AOAIResponsesClient:
                 }
             }
         return body
-
-    def _post_with_retries(self, request: LLMJsonRequest) -> tuple[httpx.Response, int]:
-        body = self._request_body(request)
-        headers = {"Content-Type": "application/json", "api-key": self.api_key}
-        attempts = self.max_retries + 1
-        last_error: Exception | None = None
-        last_attempt = 0
-
-        for attempt in range(attempts):
-            last_attempt = attempt
-            try:
-                client = self._http_client or httpx.Client(timeout=self.timeout_seconds)
-                if self._http_client is None:
-                    with client:
-                        response = client.post(self.responses_url, headers=headers, json=body)
-                        if _unsupported_parameter(response, "temperature"):
-                            self._temperature_supported = False
-                            body.pop("temperature", None)
-                            response = client.post(self.responses_url, headers=headers, json=body)
-                else:
-                    response = client.post(self.responses_url, headers=headers, json=body)
-                    if _unsupported_parameter(response, "temperature"):
-                        self._temperature_supported = False
-                        body.pop("temperature", None)
-                        response = client.post(self.responses_url, headers=headers, json=body)
-                if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts - 1:
-                    _sleep_before_retry(self.retry_backoff_seconds, attempt, response)
-                    continue
-                response.raise_for_status()
-                return response, attempt
-            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
-                last_error = exc
-                if not _should_retry(exc) or attempt >= attempts - 1:
-                    break
-                _sleep_before_retry(
-                    self.retry_backoff_seconds,
-                    attempt,
-                    exc.response if isinstance(exc, httpx.HTTPStatusError) else None,
-                )
-
-        raise LLMClientError(
-            "AOAI Responses request failed", retry_count=last_attempt
-        ) from last_error
-
 
 def _stream_failure_reason(terminal: str | None, payload: dict[str, Any] | None) -> str:
     if terminal is None:
