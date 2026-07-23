@@ -36,7 +36,9 @@ def make_breakout_strategy() -> StrategySpec:
             Condition(left="close_above_sma_20", operator=ConditionOperator.EQ, right=1),
             Condition(left="relative_strength_20d", operator=ConditionOperator.GTE, right=0),
         ],
-        exit_conditions=[Condition(left="close_below_sma_20", operator=ConditionOperator.EQ, right=1)],
+        exit_conditions=[
+            Condition(left="close_below_sma_20", operator=ConditionOperator.EQ, right=1)
+        ],
         indicators=["rolling_high", "volume_ratio_20", "SMA20", "relative_strength_20d"],
         risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
         confidence=0.8,
@@ -137,7 +139,9 @@ def test_generated_backtest_supports_multi_ticker_portfolio_rows() -> None:
     start = date(2026, 1, 1)
     for day_index in range(90):
         row_date = (start + timedelta(days=day_index)).isoformat()
-        for ticker_index, ticker in enumerate(("000001", "000002", "000003", "000004", "000005", "000006")):
+        for ticker_index, ticker in enumerate(
+            ("000001", "000002", "000003", "000004", "000005", "000006")
+        ):
             close = 100 + day_index * (ticker_index + 1) * 0.08
             price_rows.append(
                 {
@@ -257,12 +261,18 @@ def test_candidate_backtest_surfaces_split_sharpe_warnings(monkeypatch) -> None:
         )
     ]
 
-    def fake_quantstats_sharpe_from_returns(daily_returns, *, metric_name="sharpe", metric_warnings=None):
+    def fake_quantstats_sharpe_from_returns(
+        daily_returns, *, metric_name="sharpe", metric_warnings=None
+    ):
         if metric_warnings is not None:
-            metric_warnings.append({"metric": metric_name, "warning": "forced split-sharpe warning"})
+            metric_warnings.append(
+                {"metric": metric_name, "warning": "forced split-sharpe warning"}
+            )
         return 0.0
 
-    monkeypatch.setattr(backtest_node, "quantstats_sharpe_from_returns", fake_quantstats_sharpe_from_returns)
+    monkeypatch.setattr(
+        backtest_node, "quantstats_sharpe_from_returns", fake_quantstats_sharpe_from_returns
+    )
 
     result = run_candidate_backtest(strategy_a, candidates)
 
@@ -275,11 +285,15 @@ def test_candidate_backtest_surfaces_split_sharpe_warnings(monkeypatch) -> None:
 def test_metrics_from_engine_result_uses_equity_pct_change_for_split_sharpes(monkeypatch) -> None:
     captured_returns: list[list[float]] = []
 
-    def fake_quantstats_sharpe_from_returns(daily_returns, *, metric_name="sharpe", metric_warnings=None):
+    def fake_quantstats_sharpe_from_returns(
+        daily_returns, *, metric_name="sharpe", metric_warnings=None
+    ):
         captured_returns.append(list(daily_returns))
         return 0.0
 
-    monkeypatch.setattr(backtest_node, "quantstats_sharpe_from_returns", fake_quantstats_sharpe_from_returns)
+    monkeypatch.setattr(
+        backtest_node, "quantstats_sharpe_from_returns", fake_quantstats_sharpe_from_returns
+    )
 
     engine_result = SimpleNamespace(
         summary={
@@ -325,3 +339,49 @@ def test_candidate_backtest_surfaces_quantstats_install_error(monkeypatch) -> No
 
     with pytest.raises(ModuleNotFoundError, match=QUANTSTATS_REQUIRED_MESSAGE):
         run_candidate_backtest(strategy_a, candidates)
+
+
+def test_candidate_backtest_session_only_evaluates_new_candidates(monkeypatch) -> None:
+    strategy_a = make_strategy("cached-candidates", "Cached Candidates")
+    code = """def build_signals(prices):
+    return [
+        {
+            "date": row["date"],
+            "ticker": row.get("ticker"),
+            "action": "HOLD",
+            "price": float(row["close"]),
+        }
+        for row in prices
+    ]
+"""
+    initial = [
+        CodeCandidate(candidate_id=f"cached-{index}", variant="A", code=code, validation_ok=True)
+        for index in range(1, 3)
+    ]
+    improved = CodeCandidate(
+        candidate_id="cached-3",
+        variant="A",
+        code=code,
+        validation_ok=True,
+    )
+    original_run = backtest_node._run_candidate_backtest
+    executed_candidate_ids: list[str] = []
+
+    def tracking_run(strategy, candidate, rows):
+        executed_candidate_ids.append(candidate.candidate_id)
+        return original_run(strategy, candidate, rows)
+
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
+    monkeypatch.setattr(backtest_node, "_run_candidate_backtest", tracking_run)
+    rows = backtest_node._price_rows(None)
+
+    with backtest_node._CandidateBacktestSession(strategy_a, rows) as session:
+        run_candidate_backtest(strategy_a, initial, price_rows=rows, _session=session)
+        run_candidate_backtest(
+            strategy_a,
+            [*initial, improved],
+            price_rows=rows,
+            _session=session,
+        )
+
+    assert executed_candidate_ids == ["cached-1", "cached-2", "cached-3"]
