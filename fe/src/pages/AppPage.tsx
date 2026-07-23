@@ -345,6 +345,13 @@ export function AppPage() {
   const latestJob = analysisJobs.at(-1);
   const hasCurrentConversation = analysisJobs.length > 0;
   const canRenderWorkspace = hasWorkspaceResult(latestJob);
+  // Today's picks are only a recommendation if the strategy behind them cleared its
+  // backtest. When it did not, the picks still render but under an explicit not-validated
+  // banner so they read as reference, not a buy list.
+  const latestPayload = latestJob?.result?.user_payload;
+  const recommendationGate =
+    latestPayload && "recommendation_gate" in latestPayload ? latestPayload.recommendation_gate ?? null : null;
+  const showGateWarning = canRenderWorkspace && recommendationGate !== null && !recommendationGate.validated;
   const panelStrategy = canRenderWorkspace
     ? overview.strategy
     : { ...data.strategy, natural_language_strategy: latestJob?.query ?? data.strategy.natural_language_strategy };
@@ -421,6 +428,12 @@ export function AppPage() {
         <main className="workspace-main">
           {canRenderWorkspace ? (
             <>
+              {showGateWarning && recommendationGate ? (
+                <div className="warning-box" role="alert">
+                  <strong>검증 미통과</strong>
+                  <span>{recommendationGate.reason} 아래 종목은 추천이 아닌 참고용입니다.</span>
+                </div>
+              ) : null}
               <Tabs
                 activeId={activeTab}
                 items={TAB_ITEMS.map((item) => item.id === "trading" ? { ...item, count: overview.candidates.length } : item)}

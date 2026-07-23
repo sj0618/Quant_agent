@@ -359,7 +359,12 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                 detail="추가 변형이 성과를 높이지 못해 최적화를 중단합니다.",
             )
             break
-    return {"backtest": result.model_dump()}
+    # The recommendation gate downstream needs to know whether this strategy's backtest
+    # actually cleared the objective floor, not just what its metrics were.
+    return {
+        "backtest": result.model_dump(),
+        "strategy_validated": _passes_objective_floor(result),
+    }
 
 
 def _selected_candidate_detail(result: CandidateBacktestResult) -> str:
