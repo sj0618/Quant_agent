@@ -128,15 +128,48 @@ SIGNAL_METRIC_VALUES = {
     "HOLD": HOLD_SIGNAL_VALUE,
 }
 
+VERBOSE_ENGINE_SUMMARY_KEYS = frozenset(
+    {
+        "metrics",
+        "monthly_returns",
+        "drawdown_details",
+        "drawdown_series",
+        "rolling_volatility",
+        "rolling_sharpe",
+        "rolling_sortino",
+        "rolling_greeks",
+        "montecarlo",
+        "montecarlo_mean",
+        "montecarlo_cagr",
+        "montecarlo_drawdown",
+        "montecarlo_sharpe",
+        "outliers",
+        "excluded_tickers",
+        "excluded_ticker_jsonb",
+        "indicator_report",
+        "indicator_report_jsonb",
+    }
+)
+
 
 def summarize_backtest(backtest: Mapping[str, Any]) -> dict[str, Any]:
     selected = backtest.get("selected_candidate") or {}
     selected_id = selected.get("candidate_id")
+    engine_summary = backtest.get("engine_summary") or (
+        backtest.get("engine_summaries_by_candidate") or {}
+    ).get(selected_id, {})
     return {
         "selected_candidate_id": selected_id,
         "metrics": selected.get("metrics") or {},
-        "engine_summary": backtest.get("engine_summary")
-        or (backtest.get("engine_summaries_by_candidate") or {}).get(selected_id, {}),
+        # Full metrics carry multi-year rolling series and 250 Monte Carlo paths. They
+        # made one report prompt 2.18 million characters and guaranteed an AOAI
+        # response-start timeout. The scalar summary plus selected public metrics are
+        # sufficient for interpretation; detailed arrays remain in debug artifacts.
+        "engine_summary": {
+            key: value
+            for key, value in engine_summary.items()
+            if key not in VERBOSE_ENGINE_SUMMARY_KEYS
+        },
         "objective_score": (backtest.get("objective_scores_by_candidate") or {}).get(selected_id),
     }
 

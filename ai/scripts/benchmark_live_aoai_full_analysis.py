@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from ai_graph.audit import RecordingAuditSession, create_audit_correlation
-from ai_graph.graph import run_analysis
+from ai_graph.graph import DEBUG_STORE, run_analysis
 
 
 DEFAULT_QUERY = (
@@ -69,6 +69,42 @@ def _model_results(session: RecordingAuditSession) -> list[dict[str, Any]]:
     return results
 
 
+def _backtest_results(debug_ref: str) -> dict[str, Any] | None:
+    internal = DEBUG_STORE.get(debug_ref)
+    if internal is None:
+        return None
+    execution = internal.backtest_artifacts.get("execution_stats") or {}
+    candidates = execution.get("candidates") or {}
+    return {
+        "feature_preparation_seconds": execution.get(
+            "feature_preparation_seconds"
+        ),
+        "total_backtest_wall_seconds": execution.get(
+            "total_backtest_wall_seconds"
+        ),
+        "cache_hits": execution.get("cache_hits"),
+        "cache_misses": execution.get("cache_misses"),
+        "rounds": execution.get("rounds") or [],
+        "candidates": {
+            candidate_id: {
+                key: detail.get(key)
+                for key in (
+                    "metrics_mode",
+                    "wall_seconds",
+                    "cpu_seconds",
+                    "cache_hit",
+                    "cache_level",
+                    "error_type",
+                    "timeout_seconds",
+                )
+                if key in detail
+            }
+            for candidate_id, detail in candidates.items()
+            if isinstance(detail, dict)
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--query", default=DEFAULT_QUERY)
@@ -122,6 +158,7 @@ def main() -> int:
             ),
             6,
         ),
+        "backtest": _backtest_results(f"debug:{trace_id}"),
         "error_type": type(error).__name__ if error is not None else None,
         "error_message": str(error)[:240] if error is not None else None,
     }
