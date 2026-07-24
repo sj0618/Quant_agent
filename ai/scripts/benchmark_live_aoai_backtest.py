@@ -6,6 +6,8 @@ import os
 import time
 from typing import Any
 
+from pydantic import ValidationError
+
 from ai_graph.llm.aoai import AOAIResponsesClient
 from ai_graph.llm.base import LLMJsonRequest
 from ai_graph.llm.factory import create_llm_client
@@ -75,12 +77,23 @@ def _run_live_request(
     payload = client.generate_json(request)
     wall_seconds = time.perf_counter() - started
     if validate_backtest:
-        parsed = BacktestCodeLLMOutput.model_validate(payload)
-        output_summary: dict[str, Any] = {
-            "candidate_count": len(parsed.candidates),
-            "fallback_code_count": len(parsed.fallback_code),
-            "fallback_reason_count": len(parsed.fallback_reasons),
-        }
+        try:
+            parsed = BacktestCodeLLMOutput.model_validate(payload)
+        except ValidationError as exc:
+            output_summary = {
+                "validation_ok": False,
+                "validation_errors": exc.errors(
+                    include_url=False,
+                    include_input=False,
+                ),
+            }
+        else:
+            output_summary = {
+                "validation_ok": True,
+                "candidate_count": len(parsed.candidates),
+                "fallback_code_count": len(parsed.fallback_code),
+                "fallback_reason_count": len(parsed.fallback_reasons),
+            }
     else:
         if payload.get("ok") is not True:
             raise RuntimeError("minimal AOAI response did not satisfy the JSON contract")
@@ -152,6 +165,8 @@ def main() -> int:
 
     if float(backtest_result["wall_seconds"]) > args.max_backtest_wall_seconds:
         return 2
+    if backtest_result["output"].get("validation_ok") is not True:
+        return 3
     return 0
 
 
