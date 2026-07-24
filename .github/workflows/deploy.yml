@@ -53,6 +53,7 @@ jobs:
             --no-perms --no-owner --no-group \
             --exclude='.git/' \
             --exclude='node_modules/' \
+            --exclude='DE/' \
             --exclude='.env' \
             --exclude='.env.*' \
             --exclude='**/__pycache__/' \
