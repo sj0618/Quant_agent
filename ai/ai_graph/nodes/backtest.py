@@ -67,7 +67,10 @@ AI_BACKTEST_CANDIDATE_TIMEOUT_ENV = "AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS"
 DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 180.0
 AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
 DEFAULT_WALL_BUDGET_SECONDS = 540.0
-MAX_SELF_IMPROVEMENT_ROUNDS = 2
+# One bounded refinement is enough to test nearby parameters. A second six-candidate
+# round added 75 seconds on production data without changing the winner, while also
+# increasing multiple-comparisons overfitting risk.
+MAX_SELF_IMPROVEMENT_ROUNDS = 1
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
 BACKTEST_ENGINE_VERSION = "candidate-engine.v2"
 BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v2"
@@ -464,6 +467,7 @@ class _CandidateBacktestSession:
         missing_keys: set[tuple[str, bool, str]] = set()
         cache_levels: dict[tuple[str, bool, str], str] = {}
         round_worker_count = 0
+        action_build_seconds = 0.0
         memory_hits = 0
         disk_hits = 0
         for candidate in candidates:
@@ -486,6 +490,7 @@ class _CandidateBacktestSession:
                 missing_keys.add(memory_key)
             self.cache_misses += 1
 
+        actions_started = time.perf_counter()
         actions_by_identity: dict[str, Sequence[int] | None] = {}
         for candidate in missing:
             identity = _candidate_identity(candidate)
@@ -501,6 +506,7 @@ class _CandidateBacktestSession:
                 and candidate.parameters is not None
                 else None
             )
+        action_build_seconds = time.perf_counter() - actions_started
 
         if missing:
             round_worker_count = _candidate_worker_count(
@@ -568,6 +574,7 @@ class _CandidateBacktestSession:
                 "memory_cache_hits": memory_hits,
                 "disk_cache_hits": disk_hits,
                 "worker_count": round_worker_count,
+                "action_build_seconds": round(action_build_seconds, 6),
                 "cumulative_candidates": len(
                     {
                         key[0]
