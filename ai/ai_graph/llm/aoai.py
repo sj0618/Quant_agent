@@ -120,7 +120,7 @@ class AOAIResponsesClient:
         self._structured_outputs_supported = compatibility["structured_outputs"]
         self.logical_call_count = 0
         self.physical_http_post_count = 0
-        self.last_call_timings: dict[str, float | int | None] = {}
+        self.last_call_timings: dict[str, Any] = {}
 
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
         self.logical_call_count += 1
@@ -239,6 +239,7 @@ class AOAIResponsesClient:
         max_posts = self.max_retries + MAX_COMPATIBILITY_ADJUSTMENTS + 1
         last_error: Exception | None = None
         retry_count = 0
+        compatibility_adjustments: list[str] = []
 
         for _ in range(max_posts):
             attempt_started = time.perf_counter()
@@ -263,10 +264,14 @@ class AOAIResponsesClient:
                                 time.perf_counter() - attempt_started, 6
                             ),
                             "first_meaningful_text_seconds": None,
+                            "compatibility_adjustments": list(
+                                compatibility_adjustments
+                            ),
                         }
                         if response.status_code >= 400:
                             response.read()
                             if _unsupported_parameter(response, "temperature"):
+                                compatibility_adjustments.append("temperature")
                                 self._temperature_supported = False
                                 _remember_unsupported(
                                     self._compatibility_cache_key, "temperature"
@@ -274,6 +279,7 @@ class AOAIResponsesClient:
                                 body.pop("temperature", None)
                                 continue
                             if _unsupported_parameter(response, "service_tier"):
+                                compatibility_adjustments.append("service_tier")
                                 self._service_tier_supported = False
                                 _remember_unsupported(
                                     self._compatibility_cache_key, "service_tier"
@@ -285,6 +291,9 @@ class AOAIResponsesClient:
                                 # support. Keep the JSON contract in the prompt and let
                                 # Pydantic validate it when this deployment rejects the
                                 # provider-side schema.
+                                compatibility_adjustments.append(
+                                    "structured_outputs"
+                                )
                                 self._structured_outputs_supported = False
                                 _remember_unsupported(
                                     self._compatibility_cache_key, "structured_outputs"
