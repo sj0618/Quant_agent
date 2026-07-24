@@ -469,6 +469,12 @@ def _generate_backtest_code_output(
         return output
     except (LLMClientError, ValidationError) as exc:
         if is_live_llm_provider():
+            if isinstance(exc, ValidationError) and validation_feedback is None:
+                return _generate_backtest_code_output(
+                    client,
+                    request,
+                    validation_feedback=_schema_validation_feedback(exc),
+                )
             raise
         with activity_role("BACKTEST_CODE"):
             report_activity("role_completed", summary=f"{type(exc).__name__}: {exc}")
@@ -522,6 +528,24 @@ def _candidate_validation_feedback(candidates: list[str]) -> list[str]:
     if not feedback:
         return ["Return at least one non-legacy candidate that passes the requested AST contract."]
     return feedback
+
+
+def _schema_validation_feedback(exc: ValidationError) -> list[str]:
+    feedback: list[str] = []
+    feedback_chars = 0
+    for error in exc.errors(include_url=False, include_input=False):
+        location = ".".join(str(item) for item in error.get("loc") or ())
+        message = f"{location}: {error.get('msg', 'invalid value')}".strip(": ")
+        remaining = MAX_VALIDATION_FEEDBACK_CHARS - feedback_chars
+        if remaining <= len(TRUNCATED_VALIDATION_FEEDBACK):
+            feedback.append(TRUNCATED_VALIDATION_FEEDBACK)
+            break
+        clipped = message[:remaining]
+        feedback.append(clipped)
+        feedback_chars += len(clipped)
+        if len(feedback) >= MAX_VALIDATION_FEEDBACK_ITEMS or clipped != message:
+            break
+    return feedback or ["Regenerate values that satisfy every response schema constraint."]
 
 
 def map_strategy_features(strategy: StrategySpec) -> FeatureMapping:

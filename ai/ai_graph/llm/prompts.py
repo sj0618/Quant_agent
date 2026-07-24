@@ -10,7 +10,7 @@ from ai_graph.schemas import CandidateParameters, StrategyIR, StrategySpec
 
 BACKTEST_CODE_SCHEMA_NAME = "backtest_strategy_candidates.v2"
 BACKTEST_CODE_PROMPT_TEMPLATE_NAME = "backtest_strategy_generation"
-BACKTEST_CODE_PROMPT_VERSION = "v5"
+BACKTEST_CODE_PROMPT_VERSION = "v6"
 BACKTEST_CODE_SYSTEM_PROMPT = """\
 Return only the requested JSON object. Produce one StrategyIR and exactly three bounded
 CandidateParameters objects. Copy the supplied entry/exit conditions into StrategyIR and vary
@@ -18,6 +18,8 @@ parameters, not program text. Prefer profile="compiled_conditions" and return fa
 whenever StrategyIR can express the rule. Preserve risk constraints and record an OHLCV proxy in
 proxy_feature when a requested metric is unavailable. proxy_feature is always required and
 non-empty; when no substitution is needed, use the primary direct input feature such as "rsi".
+Every candidate must use lookback 3..252, threshold -1..100, 0 < stop_loss_pct <= 1,
+0 < take_profit_pct <= 10, and max_positions 1..1000.
 
 Python fallback is exceptional. If unavoidable, explain it in fallback_reasons and make one
 deterministic chronological O(N) pass, with bounded state per ticker and one signal per input row.
@@ -50,6 +52,10 @@ def build_backtest_code_json_request(
         "constraints": {
             "candidate_count": 3,
             "lookback_range": [3, 252],
+            "threshold_range": [-1.0, 100.0],
+            "stop_loss_pct_range": ["exclusive 0", 1.0],
+            "take_profit_pct_range": ["exclusive 0", 10.0],
+            "max_positions_range": [1, 1000],
             "preferred_profile": "compiled_conditions",
             "preserve_entry_exit_conditions": True,
             "preserve_risk_constraints": True,

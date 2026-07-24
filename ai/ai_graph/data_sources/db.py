@@ -367,11 +367,17 @@ class PostgresPipelineDataSource:
         the report can disclose that the conditions were widened.
         """
 
-        llm_result = self._screen_via_llm(conn, query)
-        if llm_result is not None:
-            return llm_result
-
         profile = _screening_profile(query)
+        # Known strategies already have bounded, audited SQL and do not benefit from
+        # spending two optional AOAI calls on web research plus schema-to-SQL
+        # generation. In production those calls each exhausted three response-start
+        # attempts before falling back here, adding 87 seconds without changing the
+        # result. Keep LLM-authored SQL for strategies outside the supported profiles.
+        if profile == "technical_proxy":
+            llm_result = self._screen_via_llm(conn, query)
+            if llm_result is not None:
+                return llm_result
+
         known_sectors = get_known_sectors(conn=conn)
         # The sector helper deliberately converts an unavailable optional view into a
         # static taxonomy fallback. PostgreSQL still leaves the shared transaction in
