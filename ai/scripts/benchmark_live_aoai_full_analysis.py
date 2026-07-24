@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import json
 import os
 import time
 from typing import Any
 
 from ai_graph.audit import RecordingAuditSession, create_audit_correlation
-from ai_graph.graph import DEBUG_STORE, run_analysis
+from ai_graph.graph import build_graph
+from ai_graph.schemas import APIEnvelope
 
 
 DEFAULT_QUERY = (
@@ -69,11 +71,10 @@ def _model_results(session: RecordingAuditSession) -> list[dict[str, Any]]:
     return results
 
 
-def _backtest_results(debug_ref: str) -> dict[str, Any] | None:
-    internal = DEBUG_STORE.get(debug_ref)
-    if internal is None:
+def _backtest_results(backtest: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if backtest is None:
         return None
-    execution = internal.backtest_artifacts.get("execution_stats") or {}
+    execution = backtest.get("execution_stats") or {}
     candidates = execution.get("candidates") or {}
     return {
         "feature_preparation_seconds": execution.get(
@@ -127,14 +128,12 @@ def main() -> int:
     started = time.perf_counter()
     error: Exception | None = None
     envelope = None
+    state: Mapping[str, Any] | None = None
     try:
-        envelope = run_analysis(
-            args.query,
-            trace_id=trace_id,
-            audit_session=session,
-            audit_entrypoint="benchmark_live_aoai_full_analysis",
-            audit_feature="live_aoai_full_analysis",
+        state = build_graph(audit_session=session).invoke(
+            {"user_query": args.query, "trace_id": trace_id}
         )
+        envelope = APIEnvelope.model_validate(state["envelope"])
     except Exception as exc:
         error = exc
     wall_seconds = time.perf_counter() - started
@@ -158,7 +157,9 @@ def main() -> int:
             ),
             6,
         ),
-        "backtest": _backtest_results(f"debug:{trace_id}"),
+        "backtest": _backtest_results(
+            state.get("backtest") if state is not None else None
+        ),
         "error_type": type(error).__name__ if error is not None else None,
         "error_message": str(error)[:240] if error is not None else None,
     }
