@@ -11,6 +11,15 @@ on:
         options:
           - live-aoai
           - deployed-backtest
+      remote_user:
+        description: SSH account used by the benchmark
+        required: true
+        default: etluser
+        type: choice
+        options:
+          - etluser
+          - root
+          - svcmon
 
 permissions:
   contents: read
@@ -27,7 +36,7 @@ jobs:
     env:
       SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
       SERVER_PORT: ${{ secrets.SERVER_PORT || '30233' }}
-      SERVER_USER: ${{ secrets.SERVER_USER || 'etluser' }}
+      SERVER_USER: ${{ inputs.remote_user || secrets.SERVER_USER || 'etluser' }}
       SERVER_APP_DIR: ${{ secrets.SERVER_APP_DIR || '/home/etluser/mvp_sp1/quant-proj' }}
       SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
       AOAI_RUN_ROOT: /tmp/quant-agent-aoai-${{ github.run_id }}
