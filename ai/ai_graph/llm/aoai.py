@@ -77,6 +77,12 @@ def _compatibility_snapshot(cache_key: str | None) -> dict[str, bool]:
         return {**defaults, **_compatibility_cache.get(cache_key, {})}
 
 
+def _uses_fixed_sampling_temperature(model: str) -> bool:
+    """Return whether the deployed model rejects explicit sampling temperature."""
+
+    return model.strip().lower().startswith("gpt-5")
+
+
 def _remember_unsupported(cache_key: str | None, feature: str) -> None:
     if cache_key is None:
         return
@@ -112,10 +118,13 @@ class AOAIResponsesClient:
         self.web_search_tool_type = web_search_tool_type
         self._http_client = http_client
         self._compatibility_cache_key = compatibility_cache_key
-        # Some deployments reject `temperature` outright. The first 400 tells us, and
-        # remembering it stops every later call from burning a round-trip to relearn it.
+        # Fixed-sampling model families reject `temperature` outright. Unknown model
+        # aliases still learn from the first 400 and share that result process-wide.
         compatibility = _compatibility_snapshot(compatibility_cache_key)
-        self._temperature_supported = compatibility["temperature"]
+        self._temperature_supported = (
+            compatibility["temperature"]
+            and not _uses_fixed_sampling_temperature(model)
+        )
         self._service_tier_supported = compatibility["service_tier"]
         self._structured_outputs_supported = compatibility["structured_outputs"]
         self.logical_call_count = 0
