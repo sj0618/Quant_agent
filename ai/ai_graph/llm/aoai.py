@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from threading import Lock
 import time
 from typing import Any
 
@@ -60,6 +61,28 @@ TERMINAL_STREAM_EVENTS = frozenset(
 )
 
 _logger = logging.getLogger(__name__)
+_compatibility_lock = Lock()
+_compatibility_cache: dict[str, dict[str, bool]] = {}
+
+
+def _compatibility_snapshot(cache_key: str | None) -> dict[str, bool]:
+    defaults = {
+        "temperature": True,
+        "service_tier": True,
+        "structured_outputs": True,
+    }
+    if cache_key is None:
+        return defaults
+    with _compatibility_lock:
+        return {**defaults, **_compatibility_cache.get(cache_key, {})}
+
+
+def _remember_unsupported(cache_key: str | None, feature: str) -> None:
+    if cache_key is None:
+        return
+    with _compatibility_lock:
+        state = _compatibility_cache.setdefault(cache_key, {})
+        state[feature] = False
 
 
 class AOAIResponsesClient:
@@ -76,6 +99,7 @@ class AOAIResponsesClient:
         service_tier: str = DEFAULT_SERVICE_TIER,
         web_search_tool_type: str = DEFAULT_WEB_SEARCH_TOOL_TYPE,
         http_client: httpx.Client | None = None,
+        compatibility_cache_key: str | None = None,
     ) -> None:
         self.responses_url = responses_url
         self.api_key = api_key
@@ -87,11 +111,13 @@ class AOAIResponsesClient:
         self.service_tier = service_tier
         self.web_search_tool_type = web_search_tool_type
         self._http_client = http_client
+        self._compatibility_cache_key = compatibility_cache_key
         # Some deployments reject `temperature` outright. The first 400 tells us, and
         # remembering it stops every later call from burning a round-trip to relearn it.
-        self._temperature_supported = True
-        self._service_tier_supported = True
-        self._structured_outputs_supported = True
+        compatibility = _compatibility_snapshot(compatibility_cache_key)
+        self._temperature_supported = compatibility["temperature"]
+        self._service_tier_supported = compatibility["service_tier"]
+        self._structured_outputs_supported = compatibility["structured_outputs"]
         self.logical_call_count = 0
         self.physical_http_post_count = 0
         self.last_call_timings: dict[str, float | int | None] = {}
@@ -165,6 +191,10 @@ class AOAIResponsesClient:
                 "logical_call_count": self.logical_call_count,
                 "physical_http_posts": self.physical_http_post_count - physical_before,
                 "completion_seconds": round(time.perf_counter() - started_at, 6),
+                "retry_count": retry_count,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
             }
             raise
 
@@ -185,6 +215,10 @@ class AOAIResponsesClient:
             "logical_call_count": self.logical_call_count,
             "physical_http_posts": self.physical_http_post_count - physical_before,
             "completion_seconds": round(time.perf_counter() - started_at, 6),
+            "retry_count": retry_count,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
         }
         return result
 
@@ -234,10 +268,16 @@ class AOAIResponsesClient:
                             response.read()
                             if _unsupported_parameter(response, "temperature"):
                                 self._temperature_supported = False
+                                _remember_unsupported(
+                                    self._compatibility_cache_key, "temperature"
+                                )
                                 body.pop("temperature", None)
                                 continue
                             if _unsupported_parameter(response, "service_tier"):
                                 self._service_tier_supported = False
+                                _remember_unsupported(
+                                    self._compatibility_cache_key, "service_tier"
+                                )
                                 body.pop("service_tier", None)
                                 continue
                             if "text" in body:
@@ -246,6 +286,9 @@ class AOAIResponsesClient:
                                 # Pydantic validate it when this deployment rejects the
                                 # provider-side schema.
                                 self._structured_outputs_supported = False
+                                _remember_unsupported(
+                                    self._compatibility_cache_key, "structured_outputs"
+                                )
                                 body.pop("text", None)
                                 continue
                             if (
@@ -401,6 +444,8 @@ class AOAIResponsesClient:
             body["temperature"] = request.temperature
         if self._service_tier_supported:
             body["service_tier"] = self.service_tier
+        if request.max_output_tokens is not None:
+            body["max_output_tokens"] = request.max_output_tokens
         if request.enable_web_search:
             body["tools"] = [{"type": self.web_search_tool_type}]
         if request.response_schema is not None and self._structured_outputs_supported:

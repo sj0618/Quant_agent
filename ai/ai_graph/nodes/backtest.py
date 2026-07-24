@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date
 from hashlib import sha256
@@ -62,6 +62,7 @@ HOLD_SIGNAL_VALUE = 0.0
 EXECUTION_AUDIT_TAIL_LIMIT = 20
 AI_BACKTEST_WORKERS_ENV = "AI_BACKTEST_WORKERS"
 DEFAULT_BACKTEST_WORKERS = 2
+AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV = "AI_BACKTEST_ALLOW_SPAWN_PARALLEL"
 AI_BACKTEST_CANDIDATE_TIMEOUT_ENV = "AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS"
 DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 180.0
 AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
@@ -570,21 +571,51 @@ class _CandidateBacktestSession:
             self._executor_workers = worker_count
         futures = [self._executor.submit(_evaluate_candidate_worker, task) for task in tasks]
         timeout = _candidate_timeout_seconds()
-        evaluations: list[_CandidateEvaluation] = []
-        timed_out = False
-        for index, (future, candidate) in enumerate(zip(futures, candidates, strict=True)):
-            if timed_out:
-                evaluations.append(_timeout_evaluation(candidate, timeout))
-                continue
+        # Collect completed work immediately. Previously a slow first submission hid
+        # already-finished later candidates and caused all of them to be marked timed
+        # out. One timeout window is allowed for each worker wave so queued candidates
+        # still receive a full execution budget.
+        wave_count = max(1, math.ceil(len(futures) / max(1, worker_count)))
+        deadline = time.perf_counter() + timeout * wave_count
+        evaluations: list[_CandidateEvaluation | None] = [None] * len(futures)
+        future_indexes: dict[Future[_CandidateEvaluation], int] = {
+            future: index for index, future in enumerate(futures)
+        }
+        pending: set[Future[_CandidateEvaluation]] = set(futures)
+        while pending:
+            remaining_seconds = deadline - time.perf_counter()
+            if remaining_seconds <= 0:
+                break
+            completed, pending = wait(
+                pending,
+                timeout=remaining_seconds,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                break
             try:
-                evaluations.append(future.result(timeout=timeout))
-            except FutureTimeoutError:
-                timed_out = True
-                evaluations.append(_timeout_evaluation(candidate, timeout))
+                for future in completed:
+                    evaluations[future_indexes[future]] = future.result()
+            except BaseException:
                 self._terminate_executor()
-                for remaining in futures[index + 1 :]:
-                    remaining.cancel()
-        return evaluations
+                for unresolved in pending:
+                    unresolved.cancel()
+                raise
+
+        if pending:
+            self._terminate_executor()
+            for future in pending:
+                future.cancel()
+                index = future_indexes[future]
+                evaluations[index] = _timeout_evaluation(candidates[index], timeout)
+
+        if any(evaluation is None for evaluation in evaluations):
+            raise RuntimeError("candidate worker completed without an evaluation")
+        return [
+            evaluation
+            for evaluation in evaluations
+            if evaluation is not None
+        ]
 
     def _terminate_executor(self) -> None:
         executor = self._executor
@@ -635,7 +666,19 @@ def _candidate_worker_count(candidate_count: int, *, row_count: int = 0) -> int:
     available_cpus = os.cpu_count() or 1
     if candidate_count * row_count < SERIAL_EVALUATION_WORK_ITEMS:
         return 1
-    return max(1, min(candidate_count, requested, available_cpus))
+    requested = max(1, min(candidate_count, requested, available_cpus))
+    if requested <= 1:
+        return 1
+    # fork shares prepared market data copy-on-write. spawn serializes the same large
+    # object into every worker; the measured Windows production input tripled RSS for
+    # only a small wall-time gain. Keep spawn serial unless an operator explicitly opts
+    # into that memory trade-off.
+    if (
+        "fork" not in get_all_start_methods()
+        and not _truthy_env(AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV)
+    ):
+        return 1
+    return requested
 
 
 def _configured_worker_limit() -> int:
@@ -645,6 +688,10 @@ def _configured_worker_limit() -> int:
     except ValueError:
         requested = DEFAULT_BACKTEST_WORKERS
     return max(1, requested)
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _candidate_cache_key(

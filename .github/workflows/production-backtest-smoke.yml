@@ -2,6 +2,15 @@ name: Production backtest smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Test target
+        required: true
+        default: live-aoai
+        type: choice
+        options:
+          - live-aoai
+          - deployed-backtest
 
 permissions:
   contents: read
@@ -21,8 +30,13 @@ jobs:
       SERVER_USER: ${{ secrets.SERVER_USER || 'etluser' }}
       SERVER_APP_DIR: ${{ secrets.SERVER_APP_DIR || '/home/etluser/mvp_sp1/quant-proj' }}
       SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      AOAI_RUN_ROOT: /tmp/quant-agent-aoai-${{ github.run_id }}
 
     steps:
+      - name: Checkout branch benchmark
+        if: ${{ inputs.mode == 'live-aoai' }}
+        uses: actions/checkout@v4
+
       - name: Validate required secret
         run: test -n "$SSH_PRIVATE_KEY"
 
@@ -34,7 +48,76 @@ jobs:
           ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts"
           chmod 644 "$HOME/.ssh/known_hosts"
 
+      - name: Stage branch benchmark without deploying
+        if: ${{ inputs.mode == 'live-aoai' }}
+        run: |
+          tar -czf branch-source.tgz ai backtest_module
+          scp -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -P "$SERVER_PORT" \
+            branch-source.tgz \
+            "$SERVER_USER@$SERVER_HOST:$AOAI_RUN_ROOT.tgz"
+
+      - name: Run live AOAI latency benchmark
+        if: ${{ inputs.mode == 'live-aoai' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" "$AOAI_RUN_ROOT" <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$1"
+          RUN_ROOT="$2"
+          ARCHIVE="$RUN_ROOT.tgz"
+          case "$RUN_ROOT" in
+            /tmp/quant-agent-aoai-[0-9]*) ;;
+            *) printf 'Unsafe benchmark path: %s\n' "$RUN_ROOT" >&2; exit 2 ;;
+          esac
+          trap 'rm -rf -- "$RUN_ROOT"; rm -f -- "$ARCHIVE"' EXIT
+          rm -rf -- "$RUN_ROOT"
+          mkdir -p "$RUN_ROOT"
+          tar -xzf "$ARCHIVE" -C "$RUN_ROOT"
+
+          if [ -f "$HOME/.bashrc" ]; then
+            set +u
+            source "$HOME/.bashrc"
+            set -u
+          fi
+
+          # If AOAI settings belong only to the running API process, copy just those
+          # variables into this shell without printing their values.
+          if [ -z "${AI_AOAI_RESPONSES_URL:-}" ] \
+            && [ -s "$APP_DIR/.run/ai.pid" ]; then
+            AI_PID="$(cat "$APP_DIR/.run/ai.pid")"
+            if [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]] \
+              && [ -r "/proc/$AI_PID/environ" ]; then
+              while IFS= read -r -d '' entry; do
+                case "$entry" in
+                  AI_AOAI_*=*|AI_LLM_BACKTEST_CODE_*=*) export "$entry" ;;
+                esac
+              done < "/proc/$AI_PID/environ"
+            fi
+          fi
+
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          export AI_LLM_PROVIDER=aoai
+          export AI_AOAI_LIVE_TEST=1
+          cd "$RUN_ROOT/ai"
+          PYTHONPATH="$RUN_ROOT/ai:$RUN_ROOT/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u \
+            "$RUN_ROOT/ai/scripts/benchmark_live_aoai_backtest.py"
+          REMOTE
+
       - name: Run production analysis with two workers
+        if: ${{ inputs.mode == 'deployed-backtest' }}
         run: |
           ssh -o BatchMode=yes \
             -o ConnectTimeout=10 \

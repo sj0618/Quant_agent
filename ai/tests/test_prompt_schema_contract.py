@@ -47,19 +47,24 @@ def test_strategy_spec_contract_preserves_rsi_buy_sell_semantics() -> None:
     )
 
 
-def test_backtest_code_prompt_declares_expected_json_schema() -> None:
+def test_backtest_code_prompt_keeps_schema_out_of_transport_prompt() -> None:
     envelope = run_analysis(QUERY, trace_id="trace-prompt-contract")
     spec = StrategySpec.model_validate(envelope.strategy_spec)
 
     request = build_backtest_code_json_request(spec, "A")
     prompt_payload = json.loads(request.user_prompt)
-    schema = prompt_payload["expected_json_schema"]
+    schema = request.variables_jsonb["expected_json_schema"]
 
     assert request.schema_name == "backtest_strategy_candidates.v2"
     assert request.task_type == "backtest_code_generation"
     assert request.prompt_template_name == "backtest_strategy_generation"
-    assert request.prompt_version == "v3"
-    assert request.variables_jsonb == prompt_payload
+    assert request.prompt_version == "v4"
+    assert request.max_output_tokens == 2048
+    assert "expected_json_schema" not in prompt_payload
+    assert request.variables_jsonb == {
+        **prompt_payload,
+        "expected_json_schema": schema,
+    }
     assert request.response_schema == schema
     assert "strategy_ir" in schema["properties"]
     assert "candidates" in schema["properties"]
@@ -67,17 +72,14 @@ def test_backtest_code_prompt_declares_expected_json_schema() -> None:
     assert schema["properties"]["candidates"]["maxItems"] == 3
 
     performance = prompt_payload["fallback_code_performance_contract"]
-    assert performance["target"] == "O(N) time for N supplied rows"
-    assert performance["input_passes"] == (
-        "exactly one forward pass over prices in supplied order"
-    )
+    assert performance["target"] == "one chronological O(N) pass"
     forbidden = " ".join(performance["forbidden"])
     required = " ".join(performance["required"])
-    assert "sorted(prices)" in forbidden
+    assert "full-input copy" in forbidden
     assert "history slicing" in forbidden
     assert "nested scan" in forbidden
-    assert "incrementally" in required
-    assert "future row" in required
+    assert "incremental" in required
+    assert "ticker" in required
 
 
 def test_backtest_code_schema_validation_failure_records_fallback_reason() -> None:

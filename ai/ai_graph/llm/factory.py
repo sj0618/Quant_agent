@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import atexit
 import os
 from collections.abc import Mapping
+from threading import Lock
+
+import httpx
 
 from ai_graph.llm.aoai import (
     DEFAULT_MAX_RETRIES,
@@ -24,6 +28,28 @@ AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV = "AI_AOAI_WEB_SEARCH_TOOL_TYPE"
 
 LLM_PROVIDER_MOCK = "mock"
 LLM_PROVIDER_AOAI = "aoai"
+_shared_http_client_lock = Lock()
+_shared_http_client: httpx.Client | None = None
+
+
+def _get_shared_http_client() -> httpx.Client:
+    global _shared_http_client
+    with _shared_http_client_lock:
+        if _shared_http_client is None:
+            _shared_http_client = httpx.Client()
+        return _shared_http_client
+
+
+def _close_shared_http_client() -> None:
+    global _shared_http_client
+    with _shared_http_client_lock:
+        client = _shared_http_client
+        _shared_http_client = None
+    if client is not None:
+        client.close()
+
+
+atexit.register(_close_shared_http_client)
 
 
 def create_llm_client(
@@ -77,6 +103,8 @@ def _create_aoai_client(
             _role_env_name(role, "WEB_SEARCH_TOOL_TYPE"),
             _str_env(env, AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV, DEFAULT_WEB_SEARCH_TOOL_TYPE),
         ),
+        http_client=_get_shared_http_client(),
+        compatibility_cache_key=f"{responses_url}\0{model}",
     )
 
 

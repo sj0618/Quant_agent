@@ -10,42 +10,19 @@ from ai_graph.schemas import CandidateParameters, StrategyIR, StrategySpec
 
 BACKTEST_CODE_SCHEMA_NAME = "backtest_strategy_candidates.v2"
 BACKTEST_CODE_PROMPT_TEMPLATE_NAME = "backtest_strategy_generation"
-BACKTEST_CODE_PROMPT_VERSION = "v3"
+BACKTEST_CODE_PROMPT_VERSION = "v4"
 BACKTEST_CODE_SYSTEM_PROMPT = """\
-You are QuantAgent's structured backtest-strategy generation node.
-Return only JSON that conforms to the requested schema.
-Return one StrategyIR and exactly three bounded CandidateParameters objects.
-Reuse entry_conditions and exit_conditions already present in StrategySpec; do not restate
-the same strategy as three Python programs. Vary only profile, lookback, threshold, stop loss,
-take profit, and max positions.
-Choose profile="compiled_conditions" when the supplied conditions are expressible by StrategyIR.
-Use a clearly named OHLCV proxy only when a requested metric is absent, and preserve that mapping
-in proxy_feature. Python fallback_code is exceptional: use it only when StrategyIR cannot express
-the user strategy, and explain why in fallback_reasons.
+Return only the requested JSON object. Produce one StrategyIR and exactly three bounded
+CandidateParameters objects. Copy the supplied entry/exit conditions into StrategyIR and vary
+parameters, not program text. Prefer profile="compiled_conditions" and return fallback_code=[]
+whenever StrategyIR can express the rule. Preserve risk constraints and record an OHLCV proxy in
+proxy_feature only when a requested metric is unavailable.
 
-Any fallback build_signals implementation must be deterministic, keep state per ticker, emit one
-signal per input row, preserve supplied row order, and consume prices exactly once. Target O(N)
-time. Apart from the required N output signals, keep only bounded rolling state per ticker. Never
-copy, sort, slice, scan, filter, or aggregate the full prices collection. Inside the row loop,
-never build a history-derived list or call sum/max/min over a window. Use supplied indicator
-columns first; otherwise update rolling sums, EMA, Wilder RSI state, or fixed-size circular
-buffers incrementally. Do not use future rows or mix history across tickers. Do not import
-network, filesystem, subprocess, OS, eval, exec, reflection, or concurrency APIs.
-
-Verified O(N) fallback shape:
-def build_signals(prices):
-    signals = []
-    previous_by_ticker = {}
-    for row in prices:
-        ticker = str(row.get("ticker", "000000"))
-        close = float(row["close"])
-        previous = previous_by_ticker.get(ticker)
-        action = "HOLD"
-        if previous is not None:
-            action = "BUY" if close > previous else "SELL" if close < previous else "HOLD"
-        signals.append({"date": row["date"], "ticker": ticker, "action": action, "price": close})
-        previous_by_ticker[ticker] = close
-    return signals
+Python fallback is exceptional. If unavoidable, explain it in fallback_reasons and make one
+deterministic chronological O(N) pass, with bounded state per ticker and one signal per input row.
+Never copy or rescan the full input, slice growing history inside the row loop, use future rows,
+mix ticker histories, or import network, filesystem, subprocess, OS, reflection, eval, exec, or
+concurrency APIs. Do not repeat the schema or add prose.
 """
 
 
@@ -66,47 +43,37 @@ def build_backtest_code_json_request(
 ) -> LLMJsonRequest:
     schema = BacktestCodeLLMOutput.model_json_schema()
     user_prompt = {
-        "task": "Generate one StrategyIR and exactly three CandidateParameters objects.",
+        "task": "Normalize this strategy and produce exactly three parameter candidates.",
         "variant": variant,
         "strategy_spec": strategy.model_dump(mode="json"),
-        "expected_json_schema": schema,
-        "output_contract": {
-            "strategy_ir": "one normalized strategy rule shared by all candidates",
-            "candidates": "exactly three bounded parameter objects",
-            "fallback_code": "zero to three Python strings; only for unrepresentable StrategyIR",
-            "fallback_reasons": "array of strings, empty when generation succeeded",
+        "constraints": {
+            "candidate_count": 3,
+            "lookback_range": [3, 252],
+            "preferred_profile": "compiled_conditions",
+            "preserve_entry_exit_conditions": True,
+            "preserve_risk_constraints": True,
         },
         "fallback_code_performance_contract": {
-            "target": "O(N) time for N supplied rows",
-            "input_passes": "exactly one forward pass over prices in supplied order",
-            "state": (
-                "bounded incremental state per ticker; the required output list is the only "
-                "collection that may grow once per input row"
-            ),
+            "use_only_when": "StrategyIR cannot express the supplied rule",
+            "target": "one chronological O(N) pass",
+            "state": "bounded incremental state per ticker",
             "required": [
-                "Emit exactly one signal for every supplied row.",
-                "Use row-provided indicators before calculating a rolling value.",
-                "Update rolling sums, EMA, RSI, extrema, and volume averages incrementally.",
-                "Keep histories isolated by ticker and never reference a future row.",
+                "one output signal per input row",
+                "row-provided indicators before calculated rolling values",
+                "incremental rolling state isolated by ticker",
             ],
             "forbidden": [
-                "sorted(prices), list(prices), prices[:] or any full-input copy",
-                "a nested scan, filter, or comprehension over prices",
-                "history slicing inside the row loop",
-                "sum, min, max, or statistics calls over a rolling slice inside the row loop",
-                "rebuilding ticker histories or indicator arrays for each row",
+                "full-input copy, sort, nested scan, or filter",
+                "history slicing or rolling aggregation inside the row loop",
+                "future-row access or cross-ticker state",
             ],
         },
-        "quality_checks": [
-            "Reuse StrategySpec entry_conditions and exit_conditions in StrategyIR.",
-            "Keep the candidate count equal to the evaluator limit of three.",
-            "Vary parameters, not duplicated program text.",
-            "Keep lookback between 3 and 252 and preserve supplied risk constraints.",
-            "Use compiled_conditions when StrategyIR can represent the user rule.",
-            "Document any OHLCV proxy in proxy_feature.",
-            "Use fallback_code only when the structured rule cannot represent the strategy.",
-            "When fallback_code is necessary, satisfy fallback_code_performance_contract exactly.",
-        ],
+        "response_shape": {
+            "strategy_ir": "object",
+            "candidates": "array[3]",
+            "fallback_code": "array, normally empty",
+            "fallback_reasons": "array, normally empty",
+        },
     }
     if validation_feedback:
         user_prompt["validation_feedback"] = validation_feedback
@@ -119,9 +86,10 @@ def build_backtest_code_json_request(
         system_prompt=BACKTEST_CODE_SYSTEM_PROMPT,
         user_prompt=json.dumps(user_prompt, ensure_ascii=False, sort_keys=True),
         temperature=0.0,
+        max_output_tokens=2048,
         task_type="backtest_code_generation",
         prompt_template_name=BACKTEST_CODE_PROMPT_TEMPLATE_NAME,
         prompt_version=BACKTEST_CODE_PROMPT_VERSION,
-        variables_jsonb=user_prompt,
+        variables_jsonb={**user_prompt, "expected_json_schema": schema},
         response_schema=schema,
     )
