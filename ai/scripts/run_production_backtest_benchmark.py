@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # Production keeps benchmark-only dependencies opti
     psutil = None
 
 from ai_graph.data_sources import load_pipeline_data_from_env
-from ai_graph.llm.mock import MockLLMClient
+from ai_graph.llm.factory import create_llm_client
 from ai_graph.nodes.backtest import run_candidate_backtest
 from ai_graph.nodes.backtest_code import Loop3Request, generate_loop3_candidates
 from ai_graph.schemas import Condition, ConditionOperator, StrategySpec
@@ -161,12 +161,27 @@ def main() -> int:
     parser.add_argument("--query", default=DEFAULT_QUERY)
     parser.add_argument("--max-wall-seconds", type=float, default=600.0)
     parser.add_argument("--repeat-cache", action="store_true")
+    parser.add_argument(
+        "--llm-provider",
+        choices=("mock", "aoai"),
+        default="mock",
+    )
     args = parser.parse_args()
 
-    # This benchmark isolates the deployed data and backtest path. A deterministic
-    # client produces the same validated StrategyIR every time, so Azure latency does
-    # not contaminate the engine measurement.
-    os.environ["AI_LLM_PROVIDER"] = "mock"
+    os.environ["AI_LLM_PROVIDER"] = args.llm_provider
+    if args.llm_provider == "aoai":
+        if os.environ.get("AI_AOAI_LIVE_TEST") != "1":
+            raise RuntimeError(
+                "live AOAI benchmark requires AI_AOAI_LIVE_TEST=1"
+            )
+        llm_client = create_llm_client(role="BACKTEST_CODE")
+    else:
+        # Keep deterministic engine-only benchmarking available to operators, but
+        # require an explicit live mode for end-to-end AOAI measurements.
+        from ai_graph.llm.mock import MockLLMClient
+
+        llm_client = MockLLMClient()
+
     load_started = time.perf_counter()
     bundle = load_pipeline_data_from_env(
         args.query,
@@ -184,7 +199,7 @@ def main() -> int:
             variant="A",
             trace_id="production-backtest-benchmark",
         ),
-        llm_client=MockLLMClient(),
+        llm_client=llm_client,
     )
 
     sampler = _ProcessTreeSampler()
@@ -215,6 +230,7 @@ def main() -> int:
     metrics = result.selected_candidate.metrics
     output: dict[str, object] = {
         "status": "completed",
+        "llm_provider": args.llm_provider,
         "data_source": bundle.metadata.get("source"),
         "data_load_seconds": round(data_load_seconds, 6),
         "rows": len(rows),

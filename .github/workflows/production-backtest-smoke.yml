@@ -60,7 +60,7 @@ jobs:
             branch-source.tgz \
             "$SERVER_USER@$SERVER_HOST:$AOAI_RUN_ROOT.tgz"
 
-      - name: Run live AOAI latency benchmark
+      - name: Run live AOAI and branch backtest benchmarks
         if: ${{ inputs.mode == 'live-aoai' }}
         run: |
           ssh -o BatchMode=yes \
@@ -114,6 +114,18 @@ jobs:
           PYTHONPATH="$RUN_ROOT/ai:$RUN_ROOT/backtest_module" \
             "$APP_DIR/ai/.venv/bin/python" -u \
             "$RUN_ROOT/ai/scripts/benchmark_live_aoai_backtest.py"
+
+          export AI_DB_STATEMENT_TIMEOUT_MS=180000
+          export AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS=300000
+          export AI_BACKTEST_WORKERS=2
+          export AI_BACKTEST_WALL_BUDGET_SECONDS=540
+          export AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS=180
+          PYTHONPATH="$RUN_ROOT/ai:$RUN_ROOT/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u \
+            "$RUN_ROOT/ai/scripts/run_production_backtest_benchmark.py" \
+            --llm-provider aoai \
+            --max-wall-seconds 600 \
+            --repeat-cache
           REMOTE
 
       - name: Run production analysis with two workers

@@ -430,6 +430,7 @@ class _CandidateBacktestSession:
         missing: list[CodeCandidate] = []
         missing_keys: set[tuple[str, bool, str]] = set()
         cache_levels: dict[tuple[str, bool, str], str] = {}
+        round_worker_count = 0
         memory_hits = 0
         disk_hits = 0
         for candidate in candidates:
@@ -469,7 +470,7 @@ class _CandidateBacktestSession:
             )
 
         if missing:
-            worker_count = _candidate_worker_count(
+            round_worker_count = _candidate_worker_count(
                 len(missing),
                 row_count=len(self.price_rows),
             )
@@ -486,7 +487,11 @@ class _CandidateBacktestSession:
                 for candidate in missing
             )
             reuse_executor = self._executor is not None
-            if worker_count == 1 and not requires_isolation and not reuse_executor:
+            if (
+                round_worker_count == 1
+                and not requires_isolation
+                and not reuse_executor
+            ):
                 evaluations = [
                     _evaluate_candidate(
                         self.strategy,
@@ -504,7 +509,11 @@ class _CandidateBacktestSession:
                 evaluations = self._evaluate_parallel(
                     tasks,
                     missing,
-                    self._executor_workers if reuse_executor else max(1, worker_count),
+                    (
+                        self._executor_workers
+                        if reuse_executor
+                        else max(1, round_worker_count)
+                    ),
                 )
             for candidate, evaluation in zip(missing, evaluations, strict=True):
                 memory_key = _candidate_cache_key(candidate, metrics_mode)
@@ -525,6 +534,7 @@ class _CandidateBacktestSession:
                 "cached_candidates": memory_hits + disk_hits,
                 "memory_cache_hits": memory_hits,
                 "disk_cache_hits": disk_hits,
+                "worker_count": round_worker_count,
                 "cumulative_candidates": len(
                     {
                         key[0]
