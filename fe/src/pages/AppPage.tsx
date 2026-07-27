@@ -445,7 +445,7 @@ export function AppPage() {
                   </>
                 }
               />
-              {activeTab === "overview" ? <OverviewTab overview={overview} /> : null}
+              {activeTab === "overview" ? <OverviewTab overview={overview} validated={!showGateWarning} /> : null}
               {activeTab === "trading" ? <TradingInfoTab candidates={overview.candidates} /> : null}
               {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
             </>

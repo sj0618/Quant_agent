@@ -88,6 +88,11 @@ DART_ACCOUNTS = {
 
 TICKER_PATTERN = re.compile(r"\b\d{6}\b")
 RSI_KEYS = ("rsi", "RSI", "rsi_14", "RSI_14", "talib_rsi_14", "TA_RSI_14")
+# The rebound screen deliberately runs wider than the textbook 30 so names that are still
+# working off an oversold reading are not dropped a point early. That widening is why a
+# match can carry RSI 33 while the strategy card reads "RSI <= 30", so the label prints the
+# actual reading - "RSI 과매도권" alone let a 33 pass for a 30.
+RSI_OVERSOLD_MAX = 35
 MARKET_SCOPE_TERMS = (
     "KOSPI200",
     "KOSPI 200",
@@ -1187,7 +1192,7 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
             "close >= high_252 * 0.995 AND volume_ratio_20 >= 1.5 "
             "AND close > sma20 AND relative_strength_20d >= 0"
         ),
-        "rsi_rebound": "(rsi <= 35 OR (prev_rsi < 30 AND rsi >= 30))",
+        "rsi_rebound": f"(rsi <= {RSI_OVERSOLD_MAX} OR (prev_rsi < 30 AND rsi >= 30))",
         "pullback_trend": (
             "close > sma200 AND sma20 > 0 AND abs(close / sma20 - 1) <= 0.04"
         ),
@@ -1380,8 +1385,8 @@ def _matched_screening_rules(row: Mapping[str, Any], profile: str) -> list[str]:
         rules.append("20일 상대강도 양호")
     rsi = _optional_float_value(row.get("rsi"))
     prev_rsi = _optional_float_value(row.get("prev_rsi"))
-    if rsi is not None and rsi <= 35:
-        rules.append("RSI 과매도권")
+    if rsi is not None and rsi <= RSI_OVERSOLD_MAX:
+        rules.append(f"RSI {rsi:.0f} 과매도권")
     if prev_rsi is not None and rsi is not None and prev_rsi < 30 <= rsi:
         rules.append("RSI 30 상향 돌파")
     if profile == "bollinger_squeeze" and _compare(row.get("bb_upper"), close):

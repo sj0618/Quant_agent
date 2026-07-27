@@ -615,8 +615,10 @@ function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandida
   if (!result) {
     return [];
   }
-  const finalSignal = result.user_payload.report ? extractFinalSignal(result.user_payload.report) : null;
-  const signal = finalSignal?.action ?? "HOLD";
+  // These names came out of a DB screen, so what is known about each one is which rules it
+  // matched. The strategy's single action and the candidate card's confidence describe the
+  // strategy, not any one name, and stamping them onto each row read as a per-name verdict.
+  // The strategy-level signal is still shown once, in the overview counters.
   const candidates = result.user_payload.candidate_cards.flatMap((card) =>
     (card.matches ?? []).map((match) => {
       const matchedRules = match.matched_rules ?? [];
@@ -626,10 +628,7 @@ function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandida
         ticker: match.ticker,
         name: match.name,
         sector: match.sector ?? card.sector ?? match.market,
-        signal,
-        confidence: card.confidence,
         price: match.close == null ? "—" : `${new Intl.NumberFormat(APP_LOCALE).format(match.close)}원`,
-        changePercent: "—",
         rationale,
         evidence: [
           {
@@ -854,7 +853,10 @@ function formatEquityPointLabel(value: string) {
   if (Number.isNaN(date.getTime())) {
     return value;
   }
+  // Backtest windows routinely cross a year boundary, and a month/day label cannot say
+  // whether 11.03 precedes or follows 07.24 - nor which year the run covered at all.
   return new Intl.DateTimeFormat(APP_LOCALE, {
+    year: "2-digit",
     month: "2-digit",
     day: "2-digit",
   }).format(date);

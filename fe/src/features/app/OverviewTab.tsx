@@ -2,18 +2,25 @@ import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
 import { ROUTES } from "../../config/routes";
 import type { AppOverview } from "../../types/quantagent";
+import { countScoredSignals } from "../../utils/signalCounts";
 import { PerformanceChart } from "./PerformanceChart";
 import { SignalCard } from "./SignalCard";
 
 interface OverviewTabProps {
   overview: AppOverview;
+  /**
+   * Whether the backtest behind these picks cleared its objective floor. The graph already
+   * decides this in recommendation_gate; the header used to ignore it and print ACTIVE with
+   * a recommendation score on a strategy the system had judged unfit.
+   */
+  validated?: boolean;
 }
 
 const CHART_INITIAL_ASSET = 1_000_000;
 const PERCENT_SCALE = 100;
 const PERCENT_DIGITS = 2;
 
-export function OverviewTab({ overview }: OverviewTabProps) {
+export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
   const featuredCandidates = overview.candidates.slice(0, 4);
   const strategyName = overview.strategy.name ?? "활성 전략";
   const totalReturnMetric = metricByKey(overview, "totalReturn");
@@ -26,17 +33,14 @@ export function OverviewTab({ overview }: OverviewTabProps) {
   const currentAsset = CHART_INITIAL_ASSET * (1 + strategyReturn / PERCENT_SCALE);
   const benchmarkLabel = overview.performance.benchmarkLabel ?? "KOSPI200";
   const hasBenchmarkSeries = chartPoints.some((point) => point.benchmark !== 0);
-  const candidateCounts = overview.candidates.reduce(
-    (counts, candidate) => ({ ...counts, [candidate.signal]: counts[candidate.signal] + 1 }),
-    { BUY: 0, HOLD: 0, DROP: 0 },
-  );
+  const candidateCounts = countScoredSignals(overview.candidates);
 
   return (
     <div className="workspace-content">
       <Card className="strategy-strip">
         <div>
           <div className="eyebrow-row">
-            <Badge variant="dark">ACTIVE</Badge>
+            {validated ? <Badge variant="dark">ACTIVE</Badge> : <Badge variant="soft">검증 미통과</Badge>}
             <span>STRATEGY</span>
           </div>
           <strong>{strategyName}</strong>
@@ -55,7 +59,9 @@ export function OverviewTab({ overview }: OverviewTabProps) {
 
       <section className="summary-grid">
         {[
-          { label: "오늘의 권장도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "최종 신호 신뢰도 기준" },
+          validated
+            ? { label: "오늘의 권장도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "최종 신호 등급 · BUY 8.2 / HOLD 6.8 / DROP 6.4" }
+            : { label: "오늘의 권장도", value: "산출 안 함", delta: undefined, caption: "백테스트 목표 기준 미달" },
           { label: "활성 신호", value: `${overview.passCount}건`, delta: undefined, caption: `BUY ${overview.buyCount} · HOLD ${overview.holdCount} · DROP ${overview.dropCount}` },
           {
             label: "검증 누적 수익률",
@@ -85,15 +91,19 @@ export function OverviewTab({ overview }: OverviewTabProps) {
         <Card className="candidate-table" padded={false}>
           <div className="card-head">
             <div>
-              <strong>종목별 추천 데이터</strong>
+              <strong>조건 일치 종목</strong>
               <p>{overview.candidates.length ? `${overview.latestRunLabel} · ${overview.candidates.length}건` : "이번 분석 응답에 포함되지 않음"}</p>
             </div>
             {overview.candidates.length ? (
               <div className="filter-row">
                 <Badge variant="dark">ALL {overview.candidates.length}</Badge>
-                <Badge signal="BUY">BUY {candidateCounts.BUY}</Badge>
-                <Badge signal="HOLD">HOLD {candidateCounts.HOLD}</Badge>
-                <Badge signal="DROP">DROP {candidateCounts.DROP}</Badge>
+                {candidateCounts ? (
+                  <>
+                    <Badge signal="BUY">BUY {candidateCounts.BUY}</Badge>
+                    <Badge signal="HOLD">HOLD {candidateCounts.HOLD}</Badge>
+                    <Badge signal="DROP">DROP {candidateCounts.DROP}</Badge>
+                  </>
+                ) : null}
               </div>
             ) : null}
           </div>

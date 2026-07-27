@@ -627,7 +627,10 @@ function formatEquityPointLabel(value: string) {
   if (Number.isNaN(date.getTime())) {
     return value;
   }
+  // Backtest windows routinely cross a year boundary, and a month/day label cannot say
+  // whether 11.03 precedes or follows 07.24 - nor which year the run covered at all.
   return new Intl.DateTimeFormat(APP_LOCALE, {
+    year: "2-digit",
     month: "2-digit",
     day: "2-digit",
   }).format(date);

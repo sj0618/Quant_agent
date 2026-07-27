@@ -2,6 +2,7 @@ import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
 import { ROUTES } from "../../config/routes";
 import type { TradingCandidate } from "../../types/quantagent";
+import { countScoredSignals } from "../../utils/signalCounts";
 import { SignalCard } from "./SignalCard";
 
 interface TradingInfoTabProps {
@@ -22,10 +23,7 @@ export function TradingInfoTab({ candidates }: TradingInfoTabProps) {
     );
   }
 
-  const counts = candidates.reduce(
-    (acc, candidate) => ({ ...acc, [candidate.signal]: acc[candidate.signal] + 1 }),
-    { BUY: 0, HOLD: 0, DROP: 0 },
-  );
+  const counts = countScoredSignals(candidates);
 
   return (
     <div className="workspace-content">
@@ -36,9 +34,13 @@ export function TradingInfoTab({ candidates }: TradingInfoTabProps) {
         </div>
         <div className="filter-row">
           <Badge variant="dark">ALL {candidates.length}</Badge>
-          <Badge signal="BUY">BUY {counts.BUY}</Badge>
-          <Badge signal="HOLD">HOLD {counts.HOLD}</Badge>
-          <Badge signal="DROP">DROP {counts.DROP}</Badge>
+          {counts ? (
+            <>
+              <Badge signal="BUY">BUY {counts.BUY}</Badge>
+              <Badge signal="HOLD">HOLD {counts.HOLD}</Badge>
+              <Badge signal="DROP">DROP {counts.DROP}</Badge>
+            </>
+          ) : null}
           <Badge variant="soft">종목코드 순</Badge>
         </div>
       </Card>
