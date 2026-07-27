@@ -114,6 +114,56 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         self.assertIn("WHERE status = 'issued'", sql)
         self.assertNotIn("DROP ", upper_sql)
         self.assertNotIn("TRUNCATE ", upper_sql)
+
+    def test_notification_settings_migration_is_additive_and_idempotent(self):
+        sql = (
+            SERVICE_DB_ROOT
+            / "migrations/017_add_notification_settings_to_users.sql"
+        ).read_text(encoding="utf-8")
+        upper_sql = sql.upper()
+        for column_definition in (
+            "ADD COLUMN IF NOT EXISTS daily_report_email BOOLEAN NOT NULL DEFAULT TRUE",
+            "ADD COLUMN IF NOT EXISTS action_emails BOOLEAN NOT NULL DEFAULT TRUE",
+            "ADD COLUMN IF NOT EXISTS marketing_email BOOLEAN NOT NULL DEFAULT FALSE",
+            "ADD COLUMN IF NOT EXISTS delivery_hour TEXT NOT NULL DEFAULT '08:00'",
+        ):
+            self.assertIn(column_definition, sql)
+        self.assertNotIn("UPDATE APP.USER_NOTIFICATION_SETTINGS", upper_sql)
+        self.assertNotIn("DROP TABLE", upper_sql)
+        self.assertNotIn("TRUNCATE ", upper_sql)
+
+    def test_email_delivery_outbox_is_separate_from_history(self):
+        sql = (
+            SERVICE_DB_ROOT
+            / "migrations/018_create_email_delivery_outbox.sql"
+        ).read_text(encoding="utf-8")
+        upper_sql = sql.upper()
+        self.assertIn(
+            "CREATE TABLE IF NOT EXISTS app.email_delivery_outbox",
+            sql,
+        )
+        for column_definition in (
+            "idempotency_key text NOT NULL",
+            "attempt_count integer DEFAULT 0 NOT NULL",
+            "max_attempts integer DEFAULT 3 NOT NULL",
+            "next_attempt_at timestamptz DEFAULT now() NOT NULL",
+            "claimed_by text",
+            "claim_token uuid",
+            "claim_expires_at timestamptz",
+        ):
+            self.assertIn(column_definition, sql)
+        self.assertIn(
+            "CREATE INDEX IF NOT EXISTS idx_email_delivery_outbox_due",
+            sql,
+        )
+        self.assertIn(
+            "CREATE INDEX IF NOT EXISTS idx_email_delivery_outbox_claim_expiry",
+            sql,
+        )
+        self.assertNotIn("ALTER TABLE app.email_delivery_history", sql)
+        self.assertNotIn("DROP TABLE", upper_sql)
+        self.assertNotIn("TRUNCATE ", upper_sql)
+
     def test_fixed_replay_verifier_rejects_wrong_disposable_dsn_components(self):
         verifier = load_replay_verifier()
         with self.assertRaises(verifier.ReplayContractError):

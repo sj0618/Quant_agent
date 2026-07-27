@@ -25,6 +25,8 @@ FIXED_MIGRATIONS = (
     "014_create_report_email_tables.sql",
     "015_ai_backtest_execution_process_identity.sql",
     "016_ai_backtest_idempotency.sql",
+    "017_add_notification_settings_to_users.sql",
+    "018_create_email_delivery_outbox.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 PG17_MIN_VERSION_NUM = 170000
@@ -51,7 +53,7 @@ OWNED_RELATIONS = {
         "strategy_email_report", "strategy_email_report_news",
         "strategy_email_report_candidate", "email_digest_subscription",
         "email_delivery_history", "ai_backtest_request",
-        "ai_backtest_replacement_approval",
+        "ai_backtest_replacement_approval", "email_delivery_outbox",
     ),
     "i": (
         "idx_users_email", "idx_users_provider_user_id", "idx_strategy_user_created",
@@ -89,6 +91,8 @@ OWNED_RELATIONS = {
         "uq_ai_backtest_request_active_scope_fingerprint", "idx_ai_backtest_request_trace",
         "idx_ai_backtest_request_lease_created", "uq_ai_backtest_replacement_live_source",
         "idx_ai_backtest_replacement_scope_fingerprint", "uq_ai_backtest_replacement_key_hash",
+        "idx_email_delivery_outbox_due", "idx_email_delivery_outbox_claim_expiry",
+        "idx_email_delivery_outbox_user_created", "idx_email_delivery_outbox_report",
     ),
     "v": ("strategy_report_summary_v", "email_digest_history_v"),
 }
@@ -102,6 +106,10 @@ OWNED_COLUMNS = (
     ("code_execution_run", "worker_pid"),
     ("code_execution_run", "worker_pgid"),
     ("code_execution_run", "worker_started_at"),
+    ("users", "daily_report_email"),
+    ("users", "action_emails"),
+    ("users", "marketing_email"),
+    ("users", "delivery_hour"),
 )
 OWNED_CONSTRAINTS = (
     "fk_ai_model_call_log_execution",
@@ -109,6 +117,13 @@ OWNED_CONSTRAINTS = (
     "ck_ai_backtest_request_safety_lease",
     "ck_ai_backtest_request_state_version",
     "ck_ai_backtest_replacement_approval_status",
+    "email_delivery_outbox_idempotency_key_key",
+    "email_delivery_outbox_user_id_fkey",
+    "email_delivery_outbox_report_id_fkey",
+    "email_delivery_outbox_strategy_id_fkey",
+    "email_delivery_outbox_status_check",
+    "email_delivery_outbox_attempt_count_check",
+    "email_delivery_outbox_payload_object_check",
 )
 OWNED_TRIGGERS = ("trg_email_digest_subscription_limit",)
 
