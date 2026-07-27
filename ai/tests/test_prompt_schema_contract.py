@@ -4,7 +4,11 @@ import pytest
 
 from ai_graph.graph import run_analysis
 from ai_graph.llm.base import LLMJsonRequest
-from ai_graph.llm.prompts import BacktestCodeLLMOutput, build_backtest_code_json_request
+from ai_graph.llm.prompts import (
+    BACKTEST_CODE_PROMPT_VERSION,
+    BacktestCodeLLMOutput,
+    build_backtest_code_json_request,
+)
 from ai_graph.nodes.backtest_code import Loop3Request, generate_loop3_candidates
 from ai_graph.schemas import StrategySpec
 
@@ -58,7 +62,7 @@ def test_backtest_code_prompt_keeps_schema_out_of_transport_prompt() -> None:
     assert request.schema_name == "backtest_strategy_candidates.v2"
     assert request.task_type == "backtest_code_generation"
     assert request.prompt_template_name == "backtest_strategy_generation"
-    assert request.prompt_version == "v4"
+    assert request.prompt_version == BACKTEST_CODE_PROMPT_VERSION
     assert request.max_output_tokens == 2048
     assert "expected_json_schema" not in prompt_payload
     assert request.variables_jsonb == {

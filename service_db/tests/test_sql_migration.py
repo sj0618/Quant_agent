@@ -82,6 +82,19 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         self.assertNotIn("TRUNCATE ", upper_sql)
 
 
+    def test_ai_prompt_response_summary_migration_is_additive_and_idempotent(self):
+        sql = (
+            SERVICE_DB_ROOT / "migrations/019_ai_prompt_response_summary.sql"
+        ).read_text(encoding="utf-8")
+        upper_sql = sql.upper()
+        self.assertIn(
+            "ADD COLUMN IF NOT EXISTS assistant_response_summary TEXT",
+            sql,
+        )
+        self.assertNotIn("DROP ", upper_sql)
+        self.assertNotIn("TRUNCATE ", upper_sql)
+
+
     def test_execution_process_identity_migration_is_additive_and_idempotent(self):
         sql = (
             SERVICE_DB_ROOT

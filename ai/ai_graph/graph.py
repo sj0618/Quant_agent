@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from time import perf_counter
@@ -23,12 +23,10 @@ from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_s
 from pydantic import ValidationError
 
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
-from ai_graph.memory import AnalysisMemory, summarize_recall
+from ai_graph.memory import AnalysisMemory
 from ai_graph.progress import raise_if_cancelled, report_node_stage
 from ai_graph.llm.role_calls import (
-    RoleDebatePayload,
     StrategyConditionsPayload,
-    generate_role_debate,
     generate_strategy_conditions,
 )
 from ai_graph.nodes.backtest import backtest_node

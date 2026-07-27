@@ -75,7 +75,7 @@ def _execute_generated_backtest(
     strategy = (
         StrategySpec.model_validate(request.parsed_strategy_jsonb)
         if request.parsed_strategy_jsonb
-        else build_strategy_spec(request.natural_language_prompt, variant="A", retrieval={"hits": []})
+        else build_strategy_spec(request.natural_language_prompt, variant="A")
     )
     pipeline = load_pipeline_data_from_env(request.natural_language_prompt, str(trace_id))
     rows = pipeline.price_rows or list(ai_backtest.DEFAULT_BACKTEST_PRICE_ROWS)

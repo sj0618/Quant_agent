@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from ai_graph.llm.prompts import BACKTEST_CODE_SCHEMA_NAME, BACKTEST_CODE_SYSTEM_PROMPT
 from app.schemas.ai_backtest import (
     AI_BACKTEST_MAX_MEMORY_LIMIT_MB,
     AI_BACKTEST_MAX_PROMPT_CHARS,
@@ -91,7 +92,11 @@ def build_signals(prices):
     assert any("pandas.read_csv" in error["message"] for error in result.errors_jsonb)
 
 
-def test_sandboxed_backtest_executor_enforces_timeout():
+def test_sandboxed_backtest_executor_enforces_timeout(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.ai_backtest_runtime._limit_subprocess_resources",
+        lambda _memory_limit_mb, _timeout_seconds: None,
+    )
     executor = SandboxedBacktestExecutor()
     request = AICodeBacktestFlowRequest(
         natural_language_prompt="무한 루프 전략",
@@ -117,7 +122,13 @@ def test_sandboxed_backtest_executor_enforces_timeout():
     generated = GeneratedCodeResult(
         target_runtime="python-sandbox",
         code_purpose="backtest",
-        generated_code="def build_signals(prices):\n    while True:\n        pass\n",
+        generated_code=(
+            "def build_signals(prices):\n"
+            "    for left in range(10000):\n"
+            "        for right in range(10000):\n"
+            "            pass\n"
+            "    return []\n"
+        ),
     )
 
     persisted_identity = []
@@ -258,7 +269,7 @@ def test_aoai_code_generator_captures_full_model_call(monkeypatch):
     assert result.model_call.error_message is None
     assert result.model_call.prompt_log is not None
     assert result.model_call.prompt_log.prompt_template_name
-    assert result.model_call.prompt_log.system_prompt.startswith("You are QuantAgent's backtest-code generation node")
+    assert result.model_call.prompt_log.system_prompt == BACKTEST_CODE_SYSTEM_PROMPT
     assert json.loads(result.model_call.prompt_log.user_prompt)["strategy_spec"]["strategy_id"] == "rsi_rebound"
     assert json.loads(result.model_call.prompt_log.assistant_response)["candidates"]
     assert result.model_call.prompt_log.variables_jsonb["strategy_spec"]["strategy_id"] == "rsi_rebound"
@@ -326,7 +337,7 @@ def test_aoai_code_generator_marks_provider_failure_and_keeps_prompt_for_fallbac
     assert result.model_call.error_type == "LLMClientError"
     assert result.model_call.retry_count == 2
     assert result.model_call.prompt_log is not None
-    assert result.model_call.prompt_log.system_prompt.startswith("You are QuantAgent's backtest-code generation node")
+    assert result.model_call.prompt_log.system_prompt == BACKTEST_CODE_SYSTEM_PROMPT
     assert result.model_call.prompt_log.assistant_response is None
     assert result.model_call.prompt_log.masked is False
 
@@ -503,7 +514,7 @@ def test_aoai_code_generator_marks_response_schema_fallback_as_failed(monkeypatc
     assert result.model_call.error_message == (
         "Model response did not match the required schema; deterministic fallback code was executed."
     )
-    assert result.model_call.response_schema_name == "backtest_code_candidates.v1"
+    assert result.model_call.response_schema_name == BACKTEST_CODE_SCHEMA_NAME
     assert result.model_call.web_search_used is False
     assert result.model_call.prompt_log is not None
     assert result.model_call.prompt_log.assistant_response == '{"unexpected":true}'

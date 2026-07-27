@@ -12,6 +12,7 @@ on:
           - deployed-backtest
           - live-aoai
           - live-full-analysis
+          - live-audit
 
 permissions:
   contents: read
@@ -35,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout branch benchmark
-        if: ${{ inputs.mode != 'deployed-backtest' }}
+        if: ${{ inputs.mode == 'live-aoai' || inputs.mode == 'live-full-analysis' }}
         uses: actions/checkout@v4
 
       - name: Validate required secret
@@ -50,7 +51,7 @@ jobs:
           chmod 644 "$HOME/.ssh/known_hosts"
 
       - name: Stage branch benchmark without deploying
-        if: ${{ inputs.mode != 'deployed-backtest' }}
+        if: ${{ inputs.mode == 'live-aoai' || inputs.mode == 'live-full-analysis' }}
         run: |
           tar -czf branch-source.tgz ai backtest_module
           scp -o BatchMode=yes \
@@ -190,6 +191,169 @@ jobs:
             "$RUN_ROOT/ai/scripts/benchmark_live_aoai_full_analysis.py" \
             --max-wall-seconds 1200
           REMOTE
+
+      - name: Run deployed AOAI audit round trip
+        if: ${{ inputs.mode == 'live-audit' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=40 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" "$GITHUB_RUN_ID" <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$1"
+          RUN_ID="$2"
+          if [ -f "$HOME/.bashrc" ]; then
+            set +u
+            source "$HOME/.bashrc"
+            set -u
+          fi
+
+          test -s "$APP_DIR/.run/ai.pid"
+          AI_PID="$(cat "$APP_DIR/.run/ai.pid")"
+          [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]]
+          test -r "/proc/$AI_PID/environ"
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              APP_ENV=*|AI_AUDIT_*=*|AI_AOAI_*=*|AI_LLM_*=*|AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) \
+                export "$entry" ;;
+            esac
+          done < "/proc/$AI_PID/environ"
+
+          test "${APP_ENV:-}" = production
+          test "${AI_AUDIT_PRODUCTION_ENABLED:-}" = 1
+          test "${AI_AUDIT_SINK:-}" = postgres
+          test "${AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE:-}" = active
+          test "${AI_LLM_PROVIDER:-}" = aoai
+          export AI_DB_STATEMENT_TIMEOUT_MS=180000
+          export AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS=300000
+          export AI_BACKTEST_WALL_BUDGET_SECONDS=540
+          export AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS=180
+          export AUDIT_SMOKE_TRACE_ID="production-ai-audit-$RUN_ID"
+
+          cd "$APP_DIR/ai"
+          "$APP_DIR/ai/.venv/bin/python" -u <<'PY'
+          import json
+          import os
+
+          import psycopg
+
+          from ai_graph.audit_postgres import AuthorizedAuditSink, create_audit_sink_from_env
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+          from ai_graph.graph import run_analysis
+
+          if not isinstance(create_audit_sink_from_env(), AuthorizedAuditSink):
+              raise RuntimeError("deployed audit sink is not authorized")
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is not configured")
+
+          public_trace_id = os.environ["AUDIT_SMOKE_TRACE_ID"]
+          result = run_analysis(
+              "삼성전자 005930을 RSI 30 이하에서 매수하고 70 이상에서 매도해 최근 1년을 백테스트해줘",
+              trace_id=public_trace_id,
+              audit_entrypoint="production.audit_smoke",
+              audit_feature="production_audit_smoke",
+          )
+
+          with psycopg.connect(dsn) as conn:
+              trace = conn.execute(
+                  """
+                  SELECT trace_id, status
+                  FROM app.ai_trace
+                  WHERE metadata_jsonb->>'public_trace_id' = %s
+                  ORDER BY started_at DESC
+                  LIMIT 1
+                  """,
+                  (public_trace_id,),
+              ).fetchone()
+              if trace is None:
+                  raise RuntimeError("audit trace was not persisted")
+              db_trace_id, trace_status = trace
+              counts = conn.execute(
+                  """
+                  SELECT
+                      (SELECT count(*) FROM app.ai_agent_execution_log
+                       WHERE trace_id = %s),
+                      (SELECT count(*) FROM app.ai_model_call_log
+                       WHERE trace_id = %s),
+                      (SELECT count(*) FROM app.ai_model_call_log
+                       WHERE trace_id = %s AND provider = 'aoai'
+                         AND status = 'succeeded'),
+                      (SELECT count(*) FROM app.ai_prompt_log AS prompt
+                       JOIN app.ai_model_call_log AS model USING (call_id)
+                       WHERE model.trace_id = %s
+                         AND length(prompt.assistant_response) > 0),
+                      (SELECT count(*) FROM app.ai_prompt_log AS prompt
+                       JOIN app.ai_model_call_log AS model USING (call_id)
+                       WHERE model.trace_id = %s
+                         AND length(prompt.assistant_response_summary) > 0),
+                      (SELECT coalesce(sum(length(prompt.assistant_response)), 0)
+                       FROM app.ai_prompt_log AS prompt
+                       JOIN app.ai_model_call_log AS model USING (call_id)
+                       WHERE model.trace_id = %s),
+                      (SELECT coalesce(sum(length(prompt.assistant_response_summary)), 0)
+                       FROM app.ai_prompt_log AS prompt
+                       JOIN app.ai_model_call_log AS model USING (call_id)
+                       WHERE model.trace_id = %s),
+                      (SELECT count(*) FROM app.ai_error_log WHERE trace_id = %s)
+                  """,
+                  (db_trace_id,) * 8,
+              ).fetchone()
+
+          (
+              agent_executions,
+              model_calls,
+              aoai_succeeded,
+              raw_responses,
+              summaries,
+              raw_chars,
+              summary_chars,
+              errors,
+          ) = counts
+          envelope_status = result.status.value
+          output = {
+              "agent_executions": agent_executions,
+              "aoai_succeeded": aoai_succeeded,
+              "deployment_revision": os.environ[
+                  "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
+              ][:12],
+              "envelope_status": envelope_status,
+              "errors": errors,
+              "model_calls": model_calls,
+              "provider": "aoai",
+              "raw_chars": raw_chars,
+              "raw_responses": raw_responses,
+              "summaries": summaries,
+              "summary_chars": summary_chars,
+              "trace_id": public_trace_id,
+              "trace_status": trace_status,
+          }
+          print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+          if (
+              envelope_status != "ready"
+              or trace_status != "completed"
+              or model_calls < 1
+              or aoai_succeeded != model_calls
+              or raw_responses != model_calls
+              or summaries != model_calls
+              or errors != 0
+          ):
+              raise RuntimeError("production AOAI audit round trip failed")
+          PY
+          REMOTE
+
+      - name: Verify public AI health
+        if: ${{ inputs.mode == 'live-audit' }}
+        run: |
+          curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            https://qt-agent.kro.kr/ai-api/health
 
       - name: Run production analysis with two workers
         if: ${{ inputs.mode == 'deployed-backtest' }}

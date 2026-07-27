@@ -14,6 +14,10 @@ PostgreSQL에 저장하는 기능의 활성화·검증·롤백 절차다. 로그
   `code_execution`, `report_generation` 네 단계를 기록한다. 모델 호출은 해당
   단계의 `execution_id`와 연결되고 system/user prompt 및 assistant response
   원문을 `masked=false`로 저장한다.
+- `ai_graph` 모델 호출은 provider가 공개한 assistant response 원문과 함께
+  `summary`, `overall_summary`, `recommendation` 등 구조화 응답의 요약 필드를
+  우선 사용한 최대 2,000자 축약본을 저장한다. 공개 요약 필드가 없으면 공백을
+  정규화한 응답 앞부분을 사용한다. AOAI reasoning item은 원문에도 포함하지 않는다.
 - 재시도는 하나의 논리적 model call 안에서 수행한다. 모델 호출이 끝내
   실패해도 deterministic fallback이 성공하면 model call과 error는 실패로
   남지만 agent와 trace는 성공할 수 있다. fallback도 실패하면 agent와 trace를
@@ -34,7 +38,8 @@ PostgreSQL에 저장하는 기능의 활성화·검증·롤백 절차다. 로그
 | 설정 | 값 | 동작 |
 |---|---|---|
 | `AI_AUDIT_SINK` | `noop` | 기본값. AI는 정상 실행하고 DB 로그는 저장하지 않는다. |
-| `AI_AUDIT_SINK` | `postgres` | 코드 경로는 존재하지만 현재 운영·스테이징 활성화는 BLOCKED다. |
+| `AI_AUDIT_SINK` | `postgres` | signed admission이 유효할 때 PostgreSQL에 기록한다. |
+| `AI_AUDIT_PRODUCTION_ENABLED` | `1` | production/staging의 기본 차단을 명시적으로 해제한다. 다른 값이면 계속 차단한다. |
 | `AI_AUDIT_CONNECT_TIMEOUT_SECONDS` | 양의 정수, 기본 `2` | 로깅 DB 연결 제한 시간. |
 | `AI_AUDIT_STATEMENT_TIMEOUT_MS` | 양의 정수, 기본 `2000` | 로깅 SQL 제한 시간. |
 | `AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE` | `active`만 허용 | env-backed 결정론 verifier 상태. `revoked`, 누락, 알 수 없는 값은 write-time fail-closed deny다. 로컬 테스트 경계이며 운영 revocation provider가 아니다. |
@@ -49,19 +54,19 @@ DSN은 첫 번째 비어 있지 않은 값을 아래 순서로 사용한다.
 동작한다. DSN과 인증 정보는 배포 환경의 secret 저장소로 주입하고 로그나
 증거 문서에 원문을 남기지 않는다.
 
-외부 signer와 revocation provider가 없으므로 이 문서에는 `AI_AUDIT_SINK=postgres`
-활성화 예시를 제공하지 않는다. production/staging에서 raw-on 설정 또는 canary를
-실행하지 않는다. signer가 발행한 HMAC admission과 독립적인 revocation provider의
-증거가 모두 준비되기 전에는 `AI_AUDIT_SINK=noop`을 유지한다.
+배포 workflow가 서버 내부 0600 secret으로 revision-bound admission을 발급해 AI
+process에 주입한다. secret과 token은 workflow 로그에 출력하지 않는다. 외부 요청
+인증 설정은 이 기능과 별개이며 변경하지 않는다.
 
 ## 2. 마이그레이션
 
 선행 조건은 `service_db/migrations/011_app_ai_backtest_erd.sql`이 적용된 DB다. 코드
-활성화 전에 additive migration 013을 적용한다.
+활성화 전에 additive migration 013과 019를 적용한다.
 
 ```bash
 psql "$AI_DATABASE_DSN" -v ON_ERROR_STOP=1 \
-  -f service_db/migrations/013_ai_runtime_logging.sql
+  -f service_db/migrations/013_ai_runtime_logging.sql \
+  -f service_db/migrations/019_ai_prompt_response_summary.sql
 ```
 
 013은 다음만 추가하며 기존 컬럼이나 데이터를 삭제하지 않는다.
@@ -70,6 +75,7 @@ psql "$AI_DATABASE_DSN" -v ON_ERROR_STOP=1 \
 - model call → agent execution FK (`ON DELETE SET NULL`)
 - execution correlation index
 - prompt 90일 삭제용 `(created_at, prompt_log_id)` index
+- prompt의 nullable `assistant_response_summary` 컬럼
 
 적용 후 카탈로그 검증:
 
@@ -93,27 +99,27 @@ WHERE schemaname = 'app'
     'idx_ai_prompt_log_retention'
   )
 ORDER BY indexname;
+
+SELECT column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'app'
+  AND table_name = 'ai_prompt_log'
+  AND column_name = 'assistant_response_summary';
 ```
 
-## 3. 스테이징 활성화와 canary — BLOCKED
+## 3. 운영 활성화와 live audit 검증
 
-현재 external signer/provider가 없으므로 production/staging raw-on과 canary는
-**실행 금지**다. `AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE=active`는 process
-env를 읽는 결정론 테스트 verifier일 뿐, 외부 revocation 확인이나 Gate B PASS
-증거가 아니다.
+`.github/workflows/deploy.yml`이 migration 적용, signed admission 발급,
+`AI_AUDIT_PRODUCTION_ENABLED=1`, `AI_AUDIT_SINK=postgres` 설정과 AI 재시작을
+한 번에 수행한다. `.github/workflows/production-backtest-smoke.yml`의
+`live-audit` 모드는 배포된 AOAI graph를 실행한 뒤 같은 trace의 agent/model/prompt
+row를 다시 읽어 다음을 모두 검증한다.
 
-BLOCKED 해제에는 다음이 모두 필요하다.
-
-1. signer가 audience, evidence ID, deployment revision, issued_at, expiry, key version을
-   포함한 admission을 발행한다.
-2. write-time에 조회 가능한 독립 revocation provider가 revoke/unavailable을
-   fail-closed로 응답한다.
-3. provider 장애·revoke·expiry 시 raw write 0건과 AI fail-open 결과를 증명한
-   staging evidence가 owner, reviewer, date와 함께 기록된다.
-4. Gate B의 TLS, storage, backup, 권한 증거가 모두 PASS다.
-
-이 조건이 충족되어 별도 승인되기 전에는 local/unit test 외의 raw write를 수행하지
-않는다.
+1. analysis와 trace가 완료 상태다.
+2. model call provider가 모두 `aoai`이고 성공 상태다.
+3. 모든 model call에 비어 있지 않은 원문과 요약이 각각 한 건 있다.
+4. 연결된 audit error가 0건이다.
+5. 공개 `https://qt-agent.kro.kr/ai-api/health`가 성공한다.
 
 ## 4. 즉시 롤백과 forward schema 정책
 
@@ -124,7 +130,7 @@ BLOCKED 해제에는 다음이 모두 필요하다.
 AI_AUDIT_SINK=noop
 ```
 
-- 013에서 추가한 nullable 컬럼·FK·인덱스는 그대로 둔다.
+- 013·019에서 추가한 nullable 컬럼·FK·인덱스는 그대로 둔다.
 - `DROP COLUMN`, `DROP CONSTRAINT`, `DROP INDEX`로 기존 로그를 훼손하지 않는다.
 - 후속 오류는 삭제형 down migration 대신 additive forward migration으로 수정한다.
 - 잘못 삭제된 90일 초과 prompt/response는 DB에서 복원하지 않는다. purge
@@ -196,7 +202,7 @@ retention/expiry는 Gate B에서 별도로 증명한다.
 
 - [ ] migration 013이 전체 migration과 함께 두 번 적용되고 FK/index가 확인된다.
 - [ ] API entrypoint와 direct `run_analysis()`가 하나의 trace로 agent/model/prompt/error를 연결한다.
-- [ ] system/user/variables/assistant 원문이 손실 없이 round-trip된다.
+- [ ] system/user/variables/assistant 원문과 assistant 요약이 round-trip된다.
 - [ ] DB 연결·timeout·제약조건·직렬화 실패에서 AI 결과가 변하지 않는다.
 - [ ] 90일 purge가 배치·재시도·반복 실행에 안전하고 metadata를 유지한다.
 - [ ] test, lint, migration, integration, OpenAPI non-scope contract가 통과한다.
@@ -213,8 +219,9 @@ Gate A는 아래 Gate B의 대체 증거가 아니다.
   revoke, unavailable을 fail-closed로 검증한다. 현재 이 증거는 **BLOCKED**다.
 - [ ] 모든 증거에 owner, reviewer, date, resource, observed value가 있다.
 
-Gate A만 통과하고 Gate B가 미확인이면 상태는
-**`코드 완료 / 운영 full-content logging 비활성`**이다.
+현재 배포-local signer는 운영 기능을 켜는 capability이며 독립 signer나 외부
+revocation provider의 인프라 인증을 대체하지 않는다. 아래 Gate B 증거가 미확인이면
+운영 로깅은 동작하더라도 **Gate B 인증 완료**로 표시하지 않는다.
 
 ## 8. TLS 검증
 

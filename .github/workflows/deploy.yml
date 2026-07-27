@@ -67,9 +67,11 @@ jobs:
 
       - name: Install and restart development servers
         run: |
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            bash -s -- "$GITHUB_SHA" <<'REMOTE'
             set -euo pipefail
 
+            DEPLOYMENT_REVISION="$1"
             if [ -f "$HOME/.bashrc" ]; then
               set +u
               source "$HOME/.bashrc"
@@ -83,6 +85,96 @@ jobs:
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
             "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/ai"
+
+            "$APP_DIR/ai/.venv/bin/python" - "$APP_DIR" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          import psycopg
+
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+
+          app_dir = Path(sys.argv[1])
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is required for AI audit migrations")
+          with psycopg.connect(dsn, autocommit=True) as conn:
+              for name in (
+                  "011_app_ai_backtest_erd.sql",
+                  "013_ai_runtime_logging.sql",
+                  "019_ai_prompt_response_summary.sql",
+              ):
+                  conn.execute(
+                      (app_dir / "service_db" / "migrations" / name).read_text(
+                          encoding="utf-8"
+                      )
+                  )
+                  print(f"applied {name}")
+          PY
+
+            umask 077
+            AUDIT_SECRET_FILE="$RUN_DIR/ai-audit-admission.secret"
+            if [ ! -s "$AUDIT_SECRET_FILE" ]; then
+              openssl rand -hex 32 > "$AUDIT_SECRET_FILE"
+            fi
+            chmod 600 "$AUDIT_SECRET_FILE"
+            export APP_ENV=production
+            export AI_AUDIT_PRODUCTION_ENABLED=1
+            export AI_AUDIT_SINK=postgres
+            export AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET
+            AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET="$(tr -d '\r\n' < "$AUDIT_SECRET_FILE")"
+            export AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION=server-v1
+            export AI_AUDIT_GATE_B_ADMISSION_AUDIENCE=quantagent.ai.audit
+            export AI_AUDIT_GATE_B_EVIDENCE_ID=production-deployment
+            export AI_AUDIT_GATE_B_DEPLOYMENT_REVISION="$DEPLOYMENT_REVISION"
+            export AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE=active
+            export AI_AUDIT_GATE_B_ADMISSION_TOKEN
+            AI_AUDIT_GATE_B_ADMISSION_TOKEN="$("$APP_DIR/ai/.venv/bin/python" - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import os
+          import time
+
+          def encode(value):
+              raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+              return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+          now = time.time()
+          key_version = os.environ["AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION"]
+          header = {"alg": "HS256", "key_version": key_version}
+          claims = {
+              "audience": os.environ["AI_AUDIT_GATE_B_ADMISSION_AUDIENCE"],
+              "deployment_revision": os.environ[
+                  "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
+              ],
+              "evidence_id": os.environ["AI_AUDIT_GATE_B_EVIDENCE_ID"],
+              "expiry": now + 365 * 24 * 60 * 60,
+              "issued_at": now - 1,
+              "key_version": key_version,
+          }
+          signing_input = f"{encode(header)}.{encode(claims)}"
+          signature = hmac.new(
+              os.environ["AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET"].encode(),
+              signing_input.encode("ascii"),
+              hashlib.sha256,
+          ).digest()
+          print(
+              f"{signing_input}."
+              f"{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}"
+          )
+          PY
+            )"
+
+            "$APP_DIR/ai/.venv/bin/python" - <<'PY'
+          from ai_graph.audit_postgres import AuthorizedAuditSink, create_audit_sink_from_env
+
+          if not isinstance(create_audit_sink_from_env(), AuthorizedAuditSink):
+              raise RuntimeError("production AI audit admission was not authorized")
+          print("production AI audit admission authorized")
+          PY
 
             cd "$APP_DIR/fe"
             npm ci

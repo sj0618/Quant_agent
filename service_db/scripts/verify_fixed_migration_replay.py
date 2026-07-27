@@ -27,6 +27,7 @@ FIXED_MIGRATIONS = (
     "016_ai_backtest_idempotency.sql",
     "017_add_notification_settings_to_users.sql",
     "018_create_email_delivery_outbox.sql",
+    "019_ai_prompt_response_summary.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 PG17_MIN_VERSION_NUM = 170000
@@ -39,7 +40,7 @@ REQUIRED_EXTERNAL_INPUTS = {
     "trusted_root": "SERVICE_DB_REPLAY_TRUSTED_ROOT",
 }
 
-# Names explicitly owned by 011, 013, 014, 015, and 016.  System-owned primary
+# Names explicitly owned by the fixed migrations above. System-owned primary
 # indexes and sequences are intentionally excluded from this migration contract.
 OWNED_RELATIONS = {
     "r": (
@@ -101,6 +102,7 @@ OWNED_COLUMNS = (
     ("ai_model_call_log", "execution_id"),
     ("ai_model_call_log", "response_schema_name"),
     ("ai_model_call_log", "web_search_used"),
+    ("ai_prompt_log", "assistant_response_summary"),
     ("code_execution_run", "attempt_id"),
     ("code_execution_run", "worker_host"),
     ("code_execution_run", "worker_pid"),

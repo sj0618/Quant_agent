@@ -33,6 +33,7 @@ from ai_graph.data_sources.db import resolve_database_dsn_from_env
 
 
 AI_AUDIT_SINK_ENV = "AI_AUDIT_SINK"
+AI_AUDIT_PRODUCTION_ENABLED_ENV = "AI_AUDIT_PRODUCTION_ENABLED"
 AI_AUDIT_CONNECT_TIMEOUT_SECONDS_ENV = "AI_AUDIT_CONNECT_TIMEOUT_SECONDS"
 AI_AUDIT_STATEMENT_TIMEOUT_MS_ENV = "AI_AUDIT_STATEMENT_TIMEOUT_MS"
 AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET_ENV = "AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET"
@@ -48,6 +49,16 @@ _AUDIT_WRITER_CAPABILITY = object()
 _AUDIT_TEST_SINK_CAPABILITY = object()
 _RAW_AUDIT_ADMISSION_ISSUER = object()
 _RAW_AUDIT_HARD_DISABLED_ENVS = frozenset({"prod", "production", "stage", "staging"})
+_ASSISTANT_RESPONSE_SUMMARY_KEYS = (
+    "summary",
+    "overall_summary",
+    "sanitized_summary",
+    "recommendation",
+    "conclusion",
+    "rationale",
+    "decision",
+)
+MAX_ASSISTANT_RESPONSE_SUMMARY_CHARS = 2_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -527,8 +538,16 @@ class _PostgresAuditSession:
                 ),
             )
             self.connection.execute(
-                "UPDATE app.ai_prompt_log SET assistant_response = %s WHERE call_id = %s",
-                (assistant_response, call_id),
+                """
+                UPDATE app.ai_prompt_log
+                SET assistant_response = %s, assistant_response_summary = %s
+                WHERE call_id = %s
+                """,
+                (
+                    assistant_response,
+                    _assistant_response_summary(assistant_response),
+                    call_id,
+                ),
             )
             if status == "failed" and error_type:
                 self._insert_error(
@@ -667,7 +686,11 @@ def _create_test_audit_sink(sink: AuditSink) -> AuditSink:
 
 def _raw_audit_hard_disabled(env: Mapping[str, str]) -> bool:
     app_env = _required_text(env.get("APP_ENV"))
-    return app_env is not None and app_env.lower() in _RAW_AUDIT_HARD_DISABLED_ENVS
+    return (
+        app_env is not None
+        and app_env.lower() in _RAW_AUDIT_HARD_DISABLED_ENVS
+        and not _enabled(env.get(AI_AUDIT_PRODUCTION_ENABLED_ENV))
+    )
 
 
 def _admission_from_env(env: Mapping[str, str]) -> _RawAuditAdmission | None:
@@ -844,6 +867,37 @@ def _bounded(value: str, limit: int) -> str:
     return value[:limit]
 
 
+def _assistant_response_summary(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return _bounded(normalized, MAX_ASSISTANT_RESPONSE_SUMMARY_CHARS)
+    if isinstance(payload, dict):
+        parts: list[str] = []
+        for key in _ASSISTANT_RESPONSE_SUMMARY_KEYS:
+            candidate = payload.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                parts.append(" ".join(candidate.split()))
+            elif isinstance(candidate, list):
+                parts.extend(
+                    " ".join(item.split())
+                    for item in candidate
+                    if isinstance(item, str) and item.strip()
+                )
+        if parts:
+            return _bounded(" | ".join(parts), MAX_ASSISTANT_RESPONSE_SUMMARY_CHARS)
+    return _bounded(normalized, MAX_ASSISTANT_RESPONSE_SUMMARY_CHARS)
+
+
+def _enabled(value: object) -> bool:
+    return isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _positive_int(value: str | None, default: int) -> int:
     if value is None or not value.strip():
         return default
@@ -871,6 +925,7 @@ __all__ = [
     "AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE_ENV",
     "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION_ENV",
     "AI_AUDIT_GATE_B_EVIDENCE_ID_ENV",
+    "AI_AUDIT_PRODUCTION_ENABLED_ENV",
     "AI_AUDIT_SINK_ENV",
     "AI_AUDIT_STATEMENT_TIMEOUT_MS_ENV",
     "AuthorizedAuditSink",

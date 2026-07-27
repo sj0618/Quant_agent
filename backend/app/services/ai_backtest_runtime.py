@@ -4,6 +4,7 @@ import ast
 import hashlib
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -108,7 +109,7 @@ class AOAICodeGenerator:
         strategy = (
             StrategySpec.model_validate(request.parsed_strategy_jsonb)
             if request.parsed_strategy_jsonb
-            else build_strategy_spec(request.natural_language_prompt, variant="A", retrieval={"hits": []})
+            else build_strategy_spec(request.natural_language_prompt, variant="A")
         )
         prompt_request = build_backtest_code_json_request(strategy, "A")
         llm_client = create_llm_client(role="BACKTEST_CODE")
@@ -254,6 +255,32 @@ def _failed_execution_result(
     )
 
 
+def _timeout_execution_result(
+    *,
+    request: AICodeBacktestFlowRequest,
+    generated: GeneratedCodeResult,
+    execution_run_id: UUID,
+    started_at: datetime,
+    stdout: str,
+    stderr: str,
+) -> CodeExecutionResult:
+    ended_at = datetime.now(UTC)
+    return CodeExecutionResult(
+        runtime_env=generated.target_runtime,
+        status="timeout",
+        timeout_seconds=request.timeout_seconds,
+        memory_limit_mb=request.memory_limit_mb,
+        sandbox_id=f"subprocess:{execution_run_id}",
+        latency_ms=round((ended_at - started_at).total_seconds() * 1000, 6),
+        stdout=stdout,
+        stderr=f"{stderr}\nexecution timed out".strip(),
+        output_artifacts_jsonb=None,
+        started_at=started_at,
+        ended_at=ended_at,
+        backtest_result=None,
+    )
+
+
 async def _withhold_release_and_wait(process: subprocess.Popen[str]) -> None:
     try:
         process.communicate(timeout=5)
@@ -391,24 +418,26 @@ class SandboxedBacktestExecutor:
             except subprocess.TimeoutExpired as exc:
                 process.kill()
                 stdout, stderr = process.communicate()
-                ended_at = datetime.now(UTC)
-                return CodeExecutionResult(
-                    runtime_env=generated.target_runtime,
-                    status="timeout",
-                    timeout_seconds=request.timeout_seconds,
-                    memory_limit_mb=request.memory_limit_mb,
-                    sandbox_id=f"subprocess:{execution_run_id}",
-                    latency_ms=round((ended_at - started_at).total_seconds() * 1000, 6),
-                    stdout=stdout or exc.stdout or "",
-                    stderr=(stderr or exc.stderr or "") + "\nexecution timed out",
-                    output_artifacts_jsonb=None,
+                return _timeout_execution_result(
+                    request=request,
+                    generated=generated,
+                    execution_run_id=execution_run_id,
                     started_at=started_at,
-                    ended_at=ended_at,
-                    backtest_result=None,
+                    stdout=stdout or exc.stdout or "",
+                    stderr=stderr or exc.stderr or "",
                 )
             ended_at = datetime.now(UTC)
             stdout = stdout or ""
             stderr = stderr or ""
+            if process.returncode == -signal.SIGXCPU:
+                return _timeout_execution_result(
+                    request=request,
+                    generated=generated,
+                    execution_run_id=execution_run_id,
+                    started_at=started_at,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
             if process.returncode != 0:
                 return CodeExecutionResult(
                     runtime_env=generated.target_runtime,

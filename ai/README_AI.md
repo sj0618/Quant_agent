@@ -86,20 +86,20 @@ AI_L4_EVIDENCE_LIMIT=5 \
   --app-dir "$WORKTREE_ROOT/ai" --host "$AI_API_HOST" --port "$AI_API_PORT"
 ```
 
-AI 운영 로그는 기본적으로 꺼져 있으며 현재 운영·스테이징 raw logging 활성화는
-**BLOCKED**다. 외부 Gate B revocation provider와 승인 signer가 없으므로
-`AI_AUDIT_SINK=postgres`를 production/staging에 설정하거나 canary를 실행하지 않는다.
-PostgreSQL sink는 signed Gate B admission 변수 6개, migration, TLS·backup, retention,
-canary row 검증을 모두 요구하며 이 fixture MVP 범위에서 활성화하지 않는다.
+AI 운영 로그는 기본적으로 꺼져 있다. 배포 workflow는 migration 011·013·019를 적용하고,
+서버에서 생성한 signed admission과 `AI_AUDIT_PRODUCTION_ENABLED=1`을 AI process에만
+주입해 PostgreSQL sink를 명시적으로 켠다. AOAI가 반환한 공개 assistant response 원문은
+`assistant_response`, 구조화 응답의 summary 계열 필드에서 만든 축약본은
+`assistant_response_summary`에 저장한다. provider가 공개하지 않는 내부 reasoning item은
+저장하지 않는다.
 
 DB audit 세션은 각 write transaction 직전에 signed admission의 expiry, claim integrity,
 env-backed revocation state를 다시 확인한다. `active` 외의 값(`revoked`, 누락, 알 수 없는
-값)은 fail-closed로 해당 raw write만 중단하고 AI 결과는 계속 반환한다. 이 env verifier는
-로컬 결정론 테스트 경계일 뿐 운영 Gate B 증거가 아니다.
+값)은 fail-closed로 해당 raw write만 중단하고 AI 결과는 계속 반환한다.
 
 DSN은 `AI_DATABASE_DSN`, `QUANT_DB_DSN`, `DATABASE_URL` 순서로 선택된다.
-즉시 롤백은 `AI_AUDIT_SINK=noop`이며, migration, canary, TLS, backup, retention 확인과
-BLOCKED 해제 조건은 [AI 로깅 운영 런북](docs/ai-logging-operations.md)을 따른다.
+즉시 롤백은 `AI_AUDIT_SINK=noop`이며 migration, live audit smoke, TLS, backup,
+retention 확인은 [AI 로깅 운영 런북](docs/ai-logging-operations.md)을 따른다.
 
 AOAI Responses API는 opt-in이다. 기본값은 로컬 테스트용 mock LLM이며, 아래 값이 모두 있을 때
 `httpx` 기반 AOAI client를 사용한다. `AI_LLM_PROVIDER=aoai`에서는 provider 오류, schema 오류, 안전한 코드 후보 부재를 결정론 fallback으로 숨기지 않고 analysis job 실패로 남긴다.

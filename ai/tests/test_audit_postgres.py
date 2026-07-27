@@ -264,6 +264,16 @@ def test_postgres_session_persists_joined_lifecycles_and_closes_once() -> None:
         None,
         call_id,
     )
+    prompt_update_params = next(
+        params
+        for statement, params in conn.executions
+        if "UPDATE app.ai_prompt_log" in statement
+    )
+    assert prompt_update_params == (
+        '{"summary":"전체 응답"}',
+        "전체 응답",
+        call_id,
+    )
 
 
 def test_initial_model_prompt_serialization_failure_rolls_back_and_breaks_session(
@@ -350,7 +360,7 @@ def test_sink_factory_requires_signed_gate_b_admission_before_issuing_persistent
     assert "postgresql://preferred" not in repr(sink)
 
 @pytest.mark.parametrize("app_env", ["production", "prod", "staging", "stage"])
-def test_postgres_sink_and_admission_are_hard_disabled_without_external_provider(
+def test_postgres_sink_and_admission_are_hard_disabled_without_explicit_enable(
     app_env: str,
 ) -> None:
     module = importlib.import_module("ai_graph.audit_postgres")
@@ -364,6 +374,20 @@ def test_postgres_sink_and_admission_are_hard_disabled_without_external_provider
         NoOpAuditSink,
     )
     assert isinstance(create_audit_sink_from_env(env), NoOpAuditSink)
+
+
+@pytest.mark.parametrize("app_env", ["production", "prod", "staging", "stage"])
+def test_protected_environment_allows_signed_admission_when_explicitly_enabled(
+    app_env: str,
+) -> None:
+    module = importlib.import_module("ai_graph.audit_postgres")
+    env = _audit_sink_env()
+    env["APP_ENV"] = app_env
+    env["AI_AUDIT_PRODUCTION_ENABLED"] = "1"
+    env["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "active"
+
+    assert module._admission_from_env(env) is not None
+    assert isinstance(create_audit_sink_from_env(env), AuthorizedAuditSink)
 
 
 @pytest.mark.parametrize(
@@ -846,6 +870,16 @@ def test_disposable_timescaledb_migrations_and_large_unicode_round_trip() -> Non
             )
         }
         assert columns == {"execution_id", "response_schema_name", "web_search_used"}
+        prompt_summary_column = conn.execute(
+            """
+            SELECT data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'app'
+              AND table_name = 'ai_prompt_log'
+              AND column_name = 'assistant_response_summary'
+            """
+        ).fetchone()
+        assert prompt_summary_column == ("text", "YES")
         fk_definition = conn.execute(
             """
             SELECT pg_get_constraintdef(oid)
@@ -937,7 +971,7 @@ def test_disposable_timescaledb_migrations_and_large_unicode_round_trip() -> Non
                 SELECT trace.status, agent.status, model.status,
                        prompt.system_prompt, prompt.user_prompt,
                        prompt.variables_jsonb, prompt.assistant_response,
-                       error.error_type
+                       prompt.assistant_response_summary, error.error_type
                 FROM app.ai_trace AS trace
                 JOIN app.ai_agent_execution_log AS agent USING (trace_id)
                 JOIN app.ai_model_call_log AS model
@@ -967,7 +1001,8 @@ def test_disposable_timescaledb_migrations_and_large_unicode_round_trip() -> Non
         ).digest() == sha256(
             json.dumps(variables, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).digest()
-        assert row[7] == "VerificationError"
+        assert row[7] == "가" * 2_000
+        assert row[8] == "VerificationError"
 
         retention_script = Path(__file__).resolve().parents[2] / "DE" / "scripts" / (
             "purge_ai_prompt_logs.py"

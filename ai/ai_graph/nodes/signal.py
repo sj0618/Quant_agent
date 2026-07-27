@@ -7,7 +7,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ai_graph.nodes.backtest import summarize_backtest
 from ai_graph.schemas import L4Evidence, SignalDecision as InvestmentSignalDecision
 
 SignalAction = Literal["BUY", "SELL", "HOLD", "WATCH"]
