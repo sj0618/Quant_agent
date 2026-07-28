@@ -36,7 +36,9 @@
 
 - **FE 구독 선택 UI**: `/reports` 페이지에서 체크박스로 최대 3개 전략 선택 (`fe/src/features/reports/ReportList.tsx`). 현재는 `fe/src/api/emailDigestClient.ts`가 **localStorage mock**으로 선택 상태를 저장한다 — 아래 "필요한 저장 API"로 교체되어야 한다.
 
-- **FE 이메일 미리보기**: `/reports`의 "이메일 다이제스트 미리보기" 버튼 → `DailyDigestPreview` 컴포넌트가 실제 이메일과 동일한 7개 섹션을 렌더링한다 (`fe/src/features/reports/DailyDigestPreview.tsx`, mock 데이터는 `fe/src/mocks/dailyDigest.mock.ts`). 이메일 HTML 템플릿을 만들 때 이 컴포넌트의 섹션 구조/문구를 그대로 참고하면 된다.
+- **FE 이메일 미리보기**: `/reports`의 "이메일 다이제스트 미리보기" 버튼 → `DailyDigestPreview` 컴포넌트가 실제 이메일과 동일한 7개 섹션을 렌더링한다 (`fe/src/features/reports/DailyDigestPreview.tsx`, mock 데이터는 `fe/src/mocks/dailyDigest.mock.ts`). 이건 앱 화면용이다.
+
+- **발송용 이메일 HTML 템플릿**: `fe/src/features/reports/DailyDigestEmail.tsx` — `DailyDigestReport`를 그대로 받아 메일 클라이언트에서 깨지지 않는 HTML(table + inline style)을 만든다. `renderDailyDigestEmailHtml({ digest, baseUrl })`가 doctype/head까지 붙은 완성 문서를 돌려주므로 BE는 이 마크업을 서버 템플릿으로 옮기면 된다. 예비 라우트 `/dev/email-template`(로그인 불필요)에서 미리보기 + HTML 복사/다운로드가 되고, 생성된 실제 결과물은 `fe/docs/email-template/daily-digest.sample.html`에 커밋돼 있다. 제약 사항과 미해결 결정(WATCH 신호 부재 등)은 `fe/docs/email-template/README.md` 참고.
 
 ## BE가 만들어야 하는 것
 
@@ -54,7 +56,7 @@
 1. `email_digest_subscriptions`에서 구독 중인 유저 전체를 조회 (`dailyReportEmail=true`인 유저만).
 2. 유저별로 선택된 전략들의 최신 시그널/백테스트 지표를 조회해 `DailyDigestStrategyInput[]`로 변환.
 3. `POST /ai/daily-digest` 호출 → `DailyDigestReport` 수신.
-4. `DailyDigestReport`를 이메일 HTML로 렌더링 (템플릿은 `DailyDigestPreview.tsx` 구조 참고) 후 발송 수단(SES/SMTP/SendGrid 등, BE 결정)으로 발송.
+4. `DailyDigestReport`를 이메일 HTML로 렌더링 (템플릿은 `fe/src/features/reports/DailyDigestEmail.tsx`, 결과물 샘플은 `fe/docs/email-template/daily-digest.sample.html`) 후 발송 수단(SES/SMTP/SendGrid 등, BE 결정)으로 발송. 링크가 모두 절대 주소여야 하므로 `baseUrl`을 반드시 채워 넣어야 한다.
 5. 발송 성공/실패 로그 저장 — 기존 `fe/src/pages/ReportsPage.tsx`의 "리포트" 개념과 동일한 감사 로그 수준을 유지.
 
 ### 3. 재발송 / 구독취소 연결
