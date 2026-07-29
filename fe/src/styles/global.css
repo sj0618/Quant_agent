@@ -440,6 +440,14 @@ p, h1, h2, h3, h4 { margin: 0; }
 .report-paper h2 span { color: var(--subdued); font-size: 10px; }
 .news-list { padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; list-style: none; }
 .news-list li { display: grid; grid-template-columns: 24px 1fr auto; gap: 10px; align-items: center; border-bottom: 1px solid var(--line); padding-bottom: 10px; font-size: 12px; }
+.report-content-sections { display: flex; flex-direction: column; gap: 16px; }
+.report-content-section { border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+.report-content-section h3 { font-size: 14px; }
+.report-content-section > p { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+.report-content-entries { display: flex; flex-direction: column; gap: 6px; margin: 10px 0 0; }
+.report-content-entries > div { display: grid; grid-template-columns: minmax(120px, 0.7fr) minmax(0, 1.3fr); gap: 12px; padding: 7px 8px 7px var(--entry-indent); border-radius: 6px; background: var(--soft); font-size: 11px; line-height: 1.5; }
+.report-content-entries dt { color: var(--subdued); overflow-wrap: anywhere; }
+.report-content-entries dd { margin: 0; color: var(--ink); font-weight: 650; overflow-wrap: anywhere; white-space: pre-wrap; }
 .report-signal-list { display: flex; flex-direction: column; gap: 12px; }
 .axis-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 16px; }
 .axis-grid > div { background: var(--soft); border-radius: 8px; padding: 14px; }

@@ -1,35 +1,15 @@
 import type { NotificationSettings } from "../types/auth";
+import { backendRequest } from "./backendClient";
 
-const NOTIFICATION_STORAGE_KEY = "quantagent.notification-settings.v1";
+const NOTIFICATION_SETTINGS_ENDPOINT = "/me/notifications";
 
-function readSettings(): NotificationSettings | null {
-  const raw = window.localStorage.getItem(NOTIFICATION_STORAGE_KEY);
-  if (!raw) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(raw) as NotificationSettings;
-  } catch {
-    return null;
-  }
+export function getNotificationSettings(): Promise<NotificationSettings> {
+  return backendRequest<NotificationSettings>(NOTIFICATION_SETTINGS_ENDPOINT);
 }
 
-export function getNotificationSettings(email: string): NotificationSettings {
-  return (
-    readSettings() ?? {
-      dailyReportEmail: true,
-      email,
-    }
-  );
-}
-
-export function saveNotificationSettings(settings: NotificationSettings) {
-  window.localStorage.setItem(NOTIFICATION_STORAGE_KEY, JSON.stringify(settings));
-  return settings;
-}
-
-export function disableDailyReportEmail(email: string) {
-  const settings = getNotificationSettings(email);
-  return saveNotificationSettings({ ...settings, dailyReportEmail: false, email });
+export function saveNotificationSettings(settings: NotificationSettings): Promise<NotificationSettings> {
+  return backendRequest<NotificationSettings>(NOTIFICATION_SETTINGS_ENDPOINT, {
+    method: "PATCH",
+    body: JSON.stringify(settings),
+  });
 }

@@ -24,6 +24,7 @@ from app.core.security import (
     validate_unsafe_request_origin,
 )
 from app.services.google_oauth import build_google_authorization_url, validate_google_claims
+from app.services import session_store as session_store_module
 from app.services.session_store import AuthSessionStore
 from tests.unit.test_auth_config import valid_settings
 
@@ -45,6 +46,12 @@ class FakeRedis:
             self.values.pop(key, None)
             self.ttls.pop(key, None)
 
+    async def expire(self, key, ex):
+        if key in self.values:
+            self.ttls[key] = ex
+            return True
+        return False
+
 
 class FailingRedis(FakeRedis):
     async def get(self, key):
@@ -65,9 +72,9 @@ def test_sanitize_return_to_allows_local_path_and_default():
     assert sanitize_return_to("/app?tab=profile") == "/app?tab=profile"
 
 
-def test_validate_oauth_redirect_uri_accepts_configured_backend_and_fe_origin():
+def test_validate_oauth_redirect_uri_accepts_fe_origin_callback():
     settings = valid_settings(AUTH_ALLOWED_ORIGINS="https://fe.example.co.kr")
-    assert validate_oauth_redirect_uri(settings.google_redirect_uri, settings) == settings.google_redirect_uri
+    assert settings.google_redirect_uri == "https://api.example.co.kr/api/v1/auth/google/callback"
     assert (
         validate_oauth_redirect_uri("https://fe.example.co.kr/auth/google/callback", settings)
         == "https://fe.example.co.kr/auth/google/callback"
@@ -93,7 +100,7 @@ def test_validate_oauth_redirect_uri_accepts_localhost_http_in_local_env():
         "https://fe.example.co.kr/wrong/callback",
         "https://fe.example.co.kr/auth/google/callback?next=/app",
         "https://fe.example.co.kr/auth/google/callback#fragment",
-        "https://user:pass@fe.example.co.kr/auth/google/callback",
+        "https://fe.example.co.kr/auth/google/callback?user=pass",
         "javascript:alert(1)",
         "//fe.example.co.kr/auth/google/callback",
     ],
@@ -106,7 +113,11 @@ def test_validate_oauth_redirect_uri_rejects_untrusted_or_malformed_values(value
 
 
 def test_cookie_helpers_set_and_clear_secure_httponly_cookie():
-    settings = valid_settings(AUTH_SESSION_COOKIE_NAME="qa_session", AUTH_COOKIE_SAMESITE="lax")
+    settings = valid_settings(
+        AUTH_SESSION_COOKIE_NAME="qa_session",
+        AUTH_COOKIE_SAMESITE="lax",
+        AUTH_SESSION_ABSOLUTE_TTL_SECONDS=3600,
+    )
     response = Response()
     set_session_cookie(response, settings, "session-id")
     header = response.headers["set-cookie"]
@@ -114,6 +125,7 @@ def test_cookie_helpers_set_and_clear_secure_httponly_cookie():
     assert "HttpOnly" in header
     assert "Secure" in header
     assert "SameSite=lax" in header
+    assert f"Max-Age={settings.auth_session_absolute_ttl_seconds}" in header
 
     response = Response()
     clear_session_cookie(response, settings)
@@ -129,7 +141,7 @@ def test_oauth_transaction_cookie_helpers_set_short_lived_httponly_cookie():
     header = response.headers["set-cookie"]
     assert f"{OAUTH_TRANSACTION_COOKIE_NAME}=transaction-token" in header
     assert "HttpOnly" in header
-    assert "Path=/auth/google" in header
+    assert "Path=/api/v1/auth/google" in header
     assert "Max-Age=300" in header
 
     response = Response()
@@ -137,7 +149,7 @@ def test_oauth_transaction_cookie_helpers_set_short_lived_httponly_cookie():
     clear_header = response.headers["set-cookie"]
     assert f"{OAUTH_TRANSACTION_COOKIE_NAME}=" in clear_header
     assert "Max-Age=0" in clear_header
-    assert "Path=/auth/google" in clear_header
+    assert "Path=/api/v1/auth/google" in clear_header
 
 
 def test_oauth_transaction_hash_compares_without_storing_plain_token():
@@ -206,14 +218,45 @@ async def test_session_store_oauth_state_round_trips_json_flow_metadata():
 
 
 @pytest.mark.asyncio
-async def test_session_store_session_and_csrf_are_redis_backed():
-    settings = valid_settings(AUTH_SESSION_TTL_SECONDS=900, AUTH_CSRF_TTL_SECONDS=600)
+async def test_session_store_session_and_csrf_are_redis_backed(monkeypatch):
+    settings = valid_settings(
+        AUTH_SESSION_IDLE_TTL_SECONDS=900,
+        AUTH_SESSION_ABSOLUTE_TTL_SECONDS=3600,
+        AUTH_SESSION_TOUCH_INTERVAL_SECONDS=60,
+        AUTH_CSRF_TTL_SECONDS=1200,
+    )
     redis = FakeRedis()
     store = AuthSessionStore(redis, settings)
+    now = 1_700_000_000
+    monkeypatch.setattr(session_store_module.time, "time", lambda: now)
     session_id, csrf = await store.create_session(user_id="user-123")
+    session_key = store.session_key(session_id)
+    csrf_key = store.csrf_key(session_id)
+
+    initial_payload = json.loads(redis.values[session_key])
     assert await store.get_session_user_id(session_id) == "user-123"
     assert await store.get_csrf_token(session_id) == csrf
-    assert redis.ttls[store.session_key(session_id)] == 900
+    assert initial_payload["user_id"] == "user-123"
+    assert initial_payload["created_at"] == now
+    assert initial_payload["last_seen_at"] == now
+    assert initial_payload["absolute_expires_at"] == now + settings.auth_session_absolute_ttl_seconds
+    assert redis.ttls[session_key] == min(settings.auth_session_idle_ttl_seconds, settings.auth_session_absolute_ttl_seconds)
+    assert redis.ttls[csrf_key] == min(settings.auth_csrf_ttl_seconds, settings.auth_session_idle_ttl_seconds)
+
+    touched_at = now + settings.auth_session_touch_interval_seconds + 1
+    monkeypatch.setattr(session_store_module.time, "time", lambda: touched_at)
+    assert await store.get_session_user_id(session_id) == "user-123"
+    touched_payload = json.loads(redis.values[session_key])
+    assert touched_payload["last_seen_at"] == touched_at
+    assert touched_payload["absolute_expires_at"] == now + settings.auth_session_absolute_ttl_seconds
+    assert redis.ttls[session_key] == min(settings.auth_session_idle_ttl_seconds, settings.auth_session_absolute_ttl_seconds)
+    assert redis.ttls[csrf_key] == min(settings.auth_csrf_ttl_seconds, settings.auth_session_idle_ttl_seconds)
+
+    expired_at = now + settings.auth_session_absolute_ttl_seconds + 1
+    monkeypatch.setattr(session_store_module.time, "time", lambda: expired_at)
+    assert await store.get_session_user_id(session_id) is None
+    assert session_key not in redis.values
+    assert csrf_key not in redis.values
     await store.revoke_session(session_id)
     assert await store.get_session_user_id(session_id) is None
 

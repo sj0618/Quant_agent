@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import contextmanager
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -10,8 +11,10 @@ from fastapi.testclient import TestClient
 
 from app.api.routes import auth
 from app.core.errors import register_exception_handlers
+from app.core.runtime_perf import install_runtime_performance_middleware
 from app.core.security import OAUTH_TRANSACTION_COOKIE_NAME, hash_oauth_transaction_token
 from app.main import _install_credentialed_cors_middleware
+from app.services import session_store as session_store_module
 from app.services.google_oauth import GoogleIdentity
 from app.services.session_store import AuthSessionStore
 from tests.unit.test_auth_config import valid_settings
@@ -28,7 +31,8 @@ def make_client(settings=None, redis=None, *, install_cors: bool = False):
     register_exception_handlers(app)
     if install_cors:
         _install_credentialed_cors_middleware(app)
-    app.include_router(auth.router)
+    install_runtime_performance_middleware(app)
+    app.include_router(auth.router, prefix="/api/v1")
     app.state.settings = settings
     app.state.redis_client = redis or FakeRedis()
     app.state.db_engine = object()
@@ -39,7 +43,7 @@ def make_client(settings=None, redis=None, *, install_cors: bool = False):
 
 def test_google_start_redirects_and_stores_state():
     client, app = make_client()
-    response = client.get("/auth/google/start?return_to=/app", follow_redirects=False)
+    response = client.get("/api/v1/auth/google/start?return_to=/app", follow_redirects=False)
     assert response.status_code == 307
     assert response.headers["location"].startswith("https://accounts.google.com/o/oauth2/v2/auth?")
     assert any(key.startswith("qa:auth:state:") for key in app.state.redis_client.values)
@@ -47,7 +51,7 @@ def test_google_start_redirects_and_stores_state():
 
 def test_google_start_rejects_external_return_to():
     client, _app = make_client()
-    response = client.get("/auth/google/start?return_to=https://evil.example", follow_redirects=False)
+    response = client.get("/api/v1/auth/google/start?return_to=https://evil.example", follow_redirects=False)
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_return_to"
 
@@ -57,7 +61,7 @@ def test_google_start_json_returns_authorization_url_and_binds_transaction_cooki
     client, app = make_client(settings)
 
     response = client.get(
-        "/auth/google/start",
+        "/api/v1/auth/google/start",
         params={"return_to": "/app", "response_mode": "json", "redirect_uri": FE_CALLBACK},
     )
 
@@ -66,7 +70,7 @@ def test_google_start_json_returns_authorization_url_and_binds_transaction_cooki
     cookie_header = response.headers["set-cookie"]
     assert f"{OAUTH_TRANSACTION_COOKIE_NAME}=" in cookie_header
     assert "HttpOnly" in cookie_header
-    assert "Path=/auth/google" in cookie_header
+    assert "Path=/api/v1/auth/google" in cookie_header
     assert "Max-Age=600" in cookie_header
 
     body = response.json()
@@ -86,7 +90,7 @@ def test_google_start_redirect_uri_implies_json_response_for_current_fe_client()
     client, _app = make_client(settings)
 
     response = client.get(
-        "/auth/google/start",
+        "/api/v1/auth/google/start",
         params={"return_to": "/app", "redirect_uri": FE_CALLBACK},
     )
 
@@ -108,7 +112,7 @@ def test_google_start_json_rejects_invalid_redirect_uri(redirect_uri: str):
     client, _app = make_client(settings)
 
     response = client.get(
-        "/auth/google/start",
+        "/api/v1/auth/google/start",
         params={"return_to": "/app", "response_mode": "json", "redirect_uri": redirect_uri},
     )
 
@@ -142,7 +146,7 @@ def test_google_callback_sets_cookie_and_redirects(monkeypatch):
     monkeypatch.setattr(auth, "validate_google_id_token", fake_validate)
     monkeypatch.setattr(auth, "upsert_google_user", fake_upsert)
 
-    response = client.get("/auth/google/callback?code=code-1&state=state-1", follow_redirects=False)
+    response = client.get("/api/v1/auth/google/callback?code=code-1&state=state-1", follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"] == "/app"
     assert "qa_session=" in response.headers["set-cookie"]
@@ -178,10 +182,10 @@ def test_google_callback_session_supports_follow_up_auth_me(monkeypatch):
     monkeypatch.setattr(auth, "upsert_google_user", fake_upsert)
     monkeypatch.setattr(auth, "load_user_by_id", fake_load)
 
-    callback = client.get("/auth/google/callback?code=code-1&state=state-1", follow_redirects=False)
+    callback = client.get("/api/v1/auth/google/callback?code=code-1&state=state-1", follow_redirects=False)
     assert callback.status_code == 303
 
-    response = client.get("/auth/me")
+    response = client.get("/api/v1/auth/me")
     assert response.status_code == 200
     assert response.json()["user"]["id"] == "user-1"
     assert response.json()["user"]["email"] == "user@example.co.kr"
@@ -193,7 +197,7 @@ def test_google_json_callback_returns_session_sets_cookie_and_clears_transaction
     users = {}
 
     start = client.get(
-        "/auth/google/start",
+        "/api/v1/auth/google/start",
         params={"return_to": "/app", "response_mode": "json", "redirect_uri": FE_CALLBACK},
     )
     state = parse_qs(urlsplit(start.json()["authorizationUrl"]).query)["state"][0]
@@ -220,7 +224,7 @@ def test_google_json_callback_returns_session_sets_cookie_and_clears_transaction
     monkeypatch.setattr(auth, "load_user_by_id", fake_load)
 
     response = client.post(
-        "/auth/google/callback",
+        "/api/v1/auth/google/callback",
         headers={"Origin": FE_ORIGIN},
         json={"code": "code-1", "state": state, "redirectUri": FE_CALLBACK},
     )
@@ -235,7 +239,7 @@ def test_google_json_callback_returns_session_sets_cookie_and_clears_transaction
     assert f"{OAUTH_TRANSACTION_COOKIE_NAME}=" in set_cookie
     assert "Max-Age=0" in set_cookie
 
-    me = client.get("/auth/me")
+    me = client.get("/api/v1/auth/me")
     assert me.status_code == 200
     assert me.json()["user"]["email"] == "user@example.co.kr"
 
@@ -265,7 +269,7 @@ def test_google_json_callback_rejects_missing_transaction_cookie_before_exchange
 
     monkeypatch.setattr(auth, "exchange_authorization_code", fake_exchange)
     response = client.post(
-        "/auth/google/callback",
+        "/api/v1/auth/google/callback",
         headers={"Origin": FE_ORIGIN},
         json={"code": "code-1", "state": "state-1", "redirectUri": FE_CALLBACK},
     )
@@ -301,7 +305,7 @@ def test_google_json_callback_rejects_transaction_cookie_mismatch_before_exchang
 
     monkeypatch.setattr(auth, "exchange_authorization_code", fake_exchange)
     response = client.post(
-        "/auth/google/callback",
+        "/api/v1/auth/google/callback",
         headers={"Origin": FE_ORIGIN},
         cookies={OAUTH_TRANSACTION_COOKIE_NAME: "wrong-token"},
         json={"code": "code-1", "state": "state-1", "redirectUri": FE_CALLBACK},
@@ -342,7 +346,7 @@ def test_google_json_callback_rejects_redirect_uri_mismatch_before_exchange(monk
 
     monkeypatch.setattr(auth, "exchange_authorization_code", fake_exchange)
     response = client.post(
-        "/auth/google/callback",
+        "/api/v1/auth/google/callback",
         headers={"Origin": FE_ORIGIN},
         cookies={OAUTH_TRANSACTION_COOKIE_NAME: "transaction-token"},
         json={"code": "code-1", "state": "state-1", "redirectUri": other_callback},
@@ -366,7 +370,7 @@ def test_google_json_callback_rejects_disallowed_origin_before_exchange(monkeypa
 
     monkeypatch.setattr(auth, "exchange_authorization_code", fake_exchange)
     response = client.post(
-        "/auth/google/callback",
+        "/api/v1/auth/google/callback",
         headers={"Origin": "https://evil.example"},
         cookies={OAUTH_TRANSACTION_COOKIE_NAME: "transaction-token"},
         json={"code": "code-1", "state": "state-1", "redirectUri": FE_CALLBACK},
@@ -374,6 +378,77 @@ def test_google_json_callback_rejects_disallowed_origin_before_exchange(monkeypa
 
     assert response.status_code == 403
     assert called is False
+
+
+def test_test_login_returns_404_when_disabled():
+    client, _app = make_client()
+
+    response = client.post("/api/v1/auth/test-login", headers={"Origin": API_ORIGIN})
+
+    assert response.status_code == 404
+
+
+def test_test_login_creates_backend_session_and_supports_follow_up_auth_me(monkeypatch):
+    settings = valid_settings(APP_ENV="local", TEST_AUTH_ENABLED=True, TEST_AUTH_USER_ID=7)
+    client, app = make_client(settings)
+
+    async def fake_load(engine, user_id):
+        assert user_id == "7"
+        return {"id": "7", "email": "test.user@example.co.kr", "name": "Test User", "avatar_url": None}
+
+    monkeypatch.setattr(auth, "load_user_by_id", fake_load)
+
+    response = client.post("/api/v1/auth/test-login", headers={"Origin": API_ORIGIN})
+
+    assert response.status_code == 204
+    assert "qa_session=" in response.headers["set-cookie"]
+
+    me = client.get("/api/v1/auth/me")
+    assert me.status_code == 200
+    assert me.json()["user"] == {
+        "id": "7",
+        "name": "Test User",
+        "email": "test.user@example.co.kr",
+        "provider": "google",
+        "avatarUrl": None,
+    }
+
+
+def test_test_login_rejects_when_configured_user_is_missing(monkeypatch):
+    settings = valid_settings(APP_ENV="local", TEST_AUTH_ENABLED=True, TEST_AUTH_USER_ID=7)
+    client, _app = make_client(settings)
+
+    async def fake_load(engine, user_id):
+        assert user_id == "7"
+        return None
+
+    monkeypatch.setattr(auth, "load_user_by_id", fake_load)
+
+    response = client.post("/api/v1/auth/test-login", headers={"Origin": API_ORIGIN})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "test_auth_user_missing"
+    assert "qa_session=" not in response.headers.get("set-cookie", "")
+
+
+def test_test_login_ignores_client_supplied_body_and_uses_configured_user(monkeypatch):
+    settings = valid_settings(APP_ENV="local", TEST_AUTH_ENABLED=True, TEST_AUTH_USER_ID=7)
+    client, _app = make_client(settings)
+
+    async def fake_load(engine, user_id):
+        assert user_id == "7"
+        return {"id": "7", "email": "test.user@example.co.kr", "name": "Test User", "avatar_url": None}
+
+    monkeypatch.setattr(auth, "load_user_by_id", fake_load)
+
+    response = client.post(
+        "/api/v1/auth/test-login",
+        headers={"Origin": API_ORIGIN},
+        json={"userId": 999, "email": "evil@example.com"},
+    )
+
+    assert response.status_code == 204
+    assert "qa_session=" in response.headers["set-cookie"]
 
 
 def test_auth_me_requires_and_loads_valid_session(monkeypatch):
@@ -385,20 +460,122 @@ def test_auth_me_requires_and_loads_valid_session(monkeypatch):
         return {"id": "user-1", "email": "user@example.co.kr", "name": "User", "avatar_url": None}
 
     monkeypatch.setattr(auth, "load_user_by_id", fake_load)
-    missing = client.get("/auth/me")
+    missing = client.get("/api/v1/auth/me")
     assert missing.status_code == 401
-    response = client.get("/auth/me", cookies={"qa_session": session_id})
+    response = client.get("/api/v1/auth/me", cookies={"qa_session": session_id})
     assert response.status_code == 200
     assert response.json()["user"]["provider"] == "google"
     assert response.json()["user"]["email"] == "user@example.co.kr"
 
 
+def test_auth_me_diagnostics_preserve_401_and_200_contracts(monkeypatch, caplog):
+    settings = valid_settings(AUTH_PUBLIC_BACKEND_ORIGIN=API_ORIGIN, PERF_DIAGNOSTICS_ENABLED=True)
+    client, app = make_client(settings)
+    session_id, _csrf = asyncio.run(AuthSessionStore(app.state.redis_client, settings).create_session(user_id="user-1"))
+
+    async def fake_load(_engine, _user_id):
+        return {"id": "user-1", "email": "user@example.co.kr", "name": "User", "avatar_url": None}
+
+    monkeypatch.setattr(auth, "load_user_by_id", fake_load)
+    caplog.set_level("INFO", logger="uvicorn.error.runtime_perf")
+
+    missing = client.get("/api/v1/auth/me", headers={"X-Request-ID": "auth-missing-1"})
+    authenticated = client.get(
+        "/api/v1/auth/me",
+        cookies={"qa_session": session_id},
+        headers={"X-Request-ID": "auth-present-1"},
+    )
+
+    assert missing.status_code == 401
+    assert missing.json()["error"]["code"] == "not_authenticated"
+    assert missing.headers["X-Request-ID"] == "auth-missing-1"
+    assert authenticated.status_code == 200
+    assert authenticated.json()["user"]["email"] == "user@example.co.kr"
+    assert authenticated.headers["X-Request-ID"] == "auth-present-1"
+    assert "redis;dur=" in authenticated.headers["Server-Timing"]
+    assert "userdb;dur=" in authenticated.headers["Server-Timing"]
+    assert "cookie_parse" in caplog.text
+    assert "session_decode" in caplog.text
+    assert "auth_mapping" in caplog.text
+
+
+def test_auth_me_diagnostics_attribute_forced_session_touch_to_redis(monkeypatch):
+    class CountingRedis(FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.calls = {"get": 0, "set": 0, "expire": 0, "delete": 0}
+
+        async def get(self, key):
+            self.calls["get"] += 1
+            return await super().get(key)
+
+        async def set(self, key, value, ex=None):
+            self.calls["set"] += 1
+            return await super().set(key, value, ex=ex)
+
+        async def expire(self, key, ex):
+            self.calls["expire"] += 1
+            return await super().expire(key, ex)
+
+        async def delete(self, *keys):
+            self.calls["delete"] += 1
+            return await super().delete(*keys)
+
+    redis = CountingRedis()
+    settings = valid_settings(
+        AUTH_PUBLIC_BACKEND_ORIGIN=API_ORIGIN,
+        AUTH_SESSION_TOUCH_INTERVAL_SECONDS=1,
+        PERF_DIAGNOSTICS_ENABLED=True,
+    )
+    client, _app = make_client(settings, redis=redis)
+    store = AuthSessionStore(redis, settings)
+    session_id, _csrf = asyncio.run(store.create_session(user_id="user-1"))
+
+    session_key = store.session_key(session_id)
+    session_payload = json.loads(redis.values[session_key])
+    session_payload["created_at"] -= 120
+    session_payload["last_seen_at"] -= 2
+    redis.values[session_key] = json.dumps(session_payload)
+    redis.calls = {"get": 0, "set": 0, "expire": 0, "delete": 0}
+
+    entered_spans: list[str] = []
+    original_measure_span = session_store_module.measure_span
+
+    @contextmanager
+    def recording_span(name: str):
+        entered_spans.append(name)
+        with original_measure_span(name):
+            yield
+
+    async def fake_load(_engine, user_id):
+        assert user_id == "user-1"
+        return {"id": "user-1", "email": "user@example.co.kr", "name": "User", "avatar_url": None}
+
+    monkeypatch.setattr(session_store_module, "measure_span", recording_span)
+    monkeypatch.setattr(auth, "load_user_by_id", fake_load)
+
+    response = client.get(
+        "/api/v1/auth/me",
+        cookies={"qa_session": session_id},
+        headers={"X-Request-ID": "auth-touch-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user"]["email"] == "user@example.co.kr"
+    assert response.json()["user"]["provider"] == "google"
+    assert response.headers["X-Request-ID"] == "auth-touch-1"
+    assert "redis;dur=" in response.headers["Server-Timing"]
+    assert redis.calls == {"get": 1, "set": 1, "expire": 1, "delete": 0}
+    assert entered_spans.count("redis") == 3
+    assert entered_spans.count("session_decode") == 1
+
+
 def test_logout_requires_origin_and_revokes_session():
     client, app = make_client()
     session_id, _csrf = asyncio.run(AuthSessionStore(app.state.redis_client, app.state.settings).create_session(user_id="user-1"))
-    no_origin = client.post("/auth/logout", cookies={"qa_session": session_id})
+    no_origin = client.post("/api/v1/auth/logout", cookies={"qa_session": session_id})
     assert no_origin.status_code == 403
-    response = client.post("/auth/logout", cookies={"qa_session": session_id}, headers={"Origin": API_ORIGIN})
+    response = client.post("/api/v1/auth/logout", cookies={"qa_session": session_id}, headers={"Origin": API_ORIGIN})
     assert response.status_code == 204
     assert asyncio.run(AuthSessionStore(app.state.redis_client, app.state.settings).get_session_user_id(session_id)) is None
 
@@ -408,11 +585,11 @@ def test_logout_requires_csrf_token_when_configured():
     client, app = make_client(settings)
     session_id, csrf = asyncio.run(AuthSessionStore(app.state.redis_client, app.state.settings).create_session(user_id="user-1"))
 
-    missing = client.post("/auth/logout", cookies={"qa_session": session_id}, headers={"Origin": API_ORIGIN})
+    missing = client.post("/api/v1/auth/logout", cookies={"qa_session": session_id}, headers={"Origin": API_ORIGIN})
     assert missing.status_code == 403
 
     ok = client.post(
-        "/auth/logout",
+        "/api/v1/auth/logout",
         cookies={"qa_session": session_id},
         headers={"Origin": API_ORIGIN, "X-CSRF-Token": csrf},
     )
@@ -422,7 +599,7 @@ def test_logout_requires_csrf_token_when_configured():
 def test_csrf_route_returns_token_for_existing_session():
     client, app = make_client()
     session_id, csrf = asyncio.run(AuthSessionStore(app.state.redis_client, app.state.settings).create_session(user_id="user-1"))
-    response = client.get("/auth/csrf", cookies={"qa_session": session_id})
+    response = client.get("/api/v1/auth/csrf", cookies={"qa_session": session_id})
     assert response.status_code == 200
     assert response.json() == {"csrfToken": csrf}
 
@@ -432,7 +609,7 @@ def test_auth_cors_preflight_reflects_configured_origin_only():
     client, _app = make_client(settings, install_cors=True)
 
     allowed = client.options(
-        "/auth/google/callback",
+        "/api/v1/auth/google/callback",
         headers={"Origin": FE_ORIGIN, "Access-Control-Request-Method": "POST"},
     )
     assert allowed.status_code == 204
@@ -440,7 +617,7 @@ def test_auth_cors_preflight_reflects_configured_origin_only():
     assert allowed.headers["Access-Control-Allow-Credentials"] == "true"
 
     disallowed = client.options(
-        "/auth/google/callback",
+        "/api/v1/auth/google/callback",
         headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"},
     )
     assert disallowed.status_code == 204

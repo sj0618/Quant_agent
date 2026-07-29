@@ -12,7 +12,7 @@ from app.core.errors import AppError
 
 OAUTH_CALLBACK_PATH = "/auth/google/callback"
 OAUTH_TRANSACTION_COOKIE_NAME = "qa_oauth_state"
-OAUTH_TRANSACTION_COOKIE_PATH = "/auth/google"
+OAUTH_TRANSACTION_COOKIE_PATH = "/api/v1/auth/google"
 _LOOPBACK_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -148,7 +148,7 @@ def set_session_cookie(response: Response, settings: Settings, session_id: str) 
     response.set_cookie(
         key=settings.auth_session_cookie_name,
         value=session_id,
-        max_age=settings.auth_session_ttl_seconds,
+        max_age=settings.auth_session_absolute_ttl_seconds,
         httponly=True,
         secure=settings.auth_cookie_secure,
         samesite=settings.auth_cookie_samesite,

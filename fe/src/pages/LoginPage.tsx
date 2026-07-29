@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Badge } from "../components/common/Badge";
 import { Button } from "../components/common/Button";
 import { Card } from "../components/common/Card";
-import { getCurrentSession, saveTestSession, startGoogleSignIn } from "../api/authClient";
+import { completeTestLogin, getCurrentSession, startGoogleSignIn } from "../api/authClient";
 import { appConfig } from "../config/appConfig";
 import { ROUTES, sanitizeReturnTo } from "../config/routes";
 
@@ -28,10 +28,17 @@ export function LoginPage({ returnTo }: LoginPageProps) {
     }
   };
 
-  // TEMP(dev-auth-gate): remove once BE session integration ships.
-  const handleTestSignIn = () => {
-    saveTestSession();
-    window.location.assign(nextPath);
+  const handleTestSignIn = async () => {
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      await completeTestLogin();
+      window.location.assign(nextPath);
+    } catch (testLoginError) {
+      setSubmitting(false);
+      setError(testLoginError instanceof Error ? testLoginError.message : "Test login could not be started.");
+    }
   };
 
   return (

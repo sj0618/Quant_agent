@@ -1,0 +1,71 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+async function read(relativePath: string) {
+  return readFile(new URL(relativePath, import.meta.url), "utf8");
+}
+
+test("reports page restores generated report roles and exports", async () => {
+  const [reportsPage, reportList, reportActions] = await Promise.all([
+    read("../src/pages/ReportsPage.tsx"),
+    read("../src/features/reports/ReportList.tsx"),
+    read("../src/api/reportActionsClient.ts"),
+  ]);
+
+  assert.match(reportsPage, /getReports/);
+  assert.match(reportsPage, /downloadReportsCsv/);
+  assert.match(reportsPage, /printCurrentView/);
+  assert.match(reportsPage, /ReportList/);
+  assert.match(reportList, /resendReportEmail/);
+  assert.match(reportList, /copyReportShareLink/);
+  assert.match(reportActions, /export async function resendReportEmail/);
+  assert.doesNotMatch(reportsPage, /getReportStrategies/);
+  assert.doesNotMatch(reportList, /getDigestStrategySelection|getEmailDeliveryHistory|reportsHistory|reportStrategies/);
+});
+
+test("search uses current live report and workspace sources instead of app overview", async () => {
+  const [searchPage, clientSource] = await Promise.all([
+    read("../src/pages/SearchPage.tsx"),
+    read("../src/api/quantAgentClient.ts"),
+  ]);
+
+  assert.match(searchPage, /getReports/);
+  assert.match(searchPage, /getWorkspaceTemplate/);
+  assert.match(searchPage, /refreshLatestAnalysisJob/);
+  assert.match(searchPage, /mergeAnalysisJobIntoOverview/);
+  assert.match(searchPage, /kind: "strategy"/);
+  assert.match(searchPage, /kind: "candidate"/);
+  assert.match(searchPage, /kind: "report"/);
+  assert.match(searchPage, /ROUTES\.app/);
+  assert.match(searchPage, /tab=trading/);
+  assert.match(searchPage, /ROUTES\.reportDetail/);
+  assert.doesNotMatch(clientSource, /export async function searchInstruments/);
+  assert.doesNotMatch(searchPage, /getAppOverview/);
+  assert.doesNotMatch(searchPage, /searchInstruments/);
+});
+
+test("canonical routes exclude retired history and strategy pages", async () => {
+  const [appSource, routesSource, profilePage] = await Promise.all([
+    read("../src/App.tsx"),
+    read("../src/config/routes.ts"),
+    read("../src/pages/ProfilePage.tsx"),
+  ]);
+
+  assert.doesNotMatch(routesSource, /reportsHistory|reportStrategies|strategyReportDetail/);
+  assert.doesNotMatch(appSource, /ReportsHistoryPage|StrategyReportsPage|StrategyReportDetailPage/);
+  assert.doesNotMatch(profilePage, /EmailHistoryTimeline|getEmailDeliveryHistory|reportsHistory/);
+});
+
+test("report detail keeps generated report export/share/resend actions", async () => {
+  const [detailPage, reportActions] = await Promise.all([
+    read("../src/pages/ReportDetailPage.tsx"),
+    read("../src/api/reportActionsClient.ts"),
+  ]);
+
+  assert.match(detailPage, /getReportById/);
+  assert.match(detailPage, /copyReportShareLink/);
+  assert.match(detailPage, /printCurrentView/);
+  assert.match(detailPage, /resendReportEmail/);
+  assert.match(reportActions, /export async function resendReportEmail/);
+});

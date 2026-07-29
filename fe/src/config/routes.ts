@@ -4,8 +4,6 @@ export const ROUTES = {
   login: "/login",
   authCallback: "/auth/google/callback",
   reports: "/reports",
-  reportsHistory: "/reports/history",
-  reportStrategies: "/reports/strategies",
   me: "/me",
   notifications: "/me/notifications",
   search: "/search",
@@ -14,8 +12,9 @@ export const ROUTES = {
   disclaimer: "/disclaimer",
   unsubscribe: "/unsubscribe",
   reportDetail: (id: string) => `/reports/${encodeURIComponent(id)}`,
-  strategyReportDetail: (id: string) => `/reports/strategies/${encodeURIComponent(id)}`,
 } as const;
+
+const RETIRED_REPORT_ROUTE_SEGMENTS = new Set(["history", "strategies"]);
 
 export function withReturnTo(route: string, returnTo: string) {
   const params = new URLSearchParams({ returnTo });
@@ -31,4 +30,26 @@ export function sanitizeReturnTo(value: string | null) {
     return ROUTES.app;
   }
   return value;
+}
+
+export function parseReportDetailId(pathname: string) {
+  const normalizedPath = pathname.replace(/\/+$/, "") || "/";
+  if (!normalizedPath.startsWith(`${ROUTES.reports}/`)) {
+    return null;
+  }
+
+  const encodedId = normalizedPath.slice(ROUTES.reports.length + 1);
+  if (!encodedId || encodedId.includes("/")) {
+    return null;
+  }
+
+  try {
+    const reportId = decodeURIComponent(encodedId);
+    if (!reportId || reportId.includes("/") || RETIRED_REPORT_ROUTE_SEGMENTS.has(reportId)) {
+      return null;
+    }
+    return reportId;
+  } catch {
+    return null;
+  }
 }

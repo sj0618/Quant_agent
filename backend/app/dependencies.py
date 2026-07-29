@@ -17,7 +17,7 @@ def get_runtime_settings(request: Request) -> Settings:
         try:
             settings = load_settings()
         except ConfigurationError as exc:
-            raise config_app_error(exc) from exc
+            raise config_app_error(exc) from None
     return settings
 
 
@@ -29,6 +29,22 @@ def get_db_engine(request: Request) -> Any:
             component="db",
             code="db_engine_unavailable",
             message="Database engine is not initialized",
+        )
+    return engine
+
+
+def get_stock_universe_engine(request: Request) -> Any | None:
+    return getattr(request.app.state, "trading_data_db_engine", None)
+
+
+def get_trading_data_engine(request: Request) -> Any:
+    engine = getattr(request.app.state, "trading_data_db_engine", None)
+    if engine is None:
+        raise AppError(
+            status_code=503,
+            component="db",
+            code="trading_data_not_configured",
+            message="Trading data engine is not initialized",
         )
     return engine
 

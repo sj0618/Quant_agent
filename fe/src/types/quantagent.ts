@@ -369,11 +369,18 @@ export interface LandingSample {
   faqs: Array<{ question: string; answer?: string }>;
 }
 
-export type ReportDeliveryStatus = "sent" | "draft" | "failed" | "resent";
+export type ReportDeliveryStatus = "sent" | "draft" | "failed" | "resent" | "submitted" | "processing" | "delivered" | "cancelled" | "unknown";
 
 export interface ReportSummary {
   id: string;
+  runId?: string;
   strategyId?: string;
+  instrumentId?: string;
+  instrumentName?: string;
+  ticker?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  publishedAt?: string;
   date: string;
   weekday: string;
   sentAt: string;
@@ -384,6 +391,19 @@ export interface ReportSummary {
   recommendationScore: string;
   signals: Record<SignalType, number>;
   marketSnapshot: Array<{ label: string; value: string; tone?: Tone }>;
+}
+
+export interface PersistedReportSection {
+  id?: string;
+  title?: string;
+  body?: string;
+  entries?: PersistedReportEntry[];
+}
+
+export interface PersistedReportEntry {
+  label?: string;
+  value: string;
+  depth: number;
 }
 
 export interface DailyDigestHeader {
@@ -465,8 +485,8 @@ export interface StrategyReportDetail {
 
 export interface EmailDigestHistoryEntry {
   id: string;
-  reportId: string;
-  strategyId: string;
+  reportId?: string;
+  strategyId?: string;
   strategyName: string;
   reportDate: string;
   sentAt: string;
@@ -475,15 +495,16 @@ export interface EmailDigestHistoryEntry {
 }
 
 export interface ReportDetail extends ReportSummary {
-  recipient: string;
+  recipient: string | null;
   marketBrief: string;
-  marketContext?: string;
+  marketContext?: string | null;
+  contentSections?: PersistedReportSection[];
   news: Array<{ rank: number; title: string; source: string; tone: Tone }>;
   candidates: TradingCandidate[];
   signalAxes: Array<{ label: string; weight: string; title: string; description: string }>;
   riskManagerOverride: string;
   conclusion: string;
-  warningNote?: string;
+  warningNote?: string | null;
   performance: Pick<PerformanceSummary, "metrics" | "disclaimer">;
   costNotes: string[];
 }

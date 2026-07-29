@@ -112,8 +112,8 @@ export function OverviewTab({ overview }: OverviewTabProps) {
               <p>최근 7일</p>
             </div>
           </div>
-          {overview.recentReports.map((report) => (
-            <a className="recent-report-row" href={ROUTES.reportDetail(report.id)} key={report.id}>
+          {overview.recentReports.map((report) => {
+            const content = <>
               <span>
                 <strong>{report.date.replace("2026.", "")}</strong>
                 <small>{report.weekday}</small>
@@ -124,8 +124,13 @@ export function OverviewTab({ overview }: OverviewTabProps) {
                 {report.signals.DROP ? <Badge signal="DROP">DROP {report.signals.DROP}</Badge> : null}
               </span>
               <strong>{report.recommendationScore}</strong>
-            </a>
-          ))}
+            </>;
+            return report.id.startsWith("ai-job:") ? (
+              <div className="recent-report-row" key={report.id}>{content}</div>
+            ) : (
+              <a className="recent-report-row" href={ROUTES.reportDetail(report.id)} key={report.id}>{content}</a>
+            );
+          })}
           <div className="card-foot"><a href={ROUTES.reports}>전체 리포트 보기 →</a></div>
         </Card>
       </div>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -7,7 +8,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from app.core.config import ConfigurationError, redact_secrets
+from app.core.config import (
+    ConfigurationError,
+    redact_secrets,
+    sanitize_configuration_validation_details,
+)
+
+logger = logging.getLogger(__name__)
+
+
 class AppError(RuntimeError):
     def __init__(
         self,
@@ -41,9 +50,17 @@ def config_app_error(error: ConfigurationError) -> AppError:
         status_code=503,
         component="config",
         code="invalid_config",
-        message=str(error),
-        details=error.details,
+        message="Backend configuration is invalid",
+        details=sanitize_configuration_validation_details(error.details),
     )
+
+
+def configuration_error_observability_event(error: ConfigurationError) -> dict[str, Any]:
+    return {
+        "component": "config",
+        "category": "invalid_config",
+        "details": sanitize_configuration_validation_details(error.details),
+    }
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -53,6 +70,10 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ConfigurationError)
     async def handle_config_error(_: Request, exc: ConfigurationError) -> JSONResponse:
+        logger.error(
+            "configuration_validation_failed",
+            extra={"configuration_error": configuration_error_observability_event(exc)},
+        )
         app_error = config_app_error(exc)
         return JSONResponse(status_code=app_error.status_code, content=app_error.payload())
 

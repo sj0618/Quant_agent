@@ -53,7 +53,7 @@ export function LandingPage() {
         </p>
         <div className="hero__actions">
           <Button onClick={() => window.location.assign(loginHref)} variant="primary">Google 계정으로 시작하기 →</Button>
-          <Button onClick={() => window.location.assign("#sample")} variant="ghost">▷ 샘플 리포트 보기</Button>
+          <Button onClick={() => window.location.assign(ROUTES.reportDetail("2026-04-18"))} variant="ghost">▷ 샘플 리포트 보기</Button>
         </div>
         <small>무료 · 가입 30초 · 신용카드 등록 없음</small>
         <div className="hero__stats">
@@ -107,7 +107,7 @@ export function LandingPage() {
               </span>
             ))}
           </div>
-          <a href={loginHref}>내 전략 분석 시작하기 →</a>
+          <a href={ROUTES.reportDetail("2026-04-18")}>샘플 리포트 자세히 보기 →</a>
         </Card>
       </section>
 
