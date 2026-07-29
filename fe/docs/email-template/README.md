@@ -37,16 +37,28 @@ node 22는 `.tsx`를 직접 실행할 수 없어서(`ERR_UNKNOWN_FILE_EXTENSION`
 
 ## 섹션 구성 (구성안 대조)
 
-| 구성안 | 섹션 | 데이터 |
+| 번호 | 섹션 | 데이터 |
 | --- | --- | --- |
-| 1 | Header | `header.reportDate` / `userName` / `strategyCount` |
-| 2 | 오늘의 전체 요약 | `overallSummary[]` |
-| 3 | 전략 비교표 | `comparisonRows[]` (전략명 / 오늘 신호 / 수익률 / MDD / Sharpe / 상태) |
-| 4 | 전략별 상세 카드 | `strategyCards[]` (신호 / 대상 종목 / 성과 5항목 / AI 해석 / 주의사항) |
-| 5 | AI 종합 코멘트 | `aiOverallComment` |
-| 추가 | 시황 및 경제 기사 | `marketBrief.headline` / `items[]` |
-| 6 | 상세보기 링크 | `baseUrl` + `/reports`, `/app` |
-| 7 | Footer | `footer[]` + 수신 거부 / 알림 설정 링크 |
+| — | Header | `header.reportDate` / `userName` / `strategyCount` |
+| 01 | 오늘의 전체 요약 (+ AI 종합 코멘트) | `overallSummary[]` / `aiOverallComment` |
+| 02 | 오늘의 시황 및 경제 기사 | `marketBrief.headline` / `items[]` |
+| 03 | 구독 전략 요약 | `comparisonRows[]` (전략명 / 오늘 신호 / 수익률 / MDD / Sharpe / 상태) |
+| 04 | 전략별 상세 카드 | `strategyCards[]` (신호 / 대상 종목 / 성과 5항목 / AI 해석) |
+| 05 | 상세보기 링크 | `baseUrl` + `/reports`, `/app` |
+| — | Footer | `footer[]` + 수신 거부 / 알림 설정 링크 |
+
+메일을 열자마자 "오늘 뭘 봐야 하는지"가 먼저 보이도록 요약과 시황을 앞에 두고, 전략 단위 숫자는 그 뒤에 둔다.
+AI 종합 코멘트는 별도 섹션이 아니라 전체 요약 안에 들어간다.
+
+### 본문 규칙
+
+- **강조는 `**...**`**. AI가 생성한 문장에서 중요한 부분을 이 표기로 감싸면 `renderEmphasis`
+  (`fe/src/utils/emphasis.tsx`)가 `<strong>`으로 바꾼다. raw HTML은 허용하지 않는다 — 굵기 하나만 지원하고
+  나머지는 그대로 이스케이프된다.
+- **주의사항은 독립 섹션이 아니다.** 별도 박스로 빼면 읽고 넘기기 쉬워서, `caution`을 AI 해석 바로 뒤에
+  이어지는 문단으로 렌더한다.
+- **성과 지표는 라벨 행 + 값 행의 가로 2행 배치**다. 세로로 쌓으면 카드가 길어져 스크롤만 늘어난다.
+- **본문 15px, 표 14px 이상.** 모바일 메일 앱은 14px 미만 본문에 자동 확대를 걸어 레이아웃을 틀어놓는다.
 
 ## 서버 템플릿으로 옮길 때 지켜야 하는 것
 

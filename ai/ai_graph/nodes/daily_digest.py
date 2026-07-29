@@ -111,20 +111,28 @@ def _build_strategy_card(strategy: DailyDigestStrategyInput) -> DailyDigestStrat
         "win_rate": strategy.win_rate,
         "trade_count": strategy.trade_count,
     }
+    # 메일 본문은 퀀트를 막 시작한 구독자가 읽는다. 지표 이름만 나열하면 "그래서 뭘 하라는
+    # 건지" 알 수 없으므로, 지표가 뭘 재는지 → 오늘 왜 이 신호인지 → 무엇을 하면 되는지
+    # 순서로 풀어 쓰게 한다. 강조는 `**...**` 로만 표시한다 (렌더러가 굵기만 지원한다).
     payload = generate_role_debate(
         role="DIGEST_STRATEGY_CARD",
         task=(
-            "Write a beginner-friendly one-paragraph interpretation of today's signal "
-            "(as 'summary') and a one-sentence caution/risk note (as the first 'concerns' item)."
+            "Write for a beginner quant investor who may not know what the indicator measures. "
+            "As 'summary', write one paragraph in Korean that (1) explains in plain words what "
+            "the strategy's indicator looks at, (2) says why today's signal came out, and "
+            "(3) states what the reader should actually do. As the first 'concerns' item, write "
+            "the risk and the concrete precaution to take, also in plain Korean. "
+            "Wrap the few most important phrases in **double asterisks** for bold emphasis; "
+            "use no other markup."
         ),
         context=context,
         fallback=RoleDebatePayload(
             role="DIGEST_STRATEGY_CARD",
             summary=(
-                f"{strategy.name} 전략은 오늘 {strategy.today_signal} 신호를 유지하고 있습니다. "
+                f"{strategy.name} 전략은 오늘 **{strategy.today_signal}** 신호를 유지하고 있습니다. "
                 f"최근 승률 {strategy.win_rate * 100:.1f}%, 거래 {strategy.trade_count}건을 기준으로 판단했습니다."
             ),
-            concerns=["손절 기준을 명확히 설정하고 거래량 변화를 함께 확인하세요."],
+            concerns=["**손절 기준을 미리 정해두고**, 거래량이 함께 늘고 있는지 확인하세요."],
             recommendation=strategy.today_signal,
             confidence=0.5,
         ),

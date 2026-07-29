@@ -10,14 +10,13 @@ import { dailyDigestReport } from "../mocks/dailyDigest.mock";
 // 구성안 7개 섹션 ↔ 실제 렌더 소스 대조표. BE가 빠진 섹션 없이 포팅했는지 확인하는 용도라
 // 템플릿을 고칠 때 이 목록도 같이 갱신해야 한다.
 const SECTION_MAP = [
-  { no: "1", title: "Header", source: "header.reportDate / userName / strategyCount" },
-  { no: "2", title: "오늘의 전체 요약", source: "overallSummary[]" },
-  { no: "3", title: "전략 비교표", source: "comparisonRows[]" },
-  { no: "4", title: "전략별 상세 카드", source: "strategyCards[]" },
-  { no: "5", title: "AI 종합 코멘트", source: "aiOverallComment" },
-  { no: "+", title: "시황 및 경제 기사", source: "marketBrief.headline / items[]" },
-  { no: "6", title: "상세보기 링크", source: "baseUrl + /reports, /app" },
-  { no: "7", title: "Footer", source: "footer[] + 수신거부 / 알림설정" },
+  { no: "—", title: "Header", source: "header.reportDate / userName / strategyCount" },
+  { no: "01", title: "오늘의 전체 요약 + AI 종합 코멘트", source: "overallSummary[] / aiOverallComment" },
+  { no: "02", title: "오늘의 시황 및 경제 기사", source: "marketBrief.headline / items[]" },
+  { no: "03", title: "구독 전략 요약", source: "comparisonRows[]" },
+  { no: "04", title: "전략별 상세 카드", source: "strategyCards[]" },
+  { no: "05", title: "상세보기 링크", source: "baseUrl + /reports, /app" },
+  { no: "—", title: "Footer", source: "footer[] + 수신거부 / 알림설정" },
 ];
 
 export function EmailTemplatePreviewPage() {

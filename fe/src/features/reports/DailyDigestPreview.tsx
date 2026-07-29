@@ -1,6 +1,7 @@
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
 import type { DailyDigestReport } from "../../types/quantagent";
+import { renderEmphasis } from "../../utils/emphasis";
 
 interface DailyDigestPreviewProps {
   digest: DailyDigestReport;
@@ -37,7 +38,7 @@ export function DailyDigestPreview({ digest, onClose }: DailyDigestPreviewProps)
           <strong>오늘의 전체 요약</strong>
           <ul>
             {digest.overallSummary.map((line) => (
-              <li key={line}>{line}</li>
+              <li key={line}>{renderEmphasis(line)}</li>
             ))}
           </ul>
         </section>
@@ -86,8 +87,8 @@ export function DailyDigestPreview({ digest, onClose }: DailyDigestPreviewProps)
                   <li>승률: {(card.winRate * 100).toFixed(1)}%</li>
                   <li>거래 수: {card.tradeCount}건</li>
                 </ul>
-                <p><b>AI 해석</b><br />{card.aiInterpretation}</p>
-                <p><b>주의사항</b><br />{card.caution}</p>
+                <p><b>AI 해석</b><br />{renderEmphasis(card.aiInterpretation)}</p>
+                <p><b>주의사항</b><br />{renderEmphasis(card.caution)}</p>
               </Card>
             ))}
           </div>
@@ -95,7 +96,7 @@ export function DailyDigestPreview({ digest, onClose }: DailyDigestPreviewProps)
 
         <section className="digest-preview__section">
           <strong>AI 종합 코멘트</strong>
-          <p>{digest.aiOverallComment}</p>
+          <p>{renderEmphasis(digest.aiOverallComment)}</p>
         </section>
 
         <section className="digest-preview__section">
