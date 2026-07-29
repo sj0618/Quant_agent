@@ -7,11 +7,19 @@ import type {
   SignalType,
   Tone,
 } from "../../types/quantagent";
+import { renderEmphasis, stripEmphasis } from "../../utils/emphasis";
 
 // 발송용 이메일 본문. Gmail/Outlook/Naver가 <style> 블록, flex, grid, CSS 변수를 지우기 때문에
 // 앱 컴포넌트와 달리 className 대신 table 레이아웃 + inline style만 쓰고, styles/tokens.ts 값도
-// CSS 변수가 아니라 hex 리터럴로 복제한다. 섹션 순서는 구성안과 DailyDigestPreview.tsx를 따른다:
-// Header → 전체 요약 → 전략 비교표 → 전략별 상세 카드 → AI 종합 코멘트 → 시황 → 상세보기 → Footer.
+// CSS 변수가 아니라 hex 리터럴로 복제한다.
+//
+// 섹션 순서: Header → 01 오늘의 전체 요약(AI 종합 코멘트 포함) → 02 시황 및 경제 기사
+//          → 03 구독 전략 요약 → 04 전략별 상세 카드 → 05 상세보기 → Footer.
+// 요약과 시황이 앞에 오는 이유는 메일을 열자마자 "오늘 뭘 봐야 하는지"가 먼저 보여야 하기
+// 때문이고, 전략 단위 숫자는 그 뒤에 온다.
+//
+// 폰트는 앱보다 크게 잡는다. 메일 클라이언트는 본문을 축소해 보여주는 경우가 많고, 모바일 앱은
+// 14px 미만 본문에 자동 확대를 걸어 레이아웃을 틀어놓는다.
 
 export interface DailyDigestEmailProps {
   digest: DailyDigestReport;
@@ -49,16 +57,17 @@ const SIGNAL_TONES: Record<SignalType, Tone> = { BUY: "positive", HOLD: "warning
 const EMAIL_FONT = "'Apple SD Gothic Neo','Malgun Gothic','Noto Sans KR',Arial,sans-serif";
 
 const styles = {
-  paragraph: { margin: 0, color: COLORS.muted, fontSize: "13px", lineHeight: 1.7 },
-  sectionCell: { padding: "22px 28px", borderBottom: `1px solid ${COLORS.line}` },
-  sectionTitle: { color: COLORS.ink, fontSize: "13px", fontWeight: 800, paddingBottom: "12px" },
-  sectionIndex: { color: COLORS.subdued, paddingRight: "6px" },
-  label: { color: COLORS.subdued, fontSize: "11px", fontWeight: 700, padding: "3px 0" },
-  cardLabel: { color: COLORS.ink, fontSize: "11px", fontWeight: 800, paddingTop: "14px" },
+  paragraph: { margin: 0, color: COLORS.muted, fontSize: "15px", lineHeight: 1.8 },
+  sectionCell: { padding: "26px 30px", borderBottom: `1px solid ${COLORS.line}` },
+  sectionTitle: { color: COLORS.ink, fontSize: "16px", fontWeight: 800, paddingBottom: "14px" },
+  sectionIndex: { color: COLORS.subdued, paddingRight: "7px" },
+  label: { color: COLORS.subdued, fontSize: "13px", fontWeight: 700, padding: "4px 0" },
+  cardLabel: { color: COLORS.ink, fontSize: "14px", fontWeight: 800, paddingTop: "18px" },
   outlinedBox: { border: `1px solid ${COLORS.line}`, borderRadius: "10px" },
-  empty: { margin: 0, color: COLORS.subdued, fontSize: "12px", lineHeight: 1.7 },
-  footerLine: { color: COLORS.muted, fontSize: "11px", lineHeight: 1.8 },
+  empty: { margin: 0, color: COLORS.subdued, fontSize: "14px", lineHeight: 1.8 },
+  footerLine: { color: COLORS.muted, fontSize: "13px", lineHeight: 1.9 },
   footerLink: { color: COLORS.muted, textDecoration: "underline" },
+  strong: { color: COLORS.ink, fontWeight: 800 },
 } satisfies Record<string, CSSProperties>;
 
 export function dailyDigestEmailSubject(digest: DailyDigestReport, subjectDate?: string) {
@@ -106,7 +115,7 @@ export function DailyDigestEmail({ digest, baseUrl = "", preheader }: DailyDiges
   return (
     <>
       <div style={{ display: "none", maxHeight: 0, overflow: "hidden" }}>
-        {preheader ?? digest.overallSummary[0] ?? ""}
+        {stripEmphasis(preheader ?? digest.overallSummary[0] ?? "")}
       </div>
       <table role="presentation" width="100%" cellPadding={0} cellSpacing={0} border={0} style={{ background: COLORS.bg }}>
         <tbody>
@@ -130,8 +139,12 @@ export function DailyDigestEmail({ digest, baseUrl = "", preheader }: DailyDiges
               >
                 <tbody>
                   <HeaderSection digest={digest} />
-                  <Section index="02" title="오늘의 전체 요약">
+                  <Section index="01" title="오늘의 전체 요약">
                     <SummaryList lines={digest.overallSummary} />
+                    <OverallComment comment={digest.aiOverallComment} />
+                  </Section>
+                  <Section index="02" title="오늘의 시황 및 경제 기사">
+                    <MarketBrief brief={digest.marketBrief} />
                   </Section>
                   <Section index="03" title="구독 전략 요약">
                     <ComparisonTable digest={digest} />
@@ -139,13 +152,7 @@ export function DailyDigestEmail({ digest, baseUrl = "", preheader }: DailyDiges
                   <Section index="04" title="전략별 상세 카드">
                     <StrategyCards cards={digest.strategyCards} />
                   </Section>
-                  <Section index="05" title="AI 종합 코멘트">
-                    <p style={styles.paragraph}>{digest.aiOverallComment}</p>
-                  </Section>
-                  <Section index="06" title="시황 및 경제 기사">
-                    <MarketBrief brief={digest.marketBrief} />
-                  </Section>
-                  <Section index="07" title="상세보기">
+                  <Section index="05" title="상세보기">
                     <DetailLinks link={link} />
                   </Section>
                   <FooterSection digest={digest} link={link} />
@@ -164,13 +171,13 @@ function HeaderSection({ digest }: { digest: DailyDigestReport }) {
 
   return (
     <tr>
-      <td style={{ padding: "28px 28px 22px", borderBottom: `1px solid ${COLORS.line}` }}>
+      <td style={{ padding: "32px 30px 26px", borderBottom: `1px solid ${COLORS.line}` }}>
         <EmailBadge tone="dark">DAILY REPORT</EmailBadge>
-        <h1 style={{ margin: "14px 0 6px", color: COLORS.ink, fontSize: "22px", lineHeight: 1.4, fontWeight: 800 }}>
+        <h1 style={{ margin: "16px 0 8px", color: COLORS.ink, fontSize: "26px", lineHeight: 1.4, fontWeight: 800 }}>
           QuantAgent Daily Report
         </h1>
-        <div style={{ color: COLORS.subdued, fontSize: "12px", fontWeight: 700 }}>{header.reportDate} 기준</div>
-        <p style={{ ...styles.paragraph, paddingTop: "10px" }}>
+        <div style={{ color: COLORS.subdued, fontSize: "14px", fontWeight: 700 }}>{header.reportDate} 기준</div>
+        <p style={{ ...styles.paragraph, paddingTop: "12px" }}>
           {header.userName}님이 구독 중인 전략 {header.strategyCount}개의 오늘 리포트입니다.
         </p>
       </td>
@@ -189,17 +196,38 @@ function SummaryList({ lines }: { lines: string[] }) {
         {lines.map((line) => (
           <tr key={line}>
             <td
-              width={12}
+              width={14}
               valign="top"
-              style={{ padding: "3px 6px 3px 0", color: COLORS.subdued, fontSize: "13px", lineHeight: 1.7 }}
+              style={{ padding: "4px 8px 4px 0", color: COLORS.subdued, fontSize: "15px", lineHeight: 1.8 }}
             >
               ·
             </td>
-            <td valign="top" style={{ padding: "3px 0", color: COLORS.muted, fontSize: "13px", lineHeight: 1.7 }}>
-              {line}
+            <td valign="top" style={{ padding: "4px 0", color: COLORS.muted, fontSize: "15px", lineHeight: 1.8 }}>
+              {renderEmphasis(line, styles.strong)}
             </td>
           </tr>
         ))}
+      </tbody>
+    </table>
+  );
+}
+
+function OverallComment({ comment }: { comment: string }) {
+  if (!comment) {
+    return null;
+  }
+
+  return (
+    <table role="presentation" width="100%" cellPadding={0} cellSpacing={0} border={0} style={{ marginTop: "18px" }}>
+      <tbody>
+        <tr>
+          <td style={{ padding: "16px 18px", background: COLORS.soft, borderRadius: "10px" }}>
+            <div>
+              <EmailBadge tone="dark">AI 종합 코멘트</EmailBadge>
+            </div>
+            <p style={{ ...styles.paragraph, paddingTop: "10px" }}>{renderEmphasis(comment, styles.strong)}</p>
+          </td>
+        </tr>
       </tbody>
     </table>
   );
@@ -211,18 +239,18 @@ function ComparisonTable({ digest }: { digest: DailyDigestReport }) {
   }
 
   const head: CSSProperties = {
-    padding: "8px 6px",
+    padding: "10px 6px",
     borderBottom: `1px solid ${COLORS.line}`,
     color: COLORS.subdued,
-    fontSize: "10px",
+    fontSize: "12px",
     fontWeight: 800,
     textAlign: "left",
   };
   const cell: CSSProperties = {
-    padding: "9px 6px",
+    padding: "12px 6px",
     borderBottom: `1px solid ${COLORS.line}`,
     color: COLORS.ink,
-    fontSize: "12px",
+    fontSize: "14px",
   };
   const numeric: CSSProperties = { ...cell, textAlign: "right" };
 
@@ -271,30 +299,30 @@ function StrategyCards({ cards }: { cards: DailyDigestStrategyCard[] }) {
           cellSpacing={0}
           border={0}
           key={card.strategyId}
-          style={{ ...styles.outlinedBox, marginBottom: "12px" }}
+          style={{ ...styles.outlinedBox, marginBottom: "14px" }}
         >
           <tbody>
             <tr>
-              <td style={{ padding: "14px 16px" }}>
-                <div style={{ color: COLORS.ink, fontSize: "14px", fontWeight: 800 }}>
+              <td style={{ padding: "18px 20px" }}>
+                <div style={{ color: COLORS.ink, fontSize: "17px", fontWeight: 800, lineHeight: 1.5 }}>
                   전략 {index + 1}. {card.title}
                 </div>
 
-                <table role="presentation" width="100%" cellPadding={0} cellSpacing={0} border={0} style={{ marginTop: "10px" }}>
+                <table role="presentation" width="100%" cellPadding={0} cellSpacing={0} border={0} style={{ marginTop: "12px" }}>
                   <tbody>
                     <tr>
-                      <td width={80} valign="top" style={styles.label}>
+                      <td width={84} valign="top" style={styles.label}>
                         오늘의 신호
                       </td>
-                      <td valign="top" style={{ padding: "3px 0" }}>
+                      <td valign="top" style={{ padding: "4px 0" }}>
                         <EmailBadge tone={SIGNAL_TONES[card.todaySignal]}>{card.todaySignal}</EmailBadge>
                       </td>
                     </tr>
                     <tr>
-                      <td width={80} valign="top" style={styles.label}>
+                      <td width={84} valign="top" style={styles.label}>
                         대상 종목
                       </td>
-                      <td valign="top" style={{ padding: "3px 0", color: COLORS.ink, fontSize: "12px", fontWeight: 700 }}>
+                      <td valign="top" style={{ padding: "4px 0", color: COLORS.ink, fontSize: "14px", fontWeight: 700 }}>
                         {card.targets.length ? card.targets.join(", ") : "해당 없음"}
                       </td>
                     </tr>
@@ -302,31 +330,19 @@ function StrategyCards({ cards }: { cards: DailyDigestStrategyCard[] }) {
                 </table>
 
                 <div style={styles.cardLabel}>성과 요약</div>
-                <table
-                  role="presentation"
-                  width="100%"
-                  cellPadding={0}
-                  cellSpacing={0}
-                  border={0}
-                  style={{ marginTop: "6px", background: COLORS.soft, borderRadius: "8px" }}
-                >
-                  <tbody>
-                    <tr>
-                      <td style={{ padding: "10px 12px" }}>
-                        <MetricRow label="기간 수익률" value={formatPercent(card.totalReturn)} />
-                        <MetricRow label="MDD" value={formatPercent(card.maxDrawdown)} />
-                        <MetricRow label="Sharpe Ratio" value={card.sharpeRatio.toFixed(2)} />
-                        <MetricRow label="승률" value={`${(card.winRate * 100).toFixed(1)}%`} />
-                        <MetricRow label="거래 수" value={`${card.tradeCount}건`} />
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
+                <MetricsRow card={card} />
 
+                {/* 주의사항은 따로 박스로 빼지 않는다. 별도 섹션이면 읽고 넘기기 쉬워서,
+                    AI 해석 안에서 이어 읽도록 두고 중요한 부분만 굵게 처리한다. */}
                 <div style={styles.cardLabel}>AI 해석</div>
-                <p style={{ ...styles.paragraph, paddingTop: "4px" }}>{card.aiInterpretation}</p>
-
-                <CautionBox>{card.caution}</CautionBox>
+                <p style={{ ...styles.paragraph, paddingTop: "6px" }}>
+                  {renderEmphasis(card.aiInterpretation, styles.strong)}
+                </p>
+                {card.caution ? (
+                  <p style={{ ...styles.paragraph, paddingTop: "10px" }}>
+                    {renderEmphasis(card.caution, styles.strong)}
+                  </p>
+                ) : null}
               </td>
             </tr>
           </tbody>
@@ -336,32 +352,49 @@ function StrategyCards({ cards }: { cards: DailyDigestStrategyCard[] }) {
   );
 }
 
-function MetricRow({ label, value }: { label: string; value: string }) {
-  return (
-    <table role="presentation" width="100%" cellPadding={0} cellSpacing={0} border={0}>
-      <tbody>
-        <tr>
-          <td style={{ padding: "2px 0", color: COLORS.muted, fontSize: "12px" }}>{label}</td>
-          <td align="right" style={{ padding: "2px 0", color: COLORS.ink, fontSize: "12px", fontWeight: 800 }}>
-            {value}
-          </td>
-        </tr>
-      </tbody>
-    </table>
-  );
-}
+/** 지표는 라벨 행 + 값 행의 2행 가로 배치. 세로로 쌓으면 카드가 길어져 스크롤만 늘어난다. */
+function MetricsRow({ card }: { card: DailyDigestStrategyCard }) {
+  const metrics = [
+    { label: "기간 수익률", value: formatPercent(card.totalReturn) },
+    { label: "MDD", value: formatPercent(card.maxDrawdown) },
+    { label: "Sharpe", value: card.sharpeRatio.toFixed(2) },
+    { label: "승률", value: `${(card.winRate * 100).toFixed(1)}%` },
+    { label: "거래 수", value: `${card.tradeCount}건` },
+  ];
+  const columnWidth = `${(100 / metrics.length).toFixed(2)}%`;
 
-function CautionBox({ children }: { children: ReactNode }) {
   return (
-    <table role="presentation" width="100%" cellPadding={0} cellSpacing={0} border={0} style={{ marginTop: "12px" }}>
+    <table
+      role="presentation"
+      width="100%"
+      cellPadding={0}
+      cellSpacing={0}
+      border={0}
+      style={{ marginTop: "8px", background: COLORS.soft, borderRadius: "10px" }}
+    >
       <tbody>
         <tr>
-          <td style={{ padding: "10px 12px", background: TONE_COLORS.warning.background, borderRadius: "8px" }}>
-            <div>
-              <EmailBadge tone="warning">주의사항</EmailBadge>
-            </div>
-            <p style={{ margin: "6px 0 0", color: "#7c5307", fontSize: "12px", lineHeight: 1.7 }}>{children}</p>
-          </td>
+          {metrics.map((metric) => (
+            <td
+              key={metric.label}
+              width={columnWidth}
+              align="center"
+              style={{ padding: "14px 4px 0", color: COLORS.subdued, fontSize: "12px", fontWeight: 700 }}
+            >
+              {metric.label}
+            </td>
+          ))}
+        </tr>
+        <tr>
+          {metrics.map((metric) => (
+            <td
+              key={metric.label}
+              align="center"
+              style={{ padding: "4px 4px 16px", color: COLORS.ink, fontSize: "16px", fontWeight: 800 }}
+            >
+              {metric.value}
+            </td>
+          ))}
         </tr>
       </tbody>
     </table>
@@ -378,7 +411,7 @@ function MarketBrief({ brief }: { brief: DailyDigestReport["marketBrief"] }) {
   return (
     <>
       {brief.headline ? (
-        <p style={{ margin: "0 0 12px", color: COLORS.ink, fontSize: "13px", fontWeight: 800, lineHeight: 1.6 }}>
+        <p style={{ margin: "0 0 14px", color: COLORS.ink, fontSize: "15px", fontWeight: 800, lineHeight: 1.6 }}>
           {brief.headline}
         </p>
       ) : null}
@@ -391,17 +424,17 @@ function MarketBrief({ brief }: { brief: DailyDigestReport["marketBrief"] }) {
 
 function MarketBriefRow({ item }: { item: DailyDigestMarketBriefItem }) {
   return (
-    <table role="presentation" width="100%" cellPadding={0} cellSpacing={0} border={0} style={{ marginBottom: "8px" }}>
+    <table role="presentation" width="100%" cellPadding={0} cellSpacing={0} border={0} style={{ marginBottom: "10px" }}>
       <tbody>
         <tr>
-          <td style={{ padding: "10px 12px", ...styles.outlinedBox, borderRadius: "8px" }}>
+          <td style={{ padding: "14px 16px", ...styles.outlinedBox }}>
             <div>
               <EmailBadge tone={item.tone}>{item.source}</EmailBadge>
               {item.publishedAt ? (
-                <span style={{ color: COLORS.subdued, fontSize: "10px", paddingLeft: "6px" }}>{item.publishedAt}</span>
+                <span style={{ color: COLORS.subdued, fontSize: "12px", paddingLeft: "8px" }}>{item.publishedAt}</span>
               ) : null}
             </div>
-            <div style={{ color: COLORS.ink, fontSize: "13px", fontWeight: 700, lineHeight: 1.6, paddingTop: "6px" }}>
+            <div style={{ color: COLORS.ink, fontSize: "15px", fontWeight: 700, lineHeight: 1.6, paddingTop: "8px" }}>
               {item.url ? (
                 <a href={item.url} style={{ color: COLORS.ink, textDecoration: "none" }}>
                   {item.title}
@@ -410,7 +443,7 @@ function MarketBriefRow({ item }: { item: DailyDigestMarketBriefItem }) {
                 item.title
               )}
             </div>
-            <p style={{ ...styles.paragraph, paddingTop: "4px" }}>{item.summary}</p>
+            <p style={{ ...styles.paragraph, fontSize: "14px", paddingTop: "6px" }}>{item.summary}</p>
           </td>
         </tr>
       </tbody>
@@ -421,7 +454,7 @@ function MarketBriefRow({ item }: { item: DailyDigestMarketBriefItem }) {
 function DetailLinks({ link }: { link: (path: string) => string }) {
   return (
     <>
-      <p style={{ ...styles.paragraph, paddingBottom: "14px" }}>
+      <p style={{ ...styles.paragraph, paddingBottom: "16px" }}>
         웹 대시보드에서 전략별 백테스트 상세 결과를 확인할 수 있습니다.
       </p>
       <table role="presentation" cellPadding={0} cellSpacing={0} border={0}>
@@ -432,9 +465,9 @@ function DetailLinks({ link }: { link: (path: string) => string }) {
                 href={link("/reports")}
                 style={{
                   display: "inline-block",
-                  padding: "11px 18px",
+                  padding: "13px 22px",
                   color: "#ffffff",
-                  fontSize: "13px",
+                  fontSize: "15px",
                   fontWeight: 800,
                   textDecoration: "none",
                 }}
@@ -442,14 +475,14 @@ function DetailLinks({ link }: { link: (path: string) => string }) {
                 전략 리포트 보기 →
               </a>
             </td>
-            <td style={{ paddingLeft: "10px" }}>
+            <td style={{ paddingLeft: "12px" }}>
               <a
                 href={link("/app")}
                 style={{
                   display: "inline-block",
-                  padding: "11px 4px",
+                  padding: "13px 4px",
                   color: COLORS.blue,
-                  fontSize: "13px",
+                  fontSize: "15px",
                   fontWeight: 700,
                   textDecoration: "none",
                 }}
@@ -467,7 +500,7 @@ function DetailLinks({ link }: { link: (path: string) => string }) {
 function FooterSection({ digest, link }: { digest: DailyDigestReport; link: (path: string) => string }) {
   return (
     <tr>
-      <td style={{ padding: "22px 28px 26px", background: COLORS.soft }}>
+      <td style={{ padding: "26px 30px 30px", background: COLORS.soft }}>
         {digest.footer.map((line) => (
           <div key={line} style={styles.footerLine}>
             {line}
@@ -475,21 +508,21 @@ function FooterSection({ digest, link }: { digest: DailyDigestReport; link: (pat
         ))}
         <div
           style={{
-            paddingTop: "14px",
-            marginTop: "14px",
+            paddingTop: "16px",
+            marginTop: "16px",
             borderTop: `1px solid ${COLORS.line}`,
             color: COLORS.subdued,
-            fontSize: "11px",
+            fontSize: "13px",
           }}
         >
           <a href={link("/unsubscribe")} style={styles.footerLink}>
             수신 거부
           </a>
-          <span style={{ padding: "0 6px" }}>·</span>
+          <span style={{ padding: "0 7px" }}>·</span>
           <a href={link("/me/notifications")} style={styles.footerLink}>
             알림 설정
           </a>
-          <span style={{ padding: "0 6px" }}>·</span>
+          <span style={{ padding: "0 7px" }}>·</span>
           <span>© 2026 QuantAgent</span>
         </div>
       </td>
@@ -522,11 +555,11 @@ function EmailBadge({ children, tone }: { children: ReactNode; tone: Tone | "dar
     <span
       style={{
         display: "inline-block",
-        borderRadius: "4px",
-        padding: "3px 7px",
+        borderRadius: "5px",
+        padding: "4px 9px",
         color: palette.color,
         background: palette.background,
-        fontSize: "10px",
+        fontSize: "12px",
         fontWeight: 800,
         lineHeight: 1.4,
       }}
