@@ -41,6 +41,7 @@ jobs:
             --no-perms --no-owner --no-group \
             --exclude='.env' \
             --exclude='.env.*' \
+            --exclude='docker/postgres/' \
             --exclude='airflow/logs/' \
             --exclude='airflow/logs/**' \
             --exclude='airflow/dags/logs/' \
