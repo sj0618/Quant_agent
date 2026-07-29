@@ -14,6 +14,19 @@ from quant_agent.data.models import RawSourcePayload
 from quant_agent.data.sources.base import SourceConfigurationError, SourceResponseError, retry_call
 
 
+# OpenDART reuses these account IDs across multiple statement blocks.
+# Downstream consumers expect the canonical total row, so prefer the statement
+# and row shape most likely to carry the aggregate number.
+DART_ACCOUNT_STATEMENT_PREFERENCES: dict[str, tuple[str, ...]] = {
+    "ifrs-full_Equity": ("BS",),
+    "ifrs-full_Liabilities": ("BS",),
+    "ifrs-full_ProfitLoss": ("IS", "CIS"),
+    "ifrs-full_Revenue": ("IS", "CIS"),
+    "dart_OperatingIncomeLoss": ("IS", "CIS"),
+    "ifrs-full_BasicEarningsLossPerShare": ("IS", "CIS"),
+}
+
+
 class OpenDartClient:
     source_name = "DART"
 
@@ -113,19 +126,24 @@ def normalize_financial_statement(raw_payload: RawSourcePayload, *, symbol: str,
     fs_div = str(request["fs_div"])
     normalized_period_end = period_end or _period_end_from_report_code(business_year, report_code)
     reported_at = datetime.now(timezone.utc).isoformat()
-    accounts = {}
-    for row in rows:
+    account_candidates: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
         account_id = str(row.get("account_id") or row.get("account_nm") or "").strip()
         if not account_id:
             continue
+        account_candidates.setdefault(account_id, []).append((index, row))
+
+    accounts = {}
+    for account_id, candidates in account_candidates.items():
+        selected_row = _select_financial_statement_row(account_id, candidates)
         accounts[account_id] = {
-            "account_name": row.get("account_nm"),
-            "fs_nm": row.get("fs_nm"),
-            "sj_nm": row.get("sj_nm"),
-            "amount": _decimal_or_none(row.get("thstrm_amount")),
-            "raw": row,
+            "account_name": selected_row.get("account_nm"),
+            "fs_nm": selected_row.get("fs_nm"),
+            "sj_nm": selected_row.get("sj_nm"),
+            "amount": _decimal_or_none(selected_row.get("thstrm_amount")),
+            "raw": selected_row,
         }
     return [
         {
@@ -165,3 +183,34 @@ def _decimal_or_none(value: Any) -> Decimal | None:
         return Decimal(text)
     except InvalidOperation:
         return None
+
+
+def _select_financial_statement_row(account_id: str, candidates: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
+    preferred_sj_divs = DART_ACCOUNT_STATEMENT_PREFERENCES.get(account_id)
+    if preferred_sj_divs:
+        for sj_div in preferred_sj_divs:
+            statement_candidates = [item for item in candidates if _statement_div(item[1]) == sj_div]
+            total_candidates = [item for item in statement_candidates if not _is_expanded_account_detail(item[1].get("account_detail"))]
+            if total_candidates:
+                return min(total_candidates, key=lambda item: item[0])[1]
+        for sj_div in preferred_sj_divs:
+            statement_candidates = [item for item in candidates if _statement_div(item[1]) == sj_div]
+            if statement_candidates:
+                return min(statement_candidates, key=lambda item: item[0])[1]
+
+    total_candidates = [item for item in candidates if not _is_expanded_account_detail(item[1].get("account_detail"))]
+    if total_candidates:
+        return min(total_candidates, key=lambda item: item[0])[1]
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def _statement_div(row: dict[str, Any]) -> str:
+    return str(row.get("sj_div") or "").strip().upper()
+
+
+def _is_expanded_account_detail(account_detail: Any) -> bool:
+    detail = str(account_detail or "").strip()
+    if not detail or detail == "-":
+        return False
+    lowered = detail.casefold()
+    return "[member]" in lowered or "[component]" in lowered or "구성요소" in detail or "component" in lowered
