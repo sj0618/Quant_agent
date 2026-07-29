@@ -13,6 +13,8 @@ export const ROUTES = {
   privacy: "/privacy",
   disclaimer: "/disclaimer",
   unsubscribe: "/unsubscribe",
+  // 이메일 템플릿 확인용 예비 라우트. mock 데이터만 쓰고 로그인도 요구하지 않으므로 BE가 바로 열어볼 수 있다.
+  emailTemplatePreview: "/dev/email-template",
   reportDetail: (id: string) => `/reports/${encodeURIComponent(id)}`,
   strategyReportDetail: (id: string) => `/reports/strategies/${encodeURIComponent(id)}`,
 } as const;

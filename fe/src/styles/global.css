@@ -564,6 +564,20 @@ p, h1, h2, h3, h4 { margin: 0; }
 .digest-preview__card { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .digest-preview__footer { border-top: 1px solid var(--line); padding-top: 12px; color: var(--subdued); font-size: 11px; display: flex; flex-direction: column; gap: 4px; }
 
+.email-template-page { max-width: 760px; }
+.email-template-page code { background: var(--soft); border-radius: 4px; padding: 1px 4px; font-size: 12px; }
+.email-template-panel { display: flex; flex-direction: column; gap: 16px; }
+.email-template-meta { display: flex; flex-direction: column; gap: 10px; margin: 0; }
+.email-template-meta div { display: flex; gap: 12px; font-size: 12px; }
+.email-template-meta dt { width: 110px; flex: none; color: var(--subdued); font-weight: 700; }
+.email-template-meta dd { margin: 0; color: var(--ink); line-height: 1.6; }
+.email-template-frame { width: 100%; height: 900px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
+.email-template-sections { width: 100%; border-collapse: collapse; font-size: 12px; }
+.email-template-sections th, .email-template-sections td { border-bottom: 1px solid var(--line); padding: 7px 8px; text-align: left; }
+.email-template-sections th { color: var(--subdued); font-size: 10px; font-weight: 800; }
+.email-template-sections td:first-child { width: 48px; color: var(--subdued); font-weight: 800; }
+.email-template-notes { display: flex; flex-direction: column; gap: 8px; margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+
 /* TEMP(dev-auth-gate): remove this block with SitePasswordGate.tsx. */
 .site-gate-overlay { position: fixed; inset: 0; z-index: 999; display: flex; align-items: center; justify-content: center; background: rgba(11, 16, 27, 0.72); padding: 24px; }
 .site-gate-modal { width: min(360px, 100%); display: flex; flex-direction: column; gap: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 24px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.24); }

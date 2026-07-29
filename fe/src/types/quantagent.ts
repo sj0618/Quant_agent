@@ -259,10 +259,14 @@ export interface TradingCandidate {
   ticker: string;
   name: string;
   sector: string;
-  signal: SignalType;
-  confidence: number;
+  // A screening match is not a per-ticker verdict. The graph decides one action and one
+  // confidence for the whole strategy, so copying them onto every matched name invented a
+  // per-name judgement that nothing computed - 30 names all reading "HOLD 86%". These stay
+  // optional and are only set by sources that really do score a single name.
+  signal?: SignalType;
+  confidence?: number;
   price: string;
-  changePercent: string;
+  changePercent?: string;
   rationale: string;
   evidence: EvidenceSource[];
   riskReasons: string[];
