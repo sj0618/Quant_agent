@@ -43,6 +43,95 @@ class ExternalNormalizerTests(unittest.TestCase):
         self.assertEqual(financial_rows[0]["period_end"], date(2025, 12, 31))
         self.assertEqual(financial_rows[0]["accounts"]["ifrs-full_Revenue"]["amount"], Decimal("1000"))
 
+    def test_normalize_dart_financials_prefers_total_rows_by_statement(self):
+        raw = RawSourcePayload(
+            source="DART",
+            endpoint_key="fnlttSinglAcntAll",
+            request_date=date(2026, 7, 24),
+            request={"corp_code": "00126380", "bsns_year": "2026", "reprt_code": "11013", "fs_div": "CFS"},
+            payload={
+                "status": "000",
+                "list": [
+                    {
+                        "account_id": "ifrs-full_Equity",
+                        "sj_div": "SCE",
+                        "account_nm": "자본",
+                        "account_detail": "연결재무제표 [member]",
+                        "thstrm_amount": "0",
+                    },
+                    {
+                        "account_id": "ifrs-full_Equity",
+                        "sj_div": "BS",
+                        "account_nm": "자본총계",
+                        "account_detail": "-",
+                        "thstrm_amount": "1234",
+                    },
+                    {
+                        "account_id": "ifrs-full_ProfitLoss",
+                        "sj_div": "SCE",
+                        "account_nm": "당기순이익",
+                        "account_detail": "자본 [member]|지배기업의 소유주에게 귀속되는 자본 [member]|이익잉여금 [member]",
+                        "thstrm_amount": "0",
+                    },
+                    {
+                        "account_id": "ifrs-full_ProfitLoss",
+                        "sj_div": "CIS",
+                        "account_nm": "당기순이익",
+                        "account_detail": "-",
+                        "thstrm_amount": "5678",
+                    },
+                    {
+                        "account_id": "ifrs-full_ProfitLoss",
+                        "sj_div": "IS",
+                        "account_nm": "당기순이익",
+                        "account_detail": "-",
+                        "thstrm_amount": "91011",
+                    },
+                ],
+            },
+        )
+
+        financial_rows = normalize_financial_statement(raw, symbol="005930")
+        accounts = financial_rows[0]["accounts"]
+
+        self.assertEqual(accounts["ifrs-full_Equity"]["amount"], Decimal("1234"))
+        self.assertEqual(accounts["ifrs-full_Equity"]["raw"]["sj_div"], "BS")
+        self.assertEqual(accounts["ifrs-full_ProfitLoss"]["amount"], Decimal("91011"))
+        self.assertEqual(accounts["ifrs-full_ProfitLoss"]["raw"]["sj_div"], "IS")
+
+    def test_normalize_dart_financials_skips_expanded_rows_when_next_preferred_total_exists(self):
+        raw = RawSourcePayload(
+            source="DART",
+            endpoint_key="fnlttSinglAcntAll",
+            request_date=date(2026, 7, 24),
+            request={"corp_code": "00126380", "bsns_year": "2026", "reprt_code": "11013", "fs_div": "CFS"},
+            payload={
+                "status": "000",
+                "list": [
+                    {
+                        "account_id": "ifrs-full_ProfitLoss",
+                        "sj_div": "IS",
+                        "account_nm": "당기순이익",
+                        "account_detail": "연결재무제표 [member]",
+                        "thstrm_amount": "111",
+                    },
+                    {
+                        "account_id": "ifrs-full_ProfitLoss",
+                        "sj_div": "CIS",
+                        "account_nm": "당기순이익",
+                        "account_detail": "-",
+                        "thstrm_amount": "222",
+                    },
+                ],
+            },
+        )
+
+        financial_rows = normalize_financial_statement(raw, symbol="005930")
+        account = financial_rows[0]["accounts"]["ifrs-full_ProfitLoss"]
+
+        self.assertEqual(account["amount"], Decimal("222"))
+        self.assertEqual(account["raw"]["sj_div"], "CIS")
+
     def test_normalize_seibro_reports_and_sentiment(self):
         reports = normalize_seibro_reports(
             {
