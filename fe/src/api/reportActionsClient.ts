@@ -1,13 +1,7 @@
-import { REPORT_ACTION_ENDPOINTS, appConfig } from "../config/appConfig";
 import { ROUTES } from "../config/routes";
+import { backendRequest } from "./backendClient";
 import type { PerformanceSummary, ReportDetail, ReportSummary } from "../types/quantagent";
 import { downloadTextFile, toCsvValue } from "../utils/download";
-
-function assertOk(response: Response) {
-  if (!response.ok) {
-    throw new Error(`리포트 액션 서버 응답 실패: ${response.status}`);
-  }
-}
 
 export function downloadReportsCsv(reports: ReportSummary[]) {
   const header = ["id", "date", "strategy", "score", "buy", "hold", "drop", "summary"];
@@ -43,15 +37,9 @@ export async function copyReportShareLink(reportId: string) {
 }
 
 export async function resendReportEmail(reportId: string) {
-  if (!appConfig.reportActionApiBaseUrl) {
-    throw new Error("VITE_REPORT_ACTION_API_BASE_URL 설정이 필요합니다.");
-  }
-
-  const response = await fetch(`${appConfig.reportActionApiBaseUrl}${REPORT_ACTION_ENDPOINTS.resend(reportId)}`, {
+  await backendRequest<void>(`/reports/${encodeURIComponent(reportId)}/resend`, {
     method: "POST",
-    credentials: "include",
   });
-  assertOk(response);
 }
 
 export function buildReportPrintTitle(report: ReportDetail | ReportSummary) {

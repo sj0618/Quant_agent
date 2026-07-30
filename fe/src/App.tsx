@@ -10,14 +10,12 @@ import { LandingPage } from "./pages/LandingPage";
 import { LegalPage } from "./pages/LegalPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ProfilePage } from "./pages/ProfilePage";
-import { ReportsHistoryPage } from "./pages/ReportsHistoryPage";
 import { ReportDetailPage } from "./pages/ReportDetailPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { SearchPage } from "./pages/SearchPage";
-import { StrategyReportDetailPage } from "./pages/StrategyReportDetailPage";
 import { UnsubscribePage } from "./pages/UnsubscribePage";
 import { getCurrentSession, validateCurrentSession } from "./api/authClient";
-import { ROUTES, getCurrentPathWithSearch, sanitizeReturnTo } from "./config/routes";
+import { ROUTES, getCurrentPathWithSearch, parseReportDetailId, sanitizeReturnTo } from "./config/routes";
 import type { AuthSession } from "./types/auth";
 
 // 이 페이지만 react-dom/server 를 끌어오기 때문에(발송용 HTML 문자열 렌더) 별도 chunk 로 떼어낸다.
@@ -35,7 +33,7 @@ function isProtectedRoute(path: string) {
     path === ROUTES.app ||
     path.startsWith(`${ROUTES.app}/`) ||
     path === ROUTES.reports ||
-    path.startsWith(`${ROUTES.reports}/`) ||
+    parseReportDetailId(path) !== null ||
     path === ROUTES.me ||
     path === ROUTES.notifications ||
     path === ROUTES.search
@@ -140,11 +138,11 @@ function AppRoutes() {
   }
 
   if (path === ROUTES.me) {
-    return <ProfilePage />;
+    return <ProfilePage initialTab="profile" />;
   }
 
   if (path === ROUTES.notifications) {
-    return <ProfilePage />;
+    return <ProfilePage initialTab="notifications" />;
   }
 
   if (path === ROUTES.search) {
@@ -155,16 +153,9 @@ function AppRoutes() {
     return <ReportsPage />;
   }
 
-  if (path === ROUTES.reportsHistory) {
-    return <ReportsHistoryPage />;
-  }
-
-  if (path.startsWith(`${ROUTES.reportStrategies}/`)) {
-    return <StrategyReportDetailPage id={decodeURIComponent(path.replace(`${ROUTES.reportStrategies}/`, ""))} />;
-  }
-
-  if (path.startsWith(`${ROUTES.reports}/`)) {
-    return <ReportDetailPage id={decodeURIComponent(path.replace(`${ROUTES.reports}/`, ""))} />;
+  const reportDetailId = parseReportDetailId(path);
+  if (reportDetailId) {
+    return <ReportDetailPage id={reportDetailId} />;
   }
 
   return (

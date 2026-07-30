@@ -2,10 +2,9 @@ import { useState } from "react";
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
 import { copyReportShareLink, printCurrentView, resendReportEmail } from "../../api/reportActionsClient";
-import { MAX_EMAIL_DIGEST_STRATEGIES, getDigestStrategySelection, saveDigestStrategySelection } from "../../api/emailDigestClient";
 import { ROUTES } from "../../config/routes";
 import type { ReportSummary, SignalType } from "../../types/quantagent";
-import { DEFAULT_REPORT_FILTERS, type ReportFilters, type ReportRange } from "./reportFilters";
+import { DEFAULT_REPORT_FILTERS, getReportStrategyNames, type ReportFilters, type ReportRange } from "./reportFilters";
 
 interface ReportListProps {
   allReports: ReportSummary[];
@@ -23,26 +22,14 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
   const [draftFilters, setDraftFilters] = useState(filters);
   const [status, setStatus] = useState<string | null>(null);
   const [page, setPage] = useState(1);
-  const [digestSelection, setDigestSelection] = useState<string[]>(() => getDigestStrategySelection());
-  const [digestError, setDigestError] = useState<string | null>(null);
   const today = reports[0];
   const pastReports = reports.slice(1);
   const totalPages = Math.max(Math.ceil(pastReports.length / PAST_REPORT_PAGE_SIZE), 1);
   const visiblePastReports = pastReports.slice((page - 1) * PAST_REPORT_PAGE_SIZE, page * PAST_REPORT_PAGE_SIZE);
-  const strategyNames = Array.from(new Set(allReports.map((report) => report.strategyName)));
+  const strategyNames = getReportStrategyNames(allReports);
 
   const updateSignal = (signal: SignalType, checked: boolean) => {
     setDraftFilters((current) => ({ ...current, signals: { ...current.signals, [signal]: checked } }));
-  };
-
-  const handleDigestToggle = (strategyName: string, checked: boolean) => {
-    const next = checked ? [...digestSelection, strategyName] : digestSelection.filter((name) => name !== strategyName);
-    try {
-      setDigestSelection(saveDigestStrategySelection(next));
-      setDigestError(null);
-    } catch (error) {
-      setDigestError(error instanceof Error ? error.message : "선택을 저장하지 못했습니다.");
-    }
   };
 
   const handleReportAction = async (action: "print" | "share" | "resend", report: ReportSummary) => {
@@ -84,26 +71,29 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
             </button>
           ))}
         </Card>
-        <Card className="filter-group digest-subscription">
-          <strong>이메일 다이제스트 구독 전략 (최대 {MAX_EMAIL_DIGEST_STRATEGIES}개)</strong>
-          {strategyNames.map((strategyName) => {
-            const checked = digestSelection.includes(strategyName);
-            const disabled = !checked && digestSelection.length >= MAX_EMAIL_DIGEST_STRATEGIES;
-            return (
-              <label className={checked ? "is-active" : ""} key={strategyName}>
-                <input
-                  checked={checked}
-                  disabled={disabled}
-                  onChange={(event) => handleDigestToggle(strategyName, event.target.checked)}
-                  type="checkbox"
-                />
-                <span className="filter-check" />
-                <span>{strategyName}</span>
-              </label>
-            );
-          })}
-          <small>{digestSelection.length}/{MAX_EMAIL_DIGEST_STRATEGIES}개 선택됨 · 매일 오전 8시 다이제스트 이메일에 포함됩니다.</small>
-          {digestError ? <small className="digest-subscription__error">{digestError}</small> : null}
+        <Card className="filter-group">
+          <strong>전략</strong>
+          <button
+            className={draftFilters.strategyName === "all" ? "is-active" : ""}
+            onClick={() => setDraftFilters((current) => ({ ...current, strategyName: "all" }))}
+            type="button"
+          >
+            <span className="filter-check" />
+            <span>전체 전략</span>
+            <Badge variant="soft">{allReports.length}</Badge>
+          </button>
+          {strategyNames.map((strategyName) => (
+            <button
+              className={draftFilters.strategyName === strategyName ? "is-active" : ""}
+              key={strategyName}
+              onClick={() => setDraftFilters((current) => ({ ...current, strategyName }))}
+              type="button"
+            >
+              <span className="filter-check" />
+              <span>{strategyName}</span>
+              <Badge variant="soft">{allReports.filter((report) => report.strategyName.trim() === strategyName).length}</Badge>
+            </button>
+          ))}
         </Card>
         <Card className="filter-group">
           <strong>포함 신호</strong>
@@ -114,6 +104,17 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
               <span>{signal} 포함</span>
             </label>
           ))}
+        </Card>
+        <Card className="manual-filter">
+          <strong>직접 입력</strong>
+          <label>
+            <span>시작</span>
+            <input onChange={(event) => setDraftFilters((current) => ({ ...current, startDate: event.target.value }))} type="date" value={draftFilters.startDate} />
+          </label>
+          <label>
+            <span>종료</span>
+            <input onChange={(event) => setDraftFilters((current) => ({ ...current, endDate: event.target.value }))} type="date" value={draftFilters.endDate} />
+          </label>
         </Card>
         <Card className="score-filter">
           <strong>권장도</strong>
@@ -190,7 +191,7 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
           <strong>리포트가 적게 보이시나요?</strong>
           <p>
             전략 활성화 다음 날부터 일일 리포트가 자동 생성됩니다.{" "}
-            <a href={ROUTES.me}>마이페이지</a>에서 리포트 수신을 켜두시면 이메일로도 함께 받아보실 수 있습니다.
+            <a href={ROUTES.notifications}>마이페이지 &gt; 알림 설정</a>에서 Daily 리포트 수신을 켜두시면 이메일로도 함께 받아보실 수 있습니다.
           </p>
         </Card>
       </section>

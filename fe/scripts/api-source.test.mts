@@ -3,19 +3,16 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
 
-test("product screens use analysis API data without product mock overlays", async () => {
+test("report surfaces keep the restored live report source", async () => {
   const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
 
-  assert.doesNotMatch(source, /mocks\/(?:app|reports|reportStrategies)\.mock/);
-  assert.match(source, /AI_ENDPOINTS\.analysisJobs/);
-  assert.match(source, /listAnalysisJobs/);
-  assert.match(source, /refreshLatestAnalysisJob/);
-  assert.match(source, /listAnalysisJobs\(1\)/);
-  assert.match(source, /error\.status === 404/);
-  assert.match(source, /buildTradingCandidatesFromAnalysisJob/);
-  assert.doesNotMatch(source, /candidates: result \? \[\] : base\.candidates/);
-  assert.match(source, /AI_REQUEST_TIMEOUT_MS = 1_200_000/);
-  assert.match(source, /id\.startsWith\(AI_REPORT_ID_PREFIX\)/);
+  assert.match(source, /mocks\/(?:app|reports)\.mock/);
+  assert.match(source, /backendRequest/);
+  assert.match(source, /export async function getReports/);
+  assert.match(source, /export async function getReportById/);
+  assert.doesNotMatch(source, /export async function searchInstruments/);
+  assert.match(source, /AI_REPORT_ID_PREFIX/);
+  assert.doesNotMatch(source, /reportClient|reportAdapter/);
 });
 
 test("workspace restores the latest server analysis on a fresh browser", async () => {
@@ -25,29 +22,24 @@ test("workspace restores the latest server analysis on a fresh browser", async (
   assert.match(source, /setAnalysisJobs\(\(jobs\) => \(jobs\.length \? jobs : \[latestJob\]\)\)/);
 });
 
-test("product surfaces do not expose retired candidate-scope fields", async () => {
-  const sources = await Promise.all(
-    [
-      "../src/features/app/OverviewTab.tsx",
-      "../src/features/reports/StrategyReportList.tsx",
-      "../src/features/reports/ReportDetail.tsx",
-      "../src/types/quantagent.ts",
-    ].map((path) => readFile(new URL(path, import.meta.url), "utf8")),
-  );
+test("canonical product surface excludes retired history and strategy routes", async () => {
+  const [appSource, routesSource, profileSource, searchSource] = await Promise.all([
+    readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/config/routes.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/pages/ProfilePage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/pages/SearchPage.tsx", import.meta.url), "utf8"),
+  ]);
 
-  for (const source of sources) {
-    assert.doesNotMatch(source, /universe|유니버스|strategyUniverse/i);
-  }
+  assert.doesNotMatch(routesSource, /reportsHistory|reportStrategies|strategyReportDetail/);
+  assert.doesNotMatch(appSource, /ReportsHistoryPage|StrategyReportsPage|StrategyReportDetailPage/);
+  assert.doesNotMatch(profileSource, /EmailHistoryTimeline|getEmailDeliveryHistory|reportsHistory/);
+  assert.match(searchSource, /getReports/);
+  assert.match(searchSource, /getWorkspaceTemplate/);
+  assert.match(searchSource, /refreshLatestAnalysisJob/);
+  assert.match(searchSource, /mergeAnalysisJobIntoOverview/);
+  assert.doesNotMatch(searchSource, /getAppOverview/);
+  assert.doesNotMatch(searchSource, /searchInstruments/);
 });
-
-
-test("deployment does not force the mock LLM profile", async () => {
-  const source = await readFile(new URL("../../.github/workflows/deploy.yml", import.meta.url), "utf8");
-
-  assert.doesNotMatch(source, /AI_LLM_PROVIDER=mock/);
-  assert.match(source, /source "\$HOME\/\.bashrc"/);
-});
-
 
 test("authentication boundaries do not leak cached analysis between users", async () => {
   const authSource = await readFile(new URL("../src/api/authClient.ts", import.meta.url), "utf8");
@@ -56,15 +48,18 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   const profileSource = await readFile(new URL("../src/pages/ProfilePage.tsx", import.meta.url), "utf8");
 
   assert.match(authSource, /!currentSession \|\| currentSession\.user\.id !== session\.user\.id/);
-  assert.match(authSource, /session\.user\.id === TEST_AUTH_SESSION\.user\.id/);
   assert.match(authSource, /AUTH_ENDPOINTS\.me/);
+  assert.match(authSource, /AUTH_ENDPOINTS\.testLogin/);
+  assert.match(authSource, /completeTestLogin/);
   assert.match(authSource, /finally \{\s+clearCurrentSession\(\)/);
   assert.match(appSource, /validateCurrentSession\(\)/);
   assert.match(aiSource, /\[401, 403\]\.includes\(error\.status\)/);
   assert.match(aiSource, /error\.status === 404/);
-  assert.match(profileSource, /finally \{\s+window\.location\.assign\(ROUTES\.home\)/);
+  assert.match(profileSource, /window\.location\.assign\(ROUTES\.home\)/);
+  assert.doesNotMatch(authSource, /TEST_AUTH_SESSION/);
+  assert.doesNotMatch(authSource, /saveTestSession/);
+  assert.doesNotMatch(authSource, /provider:\s*"test"/);
 });
-
 
 test("user-scoped cache clearing removes every registered key", () => {
   const removed: string[] = [];

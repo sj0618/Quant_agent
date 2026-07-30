@@ -2,16 +2,7 @@ import { AUTH_ENDPOINTS, appConfig } from "../config/appConfig";
 import { ROUTES } from "../config/routes";
 import type { AuthSession } from "../types/auth";
 import { AUTH_SESSION_STORAGE_KEY, clearUserScopedStorage } from "../utils/userScopedStorage";
-
-// TEMP(dev-auth-gate): test-login bypass until BE session integration ships.
-const TEST_AUTH_SESSION: AuthSession = {
-  user: {
-    id: "local-test-user",
-    name: "테스트 사용자",
-    email: "test.user@quantagent.local",
-    provider: "test",
-  },
-};
+import { backendRequest, clearBackendCsrfToken } from "./backendClient";
 
 interface StartGoogleResponse {
   authorizationUrl?: string;
@@ -43,7 +34,7 @@ function readJson<T>(value: string | null): T | null {
 
 function requireAuthApiBaseUrl() {
   if (!appConfig.authApiBaseUrl) {
-    throw new Error("VITE_AUTH_API_BASE_URL 설정이 필요합니다.");
+    throw new Error("VITE_AUTH_API_BASE_URL is required.");
   }
   return appConfig.authApiBaseUrl;
 }
@@ -54,8 +45,22 @@ function buildRedirectUri() {
 
 function assertOk(response: Response) {
   if (!response.ok) {
-    throw new Error(`인증 서버 응답 실패: ${response.status}`);
+    throw new Error(`Backend request failed: ${response.status}`);
   }
+}
+
+async function fetchAuthenticatedSession(): Promise<AuthSession | null> {
+  const response = await fetch(`${requireAuthApiBaseUrl()}${AUTH_ENDPOINTS.me}`, {
+    credentials: "include",
+  });
+
+  if (response.status === 401 || response.status === 403) {
+    return null;
+  }
+
+  assertOk(response);
+  const payload = (await response.json()) as AuthMeResponse;
+  return { user: payload.user };
 }
 
 export function getCurrentSession(): AuthSession | null {
@@ -70,17 +75,8 @@ export function saveCurrentSession(session: AuthSession) {
   window.localStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(session));
 }
 
-// TEMP(dev-auth-gate): remove once BE session integration ships.
-export function saveTestSession() {
-  const session = {
-    ...TEST_AUTH_SESSION,
-    user: { ...TEST_AUTH_SESSION.user },
-  };
-  saveCurrentSession(session);
-  return session;
-}
-
 export function clearCurrentSession() {
+  clearBackendCsrfToken();
   clearUserScopedStorage();
 }
 
@@ -89,31 +85,21 @@ export async function validateCurrentSession(): Promise<AuthSession | null> {
   if (!session) {
     return null;
   }
-  if (
-    appConfig.testLoginEnabled &&
-    (session.user.provider === "test" || session.user.id === TEST_AUTH_SESSION.user.id)
-  ) {
-    return session;
-  }
 
-  const response = await fetch(`${requireAuthApiBaseUrl()}${AUTH_ENDPOINTS.me}`, {
-    credentials: "include",
-  });
-  if (response.status === 401 || response.status === 403) {
+  const backendSession = await fetchAuthenticatedSession();
+  if (!backendSession) {
     clearCurrentSession();
     return null;
   }
-  assertOk(response);
 
-  const payload = (await response.json()) as AuthMeResponse;
-  const validatedSession = { ...session, user: payload.user };
+  const validatedSession = { ...session, user: backendSession.user };
   saveCurrentSession(validatedSession);
   return validatedSession;
 }
 
 export async function startGoogleSignIn(returnTo: string) {
   const baseUrl = requireAuthApiBaseUrl();
-  const url = new URL(`${baseUrl}${AUTH_ENDPOINTS.googleStart}`);
+  const url = new URL(`${baseUrl}${AUTH_ENDPOINTS.googleStart}`, window.location.origin);
   url.searchParams.set("redirect_uri", buildRedirectUri());
   url.searchParams.set("return_to", returnTo);
 
@@ -122,7 +108,7 @@ export async function startGoogleSignIn(returnTo: string) {
 
   const data = (await response.json()) as StartGoogleResponse;
   if (!data.authorizationUrl) {
-    throw new Error("인증 서버가 Google authorizationUrl을 반환하지 않았습니다.");
+    throw new Error("Backend did not return a Google authorizationUrl.");
   }
 
   window.location.assign(data.authorizationUrl);
@@ -134,11 +120,11 @@ export async function completeGoogleSignIn(params: URLSearchParams) {
   const error = params.get("error");
 
   if (error) {
-    throw new Error(`Google 로그인이 취소되었거나 실패했습니다: ${error}`);
+    throw new Error(`Google sign-in was cancelled or failed: ${error}`);
   }
 
   if (!code) {
-    throw new Error("Google callback code가 없습니다.");
+    throw new Error("Google callback code is missing.");
   }
 
   const baseUrl = requireAuthApiBaseUrl();
@@ -157,22 +143,35 @@ export async function completeGoogleSignIn(params: URLSearchParams) {
   const data = (await response.json()) as CallbackResponse;
   const session = data.session ?? (data.user ? { user: data.user, accessToken: data.accessToken, expiresAt: data.expiresAt } : null);
   if (!session) {
-    throw new Error("인증 서버가 세션 정보를 반환하지 않았습니다.");
+    throw new Error("Backend did not return an authenticated session.");
   }
 
   saveCurrentSession(session);
   return { session, returnTo: data.returnTo };
 }
 
+export async function completeTestLogin() {
+  await backendRequest<void>(AUTH_ENDPOINTS.testLogin, {
+    method: "POST",
+    csrf: false,
+  });
+
+  const session = await fetchAuthenticatedSession();
+  if (!session) {
+    throw new Error("Test login did not create an authenticated session.");
+  }
+
+  saveCurrentSession(session);
+  return session;
+}
+
 export async function signOut() {
   const session = getCurrentSession();
   try {
-    if (appConfig.authApiBaseUrl && session?.user.provider !== "test") {
-      const response = await fetch(`${appConfig.authApiBaseUrl}${AUTH_ENDPOINTS.logout}`, {
+    if (appConfig.authApiBaseUrl && session) {
+      await backendRequest<void>(AUTH_ENDPOINTS.logout, {
         method: "POST",
-        credentials: "include",
       });
-      assertOk(response);
     }
   } finally {
     clearCurrentSession();

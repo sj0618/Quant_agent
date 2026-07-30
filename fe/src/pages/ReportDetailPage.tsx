@@ -46,19 +46,13 @@ export function ReportDetailPage({ id }: ReportDetailPageProps) {
   }
 
   if (!data) {
-    return <AsyncState title="리포트를 찾을 수 없습니다" description="요청한 리포트 ID에 해당하는 분석 API 결과가 없습니다." tone="empty" />;
+    return <AsyncState title="리포트를 찾을 수 없습니다" description="요청한 리포트 ID에 해당하는 mock data가 없습니다." tone="empty" />;
   }
 
   return (
     <AppLayout active="reports">
       <div className="report-subbar">
-        <a href={ROUTES.reports}>← 전략 레포트 목록</a>
-        {data.strategyId ? (
-          <>
-            <span>/</span>
-            <a href={ROUTES.strategyReportDetail(data.strategyId)}>{data.strategyName}</a>
-          </>
-        ) : null}
+        <a href={ROUTES.reports}>← 리포트 목록</a>
         <span>/</span>
         <strong>{data.date}</strong>
         <div>

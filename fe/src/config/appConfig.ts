@@ -1,12 +1,10 @@
 export const AUTH_ENDPOINTS = {
   googleStart: "/auth/google/start",
   googleCallback: "/auth/google/callback",
+  testLogin: "/auth/test-login",
   me: "/auth/me",
+  csrf: "/auth/csrf",
   logout: "/auth/logout",
-} as const;
-
-export const REPORT_ACTION_ENDPOINTS = {
-  resend: (id: string) => `/reports/${encodeURIComponent(id)}/resend`,
 } as const;
 
 export const STRATEGY_ENDPOINTS = {
@@ -30,6 +28,10 @@ function trimTrailingSlash(value: string | undefined) {
 
 function aiApiBaseUrl() {
   return import.meta.env.DEV ? "/ai-api" : trimTrailingSlash(import.meta.env.VITE_AI_API_BASE_URL);
+}
+
+function backendApiBaseUrl() {
+  return trimTrailingSlash(import.meta.env.VITE_BACKEND_API_BASE_URL) || "/api/v1";
 }
 
 // TEMP(dev-auth-gate): everything below until the export, remove once BE session
@@ -63,9 +65,10 @@ const sitePasswordEntryList = parseSitePasswordEntries();
 
 export const appConfig = {
   aiApiBaseUrl: aiApiBaseUrl(),
-  authApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AUTH_API_BASE_URL),
-  reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL),
-  strategyApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_STRATEGY_API_BASE_URL),
+  backendApiBaseUrl: backendApiBaseUrl(),
+  authApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AUTH_API_BASE_URL) || backendApiBaseUrl(),
+  reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL) || backendApiBaseUrl(),
+  strategyApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_STRATEGY_API_BASE_URL) || backendApiBaseUrl(),
   testLoginEnabled: import.meta.env.DEV || import.meta.env.VITE_ENABLE_TEST_LOGIN === "1",
   sitePasswordEntries: sitePasswordEntryList,
   sitePasswordGateEnabled: sitePasswordEntryList.length > 0,

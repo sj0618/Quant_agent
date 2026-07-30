@@ -2,8 +2,7 @@ export interface AuthUser {
   id: string;
   name: string;
   email: string;
-  // TEMP(dev-auth-gate): drop "test" once BE session integration ships.
-  provider: "google" | "test";
+  provider: "google";
   avatarUrl?: string;
 }
 
@@ -16,4 +15,7 @@ export interface AuthSession {
 export interface NotificationSettings {
   dailyReportEmail: boolean;
   email: string;
+  actionEmails?: boolean;
+  marketingEmail?: boolean;
+  deliveryHour?: string;
 }
