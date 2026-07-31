@@ -8,7 +8,8 @@ test("report surfaces keep the restored live report source", async () => {
 
   assert.match(source, /mocks\/(?:app|reports)\.mock/);
   assert.match(source, /backendRequest/);
-  assert.match(source, /export async function getReports/);
+  assert.match(source, /export async function getReports\(q\?: string\)/);
+  assert.match(source, /new URLSearchParams\(\{ q: normalizedQuery \}\)/);
   assert.match(source, /export async function getReportById/);
   assert.doesNotMatch(source, /export async function searchInstruments/);
   assert.match(source, /AI_REPORT_ID_PREFIX/);
@@ -34,10 +35,14 @@ test("canonical product surface excludes retired history and strategy routes", a
   assert.doesNotMatch(appSource, /ReportsHistoryPage|StrategyReportsPage|StrategyReportDetailPage/);
   assert.doesNotMatch(profileSource, /EmailHistoryTimeline|getEmailDeliveryHistory|reportsHistory/);
   assert.match(searchSource, /getReports/);
-  assert.match(searchSource, /getWorkspaceTemplate/);
-  assert.match(searchSource, /refreshLatestAnalysisJob/);
-  assert.match(searchSource, /mergeAnalysisJobIntoOverview/);
+  assert.match(searchSource, /getReports\(normalizedQuery\)/);
+  assert.match(searchSource, /ROUTES\.reportDetail/);
+  assert.match(searchSource, /Badge variant="info">report<\/Badge>/);
+  assert.match(searchSource, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
   assert.doesNotMatch(searchSource, /getAppOverview/);
+  assert.doesNotMatch(searchSource, /getWorkspaceTemplate/);
+  assert.doesNotMatch(searchSource, /refreshLatestAnalysisJob/);
+  assert.doesNotMatch(searchSource, /mergeAnalysisJobIntoOverview/);
   assert.doesNotMatch(searchSource, /searchInstruments/);
 });
 

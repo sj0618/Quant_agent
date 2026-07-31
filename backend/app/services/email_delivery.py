@@ -79,18 +79,16 @@ async def load_report_completed_delivery_context(
             profile.name AS strategy_name,
             account.email AS user_email,
             account.name AS user_name,
-            COALESCE(preferences.email, account.email) AS recipient_email,
-            COALESCE(preferences.action_emails, TRUE) AS action_emails,
-            COALESCE(preferences.daily_report_email, TRUE) AS daily_report_email,
-            COALESCE(preferences.marketing_email, FALSE) AS marketing_email,
-            COALESCE(preferences.delivery_hour, '08:00') AS delivery_hour
+            account.email AS recipient_email,
+            COALESCE(account.action_emails, TRUE) AS action_emails,
+            COALESCE(account.daily_report_email, TRUE) AS daily_report_email,
+            COALESCE(account.marketing_email, FALSE) AS marketing_email,
+            COALESCE(account.delivery_hour, '08:00') AS delivery_hour
         FROM app.strategy_email_report AS report
         JOIN app.backtest_run AS run
           ON run.run_id = report.backtest_run_id
         JOIN app.users AS account
           ON account.user_id = run.user_id
-        LEFT JOIN app.user_notification_settings AS preferences
-          ON preferences.user_id = run.user_id
         LEFT JOIN app.strategy_report_profile AS profile
           ON profile.strategy_id = report.strategy_id
         WHERE report.report_id = :report_id

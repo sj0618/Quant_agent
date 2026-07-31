@@ -468,8 +468,10 @@ export function getWorkspaceTemplate(): Promise<AppOverview> {
   return Promise.resolve(clone(EMPTY_WORKSPACE));
 }
 
-export async function getReports(): Promise<ReportSummary[]> {
-  const response = await backendRequest<LiveReportListResponse | ReportSummary[]>("/reports");
+export async function getReports(q?: string): Promise<ReportSummary[]> {
+  const normalizedQuery = q?.trim();
+  const path = normalizedQuery ? `/reports?${new URLSearchParams({ q: normalizedQuery }).toString()}` : "/reports";
+  const response = await backendRequest<LiveReportListResponse | ReportSummary[]>(path);
   return normalizeReportListResponse(response);
 }
 

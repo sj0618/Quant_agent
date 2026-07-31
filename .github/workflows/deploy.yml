@@ -31,7 +31,7 @@ jobs:
 
       - name: Build
         working-directory: fe
-        run: npm run build
+        run: VITE_AI_API_BASE_URL="/ai-api" npm run build
 
       - name: Setup SSH key
         run: |
@@ -84,7 +84,7 @@ jobs:
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
-            "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/ai"
+            "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/backend" -e "$APP_DIR/ai"
 
             "$APP_DIR/ai/.venv/bin/python" - "$APP_DIR" <<'PY'
           import os
@@ -226,21 +226,17 @@ jobs:
             }
 
             stop_listeners_on_port 18001
+            stop_listeners_on_port 18003
             stop_listeners_on_port 18000
-            rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/fe.pid"
+            rm -f "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
 
-            cd "$APP_DIR/ai"
-            nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn ai_graph.api:app \
+            cd "$APP_DIR"
+            nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
               --host 0.0.0.0 \
-              --port 18001 \
+              --port 18000 \
               --reload \
-              > "$RUN_DIR/ai.log" 2>&1 &
-            echo "$!" > "$RUN_DIR/ai.pid"
-
-            cd "$APP_DIR/fe"
-            nohup npm run dev -- --host 0.0.0.0 --port 18000 \
-              > "$RUN_DIR/fe.log" 2>&1 &
-            echo "$!" > "$RUN_DIR/fe.pid"
+              > "$RUN_DIR/combined.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/combined.pid"
 
             wait_for_url() {
               local name="$1"
@@ -258,6 +254,8 @@ jobs:
               return 1
             }
 
-            wait_for_url "AI API" "http://127.0.0.1:18001/health" "$RUN_DIR/ai.log"
-            wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
+            wait_for_url "Combined backend" "http://127.0.0.1:18000/combined-health" "$RUN_DIR/combined.log"
+            wait_for_url "General backend" "http://127.0.0.1:18000/health" "$RUN_DIR/combined.log"
+            wait_for_url "AI API" "http://127.0.0.1:18000/ai-api/health" "$RUN_DIR/combined.log"
+            wait_for_url "FE SPA" "http://127.0.0.1:18000/search" "$RUN_DIR/combined.log"
           REMOTE

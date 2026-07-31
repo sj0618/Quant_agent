@@ -944,8 +944,16 @@ async def list_reports_from_db(
     limit: int = 20,
     cursor: str | None = None,
     status: str | None = None,
+    q: str | None = None,
 ) -> dict[str, Any]:
-    return await existing_report_queries.list_reports(engine, user_id=user_id, limit=limit, cursor=cursor, status=status)
+    return await existing_report_queries.list_reports(
+        engine,
+        user_id=user_id,
+        limit=limit,
+        cursor=cursor,
+        status=status,
+        q=q,
+    )
 
 
 async def get_report_from_db(engine: Any, report_id: str, *, user_id: str) -> dict[str, Any] | None:

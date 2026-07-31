@@ -39,29 +39,32 @@ test("/me and /me/notifications stay on the profile and notification surface", a
   assert.match(profilePage, /getNotificationSettings/);
   assert.match(profilePage, /saveNotificationSettings/);
   assert.match(profilePage, /signOut/);
+  assert.match(profilePage, /Google 계정/);
   assert.doesNotMatch(profilePage, /EmailHistoryTimeline|getEmailDeliveryHistory|reportsHistory/);
   assert.match(appSource, /return <ProfilePage initialTab="profile" \/>/);
   assert.match(appSource, /return <ProfilePage initialTab="notifications" \/>/);
   assert.doesNotMatch(appSource, /StrategyReportsPage|StrategyReportDetailPage|ReportsHistoryPage/);
 });
 
-test("/search uses current live report and workspace sources", async () => {
+test("/search stays report-centric and forwards the submitted q to report search", async () => {
   const [searchPage, clientSource] = await Promise.all([
     read("../src/pages/SearchPage.tsx"),
     read("../src/api/quantAgentClient.ts"),
   ]);
 
   assert.match(searchPage, /getReports/);
-  assert.match(searchPage, /getWorkspaceTemplate/);
-  assert.match(searchPage, /refreshLatestAnalysisJob/);
-  assert.match(searchPage, /mergeAnalysisJobIntoOverview/);
-  assert.match(searchPage, /kind: "strategy"/);
-  assert.match(searchPage, /kind: "candidate"/);
-  assert.match(searchPage, /kind: "report"/);
-  assert.match(searchPage, /ROUTES\.app/);
-  assert.match(searchPage, /tab=trading/);
+  assert.match(searchPage, /getReports\(normalizedQuery\)/);
   assert.match(searchPage, /ROUTES\.reportDetail/);
+  assert.match(searchPage, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
+  assert.match(searchPage, /Badge variant="info">report<\/Badge>/);
   assert.doesNotMatch(clientSource, /export async function searchInstruments/);
+  assert.doesNotMatch(searchPage, /getWorkspaceTemplate/);
+  assert.doesNotMatch(searchPage, /refreshLatestAnalysisJob/);
+  assert.doesNotMatch(searchPage, /mergeAnalysisJobIntoOverview/);
+  assert.doesNotMatch(searchPage, /kind: "strategy"/);
+  assert.doesNotMatch(searchPage, /kind: "candidate"/);
+  assert.doesNotMatch(searchPage, /ROUTES\.app/);
+  assert.doesNotMatch(searchPage, /tab=trading/);
   assert.doesNotMatch(searchPage, /getAppOverview/);
   assert.doesNotMatch(searchPage, /searchInstruments/);
 });
@@ -77,5 +80,6 @@ test("/reports/:id keeps generated report detail navigation and actions", async 
   assert.match(detailPage, /printCurrentView/);
   assert.match(detailPage, /resendReportEmail/);
   assert.match(detailPage, /ROUTES\.reports/);
+  assert.doesNotMatch(detailPage, /mock data/);
   assert.match(reportActions, /export async function resendReportEmail/);
 });

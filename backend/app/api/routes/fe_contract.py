@@ -147,6 +147,7 @@ async def list_reports(
     limit: int = Query(default=20, ge=1, le=100),
     cursor: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    q: str | None = Query(default=None),
 ) -> dict[str, Any]:
     user_id = await _require_current_user_id(request)
     engine = get_trading_data_engine(request)
@@ -157,6 +158,7 @@ async def list_reports(
             limit=limit,
             cursor=cursor,
             status=status,
+            q=q,
         )
     items = result.get("items")
     meta = result.get("meta")

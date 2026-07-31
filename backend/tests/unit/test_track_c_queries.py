@@ -75,6 +75,54 @@ async def test_track_c_list_reports_clamps_limit_and_scopes_to_owner(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_track_c_list_reports_applies_report_strategy_candidate_search(monkeypatch):
+    recorded: dict[str, object] = {}
+
+    async def fake_fetch_all(engine, sql, params=None):
+        recorded["engine"] = engine
+        recorded["sql"] = sql
+        recorded["params"] = params or {}
+        return [
+            {
+                "report_id": "report-1",
+                "backtest_run_id": "run-1",
+                "strategy_id": "strategy-1",
+                "strategy_name": "Track C Strategy",
+                "title": "Track C report",
+                "summary": "Summary",
+                "status": "sent",
+                "report_date": "2026-07-20",
+                "weekday": "Monday",
+                "sent_at": "2026-07-20T10:10:00Z",
+                "created_at": "2026-07-20T10:00:00Z",
+                "updated_at": "2026-07-20T10:05:00Z",
+                "sort_at": "2026-07-20T10:10:00Z",
+                "run_config_jsonb": {"strategyName": "Track C Strategy", "instrumentName": "Track C Instrument", "ticker": "005930"},
+                "run_strategy_id": "strategy-1",
+                "buy_count": 2,
+                "hold_count": 1,
+                "drop_count": 1,
+                "recommendation_score": 7.4,
+                "market_snapshot": [],
+            }
+        ]
+
+    monkeypatch.setattr(existing_report_queries, "fetch_all", fake_fetch_all)
+
+    result = await existing_report_queries.list_reports(FakeEngine(), user_id="42", q="삼성전자")
+
+    assert recorded["engine"] is not None
+    assert recorded["params"]["user_id"] == "42"
+    assert recorded["params"]["q"] == "%삼성전자%"
+    assert "COALESCE(report.title, '') ILIKE :q" in str(recorded["sql"])
+    assert "COALESCE(profile.name, '') ILIKE :q" in str(recorded["sql"])
+    assert "EXISTS (SELECT 1 FROM app.strategy_email_report_candidate AS candidate" in str(recorded["sql"])
+    assert "candidate.ticker ILIKE :q" in str(recorded["sql"])
+    assert "candidate.web_projection" in str(recorded["sql"])
+    assert result["items"][0]["id"] == "report-1"
+
+
+@pytest.mark.asyncio
 async def test_track_c_list_reports_paginates_with_cursor(monkeypatch):
     recorded: dict[str, object] = {}
 

@@ -13,12 +13,16 @@ test("trading candidate meta keeps confidence when present and omits it when abs
   assert.equal(formatTradingCandidateMeta({ price: "₩100,000" }), "₩100,000");
 });
 
-test("search page uses the shared optional candidate formatter and avoids unconditional confidence dereference", async () => {
+test("search page is report-centric and forwards q to the report list endpoint", async () => {
   const searchPage = await read("../src/pages/SearchPage.tsx");
 
-  assert.match(searchPage, /formatTradingCandidateMeta/);
-  assert.doesNotMatch(searchPage, /candidate\.confidence\.toFixed/);
-  assert.doesNotMatch(searchPage, /candidate\.confidence!/);
-  assert.doesNotMatch(searchPage, /candidate\.confidence as number/);
-  assert.doesNotMatch(searchPage, /candidate\.confidence \?\? 0/);
+  assert.match(searchPage, /getReports\(normalizedQuery\)/);
+  assert.match(searchPage, /ROUTES\.reportDetail/);
+  assert.match(searchPage, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
+  assert.match(searchPage, /Badge variant="info">report<\/Badge>/);
+  assert.doesNotMatch(searchPage, /formatTradingCandidateMeta/);
+  assert.doesNotMatch(searchPage, /kind: "strategy"/);
+  assert.doesNotMatch(searchPage, /kind: "candidate"/);
+  assert.doesNotMatch(searchPage, /ROUTES\.app/);
+  assert.doesNotMatch(searchPage, /tab=trading/);
 });

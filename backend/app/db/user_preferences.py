@@ -79,8 +79,8 @@ async def get_notification_settings(engine: AsyncEngine, *, user_id: str | int, 
     row = await fetch_one(
         engine,
         """
-        SELECT email, daily_report_email, action_emails, marketing_email, delivery_hour, updated_at
-        FROM app.user_notification_settings
+        SELECT email, daily_report_email, action_emails, marketing_email, delivery_hour
+        FROM app.users
         WHERE user_id = :user_id
         """,
         {"user_id": _coerce_user_id(user_id)},
@@ -95,7 +95,7 @@ async def save_notification_settings(
     *,
     user_id: str | int,
     email: str,
-    daily_report_email: bool,
+    daily_report_email: bool | None = None,
     action_emails: bool | None = None,
     marketing_email: bool | None = None,
     delivery_hour: str | None = None,
@@ -105,30 +105,15 @@ async def save_notification_settings(
     row = await execute_one(
         engine,
         """
-        INSERT INTO app.user_notification_settings (
-            user_id,
-            email,
-            daily_report_email,
-            action_emails,
-            marketing_email,
-            delivery_hour
-        )
-        VALUES (
-            :user_id,
-            :email,
-            :daily_report_email,
-            COALESCE(:action_emails, TRUE),
-            COALESCE(:marketing_email, FALSE),
-            COALESCE(:delivery_hour, :default_delivery_hour)
-        )
-        ON CONFLICT (user_id) DO UPDATE
+        UPDATE app.users
         SET
-            email = COALESCE(:email, app.user_notification_settings.email),
-            daily_report_email = COALESCE(:daily_report_email, app.user_notification_settings.daily_report_email),
-            action_emails = COALESCE(:action_emails, app.user_notification_settings.action_emails),
-            marketing_email = COALESCE(:marketing_email, app.user_notification_settings.marketing_email),
-            delivery_hour = COALESCE(:delivery_hour, app.user_notification_settings.delivery_hour),
+            email = COALESCE(:email, app.users.email),
+            daily_report_email = COALESCE(:daily_report_email, app.users.daily_report_email),
+            action_emails = COALESCE(:action_emails, app.users.action_emails),
+            marketing_email = COALESCE(:marketing_email, app.users.marketing_email),
+            delivery_hour = COALESCE(:delivery_hour, app.users.delivery_hour),
             updated_at = now()
+        WHERE user_id = :user_id
         RETURNING email, daily_report_email, action_emails, marketing_email, delivery_hour, created_at, updated_at
         """,
         {
@@ -138,7 +123,6 @@ async def save_notification_settings(
             "action_emails": action_emails,
             "marketing_email": marketing_email,
             "delivery_hour": normalized_delivery_hour,
-            "default_delivery_hour": DEFAULT_NOTIFICATION_DELIVERY_HOUR,
         },
     )
     if row is None:

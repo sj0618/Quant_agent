@@ -73,6 +73,15 @@ def _coerce_limit(limit: int) -> int:
     return max(1, min(value, REPORT_LIST_MAX_LIMIT))
 
 
+def _normalize_search_pattern(query: str | None) -> str | None:
+    if query is None:
+        return None
+    normalized = str(query).strip()
+    if not normalized:
+        return None
+    return f"%{normalized}%"
+
+
 def _cursor_payload(value: str | None, report_id: str | None) -> str | None:
     if value is None or report_id is None:
         return None
@@ -572,6 +581,7 @@ async def list_reports(
     limit: int = REPORT_LIST_DEFAULT_LIMIT,
     cursor: str | None = None,
     status: str | None = None,
+    q: str | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
     sanitized_limit = _coerce_limit(limit)
@@ -582,6 +592,51 @@ async def list_reports(
     if status is not None and str(status).strip():
         filters.append("report.status = :status")
         params["status"] = str(status).strip()
+    search_pattern = _normalize_search_pattern(q)
+    if search_pattern is not None:
+        filters.append(
+            "("
+            "COALESCE(report.title, '') ILIKE :q "
+            "OR COALESCE(report.summary, '') ILIKE :q "
+            "OR COALESCE(report.content_md, '') ILIKE :q "
+            "OR COALESCE(report.content_html, '') ILIKE :q "
+            "OR COALESCE(report.market_brief, '') ILIKE :q "
+            "OR COALESCE(report.market_context, '') ILIKE :q "
+            "OR COALESCE(report.risk_manager_override, '') ILIKE :q "
+            "OR COALESCE(report.conclusion, '') ILIKE :q "
+            "OR COALESCE(report.warning_note, '') ILIKE :q "
+            "OR COALESCE(profile.name, '') ILIKE :q "
+            "OR COALESCE(profile.description, '') ILIKE :q "
+            "OR COALESCE(profile.universe, '') ILIKE :q "
+            "OR COALESCE(profile.entry_summary, '') ILIKE :q "
+            "OR COALESCE(profile.exit_summary, '') ILIKE :q "
+            "OR COALESCE(profile.risk_summary, '') ILIKE :q "
+            "OR COALESCE(profile.tags::text, '') ILIKE :q "
+            "OR COALESCE(run.strategy_id, '') ILIKE :q "
+            "OR COALESCE(run.config_jsonb::text, '') ILIKE :q "
+            "OR COALESCE(report.report_date::text, '') ILIKE :q "
+            "OR COALESCE(report.weekday, '') ILIKE :q "
+            "OR EXISTS ("
+            "SELECT 1 "
+            "FROM app.strategy_email_report_candidate AS candidate "
+            "WHERE candidate.report_id = report.report_id "
+            "AND ("
+            "candidate.ticker ILIKE :q "
+            "OR COALESCE(candidate.name, '') ILIKE :q "
+            "OR COALESCE(candidate.sector, '') ILIKE :q "
+            "OR candidate.signal ILIKE :q "
+            "OR COALESCE(candidate.price, '') ILIKE :q "
+            "OR COALESCE(candidate.change_percent, '') ILIKE :q "
+            "OR COALESCE(candidate.rationale, '') ILIKE :q "
+            "OR COALESCE(candidate.risk_manager_override, '') ILIKE :q "
+            "OR COALESCE(candidate.web_projection, '') ILIKE :q "
+            "OR COALESCE(candidate.evidence_jsonb::text, '') ILIKE :q "
+            "OR COALESCE(candidate.risk_reasons_jsonb::text, '') ILIKE :q"
+            ")"
+            ")"
+            ")"
+        )
+        params["q"] = search_pattern
     if cursor_payload is not None:
         filters.append(
             "(COALESCE(report.sent_at, report.created_at), report.report_id) "

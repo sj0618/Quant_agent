@@ -427,8 +427,16 @@ async def test_track_c_component_integration_store_wrappers_forward_to_query_lay
         observed["analysis_run"] = (_engine, run_id, user_id)
         return {"id": run_id}
 
-    async def fake_list_reports(_engine, *, user_id: str, limit: int = 20, cursor: str | None = None, status: str | None = None):
-        observed["list_reports"] = (_engine, user_id, limit, cursor, status)
+    async def fake_list_reports(
+        _engine,
+        *,
+        user_id: str,
+        limit: int = 20,
+        cursor: str | None = None,
+        status: str | None = None,
+        q: str | None = None,
+    ):
+        observed["list_reports"] = (_engine, user_id, limit, cursor, status, q)
         return {"items": [], "meta": {"limit": limit, "hasMore": False, "nextCursor": None}}
 
     async def fake_get_report(_engine, report_id: str, *, user_id: str | None = None):
@@ -440,13 +448,13 @@ async def test_track_c_component_integration_store_wrappers_forward_to_query_lay
     monkeypatch.setattr(existing_report_queries, "get_report", fake_get_report)
 
     assert await fe_contract_store.get_analysis_run_from_db(engine, "run-1", user_id="42") == {"id": "run-1"}
-    assert await fe_contract_store.list_reports_from_db(engine, user_id="42", limit=5, cursor="cursor", status="sent") == {
+    assert await fe_contract_store.list_reports_from_db(engine, user_id="42", limit=5, cursor="cursor", status="sent", q="삼성전자") == {
         "items": [],
         "meta": {"limit": 5, "hasMore": False, "nextCursor": None},
     }
     assert await fe_contract_store.get_report_from_db(engine, "report-1", user_id="42") == {"id": "report-1"}
     assert observed["analysis_run"] == (engine, "run-1", "42")
-    assert observed["list_reports"] == (engine, "42", 5, "cursor", "sent")
+    assert observed["list_reports"] == (engine, "42", 5, "cursor", "sent", "삼성전자")
     assert observed["report"] == (engine, "report-1", "42")
 
 

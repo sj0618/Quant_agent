@@ -23,7 +23,7 @@ router = APIRouter(tags=["email-reports"])
 class NotificationSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    dailyReportEmail: StrictBool
+    dailyReportEmail: StrictBool | None = None
     email: str | None = Field(default=None, min_length=3)
     actionEmails: StrictBool | None = None
     marketingEmail: StrictBool | None = None

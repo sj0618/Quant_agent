@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from fastapi.staticfiles import StaticFiles
+from fastapi.testclient import TestClient
 
 from app.api.routes import pages
 from app.core.errors import register_exception_handlers
@@ -14,7 +15,18 @@ from tests.unit.test_auth_config import valid_settings
 from tests.unit.test_auth_core import FakeRedis
 
 
-def make_client():
+@pytest.fixture
+def frontend_dist(tmp_path: Path) -> Path:
+    dist = tmp_path / "fe" / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html><html><body>FE SPA</body></html>", encoding="utf-8")
+    (assets / "app.js").write_text("console.log('FE SPA asset');", encoding="utf-8")
+    return dist
+
+
+def make_client(frontend_dist: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(pages, "FE_DIST_DIR", frontend_dist)
     settings = valid_settings(AUTH_PUBLIC_BACKEND_ORIGIN="https://api.example.co.kr")
     app = FastAPI()
     register_exception_handlers(app)
@@ -27,27 +39,38 @@ def make_client():
     return TestClient(app, base_url="https://api.example.co.kr"), app
 
 
-def test_login_page_serves_google_only_backend_hosted_ui():
-    client, _app = make_client()
+def test_login_page_serves_frontend_shell(frontend_dist: Path, monkeypatch: pytest.MonkeyPatch):
+    client, _app = make_client(frontend_dist, monkeypatch)
     response = client.get("/login")
     assert response.status_code == 200
-    body = response.text
-    assert "Continue with Google" in body
-    assert "/static/auth/auth.js" in body
-    disallowed = ["localStorage", "sessionStorage", "accessToken", "fake user", "test login", "테스트 로그인"]
-    assert not any(term in body for term in disallowed)
+    assert response.text == "<!doctype html><html><body>FE SPA</body></html>"
 
 
-def test_app_page_requires_valid_session_then_serves_shell():
-    client, app = make_client()
+def test_app_page_requires_valid_session_then_serves_shell(frontend_dist: Path, monkeypatch: pytest.MonkeyPatch):
+    client, app = make_client(frontend_dist, monkeypatch)
     missing = client.get("/app", follow_redirects=False)
     assert missing.status_code == 303
     assert missing.headers["location"] == "/login"
-    session_id, _csrf = asyncio.run(AuthSessionStore(app.state.redis_client, app.state.settings).create_session(user_id="user-1"))
+    session_id, _csrf = asyncio.run(
+        AuthSessionStore(app.state.redis_client, app.state.settings).create_session(user_id="user-1")
+    )
     response = client.get("/app", cookies={"qa_session": session_id})
     assert response.status_code == 200
-    assert "내 계정" in response.text
-    assert "/static/auth/auth.js" in response.text
+    assert response.text == "<!doctype html><html><body>FE SPA</body></html>"
+
+
+def test_frontend_routes_use_spa_fallback(frontend_dist: Path, monkeypatch: pytest.MonkeyPatch):
+    client, _app = make_client(frontend_dist, monkeypatch)
+    search = client.get("/search")
+    root = client.get("/")
+    asset = client.get("/assets/app.js")
+
+    assert search.status_code == 200
+    assert root.status_code == 200
+    assert asset.status_code == 200
+    assert search.text == "<!doctype html><html><body>FE SPA</body></html>"
+    assert root.text == "<!doctype html><html><body>FE SPA</body></html>"
+    assert asset.text == "console.log('FE SPA asset');"
 
 
 def test_static_auth_js_uses_same_origin_auth_urls_and_no_browser_storage():

@@ -163,7 +163,15 @@ def test_track_c_run_and_report_routes_enforce_owner_scope(monkeypatch):
             return {"id": run_id, "status": "queued", "createdAt": "2026-07-20T00:00:00Z", "strategyId": "strategy-1"}
         return None
 
-    async def fake_list_reports(engine, *, user_id: str, limit: int = 20, cursor: str | None = None, status: str | None = None):
+    async def fake_list_reports(
+        engine,
+        *,
+        user_id: str,
+        limit: int = 20,
+        cursor: str | None = None,
+        status: str | None = None,
+        q: str | None = None,
+    ):
         if user_id == "user-1":
             return {
                 "items": [{"id": "report-1", "runId": "run-1", "title": "Report", "summary": "Summary", "status": "sent"}],
@@ -230,8 +238,16 @@ def test_track_c_complete_and_report_list_routes_forward_filters(monkeypatch):
         observed["email_settings"] = email_settings
         return {"runId": run_id, "reportId": "report-1", "status": "completed", "created": True}
 
-    async def fake_list_reports(engine, *, user_id: str, limit: int = 20, cursor: str | None = None, status: str | None = None):
-        observed["list_filters"] = {"user_id": user_id, "limit": limit, "cursor": cursor, "status": status}
+    async def fake_list_reports(
+        engine,
+        *,
+        user_id: str,
+        limit: int = 20,
+        cursor: str | None = None,
+        status: str | None = None,
+        q: str | None = None,
+    ):
+        observed["list_filters"] = {"user_id": user_id, "limit": limit, "cursor": cursor, "status": status, "q": q}
         return {"items": [], "meta": {"limit": limit, "hasMore": False, "nextCursor": None}}
 
     monkeypatch.setattr(fe_contract.fe_contract_store, "complete_analysis_run_from_db", fake_complete)
@@ -246,7 +262,7 @@ def test_track_c_complete_and_report_list_routes_forward_filters(monkeypatch):
     reports = client.get(
         "/api/v1/reports",
         cookies={app.state.settings.auth_session_cookie_name: session_id},
-        params={"limit": 5, "cursor": "cursor-value", "status": "sent"},
+        params={"limit": 5, "cursor": "cursor-value", "status": "sent", "q": "삼성전자"},
     )
 
     assert completion.status_code == 200
@@ -258,7 +274,7 @@ def test_track_c_complete_and_report_list_routes_forward_filters(monkeypatch):
     assert observed["payload"]["status"] == "completed"
     assert observed["payload"]["result"]["title"] == "Report"
     assert reports.status_code == 200
-    assert observed["list_filters"] == {"user_id": "user-1", "limit": 5, "cursor": "cursor-value", "status": "sent"}
+    assert observed["list_filters"] == {"user_id": "user-1", "limit": 5, "cursor": "cursor-value", "status": "sent", "q": "삼성전자"}
 
 
 def test_report_diagnostics_preserve_contract_and_record_safe_metadata(monkeypatch, caplog):

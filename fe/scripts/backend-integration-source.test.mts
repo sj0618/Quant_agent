@@ -24,23 +24,25 @@ test("reports page restores generated report roles and exports", async () => {
   assert.doesNotMatch(reportList, /getDigestStrategySelection|getEmailDeliveryHistory|reportsHistory|reportStrategies/);
 });
 
-test("search uses current live report and workspace sources instead of app overview", async () => {
+test("search is report-centric and sends q to the live report endpoint", async () => {
   const [searchPage, clientSource] = await Promise.all([
     read("../src/pages/SearchPage.tsx"),
     read("../src/api/quantAgentClient.ts"),
   ]);
 
   assert.match(searchPage, /getReports/);
-  assert.match(searchPage, /getWorkspaceTemplate/);
-  assert.match(searchPage, /refreshLatestAnalysisJob/);
-  assert.match(searchPage, /mergeAnalysisJobIntoOverview/);
-  assert.match(searchPage, /kind: "strategy"/);
-  assert.match(searchPage, /kind: "candidate"/);
-  assert.match(searchPage, /kind: "report"/);
-  assert.match(searchPage, /ROUTES\.app/);
-  assert.match(searchPage, /tab=trading/);
+  assert.match(searchPage, /getReports\(normalizedQuery\)/);
   assert.match(searchPage, /ROUTES\.reportDetail/);
+  assert.match(searchPage, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
+  assert.match(searchPage, /Badge variant="info">report<\/Badge>/);
   assert.doesNotMatch(clientSource, /export async function searchInstruments/);
+  assert.doesNotMatch(searchPage, /getWorkspaceTemplate/);
+  assert.doesNotMatch(searchPage, /refreshLatestAnalysisJob/);
+  assert.doesNotMatch(searchPage, /mergeAnalysisJobIntoOverview/);
+  assert.doesNotMatch(searchPage, /kind: "strategy"/);
+  assert.doesNotMatch(searchPage, /kind: "candidate"/);
+  assert.doesNotMatch(searchPage, /ROUTES\.app/);
+  assert.doesNotMatch(searchPage, /tab=trading/);
   assert.doesNotMatch(searchPage, /getAppOverview/);
   assert.doesNotMatch(searchPage, /searchInstruments/);
 });

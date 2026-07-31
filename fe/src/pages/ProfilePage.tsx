@@ -53,7 +53,7 @@ export function ProfilePage({ initialTab }: ProfilePageProps) {
   if (!session) {
     return null;
   }
-  const providerLabel = "Google ?? ???";
+  const providerLabel = session.user.provider === "google" ? "Google 계정" : session.user.provider;
 
   const handleSaveSettings = async () => {
     if (!settings) {

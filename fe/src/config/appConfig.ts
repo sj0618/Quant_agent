@@ -27,7 +27,7 @@ function trimTrailingSlash(value: string | undefined) {
 }
 
 function aiApiBaseUrl() {
-  return import.meta.env.DEV ? "/ai-api" : trimTrailingSlash(import.meta.env.VITE_AI_API_BASE_URL);
+  return import.meta.env.DEV ? "/ai-api" : trimTrailingSlash(import.meta.env.VITE_AI_API_BASE_URL) || "/ai-api";
 }
 
 function backendApiBaseUrl() {

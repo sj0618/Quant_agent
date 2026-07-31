@@ -46,7 +46,7 @@ export function ReportDetailPage({ id }: ReportDetailPageProps) {
   }
 
   if (!data) {
-    return <AsyncState title="리포트를 찾을 수 없습니다" description="요청한 리포트 ID에 해당하는 mock data가 없습니다." tone="empty" />;
+    return <AsyncState title="리포트를 찾을 수 없습니다" description="요청한 리포트 ID에 해당하는 데이터가 없습니다." tone="empty" />;
   }
 
   return (

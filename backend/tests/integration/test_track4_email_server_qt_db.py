@@ -39,7 +39,6 @@ TARGET_RELATIONS = (
     "app.strategy_email_report",
     "app.strategy_email_report_candidate",
     "app.strategy_email_report_news",
-    "app.user_notification_settings",
     "app.email_digest_subscription",
     "app.email_delivery_history",
 )
@@ -134,7 +133,7 @@ async def _cleanup(context: dict[str, Any], identifiers: list[tuple[str, str, st
     )
     await _execute(
         engine,
-        "DELETE FROM app.user_notification_settings WHERE user_id IN (CAST(:owner_id AS bigint), CAST(:intruder_id AS bigint))",
+        "DELETE FROM app.users WHERE user_id IN (CAST(:owner_id AS bigint), CAST(:intruder_id AS bigint))",
         {"owner_id": owner_id, "intruder_id": intruder_id},
     )
     for run_id, strategy_id, report_id in identifiers:
@@ -163,12 +162,6 @@ async def _cleanup(context: dict[str, Any], identifiers: list[tuple[str, str, st
             "app.users",
             "auth_provider = 'google' AND provider_user_id IN (:owner, :intruder)",
             {"owner": context["owner_provider_id"], "intruder": context["intruder_provider_id"]},
-        ),
-        "user_notification_settings": await _count(
-            engine,
-            "app.user_notification_settings",
-            "user_id IN (CAST(:owner_id AS bigint), CAST(:intruder_id AS bigint))",
-            {"owner_id": owner_id, "intruder_id": intruder_id},
         ),
         "email_digest_subscription": await _count(
             engine,

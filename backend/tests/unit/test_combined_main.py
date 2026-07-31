@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import combined_main
+from app.api.routes import pages
 
 
 class DummySettings:
@@ -82,11 +83,16 @@ async def _failing_ai_lifespan(order: list[str]):
 
 
 @pytest.fixture
-def patched_general_startup(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+def patched_general_startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
     settings = DummySettings()
     redis_client = DummyRedis()
     db_engine = object()
     trading_engine = object()
+    frontend_dist = tmp_path / "fe" / "dist"
+    (frontend_dist / "assets").mkdir(parents=True)
+    (frontend_dist / "index.html").write_text("<!doctype html><html><body>Combined FE</body></html>", encoding="utf-8")
+    (frontend_dist / "assets" / "app.js").write_text("console.log('Combined FE asset');", encoding="utf-8")
+    monkeypatch.setattr(pages, "FE_DIST_DIR", frontend_dist)
 
     def fake_load_settings():
         return settings
@@ -115,6 +121,7 @@ def patched_general_startup(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "redis_client": redis_client,
         "db_engine": db_engine,
         "trading_engine": trading_engine,
+        "frontend_dist": frontend_dist,
     }
 
 
@@ -209,6 +216,8 @@ def test_combined_route_surface_routes_general_and_ai_without_cross_shadowing(
         unauthenticated_me = client.get("/api/v1/auth/me")
         ai_health = client.get("/ai-api/health")
         ai_api_status = client.get("/ai-api/api-status")
+        frontend_root = client.get("/search")
+        frontend_asset = client.get("/assets/app.js")
         ai_not_found = client.get("/ai-api/not-found")
         general_not_found = client.get("/api/v1/not-found")
         bare_analysis_jobs = client.get("/analysis-jobs")
@@ -229,6 +238,12 @@ def test_combined_route_surface_routes_general_and_ai_without_cross_shadowing(
 
     assert ai_api_status.status_code == 200
     assert ai_api_status.json()["service"] == "QuantAgent AI API"
+
+    assert frontend_root.status_code == 200
+    assert "Combined FE" in frontend_root.text
+
+    assert frontend_asset.status_code == 200
+    assert frontend_asset.text == "console.log('Combined FE asset');"
 
     assert ai_not_found.status_code == 404
     assert ai_not_found.headers["content-type"].startswith("application/json")
