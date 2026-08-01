@@ -31,7 +31,7 @@ jobs:
 
       - name: Build
         working-directory: fe
-        run: VITE_AI_API_BASE_URL="/ai-api" npm run build
+        run: npm run build
 
       - name: Setup SSH key
         run: |
@@ -226,17 +226,24 @@ jobs:
             }
 
             stop_listeners_on_port 18001
-            stop_listeners_on_port 18003
             stop_listeners_on_port 18000
-            rm -f "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
+            rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
 
             cd "$APP_DIR"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
               --host 0.0.0.0 \
-              --port 18000 \
+              --port 18001 \
               --reload \
               > "$RUN_DIR/combined.log" 2>&1 &
             echo "$!" > "$RUN_DIR/combined.pid"
+
+            cd "$APP_DIR/fe"
+            nohup env \
+              COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18001" \
+              VITE_AI_API_BASE_URL="/ai-api" \
+              npm run dev -- --host 0.0.0.0 --port 18000 \
+              > "$RUN_DIR/fe.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/fe.pid"
 
             wait_for_url() {
               local name="$1"
@@ -254,8 +261,8 @@ jobs:
               return 1
             }
 
-            wait_for_url "Combined backend" "http://127.0.0.1:18000/combined-health" "$RUN_DIR/combined.log"
-            wait_for_url "General backend" "http://127.0.0.1:18000/health" "$RUN_DIR/combined.log"
-            wait_for_url "AI API" "http://127.0.0.1:18000/ai-api/health" "$RUN_DIR/combined.log"
-            wait_for_url "FE SPA" "http://127.0.0.1:18000/search" "$RUN_DIR/combined.log"
+            wait_for_url "Combined backend" "http://127.0.0.1:18001/combined-health" "$RUN_DIR/combined.log"
+            wait_for_url "General backend" "http://127.0.0.1:18001/health" "$RUN_DIR/combined.log"
+            wait_for_url "AI API" "http://127.0.0.1:18001/ai-api/health" "$RUN_DIR/combined.log"
+            wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
           REMOTE
