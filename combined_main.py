@@ -25,6 +25,25 @@ general_app = general_main.app
 ai_app = ai_main.app
 
 
+class LegacyAiPrefixCompatibilityMiddleware:
+    """Compatibility for stripped /analysis-jobs requests; only that family is restored."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            if isinstance(path, str) and (path == "/analysis-jobs" or path.startswith("/analysis-jobs/")):
+                rewritten_scope = dict(scope)
+                rewritten_scope["path"] = f"/ai-api{path}"
+                raw_path = scope.get("raw_path")
+                if isinstance(raw_path, bytes):
+                    rewritten_scope["raw_path"] = b"/ai-api" + raw_path
+                scope = rewritten_scope
+        await self.app(scope, receive, send)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     stack = AsyncExitStack()
@@ -55,6 +74,7 @@ def create_app() -> FastAPI:
     def combined_health() -> dict[str, str]:
         return {"status": "ok", "service": "quantagent-combined-backend"}
 
+    app.add_middleware(LegacyAiPrefixCompatibilityMiddleware)
     app.mount("/ai-api", ai_app)
     app.mount("/", general_app)
     return app
