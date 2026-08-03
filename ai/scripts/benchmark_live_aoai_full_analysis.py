@@ -6,9 +6,11 @@ import json
 import os
 import time
 from typing import Any
+from unittest.mock import patch
 
 from ai_graph.audit import RecordingAuditSession, create_audit_correlation
 from ai_graph.graph import build_graph
+from ai_graph.llm.role_calls import resolve_strategy_intent
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus
 
 
@@ -21,6 +23,47 @@ DEFAULT_QUERY = (
     "stop loss, and a 30% take profit. Do not use fundamental, macro, news, flow, "
     "short-interest, sector, web, or sentiment filters."
 )
+
+
+def _emit(event: str, **fields: Any) -> None:
+    print(
+        json.dumps({"benchmark_event": event, **fields}, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
+
+
+class ProgressAuditSession(RecordingAuditSession):
+    def start_agent_execution(self, agent_name: str, **kwargs: Any) -> Any:
+        execution_id = super().start_agent_execution(agent_name, **kwargs)
+        _emit("node_started", name=agent_name)
+        return execution_id
+
+    def finish_agent_execution(self, execution_id: Any, **kwargs: Any) -> None:
+        super().finish_agent_execution(execution_id, **kwargs)
+        record = self._agent_executions[execution_id]
+        _emit(
+            "node_finished",
+            name=record.agent_name,
+            status=record.status,
+            seconds=round(float(record.latency_ms or 0) / 1000.0, 6),
+        )
+
+    def start_model_call(self, **kwargs: Any) -> Any:
+        call_id = super().start_model_call(**kwargs)
+        _emit("model_started", task_type=kwargs["task_type"])
+        return call_id
+
+    def finish_model_call(self, call_id: Any, **kwargs: Any) -> None:
+        super().finish_model_call(call_id, **kwargs)
+        record = self._model_calls[call_id]
+        _emit(
+            "model_finished",
+            task_type=record.task_type,
+            status=record.status,
+            seconds=round(float(record.latency_ms or 0) / 1000.0, 6),
+            retry_count=record.retry_count,
+            error_message=record.error_message,
+        )
 
 
 def _node_results(session: RecordingAuditSession) -> list[dict[str, Any]]:
@@ -132,15 +175,23 @@ def main() -> int:
         entrypoint="benchmark_live_aoai_full_analysis",
         feature="live_aoai_full_analysis",
     )
-    session = RecordingAuditSession(correlation)
+    session = ProgressAuditSession(correlation)
     started = time.perf_counter()
     error: Exception | None = None
     envelope = None
     state: Mapping[str, Any] | None = None
+
+    def fixed_strategy_intent(**kwargs: Any) -> dict[str, Any] | None:
+        result = resolve_strategy_intent(**kwargs)
+        if result is not None and result.get("scope") == "supported":
+            result["resolved_query"] = args.query
+        return result
+
     try:
-        state = build_graph(audit_session=session).invoke(
-            {"user_query": args.query, "trace_id": trace_id}
-        )
+        with patch("ai_graph.graph.resolve_strategy_intent", fixed_strategy_intent):
+            state = build_graph(audit_session=session).invoke(
+                {"user_query": args.query, "trace_id": trace_id}
+            )
         envelope = APIEnvelope.model_validate(state["envelope"])
     except Exception as exc:
         error = exc
