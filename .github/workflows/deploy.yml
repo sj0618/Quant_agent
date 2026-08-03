@@ -65,6 +65,55 @@ jobs:
             ./ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
 
+      - name: Configure production Google auth
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          test -n "$GOOGLE_CLIENT_ID"
+          test -n "$GOOGLE_CLIENT_SECRET"
+
+          auth_env_file="$RUNNER_TEMP/google-auth.env"
+          trap 'rm -f "$auth_env_file"' EXIT
+          umask 077
+          {
+            printf '%s\n' 'APP_ENV=production'
+            printf '%s\n' 'AUTH_ENABLED=true'
+            printf 'GOOGLE_CLIENT_ID=%s\n' "$GOOGLE_CLIENT_ID"
+            printf 'GOOGLE_CLIENT_SECRET=%s\n' "$GOOGLE_CLIENT_SECRET"
+            printf '%s\n' 'GOOGLE_REDIRECT_URI=https://qt-agent.kro.kr/auth/google/callback'
+            printf '%s\n' 'AUTH_PUBLIC_BACKEND_ORIGIN=https://qt-agent.kro.kr'
+            printf '%s\n' 'AUTH_ALLOWED_ORIGINS=https://qt-agent.kro.kr'
+            printf '%s\n' 'AUTH_ALLOWED_HOSTS=qt-agent.kro.kr,localhost,127.0.0.1'
+            printf '%s\n' 'AUTH_COOKIE_SECURE=true'
+            printf '%s\n' 'AUTH_COOKIE_SAMESITE=lax'
+          } > "$auth_env_file"
+
+          scp -q -i ~/.ssh/id_rsa -P 30233 "$auth_env_file" \
+            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/.env.auth.upload
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+            set -euo pipefail
+            APP_DIR="$HOME/mvp_sp1/quant-proj"
+            env_file="$APP_DIR/.env"
+            incoming="$APP_DIR/.env.auth.upload"
+            next_file="$(mktemp "$APP_DIR/.env.next.XXXXXX")"
+            trap 'rm -f "$incoming" "$next_file"' EXIT
+            chmod 600 "$incoming"
+
+            if [ -f "$env_file" ]; then
+              backup_file="$APP_DIR/.env.backup.$(date -u +%Y%m%dT%H%M%SZ)"
+              cp -p "$env_file" "$backup_file"
+              chmod 600 "$backup_file"
+              grep -Ev '^(APP_ENV|AUTH_ENABLED|GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|GOOGLE_REDIRECT_URI|AUTH_PUBLIC_BACKEND_ORIGIN|AUTH_ALLOWED_ORIGINS|AUTH_ALLOWED_HOSTS|AUTH_COOKIE_SECURE|AUTH_COOKIE_SAMESITE)=' \
+                "$env_file" > "$next_file" || true
+            fi
+            cat "$incoming" >> "$next_file"
+            chmod 600 "$next_file"
+            mv "$next_file" "$env_file"
+            rm -f "$incoming"
+            trap - EXIT
+          REMOTE
+
       - name: Install and restart development servers
         run: |
           ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
@@ -82,9 +131,29 @@ jobs:
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
 
+            for auth_var in \
+              AUTH_ENABLED \
+              GOOGLE_CLIENT_ID \
+              GOOGLE_CLIENT_SECRET \
+              GOOGLE_REDIRECT_URI \
+              AUTH_PUBLIC_BACKEND_ORIGIN \
+              AUTH_ALLOWED_ORIGINS \
+              AUTH_ALLOWED_HOSTS \
+              AUTH_COOKIE_SECURE \
+              AUTH_COOKIE_SAMESITE
+            do
+              unset "$auth_var"
+            done
+            export APP_ENV=production
+
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
             "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/backend" -e "$APP_DIR/ai"
+            (
+              cd "$APP_DIR"
+              "$APP_DIR/ai/.venv/bin/python" -c \
+                'from app.core.config import load_settings; settings = load_settings(); assert settings.is_production, "APP_ENV must be production"; assert settings.auth_enabled, "AUTH_ENABLED must be true"; assert settings.auth_cookie_secure, "AUTH_COOKIE_SECURE must be true"; assert settings.google_redirect_uri == "https://qt-agent.kro.kr/auth/google/callback", "GOOGLE_REDIRECT_URI mismatch"; assert "https://qt-agent.kro.kr" in settings.allowed_origins, "AUTH_ALLOWED_ORIGINS mismatch"'
+            )
 
             "$APP_DIR/ai/.venv/bin/python" - "$APP_DIR" <<'PY'
           import os
@@ -265,4 +334,23 @@ jobs:
             wait_for_url "General backend" "http://127.0.0.1:18001/health" "$RUN_DIR/combined.log"
             wait_for_url "AI API" "http://127.0.0.1:18001/ai-api/health" "$RUN_DIR/combined.log"
             wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
+
+            auth_headers="$(mktemp "$RUN_DIR/google-auth-smoke.headers.XXXXXX")"
+            auth_body="$(mktemp "$RUN_DIR/google-auth-smoke.body.XXXXXX")"
+            curl -fsS -D "$auth_headers" -o "$auth_body" \
+              'http://127.0.0.1:18000/api/v1/auth/google/start?redirect_uri=https%3A%2F%2Fqt-agent.kro.kr%2Fauth%2Fgoogle%2Fcallback&return_to=%2Fapp'
+            grep -Eqi '^set-cookie: qa_oauth_state=.*Path=/api/v1/auth/google' "$auth_headers"
+            cd "$APP_DIR"
+            "$APP_DIR/ai/.venv/bin/python" - "$auth_body" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          from urllib.parse import parse_qs, urlsplit
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          query = parse_qs(urlsplit(payload["authorizationUrl"]).query)
+          assert query["redirect_uri"] == ["https://qt-agent.kro.kr/auth/google/callback"]
+          assert query["client_id"][0].endswith(".apps.googleusercontent.com")
+          PY
+            rm -f "$auth_headers" "$auth_body"
           REMOTE
