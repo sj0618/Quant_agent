@@ -5,8 +5,15 @@ import pytest
 
 from ai_graph.audit import RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
-from ai_graph.graph import DEBUG_STORE, NODE_SEQUENCE, run_analysis
+from ai_graph.graph import (
+    DEBUG_STORE,
+    NODE_SEQUENCE,
+    ambiguity_classifier_node,
+    classify_query,
+    run_analysis,
+)
 from ai_graph.jobs import InMemoryAnalysisJobStore
+from ai_graph.schemas import AmbiguityCode, EnvelopeStatus
 
 
 def test_rsi_strategy_runs_ready_e2e_without_external_keys() -> None:
@@ -81,16 +88,16 @@ def test_ready_analysis_connects_trace_nodes_model_calls_and_full_prompts() -> N
     )
 
 
-def test_clarification_route_logs_only_nodes_that_really_execute() -> None:
+def test_out_of_scope_route_logs_only_nodes_that_really_execute() -> None:
     sink = RecordingAuditSink()
 
     envelope = run_analysis(
-        "저평가주 사줘",
-        trace_id="trace-logging-clarify",
+        "옵션 양매도 전략 만들어줘",
+        trace_id="trace-logging-rejected",
         audit_sink=_create_test_audit_sink(sink),
     )
 
-    assert envelope.status == "need_clarification"
+    assert envelope.status == "rejected"
     assert [record.agent_name for record in sink.sessions[0].agent_executions] == [
         "Supervisor",
         "Ambiguity Classifier",
@@ -100,40 +107,38 @@ def test_clarification_route_logs_only_nodes_that_really_execute() -> None:
     assert sink.sessions[0].model_calls == ()
 
 
-def test_ambiguous_value_request_returns_cards() -> None:
-    envelope = run_analysis("저평가주 사줘", trace_id="trace-c1")
+def test_underspecified_request_is_answered_instead_of_questioned() -> None:
+    """The user asked for a strategy because they did not want to write one.
 
-    assert envelope.status == "need_clarification"
-    assert len(envelope.user_payload.candidate_cards) == 3
-    assert envelope.user_payload.candidate_cards[0].strategy_id == "value_quality"
-    assert {card.strategy_id for card in envelope.user_payload.candidate_cards} <= {
-        "value_quality",
-        "dividend_defensive",
-        "reasonable_growth",
-    }
-    assert envelope.user_payload.question
-    assert len(envelope.user_payload.options) == 3
-    assert envelope.user_payload.recommended == 0
-    assert envelope.retryable is True
+    "저평가주 사줘" names no market, rule, period or risk level, and used to come back
+    as a question about all four - the user doing the work twice. Asserted on the
+    interpreter rather than end to end so the expectation is about what it decided,
+    not about what the backtest happened to return.
+    """
+
+    state = ambiguity_classifier_node({"user_query": "저평가주 사줘", "trace_id": "trace-c1"})
+
+    assert state["status"] == EnvelopeStatus.READY.value
+    assert state["ambiguity"]["needs_clarification_after_source_check"] is False
+    assert state["ambiguity"]["clarification_blocker_type"] is None
 
 
-def test_clarification_cards_stay_related_to_prompt_family() -> None:
-    dividend = run_analysis("배당주 찾아줘", trace_id="trace-dividend-clarification")
-    growth = run_analysis("성장주 찾아줘", trace_id="trace-growth-clarification")
-
-    assert dividend.status == "need_clarification"
-    assert dividend.user_payload.candidate_cards[0].strategy_id == "dividend_defensive"
-    assert all(
-        "배당" in card.title or "인컴" in card.title or "방어" in card.title
-        for card in dividend.user_payload.candidate_cards
-    )
-
-    assert growth.status == "need_clarification"
-    assert growth.user_payload.candidate_cards[0].strategy_id == "quality_growth"
-    assert all(
-        "성장" in card.title or "퀄리티" in card.title
-        for card in growth.user_payload.candidate_cards
-    )
+@pytest.mark.parametrize(
+    "query",
+    [
+        "돈 버는 전략 만들어서 검증해줘",
+        "네가 알아서 설정해",
+        "화학 관련주 사줘",
+        "좋은 종목 알아서 골라줘",
+        "배당주 찾아줘",
+        "성장주 찾아줘",
+        # Two goals that pull against each other are a trade-off to make, not a
+        # contradiction to hand back.
+        "변동성 낮은 종목으로 단기 급등 잡아줘",
+    ],
+)
+def test_no_phrasing_of_a_krx_stock_request_stops_the_run(query: str) -> None:
+    assert classify_query(query) == AmbiguityCode.READY
 
 
 def test_dividend_candidate_selection_does_not_loop_back_to_clarification() -> None:
@@ -193,12 +198,16 @@ def test_option_short_straddle_is_rejected() -> None:
     assert envelope.retryable is False
 
 
-def test_conflicting_low_volatility_short_surge_requires_clarification() -> None:
-    envelope = run_analysis("변동성 낮은 종목으로 단기 급등 잡아줘", trace_id="trace-c4")
+def test_conflicting_goals_are_traded_off_rather_than_handed_back() -> None:
+    """Low volatility and a short-term surge pull against each other; that is a
+    trade-off the interpreter resolves, not a contradiction the user has to settle."""
 
-    assert envelope.status == "need_clarification"
-    assert "충돌" in envelope.user_payload.message
-    assert envelope.user_payload.question
+    state = ambiguity_classifier_node(
+        {"user_query": "변동성 낮은 종목으로 단기 급등 잡아줘", "trace_id": "trace-c4"}
+    )
+
+    assert state["status"] == EnvelopeStatus.READY.value
+    assert state["ambiguity"]["clarification_blocker_type"] is None
 
 
 def test_supported_prompt_set_avoids_c5_for_krx_stock_screening_language() -> None:

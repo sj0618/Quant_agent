@@ -47,6 +47,9 @@ STRATEGY_REVISION_PROMPT_VERSION = "v1"
 STRATEGY_REVIEW_SCHEMA_NAME = "quantagent.strategy_review.v1"
 STRATEGY_REVIEW_PROMPT_TEMPLATE_NAME = "strategy_review"
 STRATEGY_REVIEW_PROMPT_VERSION = "v1"
+STRATEGY_INTENT_SCHEMA_NAME = "quantagent.strategy_intent.v1"
+STRATEGY_INTENT_PROMPT_TEMPLATE_NAME = "strategy_intent"
+STRATEGY_INTENT_PROMPT_VERSION = "v1"
 
 
 class RoleDebatePayload(BaseModel):
@@ -569,6 +572,10 @@ For every quantity the strategy depends on, give its standard definition, the fo
 and the raw inputs the formula consumes (e.g. PER = price / earnings per share, inputs:
 price, EPS). Where a term is ambiguous in practice, say which reading you took.
 
+Never report that the request is too vague to work with. If it leaves something open,
+pick the market-standard reading, state it as the reading you took, and carry on -
+strategy_reading always describes a strategy, never a missing input.
+
 Return JSON only:
   strategy_reading - one paragraph on what the strategy screens for
   metrics          - each with name, definition, formula, required_inputs
@@ -623,6 +630,117 @@ def research_screening_terms(*, query: str) -> dict[str, Any] | None:
         return _LiveScreeningResearch.model_validate(payload).model_dump()
     except (LLMClientError, ValidationError, ValueError, TypeError):
         return None
+
+
+STRATEGY_INTENT_SYSTEM_PROMPT = """\
+You are QuantAgent's strategy interpreter for Korean cash equities (KRX).
+
+Your job is to turn WHATEVER the user typed into one concrete, backtestable strategy.
+The user is not a quant and will not be asked follow-up questions - "돈 버는 전략 만들어줘",
+"화학 관련주 사줘", "네가 알아서 설정해" are all valid, complete requests. Treat a vague
+request as a mandate to decide, not as a defect in the input.
+
+So: never ask the user for a market, a period, a risk level or a screening rule. Choose
+them yourself, and say in `assumptions` what you chose and why. A request with nothing
+specified is the easy case, not the blocked one - answer it with the strategy you would
+actually run.
+
+Use the web search tool before deciding. Look up what is currently working or in focus in
+the Korean market, how the sector or theme the user named is usually screened, and the
+conventional parameters for the rule you pick. Ground the choice in what you find rather
+than defaulting to the same textbook rule every time; cite the sources you used.
+
+Constraints on what you may choose:
+- KRX-listed cash equities only (KOSPI/KOSDAQ). No options, futures, FX or crypto.
+- Only conditions computable from daily OHLCV, technical indicators derived from it,
+  and the fundamentals/consensus/flow fields listed in CAPABILITIES. If a natural
+  reading of the request needs something outside that, pick the closest rule that IS
+  computable and record the substitution in `assumptions`.
+- `resolved_query` must stand alone: a downstream engine sees only that string, never
+  the user's original words. Write it in Korean as a single screening instruction
+  naming the universe/sector, the entry conditions with concrete numbers and windows,
+  the exit or holding rule, and the backtest period. No hedging, no options, no
+  questions - one strategy.
+
+Set scope="unsupported" ONLY when the request is inherently about an asset class outside
+KRX cash equities. Set scope="not_a_request" ONLY for a message that is not asking for
+anything to be analysed at all - a greeting, thanks, small talk, or a question about the
+product itself. Anything that asks for stocks to buy, hold, screen or study is a
+request, no matter how briefly it is put: "화학 관련주 사줘" and "돈 되는 거 없나" are
+requests. Vagueness, missing parameters and unfamiliar slang are never grounds for
+either value - resolve them.
+
+Return JSON only:
+  interpretation - one Korean sentence on what the user is asking for
+  resolved_query - the self-contained Korean strategy instruction described above, or
+                   "" when scope is not "supported"
+  assumptions    - Korean sentences, one per decision you made for the user, each
+                   giving the reason ("기간 미지정 → 최근 3년으로 백테스트합니다")
+  scope          - "supported", "unsupported" or "not_a_request"
+  scope_reason   - Korean; why nothing was analysed, or "" when supported
+  citations      - sources you actually consulted, title and url
+"""
+
+
+class _LiveStrategyIntent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    interpretation: str
+    resolved_query: str
+    assumptions: list[str]
+    scope: Literal["supported", "unsupported", "not_a_request"]
+    scope_reason: str
+    citations: list[_LiveRoleCitation]
+
+
+def resolve_strategy_intent(
+    *, query: str, capabilities: list[dict[str, Any]] | None = None
+) -> dict[str, Any] | None:
+    """Turn any request, however vague, into one concrete strategy to run.
+
+    This is the step that decides whether the user gets an answer or a question. Every
+    stage after it reads `resolved_query` instead of the raw input, so the vagueness is
+    resolved once, by a model that can search, rather than re-detected by keyword at
+    each stage. Returns None with no live provider so mock mode keeps its
+    deterministic path.
+    """
+
+    if not is_live_llm_provider():
+        return None
+
+    expected_json_schema = _LiveStrategyIntent.model_json_schema()
+    context = {"query": query, "capabilities": capabilities or []}
+    request = LLMJsonRequest(
+        schema_name=STRATEGY_INTENT_SCHEMA_NAME,
+        system_prompt=STRATEGY_INTENT_SYSTEM_PROMPT,
+        user_prompt=(
+            "Resolve this request into one runnable strategy.\n"
+            "EXPECTED_JSON_SCHEMA="
+            f"{json.dumps(expected_json_schema, ensure_ascii=False, sort_keys=True)}\n"
+            "CAPABILITIES="
+            f"{json.dumps(context['capabilities'], ensure_ascii=False, sort_keys=True, default=str)}\n"
+            f"USER_QUERY={query}"
+        ),
+        # Not 0.0: the point of this call is to pick a strategy worth running, and a
+        # frozen decoder returns the same textbook rule for every vague request.
+        temperature=0.4,
+        enable_web_search=True,
+        task_type="strategy_intent",
+        prompt_template_name=STRATEGY_INTENT_PROMPT_TEMPLATE_NAME,
+        prompt_version=STRATEGY_INTENT_PROMPT_VERSION,
+        response_schema=expected_json_schema,
+        variables_jsonb={**context, "expected_json_schema": expected_json_schema},
+    )
+    try:
+        payload = create_llm_client(role="STRATEGY_INTENT").generate_json(request)
+        resolved = _LiveStrategyIntent.model_validate(payload)
+    except (LLMClientError, ValidationError, ValueError, TypeError):
+        return None
+    if resolved.scope == "supported" and not resolved.resolved_query.strip():
+        # An empty resolution would silently hand the raw vague query back to the
+        # screening stage - the exact failure this call exists to prevent.
+        return None
+    return resolved.model_dump()
 
 
 SCREENING_SQL_SYSTEM_PROMPT = """\

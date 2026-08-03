@@ -301,29 +301,31 @@ def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monk
     assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in create_response.text
     assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in poll_response.text
 
-    clarification_response = client.post(ANALYSIS_JOBS_PATH, json={"query": "저평가주 사줘"})
-    assert clarification_response.status_code == 201
-    clarification_job = _poll_job(client, clarification_response.json()["job_id"])
-    clarification_result = clarification_job["result"]
-    clarification_payload = clarification_result["user_payload"]
+    # An asset class outside KRX cash equities is the one input that still comes back
+    # without a result; an underspecified stock request no longer does.
+    rejected_response = client.post(ANALYSIS_JOBS_PATH, json={"query": "옵션 양매도 전략 만들어줘"})
+    assert rejected_response.status_code == 201
+    rejected_job = _poll_job(client, rejected_response.json()["job_id"])
+    rejected_result = rejected_job["result"]
+    rejected_payload = rejected_result["user_payload"]
 
-    assert clarification_result["status"] == "need_clarification"
-    assert clarification_payload["question"]
-    assert len(clarification_payload["candidate_cards"]) == 3
-    assert len(clarification_payload["options"]) == 3
-    assert clarification_payload["report"] is None
-    assert clarification_payload["performance"] is None
+    assert rejected_result["status"] == "rejected"
+    assert rejected_payload["question"]
+    assert len(rejected_payload["candidate_cards"]) == 3
+    assert len(rejected_payload["options"]) == 3
+    assert rejected_payload["report"] is None
+    assert rejected_payload["performance"] is None
 
-    clarification_poll = client.get(f"{ANALYSIS_JOBS_PATH}/{clarification_job['job_id']}")
-    assert clarification_poll.status_code == 200
-    clarification_polled = clarification_poll.json()
-    assert clarification_polled["job_id"] == clarification_job["job_id"]
-    assert clarification_polled["trace_id"] == clarification_job["trace_id"]
-    assert clarification_polled["result"] == clarification_result
-    assert clarification_polled["result"]["status"] == "need_clarification"
+    rejected_poll = client.get(f"{ANALYSIS_JOBS_PATH}/{rejected_job['job_id']}")
+    assert rejected_poll.status_code == 200
+    rejected_polled = rejected_poll.json()
+    assert rejected_polled["job_id"] == rejected_job["job_id"]
+    assert rejected_polled["trace_id"] == rejected_job["trace_id"]
+    assert rejected_polled["result"] == rejected_result
+    assert rejected_polled["result"]["status"] == "rejected"
 
-    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in clarification_response.text
-    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in clarification_poll.text
+    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in rejected_response.text
+    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in rejected_poll.text
 
 def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adapters() -> None:
     store = InMemoryAnalysisJobStore()

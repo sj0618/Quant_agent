@@ -15,6 +15,13 @@ def test_chitchat_has_no_strategy_intent(query: str) -> None:
         "RSI가 30 이하일 때 매수하는 전략",
         "저평가주 찾아줘",
         "코스피 종목을 백테스트해줘",
+        # An allowlist of strategy words decides by what it fails to recognise, and
+        # greeted these perfectly clear requests instead of running them.
+        "화학 관련주 사줘",
+        "돈 버는 전략 만들어서 검증해줘",
+        "네가 알아서 설정해",
+        "돈 되는 거 없나",
+        "요즘 뭐가 오를까",
     ],
 )
 def test_strategy_requests_keep_entering_the_analysis_pipeline(query: str) -> None:
