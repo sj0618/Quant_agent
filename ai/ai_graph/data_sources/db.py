@@ -184,18 +184,27 @@ class PostgresPipelineDataSource:
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
             ticker_resolution = "screening"
-            if _query_requests_screening(query):
+            already_screened = _query_requests_screening(query)
+            if already_screened:
                 screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
             single_ticker: str | None = None
             if not screening_candidates:
                 single_ticker = self._resolve_ticker(conn, query)
                 if single_ticker is None:
-                    # Ambiguous query (no explicit ticker, no name match): retry as
-                    # a broad condition screen instead of silently trading a
-                    # single hardcoded default ticker.
-                    screening_candidates, screening_relaxation = self._screen_with_relaxation(
-                        conn, query
-                    )
+                    # Ambiguous query (no explicit ticker, no name match): screen as a
+                    # broad condition search instead of silently trading a single
+                    # hardcoded default ticker.
+                    #
+                    # Only if we have not already done exactly that. The baseline screen
+                    # scans every ticker in feature.kis_adjusted_ohlcv_daily and runs on
+                    # the widened backtest budget; running it a second time with the same
+                    # query and the same thresholds cannot produce a different answer, and
+                    # for a screen that legitimately matched nothing today it doubled the
+                    # cost of the request and pushed it into a statement timeout.
+                    if not already_screened:
+                        screening_candidates, screening_relaxation = self._screen_with_relaxation(
+                            conn, query
+                        )
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
                         if screening_candidates

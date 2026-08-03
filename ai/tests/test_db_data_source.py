@@ -675,3 +675,54 @@ def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     assert bundle.metadata["l4_evidence_source"] == "raw.analyst_report_summary"
     assert bundle.metadata["backtest_lookback_days"] >= DEFAULT_BACKTEST_LOOKBACK_DAYS
     assert any(row.get("rsi", 100) <= RSI_OVERSOLD_THRESHOLD for row in bundle.price_rows)
+
+
+def test_empty_screen_is_not_re_run_for_the_same_query() -> None:
+    """A screen that matched nothing must not be repeated inside the same load().
+
+    The baseline screen scans every ticker in feature.kis_adjusted_ohlcv_daily with six
+    window functions over 420 days and runs on the widened backtest statement budget.
+    `load()` used to call it once for the screening branch and then, on the ambiguous
+    fallback, call it again with the same query and the same thresholds - which cannot
+    return anything different. For a screen that legitimately matched nothing today
+    (e.g. no KOSPI200 name is at RSI <= 30) that doubled the cost of the request and
+    pushed it past the statement timeout, surfacing as
+    "데이터 조회 시간이 초과되었습니다".
+    """
+
+    class Result:
+        def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
+            self.rows = rows or []
+
+        def fetchall(self) -> list[dict[str, object]]:
+            return self.rows
+
+        def fetchone(self) -> dict[str, object] | None:
+            return self.rows[0] if self.rows else None
+
+    class CountingConnection:
+        def __init__(self) -> None:
+            self.baseline_screens = 0
+
+        def __enter__(self) -> "CountingConnection":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def rollback(self) -> None:
+            return None
+
+        def execute(self, query: str, params: list[object] | None = None) -> Result:
+            if "FROM matched" in query:
+                self.baseline_screens += 1
+            return Result([])
+
+    connection = CountingConnection()
+    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://fake/fake"))
+    source._connect = lambda: connection  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="no screening candidates"):
+        source.load("RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어", "trace-dup")
+
+    assert connection.baseline_screens == 1
