@@ -42,7 +42,9 @@ DEFAULT_FIXTURE_VOLUME = 1_000_000.0
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 METRIC_ROUND_DIGITS = 6
 MIN_RETURNS_FOR_SPLIT = 4
-BACKTEST_SPLIT_FRACTION = 0.5
+# Candidates are selected using only the first 70% of the history.  The final 30%
+# is deliberately kept untouched until after selection, so it is a real hold-out.
+BACKTEST_SPLIT_FRACTION = 0.7
 PUBLIC_EQUITY_CURVE_POINTS = 12
 MIN_OBJECTIVE_TRADES = 5
 # Below this many matched names, a backtest describes the names, not the strategy, and
@@ -67,10 +69,9 @@ AI_BACKTEST_CANDIDATE_TIMEOUT_ENV = "AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS"
 DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 180.0
 AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
 DEFAULT_WALL_BUDGET_SECONDS = 540.0
-# One bounded refinement is enough to test nearby parameters. A second six-candidate
-# round added 75 seconds on production data without changing the winner, while also
-# increasing multiple-comparisons overfitting risk.
-MAX_SELF_IMPROVEMENT_ROUNDS = 1
+# A small, bounded second refinement lets the search test a different parameter
+# neighbourhood while the hold-out remains unavailable to selection.
+MAX_SELF_IMPROVEMENT_ROUNDS = 2
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
 BACKTEST_ENGINE_VERSION = "candidate-engine.v2"
 BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v2"
@@ -988,6 +989,9 @@ def _evaluate_candidate(
         _summary_float_default(engine_summary, "trade_count", 0.0),
         float(execution_audit["executed_buy_count"]),
     )
+    engine_summary["selection_buy_count"] = _selection_signal_action_count(
+        engine_result, rows, "BUY"
+    )
     return _CandidateEvaluation(
         candidate=enriched_candidate,
         engine_summary=engine_summary,
@@ -1231,15 +1235,11 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                     detail=_selected_candidate_detail(result),
                 )
             else:
-                # No improvement from another 36 variants means more of them will not help
-                # either - they just add rules fitted to the same noise. Stop rather than
-                # grind through a third round that can only overfit further.
                 report_activity(
                     "step",
                     label=f"자가개선 {iteration}차 · 개선 없음",
-                    detail="추가 변형이 성과를 높이지 못해 최적화를 중단합니다.",
+                    detail="선택 구간에서 개선은 없었습니다. 다음 제한 탐색 구간을 확인합니다.",
                 )
-                break
         result = result.model_copy(
             update={
                 "fallback_reasons": fallback_reasons,
@@ -1570,6 +1570,8 @@ def _metrics_from_engine_result(engine_result) -> BacktestMetrics:
         native=selection_mode,
     )
     degradation = _degradation(in_sample_sharpe, out_sample_sharpe)
+    split_index = max(1, int(len(daily_returns) * BACKTEST_SPLIT_FRACTION))
+    in_sample_returns = daily_returns[:split_index]
     return BacktestMetrics(
         sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
         max_drawdown=round(_summary_float(summary, "max_drawdown"), METRIC_ROUND_DIGITS),
@@ -1583,6 +1585,10 @@ def _metrics_from_engine_result(engine_result) -> BacktestMetrics:
         in_sample_sharpe=round(in_sample_sharpe, METRIC_ROUND_DIGITS),
         out_sample_sharpe=round(out_sample_sharpe, METRIC_ROUND_DIGITS),
         degradation=round(degradation, METRIC_ROUND_DIGITS),
+        in_sample_return=round(_compound_returns(in_sample_returns), METRIC_ROUND_DIGITS),
+        in_sample_max_drawdown=round(
+            _max_drawdown_from_returns(in_sample_returns), METRIC_ROUND_DIGITS
+        ),
     )
 
 
@@ -1646,6 +1652,25 @@ def _split_sharpes(
     )
 
 
+def _compound_returns(daily_returns: Sequence[float]) -> float:
+    equity = 1.0
+    for daily_return in daily_returns:
+        equity *= 1.0 + daily_return
+    return equity - 1.0
+
+
+def _max_drawdown_from_returns(daily_returns: Sequence[float]) -> float:
+    equity = 1.0
+    peak = equity
+    max_drawdown = 0.0
+    for daily_return in daily_returns:
+        equity *= 1.0 + daily_return
+        peak = max(peak, equity)
+        if peak > 0.0:
+            max_drawdown = min(max_drawdown, equity / peak - 1.0)
+    return max_drawdown
+
+
 def _sharpe_like(
     daily_returns: list[float],
     *,
@@ -1692,7 +1717,12 @@ def _degradation(in_sample_sharpe: float, out_sample_sharpe: float) -> float:
 
 def _candidate_rank(candidate: CodeCandidate) -> tuple[float, float, float]:
     metrics = _candidate_metrics(candidate)
-    return (metrics.sharpe_ratio, metrics.total_return, metrics.max_drawdown)
+    # Tie-breakers are part of selection too; keep them inside the training slice.
+    return (
+        metrics.in_sample_sharpe,
+        metrics.in_sample_return,
+        metrics.in_sample_max_drawdown,
+    )
 
 
 def _candidate_metrics(candidate: CodeCandidate) -> BacktestMetrics:
@@ -1709,15 +1739,29 @@ def _signal_action_count(engine_result: Any, action: str) -> int:
     )
 
 
+def _selection_signal_action_count(
+    engine_result: Any, rows: Sequence[Mapping[str, Any]], action: str
+) -> int:
+    dates = sorted({str(row.get("date")) for row in rows})
+    if not dates:
+        return 0
+    cutoff = dates[max(0, int(len(dates) * BACKTEST_SPLIT_FRACTION) - 1)]
+    return sum(
+        1
+        for signal in getattr(engine_result, "signals", [])
+        if str(getattr(signal, "action", "")).upper().endswith(action)
+        and str(getattr(signal, "date", "")) <= cutoff
+    )
+
+
 def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
     metrics = _candidate_metrics(result.selected_candidate)
     trade_count = _summary_float_default(result.engine_summary, "effective_trade_count", 0.0)
-    benchmark_return = _summary_float_default(result.backtest_payload, "benchmark_return", 0.0)
     return (
         trade_count >= MIN_OBJECTIVE_TRADES
-        and metrics.sharpe_ratio >= MIN_OBJECTIVE_SHARPE
+        # This gate is a report/acceptance check, so it uses the untouched hold-out.
+        and metrics.out_sample_sharpe >= MIN_OBJECTIVE_SHARPE
         and metrics.max_drawdown >= MAX_OBJECTIVE_DRAWDOWN
-        and metrics.total_return > benchmark_return
     )
 
 
@@ -1732,39 +1776,33 @@ def _objective_score(
     engine_summary: Mapping[str, Any],
     price_rows: Sequence[Mapping[str, Any]],
 ) -> float:
-    trade_count = _summary_float_default(engine_summary, "effective_trade_count", 0.0)
-    benchmark_return = _benchmark_return(price_rows)
-    calmar = _calmar_ratio(metrics.total_return, metrics.max_drawdown)
-    profit_factor = _profit_factor(engine_summary)
-    turnover_penalty = min(1.0, trade_count / max(1.0, len(price_rows)))
-    # Selection is driven by out-of-sample performance, not the full-period Sharpe.
-    # With dozens of threshold variants scored on the same history, the highest
-    # full-period Sharpe is usually the one that best fit the noise - it proves nothing
-    # about the half of the data it was not chosen on. Leading with out_sample_sharpe,
-    # and penalising the in-sample-to-out-sample drop far more heavily, makes the winner
-    # the candidate that generalised rather than the one that memorised.
+    trade_count = _summary_float_default(engine_summary, "selection_buy_count", 0.0)
+    selection_days = max(
+        1, int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION)
+    )
+    annual_return = _annualized_return(
+        metrics.in_sample_return, trading_days=selection_days
+    )
+    calmar = _calmar_ratio(annual_return, metrics.in_sample_max_drawdown)
+    trading_days = selection_days
+    annual_turnover = trade_count * 252.0 / trading_days
+    turnover_penalty = min(1.0, annual_turnover / 24.0)
+    # The hold-out must not affect selection.  It is only used by the objective floor
+    # after a candidate has been selected.
     score = (
-        0.70 * metrics.out_sample_sharpe
-        + 0.30 * metrics.sharpe_ratio
+        1.00 * metrics.in_sample_sharpe
         + 0.05 * calmar
-        + 0.03 * profit_factor
-        + 0.02 * metrics.total_return
+        + 0.02 * annual_return
         - 0.08 * turnover_penalty
-        - 0.30 * metrics.degradation
     )
     if trade_count < MIN_OBJECTIVE_TRADES:
         score -= (MIN_OBJECTIVE_TRADES - trade_count) * 0.05
-    if metrics.max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
+    if metrics.in_sample_max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
         # Was 2x, which let a single deep drawdown swamp every other term and drove the
         # score negative for otherwise strong candidates.
-        score -= abs(metrics.max_drawdown - MAX_OBJECTIVE_DRAWDOWN)
-    if metrics.sharpe_ratio < MIN_OBJECTIVE_SHARPE:
-        score -= (MIN_OBJECTIVE_SHARPE - metrics.sharpe_ratio) * 0.25
-    if metrics.total_return <= benchmark_return:
-        # Trailing the benchmark should cost something, but the raw return gap is on a
-        # different scale from the Sharpe term that leads this score - a 50-point gap
-        # used to dominate everything else. Cap what it can take away.
-        score -= min(abs(benchmark_return - metrics.total_return), 0.5) + 0.05
+        score -= abs(metrics.in_sample_max_drawdown - MAX_OBJECTIVE_DRAWDOWN)
+    if metrics.in_sample_sharpe < MIN_OBJECTIVE_SHARPE:
+        score -= (MIN_OBJECTIVE_SHARPE - metrics.in_sample_sharpe) * 0.25
     return round(score, METRIC_ROUND_DIGITS)
 
 
@@ -1773,6 +1811,22 @@ def _calmar_ratio(total_return: float, max_drawdown: float) -> float:
     if drawdown == 0:
         return 0.0
     return total_return / drawdown
+
+
+def _annualized_return(
+    total_return: float,
+    price_rows: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    trading_days: int | None = None,
+) -> float:
+    effective_days = (
+        trading_days
+        if trading_days is not None
+        else len({str(row.get("date")) for row in price_rows or ()})
+    )
+    if effective_days <= 0 or total_return <= -1.0:
+        return total_return
+    return (1.0 + total_return) ** (252.0 / effective_days) - 1.0
 
 
 def _profit_factor(engine_summary: Mapping[str, Any]) -> float:
@@ -1821,6 +1875,11 @@ def _backtest_payload(
         "first_date": str(rows[0].get("date")) if rows else None,
         "last_date": str(rows[-1].get("date")) if rows else None,
         "benchmark_return": round(_benchmark_return(rows), METRIC_ROUND_DIGITS),
+        "benchmark_method": "static_universe_equal_weight_buy_and_hold",
+        "benchmark_warning": (
+            "This is not the KOSPI200 index. The static universe can contain "
+            "survivorship bias; benchmark comparison is informational only."
+        ),
     }
     fingerprint = repr(sorted(payload.items())).encode("utf-8")
     return {**payload, "payload_hash": sha256(fingerprint).hexdigest()[:16]}

@@ -32,8 +32,7 @@
   --color-drop: #ca2b2b;
   --color-drop-soft: #fee2e2;
 
-  --font-sans: "Inter", "Noto Sans KR", system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", sans-serif;
+  --font-sans: "Pretendard", sans-serif;
 
   /* Toss-ish: softer than the 8px the legacy sheet uses everywhere. */
   --radius-bubble: 18px;

@@ -248,6 +248,7 @@ fe\.playwright-mcp
 
 
 readme_quant.md
+진행상황-문제정의.md
 
 # `lib/` above is a Python build-output rule, but fe/src/lib is application source
 # (shadcn's `cn` helper). It silently swallowed the file and broke the CI build.

@@ -34,8 +34,8 @@ export function LandingPage() {
           <a href="#sample">샘플 리포트</a>
           <a href="#faq">FAQ</a>
         </div>
+        {/* 로그인 링크와 이 버튼은 같은 곳(loginHref)으로 가는 중복 진입점이었다. */}
         <div>
-          <a href={loginHref}>로그인</a>
           <Button onClick={() => window.location.assign(loginHref)} variant="dark">Google로 시작</Button>
         </div>
       </nav>

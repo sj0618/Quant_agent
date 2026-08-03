@@ -319,6 +319,10 @@ class BacktestMetrics(BaseModel):
     in_sample_sharpe: float
     out_sample_sharpe: float
     degradation: float
+    # Selection-only statistics. Defaults preserve compatibility with historical
+    # result payloads that predate the real hold-out split.
+    in_sample_return: float = 0.0
+    in_sample_max_drawdown: float = 0.0
 
 
 class BacktestEquityPoint(BaseModel):
