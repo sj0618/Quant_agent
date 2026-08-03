@@ -59,10 +59,10 @@ p, h1, h2, h3, h4 { margin: 0; }
 .avatar { width: 24px; height: 24px; border-radius: 50%; background: linear-gradient(135deg, #dbeafe, #cbd5e1); display: inline-block; }
 .avatar--large { width: 52px; height: 52px; flex: 0 0 52px; }
 
-.async-state { min-height: 100vh; display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--muted); background: var(--bg); padding: 40px; }
+.async-state { min-height: 100dvh; display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--muted); background: var(--bg); padding: 40px; }
 /* Inside AppLayout the top bar already takes 56px, so a full-viewport block would
    overflow and push the page into a scroll it does not need. */
-.app-shell .async-state { min-height: calc(100vh - 56px); }
+.app-shell .async-state { min-height: calc(100dvh - 56px); }
 .async-state strong { display: block; color: var(--ink); }
 .async-state p { margin-top: 4px; font-size: 13px; }
 .async-state__action { display: inline-block; margin-top: 16px; }
@@ -121,9 +121,9 @@ p, h1, h2, h3, h4 { margin: 0; }
 .site-footer small { background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 4px 10px; }
 
 /* Workspace */
-.app-shell { min-height: 100vh; background: var(--bg); }
-.workspace-shell { min-height: calc(100vh - 56px); display: flex; align-items: flex-start; }
-.workspace-main { flex: 1; min-width: 0; min-height: calc(100vh - 56px); display: flex; flex-direction: column; }
+.app-shell { min-height: 100dvh; background: var(--bg); }
+.workspace-shell { min-height: calc(100dvh - 56px); display: flex; align-items: flex-start; }
+.workspace-main { flex: 1; min-width: 0; min-height: calc(100dvh - 56px); display: flex; flex-direction: column; }
 .workspace-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 32px; text-align: center; color: var(--muted); }
 .workspace-empty strong { color: var(--ink); font-size: 20px; }
 .workspace-empty p { max-width: 520px; font-size: 13px; line-height: 1.6; }
@@ -427,7 +427,7 @@ p, h1, h2, h3, h4 { margin: 0; }
 .report-paper__section--cost a { color: var(--blue); font-weight: 700; }
 
 /* Auth, settings, search, legal */
-.auth-page, .legal-page, .settings-page, .search-page, .strategy-page { min-height: calc(100vh - 56px); padding: 48px 40px 72px; }
+.auth-page, .legal-page, .settings-page, .search-page, .strategy-page { min-height: calc(100dvh - 56px); padding: 48px 40px 72px; }
 .auth-page { display: flex; align-items: center; justify-content: center; background: var(--bg); }
 .auth-panel { width: min(520px, 100%); display: flex; flex-direction: column; gap: 16px; }
 .auth-panel h1, .legal-page h1, .settings-page__head h1 { font-size: 32px; letter-spacing: -0.4px; }
@@ -472,7 +472,7 @@ p, h1, h2, h3, h4 { margin: 0; }
 .search-result-row { display: grid; grid-template-columns: 84px minmax(0, 1fr) auto; gap: 14px; align-items: center; border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 14px 16px; }
 .search-result-row small { display: block; color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 4px; }
 .search-result-row em { color: var(--subdued); font-style: normal; font-size: 12px; font-weight: 800; }
-.not-found { min-height: 100vh; display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; }
+.not-found { min-height: 100dvh; display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; }
 .not-found a { background: var(--ink); color: #fff; border-radius: 8px; padding: 10px 16px; }
 
 @media (max-width: 1180px) {
@@ -538,3 +538,89 @@ p, h1, h2, h3, h4 { margin: 0; }
 .email-template-sections th { color: var(--subdued); font-size: 10px; font-weight: 800; }
 .email-template-sections td:first-child { width: 48px; color: var(--subdued); font-weight: 800; }
 .email-template-notes { display: flex; flex-direction: column; gap: 8px; margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+
+/* ---------------------------------------------------------------------------
+   Phone layout (< 768px)
+   These rules live here rather than as Tailwind variants because the blocks they
+   target (.workspace-main, .tabs, .report-row) get their display and sizing from
+   this same unlayered stylesheet, which outranks every Tailwind layer.
+   --------------------------------------------------------------------------- */
+
+/* Any table wide enough to need it scrolls inside its own box; the page body must
+   never scroll sideways. */
+.table-scroll { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+/* .landing-section centres its children, so they size to content - a 840px-min table
+   dragged the whole section (and the page) wider than the viewport. */
+.landing-section > * { max-width: 100%; min-width: 0; }
+
+@media (max-width: 767px) {
+  /* The workspace pane switch mounts one side at a time. */
+  .workspace-pane-hidden { display: none; }
+  .workspace-shell { min-height: 0; }
+  .workspace-main { min-height: calc(100dvh - 7.25rem); }
+
+  /* Tab strip scrolls instead of squeezing its labels to nothing. */
+  .tabs { height: auto; flex: 0 0 auto; flex-wrap: wrap; gap: 8px; padding: 8px 16px; }
+  .tabs__list { width: 100%; overflow-x: auto; scrollbar-width: none; }
+  .tabs__list::-webkit-scrollbar { display: none; }
+  .tabs__list button { min-height: 44px; white-space: nowrap; }
+
+  .workspace-content { padding: 16px; gap: 12px; }
+  .workspace-progress { width: 100%; padding: 16px; }
+  .workspace-progress__head strong { font-size: 17px; }
+
+  /* Comfortable touch targets on the controls a phone user actually taps. */
+  .button, .pagination button, .reports-page__head button, .export-button { min-height: 44px; }
+  /* A label that breaks mid-word ("로그아/웃") reads as a rendering bug, not a button. */
+  .button, .export-button, .reports-page__head button, .report-subbar button { white-space: nowrap; }
+  .settings-page__head { flex-direction: column; align-items: flex-start; gap: 12px; }
+  .settings-page__head h1 { font-size: 24px; }
+  .filter-group > button, .filter-group > label { min-height: 40px; }
+
+  .reports-page, .settings-page, .search-page, .auth-page, .legal-page { padding: 16px; }
+  .reports-page__head, .list-head { flex-direction: column; align-items: flex-start; gap: 12px; }
+  .reports-page__head h1 { font-size: 22px; }
+  .report-paper__section { padding: 20px 16px; }
+  .report-detail-layout { padding: 16px; }
+  .metric-card { padding: 16px; }
+
+  /* The strategy strip is a 3-column grid next to a 220px-min block; at 375px that
+     leaves each column too narrow to fit a single Korean syllable per line. */
+  .strategy-strip { flex-direction: column; align-items: stretch; gap: 14px; }
+  .strategy-strip > div:first-child { min-width: 0; }
+  .strategy-strip dl { grid-template-columns: 1fr; gap: 12px; }
+  .strategy-strip__actions { flex-wrap: wrap; }
+
+  /* Same problem for the banner label, which was shrinking to two characters a line. */
+  .warning-box { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .warning-box strong { white-space: nowrap; }
+
+  .source-strip { flex-wrap: wrap; }
+  .source-strip a { margin-left: 0; }
+
+  /* One metric per row turns four numbers into four screens of scrolling; two fit. */
+  .metric-grid, .summary-grid, .report-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-card p { font-size: 11px; }
+
+  /* space-between on a 375px row squeezes the title into the control beside it. */
+  .card-head { flex-direction: column; align-items: flex-start; gap: 8px; padding: 14px 16px 10px; }
+  .card-foot { flex-direction: column; gap: 6px; padding: 12px 16px; }
+  .legend-row { flex-wrap: wrap; }
+  .disclaimer { align-items: flex-start; padding: 12px 16px; }
+
+  /* Landing: the brand and the sign-in group sat flush against each other once the
+     section links were hidden, and the hero CTAs split mid-word side by side. */
+  .landing-nav { padding: 12px 16px; gap: 12px; }
+  .landing-nav div { gap: 12px; }
+  .hero { min-height: 0; padding: 48px 20px 56px; }
+  .hero__actions { width: 100%; flex-direction: column; align-items: stretch; }
+  .hero__actions > * { justify-content: center; text-align: center; }
+  .landing-section { padding: 56px 20px; gap: 32px; }
+  .landing-cta { padding: 56px 20px; }
+}
+
+@media (max-width: 400px) {
+  /* Metric values are the one place the default sizes still overflow at 375px. */
+  .metric-card strong, .chat-message__stats strong { font-size: 18px; }
+  .summary-grid, .metric-grid { gap: 8px; }
+}

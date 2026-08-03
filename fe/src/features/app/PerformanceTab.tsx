@@ -95,6 +95,7 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
             <strong>선택 후보 성능 요약</strong>
             <p>후보 코드 백테스트 objective score 기준</p>
           </div>
+          <div className="table-scroll">
           <table className="comparison-table">
             <thead>
               <tr>
@@ -115,6 +116,7 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
               ))}
             </tbody>
           </table>
+          </div>
         </Card>
         {hasMacroEvents ? (
           <Card padded={false}>

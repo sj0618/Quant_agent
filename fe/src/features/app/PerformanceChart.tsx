@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+
 import type { EquityPoint } from "../../types/quantagent";
 
 interface PerformanceChartProps {
@@ -7,7 +9,12 @@ interface PerformanceChartProps {
   series?: Array<keyof Pick<EquityPoint, "strategy" | "original" | "benchmark">>;
 }
 
-const WIDTH = 960;
+/** The viewBox scales uniformly, so its aspect ratio *is* the rendered aspect ratio.
+ *  960 wide against a 300 tall box collapses to a 94px-tall smear on a 375px phone;
+ *  a narrower box keeps the curve readable at the same rendered width. */
+const WIDTH_WIDE = 960;
+const WIDTH_NARROW = 420;
+const NARROW_QUERY = "(max-width: 767px)";
 const PAD_TOP = 18;
 const PAD_BOTTOM = 26;
 /** Room for the y-axis value labels, which the chart never used to draw at all. */
@@ -17,6 +24,23 @@ const MIN_DOMAIN_SPAN = 2;
 const DOMAIN_PADDING_RATIO = 0.08;
 const Y_TICK_TARGET = 5;
 const X_LABEL_TARGET = 6;
+const X_LABEL_TARGET_NARROW = 3;
+
+function useNarrowViewport() {
+  const [narrow, setNarrow] = useState(
+    () => typeof window !== "undefined" && window.matchMedia(NARROW_QUERY).matches,
+  );
+
+  useEffect(() => {
+    const query = window.matchMedia(NARROW_QUERY);
+    const onChange = () => setNarrow(query.matches);
+    onChange();
+    query.addEventListener("change", onChange);
+    return () => query.removeEventListener("change", onChange);
+  }, []);
+
+  return narrow;
+}
 
 type EquitySeriesKey = keyof Pick<EquityPoint, "strategy" | "original" | "benchmark">;
 
@@ -78,6 +102,8 @@ export function PerformanceChart({
   mode = "compact",
   series = ["benchmark", "original", "strategy"],
 }: PerformanceChartProps) {
+  const narrow = useNarrowViewport();
+  const WIDTH = narrow ? WIDTH_NARROW : WIDTH_WIDE;
   const domain = getDomain(points, series);
   const plotHeight = height - PAD_TOP - PAD_BOTTOM;
   const plotWidth = WIDTH - PAD_LEFT - PAD_RIGHT;
@@ -94,7 +120,10 @@ export function PerformanceChart({
   const zeroInRange = domain.min <= 0 && domain.max >= 0;
   // Every date used to be rendered as its own label, so a daily curve produced hundreds of
   // overlapping 10px strings. Show a handful of evenly spaced ones instead.
-  const labelStride = Math.max(1, Math.ceil(points.length / X_LABEL_TARGET));
+  const labelStride = Math.max(
+    1,
+    Math.ceil(points.length / (narrow ? X_LABEL_TARGET_NARROW : X_LABEL_TARGET)),
+  );
 
   return (
     <div className={`performance-chart performance-chart--${mode}`}>
