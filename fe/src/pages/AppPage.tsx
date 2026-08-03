@@ -4,7 +4,9 @@ import { Tabs, type TabItem } from "../components/common/Tabs";
 import { AppLayout } from "../components/layout/AppLayout";
 import {
   clearLatestAnalysisJob,
+  completeAnalysisRun,
   createAnalysisJob,
+  createAnalysisRun,
   aiResponseStatus,
   cancelAnalysisJob,
   getAnalysisJob,
@@ -73,6 +75,7 @@ interface WorkspaceProgress {
   activeLabel: string;
   steps: Array<{ label: string; status: AIJobStageStatus }>;
   error?: string;
+  cancelRequested?: boolean;
 }
 
 function getInitialTab(): WorkspaceTab {
@@ -159,9 +162,9 @@ function WorkspaceEmptyState({
   if (progress) {
     return (
       <section className="workspace-empty workspace-empty--progress">
-        <div className="workspace-progress">
+        <div className={`workspace-progress${progress.cancelRequested ? " is-cancelling" : ""}`}>
           <div className="workspace-progress__head">
-            <span>ANALYSIS JOB</span>
+            <span>{progress.cancelRequested ? "ANALYSIS JOB · 중단 중" : "ANALYSIS JOB"}</span>
             <strong>{progress.activeLabel}</strong>
             <p>{progress.query}</p>
           </div>
@@ -209,9 +212,21 @@ export function AppPage() {
   const [pendingAnalysis, setPendingAnalysis] = useState<PendingAnalysis | null>(null);
   const [progressNow, setProgressNow] = useState(Date.now());
   const [jobErrors, setJobErrors] = useState<Record<string, string>>({});
+  // Jobs restored from a past conversation that never recorded a result. The server's
+  // in-memory store is long gone, so polling them can only ever end in the wall-clock
+  // timeout - they are kept for their chat messages and excluded from every live path.
+  const [inertJobIds, setInertJobIds] = useState<string[]>([]);
+  // Set the instant the user hits stop, before the server has answered. Cancelling only
+  // takes effect at the next node boundary, which can be minutes away; leaving the UI
+  // unchanged until then reads as "the button did nothing".
+  const [cancelledJobIds, setCancelledJobIds] = useState<string[]>([]);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [reportSaveError, setReportSaveError] = useState<string | null>(null);
   // Consecutive polling failures per job; a kept ref so retry counting does not
   // itself retrigger the polling effect.
   const pollAttemptsRef = useRef<Record<string, number>>({});
+  // Jobs already written to the service DB, so a re-render does not save them twice.
+  const persistedJobIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -234,7 +249,7 @@ export function AppPage() {
   }, [conversationHistory]);
 
   useEffect(() => {
-    const hasRunningJob = analysisJobs.some((job) => !job.result);
+    const hasRunningJob = analysisJobs.some((job) => !job.result && !inertJobIds.includes(job.job_id));
     if (!pendingAnalysis && !hasRunningJob) {
       return undefined;
     }
@@ -244,10 +259,12 @@ export function AppPage() {
     }, PROGRESS_TICK_INTERVAL_MS);
 
     return () => window.clearInterval(intervalId);
-  }, [analysisJobs, pendingAnalysis]);
+  }, [analysisJobs, inertJobIds, pendingAnalysis]);
 
   useEffect(() => {
-    const pollingJobs = analysisJobs.filter((job) => !job.result && !jobErrors[job.job_id]);
+    const pollingJobs = analysisJobs.filter(
+      (job) => !job.result && !jobErrors[job.job_id] && !inertJobIds.includes(job.job_id),
+    );
     if (!pollingJobs.length) {
       return undefined;
     }
@@ -312,11 +329,47 @@ export function AppPage() {
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [analysisJobs, jobErrors]);
+  }, [analysisJobs, inertJobIds, jobErrors]);
+
+  // Persist finished analyses into the service DB so they show up under 리포트.
+  //
+  // Deliberately NOT gated on recommendation_gate.validated: a backtest that missed its
+  // target is still a result the user asked for and should be able to look up later. The
+  // gate travels with the report and shows up as a 참고용 label, not as a reason to drop it.
+  useEffect(() => {
+    const persistable = analysisJobs.find(
+      (job) =>
+        job.result?.status === "ready" &&
+        Boolean(job.result.user_payload.report) &&
+        !persistedJobIdsRef.current.has(job.job_id),
+    );
+    if (!persistable) {
+      return;
+    }
+
+    persistedJobIdsRef.current.add(persistable.job_id);
+    void (async () => {
+      try {
+        const run = await createAnalysisRun(persistable);
+        await completeAnalysisRun(run.id, persistable);
+      } catch (error) {
+        // Retry on the next result rather than on a loop - a failed save must not block
+        // the workspace the user is already looking at.
+        persistedJobIdsRef.current.delete(persistable.job_id);
+        setReportSaveError(
+          error instanceof Error
+            ? `분석 결과를 리포트로 저장하지 못했습니다. (${error.message})`
+            : "분석 결과를 리포트로 저장하지 못했습니다.",
+        );
+      }
+    })();
+  }, [analysisJobs]);
 
   // Derived above the loading/error returns below: hooks must run on every render, and
   // useAnalysisActivity would otherwise be skipped while the workspace template loads.
-  const runningJob = [...analysisJobs].reverse().find((job) => !job.result);
+  const runningJob = [...analysisJobs]
+    .reverse()
+    .find((job) => !job.result && !inertJobIds.includes(job.job_id));
   const analysisActivity = useAnalysisActivity(runningJob?.job_id ?? null);
 
   const handleTabChange = (tab: WorkspaceTab) => {
@@ -330,12 +383,16 @@ export function AppPage() {
     setActiveTab(tab);
   };
 
-  if (loading) {
-    return <AsyncState title="워크스페이스를 불러오는 중입니다" tone="loading" />;
-  }
-
-  if (error || !data) {
-    return <AsyncState title="워크스페이스를 불러오지 못했습니다" description={error?.message} tone="error" />;
+  if (loading || error || !data) {
+    return (
+      <AppLayout active="workspace">
+        {loading ? (
+          <AsyncState title="워크스페이스를 불러오는 중입니다" tone="loading" />
+        ) : (
+          <AsyncState title="워크스페이스를 불러오지 못했습니다" description={error?.message} tone="error" />
+        )}
+      </AppLayout>
+    );
   }
 
   const overview = analysisJobs.reduce(
@@ -356,20 +413,27 @@ export function AppPage() {
     ? overview.strategy
     : { ...data.strategy, natural_language_strategy: latestJob?.query ?? data.strategy.natural_language_strategy };
   const historyPreviews = conversationHistory.map((conversation) => conversationPreview(conversation, data));
+  const cancelRequested = Boolean(runningJob && cancelledJobIds.includes(runningJob.job_id));
   const workspaceProgress = buildWorkspaceProgress({
     job: runningJob,
     pendingAnalysis,
     now: progressNow,
     error: runningJob ? jobErrors[runningJob.job_id] : undefined,
+    cancelRequested,
   });
 
-  const handleNewConversation = () => {
+  const archiveCurrentConversation = () => {
     if (analysisJobs.length) {
       setConversationHistory((history) => prependConversation(history, conversationFromJobs(analysisJobs)));
     }
     clearLatestAnalysisJob();
     setAnalysisJobs([]);
     setPendingAnalysis(null);
+    setCancelError(null);
+  };
+
+  const handleNewConversation = () => {
+    archiveCurrentConversation();
     setActiveTab("overview");
   };
 
@@ -382,11 +446,18 @@ export function AppPage() {
     if (lastJob) {
       saveLatestAnalysisJob(lastJob);
     }
-    setConversationHistory((history) => {
-      const historyWithoutRestored = history.filter((item) => item.id !== conversationId);
-      return analysisJobs.length ? prependConversation(historyWithoutRestored, conversationFromJobs(analysisJobs)) : historyWithoutRestored;
-    });
+    // Opening a past conversation used to *remove* it from the list and put the current
+    // one back in its place - so opening one from an empty workspace deleted it outright.
+    // The list is a list: the opened conversation stays, the one being replaced joins it.
+    setConversationHistory((history) =>
+      analysisJobs.length ? prependConversation(history, conversationFromJobs(analysisJobs)) : history,
+    );
+    setInertJobIds((current) => [
+      ...current,
+      ...conversation.jobs.filter((job) => !job.result).map((job) => job.job_id),
+    ]);
     setAnalysisJobs(conversation.jobs);
+    setCancelError(null);
     setActiveTab("overview");
   };
 
@@ -396,28 +467,43 @@ export function AppPage() {
         <StrategyInputPanel
           history={historyPreviews}
           messages={hasCurrentConversation ? overview.chatMessages : []}
+          cancelError={cancelError}
+          cancelRequested={cancelRequested}
           onCancel={async () => {
             if (!runningJob) {
               return;
             }
+            // Flip the UI first. The POST only registers the request - the run keeps going
+            // until the current node ends - so waiting for the response before showing
+            // anything makes the button look broken.
+            setCancelledJobIds((current) => [...current, runningJob.job_id]);
+            setCancelError(null);
             try {
               const cancelled = await cancelAnalysisJob(runningJob.job_id);
               setAnalysisJobs((jobs) =>
                 jobs.map((job) => (job.job_id === cancelled.job_id ? cancelled : job)),
               );
             } catch (error) {
-              console.warn("분석 중단 요청에 실패했습니다.", error);
+              setCancelledJobIds((current) => current.filter((id) => id !== runningJob.job_id));
+              setCancelError(error instanceof Error ? error.message : "분석 중단 요청에 실패했습니다.");
             }
           }}
           running={Boolean(runningJob) || Boolean(pendingAnalysis)}
           onNewConversation={handleNewConversation}
           onAnalyze={async (query) => {
+            // A brand-new strategy starts a brand-new conversation; answering a
+            // clarification or picking a candidate card continues the current one.
+            const awaitingUserInput = latestJob?.result?.status === "need_clarification";
+            const previousJobs = awaitingUserInput ? analysisJobs : [];
+            if (!awaitingUserInput) {
+              archiveCurrentConversation();
+            }
             const pending = { query, startedAt: Date.now() };
             setPendingAnalysis(pending);
             setProgressNow(pending.startedAt);
             try {
               const job = await createAnalysisJob(query);
-              setAnalysisJobs((jobs) => [...jobs, job]);
+              setAnalysisJobs([...previousJobs, job]);
             } finally {
               setPendingAnalysis(null);
             }
@@ -432,6 +518,12 @@ export function AppPage() {
                 <div className="warning-box" role="alert">
                   <strong>검증 미통과</strong>
                   <span>{recommendationGate.reason} 아래 종목은 추천이 아닌 참고용입니다.</span>
+                </div>
+              ) : null}
+              {reportSaveError ? (
+                <div className="warning-box warning-box--error" role="status">
+                  <strong>리포트 저장 실패</strong>
+                  <span>{reportSaveError} 화면의 결과는 그대로 사용할 수 있습니다.</span>
                 </div>
               ) : null}
               <Tabs
@@ -463,11 +555,13 @@ function buildWorkspaceProgress({
   pendingAnalysis,
   now,
   error,
+  cancelRequested = false,
 }: {
   job?: AnalysisJob;
   pendingAnalysis: PendingAnalysis | null;
   now: number;
   error?: string;
+  cancelRequested?: boolean;
 }): WorkspaceProgress | null {
   if (job) {
     const steps = WORKSPACE_PROGRESS_STEPS.map(({ stage, label }) => ({
@@ -479,9 +573,10 @@ function buildWorkspaceProgress({
     return {
       query: job.query,
       percent,
-      activeLabel: activeProgressLabel(steps),
+      activeLabel: cancelRequested ? "중단 요청됨 · 현재 단계까지만 실행합니다" : activeProgressLabel(steps),
       steps,
       error,
+      cancelRequested,
     };
   }
 

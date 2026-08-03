@@ -33,7 +33,12 @@ test("canonical product surface excludes retired history and strategy routes", a
 
   assert.doesNotMatch(routesSource, /reportsHistory|reportStrategies|strategyReportDetail/);
   assert.doesNotMatch(appSource, /ReportsHistoryPage|StrategyReportsPage|StrategyReportDetailPage/);
-  assert.doesNotMatch(profileSource, /EmailHistoryTimeline|getEmailDeliveryHistory|reportsHistory/);
+  // The retired *route* stays retired; the send-history timeline itself lives on /me now.
+  // It was deleted along with that route in 6dadc69 while its backend endpoint stayed live,
+  // so it is asserted present rather than absent.
+  assert.doesNotMatch(profileSource, /reportsHistory/);
+  assert.match(profileSource, /EmailHistoryTimeline/);
+  assert.match(profileSource, /getEmailDeliveries/);
   assert.match(searchSource, /getReports/);
   assert.match(searchSource, /getReports\(normalizedQuery\)/);
   assert.match(searchSource, /ROUTES\.reportDetail/);

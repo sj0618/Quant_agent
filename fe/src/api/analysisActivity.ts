@@ -21,6 +21,14 @@ const SOLO_ROLE_LABELS: Record<string, string> = {
   REPORT_WRITER: "리포트 작성",
 };
 
+/** Where provider calls that carry no role are shown.
+ *
+ * Screening and terminology research stream search queries, citations and text deltas
+ * without a debate role. Those events used to be dropped outright, so the whole 전략 해석
+ * stage looked idle even while the model was visibly working. */
+const UNLABELLED_ROLE_ID = "PROVIDER";
+const UNLABELLED_ROLE_LABEL = "리서치";
+
 /** The log is a tail, not an audit trail - old entries scroll out of view. */
 const MAX_ENTRIES = 14;
 
@@ -95,6 +103,15 @@ function splitRole(role: string | null | undefined) {
   return { voice: null, phase: null, label: soloLabel };
 }
 
+/** Events with no role still belong somewhere; they share one "리서치" lane. */
+function resolveRole(role: string | null | undefined) {
+  const parsed = splitRole(role);
+  if (parsed) {
+    return { id: String(role), ...parsed };
+  }
+  return { id: UNLABELLED_ROLE_ID, voice: null, phase: null, label: UNLABELLED_ROLE_LABEL };
+}
+
 /** The open entry for a role, so streamed text lands on the line it belongs to. */
 function findOpenVoice(entries: ActivityEntry[], role: string): number {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -122,7 +139,17 @@ function append(entries: ActivityEntry[], entry: ActivityEntry): ActivityEntry[]
 
 function reduce(state: ActivityState, event: ActivityEvent): ActivityState {
   if (event.kind === "stage") {
-    return { ...state, stage: event.stage ?? state.stage };
+    // Roleless provider calls have no completion event of their own, so their lane is
+    // closed when the run moves to the next stage - otherwise it spins forever.
+    return {
+      ...state,
+      stage: event.stage ?? state.stage,
+      entries: state.entries.map((entry) =>
+        entry.id === UNLABELLED_ROLE_ID && entry.status === "running"
+          ? { ...entry, status: "done", searching: false }
+          : entry,
+      ),
+    };
   }
 
   if (event.kind === "step") {
@@ -141,39 +168,41 @@ function reduce(state: ActivityState, event: ActivityEvent): ActivityState {
     };
   }
 
-  const parsed = splitRole(event.role);
-  if (!parsed) {
-    // Provider calls outside the debate (screening SQL, terminology research) stream
-    // too; their progress is reported as steps instead.
-    return state;
-  }
-
-  const role = String(event.role);
-  const { voice, phase, label } = parsed;
-  const index = findOpenVoice(state.entries, role);
+  const { id: role, voice, phase, label } = resolveRole(event.role);
+  const openEntry = (entries: ActivityEntry[]) =>
+    append(entries, {
+      id: role,
+      kind: "voice",
+      voice: voice ?? undefined,
+      phase,
+      label,
+      detail: null,
+      status: "running",
+      searching: false,
+      searchQueries: [],
+      citations: [],
+      streamingText: "",
+    });
 
   if (event.kind === "role_started") {
-    return {
-      ...state,
-      entries: append(state.entries, {
-        id: role,
-        kind: "voice",
-        voice: voice ?? undefined,
-        phase,
-        label,
-        detail: null,
-        status: "running",
-        searching: false,
-        searchQueries: [],
-        citations: [],
-        streamingText: "",
-      }),
-    };
+    return { ...state, entries: openEntry(state.entries) };
   }
 
+  // Roleless provider calls never send role_started, so their lane is opened on the first
+  // event that arrives instead of dropping everything until one that never comes.
+  let entries = state.entries;
+  let index = findOpenVoice(entries, role);
   if (index < 0) {
-    return state;
+    if (role !== UNLABELLED_ROLE_ID) {
+      return state;
+    }
+    entries = openEntry(entries);
+    index = findOpenVoice(entries, role);
+    if (index < 0) {
+      return state;
+    }
   }
+  state = { ...state, entries };
   const current = state.entries[index];
 
   switch (event.kind) {

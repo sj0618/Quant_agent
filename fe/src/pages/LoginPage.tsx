@@ -36,7 +36,7 @@ export function LoginPage({ returnTo }: LoginPageProps) {
         </a>
         <Badge variant="dark">GOOGLE LOGIN</Badge>
         <h1>Google 계정으로 시작</h1>
-        <p>로그인 후 요청하신 화면으로 이동합니다. 인증 서버 URL은 환경변수로 주입됩니다.</p>
+        <p>로그인 후 요청하신 화면으로 이동합니다.</p>
 
         {session ? (
           <div className="status-banner status-banner--success">

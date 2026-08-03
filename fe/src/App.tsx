@@ -11,7 +11,7 @@ import { ReportDetailPage } from "./pages/ReportDetailPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { SearchPage } from "./pages/SearchPage";
 import { UnsubscribePage } from "./pages/UnsubscribePage";
-import { getCurrentSession, validateCurrentSession } from "./api/authClient";
+import { getCurrentSession, isSessionRecentlyValidated, validateCurrentSession } from "./api/authClient";
 import { ROUTES, getCurrentPathWithSearch, parseReportDetailId, sanitizeReturnTo } from "./config/routes";
 import type { AuthSession } from "./types/auth";
 
@@ -44,47 +44,33 @@ export default function App() {
 function AppRoutes() {
   const path = normalizePath(window.location.pathname);
   const protectedRoute = isProtectedRoute(path);
-  const [authState, setAuthState] = useState<{
-    error: Error | null;
-    loading: boolean;
-    session: AuthSession | null;
-  }>(() => {
-    const session = getCurrentSession();
-    return { error: null, loading: protectedRoute && Boolean(session), session };
-  });
+  // There is no client-side router, so every navigation remounts the whole app. Blocking
+  // the first paint on /auth/me meant a full-screen "세션을 확인하는 중" on every single
+  // click. The cached session renders immediately and revalidation happens behind it; only
+  // an actual 401 (validateCurrentSession returning null) takes the user to the login page.
+  const [session, setSession] = useState<AuthSession | null>(getCurrentSession);
 
   useEffect(() => {
-    if (!protectedRoute) {
+    if (!protectedRoute || !session || isSessionRecentlyValidated(session)) {
       return;
     }
     let cancelled = false;
     validateCurrentSession()
-      .then((session) => {
+      .then((validatedSession) => {
         if (!cancelled) {
-          setAuthState({ error: null, loading: false, session });
+          setSession(validatedSession);
         }
       })
       .catch((error: unknown) => {
-        if (!cancelled) {
-          setAuthState({
-            error: error instanceof Error ? error : new Error("세션 확인에 실패했습니다."),
-            loading: false,
-            session: null,
-          });
-        }
+        // A network blip is not a signed-out user. Keep what is on screen and let the
+        // next navigation - or the next authenticated request's own 401 - decide.
+        console.warn("로그인 세션 재확인에 실패해 기존 세션을 유지합니다.", error);
       });
     return () => {
       cancelled = true;
     };
-  }, [protectedRoute]);
-
-  if (protectedRoute && authState.loading) {
-    return <AsyncState title="로그인 세션을 확인하는 중입니다" tone="loading" />;
-  }
-
-  if (protectedRoute && authState.error) {
-    return <AsyncState title="로그인 세션을 확인하지 못했습니다" description={authState.error.message} tone="error" />;
-  }
+    // Only the identity matters here; re-running on every session object would loop.
+  }, [protectedRoute, session?.user.id]);
 
   if (path === ROUTES.home) {
     return <LandingPage />;
@@ -122,7 +108,7 @@ function AppRoutes() {
     );
   }
 
-  if (protectedRoute && !authState.session) {
+  if (protectedRoute && !session) {
     return <AuthRequiredPage returnTo={getCurrentPathWithSearch()} />;
   }
 

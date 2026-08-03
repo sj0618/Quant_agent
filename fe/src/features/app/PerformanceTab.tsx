@@ -10,13 +10,37 @@ interface PerformanceTabProps {
   performance: PerformanceSummary;
 }
 
+const RANGE_YEARS: Record<"1Y" | "5Y" | "10Y", number> = { "1Y": 1, "5Y": 5, "10Y": 10 };
+
+/** Trim the curve to the requested window.
+ *
+ * This used to be `slice(-2)` / `slice(-4)` - the last two or four *points*, which has
+ * nothing to do with one or five years and produced a two-point "1Y" chart.
+ */
+function sliceByYears(points: EquityPoint[], range: "1Y" | "5Y" | "10Y"): EquityPoint[] {
+  if (!points.length) {
+    return points;
+  }
+  const lastDate = new Date(points[points.length - 1].date);
+  if (Number.isNaN(lastDate.getTime())) {
+    return points;
+  }
+  const cutoff = new Date(lastDate);
+  cutoff.setFullYear(cutoff.getFullYear() - RANGE_YEARS[range]);
+  const windowed = points.filter((point) => {
+    const parsed = new Date(point.date);
+    return Number.isNaN(parsed.getTime()) || parsed >= cutoff;
+  });
+  // A window that lands on a single point cannot be drawn as a line.
+  return windowed.length >= 2 ? windowed : points;
+}
+
 export function PerformanceTab({ performance }: PerformanceTabProps) {
   const [mode, setMode] = useState<"selected" | "baseline" | "combined">("selected");
   const [range, setRange] = useState<"1Y" | "5Y" | "10Y">("10Y");
-  const points = performance.source === "ai"
-    ? performance.equityCurve
-    : range === "1Y" ? performance.equityCurve.slice(-2) : range === "5Y" ? performance.equityCurve.slice(-4) : performance.equityCurve;
+  const points = performance.source === "ai" ? performance.equityCurve : sliceByYears(performance.equityCurve, range);
   const benchmarkLabel = performance.benchmarkLabel ?? "KOSPI200";
+  const hasMacroEvents = performance.macroEvents.length > 0;
   const hasBenchmarkSeries = points.some((point) => point.benchmark !== 0);
   const series: Array<keyof Pick<EquityPoint, "strategy" | "original" | "benchmark">> =
     [
@@ -63,7 +87,9 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
         <div className="disclaimer"><Badge variant="dark">신뢰구간</Badge>{performance.disclaimer}</div>
       </Card>
 
-      <div className="performance-bottom">
+      {/* 매크로 이벤트는 AI 응답에 실려 오지 않는 경우가 대부분이라, 비어 있으면 카드를
+          아예 렌더하지 않는다. 빈 상자를 남겨두면 화면만 차지하고 알려주는 게 없다. */}
+      <div className={hasMacroEvents ? "performance-bottom" : "performance-bottom performance-bottom--single"}>
         <Card padded={false}>
           <div className="card-head">
             <strong>선택 후보 성능 요약</strong>
@@ -90,23 +116,25 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
             </tbody>
           </table>
         </Card>
-        <Card padded={false}>
-          <div className="card-head">
-            <div>
-              <strong>주요 매크로 이벤트 매핑</strong>
-              <p>{performance.macroEvents.length ? `OOS 구간 내 변동성 이벤트 ${performance.macroEvents.length}건` : "이번 분석 응답에 포함되지 않음"}</p>
-            </div>
-          </div>
-          <div className="macro-list">
-            {performance.macroEvents.length ? performance.macroEvents.map((event) => (
-              <div key={`${event.date}-${event.label}`}>
-                <strong>{event.date}</strong>
-                <span>{event.label}</span>
-                <Badge variant={event.tone}>{event.impact}</Badge>
+        {hasMacroEvents ? (
+          <Card padded={false}>
+            <div className="card-head">
+              <div>
+                <strong>주요 매크로 이벤트 매핑</strong>
+                <p>{`OOS 구간 내 변동성 이벤트 ${performance.macroEvents.length}건`}</p>
               </div>
-            )) : <p>현재 AI 응답에는 매크로 이벤트 매핑 데이터가 없습니다.</p>}
-          </div>
-        </Card>
+            </div>
+            <div className="macro-list">
+              {performance.macroEvents.map((event) => (
+                <div key={`${event.date}-${event.label}`}>
+                  <strong>{event.date}</strong>
+                  <span>{event.label}</span>
+                  <Badge variant={event.tone}>{event.impact}</Badge>
+                </div>
+              ))}
+            </div>
+          </Card>
+        ) : null}
       </div>
     </div>
   );

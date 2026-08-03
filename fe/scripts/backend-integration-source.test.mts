@@ -56,7 +56,8 @@ test("canonical routes exclude retired history and strategy pages", async () => 
 
   assert.doesNotMatch(routesSource, /reportsHistory|reportStrategies|strategyReportDetail/);
   assert.doesNotMatch(appSource, /ReportsHistoryPage|StrategyReportsPage|StrategyReportDetailPage/);
-  assert.doesNotMatch(profilePage, /EmailHistoryTimeline|getEmailDeliveryHistory|reportsHistory/);
+  assert.doesNotMatch(profilePage, /reportsHistory/);
+  assert.match(profilePage, /EmailHistoryTimeline/);
 });
 
 test("report detail keeps generated report export/share/resend actions", async () => {
