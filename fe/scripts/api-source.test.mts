@@ -66,6 +66,13 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   assert.doesNotMatch(authSource, /provider:\s*"test"/);
 });
 
+test("Google callback reuses its one-time exchange under React StrictMode", async () => {
+  const source = await readFile(new URL("../src/pages/AuthCallbackPage.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /useRef<ReturnType<typeof completeGoogleSignIn> \| null>\(null\)/);
+  assert.match(source, /callbackRequestRef\.current \?\?=/);
+});
+
 test("user-scoped cache clearing removes every registered key", () => {
   const removed: string[] = [];
 
