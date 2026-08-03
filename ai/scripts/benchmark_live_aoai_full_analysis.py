@@ -60,6 +60,7 @@ def _model_results(session: RecordingAuditSession) -> list[dict[str, Any]]:
                 "completion_tokens": record.completion_tokens,
                 "total_tokens": record.total_tokens,
                 "retry_count": record.retry_count,
+                "error_message": record.error_message,
                 "system_prompt_chars": (
                     len(prompt.system_prompt) if prompt is not None else None
                 ),

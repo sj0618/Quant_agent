@@ -1,5 +1,6 @@
 import json
 from hashlib import sha256
+import time
 from uuid import uuid4
 
 import httpx
@@ -153,6 +154,46 @@ def test_aoai_client_separates_response_start_and_body_idle_timeouts() -> None:
     assert response_start_timeouts == [10.0]
     # Header arrival is not response start; the 10-second limit remains until text arrives.
     assert body_idle_timeouts == [10.0]
+
+
+def test_aoai_web_search_activity_starts_the_response_timeout() -> None:
+    class SearchStream(httpx.SyncByteStream):
+        def __iter__(self):
+            events = [
+                {"type": "response.web_search_call.searching"},
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "web_search_call",
+                        "action": {"query": "KOSPI strategy"},
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {"output_text": '{"message":"ok"}'},
+                },
+            ]
+            yield f"data: {json.dumps(events[0])}\n\n".encode()
+            time.sleep(0.02)
+            for event in events[1:]:
+                yield f"data: {json.dumps(event)}\n\n".encode()
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=SearchStream(),
+        )
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        response_start_timeout_seconds=0.01,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_json(make_request()) == {"message": "ok"}
 
 
 def test_aoai_client_retries_without_unsupported_temperature() -> None:
