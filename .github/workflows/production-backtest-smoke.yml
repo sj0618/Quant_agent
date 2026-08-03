@@ -47,7 +47,12 @@ jobs:
           install -d -m 700 "$HOME/.ssh"
           printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
           chmod 600 "$HOME/.ssh/id_ed25519"
-          ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts"
+          for attempt in 1 2 3; do
+            ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts" \
+              && break
+            test "$attempt" = 3 && exit 1
+            sleep 2
+          done
           chmod 644 "$HOME/.ssh/known_hosts"
 
       - name: Stage branch benchmark without deploying
