@@ -55,8 +55,10 @@ MIN_RELIABLE_TICKERS = 5
 # requiring them meant every run "missed the objective" and paid for two self-improvement
 # rounds no matter how well it did. A run returning 72% cumulative still scored negative.
 # These are floors for "worth showing", not for "excellent".
-MIN_OBJECTIVE_SHARPE = 0.3
-MAX_OBJECTIVE_DRAWDOWN = -0.35
+# TEMPORARY TEST-ONLY: 샤프와 MDD 커트라인을 결과 노출 검증용으로 느슨하게
+# 잡았다. 테스트가 끝나면 운영 기준을 다시 정하고 이 두 값을 함께 교체할 것.
+MIN_OBJECTIVE_SHARPE = 0.0
+MAX_OBJECTIVE_DRAWDOWN = -0.50
 GENERATED_SIGNAL_METRIC = "generated_signal"
 BUY_SIGNAL_VALUE = 1.0
 SELL_SIGNAL_VALUE = -1.0

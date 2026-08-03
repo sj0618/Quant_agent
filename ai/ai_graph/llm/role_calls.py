@@ -663,16 +663,21 @@ Constraints on what you may choose:
   questions - one strategy.
 
 Set scope="unsupported" ONLY when the request is inherently about an asset class outside
-KRX cash equities. Vagueness, missing parameters and unfamiliar slang are never
-unsupported - resolve them.
+KRX cash equities. Set scope="not_a_request" ONLY for a message that is not asking for
+anything to be analysed at all - a greeting, thanks, small talk, or a question about the
+product itself. Anything that asks for stocks to buy, hold, screen or study is a
+request, no matter how briefly it is put: "화학 관련주 사줘" and "돈 되는 거 없나" are
+requests. Vagueness, missing parameters and unfamiliar slang are never grounds for
+either value - resolve them.
 
 Return JSON only:
   interpretation - one Korean sentence on what the user is asking for
-  resolved_query - the self-contained Korean strategy instruction described above
+  resolved_query - the self-contained Korean strategy instruction described above, or
+                   "" when scope is not "supported"
   assumptions    - Korean sentences, one per decision you made for the user, each
                    giving the reason ("기간 미지정 → 최근 3년으로 백테스트합니다")
-  scope          - "supported" or "unsupported"
-  scope_reason   - Korean; why it is out of scope, or "" when supported
+  scope          - "supported", "unsupported" or "not_a_request"
+  scope_reason   - Korean; why nothing was analysed, or "" when supported
   citations      - sources you actually consulted, title and url
 """
 
@@ -683,7 +688,7 @@ class _LiveStrategyIntent(BaseModel):
     interpretation: str
     resolved_query: str
     assumptions: list[str]
-    scope: Literal["supported", "unsupported"]
+    scope: Literal["supported", "unsupported", "not_a_request"]
     scope_reason: str
     citations: list[_LiveRoleCitation]
 
@@ -731,7 +736,7 @@ def resolve_strategy_intent(
         resolved = _LiveStrategyIntent.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
         return None
-    if not resolved.resolved_query.strip():
+    if resolved.scope == "supported" and not resolved.resolved_query.strip():
         # An empty resolution would silently hand the raw vague query back to the
         # screening stage - the exact failure this call exists to prevent.
         return None

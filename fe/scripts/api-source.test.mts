@@ -23,6 +23,14 @@ test("workspace restores the latest server analysis on a fresh browser", async (
   assert.match(source, /setAnalysisJobs\(\(jobs\) => \(jobs\.length \? jobs : \[latestJob\]\)\)/);
 });
 
+test("workspace discards a running job lost during a server restart", async () => {
+  const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /missingJobIds\.add\(job\.job_id\)/);
+  assert.match(source, /\.filter\(\(job\) => !missingJobIds\.has\(job\.job_id\)\)/);
+  assert.doesNotMatch(source, /분석 job을 서버에서 찾을 수 없습니다/);
+});
+
 test("canonical product surface excludes retired history and strategy routes", async () => {
   const [appSource, routesSource, profileSource, searchSource] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),

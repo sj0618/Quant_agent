@@ -125,6 +125,38 @@ def test_the_decisions_made_for_the_user_are_disclosed_on_the_result(live_intent
     assert envelope["user_payload"]["question"] is None
 
 
+def test_small_talk_is_answered_without_paying_for_a_web_search(live_intent) -> None:
+    """A greeting should not run a backtest - but it should not cost an AOAI call with
+    web search either, so the obvious cases are settled before the model is reached."""
+
+    client = live_intent(_intent_payload())
+
+    state = ambiguity_classifier_node({"user_query": "ㅎㅇㅎㅇ", "trace_id": "t"})
+
+    assert state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value
+    assert client.requests == []
+
+
+def test_the_model_can_also_call_a_message_not_a_request(live_intent) -> None:
+    """Whatever the cheap check does not settle, the model decides - phrased so that
+    only "not asking for anything" qualifies, never "asking vaguely"."""
+
+    live_intent(
+        _intent_payload(
+            scope="not_a_request",
+            resolved_query="",
+            scope_reason="전략 요청이 아니라 서비스 사용법을 묻는 메시지입니다.",
+        )
+    )
+
+    state = ambiguity_classifier_node(
+        {"user_query": "이 서비스는 어떤 데이터를 쓰나요?", "trace_id": "t"}
+    )
+
+    assert state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value
+    assert "resolved_query" not in state
+
+
 def test_out_of_scope_asset_class_still_stops(live_intent) -> None:
     live_intent(
         _intent_payload(scope="unsupported", scope_reason="옵션은 KRX 현물 데이터로 검증할 수 없습니다.")

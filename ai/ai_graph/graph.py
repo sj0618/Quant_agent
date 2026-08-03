@@ -80,6 +80,9 @@ class FallbackGraph:
     def invoke(self, state: QuantAgentState) -> QuantAgentState:
         current = self._invoke("Supervisor", supervisor_node, state)
         current.update(self._invoke("Ambiguity Classifier", ambiguity_classifier_node, current))
+        if _route_after_ambiguity(current) == "final":
+            current.update(self._invoke("Envelope", envelope_node, current))
+            return current
         current.update(self._invoke("Data", data_node, current))
         if current["status"] == EnvelopeStatus.READY.value:
             current.update(self._invoke("Research", research_node, current))
@@ -126,7 +129,11 @@ def build_graph(audit_session: AuditSession | None = None) -> Any:
     graph.add_node("Envelope", instrument_node(audit_session, "Envelope", envelope_node))
     graph.add_edge(START, "Supervisor")
     graph.add_edge("Supervisor", "Ambiguity Classifier")
-    graph.add_edge("Ambiguity Classifier", "Data")
+    graph.add_conditional_edges(
+        "Ambiguity Classifier",
+        _route_after_ambiguity,
+        {"data": "Data", "final": "Envelope"},
+    )
     graph.add_conditional_edges(
         "Data",
         _route_after_data,
@@ -431,17 +438,21 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
     strategy precisely because they did not want to specify it. So the vagueness is
     resolved once, here, by a model that can web-search current market conditions and
     commit to concrete numbers - every later stage reads `resolved_query` and never
-    sees that the request started out vague. Only an asset class the warehouse cannot
-    price still stops the run.
+    sees that the request started out vague. What still stops a run: a message that is
+    not asking for a strategy at all, and an asset class the warehouse cannot price.
     """
 
     query = state["user_query"]
+    if _is_small_talk(query):
+        return _ambiguity_state(AmbiguityCode.NO_STRATEGY_INTENT, query, intent=None)
     report_activity("step", label="요청 해석", detail="입력을 실행 가능한 전략으로 구체화하는 중")
     intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
     if intent is None:
         # Mock mode and provider failures: no model to decide with, so fall back to the
-        # one judgment that does not need one - is this even a KRX equity request.
+        # judgments that do not need one - small talk, and asset class.
         return _ambiguity_state(classify_query(query), query, intent=None)
+    if intent["scope"] == "not_a_request":
+        return _ambiguity_state(AmbiguityCode.NO_STRATEGY_INTENT, query, intent=intent)
     if intent["scope"] == "unsupported":
         return _ambiguity_state(AmbiguityCode.INFEASIBLE, query, intent=intent)
     return _ambiguity_state(AmbiguityCode.READY, query, intent=intent)
@@ -465,7 +476,10 @@ def _ambiguity_state(
         "ambiguity_reasons": _ambiguity_reasons(category, query),
         "ambiguity_dimensions": _ambiguity_dimensions(category, query),
         "source_resolvable": category in {AmbiguityCode.INPUT_AMBIGUOUS, AmbiguityCode.TERM_UNKNOWN},
-        "needs_clarification_after_source_check": category != AmbiguityCode.READY,
+        "needs_clarification_after_source_check": category not in {
+            AmbiguityCode.READY,
+            AmbiguityCode.NO_STRATEGY_INTENT,
+        },
         "clarification_blocker_type": _clarification_blocker_type(category),
         "clarification_question": clarification["question"],
         "question_reason": clarification["question_reason"],
@@ -674,6 +688,15 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             "performance": build_public_backtest_performance(state.get("backtest")),
             "recommendation_gate": gate,
         }
+    elif state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
+        clarification = _clarification_from_ambiguity(state["ambiguity"])
+        payload = {
+            "headline": "전략 입력을 기다리고 있습니다.",
+            "message": state["ambiguity"]["reason"],
+            "next_actions": ["예: RSI가 30 이하일 때 매수하고 70 이상일 때 매도"],
+            "candidate_cards": [],
+            **clarification,
+        }
     elif status == EnvelopeStatus.REJECTED:
         clarification = _clarification_from_ambiguity(state["ambiguity"])
         payload = {
@@ -774,20 +797,58 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
 def classify_query(query: str) -> AmbiguityCode:
     """The fallback used only when no model is available to interpret the request.
 
-    It deliberately answers one question and not the others: is this an asset class the
-    warehouse can price. Everything it used to decide by keyword - whether a term was
-    "known", whether enough conditions were named, whether two goals conflicted - is a
-    judgment call that belongs to resolve_strategy_intent, which can search and then
-    commit. Matching phrases here only ever produced questions for inputs a person
-    would have had no trouble acting on.
+    It deliberately answers two questions and not the others: is this small talk, and
+    is this an asset class the warehouse can price. Everything it used to decide by
+    keyword - whether a term was "known", whether enough conditions were named,
+    whether two goals conflicted - is a judgment call that belongs to
+    resolve_strategy_intent, which can search and then commit. Matching phrases here
+    only ever produced questions for inputs a person would have had no trouble acting
+    on.
     """
 
+    if _is_small_talk(query):
+        return AmbiguityCode.NO_STRATEGY_INTENT
     return AmbiguityCode.INFEASIBLE if _is_unsupported_asset_class(query) else AmbiguityCode.READY
 
 
 def _is_unsupported_asset_class(query: str) -> bool:
     lowered = query.lower()
     return any(term in lowered for term in ("옵션", "양매도", "선물", "crypto", "가상화폐", "비트코인"))
+
+
+# Greetings, thanks and idle questions - a backtest is not an answer to any of them.
+_SMALL_TALK_TERMS = (
+    "안녕", "ㅎㅇ", "하이", "반가", "고마", "감사", "ㄳ", "수고", "잘 지내",
+    "날씨", "몇 시", "누구야", "누구세요", "뭐 해", "뭐해", "심심",
+)
+# Anything the warehouse can act on. Present only to keep the check above from firing
+# on a real request that happens to be polite.
+_MARKET_TERMS = (
+    "주", "종목", "매수", "매도", "전략", "투자", "수익", "차트", "코스피", "코스닥",
+    "백테스트", "포트폴리오", "배당", "실적", "지수", "stock", "buy", "sell", "strategy",
+)
+_SMALL_TALK_LENGTH_LIMIT = 20
+
+
+def _is_small_talk(query: str) -> bool:
+    """Whether this message is not asking for a strategy at all.
+
+    Deliberately shaped as positive evidence of chit-chat rather than as an allowlist
+    of strategy words. An allowlist decides by what it fails to recognise, so
+    "화학 관련주 사줘" - a perfectly clear request naming no listed keyword - came back
+    as a greeting. Every uncertain input must fall through to the analysis; the cost of
+    running one is a wasted job, the cost of refusing one is the user's answer.
+
+    Only consulted for the obvious cases, and before the model is called so a greeting
+    does not pay for a web search. Live runs let resolve_strategy_intent decide.
+    """
+
+    normalized = " ".join(query.split()).lower()
+    if not normalized or len(normalized) > _SMALL_TALK_LENGTH_LIMIT:
+        return False
+    if any(term in normalized for term in _MARKET_TERMS):
+        return False
+    return any(term in normalized for term in _SMALL_TALK_TERMS)
 
 
 def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
@@ -1323,10 +1384,20 @@ def _static_strategy_candidate_cards(query: str) -> list[StrategyCandidateCard]:
 
 
 def build_clarification_prompt(category: AmbiguityCode, query: str) -> dict[str, Any]:
-    """Only two things still stop a run: an unsupported asset class, and a condition
-    the warehouse cannot evaluate. Everything else the interpreter decides itself, so
-    there is no longer a prompt for a vague sentence or an unfamiliar term."""
+    """Three things still stop a run: a message that is not asking for a strategy at
+    all, an unsupported asset class, and a condition the warehouse cannot evaluate.
+    Everything else the interpreter decides itself, so there is no longer a prompt for
+    a vague sentence or an unfamiliar term."""
 
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return {
+            "question": "어떤 투자 전략이나 매매 조건을 분석할까요?",
+            "question_reason": "전략 요청이 아닌 대화로 보여 분석을 시작하지 않았습니다.",
+            "options": [],
+            "recommended": None,
+            "confidence": 1.0,
+            "confidence_reason": "전략을 요청한 것이 확실할 때만 분석 파이프라인을 시작합니다.",
+        }
     if category == AmbiguityCode.INFEASIBLE:
         options = [
             ClarificationOption(label="KRX 현물로 대체", reason="현재 실행 가능한 데이터/백테스트 범위입니다."),
@@ -1392,6 +1463,8 @@ def _clarification_from_ambiguity(ambiguity: dict[str, Any]) -> dict[str, Any]:
 def _ambiguity_dimensions(category: AmbiguityCode, query: str) -> list[str]:
     if category == AmbiguityCode.READY:
         return []
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return ["intent_missing"]
     if category == AmbiguityCode.INPUT_AMBIGUOUS:
         # The only route left to this category is a condition the warehouse cannot
         # evaluate (data_node's _unverifiable_ambiguity), never a vague sentence.
@@ -1406,6 +1479,8 @@ def _ambiguity_dimensions(category: AmbiguityCode, query: str) -> list[str]:
 def _clarification_blocker_type(category: AmbiguityCode) -> str | None:
     if category == AmbiguityCode.READY:
         return None
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return "intent_missing"
     if category == AmbiguityCode.INPUT_AMBIGUOUS:
         return "data_missing"
     if category == AmbiguityCode.TERM_UNKNOWN:
@@ -1430,6 +1505,8 @@ def _is_pullback_rsi_volume_query(query: str) -> bool:
 def _ambiguity_reasons(category: AmbiguityCode, query: str) -> list[str]:
     if category == AmbiguityCode.READY:
         return ["L1/L2 또는 기술 지표 조건으로 해석 가능한 KRX 현물 전략입니다."]
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return ["전략 관련 표현이 없어 분석 파이프라인을 시작하지 않습니다."]
     if category == AmbiguityCode.INPUT_AMBIGUOUS:
         return ["요청한 조건 중 현재 적재된 데이터로 검증할 수 없는 항목이 있습니다."]
     return [f"{query[:40]} 입력은 현재 KRX 현물 데이터 범위를 벗어난 자산군을 포함합니다."]
@@ -2119,6 +2196,7 @@ def _status_for_category(category: AmbiguityCode) -> EnvelopeStatus:
 
 def _ambiguity_reason(category: AmbiguityCode) -> str:
     return {
+        AmbiguityCode.NO_STRATEGY_INTENT: "안녕하세요! 분석할 투자 전략이나 매매 조건을 말씀해 주세요.",
         AmbiguityCode.READY: "분석 가능한 전략 입력입니다.",
         AmbiguityCode.INPUT_AMBIGUOUS: "요청한 조건 중 현재 데이터로 검증할 수 없는 항목이 있습니다.",
         AmbiguityCode.TERM_UNKNOWN: "용어를 L1/L2 지식베이스와 매칭했지만 확인이 필요합니다.",
@@ -2134,6 +2212,12 @@ def _availability_next_actions(data_availability: Mapping[str, Any]) -> list[str
     if isinstance(proxy_items, list) and proxy_items:
         return ["재무/공시/뉴스 조건은 proxy 여부 확인"]
     return []
+
+
+def _route_after_ambiguity(state: QuantAgentState) -> str:
+    if state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
+        return "final"
+    return "data"
 
 
 def _route_after_data(state: QuantAgentState) -> str:

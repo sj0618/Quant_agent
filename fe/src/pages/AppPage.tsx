@@ -274,6 +274,7 @@ export function AppPage() {
     let cancelled = false;
     const timeoutId = window.setTimeout(async () => {
       const failures: Record<string, string> = {};
+      const missingJobIds = new Set<string>();
       const refreshedJobs = await Promise.all(
         pollingJobs.map(async (job) => {
           try {
@@ -287,8 +288,8 @@ export function AppPage() {
             const attempts = (pollAttemptsRef.current[job.job_id] ?? 0) + 1;
             pollAttemptsRef.current[job.job_id] = attempts;
             if (status === 404) {
-              failures[job.job_id] =
-                "분석 job을 서버에서 찾을 수 없습니다. 서버가 재시작되었을 수 있습니다.";
+              missingJobIds.add(job.job_id);
+              clearLatestAnalysisJob();
             } else if (attempts >= MAX_POLL_FAILURES) {
               failures[job.job_id] = status
                 ? `분석 진행 상태를 불러오지 못했습니다. (서버 응답 ${status})`
@@ -305,6 +306,9 @@ export function AppPage() {
       }
 
       for (const job of refreshedJobs) {
+        if (missingJobIds.has(job.job_id)) {
+          continue;
+        }
         if (!failures[job.job_id]) {
           delete pollAttemptsRef.current[job.job_id];
         }
@@ -323,7 +327,9 @@ export function AppPage() {
       }
 
       setAnalysisJobs((jobs) =>
-        jobs.map((job) => refreshedJobs.find((refreshedJob) => refreshedJob.job_id === job.job_id) ?? job),
+        jobs
+          .filter((job) => !missingJobIds.has(job.job_id))
+          .map((job) => refreshedJobs.find((refreshedJob) => refreshedJob.job_id === job.job_id) ?? job),
       );
     }, ANALYSIS_JOB_POLL_INTERVAL_MS);
 

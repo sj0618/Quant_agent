@@ -295,6 +295,12 @@ jobs:
               return 1
             }
 
+            # A previous development reloader can respawn its listener after the port check.
+            # Stop every managed uvicorn generation before starting the single production process.
+            pkill -TERM -f "$APP_DIR/ai/.venv/bin/python -m uvicorn combined_main:app" 2>/dev/null || true
+            sleep 2
+            pkill -KILL -f "$APP_DIR/ai/.venv/bin/python -m uvicorn combined_main:app" 2>/dev/null || true
+
             stop_listeners_on_port 18001
             stop_listeners_on_port 18000
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
@@ -303,7 +309,6 @@ jobs:
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
               --host 0.0.0.0 \
               --port 18001 \
-              --reload \
               > "$RUN_DIR/combined.log" 2>&1 &
             echo "$!" > "$RUN_DIR/combined.pid"
 
