@@ -1,7 +1,12 @@
 :root {
   color: #0f172a;
   background: #f8fafc;
-  font-family: "Pretendard", sans-serif;
+  /* The npm package's dynamic-subset CSS declares its @font-face under the family name
+     "Pretendard Variable", not "Pretendard". Asking for "Pretendard" matched none of the
+     92 registered faces, so nothing loaded and the page fell through to the generic
+     fallback. "Pretendard" is kept after it for anyone who has the static family
+     installed locally. */
+  font-family: "Pretendard Variable", "Pretendard", system-ui, -apple-system, "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   --bg: #f8fafc;

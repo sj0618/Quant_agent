@@ -32,7 +32,9 @@
   --color-drop: #ca2b2b;
   --color-drop-soft: #fee2e2;
 
-  --font-sans: "Pretendard", sans-serif;
+  /* Must match global.css exactly - see the note there about the "Pretendard Variable"
+     family name the npm package actually registers. */
+  --font-sans: "Pretendard Variable", "Pretendard", system-ui, -apple-system, "Segoe UI", sans-serif;
 
   /* Toss-ish: softer than the 8px the legacy sheet uses everywhere. */
   --radius-bubble: 18px;
