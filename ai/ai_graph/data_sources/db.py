@@ -389,12 +389,17 @@ class PostgresPipelineDataSource:
         # INERROR, and that detail is hidden by the fallback, so reset unconditionally
         # before the baseline query.
         self._rollback_quietly(conn)
-        self._set_statement_timeout(conn)
         sector = extract_sector_from_query(query, known_sectors)
         params: list[Any] = [sector] if sector else []
         # The window-function CTE is the expensive part, so it runs once and every
-        # relaxation round re-filters these rows in-process.
+        # relaxation round re-filters these rows in-process. It scans every ticker in
+        # feature.kis_adjusted_ohlcv_daily (no pre-filtered candidate view narrows it
+        # anymore - see SYMBOL_MASTER_TABLE comment above), so it needs the same wider
+        # budget as the backtest universe fetch rather than the tight default, which
+        # was sized for the old, much smaller pre-filtered scan.
+        self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
         rows = conn.execute(_screening_sql(SCREENING_BASELINE_PROFILE, sector=sector), params).fetchall()
+        self._set_statement_timeout(conn)
 
         thresholds = ScreeningThresholds()
         rounds: list[dict[str, Any]] = []
