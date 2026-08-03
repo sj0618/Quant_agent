@@ -40,7 +40,8 @@ test("/me and /me/notifications stay on the profile and notification surface", a
   assert.match(profilePage, /saveNotificationSettings/);
   assert.match(profilePage, /signOut/);
   assert.match(profilePage, /Google 계정/);
-  assert.doesNotMatch(profilePage, /EmailHistoryTimeline|getEmailDeliveryHistory|reportsHistory/);
+  assert.doesNotMatch(profilePage, /reportsHistory/);
+  assert.match(profilePage, /EmailHistoryTimeline/);
   assert.match(appSource, /return <ProfilePage initialTab="profile" \/>/);
   assert.match(appSource, /return <ProfilePage initialTab="notifications" \/>/);
   assert.doesNotMatch(appSource, /StrategyReportsPage|StrategyReportDetailPage|ReportsHistoryPage/);

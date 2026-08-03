@@ -468,6 +468,57 @@ export function getWorkspaceTemplate(): Promise<AppOverview> {
   return Promise.resolve(clone(EMPTY_WORKSPACE));
 }
 
+/** Service-DB run bookkeeping.
+ *
+ * The workspace talks to the AI service directly, so nothing in that path touches the
+ * service DB. Persisting the run is a second, independent call: without it `GET /reports`
+ * has no rows to return and the 리포트 page is permanently empty. This pairing was lost in
+ * `6dadc69` and is restored here.
+ */
+export interface AnalysisRunHandle {
+  id: string;
+  status: string;
+  reportId: string | null;
+}
+
+export async function createAnalysisRun(job: AnalysisJob): Promise<AnalysisRunHandle> {
+  return backendRequest<AnalysisRunHandle>("/runs", {
+    method: "POST",
+    body: JSON.stringify({
+      query: job.query,
+      aiJobId: job.job_id,
+      requestPayload: { aiJobId: job.job_id, traceId: job.trace_id, query: job.query },
+    }),
+  });
+}
+
+export async function completeAnalysisRun(runId: string, job: AnalysisJob): Promise<AnalysisRunHandle> {
+  const result = job.result;
+  const projection = result?.user_payload.report?.web_projection;
+  if (!result || !projection) {
+    throw new Error("리포트를 만들 수 있는 분석 결과가 없습니다.");
+  }
+
+  return backendRequest<AnalysisRunHandle>(`/runs/${encodeURIComponent(runId)}/complete`, {
+    method: "POST",
+    body: JSON.stringify({
+      status: "completed",
+      completedAt: job.updated_at,
+      result: {
+        title: projection.title,
+        summary: projection.summary,
+        sections: projection.sections,
+        // Kept in the snapshot so the stored report can say whether the backtest cleared
+        // its floor. A failed gate is a label on the report, never a reason to drop it.
+        recommendationGate: result.user_payload.recommendation_gate ?? null,
+        performance: result.user_payload.performance ?? null,
+        strategySpec: result.strategy_spec ?? null,
+        aiJobId: job.job_id,
+      },
+    }),
+  });
+}
+
 export async function getReports(q?: string): Promise<ReportSummary[]> {
   const normalizedQuery = q?.trim();
   const path = normalizedQuery ? `/reports?${new URLSearchParams({ q: normalizedQuery }).toString()}` : "/reports";

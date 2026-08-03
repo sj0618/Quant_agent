@@ -512,3 +512,18 @@ export interface ReportDetail extends ReportSummary {
   performance: Pick<PerformanceSummary, "metrics" | "disclaimer">;
   costNotes: string[];
 }
+
+export type EmailDeliveryStatus = "sent" | "resent" | "failed" | "draft";
+
+/** One row of `GET /api/v1/me/email-deliveries`, trimmed to what the timeline renders. */
+export interface EmailDeliveryEntry {
+  deliveryId: string;
+  reportId: string | null;
+  reportTitle: string | null;
+  strategyName: string | null;
+  status: EmailDeliveryStatus;
+  reportDate: string | null;
+  sentAt: string | null;
+  createdAt: string | null;
+  failedAt: string | null;
+}

@@ -24,7 +24,7 @@ from pydantic import ValidationError
 
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.memory import AnalysisMemory
-from ai_graph.progress import raise_if_cancelled, report_node_stage
+from ai_graph.progress import raise_if_cancelled, report_activity, report_node_stage
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
     generate_strategy_conditions,
@@ -308,14 +308,26 @@ def _safe_state_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     return metadata
 
 
+# The interpreting stage covers Supervisor -> Ambiguity -> Data and can run for minutes,
+# but only the screening pipeline inside Data reported anything. Everything before it sat
+# behind a single "전략 해석 중" label with an empty activity log, which reads as a hang.
 def supervisor_node(state: QuantAgentState) -> QuantAgentState:
-    return {
-        **state,
-        **_prepare_supervisor_state(
-            str(state.get("user_query", "")),
-            trace_id=state.get("trace_id") or None,
-        ),
-    }
+    prepared = _prepare_supervisor_state(
+        str(state.get("user_query", "")),
+        trace_id=state.get("trace_id") or None,
+    )
+    report_activity("step", label="요청 접수", detail=_activity_query_preview(prepared["user_query"]))
+    return {**state, **prepared}
+
+
+_ACTIVITY_QUERY_PREVIEW_LIMIT = 120
+
+
+def _activity_query_preview(query: str) -> str:
+    text = str(query).strip()
+    if len(text) <= _ACTIVITY_QUERY_PREVIEW_LIMIT:
+        return text
+    return f"{text[:_ACTIVITY_QUERY_PREVIEW_LIMIT]}…"
 
 
 def _prepare_supervisor_state(user_query: str, *, trace_id: str | None) -> QuantAgentState:
@@ -411,6 +423,7 @@ def _finalization_status_for_envelope(envelope: APIEnvelope) -> str:
 
 def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
     query = state["user_query"]
+    report_activity("step", label="모호성 점검", detail="전략 문장에서 빠진 조건이 있는지 확인 중")
     category = classify_query(query)
     status = _status_for_category(category)
     clarification = build_clarification_prompt(category, query)
@@ -431,12 +444,26 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
         "recommendation_confidence": clarification["confidence"],
         "recommendation_confidence_reason": clarification["confidence_reason"],
     }
+    report_activity(
+        "step",
+        label="모호성 점검 완료",
+        detail=(
+            "추가 확인 없이 진행합니다."
+            if category == AmbiguityCode.READY
+            else f"확인이 필요한 부분: {_ambiguity_reason(category)}"
+        ),
+    )
     return {"ambiguity": ambiguity, "status": status.value}
 
 
 def data_node(state: QuantAgentState) -> dict[str, Any]:
     semantic_slots = parse_semantic_slots(state["user_query"], trace_id=state["trace_id"])
     data_requirements = plan_data_requirements(semantic_slots)
+    report_activity(
+        "step",
+        label="필요 데이터 정리",
+        detail=f"조회할 데이터 항목 {len(data_requirements)}종을 확정했습니다.",
+    )
     pipeline_data = load_pipeline_data_from_env(state["user_query"], state["trace_id"])
     source_usage = build_source_usage(
         state["user_query"],

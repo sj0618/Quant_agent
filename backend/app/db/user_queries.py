@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -86,11 +88,44 @@ async def inspect_user_schema(engine: AsyncEngine) -> UserSchemaReport:
     return UserSchemaReport(columns=columns, has_provider_sub_unique=has_provider_sub_unique)
 
 
+# `inspect_user_schema` costs two information_schema queries, and it used to run on every
+# call of `load_user_by_id` - i.e. on every `GET /auth/me`, which is every page load. The
+# shape of app.users only changes through a migration and a restart, so the accepted report
+# is cached per engine. Failures are never cached: a schema that gets fixed must be picked
+# up without a restart.
+_SCHEMA_REPORT_CACHE: "weakref.WeakKeyDictionary[AsyncEngine, UserSchemaReport]" = weakref.WeakKeyDictionary()
+_SCHEMA_REPORT_LOCK = asyncio.Lock()
+
+
+def clear_user_schema_cache(engine: AsyncEngine | None = None) -> None:
+    """Drop the cached schema report, for tests and post-migration reloads."""
+
+    if engine is None:
+        _SCHEMA_REPORT_CACHE.clear()
+        return
+    _SCHEMA_REPORT_CACHE.pop(engine, None)
+
+
 async def ensure_google_user_schema(engine: AsyncEngine) -> UserSchemaReport:
-    report = await inspect_user_schema(engine)
-    if not report.supports_google_identity:
-        raise approval_needed_error(report)
-    return report
+    cached = _SCHEMA_REPORT_CACHE.get(engine)
+    if cached is not None:
+        return cached
+
+    async with _SCHEMA_REPORT_LOCK:
+        # Another request may have filled the cache while this one waited for the lock.
+        cached = _SCHEMA_REPORT_CACHE.get(engine)
+        if cached is not None:
+            return cached
+        report = await inspect_user_schema(engine)
+        if not report.supports_google_identity:
+            raise approval_needed_error(report)
+        try:
+            _SCHEMA_REPORT_CACHE[engine] = report
+        except TypeError:
+            # Test doubles and connection objects are not always weak-referenceable;
+            # skipping the cache costs latency, never correctness.
+            pass
+        return report
 
 
 def build_google_user_upsert_sql(report: UserSchemaReport) -> str:

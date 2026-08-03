@@ -80,6 +80,21 @@ export function clearCurrentSession() {
   clearUserScopedStorage();
 }
 
+/** How long a `/auth/me` result is trusted before the next navigation re-checks it.
+ *
+ * Navigation is a full page load, so without this every click paid a round-trip to the
+ * auth server before anything could render. The server still owns expiry - this only
+ * decides how quickly the client notices a session that died on the server side. */
+const SESSION_REVALIDATE_INTERVAL_MS = 60_000;
+
+export function isSessionRecentlyValidated(session: AuthSession | null): boolean {
+  if (!session?.validatedAt) {
+    return false;
+  }
+  const age = Date.now() - session.validatedAt;
+  return age >= 0 && age < SESSION_REVALIDATE_INTERVAL_MS;
+}
+
 export async function validateCurrentSession(): Promise<AuthSession | null> {
   const session = getCurrentSession();
   if (!session) {
@@ -92,7 +107,7 @@ export async function validateCurrentSession(): Promise<AuthSession | null> {
     return null;
   }
 
-  const validatedSession = { ...session, user: backendSession.user };
+  const validatedSession = { ...session, user: backendSession.user, validatedAt: Date.now() };
   saveCurrentSession(validatedSession);
   return validatedSession;
 }

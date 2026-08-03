@@ -42,16 +42,20 @@ export function ReportsPage() {
     setActionStatus("브라우저 인쇄 대화상자에서 PDF로 저장할 수 있습니다.");
   };
 
-  if (loading) {
-    return <AsyncState title="리포트 목록을 불러오는 중입니다" tone="loading" />;
-  }
-
-  if (error) {
-    return <AsyncState title="리포트 목록을 불러오지 못했습니다" description={error.message} tone="error" />;
-  }
-
-  if (!data || data.length === 0) {
-    return <AsyncState title="아직 생성된 리포트가 없습니다" description="전략 활성화 다음 날부터 일일 리포트가 자동 생성됩니다." tone="empty" />;
+  // Loading/empty/error used to return before AppLayout, so every non-happy path silently
+  // dropped the top bar and left the user with no way to navigate out.
+  if (loading || error || !data || data.length === 0) {
+    return (
+      <AppLayout active="reports">
+        {loading ? (
+          <AsyncState title="리포트 목록을 불러오는 중입니다" tone="loading" />
+        ) : error ? (
+          <AsyncState title="리포트 목록을 불러오지 못했습니다" description={error.message} tone="error" />
+        ) : (
+          <AsyncState title="아직 생성된 리포트가 없습니다" description="전략 분석이 완료되면 이곳에 리포트가 쌓입니다." tone="empty" />
+        )}
+      </AppLayout>
+    );
   }
 
   return (
