@@ -8,7 +8,15 @@ from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.api.contract_policy import apply_contract_openapi_metadata
-from app.api.routes import ai_backtest, auth, fe_contract, health, pages, reports_pdf_temp
+from app.api.routes import (
+    ai_account_tokens,
+    ai_backtest,
+    auth,
+    fe_contract,
+    health,
+    pages,
+    reports_pdf_temp,
+)
 from app.core.config import ConfigurationError, load_settings
 from app.core.errors import AppError, register_exception_handlers
 from app.core.runtime_perf import install_runtime_performance_middleware
@@ -130,6 +138,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, include_in_schema=False)
 
     app.include_router(ai_backtest.router)
+    app.include_router(ai_account_tokens.router)
     app.include_router(reports_pdf_temp.router)
     app.include_router(fe_contract.router)
     app.include_router(pages.router)

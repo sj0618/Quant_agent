@@ -1,7 +1,4 @@
 import { Suspense, lazy, useEffect, useState } from "react";
-// TEMP(dev-auth-gate): this import and the wrapper below, remove once the product is
-// ready for public access.
-import { SitePasswordGate } from "./components/common/SitePasswordGate";
 import { AsyncState } from "./components/common/AsyncState";
 import { AppPage } from "./pages/AppPage";
 import { AuthCallbackPage } from "./pages/AuthCallbackPage";
@@ -41,11 +38,7 @@ function isProtectedRoute(path: string) {
 }
 
 export default function App() {
-  return (
-    <SitePasswordGate>
-      <AppRoutes />
-    </SitePasswordGate>
-  );
+  return <AppRoutes />;
 }
 
 function AppRoutes() {

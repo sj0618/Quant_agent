@@ -150,21 +150,6 @@ export async function completeGoogleSignIn(params: URLSearchParams) {
   return { session, returnTo: data.returnTo };
 }
 
-export async function completeTestLogin() {
-  await backendRequest<void>(AUTH_ENDPOINTS.testLogin, {
-    method: "POST",
-    csrf: false,
-  });
-
-  const session = await fetchAuthenticatedSession();
-  if (!session) {
-    throw new Error("Test login did not create an authenticated session.");
-  }
-
-  saveCurrentSession(session);
-  return session;
-}
-
 export async function signOut() {
   const session = getCurrentSession();
   try {

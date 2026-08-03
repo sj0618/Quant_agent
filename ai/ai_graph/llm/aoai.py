@@ -10,6 +10,7 @@ import httpx
 
 from ai_graph.audit import begin_model_call, finish_model_call
 from ai_graph.llm.base import LLMClientError, LLMJsonRequest, LLMResponseParseError
+from ai_graph.llm.concurrency_gate import AOAIConcurrencyGate, get_shared_gate
 from ai_graph.progress import report_activity
 
 
@@ -106,6 +107,7 @@ class AOAIResponsesClient:
         web_search_tool_type: str = DEFAULT_WEB_SEARCH_TOOL_TYPE,
         http_client: httpx.Client | None = None,
         compatibility_cache_key: str | None = None,
+        concurrency_gate: AOAIConcurrencyGate | None = None,
     ) -> None:
         self.responses_url = responses_url
         self.api_key = api_key
@@ -118,6 +120,10 @@ class AOAIResponsesClient:
         self.web_search_tool_type = web_search_tool_type
         self._http_client = http_client
         self._compatibility_cache_key = compatibility_cache_key
+        # Deferred to the shared process-wide gate unless a test injects its own, so every
+        # client instance - one is built per logical call in `role_calls` - contends for
+        # the same deployment capacity rather than each keeping a private allowance.
+        self._concurrency_gate = concurrency_gate or get_shared_gate()
         # Fixed-sampling model families reject `temperature` outright. Unknown model
         # aliases still learn from the first 400 and share that result process-wide.
         compatibility = _compatibility_snapshot(compatibility_cache_key)
@@ -249,8 +255,18 @@ class AOAIResponsesClient:
         last_error: Exception | None = None
         retry_count = 0
         compatibility_adjustments: list[str] = []
+        # Backoff is deferred to the top of the next attempt so it happens outside the
+        # concurrency gate. Sleeping while holding a slot would be capacity nobody can
+        # use, and a Retry-After wait exists precisely to let the deployment recover.
+        pending_backoff: tuple[int, httpx.Response | None] | None = None
 
         for _ in range(max_posts):
+            if pending_backoff is not None:
+                backoff_attempt, backoff_response = pending_backoff
+                pending_backoff = None
+                _sleep_before_retry(
+                    self.retry_backoff_seconds, backoff_attempt, backoff_response
+                )
             attempt_started = time.perf_counter()
             client = self._http_client or httpx.Client(timeout=self.timeout_seconds)
             owns_client = self._http_client is None
@@ -260,14 +276,19 @@ class AOAIResponsesClient:
                         self.timeout_seconds,
                         read=self.response_start_timeout_seconds,
                     )
-                    self.physical_http_post_count += 1
-                    with client.stream(
+                    # One slot spans the whole exchange, streamed body included: a
+                    # completion that is still generating still occupies deployment
+                    # capacity, so releasing at the first header would admit far more
+                    # concurrent work than Azure is actually serving.
+                    with self._concurrency_gate.acquire_slot(), client.stream(
                         "POST",
                         self.responses_url,
                         headers=headers,
                         json=body,
                         timeout=response_start_timeout,
                     ) as response:
+                        self.physical_http_post_count += 1
+                        self._observe_provider_capacity(response)
                         self.last_call_timings = {
                             "first_header_seconds": round(
                                 time.perf_counter() - attempt_started, 6
@@ -313,9 +334,7 @@ class AOAIResponsesClient:
                                 response.status_code in RETRYABLE_STATUS_CODES
                                 and retry_count < self.max_retries
                             ):
-                                _sleep_before_retry(
-                                    self.retry_backoff_seconds, retry_count, response
-                                )
+                                pending_backoff = (retry_count, response)
                                 retry_count += 1
                                 continue
                             response.raise_for_status()
@@ -354,7 +373,7 @@ class AOAIResponsesClient:
                             _stream_failure_reason(terminal, payload)
                         )
                         if retry_count < self.max_retries:
-                            _sleep_before_retry(self.retry_backoff_seconds, retry_count)
+                            pending_backoff = (retry_count, None)
                             retry_count += 1
                             continue
                         break
@@ -375,6 +394,21 @@ class AOAIResponsesClient:
         raise LLMClientError(
             "AOAI Responses request failed", retry_count=retry_count
         ) from last_error
+
+    def _observe_provider_capacity(self, response: httpx.Response) -> None:
+        """Report what this response says about remaining deployment capacity.
+
+        Called on every response, not only failures: the gate needs the healthy ones to
+        justify growing back after a shrink, and Azure attaches its remaining-quota
+        headers to successes too.
+        """
+
+        if response.status_code == 429:
+            # A 429 is authoritative on its own; deployments do not always attach usable
+            # rate-limit headers to it, and waiting for one would miss the clearest signal.
+            self._concurrency_gate.observe_rate_limited_response()
+            return
+        self._concurrency_gate.observe_rate_limit_headers(response.headers)
 
     def _consume_stream(
         self,

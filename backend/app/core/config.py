@@ -213,8 +213,6 @@ class Settings(BaseSettings):
     )
     auth_csrf_ttl_seconds: int = Field(default=3600, alias="AUTH_CSRF_TTL_SECONDS", ge=300)
     auth_csrf_required: bool = Field(default=False, alias="AUTH_CSRF_REQUIRED")
-    test_auth_enabled: bool = Field(default=False, alias="TEST_AUTH_ENABLED")
-    test_auth_user_id: int | None = Field(default=None, alias="TEST_AUTH_USER_ID", ge=1)
 
     email_delivery_enabled: bool = Field(default=False, alias="EMAIL_DELIVERY_ENABLED")
     email_report_completed_trigger_enabled: bool = Field(default=False, alias="EMAIL_REPORT_COMPLETED_TRIGGER_ENABLED")
@@ -344,6 +342,19 @@ class Settings(BaseSettings):
         default=None,
         alias="AI_BACKTEST_SCOPE_HMAC_PREVIOUS_VERSION",
         min_length=1,
+    )
+    # Allowance stamped onto every newly issued API token. Not caller-supplied: the point
+    # of the quota is to bound abuse, which a self-chosen limit would not do. Raising one
+    # account's ceiling is an operator action against the row, not a self-serve setting.
+    ai_account_token_default_quota_limit: int = Field(
+        default=60,
+        alias="AI_ACCOUNT_TOKEN_DEFAULT_QUOTA_LIMIT",
+        ge=1,
+    )
+    ai_account_token_default_quota_window_seconds: int = Field(
+        default=3600,
+        alias="AI_ACCOUNT_TOKEN_DEFAULT_QUOTA_WINDOW_SECONDS",
+        ge=1,
     )
     ai_backtest_raw_audit_enabled: bool = Field(default=False, alias="AI_BACKTEST_RAW_AUDIT_ENABLED")
     ai_backtest_raw_audit_admission_hmac_secret: SecretStr | None = Field(
@@ -720,11 +731,6 @@ class Settings(BaseSettings):
                     "AUTH_SESSION_TOUCH_INTERVAL_SECONDS must not exceed "
                     "AUTH_SESSION_IDLE_TTL_SECONDS"
                 )
-            if self.test_auth_enabled:
-                if self.is_production:
-                    raise ValueError("TEST_AUTH_ENABLED must not be enabled in production")
-                if self.test_auth_user_id is None:
-                    missing.append("TEST_AUTH_USER_ID")
             if self.ai_backtest_scope_hmac_primary is None:
                 missing.append("AI_BACKTEST_SCOPE_HMAC_PRIMARY")
             if not self.ai_backtest_scope_hmac_primary_version:
@@ -966,13 +972,15 @@ class Settings(BaseSettings):
             "auth_session_absolute_ttl_seconds": self.auth_session_absolute_ttl_seconds,
             "auth_session_touch_interval_seconds": self.auth_session_touch_interval_seconds,
             "auth_csrf_required": self.auth_csrf_required,
-            "test_auth_enabled": self.test_auth_enabled,
-            "test_auth_user_id": self.test_auth_user_id,
             "ai_backtest_scope_hmac_primary": "<configured>" if self.ai_backtest_scope_hmac_primary else None,
             "ai_backtest_scope_hmac_primary_version": self.ai_backtest_scope_hmac_primary_version,
             "ai_backtest_scope_hmac_previous": "<configured>" if self.ai_backtest_scope_hmac_previous else None,
             "ai_backtest_scope_hmac_previous_version": self.ai_backtest_scope_hmac_previous_version,
             "ai_backtest_raw_audit_enabled": self.ai_backtest_raw_audit_enabled,
+            "ai_account_token_default_quota_limit": self.ai_account_token_default_quota_limit,
+            "ai_account_token_default_quota_window_seconds": (
+                self.ai_account_token_default_quota_window_seconds
+            ),
             "email_delivery_enabled": self.email_delivery_enabled,
             "email_report_completed_trigger_enabled": self.email_report_completed_trigger_enabled,
             "email_delivery_worker_enabled": self.email_delivery_worker_enabled,
