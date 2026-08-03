@@ -31,6 +31,19 @@ button { cursor: pointer; }
 a { color: inherit; text-decoration: none; }
 p, h1, h2, h3, h4 { margin: 0; }
 
+/* Tailwind's preflight resets headings to `font-size: inherit; font-weight: inherit`.
+   This stylesheet only ever set heading *sizes* and leaned on the browser default for
+   weight, so after Tailwind landed every h1-h6 rendered at 400 next to 700 <strong> text.
+   Restoring the UA defaults here puts typography back where it was; the per-component
+   rules further down are class-based and still win. */
+h1, h2, h3, h4, h5, h6 { font-weight: 700; }
+h1 { font-size: 2em; }
+h2 { font-size: 1.5em; }
+h3 { font-size: 1.17em; }
+h4 { font-size: 1em; }
+h5 { font-size: 0.83em; }
+h6 { font-size: 0.67em; }
+
 .brand { display: inline-flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 700; color: var(--ink); white-space: nowrap; }
 .brand__mark { width: 20px; height: 20px; border-radius: 4px; background: var(--ink); display: inline-block; }
 
