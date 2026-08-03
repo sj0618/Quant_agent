@@ -201,6 +201,8 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
 
     assert bundle.metadata["source"] == "postgres"
     assert bundle.price_rows[0]["rsi"] == 28.5
+    assert bundle.metadata["timings"]["total_seconds"] >= 0
+    assert bundle.metadata["timings"]["price_rows_seconds"] >= 0
     assert source.conn.calls[0] == (
         "SELECT set_config('statement_timeout', %s, true)",
         ["12345ms"],

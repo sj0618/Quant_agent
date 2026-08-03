@@ -5,6 +5,7 @@ import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
+from time import perf_counter
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -179,7 +180,24 @@ class PostgresPipelineDataSource:
         self.config = config
 
     def load(self, query: str, trace_id: str) -> PipelineDataBundle:
+        load_started = perf_counter()
+        timings = {
+            name: 0.0
+            for name in (
+                "connect_seconds",
+                "screening_seconds",
+                "ticker_resolution_seconds",
+                "universe_seconds",
+                "symbol_info_seconds",
+                "price_rows_seconds",
+                "l4_evidence_seconds",
+                "macro_seconds",
+                "capability_seconds",
+            )
+        }
+        connect_started = perf_counter()
         with self._connect() as conn:
+            timings["connect_seconds"] = perf_counter() - connect_started
             self._set_statement_timeout(conn)
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
@@ -188,10 +206,14 @@ class PostgresPipelineDataSource:
             already_screened = _query_requests_screening(query)
             screening_mode = already_screened
             if already_screened:
+                phase_started = perf_counter()
                 screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
+                timings["screening_seconds"] += perf_counter() - phase_started
             single_ticker: str | None = None
             if not screening_candidates:
+                phase_started = perf_counter()
                 single_ticker = self._resolve_ticker(conn, query)
+                timings["ticker_resolution_seconds"] += perf_counter() - phase_started
                 if single_ticker is None:
                     screening_mode = True
                     # Ambiguous query (no explicit ticker, no name match): screen as a
@@ -205,9 +227,11 @@ class PostgresPipelineDataSource:
                     # for a screen that legitimately matched nothing today it doubled the
                     # cost of the request and pushed it into a statement timeout.
                     if not already_screened:
+                        phase_started = perf_counter()
                         screening_candidates, screening_relaxation = self._screen_with_relaxation(
                             conn, query
                         )
+                        timings["screening_seconds"] += perf_counter() - phase_started
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
                         if screening_candidates
@@ -222,27 +246,37 @@ class PostgresPipelineDataSource:
                 # past of whichever handful is at a high right now. Recommendation and
                 # backtest universe are deliberately different things.
                 recommended = [str(item["ticker"]).zfill(6) for item in screening_candidates]
+                phase_started = perf_counter()
                 tickers = self._fetch_backtest_universe(conn, recommended)
+                timings["universe_seconds"] = perf_counter() - phase_started
                 if not tickers:
                     raise ValueError("historical backtest universe is empty")
                 ticker = recommended[0] if recommended else tickers[0]
+                phase_started = perf_counter()
                 symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
+                timings["symbol_info_seconds"] = perf_counter() - phase_started
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
                 # Widen the statement timeout for the universe price/momentum/financial
                 # scan - it is far heavier than the screening SELECTs above and 30s is not
                 # enough once the backtest universe is 200 names.
                 self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
+                phase_started = perf_counter()
                 price_rows, effective_lookback_days = self._fetch_price_rows(
                     conn, tickers, symbol_info_by_ticker, query
                 )
+                timings["price_rows_seconds"] = perf_counter() - phase_started
                 self._set_statement_timeout(conn)
             elif single_ticker:
                 ticker = single_ticker
                 tickers = [ticker]
+                phase_started = perf_counter()
                 symbol_info = self._fetch_symbol_info(conn, ticker)
+                timings["symbol_info_seconds"] = perf_counter() - phase_started
+                phase_started = perf_counter()
                 price_rows, effective_lookback_days = self._fetch_price_rows(
                     conn, tickers, {ticker: symbol_info}, query
                 )
+                timings["price_rows_seconds"] = perf_counter() - phase_started
             else:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
                 # silently substitute config.default_ticker, since that produces a
@@ -254,13 +288,21 @@ class PostgresPipelineDataSource:
                 )
             if not price_rows:
                 raise ValueError(f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}")
+            phase_started = perf_counter()
             l4_evidence = (
                 self._fetch_l4_evidence(conn, ticker, trace_id)
                 if recommended or single_ticker
                 else []
             )
+            timings["l4_evidence_seconds"] = perf_counter() - phase_started
+            phase_started = perf_counter()
             macro_status = self._fetch_macro_status(conn)
+            timings["macro_seconds"] = perf_counter() - phase_started
+            phase_started = perf_counter()
             capability_availability = measure_capabilities(conn)
+            timings["capability_seconds"] = perf_counter() - phase_started
+
+        timings["total_seconds"] = perf_counter() - load_started
 
         return PipelineDataBundle(
             price_rows=price_rows,
@@ -297,6 +339,9 @@ class PostgresPipelineDataSource:
                 "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
                 "macro_status": macro_status,
+                "timings": {
+                    name: round(seconds, 6) for name, seconds in timings.items()
+                },
             },
         )
 

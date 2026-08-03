@@ -46,6 +46,7 @@ class ProgressAuditSession(RecordingAuditSession):
             name=record.agent_name,
             status=record.status,
             seconds=round(float(record.latency_ms or 0) / 1000.0, 6),
+            timings=record.output_jsonb.get("timings"),
         )
 
     def start_model_call(self, **kwargs: Any) -> Any:
@@ -199,6 +200,11 @@ def main() -> int:
 
     model_results = _model_results(session)
     final_data = state.get("data") if isinstance(state, Mapping) else None
+    pipeline_data = (
+        final_data.get("pipeline_data_source")
+        if isinstance(final_data, Mapping)
+        else None
+    )
     availability = (
         final_data.get("data_availability")
         if isinstance(final_data, Mapping)
@@ -223,6 +229,11 @@ def main() -> int:
             6,
         ),
         "resolved_query": state.get("resolved_query") if state is not None else None,
+        "data_timings": (
+            pipeline_data.get("timings")
+            if isinstance(pipeline_data, Mapping)
+            else None
+        ),
         "unsupported_capabilities": (
             availability.get("unsupported_capabilities")
             if isinstance(availability, Mapping)
