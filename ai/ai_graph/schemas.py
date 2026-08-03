@@ -40,6 +40,7 @@ FailureSubcause = Literal[
     "disclosure_mapping_gap",
     "freshness_gap",
     "external_source_rate_limited",
+    "aoai_capacity_exhausted",
     "parser_low_confidence",
     "source_conflict",
     "data_required",

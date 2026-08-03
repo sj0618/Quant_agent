@@ -23,6 +23,12 @@ from ai_graph.audit import (
 )
 from ai_graph.audit_postgres import resolve_audit_sink
 from ai_graph.auth import RequireAuthenticatedUser, SessionResolver
+from ai_graph.token_auth import (
+    AccountTokenQuota,
+    AccountTokenResolver,
+    RequireUserIdentity,
+    RequireUserIdentityWithinQuota,
+)
 from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
     BOK_MACRO_VIEW,
@@ -349,10 +355,22 @@ def create_app(
     audit_sink: AuditSink | None = None,
     report_resolver: ReportResolver | None = None,
     session_resolver: SessionResolver | None = None,
+    account_token_resolver: AccountTokenResolver | None = None,
+    account_token_quota: AccountTokenQuota | None = None,
 ) -> FastAPI:
     runtime = job_store_runtime or _job_store_runtime(job_store)
     store = runtime.store
-    require_user = RequireAuthenticatedUser(session_resolver)
+    # Identity accepts either a bearer API token or the browser session cookie. Routes
+    # that spend AOAI capacity use the quota-enforcing variant instead, so a token's
+    # allowance is charged exactly where the provider cost is incurred - listing or
+    # cancelling a job consumes none, and is not counted against it.
+    require_user = RequireUserIdentity(
+        session_requirement=RequireAuthenticatedUser(session_resolver),
+        token_resolver=account_token_resolver,
+    )
+    require_user_within_quota = RequireUserIdentityWithinQuota(
+        require_user, quota=account_token_quota
+    )
     app = FastAPI(
         title=API_TITLE,
         version=API_VERSION,
@@ -401,7 +419,7 @@ def create_app(
     def create_analysis_job(
         request: CreateAnalysisJobRequest,
         background_tasks: BackgroundTasks,
-        user_id: str = Depends(require_user),
+        user_id: str = Depends(require_user_within_quota),
     ) -> AnalysisJob:
         """Queue the analysis and return the job immediately.
 
@@ -539,7 +557,7 @@ def create_app(
     )
     def parse_strategy(
         request: ParseStrategyRequest,
-        user_id: str = Depends(require_user),
+        user_id: str = Depends(require_user_within_quota),
     ) -> AnalysisJob:
         job = store.create_job(
             request.request_text,
@@ -570,7 +588,7 @@ def create_app(
     )
     def describe_strategies(
         request: StrategyDescriptionsRequest,
-        user_id: str = Depends(require_user),
+        user_id: str = Depends(require_user_within_quota),
     ) -> StrategyDescriptionsResponse:
         session = _open_request_audit_session(
             app.state.audit_sink,

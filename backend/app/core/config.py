@@ -343,6 +343,19 @@ class Settings(BaseSettings):
         alias="AI_BACKTEST_SCOPE_HMAC_PREVIOUS_VERSION",
         min_length=1,
     )
+    # Allowance stamped onto every newly issued API token. Not caller-supplied: the point
+    # of the quota is to bound abuse, which a self-chosen limit would not do. Raising one
+    # account's ceiling is an operator action against the row, not a self-serve setting.
+    ai_account_token_default_quota_limit: int = Field(
+        default=60,
+        alias="AI_ACCOUNT_TOKEN_DEFAULT_QUOTA_LIMIT",
+        ge=1,
+    )
+    ai_account_token_default_quota_window_seconds: int = Field(
+        default=3600,
+        alias="AI_ACCOUNT_TOKEN_DEFAULT_QUOTA_WINDOW_SECONDS",
+        ge=1,
+    )
     ai_backtest_raw_audit_enabled: bool = Field(default=False, alias="AI_BACKTEST_RAW_AUDIT_ENABLED")
     ai_backtest_raw_audit_admission_hmac_secret: SecretStr | None = Field(
         default=None,
@@ -964,6 +977,10 @@ class Settings(BaseSettings):
             "ai_backtest_scope_hmac_previous": "<configured>" if self.ai_backtest_scope_hmac_previous else None,
             "ai_backtest_scope_hmac_previous_version": self.ai_backtest_scope_hmac_previous_version,
             "ai_backtest_raw_audit_enabled": self.ai_backtest_raw_audit_enabled,
+            "ai_account_token_default_quota_limit": self.ai_account_token_default_quota_limit,
+            "ai_account_token_default_quota_window_seconds": (
+                self.ai_account_token_default_quota_window_seconds
+            ),
             "email_delivery_enabled": self.email_delivery_enabled,
             "email_report_completed_trigger_enabled": self.email_report_completed_trigger_enabled,
             "email_delivery_worker_enabled": self.email_delivery_worker_enabled,
