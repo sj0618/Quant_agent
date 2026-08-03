@@ -157,6 +157,17 @@ def test_api_status_reports_persistent_job_store_fallback(monkeypatch) -> None:
     assert "AI_DATABASE_DSN" in job_store["fallback_reason"]
 
 
+def test_api_status_activates_postgres_job_store_when_configured(monkeypatch) -> None:
+    monkeypatch.setenv("AI_JOB_STORE", "persistent")
+    monkeypatch.setenv("AI_DATABASE_DSN", "postgresql://db/quant_agent")
+    client = TestClient(create_app())
+
+    job_store = client.get(API_STATUS_PATH).json()["job_store"]
+
+    assert job_store["active_mode"] == "persistent"
+    assert job_store["fallback"] is False
+
+
 def test_cors_preflight_allows_configured_fe_origin(monkeypatch) -> None:
     origin = "http://localhost:5173"
     monkeypatch.setenv(AI_CORS_ALLOW_ORIGINS_ENV, origin)

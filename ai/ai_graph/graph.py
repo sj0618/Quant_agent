@@ -2163,9 +2163,8 @@ def build_public_backtest_performance(
         selected_candidate_id=result.selected_candidate.candidate_id,
         metrics=result.selected_candidate.metrics,
         equity_curve=result.equity_curve,
-        # Full QuantStats arrays can exceed nginx's request-body limit when the browser
-        # saves this public payload as a report. Scalars remain available to the UI;
-        # detailed arrays stay in the internal/debug backtest artifacts.
+        # Public jobs are polled and persisted as JSON. Keep that durable document small;
+        # detailed QuantStats arrays stay in the internal/debug backtest artifacts.
         engine_summary=_public_engine_summary(result.engine_summary),
     )
 

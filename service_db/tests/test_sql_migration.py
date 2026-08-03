@@ -94,6 +94,15 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         self.assertNotIn("DROP ", upper_sql)
         self.assertNotIn("TRUNCATE ", upper_sql)
 
+    def test_ai_analysis_job_migration_is_additive_and_idempotent(self):
+        sql = (SERVICE_DB_ROOT / "migrations/021_ai_analysis_jobs.sql").read_text(encoding="utf-8")
+        upper_sql = sql.upper()
+        self.assertIn("CREATE TABLE IF NOT EXISTS app.ai_analysis_job", sql)
+        self.assertIn("job_jsonb JSONB NOT NULL", sql)
+        self.assertIn("CREATE INDEX IF NOT EXISTS idx_ai_analysis_job_user_updated", sql)
+        self.assertNotIn("DROP ", upper_sql)
+        self.assertNotIn("TRUNCATE ", upper_sql)
+
 
     def test_execution_process_identity_migration_is_additive_and_idempotent(self):
         sql = (
