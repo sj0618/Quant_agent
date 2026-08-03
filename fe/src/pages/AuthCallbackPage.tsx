@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AsyncState } from "../components/common/AsyncState";
 import { completeGoogleSignIn } from "../api/authClient";
 import { ROUTES, sanitizeReturnTo } from "../config/routes";
@@ -8,11 +8,15 @@ type CallbackStatus = "loading" | "error";
 export function AuthCallbackPage() {
   const [status, setStatus] = useState<CallbackStatus>("loading");
   const [message, setMessage] = useState("Google 인증 결과를 확인하고 있습니다.");
+  const callbackRequestRef = useRef<ReturnType<typeof completeGoogleSignIn> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
-    completeGoogleSignIn(new URLSearchParams(window.location.search))
+    const callbackRequest = (callbackRequestRef.current ??= completeGoogleSignIn(
+      new URLSearchParams(window.location.search),
+    ));
+    callbackRequest
       .then(({ returnTo }) => {
         if (!cancelled) {
           window.location.replace(sanitizeReturnTo(returnTo ?? ROUTES.app));
