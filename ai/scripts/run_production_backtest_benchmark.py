@@ -232,6 +232,7 @@ def main() -> int:
         "status": "completed",
         "llm_provider": args.llm_provider,
         "data_source": bundle.metadata.get("source"),
+        "data_timings": bundle.metadata.get("timings", {}),
         "data_load_seconds": round(data_load_seconds, 6),
         "rows": len(rows),
         "tickers": len(tickers),

@@ -203,6 +203,7 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
     assert bundle.price_rows[0]["rsi"] == 28.5
     assert bundle.metadata["timings"]["total_seconds"] >= 0
     assert bundle.metadata["timings"]["price_rows_seconds"] >= 0
+    assert bundle.metadata["timings"]["price_momentum_query_seconds"] >= 0
     assert source.conn.calls[0] == (
         "SELECT set_config('statement_timeout', %s, true)",
         ["12345ms"],
@@ -749,6 +750,7 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
             tickers: list[str],
             _symbol_info: object,
             _query: str,
+            _timings: dict[str, float],
         ) -> tuple[list[dict[str, object]], int]:
             return [
                 {

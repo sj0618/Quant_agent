@@ -190,6 +190,13 @@ class PostgresPipelineDataSource:
                 "universe_seconds",
                 "symbol_info_seconds",
                 "price_rows_seconds",
+                "price_ohlcv_query_seconds",
+                "price_momentum_query_seconds",
+                "price_momentum_decode_seconds",
+                "price_financial_query_seconds",
+                "price_financial_decode_seconds",
+                "price_row_conversion_seconds",
+                "price_financial_attach_seconds",
                 "l4_evidence_seconds",
                 "macro_seconds",
                 "capability_seconds",
@@ -262,7 +269,7 @@ class PostgresPipelineDataSource:
                 self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
                 phase_started = perf_counter()
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, symbol_info_by_ticker, query
+                    conn, tickers, symbol_info_by_ticker, query, timings
                 )
                 timings["price_rows_seconds"] = perf_counter() - phase_started
                 self._set_statement_timeout(conn)
@@ -274,7 +281,7 @@ class PostgresPipelineDataSource:
                 timings["symbol_info_seconds"] = perf_counter() - phase_started
                 phase_started = perf_counter()
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, {ticker: symbol_info}, query
+                    conn, tickers, {ticker: symbol_info}, query, timings
                 )
                 timings["price_rows_seconds"] = perf_counter() - phase_started
             else:
@@ -564,10 +571,12 @@ class PostgresPipelineDataSource:
         tickers: Sequence[str],
         symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
         query: str,
+        timings: dict[str, float] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
+        timings = timings if timings is not None else {}
         lookback_days = self.config.backtest_lookback_days
         price_rows = self._fetch_price_rows_for_lookback(
-            conn, tickers, symbol_info_by_ticker, lookback_days
+            conn, tickers, symbol_info_by_ticker, lookback_days, timings
         )
         if (
             _query_requires_rsi_oversold(query)
@@ -576,7 +585,7 @@ class PostgresPipelineDataSource:
         ):
             lookback_days = DEFAULT_BACKTEST_LOOKBACK_DAYS
             price_rows = self._fetch_price_rows_for_lookback(
-                conn, tickers, symbol_info_by_ticker, lookback_days
+                conn, tickers, symbol_info_by_ticker, lookback_days, timings
             )
         return price_rows, lookback_days
 
@@ -586,6 +595,7 @@ class PostgresPipelineDataSource:
         tickers: Sequence[str],
         symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
         lookback_days: int,
+        timings: dict[str, float],
     ) -> list[dict[str, Any]]:
         calendar_lookback_days = (
             lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
@@ -593,6 +603,7 @@ class PostgresPipelineDataSource:
         ticker_list = list(tickers)
         # row_number keeps the lookback per ticker: a plain LIMIT would spend the whole
         # budget on whichever ticker sorted first and starve the rest.
+        phase_started = perf_counter()
         rows = conn.execute(
             """
             SELECT as_of_date, ticker, open, high, low, close, volume,
@@ -617,10 +628,14 @@ class PostgresPipelineDataSource:
             """,
             [ticker_list, calendar_lookback_days, lookback_days],
         ).fetchall()
-        momentum_by_ticker = self._fetch_momentum_values_by_date(
-            conn, ticker_list, calendar_lookback_days, lookback_days
+        timings["price_ohlcv_query_seconds"] = (
+            timings.get("price_ohlcv_query_seconds", 0.0) + perf_counter() - phase_started
         )
-        financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
+        momentum_by_ticker = self._fetch_momentum_values_by_date(
+            conn, ticker_list, calendar_lookback_days, lookback_days, timings
+        )
+        financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list, timings)
+        phase_started = perf_counter()
         price_rows = [
             _price_row_from_feature_frame_record(
                 _feature_frame_row_from_sources(
@@ -631,11 +646,18 @@ class PostgresPipelineDataSource:
             )
             for row in rows
         ]
+        timings["price_row_conversion_seconds"] = (
+            timings.get("price_row_conversion_seconds", 0.0) + perf_counter() - phase_started
+        )
+        phase_started = perf_counter()
         _attach_pointintime_financials(price_rows, financials_by_ticker)
+        timings["price_financial_attach_seconds"] = (
+            timings.get("price_financial_attach_seconds", 0.0) + perf_counter() - phase_started
+        )
         return price_rows
 
     def _fetch_financial_timeline(
-        self, conn: Any, tickers: Sequence[str]
+        self, conn: Any, tickers: Sequence[str], timings: dict[str, float]
     ) -> dict[str, list[dict[str, Any]]]:
         """Each ticker's filings as a time-ordered list of (filed_date, ratios).
 
@@ -648,6 +670,7 @@ class PostgresPipelineDataSource:
         look-ahead or empty.
         """
 
+        phase_started = perf_counter()
         rows = conn.execute(
             f"""
             WITH filings AS (
@@ -671,7 +694,11 @@ class PostgresPipelineDataSource:
             """,
             [list(tickers)],
         ).fetchall()
+        timings["price_financial_query_seconds"] = (
+            timings.get("price_financial_query_seconds", 0.0) + perf_counter() - phase_started
+        )
 
+        phase_started = perf_counter()
         timelines: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             ticker = str(row.get("symbol") or "").zfill(6)
@@ -715,11 +742,20 @@ class PostgresPipelineDataSource:
                         streaks[metric] = streaks.get(metric, 0) + 1 if value > prior else 0
                     ratios[f"{metric}_up_streak"] = streaks.get(metric, 0)
                     previous[metric] = value
+        timings["price_financial_decode_seconds"] = (
+            timings.get("price_financial_decode_seconds", 0.0) + perf_counter() - phase_started
+        )
         return timelines
 
     def _fetch_momentum_values_by_date(
-        self, conn: Any, tickers: Sequence[str], calendar_lookback_days: int, lookback_days: int
+        self,
+        conn: Any,
+        tickers: Sequence[str],
+        calendar_lookback_days: int,
+        lookback_days: int,
+        timings: dict[str, float],
     ) -> dict[str, dict[date, Mapping[str, Any]]]:
+        phase_started = perf_counter()
         rows = conn.execute(
             """
             SELECT base_ticker, time, values_jsonb
@@ -736,6 +772,10 @@ class PostgresPipelineDataSource:
             """,
             [list(tickers), calendar_lookback_days],
         ).fetchall()
+        timings["price_momentum_query_seconds"] = (
+            timings.get("price_momentum_query_seconds", 0.0) + perf_counter() - phase_started
+        )
+        phase_started = perf_counter()
         values_by_ticker: dict[str, dict[date, Mapping[str, Any]]] = {}
         for row in rows:
             values = row.get("values_jsonb")
@@ -743,6 +783,9 @@ class PostgresPipelineDataSource:
             values_by_ticker.setdefault(ticker_key, {})[_date_value(row["time"])] = (
                 values if isinstance(values, Mapping) else {}
             )
+        timings["price_momentum_decode_seconds"] = (
+            timings.get("price_momentum_decode_seconds", 0.0) + perf_counter() - phase_started
+        )
         return values_by_ticker
 
     def _fetch_l4_evidence(self, conn: Any, ticker: str, trace_id: str) -> list[dict[str, Any]]:
