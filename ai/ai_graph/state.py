@@ -5,6 +5,10 @@ from typing import Any, TypedDict
 
 class QuantAgentState(TypedDict, total=False):
     user_query: str
+    # What the interpreter turned user_query into: one concrete, self-contained
+    # strategy. Every stage after the Ambiguity Classifier reads this.
+    resolved_query: str
+    intent: dict[str, Any]
     trace_id: str
     debug_ref: str
     route: str

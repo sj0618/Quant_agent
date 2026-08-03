@@ -187,8 +187,8 @@ AI 그래프는 LangGraph가 설치되어 있으면 `StateGraph`, 없으면 같�
 
 ```mermaid
 flowchart TD
-    S["Supervisor<br/>query 정규화, trace/debug_ref 생성"] --> A["Ambiguity Classifier<br/>READY / clarification / rejected"]
-    A --> D["Data<br/>semantic slot, 요구 데이터, 검색, DB/fixture"]
+    S["Supervisor<br/>query 정규화, trace/debug_ref 생성"] --> A["Ambiguity Classifier<br/>웹서치로 요청을 실행 가능한 전략으로 확정<br/>(resolved_query) / 범위 밖이면 rejected"]
+    A --> D["Data<br/>semantic slot, 요구 데이터, 검색, DB/fixture<br/>이후 모든 노드는 resolved_query 를 사용"]
     D -->|"READY"| R["Research<br/>Bull / Bear / Judge"]
     D -->|"clarification 또는 rejected"| E["Envelope"]
     R --> C["BacktestCode<br/>후보 코드 생성·AST 검증"]

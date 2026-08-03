@@ -154,7 +154,9 @@ p, h1, h2, h3, h4 { margin: 0; }
 .chat-message__meta span { border-radius: 3px; padding: 1px 5px; background: var(--dark-surface); border: 1px solid var(--dark-line); color: var(--subdued); font-size: 9px; font-weight: 800; }
 .chat-message--user .chat-message__meta span { background: var(--cornflower); color: #fff; border-color: var(--cornflower); }
 .chat-message__meta small { color: var(--subdued); font-size: 10px; }
-.chat-message > p { background: var(--dark-surface); border: 1px solid var(--dark-line); border-radius: 8px; padding: 12px 14px; font-size: 12px; line-height: 1.5; }
+/* pre-line: a completed analysis lists the conditions it chose on the user's behalf, one
+   per line, which collapses into a run-on sentence without it. */
+.chat-message > p { background: var(--dark-surface); border: 1px solid var(--dark-line); border-radius: 8px; padding: 12px 14px; font-size: 12px; line-height: 1.5; white-space: pre-line; }
 .chat-message--user > p { background: transparent; }
 .chat-message__stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 10px; }
 .chat-message__stats span { border: 1px solid var(--dark-line); border-radius: 6px; padding: 6px 10px; }

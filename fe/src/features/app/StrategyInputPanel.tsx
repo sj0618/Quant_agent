@@ -197,10 +197,12 @@ export function StrategyInputPanel({
             </div>
 
             {/* Toss-ish bubbles: generously rounded, with the corner nearest the speaker
-                tightened so the direction of the message stays readable. */}
+                tightened so the direction of the message stays readable. whitespace-pre-line
+                keeps the agent's line breaks - a completed analysis lists the conditions it
+                chose on the user's behalf, which collapses into one run-on line without it. */}
             <p
               className={cn(
-                "max-w-[92%] rounded-bubble px-3.5 py-3 text-xs leading-relaxed",
+                "max-w-[92%] whitespace-pre-line rounded-bubble px-3.5 py-3 text-xs leading-relaxed",
                 message.sender === "user"
                   ? "rounded-br-md bg-cornflower text-white"
                   : "rounded-bl-md border border-dark-line bg-dark-surface",

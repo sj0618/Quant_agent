@@ -28,6 +28,7 @@ from ai_graph.progress import raise_if_cancelled, report_activity, report_node_s
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
     generate_strategy_conditions,
+    resolve_strategy_intent,
 )
 from ai_graph.nodes.backtest import backtest_node
 from ai_graph.nodes.backtest_code import backtest_code_node
@@ -422,16 +423,45 @@ def _finalization_status_for_envelope(envelope: APIEnvelope) -> str:
 
 
 def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
+    """Resolve what to run, rather than judge whether the input was good enough.
+
+    An underspecified request used to end the analysis in a question: "저평가주 사줘"
+    or "네가 알아서 설정해" was pattern-matched as missing a market/rule/risk level and
+    came back asking for one. That reads as a refusal, and the user asked for the
+    strategy precisely because they did not want to specify it. So the vagueness is
+    resolved once, here, by a model that can web-search current market conditions and
+    commit to concrete numbers - every later stage reads `resolved_query` and never
+    sees that the request started out vague. Only an asset class the warehouse cannot
+    price still stops the run.
+    """
+
     query = state["user_query"]
-    report_activity("step", label="모호성 점검", detail="전략 문장에서 빠진 조건이 있는지 확인 중")
-    category = classify_query(query)
+    report_activity("step", label="요청 해석", detail="입력을 실행 가능한 전략으로 구체화하는 중")
+    intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
+    if intent is None:
+        # Mock mode and provider failures: no model to decide with, so fall back to the
+        # one judgment that does not need one - is this even a KRX equity request.
+        return _ambiguity_state(classify_query(query), query, intent=None)
+    if intent["scope"] == "unsupported":
+        return _ambiguity_state(AmbiguityCode.INFEASIBLE, query, intent=intent)
+    return _ambiguity_state(AmbiguityCode.READY, query, intent=intent)
+
+
+def _ambiguity_state(
+    category: AmbiguityCode,
+    query: str,
+    *,
+    intent: Mapping[str, Any] | None,
+) -> dict[str, Any]:
     status = _status_for_category(category)
     clarification = build_clarification_prompt(category, query)
+    assumptions = [str(item) for item in (intent or {}).get("assumptions", []) if str(item).strip()]
+    reason = str((intent or {}).get("scope_reason") or "").strip() or _ambiguity_reason(category)
     ambiguity = {
         "category": category.value,
         "ambiguity_category": category.value,
         "safety_priority": category == AmbiguityCode.INFEASIBLE,
-        "reason": _ambiguity_reason(category),
+        "reason": reason if category != AmbiguityCode.READY else _ambiguity_reason(category),
         "ambiguity_reasons": _ambiguity_reasons(category, query),
         "ambiguity_dimensions": _ambiguity_dimensions(category, query),
         "source_resolvable": category in {AmbiguityCode.INPUT_AMBIGUOUS, AmbiguityCode.TERM_UNKNOWN},
@@ -443,37 +473,59 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
         "recommended_option": clarification["recommended"],
         "recommendation_confidence": clarification["confidence"],
         "recommendation_confidence_reason": clarification["confidence_reason"],
+        "interpretation": str((intent or {}).get("interpretation") or ""),
+        "assumptions": assumptions,
+        "citations": list((intent or {}).get("citations") or []),
     }
-    report_activity(
-        "step",
-        label="모호성 점검 완료",
-        detail=(
-            "추가 확인 없이 진행합니다."
-            if category == AmbiguityCode.READY
-            else f"확인이 필요한 부분: {_ambiguity_reason(category)}"
-        ),
-    )
-    return {"ambiguity": ambiguity, "status": status.value}
+    output: dict[str, Any] = {"ambiguity": ambiguity, "status": status.value}
+    if intent is not None:
+        output["intent"] = dict(intent)
+    if category == AmbiguityCode.READY and intent is not None:
+        output["resolved_query"] = str(intent["resolved_query"])
+
+    if category == AmbiguityCode.READY:
+        detail = str((intent or {}).get("interpretation") or "").strip()
+        if assumptions:
+            detail = f"{detail} / 정한 조건: {' '.join(assumptions[:2])}".strip(" /")
+        report_activity(
+            "step",
+            label="요청 해석 완료",
+            detail=(detail or "입력한 조건 그대로 진행합니다.")[:200],
+        )
+    else:
+        report_activity("step", label="요청 해석 완료", detail=f"진행할 수 없는 요청: {reason}")
+    return output
+
+
+def _strategy_query(state: Mapping[str, Any]) -> str:
+    """The strategy every stage after the interpreter works on.
+
+    Falls back to the raw input only when nothing resolved it, so a stage never has to
+    know whether the user spelled the strategy out or the interpreter did.
+    """
+
+    return str(state.get("resolved_query") or state.get("user_query") or "")
 
 
 def data_node(state: QuantAgentState) -> dict[str, Any]:
-    semantic_slots = parse_semantic_slots(state["user_query"], trace_id=state["trace_id"])
+    query = _strategy_query(state)
+    semantic_slots = parse_semantic_slots(query, trace_id=state["trace_id"])
     data_requirements = plan_data_requirements(semantic_slots)
     report_activity(
         "step",
         label="필요 데이터 정리",
         detail=f"조회할 데이터 항목 {len(data_requirements)}종을 확정했습니다.",
     )
-    pipeline_data = load_pipeline_data_from_env(state["user_query"], state["trace_id"])
+    pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
     source_usage = build_source_usage(
-        state["user_query"],
+        query,
         data_requirements,
         trace_id=state["trace_id"],
         pipeline_metadata=pipeline_data.metadata,
     )
     evidence_refs = build_evidence_refs(source_usage, trace_id=state["trace_id"])
     cards = strategy_candidate_cards(
-        state["user_query"],
+        query,
         screening_candidates=pipeline_data.screening_candidates,
         sector=semantic_slots.sector,
     )
@@ -560,7 +612,7 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
     """
 
     strategy_a = build_strategy_spec(
-        state["user_query"],
+        _strategy_query(state),
         variant="A",
         semantic_slots=state.get("semantic_slots"),
     )
@@ -610,11 +662,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
                 if validated
                 else "전략이 백테스트 검증을 통과하지 못했습니다."
             ),
-            "message": (
-                "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다."
-                if validated
-                else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
-            ),
+            "message": _ready_message(state, validated=validated),
             "next_actions": [
                 "web_projection 확인",
                 "email_projection 예약",
@@ -665,6 +713,27 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
     return {"envelope": envelope.model_dump()}
 
 
+def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
+    """What ran, plus what the interpreter decided in the user's place.
+
+    The choices it made are disclosed on the result rather than asked about up front -
+    the user sees the strategy they got and exactly which parts of it they did not
+    specify, instead of being stopped at a form.
+    """
+
+    base = (
+        "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다."
+        if validated
+        else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
+    )
+    ambiguity = state.get("ambiguity") or {}
+    assumptions = [str(item).strip() for item in ambiguity.get("assumptions", []) if str(item).strip()]
+    if not assumptions:
+        return base
+    listed = "\n".join(f"- {item}" for item in assumptions[:5])
+    return f"{base}\n\n지정하지 않으신 부분은 이렇게 정해서 진행했습니다:\n{listed}"
+
+
 def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> None:
     """Note how this run turned out, for the next analysis of the same strategy."""
 
@@ -703,24 +772,22 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
 
 
 def classify_query(query: str) -> AmbiguityCode:
+    """The fallback used only when no model is available to interpret the request.
+
+    It deliberately answers one question and not the others: is this an asset class the
+    warehouse can price. Everything it used to decide by keyword - whether a term was
+    "known", whether enough conditions were named, whether two goals conflicted - is a
+    judgment call that belongs to resolve_strategy_intent, which can search and then
+    commit. Matching phrases here only ever produced questions for inputs a person
+    would have had no trouble acting on.
+    """
+
+    return AmbiguityCode.INFEASIBLE if _is_unsupported_asset_class(query) else AmbiguityCode.READY
+
+
+def _is_unsupported_asset_class(query: str) -> bool:
     lowered = query.lower()
-    if any(term in lowered for term in ("옵션", "양매도", "선물", "crypto", "가상화폐", "비트코인")):
-        return AmbiguityCode.INFEASIBLE
-    if _has_conflicting_targets(query):
-        return AmbiguityCode.CONFLICTING
-    if _is_candidate_selection_query(query):
-        return AmbiguityCode.READY
-    if _is_specific_supported_screening_query(query):
-        return AmbiguityCode.READY
-    if _needs_query_smoothing(query):
-        return AmbiguityCode.INPUT_AMBIGUOUS
-    if _is_supported_technical_query(query):
-        return AmbiguityCode.READY
-    if _has_known_strategy_term(query):
-        return AmbiguityCode.READY
-    if _has_unknown_term_risk(query):
-        return AmbiguityCode.TERM_UNKNOWN
-    return AmbiguityCode.READY
+    return any(term in lowered for term in ("옵션", "양매도", "선물", "crypto", "가상화폐", "비트코인"))
 
 
 def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
@@ -1256,20 +1323,10 @@ def _static_strategy_candidate_cards(query: str) -> list[StrategyCandidateCard]:
 
 
 def build_clarification_prompt(category: AmbiguityCode, query: str) -> dict[str, Any]:
-    if category == AmbiguityCode.CONFLICTING:
-        options = [
-            ClarificationOption(label="저변동성 우선", reason="급등 기대보다 낙폭과 손실 변동성을 낮추는 쪽입니다."),
-            ClarificationOption(label="돌파 모멘텀 우선", reason="단기 급등 가능성을 보되 변동성 상승을 허용합니다."),
-            ClarificationOption(label="균형형 후보", reason="저변동성 필터 뒤 거래량 돌파만 통과시킵니다."),
-        ]
-        return _clarification(
-            question="둘 중 어떤 목표를 먼저 볼까요?",
-            question_reason="낮은 변동성과 단기 급등은 같은 스크리닝 안에서 충돌할 수 있습니다.",
-            options=options,
-            recommended=2,
-            confidence=0.74,
-            confidence_reason="MVP에서는 목표를 하나로 고정하는 것보다 균형형 query smooth가 재시도 비용을 줄입니다.",
-        )
+    """Only two things still stop a run: an unsupported asset class, and a condition
+    the warehouse cannot evaluate. Everything else the interpreter decides itself, so
+    there is no longer a prompt for a vague sentence or an unfamiliar term."""
+
     if category == AmbiguityCode.INFEASIBLE:
         options = [
             ClarificationOption(label="KRX 현물로 대체", reason="현재 실행 가능한 데이터/백테스트 범위입니다."),
@@ -1284,21 +1341,6 @@ def build_clarification_prompt(category: AmbiguityCode, query: str) -> dict[str,
             confidence=0.9,
             confidence_reason="현재 API/백테스트는 KRX 현물 주식 중심으로 검증됩니다.",
         )
-    if category == AmbiguityCode.TERM_UNKNOWN:
-        options = [
-            ClarificationOption(label="표준 정의 적용", reason="시장 관행상 통용되는 정의로 조건을 보정합니다."),
-            ClarificationOption(label="기술적 proxy 사용", reason="OHLCV/TA 지표로 먼저 후보를 좁힙니다."),
-            ClarificationOption(label="질문으로 확정", reason="용어 정의가 투자 판단에 직접 영향을 줍니다."),
-        ]
-        return _clarification(
-            question="이 용어는 어떤 방식으로 해석할까요?",
-            question_reason="용어의 시장 관행 정의와 사용자의 의도가 다를 수 있습니다.",
-            options=options,
-            recommended=0,
-            confidence=0.78,
-            confidence_reason="통용되는 정의가 확인되면 질문 없이 우선 적용하는 정책입니다.",
-        )
-
     cards = strategy_candidate_cards(query)
     options = [
         ClarificationOption(
@@ -1351,10 +1393,9 @@ def _ambiguity_dimensions(category: AmbiguityCode, query: str) -> list[str]:
     if category == AmbiguityCode.READY:
         return []
     if category == AmbiguityCode.INPUT_AMBIGUOUS:
-        dimensions = ["data_missing"]
-        if _needs_query_smoothing(query):
-            dimensions.append("source_resolvable")
-        return dimensions
+        # The only route left to this category is a condition the warehouse cannot
+        # evaluate (data_node's _unverifiable_ambiguity), never a vague sentence.
+        return ["data_missing"]
     if category == AmbiguityCode.TERM_UNKNOWN:
         return ["intent_ambiguous", "source_resolvable"]
     if category == AmbiguityCode.CONFLICTING:
@@ -1378,125 +1419,6 @@ def _has_conflicting_targets(query: str) -> bool:
     return any(term in query for term in ("변동성 낮", "저변동성")) and "급등" in query
 
 
-def _is_candidate_selection_query(query: str) -> bool:
-    lowered = query.lower()
-    return "후보 확정" in query or "strategy_id=" in lowered or "candidate_id=" in lowered
-
-
-def _is_supported_technical_query(query: str) -> bool:
-    lowered = query.lower()
-    technical_terms = (
-        "rsi",
-        "신고가",
-        "거래량",
-        "200일",
-        "20일선",
-        "20일 이동평균",
-        "120일",
-        "52주",
-        "볼린저",
-        "상대강도",
-        "갭",
-        "양봉",
-        "변동성",
-        "돌파",
-        "반등",
-        "눌림목",
-    )
-    return any(term in lowered or term in query for term in technical_terms)
-
-
-def _is_specific_supported_screening_query(query: str) -> bool:
-    if _is_supported_technical_query(query):
-        return True
-    lowered = query.lower()
-    condition_terms = (
-        "per",
-        "pbr",
-        "roe",
-        "eps",
-        "fcf",
-        "부채비율",
-        "영업이익",
-        "영업이익률",
-        "roe",
-        "매출",
-        "성장률",
-        "배당수익률",
-        "배당 삭감",
-        "순현금",
-        "자사주",
-        "컨센서스",
-        "어닝",
-        "가이던스",
-        "기관",
-        "외국인",
-        "공매도",
-        "금리",
-        "환율",
-        "원달러",
-        "원자재",
-        "마진",
-        "재고",
-        "업종 평균",
-        "고점",
-        "하락",
-        "조정",
-        "과매도",
-        "우량주",
-        "리츠",
-        "유틸리티",
-        "기술적 상승",
-    )
-    matched = sum(1 for term in condition_terms if term in lowered or term in query)
-    has_numeric_or_rank = any(token in lowered or token in query for token in ("%", "이상", "이하", "상위", "연속", "최근", "3개월", "4분기", "5거래일", "양호", "개선", "상향", "하락", "조정", "현재"))
-    return matched >= 2 and has_numeric_or_rank
-
-
-def _has_known_strategy_term(query: str) -> bool:
-    known_terms = ("눌림목", "숏커버링", "방어주", "주도주", "스퀴즈", "과매도")
-    return any(term in query for term in known_terms)
-
-
-def _needs_query_smoothing(query: str) -> bool:
-    lowered = query.lower()
-    smoothing_terms = (
-        "per",
-        "pbr",
-        "roe",
-        "eps",
-        "fcf",
-        "저평가",
-        "가치",
-        "성장주",
-        "컨센서스",
-        "배당",
-        "부채",
-        "순현금",
-        "자사주",
-        "공시",
-        "기관",
-        "외국인",
-        "공매도",
-        "어닝",
-        "가이던스",
-        "매출",
-        "영업이익",
-        "재고",
-        "업종 평균",
-        "원달러",
-        "환율",
-        "원자재",
-        "리츠",
-        "유틸리티",
-    )
-    return any(term in lowered or term in query for term in smoothing_terms)
-
-
-def _has_unknown_term_risk(query: str) -> bool:
-    return any(term in query for term in ("알아서", "좋은 종목", "괜찮은 종목"))
-
-
 def _is_pullback_rsi_volume_query(query: str) -> bool:
     lowered = query.lower()
     has_trend_filter = "200일" in query or "sma200" in lowered or "sma_200" in lowered
@@ -1509,11 +1431,7 @@ def _ambiguity_reasons(category: AmbiguityCode, query: str) -> list[str]:
     if category == AmbiguityCode.READY:
         return ["L1/L2 또는 기술 지표 조건으로 해석 가능한 KRX 현물 전략입니다."]
     if category == AmbiguityCode.INPUT_AMBIGUOUS:
-        return ["재무·컨센서스·공시·수급 데이터 조건이 섞여 있어 실행 후보 선택이 필요합니다."]
-    if category == AmbiguityCode.TERM_UNKNOWN:
-        return ["용어 정의가 전략 조건으로 직접 변환되기 전 확인이 필요합니다."]
-    if category == AmbiguityCode.CONFLICTING:
-        return ["입력 안에 동시에 최적화하기 어려운 목표가 포함되어 있습니다."]
+        return ["요청한 조건 중 현재 적재된 데이터로 검증할 수 없는 항목이 있습니다."]
     return [f"{query[:40]} 입력은 현재 KRX 현물 데이터 범위를 벗어난 자산군을 포함합니다."]
 
 
@@ -2202,7 +2120,7 @@ def _status_for_category(category: AmbiguityCode) -> EnvelopeStatus:
 def _ambiguity_reason(category: AmbiguityCode) -> str:
     return {
         AmbiguityCode.READY: "분석 가능한 전략 입력입니다.",
-        AmbiguityCode.INPUT_AMBIGUOUS: "시장, 조건, 위험 기준이 부족합니다.",
+        AmbiguityCode.INPUT_AMBIGUOUS: "요청한 조건 중 현재 데이터로 검증할 수 없는 항목이 있습니다.",
         AmbiguityCode.TERM_UNKNOWN: "용어를 L1/L2 지식베이스와 매칭했지만 확인이 필요합니다.",
         AmbiguityCode.CONFLICTING: "낮은 변동성과 단기 급등 목표가 서로 충돌합니다.",
         AmbiguityCode.INFEASIBLE: "옵션/선물/가상자산은 AI MVP 지원 범위 밖입니다.",

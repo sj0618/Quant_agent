@@ -409,10 +409,12 @@ def test_factory_create_app_and_run_analysis_deny_forged_environment_admission(m
 
     app = create_app()
     monkeypatch.delenv("AI_DATABASE_DSN")
-    envelope = run_analysis("저평가주 사줘")
+    # An out-of-scope asset class is the one input that still short-circuits, so this
+    # exercises admission without paying for the full analysis pipeline.
+    envelope = run_analysis("옵션 양매도 전략 만들어줘")
 
     assert isinstance(app.state.audit_sink, NoOpAuditSink)
-    assert envelope.status == "need_clarification"
+    assert envelope.status == "rejected"
 
 
 def test_forgeable_test_marker_is_noop_for_app_and_direct_graph_ingress() -> None:
@@ -430,9 +432,9 @@ def test_forgeable_test_marker_is_noop_for_app_and_direct_graph_ingress() -> Non
     app = create_app(audit_sink=sink)
     assert isinstance(app.state.audit_sink, NoOpAuditSink)
 
-    envelope = run_analysis("저평가주 사줘", audit_sink=sink)
+    envelope = run_analysis("옵션 양매도 전략 만들어줘", audit_sink=sink)
 
-    assert envelope.status == "need_clarification"
+    assert envelope.status == "rejected"
     assert sink.open_calls == 0
 
 
