@@ -60,6 +60,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    general_app.state.analysis_job_store = getattr(ai_app.state, "job_store", None)
     app = FastAPI(
         title="QuantAgent Combined Backend",
         version="0.1.0",

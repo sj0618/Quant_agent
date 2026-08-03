@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from ai_graph.job_repository_postgres import _job_document
 from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.jobs import (
     AnalysisJob,
@@ -75,6 +76,19 @@ def test_in_memory_job_store_failure_contract_includes_error_envelope() -> None:
     assert failed.result.failure_cause is not None
     assert failed.result.failure_cause.subcause == "unknown"
     assert failed.result.user_payload.message != "execution failed"
+
+
+def test_persistent_job_document_round_trips_storage_only_fields() -> None:
+    store = InMemoryAnalysisJobStore()
+    created = store.create_job("RSI strategy", user_id="42")
+    completed = store.complete_job(created.job_id, _ready_envelope(created.trace_id))
+
+    restored = AnalysisJob.model_validate(_job_document(completed))
+
+    assert restored.user_id == "42"
+    assert restored.status == AnalysisJobStatus.COMPLETED
+    assert restored.completed_at == completed.completed_at
+    assert restored.result == completed.result
 
 
 def test_job_store_factory_defaults_to_memory_without_env() -> None:

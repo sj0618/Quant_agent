@@ -493,29 +493,9 @@ export async function createAnalysisRun(job: AnalysisJob): Promise<AnalysisRunHa
 }
 
 export async function completeAnalysisRun(runId: string, job: AnalysisJob): Promise<AnalysisRunHandle> {
-  const result = job.result;
-  const projection = result?.user_payload.report?.web_projection;
-  if (!result || !projection) {
-    throw new Error("리포트를 만들 수 있는 분석 결과가 없습니다.");
-  }
-
   return backendRequest<AnalysisRunHandle>(`/runs/${encodeURIComponent(runId)}/complete`, {
     method: "POST",
-    body: JSON.stringify({
-      status: "completed",
-      completedAt: job.updated_at,
-      result: {
-        title: projection.title,
-        summary: projection.summary,
-        sections: projection.sections,
-        // Kept in the snapshot so the stored report can say whether the backtest cleared
-        // its floor. A failed gate is a label on the report, never a reason to drop it.
-        recommendationGate: result.user_payload.recommendation_gate ?? null,
-        performance: result.user_payload.performance ?? null,
-        strategySpec: result.strategy_spec ?? null,
-        aiJobId: job.job_id,
-      },
-    }),
+    body: JSON.stringify({ aiJobId: job.job_id }),
   });
 }
 

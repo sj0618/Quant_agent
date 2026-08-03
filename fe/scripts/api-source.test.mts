@@ -31,6 +31,17 @@ test("workspace discards a running job lost during a server restart", async () =
   assert.doesNotMatch(source, /분석 job을 서버에서 찾을 수 없습니다/);
 });
 
+test("report completion sends only the durable AI job id", async () => {
+  const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+  const completion = source.slice(
+    source.indexOf("export async function completeAnalysisRun"),
+    source.indexOf("export async function getReports"),
+  );
+
+  assert.match(completion, /JSON\.stringify\(\{ aiJobId: job\.job_id \}\)/);
+  assert.doesNotMatch(completion, /recommendationGate|performance|strategySpec|sections/);
+});
+
 test("canonical product surface excludes retired history and strategy routes", async () => {
   const [appSource, routesSource, profileSource, searchSource] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),

@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from app.api.contract_policy import api_status_endpoints, fe_live_allowlist
 from app.api.routes import email_reports
@@ -34,13 +35,9 @@ class TrackCRunRequest(BaseModel):
 
 
 class TrackCRunCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
-    status: str | None = None
-    result: dict[str, Any] | None = None
-    analysisResult: dict[str, Any] | None = None
-    completedAt: str | None = None
-    completed_at: str | None = None
+    ai_job_id: str = Field(min_length=1, validation_alias=AliasChoices("aiJobId", "ai_job_id"))
 
 
 async def _require_current_user_id(request: Request) -> str:
@@ -71,6 +68,73 @@ async def _require_track_c_csrf(request: Request) -> None:
 
 def _payload(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(mode="json", exclude_none=True)
+
+
+async def _completed_analysis_payload(request: Request, *, user_id: str, ai_job_id: str) -> dict[str, Any]:
+    store = getattr(request.app.state, "analysis_job_store", None)
+    if store is None:
+        raise AppError(
+            status_code=503,
+            component="analysis_jobs",
+            code="analysis_job_store_unavailable",
+            message="Analysis job store is unavailable",
+        )
+    try:
+        job = await run_in_threadpool(store.get_job, ai_job_id)
+    except Exception as exc:
+        raise AppError(
+            status_code=503,
+            component="analysis_jobs",
+            code="analysis_job_store_unavailable",
+            message="Analysis job store is unavailable",
+            details={"errorType": type(exc).__name__},
+        ) from exc
+    if job is None or str(getattr(job, "user_id", "")) != user_id:
+        raise AppError(
+            status_code=404,
+            component="analysis_jobs",
+            code="analysis_job_not_found",
+            message="Analysis job was not found",
+            details={"aiJobId": ai_job_id},
+        )
+    job_status = getattr(getattr(job, "status", None), "value", getattr(job, "status", None))
+    result_model = getattr(job, "result", None)
+    if job_status != "completed" or result_model is None:
+        raise AppError(
+            status_code=409,
+            component="analysis_jobs",
+            code="analysis_job_not_completed",
+            message="Analysis job is not completed",
+            details={"aiJobId": ai_job_id, "status": job_status},
+        )
+
+    result = result_model.model_dump(mode="json")
+    user_payload = result.get("user_payload") or {}
+    report = user_payload.get("report") or {}
+    projection = report.get("web_projection") or {}
+    if not projection.get("title") or not projection.get("summary"):
+        raise AppError(
+            status_code=422,
+            component="reports",
+            code="analysis_report_missing",
+            message="Completed analysis does not contain a report",
+            details={"aiJobId": ai_job_id},
+        )
+    completed_at = getattr(job, "completed_at", None) or getattr(job, "updated_at", None)
+    return {
+        "status": "completed",
+        "completedAt": completed_at.isoformat(),
+        "aiJobId": ai_job_id,
+        "result": {
+            "title": projection["title"],
+            "summary": projection["summary"],
+            "sections": projection.get("sections") or [],
+            "recommendationGate": user_payload.get("recommendation_gate"),
+            "performance": user_payload.get("performance"),
+            "strategySpec": result.get("strategy_spec"),
+            "aiJobId": ai_job_id,
+        },
+    }
 
 
 def _track_c_api_status() -> dict[str, Any]:
@@ -136,7 +200,7 @@ async def complete_analysis_run(request: Request, run_id: str, payload: TrackCRu
         engine,
         user_id=user_id,
         run_id=run_id,
-        payload=_payload(payload),
+        payload=await _completed_analysis_payload(request, user_id=user_id, ai_job_id=payload.ai_job_id),
         identity_source_engine=identity_source_engine,
         email_settings=get_runtime_settings(request),
     )

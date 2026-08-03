@@ -183,12 +183,14 @@ def test_combined_app_lifespan_orders_general_then_ai_and_mounts_ai_first(monkey
     order: list[str] = []
     general_app = FastAPI(title="general", lifespan=lambda app: _general_lifespan(order))
     ai_app = FastAPI(title="ai", lifespan=lambda app: _ai_lifespan(order))
+    ai_app.state.job_store = object()
 
     monkeypatch.setattr(combined_main, "general_app", general_app)
     monkeypatch.setattr(combined_main, "ai_app", ai_app)
 
     application = combined_main.create_app()
     assert [route.path for route in application.routes] == ["/combined-health", "/ai-api", ""]
+    assert general_app.state.analysis_job_store is ai_app.state.job_store
 
     with TestClient(application) as client:
         assert client.get("/combined-health").json() == {

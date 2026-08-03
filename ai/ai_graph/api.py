@@ -48,6 +48,8 @@ from ai_graph.jobs import (
     run_job_sync,
 )
 from ai_graph.job_events import JobEventBuffer
+from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
+from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.llm.role_calls import generate_strategy_description
 from ai_graph.nodes.daily_digest import MAX_DIGEST_STRATEGIES, build_daily_digest
 from ai_graph.schemas import SCHEMA_VERSION
@@ -851,7 +853,12 @@ def _data_source_status() -> DataSourceStatus:
 
 def _job_store_runtime(job_store: AnalysisJobStore | None) -> JobStoreRuntime:
     if job_store is None:
-        return create_analysis_job_store_from_env()
+        dsn, _ = resolve_database_dsn_from_env()
+        repository = PostgresAnalysisJobRepository(dsn) if dsn else None
+        return create_analysis_job_store_from_env(
+            repository=repository,
+            persistent_store_factory=PersistentAnalysisJobStore,
+        )
     return JobStoreRuntime(
         store=job_store,
         requested_mode="injected",

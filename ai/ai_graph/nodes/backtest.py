@@ -158,6 +158,14 @@ VERBOSE_ENGINE_SUMMARY_KEYS = frozenset(
 )
 
 
+def _public_engine_summary(engine_summary: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in engine_summary.items()
+        if key not in VERBOSE_ENGINE_SUMMARY_KEYS
+    }
+
+
 def summarize_backtest(backtest: Mapping[str, Any]) -> dict[str, Any]:
     selected = backtest.get("selected_candidate") or {}
     selected_id = selected.get("candidate_id")
@@ -171,11 +179,7 @@ def summarize_backtest(backtest: Mapping[str, Any]) -> dict[str, Any]:
         # made one report prompt 2.18 million characters and guaranteed an AOAI
         # response-start timeout. The scalar summary plus selected public metrics are
         # sufficient for interpretation; detailed arrays remain in debug artifacts.
-        "engine_summary": {
-            key: value
-            for key, value in engine_summary.items()
-            if key not in VERBOSE_ENGINE_SUMMARY_KEYS
-        },
+        "engine_summary": _public_engine_summary(engine_summary),
         "objective_score": (backtest.get("objective_scores_by_candidate") or {}).get(selected_id),
     }
 

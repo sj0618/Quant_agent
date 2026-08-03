@@ -29,6 +29,7 @@ FIXED_MIGRATIONS = (
     "018_create_email_delivery_outbox.sql",
     "019_ai_prompt_response_summary.sql",
     "020_ai_account_tokens.sql",
+    "021_ai_analysis_jobs.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 PG17_MIN_VERSION_NUM = 170000
@@ -56,7 +57,7 @@ OWNED_RELATIONS = {
         "strategy_email_report_candidate", "email_digest_subscription",
         "email_delivery_history", "ai_backtest_request",
         "ai_backtest_replacement_approval", "email_delivery_outbox",
-        "ai_account_token",
+        "ai_account_token", "ai_analysis_job",
     ),
     "i": (
         "idx_users_email", "idx_users_provider_user_id", "idx_strategy_user_created",
@@ -97,6 +98,7 @@ OWNED_RELATIONS = {
         "idx_email_delivery_outbox_due", "idx_email_delivery_outbox_claim_expiry",
         "idx_email_delivery_outbox_user_created", "idx_email_delivery_outbox_report",
         "idx_ai_account_token_user_created", "idx_ai_account_token_status",
+        "idx_ai_analysis_job_user_updated",
     ),
     "v": ("strategy_report_summary_v", "email_digest_history_v"),
 }
