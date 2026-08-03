@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from hashlib import sha256
 import json
+from types import SimpleNamespace
 
 from ai_graph.nodes import backtest as backtest_node
 from ai_graph.nodes.backtest_code import (
@@ -336,6 +337,28 @@ def test_selection_score_does_not_peek_at_holdout_sharpe() -> None:
     assert backtest_node._objective_score(weak_holdout, summary, rows) == backtest_node._objective_score(
         strong_holdout, summary, rows
     )
+
+
+def test_temporary_relaxed_objective_floor_boundaries() -> None:
+    metrics = BacktestMetrics(
+        sharpe_ratio=0.0,
+        max_drawdown=-0.50,
+        win_rate=0.5,
+        total_return=0.0,
+        in_sample_sharpe=0.0,
+        out_sample_sharpe=0.0,
+        degradation=0.0,
+    )
+    result = SimpleNamespace(
+        selected_candidate=SimpleNamespace(candidate_id="temporary-floor", metrics=metrics),
+        engine_summary={"effective_trade_count": 5},
+    )
+
+    assert backtest_node._passes_objective_floor(result)
+    result.selected_candidate.metrics = metrics.model_copy(update={"out_sample_sharpe": -0.01})
+    assert not backtest_node._passes_objective_floor(result)
+    result.selected_candidate.metrics = metrics.model_copy(update={"max_drawdown": -0.501})
+    assert not backtest_node._passes_objective_floor(result)
 
 
 def test_repeated_round_submits_no_completed_candidate(monkeypatch, tmp_path) -> None:
