@@ -804,6 +804,16 @@ def test_screening_joins_momentum_as_of_not_on_an_exact_date_match() -> None:
     assert "INTERVAL '7 days'" in sql
 
 
+def test_kospi200_screening_can_limit_price_windows_to_requested_tickers() -> None:
+    sql = _screening_sql(
+        SCREENING_BASELINE_PROFILE,
+        sector=None,
+        restrict_tickers=True,
+    )
+
+    assert "AND p.ticker = ANY(%s)" in sql
+
+
 def test_all_null_rsi_cannot_be_rescued_by_relaxation() -> None:
     """Why the as-of join above matters: widening rsi_max does nothing for NULL rows."""
 

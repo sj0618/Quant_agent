@@ -104,6 +104,7 @@ MARKET_SCOPE_TERMS = (
     "코스닥150",
     "코스닥 150",
 )
+KOSPI_200_TERMS = MARKET_SCOPE_TERMS[:4]
 BROAD_SCREENING_TERMS = (
     "종목을 찾아",
     "종목 찾아",
@@ -465,7 +466,14 @@ class PostgresPipelineDataSource:
         # before the baseline query.
         self._rollback_quietly(conn)
         sector = extract_sector_from_query(query, known_sectors)
-        params: list[Any] = [sector] if sector else []
+        screening_tickers = (
+            self._fetch_backtest_universe(conn, [])
+            if any(term.lower() in query.lower() for term in KOSPI_200_TERMS)
+            else []
+        )
+        params: list[Any] = [screening_tickers] if screening_tickers else []
+        if sector:
+            params.append(sector)
         # The window-function CTE is the expensive part, so it runs once and every
         # relaxation round re-filters these rows in-process. It scans every ticker in
         # feature.kis_adjusted_ohlcv_daily (no pre-filtered candidate view narrows it
@@ -473,7 +481,14 @@ class PostgresPipelineDataSource:
         # budget as the backtest universe fetch rather than the tight default, which
         # was sized for the old, much smaller pre-filtered scan.
         self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
-        rows = conn.execute(_screening_sql(SCREENING_BASELINE_PROFILE, sector=sector), params).fetchall()
+        rows = conn.execute(
+            _screening_sql(
+                SCREENING_BASELINE_PROFILE,
+                sector=sector,
+                restrict_tickers=bool(screening_tickers),
+            ),
+            params,
+        ).fetchall()
         self._set_statement_timeout(conn)
 
         thresholds = ScreeningThresholds()
@@ -1302,7 +1317,9 @@ def _financial_cte() -> str:
         )"""
 
 
-def _screening_sql(profile: str, *, sector: str | None = None) -> str:
+def _screening_sql(
+    profile: str, *, sector: str | None = None, restrict_tickers: bool = False
+) -> str:
     where_clause = {
         "breakout_volume": (
             "close >= high_252 * 0.995 AND volume_ratio_20 >= 1.5 "
@@ -1317,10 +1334,10 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
         ),
         "relative_strength": "relative_strength_20d >= 0 AND relative_strength_60d >= 0",
     }.get(profile, "close > 0")
+    ticker_predicate = "\n              AND p.ticker = ANY(%s)" if restrict_tickers else ""
     sector_predicate = "\n              AND sm.sector = %s" if sector else ""
-    # Universe membership comes from feature.kis_adjusted_ohlcv_daily itself (a ticker is
-    # in-scope if it has recent adjusted-price rows), not meta.view_common_stock_universe —
-    # see SYMBOL_MASTER_TABLE comment above for why that view is unusable right now.
+    # The default universe comes from recent OHLCV presence; KOSPI200 requests pass the
+    # caller's 200-name market-cap universe through restrict_tickers.
     # core.symbol_master is still joined (LEFT, so a missing row can't drop a ticker) purely
     # for display fields (name/market/sector), never as a membership filter.
     return f"""
@@ -1349,7 +1366,7 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
             FROM feature.kis_adjusted_ohlcv_daily p
             LEFT JOIN core.symbol_master sm
               ON sm.symbol = p.ticker
-            WHERE p.time >= (SELECT as_of_date FROM latest_date) - INTERVAL '420 days'{sector_predicate}
+            WHERE p.time >= (SELECT as_of_date FROM latest_date) - INTERVAL '420 days'{ticker_predicate}{sector_predicate}
         ),
         features AS (
             SELECT
