@@ -54,14 +54,23 @@ class FeaturePreparationStats:
 class PreparedFeatureStore:
     """Columnar, read-only feature arrays shared by all structured candidates."""
 
-    def __init__(self, rows: Sequence[Mapping[str, Any]]) -> None:
-        self.rows = tuple(
-            sorted(
-                rows,
-                key=lambda row: (
-                    str(row.get("date") or ""),
-                    str(row.get("ticker") or "000000").zfill(6),
-                ),
+    def __init__(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        rows_are_sorted: bool = False,
+    ) -> None:
+        self.rows = (
+            tuple(rows)
+            if rows_are_sorted
+            else tuple(
+                sorted(
+                    rows,
+                    key=lambda row: (
+                        str(row.get("date") or ""),
+                        str(row.get("ticker") or "000000").zfill(6),
+                    ),
+                )
             )
         )
         self.dates = tuple(str(row.get("date") or "") for row in self.rows)

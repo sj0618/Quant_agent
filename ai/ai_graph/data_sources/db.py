@@ -244,14 +244,17 @@ class PostgresPipelineDataSource:
             indicator_families = indicator_families_for_query(query)
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
+            recommended: list[str] = []
             ticker_resolution = "screening"
             already_screened = _query_requests_screening(query)
+            screening_mode = already_screened
             if already_screened:
                 screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
             single_ticker: str | None = None
             if not screening_candidates:
                 single_ticker = self._resolve_ticker(conn, query)
                 if single_ticker is None:
+                    screening_mode = True
                     # Ambiguous query (no explicit ticker, no name match): screen as a
                     # broad condition search instead of silently trading a single
                     # hardcoded default ticker.
@@ -269,11 +272,11 @@ class PostgresPipelineDataSource:
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
                         if screening_candidates
-                        else "ambiguous_fallback_to_default_ticker"
+                        else "ambiguous_backtest_without_current_recommendations"
                     )
                 else:
                     ticker_resolution = "explicit_or_name_match"
-            if screening_candidates:
+            if screening_mode:
                 # The matched names are the recommendation ("buy these today"). The
                 # backtest, though, runs over a liquidity-selected universe so build_signals
                 # can enter and exit per date across many names instead of replaying the
@@ -291,7 +294,9 @@ class PostgresPipelineDataSource:
                     screening_candidates, self.config.backtest_max_tickers
                 )
                 tickers = self._fetch_backtest_universe(conn, recommended)
-                ticker = recommended[0]
+                if not tickers:
+                    raise ValueError("historical backtest universe is empty")
+                ticker = recommended[0] if recommended else tickers[0]
                 symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
                 # Widen the statement timeout for the universe price/momentum/financial
@@ -342,6 +347,11 @@ class PostgresPipelineDataSource:
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
+                "recommended_tickers": recommended,
+                "recommendation_ticker": recommended[0] if recommended else None,
+                "backtest_universe": (
+                    "kospi_top_200_market_cap" if screening_mode else "explicit_ticker"
+                ),
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [

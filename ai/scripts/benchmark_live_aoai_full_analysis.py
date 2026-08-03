@@ -80,6 +80,8 @@ def _backtest_results(backtest: Mapping[str, Any] | None) -> dict[str, Any] | No
         "feature_preparation_seconds": execution.get(
             "feature_preparation_seconds"
         ),
+        "feature_preparation_phases": execution.get("feature_preparation_phases") or {},
+        "prepared_market_cache_hit": execution.get("prepared_market_cache_hit"),
         "total_backtest_wall_seconds": execution.get(
             "total_backtest_wall_seconds"
         ),
