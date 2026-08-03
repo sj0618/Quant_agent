@@ -601,29 +601,29 @@ class PostgresPipelineDataSource:
             lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
         )
         ticker_list = list(tickers)
-        # row_number keeps the lookback per ticker: a plain LIMIT would spend the whole
-        # budget on whichever ticker sorted first and starve the rest.
+        # One bounded index scan per ticker avoids sorting/ranking the whole 200-name set.
         phase_started = perf_counter()
         rows = conn.execute(
             """
-            SELECT as_of_date, ticker, open, high, low, close, volume,
-                   adjusted_ohlcv_quality_flags
-            FROM (
+            SELECT prices.*
+            FROM (SELECT DISTINCT unnest(%s::text[]) AS ticker) requested
+            CROSS JOIN LATERAL (
                 SELECT
-                    time AS as_of_date,
-                    ticker,
-                    adj_open AS open,
-                    adj_high AS high,
-                    adj_low AS low,
-                    adj_close AS close,
-                    adj_volume AS volume,
-                    quality_flags AS adjusted_ohlcv_quality_flags,
-                    row_number() OVER (PARTITION BY ticker ORDER BY time DESC) AS ticker_rank
+                    p.time AS as_of_date,
+                    p.ticker,
+                    p.adj_open AS open,
+                    p.adj_high AS high,
+                    p.adj_low AS low,
+                    p.adj_close AS close,
+                    p.adj_volume AS volume,
+                    p.quality_flags AS adjusted_ohlcv_quality_flags
                 FROM feature.kis_adjusted_ohlcv_daily
-                WHERE ticker = ANY(%s)
-                  AND time >= CURRENT_DATE - make_interval(days => %s)
-            ) ranked
-            WHERE ticker_rank <= %s
+                    AS p
+                WHERE p.ticker = requested.ticker
+                  AND p.time >= CURRENT_DATE - make_interval(days => %s)
+                ORDER BY p.time DESC
+                LIMIT %s
+            ) prices
             ORDER BY as_of_date, ticker
             """,
             [ticker_list, calendar_lookback_days, lookback_days],
@@ -758,17 +758,39 @@ class PostgresPipelineDataSource:
         phase_started = perf_counter()
         rows = conn.execute(
             """
-            SELECT base_ticker, time, values_jsonb
-            FROM (
-                SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
-                    split_part(ticker, '#', 1) AS base_ticker,
-                    time,
-                    values_jsonb
-                FROM feature.ta_momentum_ticker_daily
-                WHERE split_part(ticker, '#', 1) = ANY(%s)
-                  AND time >= CURRENT_DATE - make_interval(days => %s)
-                ORDER BY split_part(ticker, '#', 1), time, ticker
-            ) deduped
+            WITH requested AS (
+                SELECT DISTINCT unnest(%s::text[]) AS base_ticker
+            ),
+            listing_segments AS (
+                SELECT
+                    sm.symbol AS base_ticker,
+                    row_number() OVER (
+                        PARTITION BY sm.symbol ORDER BY history.valid_from
+                    ) AS segment_id,
+                    count(*) OVER (PARTITION BY sm.symbol) AS segment_count
+                FROM core.symbol_listing_history history
+                JOIN core.symbol_master sm ON sm.symbol_id = history.symbol_id
+                JOIN requested ON requested.base_ticker = sm.symbol
+            ),
+            effective_tickers AS (
+                SELECT base_ticker, base_ticker AS ticker
+                FROM requested
+                UNION ALL
+                SELECT
+                    base_ticker,
+                    base_ticker || '#S' || lpad(segment_id::text, 2, '0')
+                FROM listing_segments
+                WHERE segment_count > 1
+            )
+            SELECT DISTINCT ON (effective.base_ticker, momentum.time)
+                effective.base_ticker,
+                momentum.time,
+                momentum.values_jsonb
+            FROM effective_tickers effective
+            JOIN feature.ta_momentum_ticker_daily momentum
+              ON momentum.ticker = effective.ticker
+            WHERE momentum.time >= CURRENT_DATE - make_interval(days => %s)
+            ORDER BY effective.base_ticker, momentum.time, momentum.ticker
             """,
             [list(tickers), calendar_lookback_days],
         ).fetchall()
@@ -1376,14 +1398,9 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
         ),
         {_financial_cte()},
         momentum_raw AS (
-            -- ta_momentum_ticker_daily keys tickers as '000020#S05' (6-digit code plus a
-            -- security-type suffix) while kis_adjusted_ohlcv_daily keys them as '000020',
-            -- so joining the raw columns matches nothing and every rsi comes back NULL.
-            -- Strip the suffix here; DISTINCT ON keeps one row per (ticker, time) when
-            -- several security types collapse onto the same 6-digit code.
-            SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
+            SELECT DISTINCT ON (base_ticker, time)
                 time,
-                split_part(ticker, '#', 1) AS ticker,
+                base_ticker AS ticker,
                 COALESCE(
                     values_jsonb->>'RSI_14',
                     values_jsonb->>'rsi_14',
@@ -1392,7 +1409,7 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 ) AS rsi_text
             FROM feature.ta_momentum_ticker_daily
             WHERE time >= (SELECT as_of_date FROM latest_date) - INTERVAL '90 days'
-            ORDER BY split_part(ticker, '#', 1), time, ticker
+            ORDER BY base_ticker, time, ticker
         ),
         momentum AS (
             SELECT

@@ -209,9 +209,13 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
         ["12345ms"],
     )
     price_query = next(
-        query for query, _ in source.conn.calls if "PARTITION BY ticker" in query
+        query for query, _ in source.conn.calls if "CROSS JOIN LATERAL" in query
     )
     assert "ORDER BY as_of_date, ticker" in price_query
+    momentum_query = next(
+        query for query, _ in source.conn.calls if "effective_tickers AS" in query
+    )
+    assert "momentum.ticker = effective.ticker" in momentum_query
 
 
 def test_postgres_data_source_broad_screening_uses_screening_candidates() -> None:
@@ -799,6 +803,8 @@ def test_screening_joins_momentum_as_of_not_on_an_exact_date_match() -> None:
     assert "momentum_as_of AS" in sql
     assert "LEFT JOIN momentum_as_of mwp" in sql
     assert "mwp.ticker = f.ticker AND mwp.time = f.time" not in sql
+    assert "split_part(ticker, '#', 1)" not in sql
+    assert "base_ticker AS ticker" in sql
     # Bounded, so a genuinely dead feed screens as missing instead of quietly
     # trading a month-old RSI.
     assert "INTERVAL '7 days'" in sql

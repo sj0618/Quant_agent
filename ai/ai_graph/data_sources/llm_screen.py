@@ -38,11 +38,9 @@ MAX_SCREEN_ROWS = 500
 SCHEMA_NOTES = """
 Known pitfalls in this warehouse - getting these wrong yields silently wrong results:
 
-1. Ticker keys differ between tables. feature.ta_*_ticker_daily stores tickers as
-   '000020#S05' (6-digit code plus a security-type suffix), while
-   feature.kis_adjusted_ohlcv_daily, core.symbol_master and mart.dart_financial_asof
-   use the bare '000020'. Join with split_part(ticker, '#', 1), and de-duplicate,
-   because several security types can collapse onto one 6-digit code.
+1. Ticker keys differ between tables. feature.ta_*_ticker_daily stores the effective
+   ticker in ticker and the bare 6-digit code in base_ticker. Join through base_ticker
+   and de-duplicate because several segments can collapse onto one 6-digit code.
 
 2. mart.dart_financial_asof must be filtered on available_from (the date the filing
    became public), never on period_end. Selecting by period_end lets a screen read
