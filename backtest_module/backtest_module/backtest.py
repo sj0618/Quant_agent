@@ -5,6 +5,7 @@ import csv
 import gzip
 import json
 import math
+import numpy as np
 from functools import lru_cache
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -1501,38 +1502,27 @@ def _calculate_selection_metrics(equity_curve: Sequence[EquityPoint]) -> dict[st
     initial = float(equity_curve[0].total_equity)
     final = float(equity_curve[-1].total_equity)
     total_return = final / initial - 1.0 if initial else 0.0
-    returns = [float(point.daily_return) for point in equity_curve]
-    usable = returns[1:] if len(returns) > 1 else []
-    mean_return = sum(usable) / len(usable) if usable else 0.0
-    variance = (
-        sum((value - mean_return) ** 2 for value in usable) / (len(usable) - 1)
-        if len(usable) > 1
-        else 0.0
-    )
+    returns = np.fromiter((float(point.daily_return) for point in equity_curve), dtype=np.float64)
+    usable = returns[1:] if returns.size > 1 else np.array([], dtype=np.float64)
+    mean_return = float(np.mean(usable)) if usable.size else 0.0
+    variance = float(np.var(usable, ddof=1)) if usable.size > 1 else 0.0
     volatility = math.sqrt(variance)
     sharpe = mean_return / volatility * math.sqrt(252.0) if volatility > 0.0 else 0.0
 
-    peak = float(equity_curve[0].total_equity)
-    max_drawdown = 0.0
-    for point in equity_curve:
-        value = float(point.total_equity)
-        peak = max(peak, value)
-        drawdown = value / peak - 1.0 if peak else 0.0
-        max_drawdown = min(max_drawdown, drawdown)
+    equity = np.fromiter((float(point.total_equity) for point in equity_curve), dtype=np.float64)
+    peaks = np.maximum.accumulate(equity)
+    drawdown_series = np.divide(equity, peaks, out=np.ones_like(equity), where=peaks != 0) - 1.0
+    max_drawdown = float(np.min(drawdown_series))
 
-    positive = sum(value for value in usable if value > 0.0)
-    negative = -sum(value for value in usable if value < 0.0)
+    positive = float(np.sum(usable[usable > 0.0])) if usable.size else 0.0
+    negative = -float(np.sum(usable[usable < 0.0])) if usable.size else 0.0
     profit_factor = positive / negative if negative > 0.0 else (1.0 if positive > 0.0 else 0.0)
     elapsed_days = max(
         1,
         (date.fromisoformat(equity_curve[-1].date) - date.fromisoformat(equity_curve[0].date)).days,
     )
     cagr = (final / initial) ** (365.0 / elapsed_days) - 1.0 if initial > 0.0 and final > 0.0 else 0.0
-    win_rate = (
-        sum(1 for value in usable if value > 0.0) / len(usable)
-        if usable
-        else 0.0
-    )
+    win_rate = float(np.mean(usable > 0.0)) if usable.size else 0.0
     return {
         "total_return": round(total_return, 10),
         "cagr": round(cagr, 10),
