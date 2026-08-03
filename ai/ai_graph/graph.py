@@ -18,7 +18,7 @@ from ai_graph.audit import (
     report_audit_failure,
 )
 from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_sink
-from ai_graph.data_sources import load_pipeline_data_from_env
+from ai_graph.data_sources import load_pipeline_data_from_env, screening_data_families
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from pydantic import ValidationError
 
@@ -524,7 +524,19 @@ def _strategy_query(state: Mapping[str, Any]) -> str:
 def data_node(state: QuantAgentState) -> dict[str, Any]:
     query = _strategy_query(state)
     semantic_slots = parse_semantic_slots(query, trace_id=state["trace_id"])
-    data_requirements = plan_data_requirements(semantic_slots)
+    data_requirements = plan_data_requirements(semantic_slots, query=query)
+    if not data_requirements:
+        # An empty plan means we could not name a single thing to read, so there is
+        # nothing to screen on and nothing a later stage could honestly verify. It used
+        # to be reported as "0종" and then ignored - the run continued into a full
+        # backtest whose data no stage had claimed to need. Stop here with a reason
+        # instead.
+        return {
+            "semantic_slots": semantic_slots.model_dump(),
+            "data_requirements": [],
+            "status": EnvelopeStatus.NEED_CLARIFICATION.value,
+            "ambiguity": _no_data_plan_ambiguity(query),
+        }
     report_activity(
         "step",
         label="필요 데이터 정리",
@@ -574,6 +586,39 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         output["status"] = EnvelopeStatus.NEED_CLARIFICATION.value
         output["ambiguity"] = _unverifiable_ambiguity(unsupported)
     return output
+
+
+def _no_data_plan_ambiguity(query: str) -> dict[str, Any]:
+    reason = "요청에서 조회할 데이터 항목을 하나도 확정하지 못했습니다."
+    return {
+        "category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+        "ambiguity_category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+        "safety_priority": False,
+        "reason": reason,
+        "ambiguity_reasons": [reason],
+        "ambiguity_dimensions": ["data_availability"],
+        "source_resolvable": False,
+        "needs_clarification_after_source_check": True,
+        "clarification_blocker_type": "missing_data_source",
+        "clarification_question": (
+            "어떤 지표로 종목을 고를지 알 수 없어 조회할 데이터를 정하지 못했습니다. "
+            "기준으로 삼을 지표를 하나만 정해 주시겠어요?"
+        ),
+        "question_reason": "조회할 데이터가 없으면 어떤 조건도 검증할 수 없습니다.",
+        "options": [
+            {
+                "label": "가격/기술적 지표 기준으로 검증",
+                "reason": "이동평균·RSI·거래량 같은 가격 지표는 지금 바로 검증할 수 있습니다.",
+            },
+            {
+                "label": "재무 지표 기준으로 검증",
+                "reason": "PER·ROE·부채비율 같은 재무 조건으로 종목을 고를 수 있습니다.",
+            },
+        ],
+        "recommended_option": 0,
+        "recommendation_confidence": 0.6,
+        "recommendation_confidence_reason": "가격/기술적 지표는 적재 상태가 가장 안정적입니다.",
+    }
 
 
 def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -943,11 +988,32 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
     )
 
 
-def plan_data_requirements(semantic_slots: SemanticSlots) -> list[DataRequirement]:
+def plan_data_requirements(
+    semantic_slots: SemanticSlots, *, query: str | None = None
+) -> list[DataRequirement]:
+    """What this run will read, as the loader will actually read it.
+
+    The families used to be inferred purely from `semantic_slots`, whose indicator list
+    comes from a fixed Korean keyword table (rsi/볼린저/거래량/20일선/200일/per/roe). A
+    strategy phrased outside that table - "반도체 섹터 주도주 중 상대강도 강한 종목" - set
+    no indicator, so the plan came out empty and the run reported "조회할 데이터 항목
+    0종" while the loader went on to screen the whole universe on price/TA and backtest
+    233 names. The plan was describing a different run than the one that executed.
+
+    So the families are taken from the screening profile the loader will use, and the
+    slots only add what the profile cannot know about. `query` is optional so callers
+    that only have slots still work; passing it is what makes the count honest.
+    """
+
     requirements: list[DataRequirement] = []
     indicators = set(semantic_slots.indicator)
     events = set(semantic_slots.event)
-    if indicators & {"rsi", "bollinger", "volume", "sma_20", "sma_200"} or events & {"lower_band_reentry", "new_52w_high", "upper_band_breakout"}:
+    families = set(screening_data_families(query)) if query is not None else set()
+    if (
+        "ohlcv_ta" in families
+        or indicators & {"rsi", "bollinger", "volume", "sma_20", "sma_200"}
+        or events & {"lower_band_reentry", "new_52w_high", "upper_band_breakout"}
+    ):
         requirements.append(
             DataRequirement(
                 family="ohlcv_ta",
@@ -960,7 +1026,11 @@ def plan_data_requirements(semantic_slots: SemanticSlots) -> list[DataRequiremen
                 evidence_ref="data-plan:ohlcv_ta",
             )
         )
-    if indicators & {"per", "roe"} or any(slot in semantic_slots.threshold for slot in ("debt_ratio <= 100",)):
+    if (
+        "fundamentals" in families
+        or indicators & {"per", "roe"}
+        or any(slot in semantic_slots.threshold for slot in ("debt_ratio <= 100",))
+    ):
         requirements.append(
             DataRequirement(
                 family="fundamentals",

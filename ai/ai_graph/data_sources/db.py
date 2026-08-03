@@ -161,6 +161,26 @@ class DataSourceConfig(BaseModel):
         )
 
 
+class PipelineDataUnavailableError(ValueError):
+    """The warehouse is healthy but has nothing to run this strategy on.
+
+    Subclasses ValueError because that is what these two conditions were raised as
+    before, so anything already catching them keeps working - the point of the class is
+    the `reason` code, not a new place in the hierarchy.
+
+    Distinct from an infrastructure error on purpose. Both used to be raised as bare
+    ValueErrors, so `classify_failure` sorted "no stock matches your condition today"
+    into `unknown_failure` - a message that tells the user nothing and reads as a
+    crash, which is what left runs looking like they had stalled until the client's
+    wall-clock timeout gave up on them. Carrying the reason as a code lets the job
+    layer turn it into an answer ("조건에 맞는 종목이 없습니다") instead.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class PipelineDataBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -242,13 +262,17 @@ class PostgresPipelineDataSource:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
                 # silently substitute config.default_ticker, since that produces a
                 # report that looks real but always trades the same hardcoded stock.
-                raise ValueError(
+                raise PipelineDataUnavailableError(
+                    "no_screening_matches",
                     "no screening candidates or resolvable ticker found in the database "
                     f"for this query after {screening_relaxation.get('relaxation_rounds', 0)} "
-                    "relaxation round(s); refusing to fall back to a hardcoded default ticker"
+                    "relaxation round(s); refusing to fall back to a hardcoded default ticker",
                 )
             if not price_rows:
-                raise ValueError(f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}")
+                raise PipelineDataUnavailableError(
+                    "no_price_rows",
+                    f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}",
+                )
             l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
             capability_availability = measure_capabilities(conn)
@@ -1124,6 +1148,39 @@ def _screening_profile(query: str) -> str:
     if "신고가" in query or "거래량" in query or "돌파" in query or "모멘텀" in query:
         return "breakout_volume"
     return "technical_proxy"
+
+
+def screening_profile(query: str) -> str:
+    """The profile the loader will actually screen this query with.
+
+    Public so the requirement planner can be grounded in the same decision the loader
+    makes, rather than deriving "what data does this need" from its own keyword table
+    that had already drifted out of agreement with this one.
+    """
+
+    return _screening_profile(query)
+
+
+# Which data families each screening profile reads. Every profile's WHERE clause is
+# built on price/TA columns, so ohlcv_ta is unconditional; the fundamental profiles
+# additionally join the DART financials CTE.
+_PROFILE_DATA_FAMILIES: dict[str, tuple[str, ...]] = {
+    "value_quality": ("ohlcv_ta", "fundamentals"),
+    "quality_growth": ("ohlcv_ta", "fundamentals"),
+    "growth_momentum": ("ohlcv_ta", "fundamentals"),
+    "rsi_rebound": ("ohlcv_ta",),
+    "bollinger_squeeze": ("ohlcv_ta",),
+    "pullback_trend": ("ohlcv_ta",),
+    "relative_strength": ("ohlcv_ta",),
+    "breakout_volume": ("ohlcv_ta",),
+    "technical_proxy": ("ohlcv_ta",),
+}
+
+
+def screening_data_families(query: str) -> tuple[str, ...]:
+    """Data families the screen for this query will read from the warehouse."""
+
+    return _PROFILE_DATA_FAMILIES.get(screening_profile(query), ("ohlcv_ta",))
 
 
 def _dart_amount(field: str, *, prior: bool = False) -> str:

@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_graph.data_sources.db import resolve_database_dsn_from_env
+from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.progress import (
     AnalysisCancelled,
@@ -543,6 +543,25 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             retryable=True,
             safe_message="현재 AI 분석 요청이 몰려 대기 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:aoai_capacity_exhausted"],
+        )
+    # The warehouse answered, it just had nothing to run this strategy on. That is an
+    # answer for the user, not a crash: sorted into unknown_failure it produced "분류되지
+    # 않은 오류" with no indication that the screen simply matched nothing, and the run
+    # looked indistinguishable from one that had hung.
+    if isinstance(exc, PipelineDataUnavailableError):
+        no_matches = exc.reason == "no_screening_matches"
+        return FailureDiagnostic(
+            category="data_gap",
+            subcause=exc.reason,
+            failure_stage=Stage.INTERPRETING.value,
+            owner="data_source_config",
+            retryable=False,
+            safe_message=(
+                "조건에 맞는 종목을 찾지 못했습니다. 조건을 완화해 다시 시도해 주세요."
+                if no_matches
+                else "선정된 종목의 가격 데이터가 적재되어 있지 않아 백테스트를 진행할 수 없습니다."
+            ),
+            evidence_refs=[f"failure:{exc.reason}"],
         )
     raw = str(exc).lower()
     if "connection timeout" in raw or "connect timeout" in raw or "connection timed out" in raw:

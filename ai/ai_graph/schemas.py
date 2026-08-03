@@ -44,6 +44,11 @@ FailureSubcause = Literal[
     "parser_low_confidence",
     "source_conflict",
     "data_required",
+    # The screen ran and matched nothing, or the matched names have no price history.
+    # Separate from the generic gaps above so the user is told the condition was too
+    # tight rather than that something broke.
+    "no_screening_matches",
+    "no_price_rows",
     "outside_owner",
     "product_data_gap",
     "unknown",
