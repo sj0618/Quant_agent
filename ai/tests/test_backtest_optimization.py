@@ -290,6 +290,49 @@ def test_fresh_and_disk_cache_results_are_identical(monkeypatch, tmp_path) -> No
     assert fresh_payload == cached_payload
 
 
+def test_prepared_market_cache_skips_repeated_engine_conversion(monkeypatch) -> None:
+    strategy = _strategy()
+    rows = _rows(days=12, tickers=3)
+    original = backtest_node._engine_market_rows
+    calls = 0
+
+    def counted(price_rows):
+        nonlocal calls
+        calls += 1
+        return original(price_rows)
+
+    backtest_node._clear_prepared_market_cache()
+    monkeypatch.setattr(backtest_node, "_engine_market_rows", counted)
+    try:
+        with backtest_node._CandidateBacktestSession(strategy, rows) as first:
+            assert not first.prepared_market_cache_hit
+        with backtest_node._CandidateBacktestSession(strategy, rows) as second:
+            assert second.prepared_market_cache_hit
+            assert second.preparation_phases["engine_row_conversion_seconds"] == 0.0
+            assert second.preparation_phases["engine_market_index_seconds"] == 0.0
+    finally:
+        backtest_node._clear_prepared_market_cache()
+
+    assert calls == 1
+
+
+def test_data_fingerprint_tracks_content_and_input_order() -> None:
+    rows = _rows(days=3, tickers=2)
+    same_rows = [dict(row) for row in rows]
+    changed_rows = [dict(row) for row in rows]
+    changed_rows[-1]["rsi"] = float(changed_rows[-1]["rsi"]) + 1.0
+
+    fingerprint, descriptor = backtest_node._data_fingerprint(rows)
+    same_fingerprint, _ = backtest_node._data_fingerprint(same_rows)
+    changed_fingerprint, _ = backtest_node._data_fingerprint(changed_rows)
+    _, reversed_descriptor = backtest_node._data_fingerprint(list(reversed(rows)))
+
+    assert fingerprint == same_fingerprint
+    assert fingerprint != changed_fingerprint
+    assert descriptor["rows_are_sorted"] is True
+    assert reversed_descriptor["rows_are_sorted"] is False
+
+
 def test_improvement_candidates_are_bounded_and_normalized() -> None:
     strategy = _strategy()
     generated = generate_loop3_candidates(

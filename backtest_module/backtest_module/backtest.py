@@ -585,12 +585,18 @@ def compute_talib_metrics_for_bars(
 def compute_derived_metrics_for_bars(
     bars: Sequence[OhlcvBar],
     required_metrics: set[str],
+    *,
+    rows_are_sorted: bool = False,
 ) -> tuple[dict[tuple[date, str], dict[str, float]], list[str]]:
-    sorted_bars = sorted(bars, key=lambda row: row.date)
+    requested = {METRIC_ALIASES.get(metric, metric).lower() for metric in required_metrics}
+    if not requested.intersection(
+        {"volume_ratio_20", "rolling_high_60", "rolling_high_252", "days_since_breakout"}
+    ):
+        return {}, []
+    sorted_bars = list(bars) if rows_are_sorted else sorted(bars, key=lambda row: row.date)
     if not sorted_bars:
         return {}, []
     ticker = sorted_bars[0].ticker
-    requested = {METRIC_ALIASES.get(metric, metric).lower() for metric in required_metrics}
     metric_rows: dict[tuple[date, str], dict[str, float]] = {(bar.date, ticker): {} for bar in sorted_bars}
     computed: set[str] = set()
 
@@ -656,15 +662,25 @@ class BacktestEngine:
         config: BacktestRunConfig | None = None,
         prepared_market_data: PreparedMarketData | None = None,
         generated_actions: Sequence[int] | None = None,
+        inputs_normalized: bool = False,
     ):
         self.spec = spec
         self.strategy = QuantStrategy(spec)
         self.config = config or BacktestRunConfig()
         self.prepared_market_data = prepared_market_data
         self.generated_actions = generated_actions
+        self.inputs_normalized = inputs_normalized
         if prepared_market_data is None:
-            self.ohlcv_rows = sorted(ohlcv_rows, key=lambda row: (row.date, row.ticker))
-            self.metric_rows = normalize_metric_rows(metric_rows)
+            self.ohlcv_rows = (
+                list(ohlcv_rows)
+                if inputs_normalized
+                else sorted(ohlcv_rows, key=lambda row: (row.date, row.ticker))
+            )
+            self.metric_rows = (
+                dict(metric_rows)
+                if inputs_normalized and isinstance(metric_rows, Mapping)
+                else normalize_metric_rows(metric_rows)
+            )
         else:
             self.ohlcv_rows = list(prepared_market_data.ohlcv_rows)
             self.metric_rows = {}
@@ -787,7 +803,9 @@ class BacktestEngine:
             talib_metrics, ticker_report = compute_talib_metrics_for_bars(bars, computations)
             for key, row_metrics in talib_metrics.items():
                 metrics_by_key.setdefault(key, {}).update(row_metrics)
-            derived_metrics, derived_metric_names = compute_derived_metrics_for_bars(bars, required)
+            derived_metrics, derived_metric_names = compute_derived_metrics_for_bars(
+                bars, required, rows_are_sorted=self.inputs_normalized
+            )
             for key, row_metrics in derived_metrics.items():
                 metrics_by_key.setdefault(key, {}).update(row_metrics)
             computed_functions.update(ticker_report["computed_functions"])  # type: ignore[arg-type]
@@ -801,7 +819,8 @@ class BacktestEngine:
 
         for ticker, bars in bars_by_ticker.items():
             previous: dict[str, float] | None = None
-            for bar in sorted(bars, key=lambda item: item.date):
+            ordered_bars = bars if self.inputs_normalized else sorted(bars, key=lambda item: item.date)
+            for bar in ordered_bars:
                 previous_metrics_by_key[(bar.date, ticker)] = previous
                 previous = metrics_by_key[(bar.date, ticker)]
         report.update(
@@ -821,11 +840,19 @@ class BacktestEngine:
         except Exception as exc:  # pragma: no cover
             report["catalog_error"] = f"{type(exc).__name__}: {exc}"
         self.indicator_report = report
-        dates = tuple(sorted(day for day, by_ticker in bars_by_date.items() if by_ticker))
-        sorted_rows = tuple(
-            bar
-            for day in dates
-            for _, bar in sorted(bars_by_date[day].items())
+        dates = tuple(
+            (day for day, by_ticker in bars_by_date.items() if by_ticker)
+            if self.inputs_normalized
+            else sorted(day for day, by_ticker in bars_by_date.items() if by_ticker)
+        )
+        sorted_rows = (
+            tuple(self.ohlcv_rows)
+            if self.inputs_normalized
+            else tuple(
+                bar
+                for day in dates
+                for _, bar in sorted(bars_by_date[day].items())
+            )
         )
         row_index_by_key = {
             (bar.date, bar.ticker): index for index, bar in enumerate(sorted_rows)
@@ -833,11 +860,11 @@ class BacktestEngine:
         return PreparedMarketData(
             ohlcv_rows=sorted_rows,
             bars_by_ticker={
-                ticker: tuple(sorted(bars, key=lambda item: item.date))
+                ticker: tuple(bars if self.inputs_normalized else sorted(bars, key=lambda item: item.date))
                 for ticker, bars in bars_by_ticker.items()
             },
             bars_by_date={
-                day: dict(sorted(by_ticker.items()))
+                day: dict(by_ticker) if self.inputs_normalized else dict(sorted(by_ticker.items()))
                 for day, by_ticker in bars_by_date.items()
             },
             metrics_by_key=metrics_by_key,
@@ -1551,6 +1578,7 @@ def prepare_market_data(
     ohlcv_rows: Sequence[OhlcvBar],
     metric_rows: Mapping[tuple[date | str, str], Mapping[str, object]] | Iterable[Mapping[str, object]] | None = None,
     config: BacktestRunConfig | None = None,
+    inputs_normalized: bool = False,
 ) -> PreparedMarketData:
     """Normalize, sort, index, and calculate common metrics once for many candidates."""
 
@@ -1559,6 +1587,7 @@ def prepare_market_data(
         ohlcv_rows,
         metric_rows=metric_rows,
         config=config,
+        inputs_normalized=inputs_normalized,
     )
     return engine._prepare_market_data()
 

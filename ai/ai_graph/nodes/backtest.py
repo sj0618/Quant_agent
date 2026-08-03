@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import json
 import os
+import pickle
 import sys
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
@@ -12,6 +13,7 @@ from hashlib import sha256
 from multiprocessing import get_all_start_methods, get_context
 from pathlib import Path
 from tempfile import gettempdir
+from threading import Lock
 import time
 from typing import Any
 
@@ -257,6 +259,45 @@ class _CandidateEvaluation:
     diagnostics: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class _PreparedMarketCacheEntry:
+    price_rows: tuple[Mapping[str, Any], ...]
+    prepared_market: EnginePreparedMarketData
+
+
+class _DigestWriter:
+    def __init__(self, digest: Any) -> None:
+        self.digest = digest
+
+    def write(self, payload: bytes) -> int:
+        self.digest.update(payload)
+        return len(payload)
+
+
+# ponytail: one process-local entry bounds retained memory; use a shared cache only
+# when cross-process hit rates justify serializing the full prepared market.
+_PREPARED_MARKET_CACHE: tuple[tuple[str, str], _PreparedMarketCacheEntry] | None = None
+_PREPARED_MARKET_CACHE_LOCK = Lock()
+
+
+def _get_prepared_market(key: tuple[str, str]) -> _PreparedMarketCacheEntry | None:
+    with _PREPARED_MARKET_CACHE_LOCK:
+        cached = _PREPARED_MARKET_CACHE
+    return cached[1] if cached is not None and cached[0] == key else None
+
+
+def _store_prepared_market(key: tuple[str, str], entry: _PreparedMarketCacheEntry) -> None:
+    global _PREPARED_MARKET_CACHE
+    with _PREPARED_MARKET_CACHE_LOCK:
+        _PREPARED_MARKET_CACHE = (key, entry)
+
+
+def _clear_prepared_market_cache() -> None:
+    global _PREPARED_MARKET_CACHE
+    with _PREPARED_MARKET_CACHE_LOCK:
+        _PREPARED_MARKET_CACHE = None
+
+
 _WORKER_STRATEGY: AIStrategySpec | None = None
 _WORKER_PRICE_ROWS: Sequence[Mapping[str, Any]] | None = None
 _WORKER_PREPARED_MARKET: EnginePreparedMarketData | None = None
@@ -409,34 +450,80 @@ class _CandidateBacktestSession:
     ) -> None:
         prep_started = time.perf_counter()
         self.strategy = strategy
-        self.feature_store = PreparedFeatureStore(price_rows)
-        self.price_rows = self.feature_store.rows
-        ohlcv_rows, metric_rows = _engine_market_rows(self.price_rows)
-        preparation_candidate = CodeCandidate(
-            candidate_id="prepare",
-            variant="A",
-            code="def build_signals(prices):\n    return []\n",
-            validation_ok=True,
-        )
-        preparation_spec = _engine_strategy_spec(
-            strategy,
-            preparation_candidate,
-            available_ticker_count=_available_ticker_count(self.price_rows),
-        )
-        engine_config = EngineBacktestRunConfig(
-            initial_capital=DEFAULT_INITIAL_CAPITAL,
-            write_outputs=False,
-            talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
-            metrics_mode="selection",
-        )
-        self.prepared_market = prepare_engine_market_data(
-            preparation_spec,
-            ohlcv_rows=ohlcv_rows,
-            metric_rows=metric_rows,
-            config=engine_config,
-        )
-        self.data_fingerprint, self.data_descriptor = _data_fingerprint(self.price_rows)
+        phases: dict[str, float] = {}
+
+        started = time.perf_counter()
+        self.data_fingerprint, self.data_descriptor = _data_fingerprint(price_rows)
         self.strategy_fingerprint = _strategy_fingerprint(strategy)
+        phases["fingerprint_seconds"] = time.perf_counter() - started
+
+        cache_key = (self.data_fingerprint, self.strategy_fingerprint)
+        started = time.perf_counter()
+        cached = _get_prepared_market(cache_key)
+        phases["cache_lookup_seconds"] = time.perf_counter() - started
+
+        started = time.perf_counter()
+        if cached is None:
+            self.feature_store = PreparedFeatureStore(
+                price_rows,
+                rows_are_sorted=bool(self.data_descriptor["rows_are_sorted"]),
+            )
+            self.price_rows = self.feature_store.rows
+        else:
+            self.price_rows = cached.price_rows
+            self.feature_store = PreparedFeatureStore(
+                self.price_rows,
+                rows_are_sorted=True,
+            )
+        phases["feature_store_seconds"] = time.perf_counter() - started
+
+        self.prepared_market_cache_hit = cached is not None
+        if cached is not None:
+            self.prepared_market = cached.prepared_market
+            phases["engine_row_conversion_seconds"] = 0.0
+            phases["engine_market_index_seconds"] = 0.0
+        else:
+            started = time.perf_counter()
+            ohlcv_rows, metric_rows = _engine_market_rows(self.price_rows)
+            phases["engine_row_conversion_seconds"] = time.perf_counter() - started
+
+            preparation_candidate = CodeCandidate(
+                candidate_id="prepare",
+                variant="A",
+                code="def build_signals(prices):\n    return []\n",
+                validation_ok=True,
+            )
+            preparation_spec = _engine_strategy_spec(
+                strategy,
+                preparation_candidate,
+                available_ticker_count=_available_ticker_count(self.price_rows),
+            )
+            engine_config = EngineBacktestRunConfig(
+                initial_capital=DEFAULT_INITIAL_CAPITAL,
+                write_outputs=False,
+                talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
+                metrics_mode="selection",
+            )
+            started = time.perf_counter()
+            self.prepared_market = prepare_engine_market_data(
+                preparation_spec,
+                ohlcv_rows=ohlcv_rows,
+                metric_rows=metric_rows,
+                config=engine_config,
+                inputs_normalized=True,
+            )
+            phases["engine_market_index_seconds"] = time.perf_counter() - started
+            _store_prepared_market(
+                cache_key,
+                _PreparedMarketCacheEntry(
+                    price_rows=self.price_rows,
+                    prepared_market=self.prepared_market,
+                ),
+            )
+
+        self.preparation_phases = {
+            name: round(seconds, 6) for name, seconds in phases.items()
+        }
         self.preparation_seconds = time.perf_counter() - prep_started
         self._cache: dict[tuple[str, bool, str], _CandidateEvaluation] = {}
         self._disk_cache = _DiskEvaluationCache()
@@ -705,6 +792,8 @@ class _CandidateBacktestSession:
             "feature_version": FEATURE_DEFINITION_VERSION,
             "data_fingerprint": self.data_fingerprint,
             "feature_preparation_seconds": round(self.preparation_seconds, 6),
+            "feature_preparation_phases": dict(self.preparation_phases),
+            "prepared_market_cache_hit": self.prepared_market_cache_hit,
             "feature_estimated_bytes": feature_stats.estimated_bytes,
             "feature_cached_lookbacks": list(feature_stats.cached_lookbacks),
             "cache_hits": self.cache_hits,
@@ -800,31 +889,44 @@ def _rebind_evaluation(
 def _data_fingerprint(
     rows: Sequence[Mapping[str, Any]],
 ) -> tuple[str, dict[str, Any]]:
-    digest = sha256()
     tickers: set[str] = set()
     first_date: str | None = None
     last_date: str | None = None
+    previous_sort_key: tuple[str, str] | None = None
+    rows_are_sorted = True
     for row in rows:
         ticker = str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
         row_date = str(row.get("date") or "")
         tickers.add(ticker)
         first_date = row_date if first_date is None else min(first_date, row_date)
         last_date = row_date if last_date is None else max(last_date, row_date)
-        encoded = json.dumps(
-            dict(row),
-            ensure_ascii=True,
-            default=str,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        digest.update(encoded.encode("utf-8"))
-        digest.update(b"\n")
+        sort_key = (row_date, ticker)
+        if previous_sort_key is not None and sort_key < previous_sort_key:
+            rows_are_sorted = False
+        previous_sort_key = sort_key
+
+    digest = sha256()
+    try:
+        pickle.Pickler(_DigestWriter(digest), protocol=pickle.HIGHEST_PROTOCOL).dump(rows)
+    except (AttributeError, pickle.PicklingError, TypeError):
+        digest = sha256()
+        for row in rows:
+            encoded = json.dumps(
+                dict(row),
+                ensure_ascii=True,
+                default=str,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            digest.update(encoded.encode("utf-8"))
+            digest.update(b"\n")
     descriptor = {
         "row_count": len(rows),
         "ticker_count": len(tickers),
         "tickers_sha": sha256(",".join(sorted(tickers)).encode("utf-8")).hexdigest(),
         "first_date": first_date,
         "last_date": last_date,
+        "rows_are_sorted": rows_are_sorted,
     }
     return digest.hexdigest(), descriptor
 
@@ -1366,17 +1468,15 @@ def _generated_signal_from_raw(signal: object) -> GeneratedSignal:
 
 def _engine_market_rows(
     price_rows: Sequence[Mapping[str, Any]],
-) -> tuple[list[Any], list[dict[str, object]]]:
+) -> tuple[list[Any], dict[tuple[date, str], dict[str, float]]]:
     ohlcv_rows: list[Any] = []
-    metric_rows: list[dict[str, object]] = []
-    tickers: set[str] = set()
+    metric_rows: dict[tuple[date, str], dict[str, float]] = {}
 
     for raw in price_rows:
         if "date" not in raw or "close" not in raw:
             raise ValueError("price rows must include date and close")
         row_date = date.fromisoformat(str(raw["date"]))
         ticker = str(raw.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
-        tickers.add(ticker)
         close = _finite_float(raw["close"], "close")
         open_price = _finite_float(raw.get("open", close), "open")
         high = _finite_float(raw.get("high", max(open_price, close)), "high")
@@ -1395,12 +1495,12 @@ def _engine_market_rows(
                 volume=volume,
             )
         )
-        metric_row: dict[str, object] = {"date": row_date.isoformat(), "ticker": ticker}
+        metric_row: dict[str, float] = {}
         for key, value in raw.items():
             if str(key) in PRICE_FIELD_NAMES or not _is_numeric_metric(value):
                 continue
             metric_row[str(key)] = float(value)
-        metric_rows.append(metric_row)
+        metric_rows[(row_date, ticker)] = metric_row
 
     return ohlcv_rows, metric_rows
 

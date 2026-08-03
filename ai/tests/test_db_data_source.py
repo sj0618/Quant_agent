@@ -205,6 +205,10 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
         "SELECT set_config('statement_timeout', %s, true)",
         ["12345ms"],
     )
+    price_query = next(
+        query for query, _ in source.conn.calls if "PARTITION BY ticker" in query
+    )
+    assert "ORDER BY as_of_date, ticker" in price_query
 
 
 def test_postgres_data_source_broad_screening_uses_screening_candidates() -> None:
@@ -681,8 +685,8 @@ def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     assert any(row.get("rsi", 100) <= RSI_OVERSOLD_THRESHOLD for row in bundle.price_rows)
 
 
-def test_empty_screen_is_not_re_run_for_the_same_query() -> None:
-    """A screen that matched nothing must not be repeated inside the same load().
+def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -> None:
+    """A screen that matched nothing must not block or repeat the backtest load.
 
     The baseline screen scans every ticker in feature.kis_adjusted_ohlcv_daily with six
     window functions over 420 days and runs on the widened backtest statement budget.
@@ -722,14 +726,57 @@ def test_empty_screen_is_not_re_run_for_the_same_query() -> None:
                 self.baseline_screens += 1
             return Result([])
 
-    connection = CountingConnection()
-    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://fake/fake"))
-    source._connect = lambda: connection  # type: ignore[method-assign]
+    class EmptyScreenDataSource(PostgresPipelineDataSource):
+        def _connect(self) -> CountingConnection:
+            return connection
 
-    with pytest.raises(ValueError, match="no screening candidates"):
-        source.load("RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어", "trace-dup")
+        def _fetch_backtest_universe(
+            self, _conn: object, recommended: list[str]
+        ) -> list[str]:
+            assert recommended == []
+            return ["000660"]
+
+        def _fetch_symbol_info_map(
+            self, _conn: object, tickers: list[str]
+        ) -> dict[str, dict[str, object]]:
+            return {ticker: {"ticker": ticker, "included": True} for ticker in tickers}
+
+        def _fetch_price_rows(
+            self,
+            _conn: object,
+            tickers: list[str],
+            _symbol_info: object,
+            _query: str,
+        ) -> tuple[list[dict[str, object]], int]:
+            return [
+                {
+                    "date": "2016-08-03",
+                    "ticker": tickers[0],
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 1_000,
+                }
+            ], DEFAULT_BACKTEST_LOOKBACK_DAYS
+
+        def _fetch_macro_status(self, _conn: object) -> dict[str, object]:
+            return {}
+
+    connection = CountingConnection()
+    source = EmptyScreenDataSource(
+        DataSourceConfig(database_dsn="postgresql://fake/fake")
+    )
+
+    bundle = source.load(
+        "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어",
+        "trace-dup",
+    )
 
     assert connection.baseline_screens == 1
+    assert bundle.metadata["recommended_tickers"] == []
+    assert bundle.metadata["tickers"] == ["000660"]
+    assert bundle.price_rows[0]["ticker"] == "000660"
 
 
 def test_screening_joins_momentum_as_of_not_on_an_exact_date_match() -> None:
