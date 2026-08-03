@@ -621,18 +621,16 @@ class PostgresPipelineDataSource:
         phase_started = perf_counter()
         rows = conn.execute(
             """
-            SELECT as_of_date, ticker, open, high, low, close, volume,
-                   adjusted_ohlcv_quality_flags
+            SELECT as_of_date, ticker, open, high, low, close, volume
             FROM (
                 SELECT
                     time AS as_of_date,
                     ticker,
-                    adj_open AS open,
-                    adj_high AS high,
-                    adj_low AS low,
-                    adj_close AS close,
-                    adj_volume AS volume,
-                    quality_flags AS adjusted_ohlcv_quality_flags,
+                    adj_open::double precision AS open,
+                    adj_high::double precision AS high,
+                    adj_low::double precision AS low,
+                    adj_close::double precision AS close,
+                    adj_volume::double precision AS volume,
                     row_number() OVER (PARTITION BY ticker ORDER BY time DESC) AS ticker_rank
                 FROM feature.kis_adjusted_ohlcv_daily
                 WHERE ticker = ANY(%s)
@@ -1255,7 +1253,7 @@ def _dart_amount(field: str, *, prior: bool = False) -> str:
     return f"CASE WHEN {path} ~ '^-?[0-9]+$' THEN ({path})::numeric END"
 
 
-def _financial_cte() -> str:
+def _financial_cte(*, restrict_tickers: bool = False) -> str:
     """Latest DART filing per symbol, as ratios, joined into screening.
 
     Filings are selected on available_from - the date the statement became public -
@@ -1264,6 +1262,11 @@ def _financial_cte() -> str:
     raw.frmtrm_amount is present too rarely (4% of symbols) to rely on.
     """
 
+    ticker_predicate = (
+        "\n              AND symbol IN (SELECT ticker FROM requested_tickers)"
+        if restrict_tickers
+        else ""
+    )
     return f"""financial_raw AS (
             SELECT
                 symbol,
@@ -1280,7 +1283,7 @@ def _financial_cte() -> str:
             -- Only the newest filing per symbol is used, and a year-ago comparison for
             -- growth, so there is no reason to scan back to 2016.
             WHERE available_from <= (SELECT as_of_date FROM latest_date)
-              AND available_from >= (SELECT as_of_date FROM latest_date) - INTERVAL '3 years'
+              AND available_from >= (SELECT as_of_date FROM latest_date) - INTERVAL '3 years'{ticker_predicate}
         ),
         financial_latest AS (
             SELECT DISTINCT ON (symbol) *
@@ -1334,14 +1337,28 @@ def _screening_sql(
         ),
         "relative_strength": "relative_strength_20d >= 0 AND relative_strength_60d >= 0",
     }.get(profile, "close > 0")
-    ticker_predicate = "\n              AND p.ticker = ANY(%s)" if restrict_tickers else ""
+    requested_tickers_cte = (
+        "requested_tickers AS (SELECT unnest(%s::text[]) AS ticker),\n        "
+        if restrict_tickers
+        else ""
+    )
+    ticker_predicate = (
+        "\n              AND p.ticker IN (SELECT ticker FROM requested_tickers)"
+        if restrict_tickers
+        else ""
+    )
+    momentum_ticker_predicate = (
+        "\n              AND base_ticker IN (SELECT ticker FROM requested_tickers)"
+        if restrict_tickers
+        else ""
+    )
     sector_predicate = "\n              AND sm.sector = %s" if sector else ""
     # The default universe comes from recent OHLCV presence; KOSPI200 requests pass the
     # caller's 200-name market-cap universe through restrict_tickers.
     # core.symbol_master is still joined (LEFT, so a missing row can't drop a ticker) purely
     # for display fields (name/market/sector), never as a membership filter.
     return f"""
-        WITH latest_date AS (
+        WITH {requested_tickers_cte}latest_date AS (
             -- The window is what makes this affordable: the table has 531 date
             -- partitions and an unbounded max() locks every one of them. With
             -- max_locks_per_transaction at 64 the whole statement then dies with
@@ -1391,7 +1408,7 @@ def _screening_sql(
                 w200 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 199 PRECEDING AND CURRENT ROW),
                 w252 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)
         ),
-        {_financial_cte()},
+        {_financial_cte(restrict_tickers=restrict_tickers)},
         momentum_raw AS (
             -- ta_momentum_ticker_daily keys tickers as '000020#S05' (6-digit code plus a
             -- security-type suffix) while kis_adjusted_ohlcv_daily keys them as '000020',
@@ -1408,7 +1425,7 @@ def _screening_sql(
                     values_jsonb->>'rsi'
                 ) AS rsi_text
             FROM feature.ta_momentum_ticker_daily
-            WHERE time >= (SELECT as_of_date FROM latest_date) - INTERVAL '90 days'
+            WHERE time >= (SELECT as_of_date FROM latest_date) - INTERVAL '90 days'{momentum_ticker_predicate}
             ORDER BY split_part(ticker, '#', 1), time, ticker
         ),
         momentum AS (

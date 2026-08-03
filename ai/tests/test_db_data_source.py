@@ -811,7 +811,10 @@ def test_kospi200_screening_can_limit_price_windows_to_requested_tickers() -> No
         restrict_tickers=True,
     )
 
-    assert "AND p.ticker = ANY(%s)" in sql
+    assert "requested_tickers AS (SELECT unnest(%s::text[]) AS ticker)" in sql
+    assert "p.ticker IN (SELECT ticker FROM requested_tickers)" in sql
+    assert "base_ticker IN (SELECT ticker FROM requested_tickers)" in sql
+    assert "symbol IN (SELECT ticker FROM requested_tickers)" in sql
 
 
 def test_all_null_rsi_cannot_be_rescued_by_relaxation() -> None:
