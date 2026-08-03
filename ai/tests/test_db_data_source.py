@@ -1,6 +1,7 @@
 import os
 from datetime import date
 from decimal import Decimal
+from threading import Event
 
 import pytest
 
@@ -701,6 +702,9 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
     "데이터 조회 시간이 초과되었습니다".
     """
 
+    screening_started = Event()
+    backtest_started = Event()
+
     class Result:
         def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
             self.rows = rows or []
@@ -733,6 +737,14 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
         def _connect(self) -> CountingConnection:
             return connection
 
+        def _screen_with_relaxation(
+            self, _conn: object, _query: str
+        ) -> tuple[list[dict[str, object]], dict[str, object]]:
+            connection.baseline_screens += 1
+            screening_started.set()
+            assert backtest_started.wait(5)
+            return [], {"relaxation_rounds": 3}
+
         def _fetch_backtest_universe(
             self, _conn: object, recommended: list[str]
         ) -> list[str]:
@@ -752,6 +764,8 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
             _query: str,
             _timings: dict[str, float],
         ) -> tuple[list[dict[str, object]], int]:
+            backtest_started.set()
+            assert screening_started.wait(5)
             return [
                 {
                     "date": "2016-08-03",
@@ -780,6 +794,7 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
     assert connection.baseline_screens == 1
     assert bundle.metadata["recommended_tickers"] == []
     assert bundle.metadata["tickers"] == ["000660"]
+    assert bundle.metadata["parallel_screening_backtest"] is True
     assert bundle.price_rows[0]["ticker"] == "000660"
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from time import perf_counter
@@ -181,11 +182,31 @@ class PostgresPipelineDataSource:
         self.config = config
 
     def load(self, query: str, trace_id: str) -> PipelineDataBundle:
+        if _query_requests_screening(query) and _has_kospi200_reference(query):
+            # The recommendation is guaranteed to be a subset of this fixed universe,
+            # so neither read needs the other's result.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                screening_future = executor.submit(
+                    self._screen_with_separate_connection, query
+                )
+                return self._load(query, trace_id, screening_future)
+        return self._load(query, trace_id)
+
+    def _load(
+        self,
+        query: str,
+        trace_id: str,
+        screening_future: Future[
+            tuple[list[dict[str, Any]], dict[str, Any], dict[str, float]]
+        ]
+        | None = None,
+    ) -> PipelineDataBundle:
         load_started = perf_counter()
         timings = {
             name: 0.0
             for name in (
                 "connect_seconds",
+                "screening_connect_seconds",
                 "screening_seconds",
                 "ticker_resolution_seconds",
                 "universe_seconds",
@@ -213,12 +234,40 @@ class PostgresPipelineDataSource:
             ticker_resolution = "screening"
             already_screened = _query_requests_screening(query)
             screening_mode = already_screened
-            if already_screened:
+            single_ticker: str | None = None
+            if screening_future is not None:
+                phase_started = perf_counter()
+                tickers = self._fetch_backtest_universe(conn, [])
+                timings["universe_seconds"] = perf_counter() - phase_started
+                if not tickers:
+                    raise ValueError("historical backtest universe is empty")
+                phase_started = perf_counter()
+                symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
+                timings["symbol_info_seconds"] = perf_counter() - phase_started
+                self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
+                phase_started = perf_counter()
+                price_rows, effective_lookback_days = self._fetch_price_rows(
+                    conn, tickers, symbol_info_by_ticker, query, timings
+                )
+                timings["price_rows_seconds"] = perf_counter() - phase_started
+                self._set_statement_timeout(conn)
+
+                screening_candidates, screening_relaxation, screening_timings = (
+                    screening_future.result()
+                )
+                timings.update(screening_timings)
+                recommended = [
+                    str(item["ticker"]).zfill(6) for item in screening_candidates
+                ]
+                ticker = recommended[0] if recommended else tickers[0]
+                symbol_info = symbol_info_by_ticker.get(
+                    ticker, {"ticker": ticker, "included": False}
+                )
+            elif already_screened:
                 phase_started = perf_counter()
                 screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
                 timings["screening_seconds"] += perf_counter() - phase_started
-            single_ticker: str | None = None
-            if not screening_candidates:
+            if screening_future is None and not screening_candidates:
                 phase_started = perf_counter()
                 single_ticker = self._resolve_ticker(conn, query)
                 timings["ticker_resolution_seconds"] += perf_counter() - phase_started
@@ -247,7 +296,7 @@ class PostgresPipelineDataSource:
                     )
                 else:
                     ticker_resolution = "explicit_or_name_match"
-            if screening_mode:
+            if screening_future is None and screening_mode:
                 # The matched names are the recommendation ("buy these today"). The
                 # backtest, though, runs over a liquidity-selected universe so build_signals
                 # can enter and exit per date across many names instead of replaying the
@@ -274,7 +323,7 @@ class PostgresPipelineDataSource:
                 )
                 timings["price_rows_seconds"] = perf_counter() - phase_started
                 self._set_statement_timeout(conn)
-            elif single_ticker:
+            elif screening_future is None and single_ticker:
                 ticker = single_ticker
                 tickers = [ticker]
                 phase_started = perf_counter()
@@ -285,7 +334,7 @@ class PostgresPipelineDataSource:
                     conn, tickers, {ticker: symbol_info}, query, timings
                 )
                 timings["price_rows_seconds"] = perf_counter() - phase_started
-            else:
+            elif screening_future is None:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
                 # silently substitute config.default_ticker, since that produces a
                 # report that looks real but always trades the same hardcoded stock.
@@ -329,6 +378,7 @@ class PostgresPipelineDataSource:
                 "backtest_universe": (
                     "kospi_top_200_market_cap" if screening_mode else "explicit_ticker"
                 ),
+                "parallel_screening_backtest": screening_future is not None,
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [
@@ -352,6 +402,21 @@ class PostgresPipelineDataSource:
                 },
             },
         )
+
+    def _screen_with_separate_connection(
+        self, query: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, float]]:
+        connect_started = perf_counter()
+        with self._connect() as conn:
+            connect_seconds = perf_counter() - connect_started
+            self._set_statement_timeout(conn)
+            screening_started = perf_counter()
+            candidates, relaxation = self._screen_with_relaxation(conn, query)
+            screening_seconds = perf_counter() - screening_started
+        return candidates, relaxation, {
+            "screening_connect_seconds": connect_seconds,
+            "screening_seconds": screening_seconds,
+        }
 
     def _fetch_backtest_universe(self, conn: Any, recommended: Sequence[str]) -> list[str]:
         """The universe the backtest actually trades over: KOSPI 200.
@@ -468,7 +533,7 @@ class PostgresPipelineDataSource:
         sector = extract_sector_from_query(query, known_sectors)
         screening_tickers = (
             self._fetch_backtest_universe(conn, [])
-            if any(term.lower() in query.lower() for term in KOSPI_200_TERMS)
+            if _has_kospi200_reference(query)
             else []
         )
         params: list[Any] = [screening_tickers] if screening_tickers else []
@@ -1754,6 +1819,11 @@ def _availability_word(value: bool | None) -> str:
 def _has_market_scope_reference(query: str) -> bool:
     normalized_query = query.upper()
     return any(term.upper() in normalized_query for term in MARKET_SCOPE_TERMS)
+
+
+def _has_kospi200_reference(query: str) -> bool:
+    normalized_query = query.upper()
+    return any(term.upper() in normalized_query for term in KOSPI_200_TERMS)
 
 
 def _has_broad_screening_reference(query: str) -> bool:
