@@ -23,7 +23,13 @@ from ai_graph.nodes.position_sizing import (
     available_ticker_count,
     max_position_pct_from_risk_constraints,
 )
-from ai_graph.schemas import CandidateParameters, CodeCandidate, StrategyIR, StrategySpec
+from ai_graph.schemas import (
+    CandidateParameters,
+    CodeCandidate,
+    StrategyIR,
+    StrategySpec,
+    StructuredProfile,
+)
 from ai_graph.nodes.condition_compiler import CompiledConditions, compile_conditions
 from ai_graph.security.ast_validator import validate_backtest_code
 
@@ -266,9 +272,16 @@ def _render_structured_reference_code(
     strategy_ir: StrategyIR,
     parameters: CandidateParameters,
 ) -> str:
-    """Auditable O(N) reference; production executes the equivalent fixed runtime."""
+    """Audit descriptor for a structured candidate, not executable engine logic."""
 
     return f'''def build_signals(prices):
+    """AUDIT DESCRIPTOR ONLY.
+
+    Production execution is ai_graph.nodes.backtest_features.PreparedFeatureStore
+    with the StrategyIR and CandidateParameters embedded below.  This function is
+    retained only for backwards-compatible display/AST validation and must not be
+    interpreted as the executed signal implementation.
+    """
     signals = []
     states = {{}}
     profile = {parameters.profile!r}
@@ -834,7 +847,7 @@ def _generated_strategy_candidates(
     return codes
 
 
-def _candidate_profiles(plan: CodeGenerationPlan) -> list[str]:
+def _candidate_profiles(plan: CodeGenerationPlan) -> list[StructuredProfile]:
     base = [
         "long_regime_momentum",
         "quality_trend_hold",
@@ -860,7 +873,6 @@ def _candidate_profiles(plan: CodeGenerationPlan) -> list[str]:
             "volatility_breakout_hold",
             "cash_preserving_trend",
             "breakout_volume",
-            "adaptive_market_filter",
         ]
     if plan.entry_feature == "breakout_volume":
         return [
@@ -873,8 +885,6 @@ def _candidate_profiles(plan: CodeGenerationPlan) -> list[str]:
             "return_to_volatility",
             "low_vol_momentum",
             "cash_preserving_trend",
-            "pullback_recovery",
-            "adaptive_market_filter",
             "rsi_trend_rebound",
             "mean_reversion_band",
         ]
@@ -888,7 +898,6 @@ def _candidate_profiles(plan: CodeGenerationPlan) -> list[str]:
             "dual_sma_trend",
             "volatility_breakout_hold",
             "return_to_volatility",
-            "adaptive_market_filter",
             "mean_reversion_band",
             "rsi_trend_rebound",
             "breakout_volume",
@@ -988,7 +997,7 @@ def _render_adaptive_signal_code(
                     sell = state["in_position"] and (close < medium_average * 0.95 or long_drawdown > 0.2)
                 elif profile == "rolling_sharpe_momentum":
                     score = rolling_sharpe + trend * 2 - volatility
-                    buy = rolling_sharpe >= max(0.03, threshold / 10) and close >= medium_average and trend > 0
+                    buy = rolling_sharpe >= threshold / 10 and close >= medium_average and trend > 0
                     sell = state["in_position"] and (rolling_sharpe <= 0 or close < medium_average)
                 elif profile == "dual_sma_trend":
                     score = medium_return * 3 + (short_average / medium_average - 1) * 8 if medium_average else 0
@@ -996,11 +1005,11 @@ def _render_adaptive_signal_code(
                     sell = state["in_position"] and (short_average < medium_average or close < average)
                 elif profile == "low_vol_momentum":
                     score = trend * 3 + medium_return * 2 - volatility * 1.5
-                    buy = trend >= max(0.04, threshold / 2) and medium_return >= 0 and volatility <= 0.28 and close >= medium_average
+                    buy = trend >= threshold and medium_return >= 0 and volatility <= 0.28 and close >= medium_average
                     sell = state["in_position"] and (close < medium_average * 0.96 or medium_return < -0.06 or long_drawdown > 0.22)
                 elif profile == "breakout_volume":
                     score = (close / high - 0.99) * 10 + volume_ratio * 0.2 + trend * 2
-                    buy = close >= high * 0.995 and volume_ratio >= max(1.05, threshold) and trend >= 0
+                    buy = close >= high * 0.995 and volume_ratio >= threshold and trend >= 0
                     sell = state["in_position"] and close < short_average
                 elif profile == "rsi_trend_rebound":
                     score = medium_return * 3 + (55 - abs(rsi - 45)) / 50 - volatility
@@ -1008,15 +1017,15 @@ def _render_adaptive_signal_code(
                     sell = state["in_position"] and (rsi >= 72 or close < medium_average)
                 elif profile == "mean_reversion_band":
                     score = pullback * 2 + (50 - rsi) / 50 - volatility
-                    buy = close <= average * (1 - min(0.12, max(0.015, threshold))) and rsi <= 45
+                    buy = close <= average * (1 - max(0.0, min(0.20, threshold))) and rsi <= 45
                     sell = state["in_position"] and (close >= medium_average or rsi >= 60)
                 elif profile == "return_to_volatility":
                     score = return_to_volatility + medium_return * 2
-                    buy = return_to_volatility >= max(0.4, threshold * 4) and close >= medium_average
+                    buy = return_to_volatility >= threshold * 4 and close >= medium_average
                     sell = state["in_position"] and (return_to_volatility <= 0 or close < medium_average)
                 elif profile == "cash_preserving_trend":
                     score = rolling_sharpe + trend * 2 - volatility * 2
-                    buy = trend >= max(0.03, threshold) and rolling_sharpe > 0.05 and volatility <= 0.3
+                    buy = trend >= threshold and rolling_sharpe > 0.05 and volatility <= 0.3
                     sell = state["in_position"] and (trend < 0.01 or rolling_sharpe < 0)
                 else:
                     score = trend * 2 + medium_return - volatility
@@ -1073,6 +1082,10 @@ def generate_self_improvement_candidates(
     plan = CodeGenerationPlan.model_validate(code_plan)
     strategy_ir = _normalized_strategy_ir(None, strategy, plan)
     profiles = _candidate_profiles(plan)
+    # Keep at least two nearby variants of the user's own compiled rule in every
+    # refinement. Generic profiles are comparisons, not replacements for that rule.
+    if compile_conditions(strategy.entry_conditions) is not None:
+        profiles = ["compiled_conditions", "compiled_conditions", *profiles]
     lookbacks = [
         max(3, int(value) - iteration * 2) for value in plan.lookbacks
     ] + [
@@ -1089,14 +1102,41 @@ def generate_self_improvement_candidates(
     take_profit = float(strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct))
     candidates: list[CodeCandidate] = []
     seen: set[str] = set()
-    search_size = max(len(profiles), len(lookbacks), len(thresholds))
-    for index in range(search_size):
+    # A compact Cartesian traversal varies one axis at a time before combining
+    # changes.  The prior modulo zip moved every axis together along one diagonal.
+    compiled_variants = [
+        ("compiled_conditions", lookbacks[index % len(lookbacks)], thresholds[index % len(thresholds)])
+        for index in range(2)
+        if "compiled_conditions" in profiles
+    ]
+    comparison_profiles = [profile for profile in profiles if profile != "compiled_conditions"]
+    # Seed with two faithful user-rule variants, then diversify profiles before
+    # expanding into the rest of the Cartesian product.
+    diverse_variants = [
+        (
+            profile,
+            lookbacks[(index + iteration) % len(lookbacks)],
+            thresholds[(index * 2 + iteration) % len(thresholds)],
+        )
+        for index, profile in enumerate(comparison_profiles)
+    ]
+    parameter_grid = [
+        *compiled_variants,
+        *diverse_variants,
+        *[
+            (profile, lookback, threshold)
+            for profile in profiles
+            for lookback in lookbacks
+            for threshold in thresholds
+        ],
+    ]
+    for profile, lookback, threshold in parameter_grid:
         if len(candidates) >= MAX_SELF_IMPROVEMENT_CANDIDATES:
             break
         parameters = CandidateParameters(
-            profile=profiles[index % len(profiles)],  # type: ignore[arg-type]
-            lookback=lookbacks[index % len(lookbacks)],
-            threshold=thresholds[index % len(thresholds)],
+            profile=profile,
+            lookback=lookback,
+            threshold=threshold,
             stop_loss_pct=stop_loss,
             take_profit_pct=take_profit,
             max_positions=max_positions,

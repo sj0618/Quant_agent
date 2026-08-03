@@ -530,6 +530,20 @@ def _stage_status_for(
 
 
 def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
+    # Matched on the exception type before any of the message heuristics below, and by
+    # name rather than by import so this module stays free of the llm package. A queued
+    # request that never got a provider slot is a capacity problem, not the generic
+    # unknown failure its message would otherwise be sorted into.
+    if type(exc).__name__ == "AOAIGateBusyError":
+        return FailureDiagnostic(
+            category="infrastructure_failure",
+            subcause="aoai_capacity_exhausted",
+            failure_stage=stage,
+            owner="ai_graph",
+            retryable=True,
+            safe_message="현재 AI 분석 요청이 몰려 대기 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.",
+            evidence_refs=["failure:aoai_capacity_exhausted"],
+        )
     raw = str(exc).lower()
     if "connection timeout" in raw or "connect timeout" in raw or "connection timed out" in raw:
         return FailureDiagnostic(

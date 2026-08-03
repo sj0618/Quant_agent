@@ -12,7 +12,11 @@ from ai_graph.data_sources.db import (
     PostgresPipelineDataSource,
     QUANT_DB_DSN_ENV,
     RSI_OVERSOLD_THRESHOLD,
+    SCREENING_BASELINE_PROFILE,
+    ScreeningThresholds,
     _price_row_from_feature_frame_record,
+    _relaxed_thresholds,
+    _screening_matcher,
     _screening_sql,
     load_pipeline_data_from_env,
     resolve_database_dsn_from_env,
@@ -675,3 +679,99 @@ def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     assert bundle.metadata["l4_evidence_source"] == "raw.analyst_report_summary"
     assert bundle.metadata["backtest_lookback_days"] >= DEFAULT_BACKTEST_LOOKBACK_DAYS
     assert any(row.get("rsi", 100) <= RSI_OVERSOLD_THRESHOLD for row in bundle.price_rows)
+
+
+def test_empty_screen_is_not_re_run_for_the_same_query() -> None:
+    """A screen that matched nothing must not be repeated inside the same load().
+
+    The baseline screen scans every ticker in feature.kis_adjusted_ohlcv_daily with six
+    window functions over 420 days and runs on the widened backtest statement budget.
+    `load()` used to call it once for the screening branch and then, on the ambiguous
+    fallback, call it again with the same query and the same thresholds - which cannot
+    return anything different. For a screen that legitimately matched nothing today
+    (e.g. no KOSPI200 name is at RSI <= 30) that doubled the cost of the request and
+    pushed it past the statement timeout, surfacing as
+    "데이터 조회 시간이 초과되었습니다".
+    """
+
+    class Result:
+        def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
+            self.rows = rows or []
+
+        def fetchall(self) -> list[dict[str, object]]:
+            return self.rows
+
+        def fetchone(self) -> dict[str, object] | None:
+            return self.rows[0] if self.rows else None
+
+    class CountingConnection:
+        def __init__(self) -> None:
+            self.baseline_screens = 0
+
+        def __enter__(self) -> "CountingConnection":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def rollback(self) -> None:
+            return None
+
+        def execute(self, query: str, params: list[object] | None = None) -> Result:
+            if "FROM matched" in query:
+                self.baseline_screens += 1
+            return Result([])
+
+    connection = CountingConnection()
+    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://fake/fake"))
+    source._connect = lambda: connection  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="no screening candidates"):
+        source.load("RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어", "trace-dup")
+
+    assert connection.baseline_screens == 1
+
+
+def test_screening_joins_momentum_as_of_not_on_an_exact_date_match() -> None:
+    """RSI must survive the TA feature table lagging the price table by a day.
+
+    `as_of_date` is max(time) from feature.kis_adjusted_ohlcv_daily, but RSI comes from
+    feature.ta_momentum_ticker_daily, which a *different* DE task populates. Joining the
+    two on exact date equality meant one late TA run left every rsi NULL - and an
+    all-NULL rsi is the single screen no relaxation round can rescue, because the
+    rsi_rebound predicate rejects a NULL row no matter how far rsi_max is widened. The
+    run then dies with "no screening candidates".
+    """
+
+    sql = _screening_sql(SCREENING_BASELINE_PROFILE, sector=None)
+
+    assert "momentum_as_of AS" in sql
+    assert "LEFT JOIN momentum_as_of mwp" in sql
+    assert "mwp.ticker = f.ticker AND mwp.time = f.time" not in sql
+    # Bounded, so a genuinely dead feed screens as missing instead of quietly
+    # trading a month-old RSI.
+    assert "INTERVAL '7 days'" in sql
+
+
+def test_all_null_rsi_cannot_be_rescued_by_relaxation() -> None:
+    """Why the as-of join above matters: widening rsi_max does nothing for NULL rows."""
+
+    rows = [
+        {
+            "time": date(2026, 8, 3), "ticker": f"{i:06d}", "name": f"종목{i}",
+            "market_segment": "KOSPI", "close": Decimal("10000"), "rsi": None,
+            "prev_rsi": None, "volume_ratio_20": Decimal("1.0"),
+            "relative_strength_20d": Decimal("0"), "relative_strength_60d": Decimal("0"),
+            "high_252": Decimal("12000"), "sma20": Decimal("9900"), "sma200": Decimal("9000"),
+        }
+        for i in range(50)
+    ]
+
+    thresholds = ScreeningThresholds()
+    for round_index in range(4):
+        matcher = _screening_matcher("rsi_rebound", thresholds)
+        assert [row for row in rows if matcher(row)] == []
+        thresholds = _relaxed_thresholds(thresholds, round_index)
+
+    # rsi_max really was being widened; the rows just cannot match.
+    assert thresholds.rsi_max > ScreeningThresholds().rsi_max

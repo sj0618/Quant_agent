@@ -5,8 +5,11 @@ import { Card } from "../components/common/Card";
 import { AppLayout } from "../components/layout/AppLayout";
 import { getCurrentSession, signOut } from "../api/authClient";
 import { getNotificationSettings, saveNotificationSettings } from "../api/preferencesClient";
+import { getEmailDeliveries } from "../api/emailDeliveryClient";
+import { EmailHistoryTimeline } from "../features/reports/EmailHistoryTimeline";
 import { ROUTES } from "../config/routes";
 import type { NotificationSettings } from "../types/auth";
+import type { EmailDeliveryEntry } from "../types/quantagent";
 
 interface ProfilePageProps {
   initialTab: "profile" | "notifications";
@@ -20,6 +23,34 @@ export function ProfilePage({ initialTab }: ProfilePageProps) {
   const [settings, setSettings] = useState<NotificationSettings | null>(null);
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
+  const [deliveries, setDeliveries] = useState<EmailDeliveryEntry[] | null>(null);
+  const [deliveriesError, setDeliveriesError] = useState<string | null>(null);
+
+  // The send history is informational: a failure here must not take the settings form
+  // down with it, so it keeps its own error slot instead of the page-level banner.
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+    let cancelled = false;
+    getEmailDeliveries()
+      .then((entries) => {
+        if (!cancelled) {
+          setDeliveries(entries);
+        }
+      })
+      .catch((deliveryError: unknown) => {
+        if (!cancelled) {
+          setDeliveries([]);
+          setDeliveriesError(
+            deliveryError instanceof Error ? deliveryError.message : "이메일 발송 이력을 불러오지 못했습니다.",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.user.id]);
 
   useEffect(() => {
     if (!session) {
@@ -124,11 +155,6 @@ export function ProfilePage({ initialTab }: ProfilePageProps) {
                 <Badge variant="info">{providerLabel}</Badge>
               </div>
             </div>
-            <dl className="settings-list">
-              <div><dt>사용자 ID</dt><dd>{session.user.id}</dd></div>
-              <div><dt>제공자</dt><dd>{session.user.provider}</dd></div>
-              <div><dt>세션 만료</dt><dd>{session.expiresAt ?? "서버 세션 정책 사용"}</dd></div>
-            </dl>
           </Card>
         ) : settingsLoading || !settings ? (
           <Card className="settings-card">
@@ -187,6 +213,25 @@ export function ProfilePage({ initialTab }: ProfilePageProps) {
             </div>
           </Card>
         )}
+
+        <Card className="settings-card">
+          <div className="settings-card__head">
+            <div>
+              <Badge variant="soft">발송 이력</Badge>
+              <h2>이메일 발송 타임라인</h2>
+              <p>전송 완료, 실패, 재전송 이력을 최근 순서대로 확인합니다.</p>
+            </div>
+          </div>
+          {deliveriesError ? (
+            <p className="settings-card__inline-copy settings-card__inline-copy--error">{deliveriesError}</p>
+          ) : deliveries === null ? (
+            <p className="settings-card__inline-copy">이메일 발송 이력을 불러오는 중입니다.</p>
+          ) : deliveries.length === 0 ? (
+            <p className="settings-card__inline-copy">아직 발송된 리포트 이메일이 없습니다.</p>
+          ) : (
+            <EmailHistoryTimeline entries={deliveries} />
+          )}
+        </Card>
       </main>
     </AppLayout>
   );

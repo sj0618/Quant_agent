@@ -2,8 +2,7 @@ import { useState } from "react";
 import { Badge } from "../components/common/Badge";
 import { Button } from "../components/common/Button";
 import { Card } from "../components/common/Card";
-import { completeTestLogin, getCurrentSession, startGoogleSignIn } from "../api/authClient";
-import { appConfig } from "../config/appConfig";
+import { getCurrentSession, startGoogleSignIn } from "../api/authClient";
 import { ROUTES, sanitizeReturnTo } from "../config/routes";
 
 interface LoginPageProps {
@@ -28,19 +27,6 @@ export function LoginPage({ returnTo }: LoginPageProps) {
     }
   };
 
-  const handleTestSignIn = async () => {
-    setSubmitting(true);
-    setError(null);
-
-    try {
-      await completeTestLogin();
-      window.location.assign(nextPath);
-    } catch (testLoginError) {
-      setSubmitting(false);
-      setError(testLoginError instanceof Error ? testLoginError.message : "Test login could not be started.");
-    }
-  };
-
   return (
     <main className="auth-page">
       <Card className="auth-panel">
@@ -50,7 +36,7 @@ export function LoginPage({ returnTo }: LoginPageProps) {
         </a>
         <Badge variant="dark">GOOGLE LOGIN</Badge>
         <h1>Google 계정으로 시작</h1>
-        <p>로그인 후 요청하신 화면으로 이동합니다. 인증 서버 URL은 환경변수로 주입됩니다.</p>
+        <p>로그인 후 요청하신 화면으로 이동합니다.</p>
 
         {session ? (
           <div className="status-banner status-banner--success">
@@ -71,11 +57,6 @@ export function LoginPage({ returnTo }: LoginPageProps) {
           <Button disabled={submitting} onClick={handleGoogleSignIn} variant="dark">
             {submitting ? "Google로 이동 중" : "Google로 로그인"}
           </Button>
-          {appConfig.testLoginEnabled && !session ? (
-            <Button disabled={submitting} onClick={handleTestSignIn} variant="secondary">
-              테스트 로그인
-            </Button>
-          ) : null}
           <a className="button button--secondary" href={ROUTES.home}>홈으로</a>
         </div>
       </Card>

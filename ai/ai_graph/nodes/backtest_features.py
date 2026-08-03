@@ -335,7 +335,7 @@ class PreparedFeatureStore:
                     elif profile == "rolling_sharpe_momentum":
                         score = rolling_sharpe + trend * 2.0 - volatility
                         buy = (
-                            rolling_sharpe >= max(0.03, threshold / 10.0)
+                            rolling_sharpe >= threshold / 10.0
                             and close >= medium_average
                             and trend > 0.0
                         )
@@ -359,7 +359,7 @@ class PreparedFeatureStore:
                     elif profile == "low_vol_momentum":
                         score = trend * 3.0 + medium_return * 2.0 - volatility * 1.5
                         buy = (
-                            trend >= max(0.04, threshold / 2.0)
+                            trend >= threshold
                             and medium_return >= 0.0
                             and volatility <= 0.28
                             and close >= medium_average
@@ -380,7 +380,7 @@ class PreparedFeatureStore:
                         buy = (
                             high > 0.0
                             and close >= high * 0.995
-                            and volume_ratio >= max(1.05, threshold)
+                            and volume_ratio >= threshold
                             and trend >= 0.0
                         )
                         sell = in_position and close < short_average
@@ -403,8 +403,7 @@ class PreparedFeatureStore:
                         score = pullback * 2.0 + (50.0 - rsi) / 50.0 - volatility
                         buy = (
                             close
-                            <= average
-                            * (1.0 - min(0.12, max(0.015, threshold)))
+                            <= average * (1.0 - max(0.0, min(0.20, threshold)))
                             and rsi <= 45.0
                         )
                         sell = in_position and (
@@ -413,7 +412,7 @@ class PreparedFeatureStore:
                     elif profile == "return_to_volatility":
                         score = return_to_volatility + medium_return * 2.0
                         buy = (
-                            return_to_volatility >= max(0.4, threshold * 4.0)
+                            return_to_volatility >= threshold * 4.0
                             and close >= medium_average
                         )
                         sell = in_position and (
@@ -422,7 +421,7 @@ class PreparedFeatureStore:
                     elif profile == "cash_preserving_trend":
                         score = rolling_sharpe + trend * 2.0 - volatility * 2.0
                         buy = (
-                            trend >= max(0.03, threshold)
+                            trend >= threshold
                             and rolling_sharpe > 0.05
                             and volatility <= 0.3
                         )

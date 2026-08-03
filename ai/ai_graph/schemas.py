@@ -40,6 +40,7 @@ FailureSubcause = Literal[
     "disclosure_mapping_gap",
     "freshness_gap",
     "external_source_rate_limited",
+    "aoai_capacity_exhausted",
     "parser_low_confidence",
     "source_conflict",
     "data_required",
@@ -319,6 +320,10 @@ class BacktestMetrics(BaseModel):
     in_sample_sharpe: float
     out_sample_sharpe: float
     degradation: float
+    # Selection-only statistics. Defaults preserve compatibility with historical
+    # result payloads that predate the real hold-out split.
+    in_sample_return: float = 0.0
+    in_sample_max_drawdown: float = 0.0
 
 
 class BacktestEquityPoint(BaseModel):

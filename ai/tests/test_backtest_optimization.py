@@ -15,6 +15,7 @@ from ai_graph.nodes.backtest_code import (
 )
 from ai_graph.nodes.backtest_features import PreparedFeatureStore
 from ai_graph.schemas import (
+    BacktestMetrics,
     CandidateParameters,
     CodeCandidate,
     Condition,
@@ -304,6 +305,37 @@ def test_improvement_candidates_are_bounded_and_normalized() -> None:
 
     assert 1 <= len(improved) <= 6
     assert len(identities) == len(improved)
+    assert sum(item.parameters.profile == "compiled_conditions" for item in improved if item.parameters) >= 2
+
+
+def test_candidate_profiles_are_schema_profiles_only() -> None:
+    plan = build_code_generation_plan(_strategy(), map_strategy_features(_strategy()))
+    profiles = backtest_node.generate_self_improvement_candidates(
+        _strategy(), plan.model_dump(mode="python"), start_index=4, iteration=1
+    )
+    assert all(item.parameters is not None for item in profiles)
+    # CandidateParameters validation makes this assertion a regression test for any
+    # profile returned by the generator that is outside StructuredProfile.
+    assert all(item.parameters.profile for item in profiles if item.parameters)
+
+
+def test_selection_score_does_not_peek_at_holdout_sharpe() -> None:
+    rows = _rows(days=20)
+    common = dict(
+        sharpe_ratio=1.0,
+        max_drawdown=-0.1,
+        win_rate=0.6,
+        total_return=0.1,
+        in_sample_sharpe=1.0,
+        degradation=0.0,
+    )
+    weak_holdout = BacktestMetrics(**common, out_sample_sharpe=-5.0)
+    strong_holdout = BacktestMetrics(**common, out_sample_sharpe=5.0)
+    summary = {"effective_trade_count": 8, "trade_win_rate": 0.6}
+
+    assert backtest_node._objective_score(weak_holdout, summary, rows) == backtest_node._objective_score(
+        strong_holdout, summary, rows
+    )
 
 
 def test_repeated_round_submits_no_completed_candidate(monkeypatch, tmp_path) -> None:

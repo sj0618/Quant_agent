@@ -173,6 +173,7 @@ jobs:
                   "011_app_ai_backtest_erd.sql",
                   "013_ai_runtime_logging.sql",
                   "019_ai_prompt_response_summary.sql",
+                  "020_ai_account_tokens.sql",
               ):
                   conn.execute(
                       (app_dir / "service_db" / "migrations" / name).read_text(

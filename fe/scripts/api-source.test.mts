@@ -41,7 +41,12 @@ test("canonical product surface excludes retired history and strategy routes", a
 
   assert.doesNotMatch(routesSource, /reportsHistory|reportStrategies|strategyReportDetail/);
   assert.doesNotMatch(appSource, /ReportsHistoryPage|StrategyReportsPage|StrategyReportDetailPage/);
-  assert.doesNotMatch(profileSource, /EmailHistoryTimeline|getEmailDeliveryHistory|reportsHistory/);
+  // The retired *route* stays retired; the send-history timeline itself lives on /me now.
+  // It was deleted along with that route in 6dadc69 while its backend endpoint stayed live,
+  // so it is asserted present rather than absent.
+  assert.doesNotMatch(profileSource, /reportsHistory/);
+  assert.match(profileSource, /EmailHistoryTimeline/);
+  assert.match(profileSource, /getEmailDeliveries/);
   assert.match(searchSource, /getReports/);
   assert.match(searchSource, /getReports\(normalizedQuery\)/);
   assert.match(searchSource, /ROUTES\.reportDetail/);
@@ -62,8 +67,6 @@ test("authentication boundaries do not leak cached analysis between users", asyn
 
   assert.match(authSource, /!currentSession \|\| currentSession\.user\.id !== session\.user\.id/);
   assert.match(authSource, /AUTH_ENDPOINTS\.me/);
-  assert.match(authSource, /AUTH_ENDPOINTS\.testLogin/);
-  assert.match(authSource, /completeTestLogin/);
   assert.match(authSource, /finally \{\s+clearCurrentSession\(\)/);
   assert.match(appSource, /validateCurrentSession\(\)/);
   assert.match(aiSource, /\[401, 403\]\.includes\(error\.status\)/);
@@ -72,6 +75,8 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   assert.doesNotMatch(authSource, /TEST_AUTH_SESSION/);
   assert.doesNotMatch(authSource, /saveTestSession/);
   assert.doesNotMatch(authSource, /provider:\s*"test"/);
+  assert.doesNotMatch(authSource, /completeTestLogin/);
+  assert.doesNotMatch(authSource, /AUTH_ENDPOINTS\.testLogin/);
 });
 
 test("Google callback reuses its one-time exchange under React StrictMode", async () => {

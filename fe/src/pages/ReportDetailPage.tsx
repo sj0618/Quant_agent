@@ -37,16 +37,18 @@ export function ReportDetailPage({ id }: ReportDetailPageProps) {
     }
   };
 
-  if (loading) {
-    return <AsyncState title="리포트 상세를 불러오는 중입니다" tone="loading" />;
-  }
-
-  if (error) {
-    return <AsyncState title="리포트 상세를 불러오지 못했습니다" description={error.message} tone="error" />;
-  }
-
-  if (!data) {
-    return <AsyncState title="리포트를 찾을 수 없습니다" description="요청한 리포트 ID에 해당하는 데이터가 없습니다." tone="empty" />;
+  if (loading || error || !data) {
+    return (
+      <AppLayout active="reports">
+        {loading ? (
+          <AsyncState title="리포트 상세를 불러오는 중입니다" tone="loading" />
+        ) : error ? (
+          <AsyncState title="리포트 상세를 불러오지 못했습니다" description={error.message} tone="error" />
+        ) : (
+          <AsyncState title="리포트를 찾을 수 없습니다" description="요청한 리포트 ID에 해당하는 데이터가 없습니다." tone="empty" />
+        )}
+      </AppLayout>
+    );
   }
 
   return (

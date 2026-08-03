@@ -184,18 +184,27 @@ class PostgresPipelineDataSource:
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
             ticker_resolution = "screening"
-            if _query_requests_screening(query):
+            already_screened = _query_requests_screening(query)
+            if already_screened:
                 screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
             single_ticker: str | None = None
             if not screening_candidates:
                 single_ticker = self._resolve_ticker(conn, query)
                 if single_ticker is None:
-                    # Ambiguous query (no explicit ticker, no name match): retry as
-                    # a broad condition screen instead of silently trading a
-                    # single hardcoded default ticker.
-                    screening_candidates, screening_relaxation = self._screen_with_relaxation(
-                        conn, query
-                    )
+                    # Ambiguous query (no explicit ticker, no name match): screen as a
+                    # broad condition search instead of silently trading a single
+                    # hardcoded default ticker.
+                    #
+                    # Only if we have not already done exactly that. The baseline screen
+                    # scans every ticker in feature.kis_adjusted_ohlcv_daily and runs on
+                    # the widened backtest budget; running it a second time with the same
+                    # query and the same thresholds cannot produce a different answer, and
+                    # for a screen that legitimately matched nothing today it doubled the
+                    # cost of the request and pushed it into a statement timeout.
+                    if not already_screened:
+                        screening_candidates, screening_relaxation = self._screen_with_relaxation(
+                            conn, query
+                        )
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
                         if screening_candidates
@@ -389,12 +398,17 @@ class PostgresPipelineDataSource:
         # INERROR, and that detail is hidden by the fallback, so reset unconditionally
         # before the baseline query.
         self._rollback_quietly(conn)
-        self._set_statement_timeout(conn)
         sector = extract_sector_from_query(query, known_sectors)
         params: list[Any] = [sector] if sector else []
         # The window-function CTE is the expensive part, so it runs once and every
-        # relaxation round re-filters these rows in-process.
+        # relaxation round re-filters these rows in-process. It scans every ticker in
+        # feature.kis_adjusted_ohlcv_daily (no pre-filtered candidate view narrows it
+        # anymore - see SYMBOL_MASTER_TABLE comment above), so it needs the same wider
+        # budget as the backtest universe fetch rather than the tight default, which
+        # was sized for the old, much smaller pre-filtered scan.
+        self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
         rows = conn.execute(_screening_sql(SCREENING_BASELINE_PROFILE, sector=sector), params).fetchall()
+        self._set_statement_timeout(conn)
 
         thresholds = ScreeningThresholds()
         rounds: list[dict[str, Any]] = []
@@ -1296,6 +1310,26 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 lag(rsi) OVER (PARTITION BY ticker ORDER BY time) AS prev_rsi
             FROM momentum
         ),
+        -- as_of_date comes from kis_adjusted_ohlcv_daily, but RSI lives in
+        -- ta_momentum_ticker_daily, which a different DE task populates. Requiring
+        -- momentum on exactly that date meant one late TA run made every rsi NULL, and
+        -- an all-NULL rsi is the one screen no relaxation round can rescue: the
+        -- rsi_rebound predicate rejects a NULL row whatever rsi_max is widened to, so
+        -- all four rounds match nothing and the analysis dies with "no screening
+        -- candidates". Take each ticker's most recent momentum row at or before the
+        -- price date instead, bounded so a genuinely stale feed still screens as
+        -- missing rather than silently trading a month-old RSI.
+        momentum_as_of AS (
+            SELECT DISTINCT ON (ticker)
+                ticker,
+                time AS momentum_time,
+                rsi,
+                prev_rsi
+            FROM momentum_with_prev
+            WHERE time <= (SELECT as_of_date FROM latest_date)
+              AND time >= (SELECT as_of_date FROM latest_date) - INTERVAL '7 days'
+            ORDER BY ticker, time DESC
+        ),
         latest_rows AS (
             SELECT
                 f.*,
@@ -1316,8 +1350,8 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 CASE WHEN fin.eps > 0 THEN close / fin.eps END AS per,
                 fin.financial_period_end
             FROM features f
-            LEFT JOIN momentum_with_prev mwp
-              ON mwp.ticker = f.ticker AND mwp.time = f.time
+            LEFT JOIN momentum_as_of mwp
+              ON mwp.ticker = f.ticker
             -- LEFT so a ticker without filings still screens on price alone; the
             -- fundamental predicates simply will not match it.
             LEFT JOIN financials fin ON fin.symbol = f.ticker

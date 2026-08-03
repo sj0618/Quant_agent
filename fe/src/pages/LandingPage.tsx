@@ -34,8 +34,8 @@ export function LandingPage() {
           <a href="#sample">샘플 리포트</a>
           <a href="#faq">FAQ</a>
         </div>
+        {/* 로그인 링크와 이 버튼은 같은 곳(loginHref)으로 가는 중복 진입점이었다. */}
         <div>
-          <a href={loginHref}>로그인</a>
           <Button onClick={() => window.location.assign(loginHref)} variant="dark">Google로 시작</Button>
         </div>
       </nav>
@@ -114,6 +114,9 @@ export function LandingPage() {
       <section className="landing-section">
         <SectionHead eyebrow="WHY" title="기존 도구와 무엇이 다른가?" />
         <Card padded={false}>
+          {/* 840px of table cannot fit a phone; it scrolls inside its own box instead of
+              dragging the whole page sideways. */}
+          <div className="table-scroll">
           <table className="comparison-table landing-comparison">
             <thead>
               <tr>
@@ -134,6 +137,7 @@ export function LandingPage() {
               ))}
             </tbody>
           </table>
+          </div>
         </Card>
         <div className="principle-grid">
           {data.principles.map((principle) => (
