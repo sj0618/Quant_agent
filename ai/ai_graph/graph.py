@@ -30,7 +30,7 @@ from ai_graph.llm.role_calls import (
     generate_strategy_conditions,
     resolve_strategy_intent,
 )
-from ai_graph.nodes.backtest import backtest_node
+from ai_graph.nodes.backtest import _public_engine_summary, backtest_node
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
@@ -2163,7 +2163,9 @@ def build_public_backtest_performance(
         selected_candidate_id=result.selected_candidate.candidate_id,
         metrics=result.selected_candidate.metrics,
         equity_curve=result.equity_curve,
-        engine_summary=result.engine_summary,
+        # Public jobs are polled and persisted as JSON. Keep that durable document small;
+        # detailed QuantStats arrays stay in the internal/debug backtest artifacts.
+        engine_summary=_public_engine_summary(result.engine_summary),
     )
 
 

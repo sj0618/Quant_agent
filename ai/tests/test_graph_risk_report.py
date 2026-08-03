@@ -1,6 +1,7 @@
+from ai_graph.graph import build_public_backtest_performance
 from ai_graph.nodes.report import build_report_bundle
 from ai_graph.nodes.risk_manager import MacroSnapshot, apply_risk_rules
-from ai_graph.schemas import Condition, SignalDecision, StrategySpec
+from ai_graph.schemas import BacktestMetrics, CodeCandidate, Condition, SignalDecision, StrategySpec
 
 
 def make_signal() -> SignalDecision:
@@ -57,3 +58,38 @@ def test_report_builds_web_and_email_projection_from_same_decision() -> None:
     assert report.web_projection.title
     assert report.email_projection.title
     assert report.web_projection.summary != report.email_projection.summary
+
+
+def test_public_performance_excludes_oversized_engine_arrays() -> None:
+    metrics = BacktestMetrics(
+        sharpe_ratio=0.28,
+        max_drawdown=-0.0776,
+        win_rate=0.3364,
+        total_return=0.0898,
+        in_sample_sharpe=0.3,
+        out_sample_sharpe=0.1,
+        degradation=0.0,
+    )
+    candidate = CodeCandidate(
+        candidate_id="A2",
+        variant="A",
+        code="pass",
+        validation_ok=True,
+        metrics=metrics,
+    )
+    performance = build_public_backtest_performance(
+        {
+            "strategy_a": make_strategy().model_dump(),
+            "candidates": [candidate.model_dump()],
+            "selected_candidate": candidate.model_dump(),
+            "equity_curve": [],
+            "engine_summary": {
+                "effective_trade_count": 110,
+                "montecarlo": ["large internal-only payload"],
+                "rolling_sharpe": [0.1, 0.2],
+            },
+        }
+    )
+
+    assert performance is not None
+    assert performance.engine_summary == {"effective_trade_count": 110}
