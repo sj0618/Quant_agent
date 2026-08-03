@@ -205,6 +205,7 @@ class Condition(BaseModel):
 
 
 class AmbiguityCode(str, Enum):
+    NO_STRATEGY_INTENT = "C0_NO_STRATEGY_INTENT"
     READY = "READY"
     INPUT_AMBIGUOUS = "C1_INPUT_AMBIGUOUS"
     TERM_UNKNOWN = "C2_TERM_UNKNOWN"

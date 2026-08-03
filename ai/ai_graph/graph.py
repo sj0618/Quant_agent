@@ -79,6 +79,9 @@ class FallbackGraph:
     def invoke(self, state: QuantAgentState) -> QuantAgentState:
         current = self._invoke("Supervisor", supervisor_node, state)
         current.update(self._invoke("Ambiguity Classifier", ambiguity_classifier_node, current))
+        if _route_after_ambiguity(current) == "final":
+            current.update(self._invoke("Envelope", envelope_node, current))
+            return current
         current.update(self._invoke("Data", data_node, current))
         if current["status"] == EnvelopeStatus.READY.value:
             current.update(self._invoke("Research", research_node, current))
@@ -125,7 +128,11 @@ def build_graph(audit_session: AuditSession | None = None) -> Any:
     graph.add_node("Envelope", instrument_node(audit_session, "Envelope", envelope_node))
     graph.add_edge(START, "Supervisor")
     graph.add_edge("Supervisor", "Ambiguity Classifier")
-    graph.add_edge("Ambiguity Classifier", "Data")
+    graph.add_conditional_edges(
+        "Ambiguity Classifier",
+        _route_after_ambiguity,
+        {"data": "Data", "final": "Envelope"},
+    )
     graph.add_conditional_edges(
         "Data",
         _route_after_data,
@@ -422,7 +429,10 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
         "ambiguity_reasons": _ambiguity_reasons(category, query),
         "ambiguity_dimensions": _ambiguity_dimensions(category, query),
         "source_resolvable": category in {AmbiguityCode.INPUT_AMBIGUOUS, AmbiguityCode.TERM_UNKNOWN},
-        "needs_clarification_after_source_check": category != AmbiguityCode.READY,
+        "needs_clarification_after_source_check": category not in {
+            AmbiguityCode.READY,
+            AmbiguityCode.NO_STRATEGY_INTENT,
+        },
         "clarification_blocker_type": _clarification_blocker_type(category),
         "clarification_question": clarification["question"],
         "question_reason": clarification["question_reason"],
@@ -599,6 +609,15 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             "performance": build_public_backtest_performance(state.get("backtest")),
             "recommendation_gate": gate,
         }
+    elif state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
+        clarification = _clarification_from_ambiguity(state["ambiguity"])
+        payload = {
+            "headline": "전략 입력을 기다리고 있습니다.",
+            "message": state["ambiguity"]["reason"],
+            "next_actions": ["예: RSI가 30 이하일 때 매수하고 70 이상일 때 매도"],
+            "candidate_cards": [],
+            **clarification,
+        }
     elif status == EnvelopeStatus.REJECTED:
         clarification = _clarification_from_ambiguity(state["ambiguity"])
         payload = {
@@ -677,6 +696,8 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
 
 def classify_query(query: str) -> AmbiguityCode:
     lowered = query.lower()
+    if not _has_strategy_intent(query):
+        return AmbiguityCode.NO_STRATEGY_INTENT
     if any(term in lowered for term in ("옵션", "양매도", "선물", "crypto", "가상화폐", "비트코인")):
         return AmbiguityCode.INFEASIBLE
     if _has_conflicting_targets(query):
@@ -1229,6 +1250,15 @@ def _static_strategy_candidate_cards(query: str) -> list[StrategyCandidateCard]:
 
 
 def build_clarification_prompt(category: AmbiguityCode, query: str) -> dict[str, Any]:
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return {
+            "question": "어떤 투자 전략이나 매매 조건을 분석할까요?",
+            "question_reason": "현재 입력에서는 전략 생성 의도를 확인할 수 없습니다.",
+            "options": [],
+            "recommended": None,
+            "confidence": 1.0,
+            "confidence_reason": "전략 관련 표현이 있을 때만 분석 파이프라인을 시작합니다.",
+        }
     if category == AmbiguityCode.CONFLICTING:
         options = [
             ClarificationOption(label="저변동성 우선", reason="급등 기대보다 낙폭과 손실 변동성을 낮추는 쪽입니다."),
@@ -1323,6 +1353,8 @@ def _clarification_from_ambiguity(ambiguity: dict[str, Any]) -> dict[str, Any]:
 def _ambiguity_dimensions(category: AmbiguityCode, query: str) -> list[str]:
     if category == AmbiguityCode.READY:
         return []
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return ["intent_missing"]
     if category == AmbiguityCode.INPUT_AMBIGUOUS:
         dimensions = ["data_missing"]
         if _needs_query_smoothing(query):
@@ -1338,6 +1370,8 @@ def _ambiguity_dimensions(category: AmbiguityCode, query: str) -> list[str]:
 def _clarification_blocker_type(category: AmbiguityCode) -> str | None:
     if category == AmbiguityCode.READY:
         return None
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return "intent_missing"
     if category == AmbiguityCode.INPUT_AMBIGUOUS:
         return "data_missing"
     if category == AmbiguityCode.TERM_UNKNOWN:
@@ -1470,6 +1504,54 @@ def _has_unknown_term_risk(query: str) -> bool:
     return any(term in query for term in ("알아서", "좋은 종목", "괜찮은 종목"))
 
 
+def _has_strategy_intent(query: str) -> bool:
+    lowered = query.lower()
+    # ponytail: deterministic allowlist; replace with a trained intent model only if
+    # production examples show measurable false positives or false negatives.
+    direct_terms = (
+        "전략",
+        "strategy",
+        "백테스트",
+        "backtest",
+        "주식",
+        "stock",
+        "종목",
+        "ticker",
+        "매매",
+        "trade",
+        "매수",
+        "buy",
+        "매도",
+        "sell",
+        "진입",
+        "청산",
+        "손절",
+        "익절",
+        "투자",
+        "포트폴리오",
+        "portfolio",
+        "스크리닝",
+        "screening",
+        "기술분석",
+        "코스피",
+        "kospi",
+        "코스닥",
+        "kosdaq",
+        "krx",
+        "비트코인",
+        "가상화폐",
+        "crypto",
+    )
+    return (
+        any(term in lowered for term in direct_terms)
+        or _is_candidate_selection_query(query)
+        or _is_specific_supported_screening_query(query)
+        or _needs_query_smoothing(query)
+        or _has_known_strategy_term(query)
+        or _has_unknown_term_risk(query)
+    )
+
+
 def _is_pullback_rsi_volume_query(query: str) -> bool:
     lowered = query.lower()
     has_trend_filter = "200일" in query or "sma200" in lowered or "sma_200" in lowered
@@ -1481,6 +1563,8 @@ def _is_pullback_rsi_volume_query(query: str) -> bool:
 def _ambiguity_reasons(category: AmbiguityCode, query: str) -> list[str]:
     if category == AmbiguityCode.READY:
         return ["L1/L2 또는 기술 지표 조건으로 해석 가능한 KRX 현물 전략입니다."]
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return ["전략 관련 표현이 없어 분석 파이프라인을 시작하지 않습니다."]
     if category == AmbiguityCode.INPUT_AMBIGUOUS:
         return ["재무·컨센서스·공시·수급 데이터 조건이 섞여 있어 실행 후보 선택이 필요합니다."]
     if category == AmbiguityCode.TERM_UNKNOWN:
@@ -2174,6 +2258,7 @@ def _status_for_category(category: AmbiguityCode) -> EnvelopeStatus:
 
 def _ambiguity_reason(category: AmbiguityCode) -> str:
     return {
+        AmbiguityCode.NO_STRATEGY_INTENT: "안녕하세요! 분석할 투자 전략이나 매매 조건을 말씀해 주세요.",
         AmbiguityCode.READY: "분석 가능한 전략 입력입니다.",
         AmbiguityCode.INPUT_AMBIGUOUS: "시장, 조건, 위험 기준이 부족합니다.",
         AmbiguityCode.TERM_UNKNOWN: "용어를 L1/L2 지식베이스와 매칭했지만 확인이 필요합니다.",
@@ -2189,6 +2274,12 @@ def _availability_next_actions(data_availability: Mapping[str, Any]) -> list[str
     if isinstance(proxy_items, list) and proxy_items:
         return ["재무/공시/뉴스 조건은 proxy 여부 확인"]
     return []
+
+
+def _route_after_ambiguity(state: QuantAgentState) -> str:
+    if state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
+        return "final"
+    return "data"
 
 
 def _route_after_data(state: QuantAgentState) -> str:
