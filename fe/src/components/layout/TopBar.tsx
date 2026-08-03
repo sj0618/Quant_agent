@@ -47,17 +47,19 @@ export function TopBar({ active }: TopBarProps) {
   }, []);
 
   return (
-    <header className="sticky top-0 z-30 flex h-14 items-center gap-6 border-b border-line bg-surface/85 px-6 backdrop-blur-md">
+    <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-line bg-surface/85 px-4 backdrop-blur-md sm:gap-6 sm:px-6">
       <a className="flex shrink-0 items-center gap-2 text-[15px] font-bold text-ink" href={ROUTES.home}>
         <span className="inline-block size-5 rounded bg-ink" />
-        <span>QuantAgent</span>
+        {/* Below sm the three groups add up to more than the viewport and the nav labels
+            wrap into unreadable vertical text, so the wordmark drops to just the mark. */}
+        <span className="hidden sm:inline">QuantAgent</span>
       </a>
 
       <nav aria-label="주요 메뉴" className="mr-auto flex items-center gap-1">
         {NAV_ITEMS.map((item) => (
           <a
             className={cn(
-              "rounded-lg px-3 py-1.5 text-[13px] font-semibold transition-colors",
+              "shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[13px] font-semibold transition-colors sm:px-3",
               active === item.id ? "bg-soft text-ink" : "text-muted hover:bg-soft/70 hover:text-ink",
             )}
             href={item.href}
@@ -87,7 +89,7 @@ export function TopBar({ active }: TopBarProps) {
           </button>
           <button
             aria-label="검색 열기"
-            className="flex size-9 items-center justify-center rounded-full border border-line bg-surface text-muted md:hidden"
+            className="flex size-10 items-center justify-center rounded-full border border-line bg-surface text-muted md:hidden"
             onClick={() => setSearchOpen(true)}
             type="button"
           >

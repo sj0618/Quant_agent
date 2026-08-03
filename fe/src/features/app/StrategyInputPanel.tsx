@@ -12,6 +12,8 @@ import type {
 } from "@/types/quantagent";
 
 interface StrategyInputPanelProps {
+  /** Extra classes for the panel shell, used by the phone pane switch to hide it. */
+  className?: string;
   history: ChatConversationPreview[];
   strategy: StrategySpec;
   messages: ChatMessage[];
@@ -49,6 +51,7 @@ const cardButtonClass =
   "w-full rounded-2xl border border-dark-line bg-dark-surface p-3 text-left transition-colors hover:border-cornflower/60";
 
 export function StrategyInputPanel({
+  className,
   history,
   strategy,
   messages,
@@ -113,7 +116,15 @@ export function StrategyInputPanel({
   const inputDisabled = submitting || running;
 
   return (
-    <aside className="sticky top-14 flex h-[calc(100vh-3.5rem)] w-full min-h-0 shrink-0 flex-col bg-dark text-[#edeff4] md:w-80 xl:w-[400px]">
+    <aside
+      className={cn(
+        "sticky flex min-h-0 w-full shrink-0 flex-col bg-dark text-[#edeff4]",
+        // Phone: sits under the top bar (56px) plus the pane switch (60px), and takes the
+        // rest of the small viewport. Desktop: full height beside the workspace.
+        "top-29 h-[calc(100dvh-7.25rem)] md:top-14 md:h-[calc(100dvh-3.5rem)] md:w-80 xl:w-[400px]",
+        className,
+      )}
+    >
       <div className="flex shrink-0 items-start justify-between gap-3 border-b border-dark-line p-5">
         <div className="min-w-0">
           <strong className="text-[13px]">전략 채팅</strong>
@@ -286,7 +297,7 @@ export function StrategyInputPanel({
             // for every node it completes, so leaving the user no way out is expensive.
             <button
               aria-label="분석 중단"
-              className="flex size-8 shrink-0 items-center justify-center rounded-full bg-drop text-white transition-opacity disabled:opacity-60"
+              className="flex size-10 shrink-0 items-center justify-center rounded-full bg-drop text-white transition-opacity disabled:opacity-60 md:size-8"
               disabled={cancelRequested}
               onClick={() => void onCancel()}
               type="button"
@@ -300,7 +311,7 @@ export function StrategyInputPanel({
           ) : (
             <button
               aria-label="분석 요청"
-              className="flex size-8 shrink-0 items-center justify-center rounded-full bg-cornflower text-white transition-opacity disabled:opacity-60"
+              className="flex size-10 shrink-0 items-center justify-center rounded-full bg-cornflower text-white transition-opacity disabled:opacity-60 md:size-8"
               disabled={submitting}
               type="submit"
             >

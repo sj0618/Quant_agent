@@ -114,6 +114,9 @@ export function LandingPage() {
       <section className="landing-section">
         <SectionHead eyebrow="WHY" title="기존 도구와 무엇이 다른가?" />
         <Card padded={false}>
+          {/* 840px of table cannot fit a phone; it scrolls inside its own box instead of
+              dragging the whole page sideways. */}
+          <div className="table-scroll">
           <table className="comparison-table landing-comparison">
             <thead>
               <tr>
@@ -134,6 +137,7 @@ export function LandingPage() {
               ))}
             </tbody>
           </table>
+          </div>
         </Card>
         <div className="principle-grid">
           {data.principles.map((principle) => (

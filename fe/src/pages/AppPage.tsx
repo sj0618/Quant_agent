@@ -222,6 +222,8 @@ export function AppPage() {
   const [cancelledJobIds, setCancelledJobIds] = useState<string[]>([]);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [reportSaveError, setReportSaveError] = useState<string | null>(null);
+  // Phone only: which of the two panes is on screen. Ignored from md up, where both fit.
+  const [mobilePane, setMobilePane] = useState<"chat" | "result">("chat");
   // Consecutive polling failures per job; a kept ref so retry counting does not
   // itself retrigger the polling effect.
   const pollAttemptsRef = useRef<Record<string, number>>({});
@@ -435,6 +437,7 @@ export function AppPage() {
   const handleNewConversation = () => {
     archiveCurrentConversation();
     setActiveTab("overview");
+    setMobilePane("chat");
   };
 
   const handleRestoreConversation = (conversationId: string) => {
@@ -459,12 +462,32 @@ export function AppPage() {
     setAnalysisJobs(conversation.jobs);
     setCancelError(null);
     setActiveTab("overview");
+    setMobilePane("result");
   };
 
   return (
     <AppLayout active="workspace">
+      {/* On a phone the chat panel and the result pane cannot both be full height - the
+          panel filled the viewport and pushed every result below the fold. Below md only
+          one is mounted at a time and this control switches between them. */}
+      <div className="sticky top-14 z-20 flex gap-1 border-b border-line bg-surface/95 p-2 backdrop-blur-md md:hidden">
+        {(["chat", "result"] as const).map((pane) => (
+          <button
+            aria-pressed={mobilePane === pane}
+            className={`min-h-11 flex-1 rounded-lg text-[13px] font-bold transition-colors ${
+              mobilePane === pane ? "bg-ink text-white" : "bg-soft text-muted"
+            }`}
+            key={pane}
+            onClick={() => setMobilePane(pane)}
+            type="button"
+          >
+            {pane === "chat" ? "전략 채팅" : "분석 결과"}
+          </button>
+        ))}
+      </div>
       <div className="workspace-shell">
         <StrategyInputPanel
+          className={mobilePane === "chat" ? undefined : "workspace-pane-hidden"}
           history={historyPreviews}
           messages={hasCurrentConversation ? overview.chatMessages : []}
           cancelError={cancelError}
@@ -501,6 +524,9 @@ export function AppPage() {
             const pending = { query, startedAt: Date.now() };
             setPendingAnalysis(pending);
             setProgressNow(pending.startedAt);
+            // The progress card and the live activity log live in the result pane; on a
+            // phone the user would otherwise stare at a chat that looks like it did nothing.
+            setMobilePane("result");
             try {
               const job = await createAnalysisJob(query);
               setAnalysisJobs([...previousJobs, job]);
@@ -511,7 +537,7 @@ export function AppPage() {
           onRestoreConversation={handleRestoreConversation}
           strategy={panelStrategy}
         />
-        <main className="workspace-main">
+        <main className={`workspace-main${mobilePane === "result" ? "" : " workspace-pane-hidden"}`}>
           {canRenderWorkspace ? (
             <>
               {showGateWarning && recommendationGate ? (
