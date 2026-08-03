@@ -1310,6 +1310,26 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 lag(rsi) OVER (PARTITION BY ticker ORDER BY time) AS prev_rsi
             FROM momentum
         ),
+        -- as_of_date comes from kis_adjusted_ohlcv_daily, but RSI lives in
+        -- ta_momentum_ticker_daily, which a different DE task populates. Requiring
+        -- momentum on exactly that date meant one late TA run made every rsi NULL, and
+        -- an all-NULL rsi is the one screen no relaxation round can rescue: the
+        -- rsi_rebound predicate rejects a NULL row whatever rsi_max is widened to, so
+        -- all four rounds match nothing and the analysis dies with "no screening
+        -- candidates". Take each ticker's most recent momentum row at or before the
+        -- price date instead, bounded so a genuinely stale feed still screens as
+        -- missing rather than silently trading a month-old RSI.
+        momentum_as_of AS (
+            SELECT DISTINCT ON (ticker)
+                ticker,
+                time AS momentum_time,
+                rsi,
+                prev_rsi
+            FROM momentum_with_prev
+            WHERE time <= (SELECT as_of_date FROM latest_date)
+              AND time >= (SELECT as_of_date FROM latest_date) - INTERVAL '7 days'
+            ORDER BY ticker, time DESC
+        ),
         latest_rows AS (
             SELECT
                 f.*,
@@ -1330,8 +1350,8 @@ def _screening_sql(profile: str, *, sector: str | None = None) -> str:
                 CASE WHEN fin.eps > 0 THEN close / fin.eps END AS per,
                 fin.financial_period_end
             FROM features f
-            LEFT JOIN momentum_with_prev mwp
-              ON mwp.ticker = f.ticker AND mwp.time = f.time
+            LEFT JOIN momentum_as_of mwp
+              ON mwp.ticker = f.ticker
             -- LEFT so a ticker without filings still screens on price alone; the
             -- fundamental predicates simply will not match it.
             LEFT JOIN financials fin ON fin.symbol = f.ticker
