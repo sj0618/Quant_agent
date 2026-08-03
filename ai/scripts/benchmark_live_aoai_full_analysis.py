@@ -9,12 +9,17 @@ from typing import Any
 
 from ai_graph.audit import RecordingAuditSession, create_audit_correlation
 from ai_graph.graph import build_graph
-from ai_graph.schemas import APIEnvelope
+from ai_graph.schemas import APIEnvelope, EnvelopeStatus
 
 
 DEFAULT_QUERY = (
-    "Screen the KOSPI200 universe and backtest RSI <= 30 entries with "
-    "RSI >= 70 exits over the full recommended period."
+    "Run exactly this Korean cash-equity analysis without adding conditions. "
+    "For today's recommendation, screen KOSPI200 stocks only by RSI(14) <= 30. "
+    "Separately backtest every KOSPI200 stock on every trading day from 2016-05-20 "
+    "through 2026-07-30: buy at the next open when RSI(14) <= 30, sell at the next "
+    "open when RSI(14) >= 70, use equal weights with at most 20 positions, an 8% "
+    "stop loss, and a 30% take profit. Do not use fundamental, macro, news, flow, "
+    "short-interest, sector, web, or sentiment filters."
 )
 
 
@@ -142,6 +147,12 @@ def main() -> int:
     wall_seconds = time.perf_counter() - started
 
     model_results = _model_results(session)
+    final_data = state.get("data") if isinstance(state, Mapping) else None
+    availability = (
+        final_data.get("data_availability")
+        if isinstance(final_data, Mapping)
+        else None
+    )
     output = {
         "provider": "aoai",
         "status": "failed" if error is not None else "completed",
@@ -160,6 +171,12 @@ def main() -> int:
             ),
             6,
         ),
+        "resolved_query": state.get("resolved_query") if state is not None else None,
+        "unsupported_capabilities": (
+            availability.get("unsupported_capabilities")
+            if isinstance(availability, Mapping)
+            else None
+        ),
         "backtest": _backtest_results(
             state.get("backtest") if state is not None else None
         ),
@@ -170,7 +187,13 @@ def main() -> int:
 
     if error is not None:
         return 1
-    return 0 if wall_seconds <= args.max_wall_seconds else 2
+    return (
+        0
+        if envelope is not None
+        and envelope.status == EnvelopeStatus.READY
+        and wall_seconds <= args.max_wall_seconds
+        else 2
+    )
 
 
 if __name__ == "__main__":
