@@ -132,38 +132,6 @@ async def google_callback_json(request: Request, payload: GoogleAuthCallbackRequ
     return response
 
 
-@router.post("/test-login")
-async def test_login(request: Request) -> Response:
-    settings = get_runtime_settings(request)
-    if not settings.test_auth_enabled:
-        raise AppError(status_code=404, component="auth", code="not_found", message="Not found")
-
-    validate_unsafe_request_origin(request, settings)
-
-    if settings.test_auth_user_id is None:
-        raise AppError(
-            status_code=503,
-            component="auth",
-            code="test_auth_user_missing",
-            message="Configured test auth user is unavailable",
-        )
-
-    user = await load_user_by_id(get_db_engine(request), str(settings.test_auth_user_id))
-    if not user:
-        raise AppError(
-            status_code=503,
-            component="auth",
-            code="test_auth_user_missing",
-            message="Configured test auth user is unavailable",
-        )
-
-    store = get_session_store(request)
-    session_id, _csrf_token = await store.create_session(user_id=str(user["id"]))
-    response = Response(status_code=204)
-    set_session_cookie(response, settings, session_id)
-    return response
-
-
 @router.get("/me", response_model=AuthMeResponse)
 async def auth_me(request: Request) -> dict[str, object]:
     with measure_span("auth"):

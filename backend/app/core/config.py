@@ -213,8 +213,6 @@ class Settings(BaseSettings):
     )
     auth_csrf_ttl_seconds: int = Field(default=3600, alias="AUTH_CSRF_TTL_SECONDS", ge=300)
     auth_csrf_required: bool = Field(default=False, alias="AUTH_CSRF_REQUIRED")
-    test_auth_enabled: bool = Field(default=False, alias="TEST_AUTH_ENABLED")
-    test_auth_user_id: int | None = Field(default=None, alias="TEST_AUTH_USER_ID", ge=1)
 
     email_delivery_enabled: bool = Field(default=False, alias="EMAIL_DELIVERY_ENABLED")
     email_report_completed_trigger_enabled: bool = Field(default=False, alias="EMAIL_REPORT_COMPLETED_TRIGGER_ENABLED")
@@ -720,11 +718,6 @@ class Settings(BaseSettings):
                     "AUTH_SESSION_TOUCH_INTERVAL_SECONDS must not exceed "
                     "AUTH_SESSION_IDLE_TTL_SECONDS"
                 )
-            if self.test_auth_enabled:
-                if self.is_production:
-                    raise ValueError("TEST_AUTH_ENABLED must not be enabled in production")
-                if self.test_auth_user_id is None:
-                    missing.append("TEST_AUTH_USER_ID")
             if self.ai_backtest_scope_hmac_primary is None:
                 missing.append("AI_BACKTEST_SCOPE_HMAC_PRIMARY")
             if not self.ai_backtest_scope_hmac_primary_version:
@@ -966,8 +959,6 @@ class Settings(BaseSettings):
             "auth_session_absolute_ttl_seconds": self.auth_session_absolute_ttl_seconds,
             "auth_session_touch_interval_seconds": self.auth_session_touch_interval_seconds,
             "auth_csrf_required": self.auth_csrf_required,
-            "test_auth_enabled": self.test_auth_enabled,
-            "test_auth_user_id": self.test_auth_user_id,
             "ai_backtest_scope_hmac_primary": "<configured>" if self.ai_backtest_scope_hmac_primary else None,
             "ai_backtest_scope_hmac_primary_version": self.ai_backtest_scope_hmac_primary_version,
             "ai_backtest_scope_hmac_previous": "<configured>" if self.ai_backtest_scope_hmac_previous else None,

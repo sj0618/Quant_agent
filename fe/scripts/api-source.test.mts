@@ -54,8 +54,6 @@ test("authentication boundaries do not leak cached analysis between users", asyn
 
   assert.match(authSource, /!currentSession \|\| currentSession\.user\.id !== session\.user\.id/);
   assert.match(authSource, /AUTH_ENDPOINTS\.me/);
-  assert.match(authSource, /AUTH_ENDPOINTS\.testLogin/);
-  assert.match(authSource, /completeTestLogin/);
   assert.match(authSource, /finally \{\s+clearCurrentSession\(\)/);
   assert.match(appSource, /validateCurrentSession\(\)/);
   assert.match(aiSource, /\[401, 403\]\.includes\(error\.status\)/);
@@ -64,6 +62,8 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   assert.doesNotMatch(authSource, /TEST_AUTH_SESSION/);
   assert.doesNotMatch(authSource, /saveTestSession/);
   assert.doesNotMatch(authSource, /provider:\s*"test"/);
+  assert.doesNotMatch(authSource, /completeTestLogin/);
+  assert.doesNotMatch(authSource, /AUTH_ENDPOINTS\.testLogin/);
 });
 
 test("user-scoped cache clearing removes every registered key", () => {

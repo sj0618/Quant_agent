@@ -585,13 +585,3 @@ p, h1, h2, h3, h4 { margin: 0; }
 .email-template-sections th { color: var(--subdued); font-size: 10px; font-weight: 800; }
 .email-template-sections td:first-child { width: 48px; color: var(--subdued); font-weight: 800; }
 .email-template-notes { display: flex; flex-direction: column; gap: 8px; margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
-
-/* TEMP(dev-auth-gate): remove this block with SitePasswordGate.tsx. */
-.site-gate-overlay { position: fixed; inset: 0; z-index: 999; display: flex; align-items: center; justify-content: center; background: rgba(11, 16, 27, 0.72); padding: 24px; }
-.site-gate-modal { width: min(360px, 100%); display: flex; flex-direction: column; gap: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 24px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.24); }
-.site-gate-modal h1 { font-size: 20px; margin: 0; }
-.site-gate-modal p { color: var(--muted); font-size: 13px; margin: 0; }
-.site-gate-modal input { width: 100%; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); padding: 10px 12px; }
-.site-gate-modal__error { color: var(--drop); font-size: 12px; margin: 0; }
-.site-gate-modal button { border: 1px solid var(--ink); border-radius: 8px; background: var(--ink); color: #fff; padding: 10px 12px; font-weight: 700; }
-.site-gate-modal button:disabled { opacity: 0.5; cursor: not-allowed; }

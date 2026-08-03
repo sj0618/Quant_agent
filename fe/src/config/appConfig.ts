@@ -1,7 +1,6 @@
 export const AUTH_ENDPOINTS = {
   googleStart: "/auth/google/start",
   googleCallback: "/auth/google/callback",
-  testLogin: "/auth/test-login",
   me: "/auth/me",
   csrf: "/auth/csrf",
   logout: "/auth/logout",
@@ -34,42 +33,10 @@ function backendApiBaseUrl() {
   return trimTrailingSlash(import.meta.env.VITE_BACKEND_API_BASE_URL) || "/api/v1";
 }
 
-// TEMP(dev-auth-gate): everything below until the export, remove once BE session
-// integration ships (test login) and once the product is ready for public access
-// (site password gate). Entries are salted + time-limited so a leaked hash stops
-// working after rotation even though the underlying password is unchanged; run
-// `node fe/scripts/generate-site-gate-entries.mjs` to mint a fresh batch.
-export interface SitePasswordEntry {
-  salt: string;
-  hash: string;
-  expiresAt: number;
-}
-
-function parseSitePasswordEntries(): SitePasswordEntry[] {
-  const raw = import.meta.env.VITE_SITE_PASSWORD_ENTRIES ?? "";
-  return raw
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .map((entry) => {
-      const [salt, hash, expiresAtRaw] = entry.split(":");
-      return { salt, hash: hash?.toLowerCase(), expiresAt: Number(expiresAtRaw) };
-    })
-    .filter(
-      (entry): entry is SitePasswordEntry =>
-        Boolean(entry.salt) && Boolean(entry.hash) && Number.isFinite(entry.expiresAt),
-    );
-}
-
-const sitePasswordEntryList = parseSitePasswordEntries();
-
 export const appConfig = {
   aiApiBaseUrl: aiApiBaseUrl(),
   backendApiBaseUrl: backendApiBaseUrl(),
   authApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AUTH_API_BASE_URL) || backendApiBaseUrl(),
   reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL) || backendApiBaseUrl(),
   strategyApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_STRATEGY_API_BASE_URL) || backendApiBaseUrl(),
-  testLoginEnabled: import.meta.env.DEV || import.meta.env.VITE_ENABLE_TEST_LOGIN === "1",
-  sitePasswordEntries: sitePasswordEntryList,
-  sitePasswordGateEnabled: sitePasswordEntryList.length > 0,
 } as const;

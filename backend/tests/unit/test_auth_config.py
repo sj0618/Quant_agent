@@ -269,21 +269,6 @@ def test_valid_production_auth_settings_are_accepted():
     assert settings.email_delivery_worker_enabled is False
 
 
-def test_test_auth_requires_explicit_user_id_and_is_not_allowed_in_production():
-    with pytest.raises(ValidationError):
-        valid_settings(TEST_AUTH_ENABLED=True)
-
-    with pytest.raises(ValidationError):
-        valid_settings(APP_ENV="production", TEST_AUTH_ENABLED=True, TEST_AUTH_USER_ID=7)
-
-    settings = valid_settings(APP_ENV="local", TEST_AUTH_ENABLED=True, TEST_AUTH_USER_ID=7)
-    summary = settings.safe_summary()
-    assert settings.test_auth_enabled is True
-    assert settings.test_auth_user_id == 7
-    assert summary["test_auth_enabled"] is True
-    assert summary["test_auth_user_id"] == 7
-
-
 @pytest.mark.parametrize(
     "missing_key",
     ["REDIS_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"],
