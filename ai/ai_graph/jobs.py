@@ -581,7 +581,15 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             failure_stage=stage,
             owner="data_source_config",
             retryable=True,
-            safe_message="데이터 조회 시간이 초과되었습니다. 조건을 좁혀 다시 시도해 주세요.",
+            # Deliberately does not tell the user to narrow their conditions. The
+            # timeout that prompted this was our own backtest history query asking for
+            # twenty years of date partitions per indicator table; no wording of the
+            # user's strategy would have changed it, and the advice sent people editing
+            # a request that was never the problem.
+            safe_message=(
+                "데이터 조회가 제한 시간을 넘겨 중단했습니다. "
+                "일시적인 부하일 수 있으니 잠시 후 다시 시도해 주세요."
+            ),
             evidence_refs=["failure:db_statement_timeout"],
         )
     if "validation" in raw or "contract" in raw or "schema" in raw:

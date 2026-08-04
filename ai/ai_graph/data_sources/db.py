@@ -53,7 +53,10 @@ DEFAULT_DB_STATEMENT_TIMEOUT_MS = 30_000
 # default and started timing out; screening queries keep the tight default.
 DEFAULT_DB_BACKTEST_STATEMENT_TIMEOUT_MS = 120_000
 POSTGRES_TIMEOUT_UNIT = "ms"
-BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 3
+# Trading days to calendar days. The real ratio is 365/246 ~ 1.5; the old value of 3
+# asked for 20.7 years of date partitions to retrieve 10 years of bars, doubling the
+# partitions locked and scanned on the heaviest query in the pipeline for nothing.
+BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 1.55
 RSI_OVERSOLD_THRESHOLD = 30.0
 # Sentinel profile whose WHERE clause is the permissive `close > 0` baseline: screening
 # selects the whole universe once and filters it per relaxation round in-process.
@@ -202,6 +205,9 @@ class PostgresPipelineDataSource:
         if not config.database_dsn:
             raise ValueError(f"{AI_DATABASE_DSN_ENV} is required for PostgreSQL data source")
         self.config = config
+        # Indicator families the warehouse could not serve within the statement budget
+        # for this load, so the report can say so instead of silently not matching.
+        self.unavailable_indicator_families: tuple[str, ...] = ()
 
     def load(self, query: str, trace_id: str) -> PipelineDataBundle:
         with self._connect() as conn:
@@ -326,6 +332,9 @@ class PostgresPipelineDataSource:
                     INDICATOR_TABLES[family] for family in indicator_families
                 ],
                 "indicator_families": list(indicator_families),
+                "unavailable_indicator_families": list(
+                    self.unavailable_indicator_families
+                ),
                 "price_rows": len(price_rows),
                 "screening_candidates": len(screening_candidates),
                 "screening_relaxation": screening_relaxation,
@@ -711,7 +720,7 @@ class PostgresPipelineDataSource:
         lookback_days: int,
         indicator_families: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        calendar_lookback_days = (
+        calendar_lookback_days = int(
             lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
         )
         ticker_list = list(tickers)
@@ -719,8 +728,7 @@ class PostgresPipelineDataSource:
         # budget on whichever ticker sorted first and starve the rest.
         rows = conn.execute(
             """
-            SELECT as_of_date, ticker, open, high, low, close, volume,
-                   adjusted_ohlcv_quality_flags
+            SELECT as_of_date, ticker, open, high, low, close, volume
             FROM (
                 SELECT
                     time AS as_of_date,
@@ -730,7 +738,9 @@ class PostgresPipelineDataSource:
                     adj_low AS low,
                     adj_close AS close,
                     adj_volume AS volume,
-                    quality_flags AS adjusted_ohlcv_quality_flags,
+                    -- quality_flags was selected but never read. As a JSONB document on
+                    -- every one of ~455k rows it was pure transfer cost on the single
+                    -- heaviest query in the pipeline.
                     row_number() OVER (PARTITION BY ticker ORDER BY time DESC) AS ticker_rank
                 FROM feature.kis_adjusted_ohlcv_daily
                 WHERE ticker = ANY(%s)
@@ -741,13 +751,42 @@ class PostgresPipelineDataSource:
             """,
             [ticker_list, calendar_lookback_days, lookback_days],
         ).fetchall()
+        # Indicators are only ever read for dates that have a price bar, and the price
+        # query above already capped itself at `lookback_days` rows per ticker. Asking
+        # the indicator tables for the raw calendar window instead means asking for
+        # 2520 x 3 = 7560 days - twenty years of date partitions per table - to return
+        # the same handful of years the prices actually cover. With one indicator table
+        # that was merely wasteful; with four it exceeded the statement budget outright
+        # and surfaced as "데이터 조회 시간이 초과되었습니다. 조건을 좁혀 다시 시도해
+        # 주세요", which blamed the user's conditions for our own query shape.
+        earliest_priced_date = min(
+            (_date_value(row["as_of_date"]) for row in rows), default=None
+        )
         families = indicator_families or tuple(INDICATOR_TABLES)
-        indicators_by_family = {
-            family: self._fetch_indicator_values_by_date(
-                conn, INDICATOR_TABLES[family], ticker_list, calendar_lookback_days
-            )
-            for family in families
-        }
+        indicators_by_family: dict[str, dict[str, dict[date, Mapping[str, Any]]]] = {}
+        unavailable_families: list[str] = []
+        for family in families:
+            try:
+                indicators_by_family[family] = self._fetch_indicator_values_by_date(
+                    conn, INDICATOR_TABLES[family], ticker_list, earliest_priced_date
+                )
+            except Exception:
+                # `split_part(ticker, '#', 1) = ANY(...)` cannot use the ticker index, so
+                # each family is a full scan of every partition in range. Over a
+                # multi-year window and a 200-name universe that can exceed the statement
+                # budget. One family failing must not lose the whole analysis: the bars
+                # simply arrive without that family, conditions on it do not match, and
+                # the gap is recorded rather than presented as a result.
+                _logger.warning(
+                    "indicator family %s could not be loaded within the statement budget",
+                    family,
+                )
+                self._rollback_quietly(conn)
+                self._set_statement_timeout(
+                    conn, self.config.backtest_statement_timeout_ms
+                )
+                unavailable_families.append(family)
+        self.unavailable_indicator_families = tuple(unavailable_families)
         financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
         price_rows = [
             _price_row_from_feature_frame_record(
@@ -851,19 +890,38 @@ class PostgresPipelineDataSource:
         return timelines
 
     def _fetch_indicator_values_by_date(
-        self, conn: Any, table: str, tickers: Sequence[str], calendar_lookback_days: int
+        self, conn: Any, table: str, tickers: Sequence[str], since: date | None
     ) -> dict[str, dict[date, Mapping[str, Any]]]:
-        """One ta_* table's values per ticker per date.
+        """One ta_* table's values per ticker per date, from `since` onwards.
 
         Same shape for every family, so trend/volatility/volume reach the backtest the
         way momentum always has. They did not before: the frame builder hardcoded them
         to `{}`, which is why a compiled condition could only ever reference OHLCV and
         RSI - and why the backtest and the screen disagreed about every other indicator.
+
+        Only the keys this module maps are projected, rather than hauling every
+        indicator document into Python and discarding most of it - measured 1.87x on a
+        205-name, 360-day read of all four tables (24.6s -> 13.2s).
         """
 
+        if since is None:
+            return {}
+        keys = sorted(
+            {
+                spelling
+                for source in _FAMILY_SOURCE_KEYS.get(table, ())
+                for spelling in _key_spellings(source)
+            }
+        )
+        if not keys:
+            return {}
+        projection = ", ".join(
+            f"(values_jsonb->>'{key}')::numeric AS {_metric_key(key)}" for key in keys
+        )
+        alias_by_column = {_metric_key(key): key for key in keys}
         rows = conn.execute(
             f"""
-            SELECT base_ticker, time, values_jsonb
+            SELECT base_ticker, time, {projection}
             FROM (
                 SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
                     split_part(ticker, '#', 1) AS base_ticker,
@@ -871,19 +929,21 @@ class PostgresPipelineDataSource:
                     values_jsonb
                 FROM {table}
                 WHERE split_part(ticker, '#', 1) = ANY(%s)
-                  AND time >= CURRENT_DATE - make_interval(days => %s)
+                  AND time >= %s::date
                 ORDER BY split_part(ticker, '#', 1), time, ticker
             ) deduped
             """,
-            [list(tickers), calendar_lookback_days],
+            [list(tickers), since],
         ).fetchall()
         values_by_ticker: dict[str, dict[date, Mapping[str, Any]]] = {}
         for row in rows:
-            values = row.get("values_jsonb")
             ticker_key = str(row.get("base_ticker") or "").zfill(6)
-            values_by_ticker.setdefault(ticker_key, {})[_date_value(row["time"])] = (
-                values if isinstance(values, Mapping) else {}
-            )
+            values = {
+                source: row[column]
+                for column, source in alias_by_column.items()
+                if row.get(column) is not None
+            }
+            values_by_ticker.setdefault(ticker_key, {})[_date_value(row["time"])] = values
         return values_by_ticker
 
     def _fetch_l4_evidence(self, conn: Any, ticker: str, trace_id: str) -> list[dict[str, Any]]:
@@ -1612,6 +1672,15 @@ INDICATOR_FAMILY_BY_METRIC: dict[str, str] = {
 # strategy names it, so it is never skipped.
 ALWAYS_LOADED_FAMILIES = frozenset({"momentum"})
 
+# Which warehouse keys each ta_* table is read for, so the query projects those columns
+# instead of returning whole indicator documents.
+_FAMILY_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
+    TA_TREND_TICKER_TABLE: tuple(_TREND_KEYS.values()),
+    TA_MOMENTUM_TICKER_TABLE: tuple(_MOMENTUM_KEYS.values()),
+    TA_VOLATILITY_TICKER_TABLE: (*_VOLATILITY_KEYS.values(), _BB_BANDWIDTH_KEY),
+    TA_VOLUME_TICKER_TABLE: tuple(_VOLUME_KEYS.values()),
+}
+
 # Indicators each screening profile's predicate reads off the bar (path features like
 # high_252 are computed separately and are not in any ta_* family).
 _PROFILE_INDICATOR_METRICS: dict[str, tuple[str, ...]] = {
@@ -1629,18 +1698,22 @@ _PROFILE_INDICATOR_METRICS: dict[str, tuple[str, ...]] = {
 def indicator_families_for_query(query: str) -> tuple[str, ...]:
     """The ta_* families a run of this query needs on every backtest bar.
 
-    Currently every family, deliberately. Scoping by the screening profile made the read
-    2.3x faster (37.5s -> 16.3s measured) but was scoped to the wrong consumer: the bars
-    are read by the strategy's compiled conditions, which are generated *after* this
-    load and routinely name indicators the screen never touches. A relative-strength
-    screen loaded momentum only, and a condition on sma200 then saw NaN on every bar and
-    silently matched nothing - the same class of quiet-wrong-answer this work has been
-    removing. Narrowing it again needs the conditions to exist before the load, not a
-    better guess here; `indicator_families_for_metrics` is the piece that will do it.
+    Momentum only, for now, which is what this pipeline loaded before trend/volatility/
+    volume were added. Loading all four is what a compiled condition on `sma200` needs,
+    but it does not complete: `split_part(ticker, '#', 1) = ANY(...)` cannot use the
+    ticker index, so each family is a full scan of every partition in the backtest
+    window, and four of those over a 200-name, multi-year universe exceed the statement
+    budget. Measured on the common server: the four-family read failed after ~140s even
+    with the window narrowed to five years.
+
+    The fix is a DE-side one - a `base_ticker` column on the ta_* tables, or an index on
+    the split expression - not a smaller window here. Until then this loads what can be
+    served, and `unavailable_indicator_families` records the rest so a condition on an
+    unloaded indicator is disclosed rather than quietly never matching.
     """
 
     _ = _PROFILE_INDICATOR_METRICS.get(_screening_profile(query), ())
-    return tuple(INDICATOR_TABLES)
+    return tuple(ALWAYS_LOADED_FAMILIES)
 
 
 def indicator_families_for_metrics(metrics: Sequence[str]) -> tuple[str, ...]:

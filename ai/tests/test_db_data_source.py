@@ -319,11 +319,13 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
                 return Result(
                     rows=[
                         {
-                            # Momentum is now fetched for the whole backtest pool at once,
-                            # so rows carry the ticker they belong to.
+                            # Momentum is fetched for the whole backtest pool at once, so
+                            # rows carry the ticker they belong to, and the query now
+                            # projects each indicator key into its own column rather than
+                            # returning the whole document.
                             "base_ticker": "005930",
                             "time": date(2026, 5, 20),
-                            "values_jsonb": {"RSI_14": Decimal("28.5")},
+                            "rsi_14": Decimal("28.5"),
                         }
                     ]
                 )
