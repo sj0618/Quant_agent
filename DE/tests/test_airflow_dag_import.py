@@ -9,7 +9,8 @@ import unittest
 class AirflowDagImportTests(unittest.TestCase):
     def test_dag_file_is_import_safe_without_airflow(self):
         module = _load_dag_module()
-        self.assertTrue(module.DEFAULT_DAILY_SCHEDULE)
+        self.assertEqual(module.DEFAULT_DAILY_SCHEDULE, "0 20 * * *")
+        self.assertEqual(module.DEFAULT_OHLCV_REPAIR_SCHEDULE, "0 7 * * *")
 
     def test_dag_file_does_not_require_airflow_package(self):
         path = Path("airflow/dags/quant_agent_data_engineering.py")
@@ -30,7 +31,27 @@ class AirflowDagImportTests(unittest.TestCase):
 
         self.assertIsNone(module.dag)
         self.assertIsNone(module.task)
-        self.assertTrue(module.DEFAULT_DAILY_SCHEDULE)
+        self.assertEqual(module.DEFAULT_DAILY_SCHEDULE, "0 20 * * *")
+        self.assertEqual(module.DEFAULT_OHLCV_REPAIR_SCHEDULE, "0 7 * * *")
+
+    def test_evening_collection_and_morning_repair_are_separated(self):
+        source = Path("airflow/dags/quant_agent_data_engineering.py").read_text(encoding="utf-8")
+
+        self.assertIn("dag_id=\"quant_agent_daily_data_engineering\"", source)
+        self.assertIn("schedule=DEFAULT_DAILY_SCHEDULE", source)
+        self.assertIn("dag_id=\"quant_agent_ohlcv_repair\"", source)
+        self.assertIn("schedule=DEFAULT_OHLCV_REPAIR_SCHEDULE", source)
+        self.assertIn("include_same_day_trade_date=True", source)
+        self.assertIn("include_same_day_trade_date=False", source)
+
+    def test_krx_trade_date_query_respects_same_day_flag(self):
+        module = _load_dag_module("quant_agent_data_engineering_dag_trade_date_query")
+
+        inclusive_query = module._krx_trade_date_query(date(2026, 8, 1), include_same_day_trade_date=True)
+        exclusive_query = module._krx_trade_date_query(date(2026, 8, 2), include_same_day_trade_date=False)
+
+        self.assertIn("trade_date <= DATE '2026-08-01'", inclusive_query)
+        self.assertIn("trade_date < DATE '2026-08-02'", exclusive_query)
 
     def test_kis_adjusted_ingest_args_use_daily_target_and_symbols(self):
         previous = os.environ.get("OHLCV_SYMBOLS")

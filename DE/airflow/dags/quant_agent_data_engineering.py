@@ -53,7 +53,8 @@ _load_airflow_dotenv()
 
 # 2. 한국 타임존 세팅 및 크론식에서 CRON_TZ 문구 제거 (순수 시간만 남김)
 LOCAL_TZ = pendulum.timezone("Asia/Seoul") if pendulum else ZoneInfo("Asia/Seoul")
-DEFAULT_DAILY_SCHEDULE = "0 4 * * *" 
+DEFAULT_DAILY_SCHEDULE = "0 20 * * *"
+DEFAULT_OHLCV_REPAIR_SCHEDULE = "0 7 * * *"
 DEFAULT_PROMPT_RETENTION_SCHEDULE = "0 5 * * *"
 PROMPT_RETENTION_DAG_ID = "quant_agent_ai_prompt_retention"
 PROMPT_RETENTION_RETRIES = 3
@@ -141,11 +142,15 @@ if dag and task:  # pragma: no branch
     )
     def daily_data_engineering():
         @task(task_id="ingest_ohlcv_daily")
-        def ingest_ohlcv_daily(logical_date: str | None = None) -> dict:
+        def ingest_ohlcv_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
             from quant_agent.data.config import OhlcvIngestionConfig
             from quant_agent.data.ingestion import OhlcvIngestionRequest, OhlcvIngestionService
 
-            target_date = _target_date(logical_date)
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=True,
+            )
             config = OhlcvIngestionConfig.from_env()
             result = OhlcvIngestionService().ingest_range(
                 OhlcvIngestionRequest(
@@ -160,8 +165,12 @@ if dag and task:  # pragma: no branch
             return {"run_id": str(result.run_id), "rows_written": result.rows_written}
 
         @task(task_id="compute_ta_indicators_daily")
-        def compute_ta_indicators_daily(logical_date: str | None = None) -> dict:
-            target_date = _target_date(logical_date)
+        def compute_ta_indicators_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=True,
+            )
             start_date = _warmup_start_date(target_date)
             return _run_python_script(
                 TA_PIPELINE_SCRIPT,
@@ -169,24 +178,36 @@ if dag and task:  # pragma: no branch
             )
 
         @task(task_id="ingest_kis_adjusted_ohlcv_daily")
-        def ingest_kis_adjusted_ohlcv_daily(logical_date: str | None = None) -> dict:
-            target_date = _target_date(logical_date)
+        def ingest_kis_adjusted_ohlcv_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=True,
+            )
             return _run_python_script(
                 KIS_ADJUSTED_INGEST_SCRIPT,
                 _kis_adjusted_ingest_args(start_date=target_date, end_date=target_date),
             )
 
         @task(task_id="refresh_symbol_metadata_daily")
-        def refresh_symbol_metadata_daily(logical_date: str | None = None) -> dict:
-            target_date = _target_date(logical_date)
+        def refresh_symbol_metadata_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=True,
+            )
             return _run_python_script(
                 SYMBOL_METADATA_SCRIPT,
                 _symbol_metadata_args(as_of_date=target_date),
             )
 
         @task(task_id="run_data_quality_checks_daily")
-        def run_data_quality_checks_daily(logical_date: str | None = None) -> dict:
-            target_date = _target_date(logical_date)
+        def run_data_quality_checks_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=True,
+            )
             start_date = _warmup_start_date(target_date)
             return _run_python_script(
                 QA_CHECK_SCRIPT,
@@ -194,12 +215,16 @@ if dag and task:  # pragma: no branch
             )
 
         @task(task_id="ingest_bok_daily")
-        def ingest_bok_daily(logical_date: str | None = None) -> dict:
+        def ingest_bok_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
             from quant_agent.data.config import BokConfig
 
             if not BokConfig.from_env().is_configured:
                 _skip("BOK_API_KEY is not configured.")
-            target_date = _target_date(logical_date)
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=True,
+            )
             return _run_python_script(
                 DART_BOK_INGEST_SCRIPT,
                 _dart_bok_ingest_args(
@@ -211,8 +236,12 @@ if dag and task:  # pragma: no branch
             )
 
         @task(task_id="ingest_dart_financials_daily")
-        def ingest_dart_financials_daily(logical_date: str | None = None) -> dict:
-            target_date = _target_date(logical_date)
+        def ingest_dart_financials_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=True,
+            )
             return _run_python_script(
                 DART_BOK_INGEST_SCRIPT,
                 _dart_bok_ingest_args(
@@ -234,6 +263,70 @@ if dag and task:  # pragma: no branch
         symbol_metadata >> dart
         kis_adjusted >> computed
         computed >> qa
+
+    @dag(
+        dag_id="quant_agent_ohlcv_repair",
+        description="Morning OHLCV repair run for late KRX publication.",
+        schedule=DEFAULT_OHLCV_REPAIR_SCHEDULE,
+        start_date=DEFAULT_START_DATE,
+        catchup=False,
+        max_active_runs=1,
+        default_args={"retries": int(os.getenv("QUANT_AIRFLOW_RETRIES", "3")), "retry_delay": timedelta(minutes=5)},
+        tags=["quant-agent", "data-engineering", "repair"],
+    )
+    def ohlcv_repair():
+        @task(task_id="ingest_ohlcv_daily")
+        def ingest_ohlcv_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            from quant_agent.data.config import OhlcvIngestionConfig
+            from quant_agent.data.ingestion import OhlcvIngestionRequest, OhlcvIngestionService
+
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=False,
+            )
+            config = OhlcvIngestionConfig.from_env()
+            result = OhlcvIngestionService().ingest_range(
+                OhlcvIngestionRequest(
+                    source=config.primary_source,
+                    start_date=target_date,
+                    end_date=target_date,
+                    symbols=_symbols_from_env(),
+                    dag_id="quant_agent_ohlcv_repair",
+                    task_id="ingest_ohlcv_daily",
+                )
+            )
+            return {"run_id": str(result.run_id), "rows_written": result.rows_written}
+
+        @task(task_id="refresh_symbol_metadata_daily")
+        def refresh_symbol_metadata_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=False,
+            )
+            return _run_python_script(
+                SYMBOL_METADATA_SCRIPT,
+                _symbol_metadata_args(as_of_date=target_date),
+            )
+
+        @task(task_id="run_data_quality_checks_daily")
+        def run_data_quality_checks_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=False,
+            )
+            start_date = _warmup_start_date(target_date)
+            return _run_python_script(
+                QA_CHECK_SCRIPT,
+                _data_quality_args(start_date=start_date, end_date=target_date),
+            )
+
+        ingested = ingest_ohlcv_daily()
+        symbol_metadata = refresh_symbol_metadata_daily()
+        qa = run_data_quality_checks_daily()
+        ingested >> symbol_metadata >> qa
 
     @dag(
         dag_id="quant_agent_backfill_ohlcv_10y",
@@ -286,51 +379,64 @@ if dag and task:  # pragma: no branch
         purge_ai_prompt_logs()
 
     quant_agent_daily_data_engineering = daily_data_engineering()
+    quant_agent_ohlcv_repair = ohlcv_repair()
     quant_agent_backfill_ohlcv_10y = backfill_ohlcv_10y()
     quant_agent_ai_prompt_retention = ai_prompt_retention()
 
 
-def _target_date(logical_date) -> date:
-    if logical_date:
-        # Airflow logical_date는 UTC 기준일 수 있으므로, 먼저 한국시간 기준 날짜로 맞춘다.
-        if isinstance(logical_date, datetime):
-            run_date = logical_date.astimezone(LOCAL_TZ).date() if logical_date.tzinfo else logical_date.replace(tzinfo=LOCAL_TZ).date()
-        elif isinstance(logical_date, date):
-            run_date = logical_date
-        elif isinstance(logical_date, str):
-            parsed = datetime.fromisoformat(logical_date)
+def _target_date(logical_date, data_interval_end=None, *, include_same_day_trade_date: bool) -> date:
+    reference = data_interval_end or logical_date
+    if reference:
+        # Airflow context는 UTC 또는 tz-aware datetime일 수 있으므로, 먼저 한국시간 기준 날짜로 맞춘다.
+        if isinstance(reference, datetime):
+            run_date = reference.astimezone(LOCAL_TZ).date() if reference.tzinfo else reference.replace(tzinfo=LOCAL_TZ).date()
+        elif isinstance(reference, date):
+            run_date = reference
+        elif isinstance(reference, str):
+            parsed = datetime.fromisoformat(reference)
             run_date = parsed.astimezone(LOCAL_TZ).date() if parsed.tzinfo else parsed.date()
-        elif hasattr(logical_date, "date"):
-            candidate = logical_date.date()
+        elif hasattr(reference, "date"):
+            candidate = reference.date()
             run_date = candidate.astimezone(LOCAL_TZ).date() if isinstance(candidate, datetime) else candidate
         else:
             run_date = date.today()
-        
-        current_date_kst = datetime.now(LOCAL_TZ).date()
-        operator = "<" if run_date >= current_date_kst else "<="
-        
+
         from quant_agent.data.repository import DataRepository
 
         rows = DataRepository().executor.fetch_json(
-            f"""
-            SELECT MAX(trade_date)::text AS trade_date
-              FROM core.trading_calendar
-             WHERE market = 'KRX'
-               AND is_open = TRUE
-               AND trade_date {operator} DATE '{run_date.isoformat()}'
-            """
+            _krx_trade_date_query(
+                run_date,
+                include_same_day_trade_date=include_same_day_trade_date,
+            )
         )
         raw_trade_date = rows[0].get("trade_date") if rows else None
         if not raw_trade_date:
+            operator = "<=" if include_same_day_trade_date else "<"
             raise ValueError(f"No KRX open trade date found {operator} {run_date.isoformat()}.")
         return date.fromisoformat(str(raw_trade_date))
 
     try:  # pragma: no cover - Airflow context only exists inside task runtime.
         from airflow.operators.python import get_current_context
 
-        return _target_date(get_current_context()["logical_date"])
+        context = get_current_context()
+        return _target_date(
+            context.get("logical_date"),
+            context.get("data_interval_end"),
+            include_same_day_trade_date=include_same_day_trade_date,
+        )
     except (ImportError, KeyError, RuntimeError):
         return date.today()
+
+
+def _krx_trade_date_query(run_date: date, *, include_same_day_trade_date: bool) -> str:
+    operator = "<=" if include_same_day_trade_date else "<"
+    return f"""
+            SELECT MAX(trade_date)::text AS trade_date
+              FROM core.trading_calendar
+             WHERE market = 'KRX'
+               AND is_open = TRUE
+               AND trade_date {operator} DATE '{run_date.isoformat()}'
+            """
 
 
 def _warmup_start_date(target_date: date) -> date:
