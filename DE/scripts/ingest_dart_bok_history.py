@@ -322,6 +322,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dart-report-codes", default=None)
     parser.add_argument("--dart-fs-div", default=os.getenv("DART_FS_DIV", DEFAULT_DART_FS_DIV))
     parser.add_argument(
+        "--dart-skip-existing",
+        action="store_true",
+        default=os.getenv("DART_SKIP_EXISTING", "false").lower() == "true",
+        help="Skip DART company/period jobs whose feature rows already exist in feature.dart_financial_quarterly.",
+    )
+    parser.add_argument(
         "--dart-period-mode",
         choices=["period-end", "filing-window"],
         default=None,
@@ -511,9 +517,10 @@ def run_params(args: argparse.Namespace, start_date: date, end_date: date) -> di
         "end_date": end_date.isoformat(),
         "dry_run": args.dry_run,
         "dart_period_mode": resolve_dart_period_mode(args),
-            "max_dart_companies": args.max_dart_companies,
-            "bok_series_preset": args.bok_series_preset,
-        }
+        "dart_skip_existing": args.dart_skip_existing,
+        "max_dart_companies": args.max_dart_companies,
+        "bok_series_preset": args.bok_series_preset,
+    }
 
 
 def start_ingestion_run(
@@ -706,56 +713,107 @@ def ingest_dart_history(
         universe = universe[:max_companies]
 
     report_periods = resolve_dart_report_periods(args, start_date, end_date)
+    existing_feature_keys = (
+        load_existing_dart_feature_keys(conn, schemas["feature.dart_financial_quarterly"])
+        if args.dart_skip_existing
+        else set()
+    )
     no_data_status_codes = {item.strip() for item in args.dart_no_data_status_codes.split(",") if item.strip()}
 
+    for company, period in iter_resumable_dart_jobs(
+        universe,
+        report_periods,
+        args.dart_fs_div,
+        existing_feature_keys,
+        skip_existing=args.dart_skip_existing,
+        stats=stats,
+    ):
+        raw_payload = client.fetch_financial_statement(
+            corp_code=company.corp_code,
+            business_year=period.business_year,
+            report_code=period.report_code,
+            fs_div=args.dart_fs_div,
+        )
+        stats.api_calls += 1
+        stats.raw_payloads_attempted += 1
+        stats.raw_payloads_inserted += insert_raw_payload(
+            conn, schemas.get("raw.dart_response"), raw_payload, run_id, dry_run=args.dry_run
+        )
+
+        status = str(raw_payload.payload.get("status", "")).strip()
+        if status and status != "000":
+            message = str(raw_payload.payload.get("message", ""))
+            if status in no_data_status_codes:
+                stats.no_data_responses += 1
+                time.sleep(args.dart_request_sleep_seconds)
+                continue
+            error = f"DART status={status} symbol={company.symbol} corp_code={company.corp_code}: {message}"
+            stats.errors.append(error)
+            raise SourceResponseError(error)
+
+        rows = normalize_financial_statement(raw_payload, symbol=company.symbol, period_end=period.period_end)
+        stats.rows_seen += len(rows)
+        candidate_rows = [
+            {
+                "symbol_id": company.symbol_id,
+                "corp_code": row["corp_code"],
+                "period_end": row["period_end"],
+                "reported_at": row.get("reported_at"),
+                "report_code": row["report_code"],
+                "fs_div": row["fs_div"],
+                "accounts_jsonb": row.get("accounts", {}),
+                "run_id": run_id,
+            }
+            for row in rows
+        ]
+        stats.rows_inserted += insert_rows(
+            conn,
+            schemas["feature.dart_financial_quarterly"],
+            candidate_rows,
+            dry_run=args.dry_run,
+            commit=True,
+        )
+        time.sleep(args.dart_request_sleep_seconds)
+
+
+def load_existing_dart_feature_keys(
+    conn: psycopg.Connection,
+    table_schema: TableSchema,
+) -> set[tuple[int, date, str, str]]:
+    query = sql.SQL("SELECT symbol_id, period_end, report_code, fs_div FROM {}").format(
+        sql.SQL(".").join([sql.Identifier(table_schema.schema_name), sql.Identifier(table_schema.table_name)])
+    )
+    keys: set[tuple[int, date, str, str]] = set()
+    with conn.cursor() as cur:
+        cur.execute(query)
+        for row in cur.fetchall():
+            keys.add(
+                (
+                    int(row["symbol_id"]),
+                    row["period_end"],
+                    str(row["report_code"]),
+                    str(row["fs_div"]),
+                )
+            )
+    return keys
+
+
+def iter_resumable_dart_jobs(
+    universe: list[DartUniverseEntry],
+    report_periods: list[DartReportPeriod],
+    fs_div: str,
+    existing_feature_keys: set[tuple[int, date, str, str]],
+    *,
+    skip_existing: bool,
+    stats: SourceStats,
+) -> Iterable[tuple[DartUniverseEntry, DartReportPeriod]]:
     for company in universe:
         for period in report_periods:
-            raw_payload = client.fetch_financial_statement(
-                corp_code=company.corp_code,
-                business_year=period.business_year,
-                report_code=period.report_code,
-                fs_div=args.dart_fs_div,
-            )
-            stats.api_calls += 1
-            stats.raw_payloads_attempted += 1
-            stats.raw_payloads_inserted += insert_raw_payload(
-                conn, schemas.get("raw.dart_response"), raw_payload, run_id, dry_run=args.dry_run
-            )
-
-            status = str(raw_payload.payload.get("status", "")).strip()
-            if status and status != "000":
-                message = str(raw_payload.payload.get("message", ""))
-                if status in no_data_status_codes:
-                    stats.no_data_responses += 1
-                    time.sleep(args.dart_request_sleep_seconds)
-                    continue
-                error = f"DART status={status} symbol={company.symbol} corp_code={company.corp_code}: {message}"
-                stats.errors.append(error)
-                raise SourceResponseError(error)
-
-            rows = normalize_financial_statement(raw_payload, symbol=company.symbol, period_end=period.period_end)
-            stats.rows_seen += len(rows)
-            candidate_rows = [
-                {
-                    "symbol_id": company.symbol_id,
-                    "corp_code": row["corp_code"],
-                    "period_end": row["period_end"],
-                    "reported_at": row.get("reported_at"),
-                    "report_code": row["report_code"],
-                    "fs_div": row["fs_div"],
-                    "accounts_jsonb": row.get("accounts", {}),
-                    "run_id": run_id,
-                }
-                for row in rows
-            ]
-            stats.rows_inserted += insert_rows(
-                conn,
-                schemas["feature.dart_financial_quarterly"],
-                candidate_rows,
-                dry_run=args.dry_run,
-                commit=True,
-            )
-            time.sleep(args.dart_request_sleep_seconds)
+            feature_key = (company.symbol_id, period.period_end, period.report_code, fs_div)
+            if skip_existing and feature_key in existing_feature_keys:
+                stats.rows_skipped += 1
+                continue
+            yield company, period
 
 
 def insert_corp_code_rows(

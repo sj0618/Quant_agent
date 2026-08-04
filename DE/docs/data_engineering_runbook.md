@@ -13,7 +13,7 @@
 | TA-Lib 계산 | `python scripts/compute_ta_indicators.py --start-date 2026-07-03 --end-date 2026-07-09 --symbols 005930 --db-mode docker` |
 | BOK rate-fx 10년 백필/재개 | `python scripts/ingest_dart_bok_history.py --scope full-10y --sources bok --bok-series-preset rate-fx --bok-request-sleep-seconds 0.2 --output .omx/logs/bok-rate-fx-full-10y.json` |
 | BOK 월별 유가 10년 백필 | `python scripts/ingest_dart_bok_history.py --scope custom --sources bok --start-date 2016-06-01 --end-date 2026-06-24 --bok-series-json '[{"stat_code":"902Y003","cycle":"M","item_code1":"010101","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010102","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010103","language":"en"}]' --output .omx/logs/bok-oil-monthly-full-10y-20260624.json` |
-| DART CFS 2016~2026 백필/재개 | `python scripts/ingest_dart_bok_history.py --scope full-10y --sources dart --dart-refresh-corp-codes --dart-fs-div CFS --dart-request-sleep-seconds 0.5 --output .omx/logs/dart-financial-full-10y.json` |
+| DART CFS 2016~2026 백필/재개 | `python scripts/ingest_dart_bok_history.py --scope full-10y --sources dart --dart-refresh-corp-codes --dart-fs-div CFS --dart-skip-existing --dart-request-sleep-seconds 1.5 --output .omx/logs/dart-financial-full-10y.json` |
 | BOK 단일 series 점검 | `python scripts/ingest_external_data.py --job bok-series --stat-code 722Y001 --cycle D --start-period 20260514 --end-period 20260515 --item-code1 0101000 --db-mode docker` |
 | BOK 유가 단일 series 점검 | `python scripts/ingest_external_data.py --job bok-series --stat-code 902Y003 --cycle M --start-period 202601 --end-period 202605 --item-code1 010102 --db-mode docker` |
 | OpenDART corp code | `python scripts/ingest_external_data.py --job dart-corp-codes --db-mode docker` |
@@ -40,7 +40,7 @@
 | KRX | `KRX_API_KEY`, 선택: `KRX_DAILY_MARKET_ENDPOINTS` |
 | KIS | `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_TRADING_ENV` |
 | BOK | `BOK_API_KEY`, 선택: `BOK_BASE_URL` |
-| OpenDART | `DART_API_KEY` 또는 `OPENDART_API_KEY` |
+| OpenDART | `FSS_API_KEY`, `FSS_API_KEY_2`, `FSS_API_KEY_3` 권장. 기존 호환용으로 `DART_API_KEY`, `OPENDART_API_KEY`도 인식 |
 | WICS | `WICS_COMPANY_INFO_URL`, 선택: `WICS_REQUEST_WORKERS` |
 | Airflow | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON`, `DART_REFRESH_CORP_CODES`, `QUANT_AIRFLOW_DAILY_SCHEDULE` |
 

@@ -69,6 +69,12 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.is_configured)
         self.assertEqual(config.api_key, "fss")
 
+    def test_dart_config_reads_numbered_fss_api_keys_in_order(self):
+        with EnvGuard({"FSS_API_KEY": "fss-1", "FSS_API_KEY_2": "fss-2", "FSS_API_KEY_3": "fss-3"}):
+            config = DartConfig.from_env()
+        self.assertEqual(config.api_keys, ("fss-1", "fss-2", "fss-3"))
+        self.assertEqual(config.api_key, "fss-1")
+
 
 class ConfigModuleSecurityTests(unittest.TestCase):
     def test_config_module_does_not_load_dotenv(self):

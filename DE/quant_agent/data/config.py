@@ -64,6 +64,21 @@ def _env(name: str, default: str | None = None) -> str | None:
     return value
 
 
+def _env_values(*names: str) -> tuple[str, ...]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        value = _env(name)
+        if value is None:
+            continue
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+    return tuple(values)
+
+
 def _env_float(name: str, default: float) -> float:
     raw = _env(name)
     return default if raw is None else float(raw)
@@ -322,7 +337,7 @@ class BokConfig:
 @dataclass(frozen=True)
 class DartConfig:
     base_url: str
-    api_key: str | None
+    api_keys: tuple[str, ...]
     request_timeout_seconds: int
     retry: RetryConfig
 
@@ -330,14 +345,24 @@ class DartConfig:
     def from_env(cls) -> "DartConfig":
         return cls(
             base_url=(_env("DART_BASE_URL", DEFAULT_DART_BASE_URL) or DEFAULT_DART_BASE_URL).rstrip("/"),
-            api_key=_env("DART_API_KEY") or _env("OPENDART_API_KEY") or _env("FSS_API_KEY"),
+            api_keys=_env_values(
+                "FSS_API_KEY",
+                "FSS_API_KEY_2",
+                "FSS_API_KEY_3",
+                "DART_API_KEY",
+                "OPENDART_API_KEY",
+            ),
             request_timeout_seconds=_env_int("API_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS),
             retry=RetryConfig.from_env(),
         )
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.api_keys)
+
+    @property
+    def api_key(self) -> str | None:
+        return self.api_keys[0] if self.api_keys else None
 
 
 @dataclass(frozen=True)
