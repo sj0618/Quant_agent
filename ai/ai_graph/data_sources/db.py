@@ -34,13 +34,13 @@ AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
-# Five years, not ten. The database does not struggle with either - a server-side count
-# over the ten-year, 200-name set takes ~1.0s - but returning it does: 455k rows cost
-# ~34s to transfer and build, which together with the indicator reads exceeded the
-# statement budget and surfaced as "데이터 조회 시간이 초과되었습니다". Five years is
-# 237k rows and ~11s, still 1250 bars per name for the in/out-of-sample split.
-# AI_BACKTEST_LOOKBACK_DAYS overrides this where a longer history is worth the wait.
-DEFAULT_BACKTEST_LOOKBACK_YEARS = 5
+# Ten years, which is what the warehouse holds (2016-05-20 onwards). Briefly cut to
+# five while the real cause of the statement timeout was still unknown; that was the
+# wrong trade. A five-year window starting mid-2021 excludes the COVID crash entirely -
+# the most informative stress period available - and the database was never the
+# constraint: a server-side count over the full ten-year set takes ~1.0s. The cost was
+# transferring and building rows, which is an engineering problem and is fixed as one.
+DEFAULT_BACKTEST_LOOKBACK_YEARS = 10
 DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * DEFAULT_BACKTEST_LOOKBACK_YEARS
 DEFAULT_L4_EVIDENCE_LIMIT = 5
 # Screening can match hundreds of names; every extra ticker multiplies the price rows
@@ -788,16 +788,12 @@ class PostgresPipelineDataSource:
                     conn, INDICATOR_TABLES[family], ticker_list, earliest_priced_date
                 )
             except Exception:
-                # `split_part(ticker, '#', 1) = ANY(...)` cannot use the ticker index, so
-                # each family is a full scan of every partition in range. Over a
-                # multi-year window and a 200-name universe that can exceed the statement
-                # budget. One family failing must not lose the whole analysis: the bars
-                # simply arrive without that family, conditions on it do not match, and
-                # the gap is recorded rather than presented as a result.
-                _logger.warning(
-                    "indicator family %s could not be loaded within the statement budget",
-                    family,
-                )
+                # One family failing must not lose the whole analysis: the bars simply
+                # arrive without it, conditions on it do not match, and the gap is
+                # recorded rather than presented as a result. The reason is logged in
+                # full - naming a presumed cause here hid a plain SQL syntax error
+                # behind "statement budget" for as long as this handler existed.
+                _logger.exception("indicator family %s could not be loaded", family)
                 self._rollback_quietly(conn)
                 self._set_statement_timeout(
                     conn, self.config.backtest_statement_timeout_ms
@@ -927,6 +923,39 @@ class PostgresPipelineDataSource:
         value = row.get("date_floor") if row else None
         return _date_value(value) if value is not None else None
 
+    def _resolve_indicator_ticker_keys(
+        self, conn: Any, table: str, tickers: Sequence[str]
+    ) -> list[str]:
+        """The suffixed keys ('000020#S05') this table uses for these 6-digit codes.
+
+        Read from the table's most recent partition only, so the expensive `split_part`
+        predicate is paid once over one day instead of over every partition in the
+        backtest window.
+        """
+
+        rows = conn.execute(
+            f"""
+            WITH latest AS (
+                SELECT max(time) AS time
+                FROM {table}
+                WHERE time >= CURRENT_DATE - INTERVAL '30 days'
+            )
+            SELECT DISTINCT t.ticker
+            FROM {table} t, latest
+            WHERE t.time = latest.time
+              AND split_part(t.ticker, '#', 1) = ANY(%s)
+            """,
+            [list(tickers)],
+        ).fetchall()
+        # Both spellings, because the key format changed over the history: rows from
+        # 2026 are keyed '005930#S07', rows from 2024 and earlier plain '005930'.
+        # Matching only what the latest partition uses left ten-year reads at 0.2%
+        # coverage. Both are equality on the indexed column, so the read stays an index
+        # scan rather than reverting to split_part().
+        keys = {str(row["ticker"]) for row in rows if row.get("ticker")}
+        keys.update(str(ticker) for ticker in tickers)
+        return sorted(keys)
+
     def _fetch_indicator_values_by_date(
         self, conn: Any, table: str, tickers: Sequence[str], since: date | None
     ) -> dict[str, dict[date, Mapping[str, Any]]]:
@@ -953,35 +982,49 @@ class PostgresPipelineDataSource:
         )
         if not keys:
             return {}
+        # Aliases are quoted: indicator names carry dots (CCI_20_0.015, BBU_20_2.0), and
+        # an unquoted `AS cci_20_0.015` is a syntax error - which is exactly how this
+        # read was failing, in 188ms, while the handler below reported it as a statement
+        # budget overrun.
         projection = ", ".join(
-            f"(values_jsonb->>'{key}')::numeric AS {_metric_key(key)}" for key in keys
+            f'(values_jsonb->>\'{key}\')::numeric AS "{_metric_key(key)}"' for key in keys
         )
         alias_by_column = {_metric_key(key): key for key in keys}
+        # `split_part(ticker, '#', 1) = ANY(...)` cannot use the ticker index, so the
+        # range read degenerated into a full scan of every partition in the window and
+        # blew the statement budget. Resolve the suffixed keys ('000020#S05') from a
+        # single recent partition first - one cheap lookup - then match them directly so
+        # the multi-year read is an index scan.
+        ticker_keys = self._resolve_indicator_ticker_keys(conn, table, tickers)
+        if not ticker_keys:
+            return {}
+        # No DISTINCT ON: de-duplicating in SQL meant sorting every matched row by a
+        # computed expression, which is most of what made this read unaffordable. The
+        # keys are already known, so the collision (several security types sharing one
+        # 6-digit code) is resolved here instead - first key wins, matching the previous
+        # `ORDER BY ..., ticker` tie-break.
         rows = conn.execute(
             f"""
-            SELECT base_ticker, time, {projection}
-            FROM (
-                SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
-                    split_part(ticker, '#', 1) AS base_ticker,
-                    time,
-                    values_jsonb
-                FROM {table}
-                WHERE split_part(ticker, '#', 1) = ANY(%s)
-                  AND time >= %s::date
-                ORDER BY split_part(ticker, '#', 1), time, ticker
-            ) deduped
+            SELECT ticker, time, {projection}
+            FROM {table}
+            WHERE ticker = ANY(%s)
+              AND time >= %s::date
+            ORDER BY ticker, time
             """,
-            [list(tickers), since],
+            [ticker_keys, since],
         ).fetchall()
         values_by_ticker: dict[str, dict[date, Mapping[str, Any]]] = {}
         for row in rows:
-            ticker_key = str(row.get("base_ticker") or "").zfill(6)
-            values = {
+            ticker_key = str(row.get("ticker") or "").split("#", 1)[0].zfill(6)
+            by_date = values_by_ticker.setdefault(ticker_key, {})
+            trade_date = _date_value(row["time"])
+            if trade_date in by_date:
+                continue
+            by_date[trade_date] = {
                 source: row[column]
                 for column, source in alias_by_column.items()
                 if row.get(column) is not None
             }
-            values_by_ticker.setdefault(ticker_key, {})[_date_value(row["time"])] = values
         return values_by_ticker
 
     def _fetch_l4_evidence(self, conn: Any, ticker: str, trace_id: str) -> list[dict[str, Any]]:
@@ -1736,22 +1779,17 @@ _PROFILE_INDICATOR_METRICS: dict[str, tuple[str, ...]] = {
 def indicator_families_for_query(query: str) -> tuple[str, ...]:
     """The ta_* families a run of this query needs on every backtest bar.
 
-    Momentum only, for now, which is what this pipeline loaded before trend/volatility/
-    volume were added. Loading all four is what a compiled condition on `sma200` needs,
-    but it does not complete: `split_part(ticker, '#', 1) = ANY(...)` cannot use the
-    ticker index, so each family is a full scan of every partition in the backtest
-    window, and four of those over a 200-name, multi-year universe exceed the statement
-    budget. Measured on the common server: the four-family read failed after ~140s even
-    with the window narrowed to five years.
-
-    The fix is a DE-side one - a `base_ticker` column on the ta_* tables, or an index on
-    the split expression - not a smaller window here. Until then this loads what can be
-    served, and `unavailable_indicator_families` records the rest so a condition on an
-    unloaded indicator is disclosed rather than quietly never matching.
+    All four, which is what a compiled condition on `sma200` or `bb_lower` needs. This
+    was briefly cut to momentum while the four-family read looked like it could not be
+    served; it turned out not to be a cost problem at all - the projected query carried
+    an unquoted column alias for indicators whose names contain dots (CCI_20_0.015), so
+    every family failed on a syntax error in under 200ms and was reported as a budget
+    overrun. With the alias quoted and the ticker keys resolved up front, a ten-year
+    momentum read is ~2.8s.
     """
 
     _ = _PROFILE_INDICATOR_METRICS.get(_screening_profile(query), ())
-    return tuple(ALWAYS_LOADED_FAMILIES)
+    return tuple(INDICATOR_TABLES)
 
 
 def indicator_families_for_metrics(metrics: Sequence[str]) -> tuple[str, ...]:

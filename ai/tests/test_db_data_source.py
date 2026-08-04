@@ -305,6 +305,8 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
                 return Result(row={"present": True})
             if "min(time) AS date_floor" in query:
                 return Result(row={"date_floor": date(2016, 5, 20)})
+            if "SELECT DISTINCT t.ticker" in query:
+                return Result(rows=[{"ticker": "005930#S01"}])
             if "feature.kis_adjusted_ohlcv_daily" in query:
                 return Result(
                     rows=[
@@ -327,7 +329,7 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
                             # rows carry the ticker they belong to, and the query now
                             # projects each indicator key into its own column rather than
                             # returning the whole document.
-                            "base_ticker": "005930",
+                            "ticker": "005930#S01",
                             "time": date(2026, 5, 20),
                             "rsi_14": Decimal("28.5"),
                         }
