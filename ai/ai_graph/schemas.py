@@ -526,6 +526,29 @@ class RecommendationGate(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class RuleProvenance(BaseModel):
+    """What the backtest actually evaluated, reported by the backtest itself.
+
+    The strategy spec carries the rule that was *generated*. Nothing carried the rule
+    that was *run*, and when the generated conditions could not be compiled the engine
+    quietly fell back to a generic template - producing a report whose headline was
+    byte-identical to one where the user's own rule had been tested. Two independent
+    descriptions of one run always drift; this is the executing stage describing itself,
+    so there is only one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # "user_conditions" when the strategy's own compiled rule was traded, otherwise the
+    # template profile that stood in for it.
+    evaluated_rule: str = Field(min_length=1)
+    substituted: bool
+    requested_conditions: list[str] = Field(default_factory=list)
+    # Conditions the compiler could not translate; empty when nothing was substituted.
+    untranslatable_conditions: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class UserPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -640,3 +663,4 @@ class APIEnvelope(BaseModel):
     proxy_disclosure: dict[str, str] | None = None
     failure_cause: FailureDiagnostic | None = None
     evidence_refs: list[EvidenceRef] = Field(default_factory=list)
+    rule_provenance: RuleProvenance | None = None

@@ -188,7 +188,12 @@ def test_pullback_rsi40_volume_prompt_generates_nonzero_backtest() -> None:
         ("volume_ratio_20", "gte", 1.0),
     ]
     assert envelope.user_payload.performance is not None
-    assert envelope.user_payload.performance.metrics.total_return != 0
+    # The point of this test is that the strategy the user asked for is the strategy
+    # that gets backtested. It previously asserted a non-zero return, which was only
+    # satisfiable because a generic template replaced the rule asserted just above.
+    assert envelope.rule_provenance is not None
+    assert envelope.rule_provenance.substituted is False
+    assert envelope.rule_provenance.evaluated_rule == "user_conditions"
 
 
 def test_option_short_straddle_is_rejected() -> None:

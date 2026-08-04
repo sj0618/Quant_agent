@@ -166,6 +166,78 @@ def _public_engine_summary(engine_summary: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_user_rule(candidate: Any) -> bool:
+    """Whether this candidate trades the strategy's own compiled conditions."""
+
+    parameters = getattr(candidate, "parameters", None)
+    profile = getattr(parameters, "profile", None)
+    if profile is None and isinstance(parameters, Mapping):
+        profile = parameters.get("profile")
+    return profile == "compiled_conditions"
+
+
+def rule_provenance(
+    backtest: Mapping[str, Any], entry_conditions: Sequence[Mapping[str, Any]] | None
+) -> dict[str, Any]:
+    """Which rule the backtest actually traded, stated by the backtest.
+
+    `compiled_conditions` means the strategy's own compiled rule was traded. Any other
+    profile is a generic template that stood in for it because the conditions could not
+    be translated - a substitution that previously left no trace anywhere in the result.
+    """
+
+    from ai_graph.nodes.condition_compiler import compile_conditions
+    from ai_graph.schemas import Condition
+
+    selected = backtest.get("selected_candidate") or {}
+    profile = ((selected.get("parameters") or {}).get("profile")) or "unknown"
+    requested = [str(c.get("left")) for c in (entry_conditions or []) if c.get("left")]
+    substituted = profile != "compiled_conditions"
+
+    untranslatable: list[str] = []
+    if substituted and entry_conditions:
+        for raw in entry_conditions:
+            try:
+                one = Condition.model_validate(raw)
+            except Exception:
+                untranslatable.append(str(raw.get("left")))
+                continue
+            if compile_conditions([one]) is None:
+                untranslatable.append(one.left)
+
+    # Two very different substitutions were being reported as one. "Could not be
+    # translated" means the user's rule never ran. "Scored lower" means it ran and lost
+    # to a generic template on the objective function - the user's strategy was
+    # evaluated, and then something else was recommended in its place. Asserting the
+    # first when the second happened is the same presumed-cause error this record exists
+    # to remove.
+    ran_own_rule = any(
+        ((c.get("parameters") or {}).get("profile")) == "compiled_conditions"
+        for c in (backtest.get("candidates") or [])
+    )
+    if not substituted:
+        reason = None
+    elif untranslatable:
+        reason = (
+            "생성된 조건 중 백테스트가 평가할 수 없는 항목이 있어 일반 템플릿으로 "
+            "대체했습니다: " + ", ".join(untranslatable)
+        )
+    elif ran_own_rule:
+        reason = (
+            "사용자 조건도 후보로 백테스트했지만 목적함수 점수가 더 낮아 "
+            "일반 템플릿이 선택됐습니다."
+        )
+    else:
+        reason = "사용자 조건이 백테스트 후보에 포함되지 않았습니다."
+    return {
+        "evaluated_rule": "user_conditions" if not substituted else f"template:{profile}",
+        "substituted": substituted,
+        "requested_conditions": requested,
+        "untranslatable_conditions": untranslatable,
+        "reason": reason,
+    }
+
+
 def summarize_backtest(backtest: Mapping[str, Any]) -> dict[str, Any]:
     selected = backtest.get("selected_candidate") or {}
     selected_id = selected.get("candidate_id")
@@ -1081,8 +1153,19 @@ def run_candidate_backtest(
             session.close()
         raise ValueError("at least one candidate must pass validation and engine backtest")
 
+    # The recommendation must be the strategy the user asked for. Selection used to be
+    # a plain argmax over every candidate, so a generic template that happened to score
+    # higher replaced the user's own rule - and the report then presented that template's
+    # performance as the answer. Measured on five prompts, the user's rule ran and lost
+    # on three of them; nothing in the result said so.
+    #
+    # Optimisation belongs inside the user's rule, not instead of it: variants of their
+    # compiled conditions compete with each other, and the generic profiles stay in the
+    # run only as baselines to compare against.
+    own_rule = [c for c in valid_candidates if _is_user_rule(c)]
+    selectable = own_rule or valid_candidates
     selected = max(
-        valid_candidates,
+        selectable,
         key=lambda candidate: (
             objective_scores_by_candidate.get(candidate.candidate_id, float("-inf")),
             *_candidate_rank(candidate),

@@ -511,6 +511,18 @@ def _ambiguity_state(
     return output
 
 
+def _rule_provenance(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """What the backtest reported about the rule it traded, if it ran at all."""
+
+    backtest = state.get("backtest")
+    if not isinstance(backtest, Mapping) or not backtest:
+        return None
+    from ai_graph.nodes.backtest import rule_provenance
+
+    spec = state.get("strategy_spec") or {}
+    return rule_provenance(backtest, spec.get("entry_conditions"))
+
+
 def _strategy_query(state: Mapping[str, Any]) -> str:
     """The strategy every stage after the interpreter works on.
 
@@ -776,6 +788,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         proxy_disclosure=state.get("proxy_disclosure"),
         failure_cause=state.get("failure_cause"),
         evidence_refs=state.get("evidence_refs"),
+        rule_provenance=_rule_provenance(state),
     )
     _record_analysis_memory(state, status)
     return {"envelope": envelope.model_dump()}

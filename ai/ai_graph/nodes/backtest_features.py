@@ -14,6 +14,7 @@ from ai_graph.nodes.condition_compiler import (
     boolean_window_rule,
     canonical_metric,
     derived_ratio,
+    derived_series_spec,
     percent_scale,
 )
 from ai_graph.schemas import CandidateParameters, Condition, ConditionOperator, StrategyIR
@@ -716,6 +717,11 @@ class PreparedFeatureStore:
             series = self._derived_ratio_series(ratio)
             self._metric_cache[normalized] = series
             return series
+        spec = derived_series_spec(normalized)
+        if spec is not None:
+            series = self._derived_from_bars(spec)
+            self._metric_cache[normalized] = series
+            return series
         values: list[float] = []
         for row in self.rows:
             raw = row.get(metric)
@@ -754,6 +760,82 @@ class PreparedFeatureStore:
             )
         series.setflags(write=False)
         return series
+
+    def _daily_returns(self) -> np.ndarray:
+        cached = self._metric_cache.get("__daily_returns__")
+        if cached is not None:
+            return cached
+        out = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            closes = self.close[indices]
+            if len(closes) > 1:
+                prior, later = closes[:-1], closes[1:]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    out[indices[1:]] = np.where(prior != 0.0, later / prior - 1.0, np.nan)
+        out.setflags(write=False)
+        self._metric_cache["__daily_returns__"] = out
+        return out
+
+    def _derived_from_bars(self, spec: tuple[str, str, int]) -> np.ndarray:
+        """Realised volatility, relative strength, or a cross-sectional percentile.
+
+        All three are answerable from the OHLCV already loaded; they were untranslatable
+        only because the derivation had not been written, and that gap was silently
+        turning a user's strategy into a generic template.
+        """
+
+        kind, base, window = spec
+        out = np.full(len(self.rows), np.nan, dtype=np.float64)
+
+        if kind == "realized_volatility":
+            returns = self._daily_returns()
+            for indices in self.indices_by_ticker.values():
+                series = returns[indices]
+                for position in range(len(indices)):
+                    start = position - window + 1
+                    if start < 1:
+                        continue
+                    sample = series[start : position + 1]
+                    sample = sample[np.isfinite(sample)]
+                    if sample.size >= 2:
+                        # Annualised, matching how the thresholds are written
+                        # (realized_volatility_20d <= 0.25 means 25% a year).
+                        out[indices[position]] = float(sample.std(ddof=1) * sqrt(252))
+
+        elif kind == "relative_strength":
+            own = np.full(len(self.rows), np.nan, dtype=np.float64)
+            for indices in self.indices_by_ticker.values():
+                closes = self.close[indices]
+                if len(closes) > window:
+                    prior, later = closes[:-window], closes[window:]
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        own[indices[window:]] = np.where(
+                            prior > 0.0, later / prior - 1.0, np.nan
+                        )
+            # Excess over the same-date universe mean, so "상대강도" means the same
+            # thing here as it does in the screen.
+            for start, end in self.date_ranges:
+                window_slice = own[start:end]
+                finite = window_slice[np.isfinite(window_slice)]
+                if finite.size:
+                    out[start:end] = window_slice - float(finite.mean())
+
+        elif kind == "percentile":
+            values = self._metric_series(base)
+            for start, end in self.date_ranges:
+                day = values[start:end]
+                finite_mask = np.isfinite(day)
+                finite = day[finite_mask]
+                if finite.size < 2:
+                    continue
+                order = finite.argsort().argsort().astype(np.float64)
+                ranks = order / (finite.size - 1)
+                filled = np.full(day.shape, np.nan)
+                filled[finite_mask] = ranks
+                out[start:end] = filled
+
+        out.setflags(write=False)
+        return out
 
     def _rolling_metric(self, metric: str, window: int, aggregate: str) -> np.ndarray:
         normalized_aggregate = aggregate.strip().lower()

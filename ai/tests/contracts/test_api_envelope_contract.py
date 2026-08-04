@@ -31,6 +31,10 @@ API_ENVELOPE_FIELDS = {
     "proxy_disclosure",
     "failure_cause",
     "evidence_refs",
+    # Added deliberately: the backtest's own statement of which rule it traded. Without
+    # it a report where the user's conditions were silently replaced by a generic
+    # template is byte-identical to one where they were actually tested.
+    "rule_provenance",
 }
 USER_PAYLOAD_FIELDS = {
     "headline",

@@ -17,6 +17,7 @@ both read naturally.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -169,6 +170,40 @@ _BOOLEAN_EXPRESSIONS: dict[str, str] = {
 }
 
 
+# Metrics derived from the bars the store already holds, rather than demanded of the
+# warehouse. OHLCV is fully loaded, so a rule phrased in terms of realised volatility,
+# relative strength or a cross-sectional percentile is answerable - it was only
+# untranslatable because nobody had written the derivation. Blocking those conditions
+# meant recommending a different strategy than the user asked for.
+#
+#   realized_volatility_{N}d  stdev of daily returns over N bars, annualised (x sqrt(252))
+#   relative_strength_{N}d    own N-day return minus the same-date universe mean
+#   {metric}_percentile       cross-sectional rank of {metric} on that date, 0..1
+_REALIZED_VOL = re.compile(r"^realized_volatility_(\d+)d$")
+_RELATIVE_STRENGTH = re.compile(r"^relative_strength_(\d+)d$")
+_PERCENTILE = re.compile(r"^(?P<metric>.+)_percentile$")
+
+
+def derived_series_spec(name: str) -> tuple[str, str, int] | None:
+    """(kind, base metric, window) for a store-derived metric, or None.
+
+    kind is one of "realized_volatility", "relative_strength", "percentile".
+    """
+
+    normalized = str(name).strip().lower()
+    match = _REALIZED_VOL.match(normalized)
+    if match:
+        return ("realized_volatility", "close", int(match.group(1)))
+    match = _RELATIVE_STRENGTH.match(normalized)
+    if match:
+        return ("relative_strength", "close", int(match.group(1)))
+    match = _PERCENTILE.match(normalized)
+    if match:
+        base = canonical_metric(match.group("metric"))
+        return ("percentile", base, 0)
+    return None
+
+
 def canonical_metric(name: str) -> str:
     """The row key a condition's metric name refers to."""
 
@@ -236,6 +271,11 @@ def supported_metrics() -> list[str]:
 
     return sorted(
         {
+            "realized_volatility_20d",
+            "realized_volatility_60d",
+            "relative_strength_20d",
+            "relative_strength_60d",
+            "per_percentile",
             *_CURRENT,
             *_ALIASES,
             *_PERCENT_SCALED,
@@ -455,6 +495,12 @@ def _series_value(metric: str, window: int | None, aggregate: str | None) -> str
     derived = _DERIVED.get(metric)
     if derived is not None:
         return derived
+    if derived_series_spec(metric) is not None:
+        # Computed by the feature store from the bars it holds. The generated-code path
+        # binds it via _ind() and therefore sees NaN; that path is already unreachable
+        # (the AST validator rejects every candidate it emits) and must be revisited
+        # before it is relied on again.
+        return metric
     return _CURRENT.get(metric)
 
 
