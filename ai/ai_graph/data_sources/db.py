@@ -423,15 +423,10 @@ class PostgresPipelineDataSource:
         # before the baseline query.
         self._rollback_quietly(conn)
         sector = extract_sector_from_query(query, known_sectors)
-        params: list[Any] = [sector] if sector else []
-        # The window-function CTE is the expensive part, so it runs once and every
-        # relaxation round re-filters these rows in-process. It scans every ticker in
-        # feature.kis_adjusted_ohlcv_daily (no pre-filtered candidate view narrows it
-        # anymore - see SYMBOL_MASTER_TABLE comment above), so it needs the same wider
-        # budget as the backtest universe fetch rather than the tight default, which
-        # was sized for the old, much smaller pre-filtered scan.
+        # Fetched once and re-filtered in-process for every relaxation round, so a wider
+        # screen costs nothing at the database.
         self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
-        rows = conn.execute(_screening_sql(SCREENING_BASELINE_PROFILE, sector=sector), params).fetchall()
+        rows, frame_trace = self._load_screening_frame(conn, sector=sector, profile=profile)
         self._set_statement_timeout(conn)
 
         thresholds = ScreeningThresholds()
@@ -451,7 +446,9 @@ class PostgresPipelineDataSource:
                 candidates = [
                     _screening_candidate_from_row(row, profile, sector=sector) for row in matched
                 ]
-                return candidates, _relaxation_trace(profile, rounds, len(rows))
+                return candidates, _relaxation_trace(
+                    profile, rounds, len(rows), frame=frame_trace
+                )
             if round_index == MAX_SCREENING_RELAXATION_ROUNDS:
                 break
             thresholds = _propose_relaxed_thresholds(
@@ -461,7 +458,138 @@ class PostgresPipelineDataSource:
                 round_index=round_index,
                 universe_rows=len(rows),
             )
-        return [], _relaxation_trace(profile, rounds, len(rows))
+        return [], _relaxation_trace(profile, rounds, len(rows), frame=frame_trace)
+
+    def _load_screening_frame(
+        self, conn: Any, *, sector: str | None, profile: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """One screening date's rows: warehouse indicators plus the few path features.
+
+        Four small statements instead of one large one, because the anchor date has to
+        reach each of them as a bind parameter. Passed as a subquery - which is what the
+        single-statement version did - PostgreSQL cannot prune partitions, so a read of
+        the feature frame took locks on every partition of all five ta_* tables and
+        failed with "out of shared memory / max_locks_per_transaction". With the date as
+        a parameter the same read is ~0.4s.
+
+        Moving averages, Bollinger bands and RSI are no longer recomputed here. The
+        warehouse already stores them per ticker per date, and recomputing meant the
+        screen and the backtest each had their own definition of the same indicator.
+        """
+
+        as_of = self._resolve_screening_date(conn)
+        if as_of is None:
+            return [], {"as_of_date": None, "reason": "no recent rows in the price table"}
+
+        frame_rows = conn.execute(
+            _mart_frame_sql(sector=bool(sector)),
+            {"as_of": as_of, "sector": sector},
+        ).fetchall()
+
+        needs = (
+            _ALL_PATH_NEEDS
+            if profile == SCREENING_BASELINE_PROFILE
+            else _PROFILE_PATH_NEEDS.get(profile, _ALL_PATH_NEEDS)
+        )
+        # Relative strength is measured against the whole priced universe, so the path
+        # read is never sector-scoped even when the frame is.
+        needs = needs | {PATH_RETURNS}
+        path_sql, lookback_days = _path_features_sql(needs)
+        path_rows = conn.execute(path_sql, {"as_of": as_of}).fetchall()
+
+        prev_date = self._resolve_previous_trading_date(conn, as_of)
+        prev_rsi_by_ticker: dict[str, Any] = {}
+        if prev_date is not None:
+            prev_rsi_by_ticker = {
+                str(row["ticker"]).zfill(6): row.get("prev_rsi")
+                for row in conn.execute(_prev_rsi_sql(), {"prev": prev_date}).fetchall()
+            }
+
+        financials_by_symbol = {
+            str(row["symbol"]).zfill(6): row
+            for row in conn.execute(_financial_sql(), {"as_of": as_of}).fetchall()
+        }
+
+        strength, benchmark = _relative_strength(path_rows)
+        path_by_ticker = {str(row["ticker"]).zfill(6): row for row in path_rows}
+
+        rows: list[dict[str, Any]] = []
+        for frame_row in frame_rows:
+            ticker = str(frame_row.get("ticker") or "").zfill(6)
+            row = dict(frame_row)
+            row["ticker"] = ticker
+            path = path_by_ticker.get(ticker) or {}
+            row["high_252"] = path.get("high_252")
+            avg_volume_20 = _optional_float_value(path.get("avg_volume_20"))
+            volume = _optional_float_value(frame_row.get("volume"))
+            row["volume_ratio_20"] = (
+                volume / avg_volume_20
+                if volume is not None and avg_volume_20 and avg_volume_20 > 0
+                else None
+            )
+            excess = strength.get(ticker) or {}
+            row["relative_strength_20d"] = excess.get("20d")
+            row["relative_strength_60d"] = excess.get("60d")
+            row["prev_rsi"] = prev_rsi_by_ticker.get(ticker)
+            financial = financials_by_symbol.get(ticker)
+            if financial is not None:
+                row["financial_period_end"] = financial.get("financial_period_end")
+                for field in (
+                    "roe",
+                    "debt_to_equity",
+                    "operating_margin",
+                    "revenue_growth_yoy",
+                ):
+                    row[field] = financial.get(field)
+                eps = _optional_float_value(financial.get("eps"))
+                close = _optional_float_value(frame_row.get("close"))
+                row["per"] = close / eps if eps and eps > 0 and close is not None else None
+            rows.append(row)
+
+        trace = {
+            "as_of_date": as_of.isoformat(),
+            "previous_trading_date": prev_date.isoformat() if prev_date else None,
+            "indicator_source": KIS_FEATURE_FRAME_VIEW,
+            "indicators_read": list(INDICATOR_FIELDS),
+            "path_features_computed": sorted(needs),
+            "path_lookback_days": lookback_days,
+            "frame_rows": len(frame_rows),
+            "relative_strength_benchmark": benchmark,
+        }
+        return rows, trace
+
+    def _resolve_screening_date(self, conn: Any, ) -> date | None:
+        """The latest trading date, read from the price table rather than the mart view.
+
+        Bounded to 90 days for the reason spelled out throughout this module: an
+        unbounded max() over a 531-partition table exhausts max_locks_per_transaction.
+        Anchoring on the base table also keeps this cheap (~80ms) - the same max() over
+        the feature-frame view costs ~25s because the view's own predicates block
+        pruning.
+        """
+
+        row = conn.execute(
+            f"""
+            SELECT max(time) AS as_of_date
+            FROM {KIS_ADJUSTED_OHLCV_TABLE}
+            WHERE time >= CURRENT_DATE - INTERVAL '90 days'
+            """
+        ).fetchone()
+        value = row.get("as_of_date") if row else None
+        return _date_value(value) if value is not None else None
+
+    def _resolve_previous_trading_date(self, conn: Any, as_of: date) -> date | None:
+        row = conn.execute(
+            f"""
+            SELECT max(time) AS previous_date
+            FROM {KIS_ADJUSTED_OHLCV_TABLE}
+            WHERE time < %(as_of)s::date
+              AND time >= %(as_of)s::date - 10
+            """,
+            {"as_of": as_of},
+        ).fetchone()
+        value = row.get("previous_date") if row else None
+        return _date_value(value) if value is not None else None
 
     def _connect(self) -> Any:
         import psycopg
@@ -1074,7 +1202,11 @@ def _backtest_ticker_pool(
 
 
 def _relaxation_trace(
-    profile: str, rounds: list[dict[str, Any]], universe_rows: int
+    profile: str,
+    rounds: list[dict[str, Any]],
+    universe_rows: int,
+    *,
+    frame: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     final = rounds[-1] if rounds else {}
     return {
@@ -1084,6 +1216,10 @@ def _relaxation_trace(
         "relaxation_rounds": max(len(rounds) - 1, 0),
         "relaxed": bool(final.get("relaxed")) and bool(final.get("matched_count")),
         "matched_count": int(final.get("matched_count") or 0),
+        # Which date was screened, where the indicators came from, and what the
+        # relative-strength benchmark was measured against - all three used to be
+        # invisible in the report.
+        "frame": dict(frame or {}),
     }
 
 
@@ -1195,16 +1331,22 @@ def _dart_amount(field: str, *, prior: bool = False) -> str:
     return f"CASE WHEN {path} ~ '^-?[0-9]+$' THEN ({path})::numeric END"
 
 
-def _financial_cte() -> str:
-    """Latest DART filing per symbol, as ratios, joined into screening.
+def _financial_sql() -> str:
+    """Latest DART filing per symbol, as ratios, for one screening date.
 
     Filings are selected on available_from - the date the statement became public -
     rather than period_end, so a screen never sees numbers that were not yet filed.
     Revenue growth compares against the same report_code roughly a year earlier;
     raw.frmtrm_amount is present too rarely (4% of symbols) to rely on.
+
+    Takes the anchor date as a bind parameter rather than reading it from a CTE. The
+    date has to be a plan-time constant for PostgreSQL to prune partitions; supplied as
+    a subquery it cannot, and the screen then takes a lock on every partition of every
+    daily table it touches and dies with "out of shared memory".
     """
 
-    return f"""financial_raw AS (
+    return f"""
+        WITH financial_raw AS (
             SELECT
                 symbol,
                 period_end,
@@ -1219,8 +1361,8 @@ def _financial_cte() -> str:
             FROM {DART_FINANCIAL_TABLE}
             -- Only the newest filing per symbol is used, and a year-ago comparison for
             -- growth, so there is no reason to scan back to 2016.
-            WHERE available_from <= (SELECT as_of_date FROM latest_date)
-              AND available_from >= (SELECT as_of_date FROM latest_date) - INTERVAL '3 years'
+            WHERE available_from <= %(as_of)s::date
+              AND available_from >= %(as_of)s::date - INTERVAL '3 years'
         ),
         financial_latest AS (
             SELECT DISTINCT ON (symbol) *
@@ -1254,185 +1396,251 @@ def _financial_cte() -> str:
              AND prior_filing.report_code = current_filing.report_code
              AND prior_filing.period_end BETWEEN current_filing.period_end - INTERVAL '400 days'
                                              AND current_filing.period_end - INTERVAL '330 days'
-        )"""
-
-
-def _screening_sql(profile: str, *, sector: str | None = None) -> str:
-    where_clause = {
-        "breakout_volume": (
-            "close >= high_252 * 0.995 AND volume_ratio_20 >= 1.5 "
-            "AND close > sma20 AND relative_strength_20d >= 0"
-        ),
-        "rsi_rebound": f"(rsi <= {RSI_OVERSOLD_MAX} OR (prev_rsi < 30 AND rsi >= 30))",
-        "pullback_trend": (
-            "close > sma200 AND sma20 > 0 AND abs(close / sma20 - 1) <= 0.04"
-        ),
-        "bollinger_squeeze": (
-            "bb_width > 0 AND bb_width <= 0.18 AND close >= bb_upper * 0.995"
-        ),
-        "relative_strength": "relative_strength_20d >= 0 AND relative_strength_60d >= 0",
-    }.get(profile, "close > 0")
-    sector_predicate = "\n              AND sm.sector = %s" if sector else ""
-    # Universe membership comes from feature.kis_adjusted_ohlcv_daily itself (a ticker is
-    # in-scope if it has recent adjusted-price rows), not meta.view_common_stock_universe —
-    # see SYMBOL_MASTER_TABLE comment above for why that view is unusable right now.
-    # core.symbol_master is still joined (LEFT, so a missing row can't drop a ticker) purely
-    # for display fields (name/market/sector), never as a membership filter.
-    return f"""
-        WITH latest_date AS (
-            -- The window is what makes this affordable: the table has 531 date
-            -- partitions and an unbounded max() locks every one of them. With
-            -- max_locks_per_transaction at 64 the whole statement then dies with
-            -- "out of shared memory" before it reads a single row.
-            SELECT max(time) AS as_of_date
-            FROM feature.kis_adjusted_ohlcv_daily
-            WHERE time >= CURRENT_DATE - INTERVAL '90 days'
-        ),
-        prices AS (
-            SELECT
-                p.time,
-                p.ticker,
-                sm.name,
-                sm.market,
-                sm.market_segment,
-                sm.sector,
-                p.adj_open AS open,
-                p.adj_high AS high,
-                p.adj_low AS low,
-                p.adj_close AS close,
-                p.adj_volume AS volume
-            FROM feature.kis_adjusted_ohlcv_daily p
-            LEFT JOIN core.symbol_master sm
-              ON sm.symbol = p.ticker
-            WHERE p.time >= (SELECT as_of_date FROM latest_date) - INTERVAL '420 days'{sector_predicate}
-        ),
-        features AS (
-            SELECT
-                prices.*,
-                avg(close) OVER w20 AS sma20,
-                avg(close) OVER w50 AS sma50,
-                avg(close) OVER w200 AS sma200,
-                max(high) OVER w20 AS high_20,
-                max(high) OVER w120 AS high_120,
-                max(high) OVER w252 AS high_252,
-                avg(volume) OVER w20 AS avg_volume_20,
-                stddev_samp(close) OVER w20 AS std20,
-                lag(close, 20) OVER wt AS close_20d_ago,
-                lag(close, 60) OVER wt AS close_60d_ago,
-                lag(close, 120) OVER wt AS close_120d_ago
-            FROM prices
-            WINDOW
-                wt AS (PARTITION BY ticker ORDER BY time),
-                w20 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW),
-                w50 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 49 PRECEDING AND CURRENT ROW),
-                w120 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 119 PRECEDING AND CURRENT ROW),
-                w200 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 199 PRECEDING AND CURRENT ROW),
-                w252 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)
-        ),
-        {_financial_cte()},
-        momentum_raw AS (
-            -- ta_momentum_ticker_daily keys tickers as '000020#S05' (6-digit code plus a
-            -- security-type suffix) while kis_adjusted_ohlcv_daily keys them as '000020',
-            -- so joining the raw columns matches nothing and every rsi comes back NULL.
-            -- Strip the suffix here; DISTINCT ON keeps one row per (ticker, time) when
-            -- several security types collapse onto the same 6-digit code.
-            SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
-                time,
-                split_part(ticker, '#', 1) AS ticker,
-                COALESCE(
-                    values_jsonb->>'RSI_14',
-                    values_jsonb->>'rsi_14',
-                    values_jsonb->>'RSI',
-                    values_jsonb->>'rsi'
-                ) AS rsi_text
-            FROM feature.ta_momentum_ticker_daily
-            WHERE time >= (SELECT as_of_date FROM latest_date) - INTERVAL '90 days'
-            ORDER BY split_part(ticker, '#', 1), time, ticker
-        ),
-        momentum AS (
-            SELECT
-                time,
-                ticker,
-                CASE
-                    WHEN rsi_text ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN rsi_text::numeric
-                    ELSE NULL
-                END AS rsi
-            FROM momentum_raw
-        ),
-        momentum_with_prev AS (
-            SELECT
-                time,
-                ticker,
-                rsi,
-                lag(rsi) OVER (PARTITION BY ticker ORDER BY time) AS prev_rsi
-            FROM momentum
-        ),
-        -- as_of_date comes from kis_adjusted_ohlcv_daily, but RSI lives in
-        -- ta_momentum_ticker_daily, which a different DE task populates. Requiring
-        -- momentum on exactly that date meant one late TA run made every rsi NULL, and
-        -- an all-NULL rsi is the one screen no relaxation round can rescue: the
-        -- rsi_rebound predicate rejects a NULL row whatever rsi_max is widened to, so
-        -- all four rounds match nothing and the analysis dies with "no screening
-        -- candidates". Take each ticker's most recent momentum row at or before the
-        -- price date instead, bounded so a genuinely stale feed still screens as
-        -- missing rather than silently trading a month-old RSI.
-        momentum_as_of AS (
-            SELECT DISTINCT ON (ticker)
-                ticker,
-                time AS momentum_time,
-                rsi,
-                prev_rsi
-            FROM momentum_with_prev
-            WHERE time <= (SELECT as_of_date FROM latest_date)
-              AND time >= (SELECT as_of_date FROM latest_date) - INTERVAL '7 days'
-            ORDER BY ticker, time DESC
-        ),
-        latest_rows AS (
-            SELECT
-                f.*,
-                mwp.rsi,
-                mwp.prev_rsi,
-                CASE WHEN avg_volume_20 > 0 THEN volume / avg_volume_20 ELSE NULL END AS volume_ratio_20,
-                CASE WHEN close_20d_ago > 0 THEN close / close_20d_ago - 1 ELSE NULL END AS return_20d,
-                CASE WHEN close_60d_ago > 0 THEN close / close_60d_ago - 1 ELSE NULL END AS return_60d,
-                CASE WHEN close_120d_ago > 0 THEN close / close_120d_ago - 1 ELSE NULL END AS return_120d,
-                (sma20 + 2 * COALESCE(std20, 0)) AS bb_upper,
-                CASE WHEN sma20 > 0 THEN (4 * COALESCE(std20, 0)) / sma20 ELSE NULL END AS bb_width,
-                close * volume AS turnover,
-                fin.roe,
-                fin.debt_to_equity,
-                fin.operating_margin,
-                fin.revenue_growth_yoy,
-                -- PER needs no share count: DART reports basic EPS directly.
-                CASE WHEN fin.eps > 0 THEN close / fin.eps END AS per,
-                fin.financial_period_end
-            FROM features f
-            LEFT JOIN momentum_as_of mwp
-              ON mwp.ticker = f.ticker
-            -- LEFT so a ticker without filings still screens on price alone; the
-            -- fundamental predicates simply will not match it.
-            LEFT JOIN financials fin ON fin.symbol = f.ticker
-            WHERE f.time = (SELECT as_of_date FROM latest_date)
-        ),
-        market AS (
-            SELECT
-                avg(return_20d) AS market_return_20d,
-                avg(return_60d) AS market_return_60d
-            FROM latest_rows
-        ),
-        matched AS (
-            SELECT
-                latest_rows.*,
-                COALESCE(return_20d, 0) - COALESCE(market.market_return_20d, 0) AS relative_strength_20d,
-                COALESCE(return_60d, 0) - COALESCE(market.market_return_60d, 0) AS relative_strength_60d
-            FROM latest_rows
-            CROSS JOIN market
         )
-        SELECT *
-        FROM matched
-        WHERE {where_clause}
-        ORDER BY ticker
+        SELECT symbol, financial_period_end, roe, debt_to_equity, operating_margin,
+               revenue_growth_yoy, eps
+        FROM financials"""
+
+
+# What each profile's predicate reads from the price path. Everything else it needs -
+# moving averages, Bollinger bands, RSI - the warehouse has already computed, so the
+# only reason to walk price history at all is the handful of things it has not.
+#
+# Scoping matters: a 252-row rolling max over 420 days of the whole universe is by far
+# the most expensive thing the screen does (~3.0s), while the 20/60-day lags need only
+# ~130 days (~0.5s). A relative-strength screen paying the 52-week-high cost it never
+# reads was most of the query's runtime.
+PATH_HIGH_252 = "high_252"
+PATH_VOLUME_RATIO = "volume_ratio_20"
+PATH_RETURNS = "returns"
+
+_PROFILE_PATH_NEEDS: dict[str, frozenset[str]] = {
+    "breakout_volume": frozenset({PATH_HIGH_252, PATH_VOLUME_RATIO, PATH_RETURNS}),
+    "rsi_rebound": frozenset(),
+    "pullback_trend": frozenset(),
+    "bollinger_squeeze": frozenset(),
+    "relative_strength": frozenset({PATH_RETURNS}),
+    "value_quality": frozenset({PATH_RETURNS}),
+    "quality_growth": frozenset(),
+    "growth_momentum": frozenset(),
+}
+# The baseline screen is re-filtered in-process for every relaxation round and for
+# whichever profile is active, and _matched_screening_rules explains a candidate using
+# all of them, so the baseline reads the full set.
+_ALL_PATH_NEEDS = frozenset({PATH_HIGH_252, PATH_VOLUME_RATIO, PATH_RETURNS})
+
+# Calendar days of price history each path feature needs, with slack for holidays.
+_PATH_LOOKBACK_DAYS: dict[str, int] = {
+    PATH_HIGH_252: 420,
+    PATH_RETURNS: 130,
+    PATH_VOLUME_RATIO: 40,
+}
+
+# Indicator keys inside the mart feature frame's JSONB columns, mapped to the names the
+# screening predicates and candidate cards use. The warehouse computes these with
+# pandas-ta on the adjusted series; reading them here is what makes the screen and the
+# backtest share one definition instead of each deriving its own.
+_TREND_KEYS: dict[str, str] = {
+    "sma20": "SMA_20",
+    "sma50": "SMA_50",
+    "sma200": "SMA_200",
+    "ema20": "EMA_20",
+    "ema50": "EMA_50",
+    "ema200": "EMA_200",
+    "macd": "MACD_12_26_9",
+    "macd_signal": "MACDs_12_26_9",
+    "macd_hist": "MACDh_12_26_9",
+    "adx": "ADX_14",
+}
+_VOLATILITY_KEYS: dict[str, str] = {
+    "bb_upper": "BBU_20_2.0",
+    "bb_lower": "BBL_20_2.0",
+    "bb_middle": "BBM_20_2.0",
+    "bb_pct": "BBP_20_2.0",
+    "atr": "ATRr_14",
+    "natr": "NATR_14",
+}
+_MOMENTUM_KEYS: dict[str, str] = {
+    "rsi": "RSI_14",
+    "mfi": "MFI_14",
+    "cci": "CCI_20_0.015",
+    "willr": "WILLR_14",
+    "roc": "ROC_10",
+    "stoch_k": "STOCHk_14_3_3",
+    "stoch_d": "STOCHd_14_3_3",
+}
+_VOLUME_KEYS: dict[str, str] = {
+    "obv": "OBV",
+    "cmf": "CMF_20",
+    "ad": "AD",
+    "adosc": "ADOSC_3_10",
+}
+# Bollinger bandwidth: pandas-ta reports BBB as a percentage of the middle band,
+# (upper - lower) / middle * 100. The screen's thresholds are fractions, so it is
+# divided here rather than every predicate being rewritten around a percentage.
+_BB_BANDWIDTH_KEY = "BBB_20_2.0"
+_BB_BANDWIDTH_SCALE = 100.0
+
+INDICATOR_FIELDS: tuple[str, ...] = (
+    *_TREND_KEYS,
+    *_VOLATILITY_KEYS,
+    *_MOMENTUM_KEYS,
+    *_VOLUME_KEYS,
+    "bb_width",
+)
+
+
+def _jsonb_projection(column: str, keys: Mapping[str, str]) -> str:
+    return ",\n            ".join(
+        f"({column}->>'{source}')::numeric AS {alias}" for alias, source in keys.items()
+    )
+
+
+def _mart_frame_sql(*, sector: bool) -> str:
+    """Every indicator the warehouse already has, for one trading date.
+
+    DISTINCT ON collapses the security-type variants that share a 6-digit code; the
+    feature frame keys rows as '000020#S05' in `ticker` and the bare code in
+    `base_ticker`, and on some dates both variants are present.
     """
+
+    sector_predicate = "\n          AND sector = %(sector)s" if sector else ""
+    return f"""
+        SELECT DISTINCT ON (base_ticker)
+            base_ticker AS ticker,
+            name,
+            market_segment,
+            market_segment AS market,
+            sector,
+            as_of_date AS time,
+            open, high, low, close, volume,
+            {_jsonb_projection("trend_values", _TREND_KEYS)},
+            {_jsonb_projection("volatility_values", _VOLATILITY_KEYS)},
+            {_jsonb_projection("momentum_values", _MOMENTUM_KEYS)},
+            {_jsonb_projection("volume_values", _VOLUME_KEYS)},
+            (volatility_values->>'{_BB_BANDWIDTH_KEY}')::numeric
+                / {_BB_BANDWIDTH_SCALE} AS bb_width
+        FROM {KIS_FEATURE_FRAME_VIEW}
+        WHERE as_of_date = %(as_of)s::date{sector_predicate}
+        ORDER BY base_ticker, ticker
+    """
+
+
+def _prev_rsi_sql() -> str:
+    return f"""
+        SELECT DISTINCT ON (base_ticker)
+            base_ticker AS ticker,
+            (momentum_values->>'{_MOMENTUM_KEYS["rsi"]}')::numeric AS prev_rsi
+        FROM {KIS_FEATURE_FRAME_VIEW}
+        WHERE as_of_date = %(prev)s::date
+        ORDER BY base_ticker, ticker
+    """
+
+
+def _path_features_sql(needs: frozenset[str]) -> tuple[str, int]:
+    """Only the price-path features the warehouse does not precompute.
+
+    Returns the statement and the calendar-day window it needs, so a screen that never
+    reads a 52-week high does not pay to compute one.
+    """
+
+    lookback = max(
+        (_PATH_LOOKBACK_DAYS[need] for need in needs if need in _PATH_LOOKBACK_DAYS),
+        default=40,
+    )
+    # The close comes from here, not from the (possibly sector-scoped) feature frame,
+    # so the relative-strength benchmark can be the whole priced universe.
+    selected = ["ticker", "time", "adj_close AS close"]
+    windows = ["wt AS (PARTITION BY ticker ORDER BY time)"]
+    if PATH_HIGH_252 in needs:
+        selected.append("max(adj_high) OVER w252 AS high_252")
+        windows.append(
+            "w252 AS (PARTITION BY ticker ORDER BY time "
+            "ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)"
+        )
+    if PATH_VOLUME_RATIO in needs:
+        selected.append("avg(adj_volume) OVER w20 AS avg_volume_20")
+        windows.append(
+            "w20 AS (PARTITION BY ticker ORDER BY time "
+            "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)"
+        )
+    if PATH_RETURNS in needs:
+        selected.append("lag(adj_close, 20) OVER wt AS close_20d_ago")
+        selected.append("lag(adj_close, 60) OVER wt AS close_60d_ago")
+    projection = ",\n                ".join(selected)
+    return (
+        f"""
+        WITH path AS (
+            SELECT
+                {projection}
+            FROM {KIS_ADJUSTED_OHLCV_TABLE}
+            WHERE time > %(as_of)s::date - {lookback}
+              AND time <= %(as_of)s::date
+            WINDOW {", ".join(windows)}
+        )
+        SELECT * FROM path WHERE time = %(as_of)s::date
+        """,
+        lookback,
+    )
+
+
+def _relative_strength(
+    path_rows: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, dict[str, float | None]], dict[str, Any]]:
+    """Each stock's excess return over the market, and what "the market" was.
+
+    The benchmark is the mean return of the whole priced universe, computed before any
+    sector filter is applied. It used to be the mean of whatever set the screen had
+    already narrowed to, so asking for "반도체 섹터 주도주 중 상대강도 강한 종목"
+    measured each chip stock against the chip sector's own average - a sector that fell
+    20% while the market rose still produced "leaders", because half of any set is
+    above its own mean by construction. Relative strength now means the same thing
+    whatever the query filtered on, and the population is reported alongside it.
+
+    Both the close and its lagged values come from `path_rows`, which is never
+    sector-scoped. Taking the close from the feature frame instead silently put the
+    filter back: tickers outside the sector had no close to pair with their return and
+    dropped out of the mean.
+    """
+
+    returns: dict[str, dict[str, float | None]] = {}
+    for row in path_rows:
+        ticker = str(row.get("ticker") or "").zfill(6)
+        close = _optional_float_value(row.get("close"))
+        if close is None:
+            continue
+        entry: dict[str, float | None] = {}
+        for horizon, column in (("20d", "close_20d_ago"), ("60d", "close_60d_ago")):
+            prior = _optional_float_value(row.get(column))
+            entry[horizon] = close / prior - 1.0 if prior and prior > 0 else None
+        returns[ticker] = entry
+
+    benchmark: dict[str, Any] = {
+        "population": "priced_universe_before_sector_filter",
+        "constituents": len(returns),
+    }
+    market: dict[str, float | None] = {}
+    for horizon in ("20d", "60d"):
+        values = [
+            entry[horizon] for entry in returns.values() if entry.get(horizon) is not None
+        ]
+        market[horizon] = sum(values) / len(values) if values else None
+        benchmark[f"market_return_{horizon}"] = market[horizon]
+        benchmark[f"observations_{horizon}"] = len(values)
+
+    strength: dict[str, dict[str, float | None]] = {}
+    for ticker, entry in returns.items():
+        strength[ticker] = {}
+        for horizon in ("20d", "60d"):
+            own, mkt = entry.get(horizon), market.get(horizon)
+            # A stock without enough history has no excess return. It used to be
+            # COALESCE(return, 0) - market, which handed every newly listed name the
+            # negative of the market as its "relative strength" and let it screen in
+            # whenever the market fell.
+            strength[ticker][horizon] = (
+                own - mkt if own is not None and mkt is not None else None
+            )
+    return strength, benchmark
 
 
 def _screening_candidate_from_row(
