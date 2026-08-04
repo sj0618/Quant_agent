@@ -30,7 +30,11 @@ from ai_graph.schemas import (
     StrategySpec,
     StructuredProfile,
 )
-from ai_graph.nodes.condition_compiler import CompiledConditions, compile_conditions
+from ai_graph.nodes.condition_compiler import (
+    CompiledConditions,
+    compile_conditions,
+    indicator_row_keys,
+)
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
@@ -717,6 +721,11 @@ def _render_condition_signal_code(
     entry_expr = compiled.per_stock
     # (metric, pct, top) triples, evaluated against the day's universe below.
     rank_filters = list(compiled.rank_filters)
+    # Generated from the compiler's own vocabulary so an expression can never name a
+    # variable the template forgot to bind.
+    indicator_bindings = "\n            ".join(
+        f'{key} = _ind(row, "{key}")' for key in indicator_row_keys()
+    )
     return f'''def build_signals(prices):
     def _avg(xs):
         return sum(xs) / len(xs) if xs else 0.0
@@ -727,6 +736,15 @@ def _render_condition_signal_code(
         return value if isinstance(value, (int, float)) else float("-inf")
     def _num(value):
         return value if isinstance(value, (int, float)) else None
+    def _ind(row, key):
+        # Warehouse indicators forward-filled onto the bar. A missing one becomes NaN,
+        # which fails every comparison, so the condition simply does not match. It must
+        # not become a plausible-looking default: `rsi` used to fall back to 50, and a
+        # stock with no RSI at all then read as perfectly neutral momentum.
+        value = row.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return float("nan")
+        return float(value)
     rank_filters = {rank_filters!r}
     signals = []
     rows_by_date = {{}}
@@ -748,7 +766,7 @@ def _render_condition_signal_code(
             low_price = float(row.get("low", row.get("close", 0)))
             close = float(row["close"])
             volume = float(row.get("volume", 0))
-            rsi = float(row.get("rsi", row.get("RSI_14", 50)))
+            {indicator_bindings}
             # The forward-filled financials live on the row itself; _fin() reads them.
             fin = row
             hist = histories.setdefault(

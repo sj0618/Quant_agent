@@ -9,6 +9,13 @@ from typing import Any
 
 import numpy as np
 
+from ai_graph.nodes.condition_compiler import (
+    boolean_comparison,
+    boolean_window_rule,
+    canonical_metric,
+    derived_ratio,
+    percent_scale,
+)
 from ai_graph.schemas import CandidateParameters, Condition, ConditionOperator, StrategyIR
 
 
@@ -65,11 +72,12 @@ class PreparedFeatureStore:
             [float(row.get("volume", 0.0) or 0.0) for row in self.rows],
             dtype=np.float64,
         )
+        # A missing RSI is missing, not neutral. It used to default to 50.0, so a bar
+        # the warehouse had no RSI for read as perfectly average momentum and could
+        # satisfy a band condition on the strength of a number nobody measured. NaN
+        # fails every comparison instead, so the condition simply does not match.
         self.rsi = np.asarray(
-            [
-                float(row.get("rsi", row.get("RSI_14", 50.0)) or 50.0)
-                for row in self.rows
-            ],
+            [_optional_metric(row, "rsi", "RSI_14") for row in self.rows],
             dtype=np.float64,
         )
         self.close.setflags(write=False)
@@ -567,6 +575,15 @@ class PreparedFeatureStore:
         return self._base_condition_matches(condition, index)
 
     def _base_condition_matches(self, condition: Condition, index: int) -> bool:
+        # Flags and ratios are conditions in disguise. The compiler rewrites them when
+        # it emits Python; this evaluator - the one that actually runs - has to make the
+        # same rewrite, or a rule that "compiled" would silently match nothing here.
+        flag = boolean_comparison(condition.left)
+        if flag is not None:
+            return self._boolean_comparison_matches(condition, flag, index)
+        window_rule = boolean_window_rule(condition.left)
+        if window_rule is not None:
+            return self._boolean_window_matches(condition, window_rule, index)
         if isinstance(condition.right, str):
             left = self._current_metric(condition.left, index)
             right = self._condition_series_value(
@@ -582,7 +599,11 @@ class PreparedFeatureStore:
                 condition.aggregate,
                 index,
             )
-            right = float(condition.right) if isinstance(condition.right, (int, float)) else None
+            right = (
+                float(condition.right) * percent_scale(condition.left)
+                if isinstance(condition.right, (int, float))
+                else None
+            )
         if left is None:
             return False
         operator = condition.operator
@@ -633,6 +654,35 @@ class PreparedFeatureStore:
             return left != right
         return False
 
+    def _boolean_comparison_matches(
+        self, condition: Condition, rule: tuple[str, str, str], index: int
+    ) -> bool:
+        left_metric, operator, right_metric = rule
+        asserted = _flag_is_asserted(condition)
+        if asserted is None:
+            return False
+        left = self._current_metric(left_metric, index)
+        right = self._current_metric(right_metric, index)
+        if left is None or right is None:
+            return False
+        holds = left > right if operator == ">" else left < right
+        return holds if asserted else not holds
+
+    def _boolean_window_matches(
+        self, condition: Condition, rule: tuple[str, str, str, int, float], index: int
+    ) -> bool:
+        metric, aggregate, comparison, window, factor = rule
+        asserted = _flag_is_asserted(condition)
+        if asserted is None:
+            return False
+        close = self._current_metric("close", index)
+        extreme = self._condition_series_value(metric, window, aggregate, index)
+        if close is None or extreme is None:
+            return False
+        threshold = extreme * factor
+        holds = close >= threshold if comparison == ">=" else close <= threshold
+        return holds if asserted else not holds
+
     def _condition_series_value(
         self,
         metric: str,
@@ -651,7 +701,7 @@ class PreparedFeatureStore:
         return value if isfinite(value) else None
 
     def _metric_series(self, metric: str) -> np.ndarray:
-        normalized = metric.strip().lower()
+        normalized = canonical_metric(metric)
         cached = self._metric_cache.get(normalized)
         if cached is not None:
             return cached
@@ -659,8 +709,13 @@ class PreparedFeatureStore:
             return self.close
         if normalized == "volume":
             return self.volume
-        if normalized in {"rsi", "rsi_14"}:
+        if normalized == "rsi":
             return self.rsi
+        ratio = derived_ratio(metric)
+        if ratio is not None:
+            series = self._derived_ratio_series(ratio)
+            self._metric_cache[normalized] = series
+            return series
         values: list[float] = []
         for row in self.rows:
             raw = row.get(metric)
@@ -675,6 +730,30 @@ class PreparedFeatureStore:
         source.setflags(write=False)
         self._metric_cache[normalized] = source
         return source
+
+    def _derived_ratio_series(self, ratio: tuple[str, str, int]) -> np.ndarray:
+        """A ratio metric like volume_ratio_20, evaluated the compiler's way.
+
+        window > 0 divides by the denominator's trailing average; window 0 divides by
+        the denominator's current bar.
+        """
+
+        numerator_name, denominator_name, window = ratio
+        numerator = self._metric_series(numerator_name)
+        denominator = (
+            self._rolling_metric(denominator_name, window, "avg")
+            if window
+            else self._metric_series(denominator_name)
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            series = np.divide(
+                numerator,
+                denominator,
+                out=np.full(len(self.rows), np.nan, dtype=np.float64),
+                where=np.isfinite(denominator) & (denominator != 0.0),
+            )
+        series.setflags(write=False)
+        return series
 
     def _rolling_metric(self, metric: str, window: int, aggregate: str) -> np.ndarray:
         normalized_aggregate = aggregate.strip().lower()
@@ -729,6 +808,40 @@ class PreparedFeatureStore:
         output.setflags(write=False)
         self._rolling_cache[key] = output
         return output
+
+
+def _optional_metric(row: Mapping[str, Any], *keys: str) -> float:
+    """The first numeric value among `keys`, or NaN when the bar carries none."""
+
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        parsed = float(value)
+        if isfinite(parsed):
+            return parsed
+    return float("nan")
+
+
+def _flag_is_asserted(condition: Condition) -> bool | None:
+    """Whether a flag-style condition asserts its rule or negates it."""
+
+    if not isinstance(condition.right, (int, float)) or isinstance(condition.right, bool):
+        return None
+    truthy = float(condition.right) != 0.0
+    if condition.operator in {
+        ConditionOperator.EQ,
+        ConditionOperator.GTE,
+        ConditionOperator.GT,
+    }:
+        return truthy
+    if condition.operator in {
+        ConditionOperator.NE,
+        ConditionOperator.LT,
+        ConditionOperator.LTE,
+    }:
+        return not truthy
+    return None
 
 
 def _prefix_average(prefix: np.ndarray, start: int, end: int) -> float:

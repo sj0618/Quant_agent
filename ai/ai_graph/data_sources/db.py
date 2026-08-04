@@ -710,15 +710,23 @@ class PostgresPipelineDataSource:
             """,
             [ticker_list, calendar_lookback_days, lookback_days],
         ).fetchall()
-        momentum_by_ticker = self._fetch_momentum_values_by_date(
-            conn, ticker_list, calendar_lookback_days, lookback_days
-        )
+        indicators_by_family = {
+            family: self._fetch_indicator_values_by_date(
+                conn, table, ticker_list, calendar_lookback_days
+            )
+            for family, table in INDICATOR_TABLES.items()
+        }
         financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
         price_rows = [
             _price_row_from_feature_frame_record(
                 _feature_frame_row_from_sources(
                     row,
-                    momentum_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
+                    {
+                        family: by_ticker.get(
+                            str(row.get("ticker") or "").zfill(6), {}
+                        )
+                        for family, by_ticker in indicators_by_family.items()
+                    },
                     symbol_info_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
                 )
             )
@@ -810,18 +818,26 @@ class PostgresPipelineDataSource:
                     previous[metric] = value
         return timelines
 
-    def _fetch_momentum_values_by_date(
-        self, conn: Any, tickers: Sequence[str], calendar_lookback_days: int, lookback_days: int
+    def _fetch_indicator_values_by_date(
+        self, conn: Any, table: str, tickers: Sequence[str], calendar_lookback_days: int
     ) -> dict[str, dict[date, Mapping[str, Any]]]:
+        """One ta_* table's values per ticker per date.
+
+        Same shape for every family, so trend/volatility/volume reach the backtest the
+        way momentum always has. They did not before: the frame builder hardcoded them
+        to `{}`, which is why a compiled condition could only ever reference OHLCV and
+        RSI - and why the backtest and the screen disagreed about every other indicator.
+        """
+
         rows = conn.execute(
-            """
+            f"""
             SELECT base_ticker, time, values_jsonb
             FROM (
                 SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
                     split_part(ticker, '#', 1) AS base_ticker,
                     time,
                     values_jsonb
-                FROM feature.ta_momentum_ticker_daily
+                FROM {table}
                 WHERE split_part(ticker, '#', 1) = ANY(%s)
                   AND time >= CURRENT_DATE - make_interval(days => %s)
                 ORDER BY split_part(ticker, '#', 1), time, ticker
@@ -1481,6 +1497,27 @@ _VOLUME_KEYS: dict[str, str] = {
 _BB_BANDWIDTH_KEY = "BBB_20_2.0"
 _BB_BANDWIDTH_SCALE = 100.0
 
+# The per-ticker indicator tables behind the mart feature frame, read directly for the
+# backtest window (the frame view is anchored to a single date).
+INDICATOR_TABLES: dict[str, str] = {
+    "trend": TA_TREND_TICKER_TABLE,
+    "momentum": TA_MOMENTUM_TICKER_TABLE,
+    "volatility": TA_VOLATILITY_TICKER_TABLE,
+    "volume": TA_VOLUME_TICKER_TABLE,
+}
+
+# Warehouse indicator key -> the name a condition uses, applied to every backtest bar
+# so `sma20` on a bar means exactly what `sma20` meant in the screen.
+BACKTEST_INDICATOR_ALIASES: dict[str, str] = {
+    source: alias
+    for alias, source in {
+        **_TREND_KEYS,
+        **_VOLATILITY_KEYS,
+        **_MOMENTUM_KEYS,
+        **_VOLUME_KEYS,
+    }.items()
+}
+
 INDICATOR_FIELDS: tuple[str, ...] = (
     *_TREND_KEYS,
     *_VOLATILITY_KEYS,
@@ -1961,20 +1998,27 @@ def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, An
 
 def _feature_frame_row_from_sources(
     row: Mapping[str, Any],
-    momentum_by_date: Mapping[date, Mapping[str, Any]],
+    indicators_by_family: Mapping[str, Mapping[date, Mapping[str, Any]]],
     symbol_info: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """One backtest bar: prices plus every indicator family for that date.
+
+    All four non-momentum families used to be hardcoded to `{}` here, so the backtest
+    saw OHLCV and RSI and nothing else - while the screen that picked the stock had
+    moving averages, bands and the rest. Filling them is what lets a compiled condition
+    mean the same thing on both sides.
+    """
+
     trade_date = _date_value(row["as_of_date"])
     return {
         **dict(row),
         "as_of_date": trade_date,
         "name": symbol_info.get("name") or "",
         "market_segment": symbol_info.get("market_segment") or "KRX",
-        "trend_values": {},
-        "momentum_values": momentum_by_date.get(trade_date, {}),
-        "volatility_values": {},
-        "volume_values": {},
-        "pattern_values": {},
+        **{
+            f"{family}_values": indicators_by_family.get(family, {}).get(trade_date, {})
+            for family in INDICATOR_TABLES
+        },
     }
 
 
@@ -2003,6 +2047,15 @@ def _l4_evidence_from_report(row: Mapping[str, Any], trace_id: str) -> dict[str,
 
 
 def _merge_metric_values(target: dict[str, Any], row: Mapping[str, Any]) -> None:
+    """Flatten the indicator JSONB onto the bar, under the condition vocabulary's names.
+
+    Both spellings are kept: the warehouse key (`SMA_20`) so nothing that already reads
+    it breaks, and the canonical alias (`sma20`) that compiled conditions and the screen
+    both use. Bollinger bandwidth is rescaled from pandas-ta's percentage to the
+    fraction the thresholds are written in - the same conversion the screen applies, so
+    `bb_width` cannot mean 16.35 on one side and 0.1635 on the other.
+    """
+
     for field_name in (
         "trend_values",
         "momentum_values",
@@ -2017,7 +2070,13 @@ def _merge_metric_values(target: dict[str, Any], row: Mapping[str, Any]) -> None
             parsed = _optional_float_value(value)
             if parsed is None:
                 continue
-            target.setdefault(_metric_key(str(key)), parsed)
+            source_key = str(key)
+            target.setdefault(_metric_key(source_key), parsed)
+            alias = BACKTEST_INDICATOR_ALIASES.get(source_key)
+            if alias is not None:
+                target.setdefault(alias, parsed)
+            if source_key == _BB_BANDWIDTH_KEY:
+                target.setdefault("bb_width", parsed / _BB_BANDWIDTH_SCALE)
 
 
 def _find_metric_value(

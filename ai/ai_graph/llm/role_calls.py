@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.llm import LLMClientError, LLMJsonRequest, create_llm_client, is_live_llm_provider
+from ai_graph.nodes.condition_compiler import supported_metrics
 from ai_graph.progress import activity_role, report_activity
 from ai_graph.schemas import (
     Condition,
@@ -309,27 +310,49 @@ def generate_strategy_description(
     )
 
 
-STRATEGY_CONDITIONS_SYSTEM_PROMPT = (
-    "You are a QuantAgent strategy analyst. Convert the user's Korean natural-language "
-    "trading strategy into structured JSON that matches EXPECTED_JSON_SCHEMA exactly: "
-    '"entry_conditions" and "exit_conditions" (each a non-empty array of objects with '
-    "left, operator, right, description — operator one of lt/lte/gt/gte/eq/ne/between/"
-    'cross_above/cross_below), "indicators" (array of indicator names referenced), and '
-    '"confidence" (0-1). Use the web search tool to confirm current market-standard '
-    "definitions and thresholds for any named indicator or strategy pattern when the query "
-    "alone is insufficient. Return JSON only, no prose.\n\n"
-    "Condition value format (required, no exceptions):\n"
-    "- lt/lte/gt/gte/eq/ne: `right` MUST be a number (int or float). Never a ticker, "
-    "company name, or any other non-numeric string.\n"
-    "- between: `right` MUST be a 2-item [low, high] number array.\n"
-    "- cross_above/cross_below: `right` MUST be a string naming the other metric/line "
-    "being crossed (e.g. \"sma_20\"), not a company or ticker.\n"
-    "Entry/exit conditions describe technical trading logic only (price, indicators, "
-    "volume, moving averages, etc.) — never instrument selection. If the user names a "
-    "specific stock or ticker (e.g. 삼성전자, 005930), do not emit a condition for it; "
-    "stock/universe selection is resolved separately by the data layer, outside this call. "
-    "Only describe the trading logic that applies once a stock is already selected."
-)
+def _strategy_conditions_prompt() -> str:
+    """Built at import from the compiler's own vocabulary.
+
+    The prompt used to constrain the shape of a condition but not its `left`, and
+    offered "sma_20" as an example of a metric name - which the compiler did not
+    recognise. Conditions therefore came back well-formed and untranslatable: six of
+    the seven built-in strategy profiles compiled to nothing, and the backtest quietly
+    validated a generic template instead of the user's rule while the UI reported
+    "매수 조건 N개 생성 완료". Listing the vocabulary here, from the module that
+    consumes it, is what stops the two drifting again.
+    """
+
+    vocabulary = ", ".join(supported_metrics())
+    return (
+        "You are a QuantAgent strategy analyst. Convert the user's Korean natural-language "
+        "trading strategy into structured JSON that matches EXPECTED_JSON_SCHEMA exactly: "
+        '"entry_conditions" and "exit_conditions" (each a non-empty array of objects with '
+        "left, operator, right, description — operator one of lt/lte/gt/gte/eq/ne/between/"
+        'cross_above/cross_below), "indicators" (array of indicator names referenced), and '
+        '"confidence" (0-1). Use the web search tool to confirm current market-standard '
+        "definitions and thresholds for any named indicator or strategy pattern when the query "
+        "alone is insufficient. Return JSON only, no prose.\n\n"
+        "Metric names (required):\n"
+        f"- `left`, and `right` when it names a metric, MUST come from this list: {vocabulary}\n"
+        "- A metric outside the list cannot be backtested. If the strategy genuinely needs "
+        "one, express the closest rule you can with the listed metrics and say what you "
+        "substituted in that condition's `description`. Do not invent a metric name.\n\n"
+        "Condition value format (required, no exceptions):\n"
+        "- lt/lte/gt/gte/eq/ne: `right` MUST be a number (int or float). Never a ticker, "
+        "company name, or any other non-numeric string.\n"
+        "- between: `right` MUST be a 2-item [low, high] number array.\n"
+        "- cross_above/cross_below: `right` MUST be a string naming the other metric/line "
+        'being crossed (e.g. "sma20"), not a company or ticker.\n'
+        "Entry/exit conditions describe technical trading logic only (price, indicators, "
+        "volume, moving averages, etc.) — never instrument selection. If the user names a "
+        "specific stock or ticker (e.g. 삼성전자, 005930), do not emit a condition for it; "
+        "stock/universe selection is resolved separately by the data layer, outside this call. "
+        "Only describe the trading logic that applies once a stock is already selected."
+    )
+
+
+STRATEGY_CONDITIONS_SYSTEM_PROMPT = _strategy_conditions_prompt()
+
 
 
 def generate_strategy_conditions(
