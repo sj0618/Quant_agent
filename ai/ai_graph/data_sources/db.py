@@ -34,7 +34,13 @@ AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
-DEFAULT_BACKTEST_LOOKBACK_YEARS = 10
+# Five years, not ten. The database does not struggle with either - a server-side count
+# over the ten-year, 200-name set takes ~1.0s - but returning it does: 455k rows cost
+# ~34s to transfer and build, which together with the indicator reads exceeded the
+# statement budget and surfaced as "데이터 조회 시간이 초과되었습니다". Five years is
+# 237k rows and ~11s, still 1250 bars per name for the in/out-of-sample split.
+# AI_BACKTEST_LOOKBACK_DAYS overrides this where a longer history is worth the wait.
+DEFAULT_BACKTEST_LOOKBACK_YEARS = 5
 DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * DEFAULT_BACKTEST_LOOKBACK_YEARS
 DEFAULT_L4_EVIDENCE_LIMIT = 5
 # Screening can match hundreds of names; every extra ticker multiplies the price rows
@@ -273,7 +279,17 @@ class PostgresPipelineDataSource:
                 # can enter and exit per date across many names instead of replaying the
                 # past of whichever handful is at a high right now. Recommendation and
                 # backtest universe are deliberately different things.
-                recommended = [str(item["ticker"]).zfill(6) for item in screening_candidates]
+                # Only the strongest matches are folded into the backtest universe. The
+                # union used to take every recommended name, which is fine for a screen
+                # that matched a handful - but a query whose wording matches no profile
+                # falls to the baseline predicate `close > 0`, so every priced name
+                # matches. That made the "KOSPI 200 plus the recommendations" universe
+                # ~2,900 tickers and the price history ~3.6M rows, far past the statement
+                # budget. This is the single cause of the reported
+                # "데이터 조회 시간이 초과되었습니다".
+                recommended = _backtest_ticker_pool(
+                    screening_candidates, self.config.backtest_max_tickers
+                )
                 tickers = self._fetch_backtest_universe(conn, recommended)
                 ticker = recommended[0]
                 symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
@@ -724,32 +740,33 @@ class PostgresPipelineDataSource:
             lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
         )
         ticker_list = list(tickers)
-        # row_number keeps the lookback per ticker: a plain LIMIT would spend the whole
-        # budget on whichever ticker sorted first and starve the rest.
+        # Every ticker shares one trading calendar, so the lookback is a date, resolved
+        # once. It used to be a per-ticker row_number() rank, which sorted all ~455k rows
+        # to apply a cap that never bound - a ten-year request against tickers that have
+        # 2499 trading days. Resolving the floor also makes it a bind parameter rather
+        # than `CURRENT_DATE - make_interval(days => %s)`, which is not a plan-time
+        # constant and so blocks partition pruning.
+        date_floor = self._resolve_backtest_date_floor(
+            conn, lookback_days, calendar_lookback_days
+        )
+        if date_floor is None:
+            return []
         rows = conn.execute(
             """
-            SELECT as_of_date, ticker, open, high, low, close, volume
-            FROM (
-                SELECT
-                    time AS as_of_date,
-                    ticker,
-                    adj_open AS open,
-                    adj_high AS high,
-                    adj_low AS low,
-                    adj_close AS close,
-                    adj_volume AS volume,
-                    -- quality_flags was selected but never read. As a JSONB document on
-                    -- every one of ~455k rows it was pure transfer cost on the single
-                    -- heaviest query in the pipeline.
-                    row_number() OVER (PARTITION BY ticker ORDER BY time DESC) AS ticker_rank
-                FROM feature.kis_adjusted_ohlcv_daily
-                WHERE ticker = ANY(%s)
-                  AND time >= CURRENT_DATE - make_interval(days => %s)
-            ) ranked
-            WHERE ticker_rank <= %s
-            ORDER BY ticker, as_of_date
+            SELECT
+                time AS as_of_date,
+                ticker,
+                adj_open AS open,
+                adj_high AS high,
+                adj_low AS low,
+                adj_close AS close,
+                adj_volume AS volume
+            FROM feature.kis_adjusted_ohlcv_daily
+            WHERE ticker = ANY(%s)
+              AND time >= %s::date
+            ORDER BY ticker, time
             """,
-            [ticker_list, calendar_lookback_days, lookback_days],
+            [ticker_list, date_floor],
         ).fetchall()
         # Indicators are only ever read for dates that have a price bar, and the price
         # query above already capped itself at `lookback_days` rows per ticker. Asking
@@ -888,6 +905,27 @@ class PostgresPipelineDataSource:
                     ratios[f"{metric}_up_streak"] = streaks.get(metric, 0)
                     previous[metric] = value
         return timelines
+
+    def _resolve_backtest_date_floor(
+        self, conn: Any, lookback_days: int, calendar_lookback_days: int
+    ) -> date | None:
+        """The date `lookback_days` trading sessions back, from the calendar itself."""
+
+        row = conn.execute(
+            """
+            SELECT min(time) AS date_floor
+            FROM (
+                SELECT DISTINCT time
+                FROM feature.kis_adjusted_ohlcv_daily
+                WHERE time >= CURRENT_DATE - make_interval(days => %s)
+                ORDER BY time DESC
+                LIMIT %s
+            ) sessions
+            """,
+            [calendar_lookback_days, lookback_days],
+        ).fetchone()
+        value = row.get("date_floor") if row else None
+        return _date_value(value) if value is not None else None
 
     def _fetch_indicator_values_by_date(
         self, conn: Any, table: str, tickers: Sequence[str], since: date | None

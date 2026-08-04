@@ -103,6 +103,8 @@ class FakeScreeningConnection:
             return FakeResult(row={"as_of_date": AS_OF})
         if "max(time) AS previous_date" in query:
             return FakeResult(row={"previous_date": PREVIOUS_TRADING_DAY})
+        if "min(time) AS date_floor" in query:
+            return FakeResult(row={"date_floor": AS_OF})
         if KIS_FEATURE_FRAME_VIEW in query and "prev_rsi" in query:
             return FakeResult(rows=[
                 {"ticker": row["ticker"], "prev_rsi": row.get("prev_rsi")}
@@ -140,7 +142,7 @@ class FakeScreeningConnection:
                 for row in self.frame_rows
             ]
             return FakeResult(rows=rows)
-        if "ticker_rank" in query:
+        if "FROM feature.kis_adjusted_ohlcv_daily" in query and "adj_open" in query:
             return FakeResult(rows=[
                 {
                     "as_of_date": AS_OF,
@@ -301,6 +303,8 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
             self.calls.append((query, params))
             if "AS present" in query:
                 return Result(row={"present": True})
+            if "min(time) AS date_floor" in query:
+                return Result(row={"date_floor": date(2016, 5, 20)})
             if "feature.kis_adjusted_ohlcv_daily" in query:
                 return Result(
                     rows=[
@@ -822,3 +826,27 @@ def test_macro_snapshot_labels_the_universe_proxy_rather_than_calling_it_the_kos
 
     assert _latest_universe_return(rows) == pytest.approx(0.0)
     assert _latest_universe_return([]) is None
+
+
+def test_backtest_universe_caps_the_recommended_names_it_folds_in() -> None:
+    """A screen that matches everything must not become the backtest universe.
+
+    A query whose wording matches no profile falls to the baseline predicate
+    `close > 0`, so every priced name matches - ~2,764 of them. Those were all unioned
+    into the "KOSPI 200 plus the recommendations" universe, making it ~2,900 tickers and
+    the price history ~3.6M rows, far past the statement budget. That was the reported
+    "데이터 조회 시간이 초과되었습니다".
+    """
+
+    from ai_graph.data_sources.db import _backtest_ticker_pool
+
+    everything = [
+        {"ticker": f"{i:06d}", "relative_strength_20d": i / 1000.0}
+        for i in range(2764)
+    ]
+
+    pool = _backtest_ticker_pool(everything, 20)
+
+    assert len(pool) == 20
+    # The cap keeps the strongest matches, not the lowest ticker codes.
+    assert pool[0] == "002763"
