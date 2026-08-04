@@ -56,10 +56,20 @@ class FakeScreeningConnection:
     about that split rather than returning one canned row to everything.
     """
 
-    def __init__(self, *, frame_rows=None, sectors=("반도체", "화학"), sector_view_missing=False):
+    def __init__(
+        self,
+        *,
+        frame_rows=None,
+        sectors=("반도체", "화학"),
+        sector_view_missing=False,
+        unavailable_probes=(),
+    ):
         self.frame_rows = frame_rows if frame_rows is not None else [default_frame_row()]
         self.sectors = sectors
         self.sector_view_missing = sector_view_missing
+        # Tables the warehouse has no rows for, by name, so a test can reproduce the
+        # "capability is configured but empty" case the probe now has to catch.
+        self.unavailable_probes = tuple(unavailable_probes)
         self.aborted = False
         self.rollbacks = 0
         self.calls: list[tuple[str, object]] = []
@@ -84,6 +94,9 @@ class FakeScreeningConnection:
             raise RuntimeError("current transaction is aborted")
         if "set_config('statement_timeout'" in query:
             return FakeResult()
+        if "AS present" in query:
+            missing = any(table in query for table in self.unavailable_probes)
+            return FakeResult(row={"present": not missing})
         if "DISTINCT sm.sector" in query or "DISTINCT sector" in query:
             return FakeResult(rows=[{"sector": s} for s in self.sectors])
         if "max(time) AS as_of_date" in query:
@@ -286,6 +299,8 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
             self.calls.append((query, params))
+            if "AS present" in query:
+                return Result(row={"present": True})
             if "feature.kis_adjusted_ohlcv_daily" in query:
                 return Result(
                     rows=[
@@ -583,6 +598,8 @@ def test_empty_screen_is_not_re_run_for_the_same_query() -> None:
             # test is about.
             if "max(time) AS as_of_date" in query:
                 return Result([{"as_of_date": date(2026, 7, 30)}])
+            if "AS present" in query:
+                return Result([{"present": True}])
             return Result([])
 
     connection = CountingConnection()
@@ -704,3 +721,102 @@ def test_all_null_rsi_cannot_be_rescued_by_relaxation() -> None:
 
     # rsi_max really was being widened; the rows just cannot match.
     assert thresholds.rsi_max > ScreeningThresholds().rsi_max
+
+
+def test_missing_capability_stops_before_the_screen_spends_relaxation_rounds() -> None:
+    """A strategy whose data is not loaded must fail immediately, not slowly.
+
+    mart.dart_financial_asof is empty on the common server, so every fundamental
+    condition matched zero rows. The capability probe ran *after* screening, so the run
+    still paid for the full screen plus three LLM relaxation rounds - each widening a
+    threshold against columns that were NULL for every row and could never match - and
+    then surfaced as "데이터 조회 시간이 초과되었습니다", naming neither the missing data
+    nor the fact that waiting could not help.
+    """
+
+    connection = FakeScreeningConnection(unavailable_probes=("mart.dart_financial_asof",))
+
+    class ProbingDataSource(PostgresPipelineDataSource):
+        def _connect(self):
+            return connection
+
+    source = ProbingDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+
+    bundle = source.load("저PER 고ROE 부채비율 100% 이하 종목", "trace-capability")
+
+    assert bundle.metadata["stopped_before_screening"] is True
+    labels = [item["label"] for item in bundle.data_availability["unsupported_capabilities"]]
+    assert any("재무" in label for label in labels)
+    # No screen, and therefore no relaxation rounds, were run at all.
+    assert connection.frame_reads == 0
+    assert not any("WITH path AS" in query for query, _ in connection.calls)
+
+
+def test_available_capabilities_do_not_stop_the_screen() -> None:
+    connection = FakeScreeningConnection()
+
+    class ProbingDataSource(PostgresPipelineDataSource):
+        def _connect(self):
+            return connection
+
+    source = ProbingDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+
+    bundle = source.load("코스피 신고가 거래량 종목", "trace-capability-ok")
+
+    assert "stopped_before_screening" not in bundle.metadata
+    assert connection.frame_reads >= 1
+
+
+def test_bollinger_reads_both_warehouse_key_spellings() -> None:
+    """The Bollinger keys were renamed mid-pipeline and both spellings are live.
+
+    Bars up to 2026-07-10 are keyed `BBU_20_2.0_2.0`, bars from 2025-08-28
+    `BBU_20_2.0`. Reading only the current one left Bollinger populated on 13.5% of
+    backtest bars while every other indicator sat at 99.9%, so a band strategy quietly
+    stopped matching on older history.
+    """
+
+    sql = _mart_frame_sql(sector=False)
+
+    assert "BBU_20_2.0_2.0" in sql
+    assert "BBB_20_2.0_2.0" in sql
+    assert "COALESCE" in sql
+    # Keys that were never renamed must not grow a spurious fallback.
+    assert "SMA_20_2.0" not in sql
+    assert "RSI_14_2.0" not in sql
+
+
+def test_legacy_bollinger_keys_flatten_onto_a_bar_under_the_canonical_name() -> None:
+    row = {
+        "as_of_date": AS_OF, "ticker": "000660",
+        "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0,
+        "trend_values": {}, "momentum_values": {},
+        "volatility_values": {"BBU_20_2.0_2.0": 120.0, "BBB_20_2.0_2.0": 16.35},
+        "volume_values": {}, "pattern_values": {},
+    }
+
+    price_row = _price_row_from_feature_frame_record(row)
+
+    assert price_row["bb_upper"] == 120.0
+    # pandas-ta reports bandwidth as a percentage; the thresholds are fractions.
+    assert price_row["bb_width"] == pytest.approx(0.1635)
+
+
+def test_macro_snapshot_labels_the_universe_proxy_rather_than_calling_it_the_kospi() -> None:
+    """There is no index series in the warehouse, so the equity leg is a proxy.
+
+    All three risk rules used to default to values no threshold could fire on and
+    nothing ever assigned the snapshot, so they were dead while looking implemented.
+    """
+
+    from ai_graph.data_sources.db import _latest_universe_return
+
+    rows = [
+        {"ticker": "000660", "date": "2026-05-19", "close": 100.0},
+        {"ticker": "000660", "date": "2026-05-20", "close": 110.0},
+        {"ticker": "005930", "date": "2026-05-19", "close": 100.0},
+        {"ticker": "005930", "date": "2026-05-20", "close": 90.0},
+    ]
+
+    assert _latest_universe_return(rows) == pytest.approx(0.0)
+    assert _latest_universe_return([]) is None

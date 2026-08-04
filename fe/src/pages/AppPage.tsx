@@ -74,8 +74,25 @@ interface WorkspaceProgress {
   percent: number;
   activeLabel: string;
   steps: Array<{ label: string; status: AIJobStageStatus }>;
-  error?: string;
+  error?: JobFailure;
   cancelRequested?: boolean;
+}
+
+// A failed analysis carries a diagnosis the envelope already built - what broke, who
+// owns it, whether retrying can help, and the debug_ref support needs. None of it used
+// to reach the screen: a job whose result came back `failed` matched neither the
+// "has a result" branch nor the polling-error branch, so the workspace simply sat on a
+// progress bar until the wall-clock cap turned it into "시간이 초과되었습니다" - a
+// message that was wrong about the cause in every case where the run had already
+// stopped on purpose.
+interface JobFailure {
+  message: string;
+  category?: string;
+  subcause?: string;
+  stage?: string;
+  owner?: string;
+  retryable?: boolean;
+  debugRef?: string;
 }
 
 function getInitialTab(): WorkspaceTab {
@@ -150,11 +167,40 @@ function WorkspaceEmptyState({
   activity?: ActivityState;
 }) {
   if (progress?.error) {
+    const failure = progress.error;
+    // Retryable and permanent failures need different next steps from the reader: one
+    // is "try again", the other "this data does not exist yet". Saying only "분석을
+    // 이어갈 수 없습니다" left both looking like a transient glitch.
+    const permanent = failure.retryable === false;
+    const details: Array<[string, string]> = [];
+    if (failure.category) details.push(["분류", failure.category]);
+    if (failure.subcause) details.push(["원인", failure.subcause]);
+    if (failure.stage) details.push(["단계", failure.stage]);
+    if (failure.owner) details.push(["담당", failure.owner]);
+    if (failure.debugRef) details.push(["debug_ref", failure.debugRef]);
     return (
-      <section className="workspace-empty workspace-empty--error">
-        <strong>분석을 이어갈 수 없습니다</strong>
-        <p>{progress.error}</p>
+      <section className="workspace-empty workspace-empty--error" role="alert">
+        <strong>{permanent ? "이 조건으로는 분석할 수 없습니다" : "분석을 이어갈 수 없습니다"}</strong>
+        <p>{failure.message}</p>
         <p className="workspace-empty__query">{progress.query}</p>
+        {permanent ? (
+          <p className="workspace-empty__hint">
+            같은 조건으로 다시 시도해도 결과는 같습니다. 조건을 바꿔 요청해 주세요.
+          </p>
+        ) : null}
+        {details.length ? (
+          <details className="workspace-empty__diagnostics">
+            <summary>진단 정보</summary>
+            <dl>
+              {details.map(([label, value]) => (
+                <div key={label}>
+                  <dt>{label}</dt>
+                  <dd>{value}</dd>
+                </div>
+              ))}
+            </dl>
+          </details>
+        ) : null}
       </section>
     );
   }
@@ -211,7 +257,7 @@ export function AppPage() {
   const [conversationHistory, setConversationHistory] = useState<WorkspaceConversation[]>(readConversationHistory);
   const [pendingAnalysis, setPendingAnalysis] = useState<PendingAnalysis | null>(null);
   const [progressNow, setProgressNow] = useState(Date.now());
-  const [jobErrors, setJobErrors] = useState<Record<string, string>>({});
+  const [jobErrors, setJobErrors] = useState<Record<string, JobFailure>>({});
   // Jobs restored from a past conversation that never recorded a result. The server's
   // in-memory store is long gone, so polling them can only ever end in the wall-clock
   // timeout - they are kept for their chat messages and excluded from every live path.
@@ -273,7 +319,7 @@ export function AppPage() {
 
     let cancelled = false;
     const timeoutId = window.setTimeout(async () => {
-      const failures: Record<string, string> = {};
+      const failures: Record<string, JobFailure> = {};
       const missingJobIds = new Set<string>();
       const refreshedJobs = await Promise.all(
         pollingJobs.map(async (job) => {
@@ -291,9 +337,13 @@ export function AppPage() {
               missingJobIds.add(job.job_id);
               clearLatestAnalysisJob();
             } else if (attempts >= MAX_POLL_FAILURES) {
-              failures[job.job_id] = status
-                ? `분석 진행 상태를 불러오지 못했습니다. (서버 응답 ${status})`
-                : "분석 진행 상태를 불러오지 못했습니다. 네트워크 연결을 확인해 주세요.";
+              failures[job.job_id] = {
+                message: status
+                  ? `분석 진행 상태를 불러오지 못했습니다. (서버 응답 ${status})`
+                  : "분석 진행 상태를 불러오지 못했습니다. 네트워크 연결을 확인해 주세요.",
+                category: "fe_polling",
+                retryable: true,
+              };
             }
             console.warn("AI 분석 job 진행률 갱신에 실패했습니다.", error);
             return job;
@@ -312,13 +362,34 @@ export function AppPage() {
         if (!failures[job.job_id]) {
           delete pollAttemptsRef.current[job.job_id];
         }
+        // A finished-but-failed job carries its own diagnosis. Surface that instead of
+        // waiting for the wall-clock cap, which would blame a timeout for a run that had
+        // already stopped for a known reason.
+        const cause = job.result?.failure_cause;
+        if (job.result?.status === "failed" && !failures[job.job_id]) {
+          failures[job.job_id] = {
+            message: cause?.safe_message ?? "분석을 완료하지 못했습니다.",
+            category: cause?.category,
+            subcause: cause?.subcause,
+            stage: cause?.failure_stage,
+            owner: cause?.owner,
+            retryable: cause?.retryable,
+            debugRef: job.result?.debug_ref ?? undefined,
+          };
+        }
         // A job the server keeps reporting as still-running past the wall-clock cap is
         // treated as stuck: successful polls alone would never end the loading state.
         if (!job.result && !failures[job.job_id]) {
           const startedAt = Date.parse(job.created_at);
           if (Number.isFinite(startedAt) && Date.now() - startedAt > MAX_ANALYSIS_DURATION_MS) {
-            failures[job.job_id] =
-              "분석이 시간 내에 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.";
+            failures[job.job_id] = {
+              message: "분석이 시간 내에 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.",
+              category: "client_timeout",
+              // polling_stage is excluded from the public job model, so name the stage
+              // from the progress the client can actually see.
+              stage: job.stages.find((step) => step.status === "running")?.stage,
+              retryable: true,
+            };
           }
         }
       }
@@ -592,7 +663,7 @@ function buildWorkspaceProgress({
   job?: AnalysisJob;
   pendingAnalysis: PendingAnalysis | null;
   now: number;
-  error?: string;
+  error?: JobFailure;
   cancelRequested?: boolean;
 }): WorkspaceProgress | null {
   if (job) {

@@ -74,6 +74,9 @@ UNIVERSE_VIEW = "meta.view_common_stock_universe"
 SYMBOL_MASTER_TABLE = "core.symbol_master"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
+# BOK ECOS daily 원/달러 rate. The only macro series the risk rules can be fed from
+# directly; there is no equity index and no volatility index in this warehouse.
+USD_KRW_SERIES_ID = "731Y003:0000003"
 DART_FINANCIAL_TABLE = "mart.dart_financial_asof"
 # DART accounts are stored as objects, with the figure under "amount" and the prior
 # period under raw.frmtrm_amount. Values are text and not always numeric.
@@ -187,7 +190,9 @@ class PipelineDataBundle(BaseModel):
     price_rows: list[dict[str, Any]] = Field(default_factory=list)
     screening_candidates: list[dict[str, Any]] = Field(default_factory=list)
     l4_evidence: list[dict[str, Any]] = Field(default_factory=list)
-    macro_snapshot: dict[str, float] | None = None
+    # Carries the measured values plus the label saying what the equity leg was
+    # measured against, so a report can never call a universe proxy "the KOSPI".
+    macro_snapshot: dict[str, Any] | None = None
     data_availability: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -201,6 +206,30 @@ class PostgresPipelineDataSource:
     def load(self, query: str, trace_id: str) -> PipelineDataBundle:
         with self._connect() as conn:
             self._set_statement_timeout(conn)
+            # Ask what the warehouse can actually serve before spending anything on the
+            # query. This used to run last, after screening, so a strategy whose data is
+            # not loaded at all still paid for the full screen plus three LLM relaxation
+            # rounds - each widening a threshold against columns that were NULL for every
+            # row and could never match - and then failed with a generic message. With
+            # mart.dart_financial_asof empty, every fundamental strategy took that path
+            # and surfaced as "데이터 조회 시간이 초과되었습니다", which named neither the
+            # missing data nor the fact that waiting longer could not help.
+            capability_availability = measure_capabilities(conn)
+            unsupported = unsupported_capabilities(query, capability_availability)
+            if unsupported:
+                return PipelineDataBundle(
+                    data_availability=_data_availability_for_query(
+                        query, source="postgres", available=capability_availability
+                    ),
+                    metadata={
+                        "source": "postgres",
+                        "dsn_env": self.config.database_dsn_env,
+                        "stopped_before_screening": True,
+                        "unsupported_capabilities": unsupported,
+                        "capability_probe": capability_availability,
+                    },
+                )
+            indicator_families = indicator_families_for_query(query)
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
             ticker_resolution = "screening"
@@ -248,7 +277,7 @@ class PostgresPipelineDataSource:
                 # enough once the backtest universe is 200 names.
                 self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, symbol_info_by_ticker, query
+                    conn, tickers, symbol_info_by_ticker, query, indicator_families
                 )
                 self._set_statement_timeout(conn)
             elif single_ticker:
@@ -256,7 +285,7 @@ class PostgresPipelineDataSource:
                 tickers = [ticker]
                 symbol_info = self._fetch_symbol_info(conn, ticker)
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, {ticker: symbol_info}, query
+                    conn, tickers, {ticker: symbol_info}, query, indicator_families
                 )
             else:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
@@ -275,12 +304,14 @@ class PostgresPipelineDataSource:
                 )
             l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
-            capability_availability = measure_capabilities(conn)
+            macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
+            # Capabilities were probed up front; nothing since then can change them.
 
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
+            macro_snapshot=macro_snapshot,
             data_availability=_data_availability_for_query(
                 query, source="postgres", available=capability_availability
             ),
@@ -292,11 +323,9 @@ class PostgresPipelineDataSource:
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [
-                    TA_MOMENTUM_TICKER_TABLE,
-                    TA_TREND_TICKER_TABLE,
-                    TA_VOLATILITY_TICKER_TABLE,
-                    TA_VOLUME_TICKER_TABLE,
+                    INDICATOR_TABLES[family] for family in indicator_families
                 ],
+                "indicator_families": list(indicator_families),
                 "price_rows": len(price_rows),
                 "screening_candidates": len(screening_candidates),
                 "screening_relaxation": screening_relaxation,
@@ -657,10 +686,11 @@ class PostgresPipelineDataSource:
         tickers: Sequence[str],
         symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
         query: str,
+        indicator_families: Sequence[str] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         lookback_days = self.config.backtest_lookback_days
         price_rows = self._fetch_price_rows_for_lookback(
-            conn, tickers, symbol_info_by_ticker, lookback_days
+            conn, tickers, symbol_info_by_ticker, lookback_days, indicator_families
         )
         if (
             _query_requires_rsi_oversold(query)
@@ -669,7 +699,7 @@ class PostgresPipelineDataSource:
         ):
             lookback_days = DEFAULT_BACKTEST_LOOKBACK_DAYS
             price_rows = self._fetch_price_rows_for_lookback(
-                conn, tickers, symbol_info_by_ticker, lookback_days
+                conn, tickers, symbol_info_by_ticker, lookback_days, indicator_families
             )
         return price_rows, lookback_days
 
@@ -679,6 +709,7 @@ class PostgresPipelineDataSource:
         tickers: Sequence[str],
         symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
         lookback_days: int,
+        indicator_families: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         calendar_lookback_days = (
             lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
@@ -710,11 +741,12 @@ class PostgresPipelineDataSource:
             """,
             [ticker_list, calendar_lookback_days, lookback_days],
         ).fetchall()
+        families = indicator_families or tuple(INDICATOR_TABLES)
         indicators_by_family = {
             family: self._fetch_indicator_values_by_date(
-                conn, table, ticker_list, calendar_lookback_days
+                conn, INDICATOR_TABLES[family], ticker_list, calendar_lookback_days
             )
-            for family, table in INDICATOR_TABLES.items()
+            for family in families
         }
         financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
         price_rows = [
@@ -929,6 +961,49 @@ class PostgresPipelineDataSource:
             ticker: found.get(ticker, {"ticker": ticker, "included": False})
             for ticker in tickers
         }
+
+    def _fetch_macro_snapshot(
+        self, conn: Any, price_rows: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any] | None:
+        """The macro inputs the risk rules read, from the series the warehouse has.
+
+        FX is real: BOK series 731Y003:0000003 is the daily 원/달러 rate, so its
+        day-over-day change feeds FX_DAILY_MOVE_2PCT_CAP directly. There is no index
+        series, so the equity leg is the loaded universe's mean daily return - a proxy,
+        labelled as one in `kospi_source` so a report never calls it the KOSPI. There is
+        no volatility series at all, so vkospi stays None and its rule skips rather than
+        assuming a calm market.
+        """
+
+        snapshot: dict[str, Any] = {}
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT value
+                FROM {BOK_MACRO_VIEW}
+                WHERE series_id = %(series)s
+                  AND effective_date >= CURRENT_DATE - 30
+                ORDER BY effective_date DESC
+                LIMIT 2
+                """,
+                {"series": USD_KRW_SERIES_ID},
+            ).fetchall()
+        except Exception:
+            _logger.warning("BOK macro read failed; FX risk rule will not be evaluated")
+            rows = []
+        if len(rows) == 2:
+            latest = _optional_float_value(rows[0].get("value"))
+            prior = _optional_float_value(rows[1].get("value"))
+            if latest is not None and prior and prior > 0:
+                snapshot["fx_daily_change_pct"] = latest / prior - 1.0
+
+        market_return = _latest_universe_return(price_rows)
+        if market_return is not None:
+            snapshot["kospi_close_change_pct"] = market_return
+            snapshot["kospi_source"] = (
+                "loaded universe mean daily return (no index series in the warehouse)"
+            )
+        return snapshot or None
 
     def _fetch_macro_status(self, conn: Any) -> dict[str, Any]:
         row = conn.execute(
@@ -1476,6 +1551,23 @@ _VOLATILITY_KEYS: dict[str, str] = {
     "atr": "ATRr_14",
     "natr": "NATR_14",
 }
+# The Bollinger keys were renamed mid-pipeline: bars up to 2026-07-10 are keyed
+# `BBU_20_2.0_2.0`, bars from 2025-08-28 `BBU_20_2.0`, and the two overlap. Reading only
+# the current spelling left Bollinger populated on 13.5% of backtest bars while every
+# other indicator sat at 99.9% - a strategy would quietly stop matching on older
+# history. Each key falls back to its older spelling until the data team normalises it.
+_LEGACY_KEY_SUFFIX = "_2.0"
+_LEGACY_KEYED = frozenset(
+    {"BBU_20_2.0", "BBL_20_2.0", "BBM_20_2.0", "BBP_20_2.0", "BBB_20_2.0"}
+)
+
+
+def _key_spellings(source: str) -> tuple[str, ...]:
+    """Every warehouse spelling of one indicator key, most current first."""
+
+    if source in _LEGACY_KEYED:
+        return (source, f"{source}{_LEGACY_KEY_SUFFIX}")
+    return (source,)
 _MOMENTUM_KEYS: dict[str, str] = {
     "rsi": "RSI_14",
     "mfi": "MFI_14",
@@ -1506,16 +1598,72 @@ INDICATOR_TABLES: dict[str, str] = {
     "volume": TA_VOLUME_TICKER_TABLE,
 }
 
+# Which family each condition metric lives in, so the backtest reads only the tables its
+# strategy actually references. Reading all four over a 200-name universe cost ~37s;
+# most strategies touch one or two.
+INDICATOR_FAMILY_BY_METRIC: dict[str, str] = {
+    **{alias: "trend" for alias in _TREND_KEYS},
+    **{alias: "momentum" for alias in _MOMENTUM_KEYS},
+    **{alias: "volatility" for alias in _VOLATILITY_KEYS},
+    **{alias: "volume" for alias in _VOLUME_KEYS},
+    "bb_width": "volatility",
+}
+# Momentum carries RSI, which the report and several fallbacks read whether or not the
+# strategy names it, so it is never skipped.
+ALWAYS_LOADED_FAMILIES = frozenset({"momentum"})
+
+# Indicators each screening profile's predicate reads off the bar (path features like
+# high_252 are computed separately and are not in any ta_* family).
+_PROFILE_INDICATOR_METRICS: dict[str, tuple[str, ...]] = {
+    "breakout_volume": ("sma20",),
+    "rsi_rebound": ("rsi",),
+    "pullback_trend": ("sma20", "sma200"),
+    "bollinger_squeeze": ("bb_upper", "bb_width"),
+    "relative_strength": (),
+    "value_quality": (),
+    "quality_growth": (),
+    "growth_momentum": ("sma50",),
+}
+
+
+def indicator_families_for_query(query: str) -> tuple[str, ...]:
+    """The ta_* families a run of this query needs on every backtest bar.
+
+    Currently every family, deliberately. Scoping by the screening profile made the read
+    2.3x faster (37.5s -> 16.3s measured) but was scoped to the wrong consumer: the bars
+    are read by the strategy's compiled conditions, which are generated *after* this
+    load and routinely name indicators the screen never touches. A relative-strength
+    screen loaded momentum only, and a condition on sma200 then saw NaN on every bar and
+    silently matched nothing - the same class of quiet-wrong-answer this work has been
+    removing. Narrowing it again needs the conditions to exist before the load, not a
+    better guess here; `indicator_families_for_metrics` is the piece that will do it.
+    """
+
+    _ = _PROFILE_INDICATOR_METRICS.get(_screening_profile(query), ())
+    return tuple(INDICATOR_TABLES)
+
+
+def indicator_families_for_metrics(metrics: Sequence[str]) -> tuple[str, ...]:
+    """The ta_* families needed to evaluate these condition metrics."""
+
+    families = set(ALWAYS_LOADED_FAMILIES)
+    for metric in metrics:
+        family = INDICATOR_FAMILY_BY_METRIC.get(str(metric).strip().lower())
+        if family is not None:
+            families.add(family)
+    return tuple(family for family in INDICATOR_TABLES if family in families)
+
 # Warehouse indicator key -> the name a condition uses, applied to every backtest bar
 # so `sma20` on a bar means exactly what `sma20` meant in the screen.
 BACKTEST_INDICATOR_ALIASES: dict[str, str] = {
-    source: alias
+    spelling: alias
     for alias, source in {
         **_TREND_KEYS,
         **_VOLATILITY_KEYS,
         **_MOMENTUM_KEYS,
         **_VOLUME_KEYS,
     }.items()
+    for spelling in _key_spellings(source)
 }
 
 INDICATOR_FIELDS: tuple[str, ...] = (
@@ -1528,9 +1676,16 @@ INDICATOR_FIELDS: tuple[str, ...] = (
 
 
 def _jsonb_projection(column: str, keys: Mapping[str, str]) -> str:
-    return ",\n            ".join(
-        f"({column}->>'{source}')::numeric AS {alias}" for alias, source in keys.items()
-    )
+    projections = []
+    for alias, source in keys.items():
+        spellings = _key_spellings(source)
+        if len(spellings) == 1:
+            expression = f"({column}->>'{spellings[0]}')::numeric"
+        else:
+            reads = ", ".join(f"{column}->>'{name}'" for name in spellings)
+            expression = f"(COALESCE({reads}))::numeric"
+        projections.append(f"{expression} AS {alias}")
+    return ",\n            ".join(projections)
 
 
 def _mart_frame_sql(*, sector: bool) -> str:
@@ -1555,8 +1710,12 @@ def _mart_frame_sql(*, sector: bool) -> str:
             {_jsonb_projection("volatility_values", _VOLATILITY_KEYS)},
             {_jsonb_projection("momentum_values", _MOMENTUM_KEYS)},
             {_jsonb_projection("volume_values", _VOLUME_KEYS)},
-            (volatility_values->>'{_BB_BANDWIDTH_KEY}')::numeric
-                / {_BB_BANDWIDTH_SCALE} AS bb_width
+            (COALESCE(
+                {", ".join(
+                    f"volatility_values->>'{name}'"
+                    for name in _key_spellings(_BB_BANDWIDTH_KEY)
+                )}
+            ))::numeric / {_BB_BANDWIDTH_SCALE} AS bb_width
         FROM {KIS_FEATURE_FRAME_VIEW}
         WHERE as_of_date = %(as_of)s::date{sector_predicate}
         ORDER BY base_ticker, ticker
@@ -1619,6 +1778,27 @@ def _path_features_sql(needs: frozenset[str]) -> tuple[str, int]:
         """,
         lookback,
     )
+
+
+def _latest_universe_return(rows: Sequence[Mapping[str, Any]]) -> float | None:
+    """Mean one-day return across the loaded universe on its most recent date."""
+
+    by_ticker: dict[str, list[tuple[str, float]]] = {}
+    for row in rows:
+        close = _optional_float_value(row.get("close"))
+        date_value = str(row.get("date") or "")
+        if close is None or not date_value:
+            continue
+        by_ticker.setdefault(str(row.get("ticker") or ""), []).append((date_value, close))
+    returns: list[float] = []
+    for series in by_ticker.values():
+        if len(series) < 2:
+            continue
+        series.sort(key=lambda item: item[0])
+        prior, latest = series[-2][1], series[-1][1]
+        if prior > 0:
+            returns.append(latest / prior - 1.0)
+    return sum(returns) / len(returns) if returns else None
 
 
 def _relative_strength(
@@ -2075,7 +2255,7 @@ def _merge_metric_values(target: dict[str, Any], row: Mapping[str, Any]) -> None
             alias = BACKTEST_INDICATOR_ALIASES.get(source_key)
             if alias is not None:
                 target.setdefault(alias, parsed)
-            if source_key == _BB_BANDWIDTH_KEY:
+            if source_key in _key_spellings(_BB_BANDWIDTH_KEY):
                 target.setdefault("bb_width", parsed / _BB_BANDWIDTH_SCALE)
 
 

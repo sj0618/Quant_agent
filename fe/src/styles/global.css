@@ -193,6 +193,16 @@ h6 { font-size: 0.67em; }
 
 .workspace-empty--error strong { color: var(--drop); }
 .workspace-empty__query { color: var(--subdued); font-size: 12px; }
+/* A permanent failure needs a different next step from a transient one, so the hint
+   sits with the message rather than in a tooltip. */
+.workspace-empty__hint { color: var(--muted); font-size: 12px; max-width: 46ch; }
+/* Collapsed by default: the reader needs the message, support needs the debug_ref. */
+.workspace-empty__diagnostics { margin-top: 4px; font-size: 11px; color: var(--subdued); }
+.workspace-empty__diagnostics summary { cursor: pointer; color: var(--muted); }
+.workspace-empty__diagnostics dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 8px 0 0; }
+.workspace-empty__diagnostics dl > div { display: contents; }
+.workspace-empty__diagnostics dt { color: var(--muted); }
+.workspace-empty__diagnostics dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
 .workspace-progress__step.is-failed { color: var(--drop); }
 .workspace-progress__step.is-failed > span { background: var(--drop); border-color: var(--drop); }
 .tabs { height: 48px; flex: 0 0 48px; display: flex; align-items: center; justify-content: space-between; background: #fff; border-bottom: 1px solid var(--line); padding: 0 24px; }
