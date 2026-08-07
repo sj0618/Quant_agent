@@ -329,6 +329,25 @@ class BacktestMetrics(BaseModel):
     # result payloads that predate the real hold-out split.
     in_sample_return: float = 0.0
     in_sample_max_drawdown: float = 0.0
+    # Hold-out statistics. `sharpe_ratio`/`total_return`/`max_drawdown` above span the
+    # whole period, including the 70% that selection already read, so they are not an
+    # out-of-sample claim and must not be presented as one. These are.
+    out_sample_return: float = 0.0
+    out_sample_max_drawdown: float = 0.0
+    # Daily returns behind the in-sample statistics. Needed to deflate a Sharpe for the
+    # width of the search: the public equity curve is downsampled to a dozen points, so
+    # it cannot stand in for the sample size.
+    in_sample_observations: int = 0
+    # How many candidates the winner was chosen from. Reporting the best of N without
+    # saying what N was is what makes an argmax look like a discovery: with six
+    # candidates whose actions are pure noise, the best-of-six still returned +16.2%
+    # against a -3.7% average, so ~20 percentage points of any headline is selection
+    # luck before any skill is involved.
+    candidates_evaluated: int = 1
+    # Sharpe after deflating for that search. Compares the in-sample Sharpe against the
+    # best-of-N a skill-free search would be expected to produce; at or below zero means
+    # the result is not distinguishable from having tried N things and kept the luckiest.
+    selection_adjusted_sharpe: float = 0.0
 
 
 class BacktestEquityPoint(BaseModel):

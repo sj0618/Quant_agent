@@ -165,9 +165,21 @@ class PreparedFeatureStore:
             long_highs = _prior_rolling_extreme(closes, long_limit, maximum=True)
 
             for local_index, global_index in enumerate(indices):
-                window = min(lookback, local_index)
-                if window <= 0:
+                # A window is only itself once there are `lookback` prior bars to fill
+                # it. Taking min(lookback, local_index) instead made every indicator
+                # report a shorter one under its own name: a 20-day average was the
+                # previous close on the second bar, and `high` was a single prior close,
+                # so a breakout could fire on bar two against a "high" of one day. Rows
+                # inside the warm-up stay zeroed, which leaves READY false and keeps them
+                # untradable rather than tradable on a number nobody measured.
+                #
+                # This matters most exactly where it is least visible: a name that lists
+                # mid-backtest warms up during its post-IPO stretch, which is its most
+                # volatile. Enforcing it moved individual candidates by up to 16
+                # percentage points of ten-year return on the live universe.
+                if local_index < lookback:
                     continue
+                window = lookback
                 start = local_index - window
                 short_window = min(max(3, window // 4), local_index)
                 medium_window = min(max(5, window // 2), local_index)
@@ -446,16 +458,16 @@ class PreparedFeatureStore:
                         )
                         sell = in_position and close < average
                     if in_position and float(state[1]) > 0.0:
-                        pnl = close / float(state[1]) - 1.0
+                        # The trailing stop is part of the profile's own rule - it tracks
+                        # the peak since entry, which the engine does not model - so it
+                        # stays here. The fixed stop-loss and take-profit do not: the
+                        # engine applies both against the price actually paid, and this
+                        # loop only knows the signal-day close. Keeping both meant one
+                        # stop evaluated twice from two entry prices a bar apart.
                         trailing_stop = (
                             float(state[3]) > 0.0 and close < float(state[3]) * 0.93
                         )
-                        sell = (
-                            sell
-                            or pnl <= -parameters.stop_loss_pct
-                            or pnl >= parameters.take_profit_pct
-                            or trailing_stop
-                        )
+                        sell = sell or trailing_stop
                 evaluations.append(
                     (index, ticker, close, buy, sell, score, state)
                 )
@@ -503,17 +515,17 @@ class PreparedFeatureStore:
                 close = self.close[index]
                 state = states.setdefault(ticker, [False, 0.0])
                 if bool(state[0]):
+                    # Rule exits only. Stop-loss and take-profit belong to the engine,
+                    # which is the side that knows the price actually paid: this loop
+                    # records the signal-day close as the entry, while the fill happens
+                    # at the next open plus slippage. Testing the same stop against two
+                    # different entry prices applied it twice, from figures that drift
+                    # apart by a whole bar's move plus costs.
                     exit_match = bool(exit_conditions) and all(
                         self._condition_matches(condition, index)
                         for condition in exit_conditions
                     )
-                    entry_price = float(state[1])
-                    pnl = close / entry_price - 1.0 if entry_price else 0.0
-                    if (
-                        exit_match
-                        or pnl <= -parameters.stop_loss_pct
-                        or pnl >= parameters.take_profit_pct
-                    ):
+                    if exit_match:
                         exits.append((index, ticker))
                 elif all(
                     self._condition_matches(condition, index)
