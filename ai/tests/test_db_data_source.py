@@ -371,9 +371,12 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
         ["12345ms"],
     )
     price_query = next(
-        query for query, _ in source.conn.calls if "PARTITION BY ticker" in query
+        query
+        for query, _ in source.conn.calls
+        if "WHERE ticker = ANY(%s)" in query
     )
-    assert "ORDER BY as_of_date, ticker" in price_query
+    assert "time >= %s::date" in price_query
+    assert "ORDER BY ticker, time" in price_query
 
 
 def test_postgres_data_source_broad_screening_uses_screening_candidates() -> None:
@@ -635,6 +638,7 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
             tickers: list[str],
             _symbol_info: object,
             _query: str,
+            _indicator_families: object | None = None,
         ) -> tuple[list[dict[str, object]], int]:
             return [
                 {
