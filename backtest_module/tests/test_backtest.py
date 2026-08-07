@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
@@ -499,3 +499,81 @@ def test_single_point_equity_defaults_core_metrics_and_surfaces_warnings():
     assert metrics["montecarlo_sharpe"] == {}
     assert metrics["outliers"] == {}
     assert metrics["metric_warnings"]
+
+
+def _delisting_scenario(*, grace_days, recovery_rate, survivor_days=40, doomed_days=3):
+    """One name that keeps trading and one that stops after `doomed_days`."""
+
+    days = [date(2026, 1, 1) + timedelta(days=n) for n in range(survivor_days)]
+    rows = []
+    for index, day in enumerate(days):
+        rows.append(
+            OhlcvBar(date=day, ticker="000001", open=100, high=100, low=100, close=100, volume=1000)
+        )
+        if index < doomed_days:
+            rows.append(
+                OhlcvBar(date=day, ticker="000002", open=100, high=100, low=100, close=100, volume=1000)
+            )
+    metrics = [
+        {"date": row.date.isoformat(), "ticker": row.ticker, "rsi_14": 20 if row.date == days[0] else 50}
+        for row in rows
+    ]
+    return run_backtest(
+        StrategySpec(
+            strategy_id="delisting",
+            strategy_name="Delisting",
+            entry_rules=[Condition(left="rsi_14", operator=ConditionOperator.LTE, right=30)],
+            exit_rules=[Condition(left="rsi_14", operator=ConditionOperator.GTE, right=70)],
+            position_sizing=PositionSizing(max_positions=2),
+            risk_controls=RiskControls(
+                max_gross_exposure_pct=1.0, max_single_position_pct=0.5, stop_loss_pct=0.9
+            ),
+            backtest={"cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump()},
+        ),
+        ohlcv_rows=rows,
+        metric_rows=metrics,
+        config=BacktestRunConfig(
+            initial_capital=1000,
+            write_outputs=False,
+            talib=TalibIndicatorConfig(enabled=False, mode="none"),
+            delisting_grace_days=grace_days,
+            delisting_recovery_rate=recovery_rate,
+        ),
+    )
+
+
+def test_position_in_a_name_that_stops_trading_is_written_off_not_held_forever():
+    """A delisted name used to keep its last quoted value in equity for the whole run.
+
+    `last_price` is only refreshed on days the ticker has a bar, so the position was
+    never sold, never marked down, and still counted toward final equity - and its
+    capital never came back to fund another entry.
+    """
+
+    result = _delisting_scenario(grace_days=5, recovery_rate=0.0)
+
+    write_offs = [t for t in result.trades if t.reason == "delisted_write_off"]
+    assert [t.ticker for t in write_offs] == ["000002"]
+    assert write_offs[0].exit_price == 0.0
+    assert write_offs[0].net_pnl < 0
+    assert result.summary["delisting"]["forced_exits"] == 1
+    # The position is gone, so nothing unrealisable is left carrying the headline,
+    # and only the surviving name is still held.
+    assert result.summary["delisting"]["unrealizable_equity"] == 0.0
+    assert result.summary["open_positions"] == 1
+
+
+def test_write_off_respects_the_grace_period_and_the_recovery_rate():
+    """A short suspension must not be treated as a delisting, and the recovery is a knob."""
+
+    # Grace longer than the gap: the name is still held at its last close.
+    held = _delisting_scenario(grace_days=100, recovery_rate=0.0)
+    assert [t for t in held.trades if t.reason == "delisted_write_off"] == []
+    assert held.summary["delisting"]["forced_exits"] == 0
+    assert held.summary["delisting"]["unrealizable_equity"] > 0
+
+    # Same scenario, but a holder recovers half of the last close.
+    partial = _delisting_scenario(grace_days=5, recovery_rate=0.5)
+    write_off = next(t for t in partial.trades if t.reason == "delisted_write_off")
+    assert write_off.exit_price == 50.0
+    assert partial.summary["delisting"]["recovery_rate"] == 0.5
