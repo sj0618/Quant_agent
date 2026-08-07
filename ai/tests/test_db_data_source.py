@@ -1,6 +1,7 @@
 import os
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -129,6 +130,8 @@ class FakeScreeningConnection:
         if "mart.dart_financial_asof" in query:
             return FakeResult(rows=[])
         if "MKTCAP" in query:
+            # Only the screener ranks by present-day market cap now. The backtest
+            # universe deliberately does not - see the "WITH bounds AS" branch.
             return FakeResult(rows=[{"symbol": row["ticker"]} for row in self.frame_rows])
         if "FROM core.symbol_master" in query:
             rows = [
@@ -142,6 +145,11 @@ class FakeScreeningConnection:
                 for row in self.frame_rows
             ]
             return FakeResult(rows=rows)
+        if "WITH bounds AS" in query:
+            # The backtest universe, ranked by traded value as of the backtest start.
+            return FakeResult(rows=[
+                {"symbol": row["ticker"], "as_of": AS_OF} for row in self.frame_rows
+            ])
         if "FROM feature.kis_adjusted_ohlcv_daily" in query and "adj_open" in query:
             return FakeResult(rows=[
                 {
@@ -852,3 +860,77 @@ def test_backtest_universe_caps_the_recommended_names_it_folds_in() -> None:
     assert len(pool) == 20
     # The cap keeps the strongest matches, not the lowest ticker codes.
     assert pool[0] == "002763"
+
+
+def _universe_source():
+    from ai_graph.data_sources.db import PostgresPipelineDataSource
+
+    source = PostgresPipelineDataSource.__new__(PostgresPipelineDataSource)
+    source.config = SimpleNamespace(backtest_lookback_days=2520)
+    return source
+
+
+def test_backtest_universe_is_ranked_as_of_the_start_not_today() -> None:
+    """Today's market cap ranking applied to a ten-year-old start date is survivorship.
+
+    Every name in a present-day top-200 is one that survived to be large today, so the
+    strategy is only ever tested on winners. Measured against a universe selected as of
+    the start, that overstated the same strategy's ten-year return by 22-44 percentage
+    points. The ranking has to be rebuilt from bars that existed at the start.
+    """
+
+    conn = FakeScreeningConnection()
+
+    universe, descriptor = _universe_source()._fetch_backtest_universe(conn, [])
+
+    assert universe == ["000660"]
+    assert descriptor["selection"] == "traded_value_as_of_backtest_start"
+    assert descriptor["source"] == "feature.kis_adjusted_ohlcv_daily"
+
+    ranking_query = next(
+        query for query, _ in conn.calls if "WITH bounds AS" in query
+    )
+    # symbol_master's MKTCAP is a single present-day scalar with no history, so it
+    # cannot be evaluated as of an earlier date and must not appear here.
+    assert "MKTCAP" not in ranking_query
+    assert "symbol_master" not in ranking_query
+    # The window has to end at the backtest start, not at today.
+    assert "CURRENT_DATE - make_interval(days => %s)" in ranking_query
+
+
+def test_backtest_universe_clamps_an_as_of_date_that_predates_the_warehouse() -> None:
+    """A ten-year lookback resolves to 2015-11 against data that starts 2016-05.
+
+    Left alone that returns nothing and the backtest silently runs on the recommended
+    names only. Falling back to today's ranking instead would reintroduce exactly the
+    bias this replaces, so the as-of date is clamped forward to the first date with a
+    full ranking window behind it.
+    """
+
+    conn = FakeScreeningConnection()
+
+    _universe_source()._fetch_backtest_universe(conn, [])
+
+    ranking_query = next(
+        query for query, _ in conn.calls if "WITH bounds AS" in query
+    )
+    assert "GREATEST" in ranking_query
+    assert f"SELECT min(time) FROM feature.kis_adjusted_ohlcv_daily" in ranking_query
+
+
+def test_backtest_universe_unions_recommendations_without_duplicating_them() -> None:
+    """A recommended name stays tradable, but never appears twice."""
+
+    source = _universe_source()
+
+    inside, inside_descriptor = source._fetch_backtest_universe(
+        FakeScreeningConnection(), ["000660"]
+    )
+    outside, outside_descriptor = source._fetch_backtest_universe(
+        FakeScreeningConnection(), ["999999"]
+    )
+
+    assert inside == ["000660"]
+    assert inside_descriptor["recommended_unioned"] == 0
+    assert outside == ["999999", "000660"]
+    assert outside_descriptor["recommended_unioned"] == 1

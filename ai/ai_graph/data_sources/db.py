@@ -63,6 +63,14 @@ POSTGRES_TIMEOUT_UNIT = "ms"
 # asked for 20.7 years of date partitions to retrieve 10 years of bars, doubling the
 # partitions locked and scanned on the heaviest query in the pipeline for nothing.
 BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 1.55
+# Backtest universe, selected as of the START of the backtest window rather than today.
+BACKTEST_UNIVERSE_SIZE = 200
+# Ranking window ending at the backtest start. Long enough that one quiet month does not
+# decide membership, short enough to stay inside a couple of Timescale chunks.
+BACKTEST_UNIVERSE_RANKING_WINDOW_DAYS = 90
+# A name has to have actually traded through the ranking window to be in the universe;
+# this rejects names that were suspended or listed days before the cut.
+BACKTEST_UNIVERSE_MIN_BARS = 30
 RSI_OVERSOLD_THRESHOLD = 30.0
 # Sentinel profile whose WHERE clause is the permissive `close > 0` baseline: screening
 # selects the whole universe once and filters it per relaxation round in-process.
@@ -244,6 +252,7 @@ class PostgresPipelineDataSource:
             indicator_families = indicator_families_for_query(query)
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
+            universe_descriptor: dict[str, Any] = {"selection": "single_ticker"}
             ticker_resolution = "screening"
             already_screened = _query_requests_screening(query)
             if already_screened:
@@ -290,7 +299,9 @@ class PostgresPipelineDataSource:
                 recommended = _backtest_ticker_pool(
                     screening_candidates, self.config.backtest_max_tickers
                 )
-                tickers = self._fetch_backtest_universe(conn, recommended)
+                tickers, universe_descriptor = self._fetch_backtest_universe(
+                    conn, recommended
+                )
                 ticker = recommended[0]
                 symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
@@ -357,15 +368,20 @@ class PostgresPipelineDataSource:
                 "backtest_lookback_days": effective_lookback_days,
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_rows": len(l4_evidence),
-                "universe_source": SYMBOL_MASTER_TABLE,
+                # The universe is no longer symbol_master's present-day ranking; the
+                # descriptor records the as-of date it was actually rebuilt for.
+                "universe_source": universe_descriptor.get("source", SYMBOL_MASTER_TABLE),
+                "backtest_universe": universe_descriptor,
                 "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
                 "macro_status": macro_status,
             },
         )
 
-    def _fetch_backtest_universe(self, conn: Any, recommended: Sequence[str]) -> list[str]:
-        """The universe the backtest actually trades over: KOSPI 200.
+    def _fetch_backtest_universe(
+        self, conn: Any, recommended: Sequence[str]
+    ) -> tuple[list[str], dict[str, Any]]:
+        """The universe the backtest trades over, as it stood when the backtest starts.
 
         The screen answers "which names meet the condition today"; using that as the
         backtest universe means trading only the two stocks that happen to be at a
@@ -374,28 +390,98 @@ class PostgresPipelineDataSource:
         generated build_signals already decides entries per date from each stock's own
         history, so it just needs a fixed, outcome-independent market to trade in.
 
-        KOSPI 200 is that market. There is no index-membership table, so it is
-        approximated the standard way - the 200 largest KOSPI common stocks by market
-        cap (MKTCAP on symbol_master). The strategy's recommended names are unioned in so
-        they remain tradable even if one sits just outside the top 200.
+        That market used to be "the 200 largest KOSPI names by MKTCAP on symbol_master",
+        which is today's ranking applied to a ten-year-old start date - a pure
+        survivorship filter. Measured against a universe selected as of the start, it
+        overstated the ten-year return of the same strategy by 22-44 percentage points,
+        because every name in it is, by construction, one that survived to be large
+        today. It also could not be reproduced: symbol_master is bulk-rewritten daily,
+        so the same request returned a different universe and a materially different
+        headline from one day to the next.
+
+        The ranking is rebuilt here from the price history instead, over the 90 days
+        ending at the backtest start. That keeps names that later delisted, which is the
+        whole point, and it is stable because past bars do not change. Traded value
+        stands in for market cap: MKTCAP is a single present-day scalar with no history,
+        so it cannot be evaluated as of any earlier date.
+
+        The listing metadata cannot help here. `listing_status` is 'delisted' for all
+        3,238 rows, `delisted_at` is bulk-stamped to the load date, and every
+        symbol_listing_history delisted interval carries the same load timestamp - so
+        none of the three distinguishes a live name from a dead one. A name that has
+        bars through the ranking window was trading; that is the only signal left.
+
+        The strategy's recommended names are still unioned in so a recommendation stays
+        tradable. Those come from today's screen, so they do carry the look-ahead this
+        method otherwise removes; they are reported separately in the descriptor rather
+        than being folded in silently.
         """
 
-        rows = conn.execute(
-            """
-            SELECT symbol
-            FROM core.symbol_master
-            WHERE market = 'KOSPI'
-              AND security_type = '보통주'
-              AND metadata_jsonb->>'MKTCAP' ~ '^[0-9]+$'
-            ORDER BY (metadata_jsonb->>'MKTCAP')::numeric DESC
-            LIMIT 200
-            """
-        ).fetchall()
-        universe = [str(row["symbol"]).zfill(6) for row in rows]
+        lookback_days = self.config.backtest_lookback_days
+        calendar_lookback_days = int(
+            lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
+        )
+        universe, as_of, window_days = self._rank_universe_as_of(
+            conn, calendar_lookback_days
+        )
         seen = set(universe)
-        # Recommended names first, then KOSPI 200, so a recommendation is never dropped.
+        # Recommended names first, then the ranked universe, so a recommendation is
+        # never dropped for sitting outside the cut.
         extra = [t for t in (str(x).zfill(6) for x in recommended) if t not in seen]
-        return [*extra, *universe]
+        descriptor = {
+            "selection": "traded_value_as_of_backtest_start",
+            "as_of": as_of.isoformat() if as_of else None,
+            "ranking_window_days": window_days,
+            "ranked_size": len(universe),
+            "recommended_unioned": len(extra),
+            "source": KIS_ADJUSTED_OHLCV_TABLE,
+        }
+        return [*extra, *universe], descriptor
+
+    def _rank_universe_as_of(
+        self, conn: Any, calendar_lookback_days: int
+    ) -> tuple[list[str], date | None, int]:
+        """Top names by traded value over the window ending at the backtest start.
+
+        The requested start is normally earlier than the warehouse goes: a ten-year
+        lookback resolves to 2015-11 against data that begins 2016-05. The as-of date is
+        therefore clamped forward to the first date with a full ranking window behind
+        it, so an over-long lookback yields the earliest universe that can be ranked
+        rather than an empty one. Ranking today's numbers instead is not an option -
+        that is the survivorship defect this replaces.
+        """
+
+        window_days = BACKTEST_UNIVERSE_RANKING_WINDOW_DAYS
+        rows = conn.execute(
+            f"""
+            WITH bounds AS (
+                SELECT GREATEST(
+                         CURRENT_DATE - make_interval(days => %s),
+                         (SELECT min(time) FROM {KIS_ADJUSTED_OHLCV_TABLE})
+                           + make_interval(days => %s)
+                       )::date AS as_of
+            )
+            SELECT split_part(o.ticker, '#', 1) AS symbol,
+                   min(b.as_of) AS as_of
+            FROM {KIS_ADJUSTED_OHLCV_TABLE} o
+            CROSS JOIN bounds b
+            WHERE o.time >= b.as_of - make_interval(days => %s)
+              AND o.time <  b.as_of
+            GROUP BY 1
+            HAVING count(*) >= %s
+            ORDER BY avg(o.adj_close * o.adj_volume) DESC NULLS LAST
+            LIMIT %s
+            """,
+            [
+                calendar_lookback_days,
+                window_days,
+                window_days,
+                BACKTEST_UNIVERSE_MIN_BARS,
+                BACKTEST_UNIVERSE_SIZE,
+            ],
+        ).fetchall()
+        as_of = _date_value(rows[0]["as_of"]) if rows else None
+        return [str(row["symbol"]).zfill(6) for row in rows], as_of, window_days
 
     def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
         return self._screen_with_relaxation(conn, query)[0]
