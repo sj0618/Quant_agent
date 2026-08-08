@@ -17,11 +17,16 @@ from ai_graph.nodes.condition_compiler import (
     derived_series_spec,
     percent_scale,
 )
-from ai_graph.quant_strategy import compute_academic_factor_arrays
+from ai_graph.quant_strategy import (
+    AUTOMATIC_TOURNAMENT_PROFILES,
+    MOMENTUM_LONG_LOOKBACK,
+    REBALANCE_INTERVAL_DAYS,
+    compute_academic_factor_arrays,
+)
 from ai_graph.schemas import CandidateParameters, Condition, ConditionOperator, StrategyIR
 
 
-FEATURE_DEFINITION_VERSION = "structured-features.v1"
+FEATURE_DEFINITION_VERSION = "structured-features.v2"
 
 READY = 0
 AVERAGE = 1
@@ -274,6 +279,8 @@ class PreparedFeatureStore:
 
     def _profile_actions(self, parameters: CandidateParameters) -> array:
         features = self.features(parameters.lookback)
+        if parameters.profile in AUTOMATIC_TOURNAMENT_PROFILES:
+            return self._rotation_profile_actions(parameters, features)
         actions = array("b", [0]) * len(self.rows)
         states: dict[str, list[float | bool | int]] = {}
         profile = parameters.profile
@@ -536,6 +543,128 @@ class PreparedFeatureStore:
                 elif bool(state[0]):
                     state[2] = int(state[2]) + 1
                     state[3] = max(float(state[3]), close)
+        return actions
+
+    def _rotation_profile_actions(
+        self,
+        parameters: CandidateParameters,
+        features: np.ndarray,
+    ) -> array:
+        """Monthly cross-sectional momentum rotation with past-only features.
+
+        The previous automatic profiles treated each stock independently and took
+        profits at a fixed percentage. That systematically cut the few large winners
+        which drive a momentum portfolio. Rotation instead constructs one portfolio:
+        rank the whole universe on a fixed schedule, keep leaders that remain leaders,
+        and replace only names that fall out of the target set.
+        """
+
+        actions = array("b", [0]) * len(self.rows)
+        states: dict[str, list[float | bool | int]] = {}
+        profile = parameters.profile
+        threshold = parameters.threshold
+
+        for date_index, (start, end) in enumerate(self.date_ranges):
+            rotation_day = (
+                date_index >= MOMENTUM_LONG_LOOKBACK
+                and (date_index - MOMENTUM_LONG_LOOKBACK) % REBALANCE_INTERVAL_DAYS == 0
+            )
+            observations: list[tuple[int, str, float, float, float, float, float]] = []
+            for index in range(start, end):
+                row = features[index]
+                if not row[READY]:
+                    continue
+                values = [
+                    row[MOMENTUM_12_1],
+                    row[MEDIUM_RETURN],
+                    row[SMA_200],
+                ]
+                if profile == "risk_adjusted_momentum_rotation":
+                    values.append(row[REALIZED_VOLATILITY_21D])
+                if not all(isfinite(value) for value in values):
+                    continue
+                observations.append(
+                    (
+                        index,
+                        self.tickers[index],
+                        float(self.close[index]),
+                        float(row[MOMENTUM_12_1]),
+                        float(row[MEDIUM_RETURN]),
+                        float(row[REALIZED_VOLATILITY_21D]),
+                        float(row[SMA_200]),
+                    )
+                )
+
+            target: set[str] = set()
+            if rotation_day and observations:
+                momentum_ranks = _percentile_ranks(
+                    [(ticker, momentum) for _, ticker, _, momentum, _, _, _ in observations]
+                )
+                medium_ranks = _percentile_ranks(
+                    [(ticker, medium) for _, ticker, _, _, medium, _, _ in observations]
+                )
+                volatility_ranks = (
+                    _percentile_ranks(
+                        [
+                            (ticker, volatility)
+                            for _, ticker, _, _, _, volatility, _ in observations
+                        ]
+                    )
+                    if profile == "risk_adjusted_momentum_rotation"
+                    else {}
+                )
+                ranked: list[tuple[float, str]] = []
+                for _, ticker, close, momentum, medium, volatility, sma_200 in observations:
+                    if profile == "relative_momentum_rotation":
+                        eligible = momentum > threshold and close >= sma_200
+                        score = momentum_ranks[ticker]
+                    elif profile == "risk_adjusted_momentum_rotation":
+                        eligible = (
+                            momentum > threshold
+                            and medium > 0.0
+                            and close >= sma_200
+                            and volatility <= 0.65
+                        )
+                        score = (
+                            momentum_ranks[ticker] * 0.55
+                            + medium_ranks[ticker] * 0.30
+                            - volatility_ranks[ticker] * 0.15
+                        )
+                    else:
+                        eligible = medium > threshold and close >= sma_200
+                        score = (
+                            medium_ranks[ticker] * 0.65
+                            + momentum_ranks[ticker] * 0.35
+                        )
+                    if eligible:
+                        ranked.append((score, ticker))
+                ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                target = {ticker for _, ticker in ranked[: parameters.max_positions]}
+
+            for index in range(start, end):
+                ticker = self.tickers[index]
+                close = float(self.close[index])
+                state = states.setdefault(ticker, [False, 0.0, 0, 0.0])
+                in_position = bool(state[0])
+                risk_exit = False
+                if in_position and float(state[1]) > 0.0:
+                    state[2] = int(state[2]) + 1
+                    state[3] = max(float(state[3]), close)
+                    pnl = close / float(state[1]) - 1.0
+                    trailing_stop = float(state[3]) > 0.0 and close < float(state[3]) * 0.75
+                    risk_exit = (
+                        pnl <= -parameters.stop_loss_pct
+                        or pnl >= parameters.take_profit_pct
+                        or trailing_stop
+                    )
+
+                if in_position and (risk_exit or (rotation_day and ticker not in target)):
+                    actions[index] = -1
+                    state[:] = [False, 0.0, 0, 0.0]
+                elif rotation_day and ticker in target and not in_position:
+                    actions[index] = 1
+                    state[:] = [True, close, 0, close]
+
         return actions
 
     def _compiled_actions(
@@ -949,6 +1078,28 @@ class PreparedFeatureStore:
         output.setflags(write=False)
         self._rolling_cache[key] = output
         return output
+
+
+def _percentile_ranks(values: Sequence[tuple[str, float]]) -> dict[str, float]:
+    """Cross-sectional percentile ranks with equal values receiving equal ranks."""
+
+    ordered = sorted(values, key=lambda item: (item[1], item[0]))
+    if not ordered:
+        return {}
+    if len(ordered) == 1:
+        return {ordered[0][0]: 1.0}
+    output: dict[str, float] = {}
+    start = 0
+    while start < len(ordered):
+        end = start + 1
+        while end < len(ordered) and ordered[end][1] == ordered[start][1]:
+            end += 1
+        average_position = (start + end - 1) / 2.0
+        percentile = average_position / (len(ordered) - 1)
+        for index in range(start, end):
+            output[ordered[index][0]] = percentile
+        start = end
+    return output
 
 
 def _optional_metric(row: Mapping[str, Any], *keys: str) -> float:

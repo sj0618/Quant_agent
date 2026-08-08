@@ -382,6 +382,29 @@ def test_selection_score_does_not_peek_at_holdout_sharpe() -> None:
     )
 
 
+def test_selection_score_rewards_training_return_when_risk_is_equal() -> None:
+    rows = _rows(days=300)
+    common = dict(
+        sharpe_ratio=0.8,
+        max_drawdown=-0.15,
+        win_rate=0.55,
+        total_return=0.4,
+        in_sample_sharpe=0.8,
+        out_sample_sharpe=0.7,
+        degradation=0.1,
+        in_sample_max_drawdown=-0.15,
+    )
+    lower_return = BacktestMetrics(**common, in_sample_return=0.10)
+    higher_return = BacktestMetrics(**common, in_sample_return=0.30)
+    summary = {"selection_buy_count": 12}
+
+    assert backtest_node._objective_score(
+        higher_return,
+        summary,
+        rows,
+    ) > backtest_node._objective_score(lower_return, summary, rows)
+
+
 def test_temporary_relaxed_objective_floor_boundaries() -> None:
     metrics = BacktestMetrics(
         sharpe_ratio=0.0,

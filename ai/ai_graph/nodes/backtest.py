@@ -1435,7 +1435,7 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                     "candidate_timeout_seconds": _candidate_timeout_seconds(),
                     "wall_budget_seconds": _wall_budget_seconds(),
                     "selection_policy": (
-                        "pre_registered_three_family_holdout"
+                        "performance_momentum_train_select_holdout_validate"
                         if strategy_a.selection_mode == "automatic"
                         else "bounded_candidate_refinement"
                     ),
@@ -1962,16 +1962,26 @@ def _objective_score(
     )
     annual_return = _annualized_return(metrics.in_sample_return, trading_days=selection_days)
     calmar = _calmar_ratio(annual_return, metrics.in_sample_max_drawdown)
+    dates = sorted({str(row.get("date")) for row in price_rows})
+    cutoff = dates[max(0, selection_days - 1)] if dates else ""
+    selection_rows = [row for row in price_rows if str(row.get("date")) <= cutoff]
+    _, benchmark_return = _equal_weight_benchmark_curve(selection_rows)
+    annual_benchmark_return = _annualized_return(
+        float(benchmark_return or 0.0),
+        trading_days=selection_days,
+    )
+    annual_excess_return = annual_return - annual_benchmark_return
     trading_days = selection_days
     annual_turnover = trade_count * 252.0 / trading_days
     turnover_penalty = min(1.0, annual_turnover / 24.0)
     # The hold-out must not affect selection.  It is only used by the objective floor
     # after a candidate has been selected.
     score = (
-        1.00 * metrics.in_sample_sharpe
-        + 0.05 * calmar
-        + 0.02 * annual_return
-        - 0.08 * turnover_penalty
+        0.65 * metrics.in_sample_sharpe
+        + 0.15 * calmar
+        + 0.55 * annual_return
+        + 0.20 * annual_excess_return
+        - 0.05 * turnover_penalty
     )
     if trade_count < MIN_OBJECTIVE_TRADES:
         score -= (MIN_OBJECTIVE_TRADES - trade_count) * 0.05
@@ -1981,6 +1991,8 @@ def _objective_score(
         score -= abs(metrics.in_sample_max_drawdown - MAX_OBJECTIVE_DRAWDOWN)
     if metrics.in_sample_sharpe < MIN_OBJECTIVE_SHARPE:
         score -= (MIN_OBJECTIVE_SHARPE - metrics.in_sample_sharpe) * 0.25
+    if annual_return <= 0.0:
+        score -= 0.25 + abs(annual_return) * 0.5
     return round(score, METRIC_ROUND_DIGITS)
 
 

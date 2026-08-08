@@ -217,13 +217,13 @@ def test_public_explanation_matches_the_selected_automatic_profile() -> None:
         engine_summary={"effective_trade_count": 12},
     )
     payload["strategy_a"]["selection_mode"] = "automatic"
-    payload["strategy_a"]["strategy_id"] = "automatic_robust_tournament_a"
+    payload["strategy_a"]["strategy_id"] = "automatic_performance_momentum_a"
     parameters = CandidateParameters(
-        profile="low_vol_momentum",
-        lookback=126,
-        threshold=0.03,
-        stop_loss_pct=0.08,
-        take_profit_pct=0.45,
+        profile="risk_adjusted_momentum_rotation",
+        lookback=252,
+        threshold=0.0,
+        stop_loss_pct=0.20,
+        take_profit_pct=10.0,
         max_positions=10,
     ).model_dump()
     payload["selected_candidate"]["parameters"] = parameters
@@ -238,13 +238,16 @@ def test_public_explanation_matches_the_selected_automatic_profile() -> None:
     assert performance is not None
     explanation = performance.strategy_explanation
     assert explanation is not None
-    assert explanation.title == "저변동 모멘텀 전략"
-    assert "126거래일" in explanation.summary
+    assert explanation.title == "변동성 조절 복합 모멘텀 순환 전략"
+    assert "12-1 모멘텀" in explanation.summary
     assert "마지막 30%" in explanation.why_selected
     assert {item.key for item in explanation.indicators} == {
-        "medium_momentum_126d",
-        "price_range_volatility",
-        "trend_risk_exit",
+        "cross_sectional_rank",
+        "momentum_blend",
+        "realized_volatility_21d",
+        "sma_200_regime",
+        "winner_hold",
+        "crash_risk_guard",
     }
 
 

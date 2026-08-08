@@ -1796,8 +1796,15 @@ def build_strategy_spec(
         indicators=conditions.indicators or profile["indicators"],
         risk_constraints={
             "max_position_pct": 0.1,
-            "stop_loss_pct": 0.08,
-            **({"rebalance_interval_days": 21} if selection_mode == "automatic" else {}),
+            "stop_loss_pct": 0.20 if selection_mode == "automatic" else 0.08,
+            **(
+                {
+                    "take_profit_pct": 10.0,
+                    "rebalance_interval_days": 21,
+                }
+                if selection_mode == "automatic"
+                else {}
+            ),
         },
         assumptions=[
             f"sector filter: {sector}" if sector else "all matching listed common stocks",
@@ -1842,8 +1849,8 @@ def _strategy_profile_base(
     slot_event = set(semantic_slots.get("event", [])) if semantic_slots else set()
     if (selection_mode or classify_strategy_request(query)) == "automatic":
         return {
-            "strategy_id": "automatic_robust_tournament",
-            "name": "연구 기반 3계열 퀀트 전략 자동선택",
+            "strategy_id": "automatic_performance_momentum",
+            "name": "성과 우선 모멘텀 순환 전략 자동선택",
             "entry_conditions": [
                 Condition(
                     left="past_only_signal",
@@ -1873,23 +1880,25 @@ def _strategy_profile_base(
                 )
             ],
             "indicators": [
+                "cross_sectional_rank",
                 "momentum_12_1",
-                "SMA50",
-                "SMA100",
-                "SMA200",
                 "medium_momentum_126d",
+                "SMA200",
                 "realized_volatility_21d",
-                "price_range_volatility",
+                "rebalance_21d",
+                "crash_risk_guard",
             ],
             "assumptions": [
-                "12-1 모멘텀·장기 추세, 다중 이동평균 추세, 저변동 모멘텀을 고정 후보로 사용",
+                "12-1 상대강도, 변동성 조절 복합 모멘텀, 6개월·12-1 주도주 순환을 고정 후보로 사용",
                 "앞 70% 구간만 후보 선택에 사용하고 마지막 30%는 별도 검증",
                 "지표는 평가 시점까지 알려진 조정 종가만 사용",
+                "45% 같은 조기 고정 익절로 큰 승자를 자르지 않고 월간 상대 순위와 장기 추세가 유지되면 보유",
+                "종목당 10%, 최대 10종목 분산과 20% 손실 제한을 적용",
                 "후보 수와 기본 파라미터를 백테스트 전에 고정해 과최적화 탐색을 제한",
                 "과거 연구와 백테스트는 미래 수익을 보장하지 않음",
             ],
             "source_refs": robust_strategy_source_refs(),
-            "confidence": 0.82,
+            "confidence": 0.84,
         }
     if _is_pullback_rsi_volume_query(query):
         return {
