@@ -1816,6 +1816,10 @@ def build_strategy_spec(
             "investment_horizon": automatic_preferences.horizon,
             "benchmark_objective": "fixed_universe_excess_return",
             "benchmark_evaluation_period_days": 126,
+            # The generic automatic StrategySpec intentionally has broad indicators.
+            # Preserve the normalized request so the pre-registered catalog can tell
+            # "low volatility" from "breakout" without inspecting any return data.
+            "catalog_query": preference_query,
         }
         style_label = {
             "aggressive": "공격형",

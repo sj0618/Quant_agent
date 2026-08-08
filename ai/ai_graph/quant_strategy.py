@@ -33,14 +33,14 @@ AQR_TIME_SERIES_MOMENTUM_SOURCE = (
 )
 MSCI_MOMENTUM_METHODOLOGY_SOURCE = (
     "https://www.msci.com/indexes/documents/methodology/"
-    "2_MSCI_Momentum_Indexes_Methodology_20250725.pdf"
+    "2_MSCI_Momentum_Indexes_Methodology_20250417.pdf"
 )
 NBER_BENCHMARKING_SOURCE = "https://www.nber.org/papers/w12461"
 BACKTEST_OVERFITTING_SOURCE = "https://academic.oup.com/jrssig/article/18/6/22/7038278"
 
-# These are three pre-registered momentum constructions, not dozens of thresholds
-# searched after seeing returns. Keeping the menu small and fixed limits the chance
-# that the apparent winner is merely the luckiest data-mined variant.
+# These are the default automatic priorities and the compatibility fallback for
+# results created before the blueprint catalog. An explicit user preference may pick
+# other pre-registered profiles, but selection still happens before returns are read.
 AUTOMATIC_TOURNAMENT_PROFILES = (
     "relative_momentum_rotation",
     "risk_adjusted_momentum_rotation",

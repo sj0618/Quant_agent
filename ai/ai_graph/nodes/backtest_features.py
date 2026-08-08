@@ -456,7 +456,9 @@ class PreparedFeatureStore:
                         sell = in_position and close < average
                     if in_position and float(state[1]) > 0.0:
                         pnl = close / float(state[1]) - 1.0
-                        trailing_stop = float(state[3]) > 0.0 and close < float(state[3]) * 0.93
+                        trailing_stop = float(state[3]) > 0.0 and close < float(state[3]) * (
+                            1.0 - parameters.trailing_stop_pct
+                        )
                         sell = (
                             sell
                             or pnl <= -parameters.stop_loss_pct

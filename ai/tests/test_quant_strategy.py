@@ -279,8 +279,8 @@ def test_user_risk_and_horizon_customize_the_automatic_candidate_menu() -> None:
     assert defensive_plan.lookbacks == [252, 252, 252]
     assert defensive_plan.candidate_profiles == [
         "risk_adjusted_momentum_rotation",
-        "relative_momentum_rotation",
-        "trend_leader_rotation",
+        "low_vol_momentum",
+        "quality_trend_hold",
     ]
     assert defensive.risk_constraints["stop_loss_pct"] == 0.12
     assert defensive.risk_constraints["trailing_stop_pct"] == 0.15

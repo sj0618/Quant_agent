@@ -196,9 +196,10 @@ def rule_provenance(
 ) -> dict[str, Any]:
     """Which rule the backtest actually traded, stated by the backtest.
 
-    `compiled_conditions` means the user's concrete rule was traded. Every profile in
-    the fixed automatic tournament is also an intended rule when the user delegated
-    selection. Any other generic profile is a substitution that must remain visible.
+    `compiled_conditions` means the user's concrete rule was traded. Profiles recorded
+    in the catalog blueprints are also intended rules when the user delegated selection.
+    Any other generic profile is a substitution that must remain visible. The legacy
+    three-profile menu is accepted only for older results without catalog metadata.
     """
 
     from ai_graph.nodes.condition_compiler import compile_conditions
@@ -207,8 +208,14 @@ def rule_provenance(
     selected = backtest.get("selected_candidate") or {}
     profile = ((selected.get("parameters") or {}).get("profile")) or "unknown"
     requested = [str(c.get("left")) for c in (entry_conditions or []) if c.get("left")]
-    intended_automatic_profile = (
-        selection_mode == "automatic" and profile in AUTOMATIC_TOURNAMENT_PROFILES
+    catalog_profiles = {
+        str(item.get("profile"))
+        for item in (backtest.get("generated_strategy_blueprints") or [])
+        if isinstance(item, Mapping) and item.get("profile")
+    }
+    intended_automatic_profile = selection_mode == "automatic" and (
+        profile in catalog_profiles
+        or (not catalog_profiles and profile in AUTOMATIC_TOURNAMENT_PROFILES)
     )
     substituted = profile != "compiled_conditions" and not intended_automatic_profile
 
