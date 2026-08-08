@@ -381,6 +381,7 @@ jobs:
           command -v taskset >/dev/null
 
           cd "$APP_DIR/ai"
+          export AI_LLM_PROVIDER=mock
           export OMP_NUM_THREADS=1
           export OPENBLAS_NUM_THREADS=1
           export MKL_NUM_THREADS=1
