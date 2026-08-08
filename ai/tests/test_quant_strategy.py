@@ -4,6 +4,7 @@ from datetime import date, timedelta
 
 import numpy as np
 
+from ai_graph import run_analysis
 from ai_graph.graph import build_strategy_spec
 from ai_graph.nodes.backtest_code import (
     Loop3Request,
@@ -129,6 +130,24 @@ def test_automatic_request_builds_cited_academic_plan() -> None:
         "realized_volatility_21d",
         "rebalance_21d",
     }
+
+
+def test_automatic_profile_is_reported_as_the_intended_rule() -> None:
+    envelope = run_analysis(
+        "사람들이 많이 쓰는 검증된 퀀트 전략으로 자동 추천해줘",
+        trace_id="automatic-profile-provenance",
+    )
+
+    assert envelope.status == "ready"
+    assert envelope.strategy_spec is not None
+    assert envelope.strategy_spec.selection_mode == "automatic"
+    assert envelope.rule_provenance is not None
+    assert envelope.rule_provenance.substituted is False
+    assert (
+        envelope.rule_provenance.evaluated_rule
+        == "automatic_profile:academic_momentum_trend"
+    )
+    assert envelope.rule_provenance.untranslatable_conditions == []
 
 
 def test_automatic_profile_waits_for_history_and_monthly_rebalance() -> None:
