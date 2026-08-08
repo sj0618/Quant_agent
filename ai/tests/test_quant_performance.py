@@ -4,7 +4,13 @@ from ai_graph import graph
 from ai_graph import quant_performance
 from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_performance import build_public_backtest_performance
-from ai_graph.schemas import BacktestMetrics, CodeCandidate, Condition, StrategySpec
+from ai_graph.schemas import (
+    BacktestMetrics,
+    CandidateParameters,
+    CodeCandidate,
+    Condition,
+    StrategySpec,
+)
 
 
 def _make_strategy() -> StrategySpec:
@@ -44,9 +50,7 @@ def _build_payload(
     }
 
 
-def _rows(
-    start: datetime, trading_days: int, ticker_count: int = 5
-) -> list[dict]:
+def _rows(start: datetime, trading_days: int, ticker_count: int = 5) -> list[dict]:
     tickers = [f"{idx + 1:06d}" for idx in range(ticker_count)]
     rows: list[dict] = []
     for day in range(trading_days):
@@ -151,13 +155,11 @@ def test_public_performance_source_refs_are_propagated_from_explanations() -> No
     )
     assert performance is not None
     details = {item.key: item for item in performance.metric_details}
-    assert (
-        details["sharpe_ratio"].source_refs
-        == metric_explanation("sharpe_ratio").get("source_refs")
+    assert details["sharpe_ratio"].source_refs == metric_explanation("sharpe_ratio").get(
+        "source_refs"
     )
-    assert (
-        details["benchmark_return"].source_refs
-        == metric_explanation("benchmark_return").get("source_refs")
+    assert details["benchmark_return"].source_refs == metric_explanation("benchmark_return").get(
+        "source_refs"
     )
     assert details["total_return"].unit == "percent"
 
@@ -196,10 +198,54 @@ def test_public_performance_includes_beginner_strategy_explanation() -> None:
     assert "자동" in performance.strategy_explanation.why_selected
     assert "미래 수익을 보장하지 않습니다" in performance.strategy_explanation.caution
     assert any(
-        item.key == "momentum_12_1"
-        and item.source_refs
+        item.key == "momentum_12_1" and item.source_refs
         for item in performance.strategy_explanation.indicators
     )
+
+
+def test_public_explanation_matches_the_selected_automatic_profile() -> None:
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.9,
+            max_drawdown=-0.08,
+            win_rate=0.52,
+            total_return=0.15,
+            in_sample_sharpe=0.7,
+            out_sample_sharpe=1.1,
+            degradation=-0.4,
+        ),
+        engine_summary={"effective_trade_count": 12},
+    )
+    payload["strategy_a"]["selection_mode"] = "automatic"
+    payload["strategy_a"]["strategy_id"] = "automatic_robust_tournament_a"
+    parameters = CandidateParameters(
+        profile="low_vol_momentum",
+        lookback=126,
+        threshold=0.03,
+        stop_loss_pct=0.08,
+        take_profit_pct=0.45,
+        max_positions=10,
+    ).model_dump()
+    payload["selected_candidate"]["parameters"] = parameters
+    payload["candidates"][0]["parameters"] = parameters
+
+    performance = build_public_backtest_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    explanation = performance.strategy_explanation
+    assert explanation is not None
+    assert explanation.title == "저변동 모멘텀 전략"
+    assert "126거래일" in explanation.summary
+    assert "마지막 30%" in explanation.why_selected
+    assert {item.key for item in explanation.indicators} == {
+        "medium_momentum_126d",
+        "price_range_volatility",
+        "trend_risk_exit",
+    }
 
 
 def test_public_performance_reliability_boundary_cases() -> None:

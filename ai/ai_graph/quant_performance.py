@@ -67,6 +67,7 @@ def build_public_backtest_performance(
     source = _pipeline_source(pipeline_data_source)
     reliability = _build_backtest_reliability(result, normalized_rows, source=source)
     benchmark = _build_public_benchmark(normalized_rows, reliability=reliability)
+    selected_parameters = result.selected_candidate.parameters
     return BacktestPerformance(
         selected_candidate_id=result.selected_candidate.candidate_id,
         metrics=result.selected_candidate.metrics,
@@ -80,7 +81,13 @@ def build_public_backtest_performance(
             reliability=reliability,
             benchmark=benchmark,
         ),
-        strategy_explanation=build_strategy_explanation(result.strategy_a),
+        strategy_explanation=build_strategy_explanation(
+            result.strategy_a,
+            selected_profile=(
+                selected_parameters.profile if selected_parameters is not None else None
+            ),
+            selected_parameters=selected_parameters,
+        ),
     )
 
 
@@ -102,9 +109,7 @@ def _build_backtest_reliability(
     source: Literal["fixture", "postgres", "unknown"],
 ) -> BacktestReliability:
     row_count = len(price_rows)
-    dates = sorted(
-        {str(row.get("date")) for row in price_rows if row.get("date") is not None}
-    )
+    dates = sorted({str(row.get("date")) for row in price_rows if row.get("date") is not None})
     trading_days = len(dates)
     ticker_count = len(
         {
@@ -127,18 +132,18 @@ def _build_backtest_reliability(
             f"거래일 수가 {_RELIABILITY_SHORT_TERM_DAYS}일 미만입니다. ({trading_days}일)"
         )
     if ticker_count < MIN_RELIABLE_TICKERS:
-        reasons.append(
-            f"종목 수가 {MIN_RELIABLE_TICKERS}개 미만입니다. ({ticker_count}개)"
-        )
+        reasons.append(f"종목 수가 {MIN_RELIABLE_TICKERS}개 미만입니다. ({ticker_count}개)")
 
     if source == "unknown":
         warnings.append("데이터 소스가 unknown입니다.")
-    if source == "postgres" and trading_days < _RELIABILITY_MIN_DAYS and trading_days >= _RELIABILITY_SHORT_TERM_DAYS:
+    if (
+        source == "postgres"
+        and trading_days < _RELIABILITY_MIN_DAYS
+        and trading_days >= _RELIABILITY_SHORT_TERM_DAYS
+    ):
         warnings.append("PostgreSQL은 거래일 252일 이상일 때만 충분 조건을 충족합니다.")
     if trade_count < MIN_OBJECTIVE_TRADES:
-        warnings.append(
-            f"유효 거래 수가 기준 미달입니다. ({trade_count} < {MIN_OBJECTIVE_TRADES})"
-        )
+        warnings.append(f"유효 거래 수가 기준 미달입니다. ({trade_count} < {MIN_OBJECTIVE_TRADES})")
 
     if reasons:
         status: Literal["insufficient", "limited", "sufficient"] = "insufficient"
@@ -237,9 +242,7 @@ def _build_public_metric_details(
     values: dict[str, float | None] = {
         "total_return": _safe_metric(metrics.total_return),
         "cagr": _metric_summary(summary, ("cagr",)),
-        "annualized_volatility": _metric_summary(
-            summary, ("annualized_volatility", "volatility")
-        ),
+        "annualized_volatility": _metric_summary(summary, ("annualized_volatility", "volatility")),
         "sharpe_ratio": _safe_metric(metrics.sharpe_ratio),
         "sortino_ratio": _metric_summary(summary, ("sortino_ratio", "sortino")),
         "max_drawdown": _safe_metric(metrics.max_drawdown),
@@ -259,12 +262,9 @@ def _build_public_metric_details(
         values["excess_return"] = None
     else:
         unavailable_reason = None
-        values["benchmark_return"] = (
-            benchmark.total_return if benchmark.is_available else None
-        )
-        if (
-            _is_numeric_metric(values["total_return"])
-            and _is_numeric_metric(values["benchmark_return"])
+        values["benchmark_return"] = benchmark.total_return if benchmark.is_available else None
+        if _is_numeric_metric(values["total_return"]) and _is_numeric_metric(
+            values["benchmark_return"]
         ):
             values["excess_return"] = float(values["total_return"]) - float(
                 values["benchmark_return"]
@@ -296,7 +296,9 @@ def _metric_detail(
         value=round(float(value), METRIC_ROUND_DIGITS) if is_available else None,
         unit=explanation["unit"],
         is_available=is_available,
-        unavailable_reason=None if is_available else (unavailable_reason or explanation.get("unavailable_reason")),
+        unavailable_reason=None
+        if is_available
+        else (unavailable_reason or explanation.get("unavailable_reason")),
         plain_explanation=explanation["plain_explanation"],
         why_used=explanation["why_used"],
         caution=explanation["caution"],

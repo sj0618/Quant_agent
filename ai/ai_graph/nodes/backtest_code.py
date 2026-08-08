@@ -35,6 +35,7 @@ from ai_graph.nodes.condition_compiler import (
     compile_conditions,
     indicator_row_keys,
 )
+from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
@@ -93,7 +94,9 @@ class Loop3Result(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     variant: str
-    candidates: list[CodeCandidate] = Field(min_length=MIN_GENERATED_CANDIDATES, max_length=MAX_GENERATED_CANDIDATES)
+    candidates: list[CodeCandidate] = Field(
+        min_length=MIN_GENERATED_CANDIDATES, max_length=MAX_GENERATED_CANDIDATES
+    )
     selected_candidate: CodeCandidate
     feature_mapping: FeatureMapping
     code_plan: CodeGenerationPlan
@@ -178,10 +181,9 @@ def _normalized_parameter_sets(
 ) -> list[CandidateParameters]:
     compiled = compile_conditions(strategy.entry_conditions) is not None
     defaults = _default_parameter_sets(strategy, plan, max_positions)
-    # Automatic mode has a public, cited behavior contract.  Model-proposed generic
-    # profiles could win the objective score while the UI still explained 12-1 momentum;
-    # compare threshold variants of the cited profile only so execution and explanation
-    # remain the same strategy.
+    # Automatic mode has a public, cited behavior contract. Model-proposed profiles are
+    # intentionally ignored: the fixed three-family tournament is chosen before seeing
+    # returns, so a language-model suggestion cannot expand the search after the fact.
     pool = defaults if strategy.selection_mode == "automatic" else [*proposed, *defaults]
     normalized: list[CandidateParameters] = []
     seen: set[str] = set()
@@ -220,7 +222,9 @@ def _default_parameter_sets(
 ) -> list[CandidateParameters]:
     profiles = _candidate_profiles(plan)
     compiled = compile_conditions(strategy.entry_conditions) is not None
-    if plan.entry_feature == "academic_momentum_trend":
+    if plan.entry_feature == "robust_strategy_tournament":
+        selected_profiles = list(AUTOMATIC_TOURNAMENT_PROFILES)
+    elif plan.entry_feature == "academic_momentum_trend":
         selected_profiles = ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES
     elif compiled:
         selected_profiles = ["compiled_conditions", profiles[0], profiles[1]]
@@ -479,7 +483,9 @@ def _generate_backtest_code_output(
                     request.max_positions,
                 ),
                 fallback_code=legacy_code[:MAX_GENERATED_CANDIDATES],
-                fallback_reasons=["Accepted legacy v1 response through the isolated Python fallback."],
+                fallback_reasons=[
+                    "Accepted legacy v1 response through the isolated Python fallback."
+                ],
             )
         else:
             output = BacktestCodeLLMOutput.model_validate(raw_output)
@@ -571,7 +577,9 @@ def _schema_validation_feedback(exc: ValidationError) -> list[str]:
 
 
 def map_strategy_features(strategy: StrategySpec) -> FeatureMapping:
-    requested = [condition.left for condition in strategy.entry_conditions + strategy.exit_conditions]
+    requested = [
+        condition.left for condition in strategy.entry_conditions + strategy.exit_conditions
+    ]
     direct_vocab = {
         "rsi",
         "relative_strength_20d",
@@ -620,9 +628,17 @@ def build_code_generation_plan(
 ) -> CodeGenerationPlan:
     strategy_id = strategy.strategy_id
     requested_text = " ".join(feature_mapping.requested_features + strategy.indicators).lower()
-    if strategy.selection_mode == "automatic" or strategy_id.startswith(
-        "automatic_academic_momentum"
-    ):
+    if strategy.selection_mode == "automatic":
+        return CodeGenerationPlan(
+            strategy_id=strategy_id,
+            entry_feature="robust_strategy_tournament",
+            exit_feature="selected_profile_trend_or_stop",
+            proxy_feature="past_only_price_factors",
+            lookbacks=[252, 200, 126],
+            thresholds=[0.0, 0.0, 0.03],
+            expected_trade_frequency="monthly_or_signal_change",
+        )
+    if strategy_id.startswith("automatic_academic_momentum"):
         return CodeGenerationPlan(
             strategy_id=strategy_id,
             entry_feature="academic_momentum_trend",
@@ -716,7 +732,9 @@ def _deterministic_fallback_candidates(
     plan: CodeGenerationPlan,
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[str]:
-    templates = _strategy_template_candidates(strategy) or MOCK_BACKTEST_CODE_LLM.generate_backtest_candidates(strategy, "A")
+    templates = _strategy_template_candidates(
+        strategy
+    ) or MOCK_BACKTEST_CODE_LLM.generate_backtest_candidates(strategy, "A")
     generated = _generated_strategy_candidates(strategy, plan, max_positions)
     return (generated + templates)[:MAX_GENERATED_CANDIDATES]
 
@@ -743,7 +761,7 @@ def _render_condition_signal_code(
     indicator_bindings = "\n            ".join(
         f'{key} = _ind(row, "{key}")' for key in indicator_row_keys()
     )
-    return f'''def build_signals(prices):
+    return f"""def build_signals(prices):
     def _avg(xs):
         return sum(xs) / len(xs) if xs else 0.0
     def _fin(row, key):
@@ -844,7 +862,7 @@ def _render_condition_signal_code(
             states[ticker]["entry_price"] = price
             held += 1
     return signals
-'''
+"""
 
 
 def _generated_strategy_candidates(
@@ -883,6 +901,8 @@ def _generated_strategy_candidates(
 
 
 def _candidate_profiles(plan: CodeGenerationPlan) -> list[StructuredProfile]:
+    if plan.entry_feature == "robust_strategy_tournament":
+        return list(AUTOMATIC_TOURNAMENT_PROFILES)  # type: ignore[return-value]
     if plan.entry_feature == "academic_momentum_trend":
         return ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES
     base = [
@@ -954,7 +974,7 @@ def _render_adaptive_signal_code(
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> str:
     mode = plan.entry_feature
-    return f'''def build_signals(prices):
+    return f"""def build_signals(prices):
     signals = []
     rows_by_date = {{}}
     for row in sorted(prices, key=lambda item: (item["date"], item.get("ticker", "000000"))):
@@ -1142,7 +1162,7 @@ def _render_adaptive_signal_code(
             item["history"]["closes"].append(close)
             item["history"]["volumes"].append(item["volume"])
     return signals
-'''
+"""
 
 
 def generate_self_improvement_candidates(
@@ -1160,14 +1180,11 @@ def generate_self_improvement_candidates(
     # refinement. Generic profiles are comparisons, not replacements for that rule.
     if compile_conditions(strategy.entry_conditions) is not None:
         profiles = ["compiled_conditions", "compiled_conditions", *profiles]
-    lookbacks = [
-        max(3, int(value) - iteration * 2) for value in plan.lookbacks
-    ] + [
+    lookbacks = [max(3, int(value) - iteration * 2) for value in plan.lookbacks] + [
         min(252, int(value) + iteration * 10) for value in plan.lookbacks
     ]
     thresholds = [
-        _adjust_threshold(float(value), plan.entry_feature, iteration)
-        for value in plan.thresholds
+        _adjust_threshold(float(value), plan.entry_feature, iteration) for value in plan.thresholds
     ] + [
         _selective_threshold(float(value), plan.entry_feature, iteration)
         for value in plan.thresholds
@@ -1179,7 +1196,11 @@ def generate_self_improvement_candidates(
     # A compact Cartesian traversal varies one axis at a time before combining
     # changes.  The prior modulo zip moved every axis together along one diagonal.
     compiled_variants = [
-        ("compiled_conditions", lookbacks[index % len(lookbacks)], thresholds[index % len(thresholds)])
+        (
+            "compiled_conditions",
+            lookbacks[index % len(lookbacks)],
+            thresholds[index % len(thresholds)],
+        )
         for index in range(2)
         if "compiled_conditions" in profiles
     ]
@@ -1304,14 +1325,10 @@ def _self_improvement_grid_codes(
                     lookback=lookback,
                     threshold=threshold,
                     stop_loss=float(
-                        strategy.risk_constraints.get(
-                            "stop_loss_pct", plan.stop_loss_pct
-                        )
+                        strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct)
                     ),
                     take_profit=float(
-                        strategy.risk_constraints.get(
-                            "take_profit_pct", plan.take_profit_pct
-                        )
+                        strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct)
                     ),
                     max_positions=max_positions,
                 )

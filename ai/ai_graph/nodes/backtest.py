@@ -35,6 +35,7 @@ from ai_graph.nodes.position_sizing import (
     available_ticker_count as _shared_available_ticker_count,
     requested_max_positions as _shared_requested_max_positions,
 )
+from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
@@ -193,8 +194,8 @@ def rule_provenance(
 ) -> dict[str, Any]:
     """Which rule the backtest actually traded, stated by the backtest.
 
-    `compiled_conditions` means the user's concrete rule was traded. The cited academic
-    profile is also the intended rule when the user explicitly requested automatic
+    `compiled_conditions` means the user's concrete rule was traded. Every profile in
+    the fixed automatic tournament is also an intended rule when the user delegated
     selection. Any other generic profile is a substitution that must remain visible.
     """
 
@@ -205,7 +206,7 @@ def rule_provenance(
     profile = ((selected.get("parameters") or {}).get("profile")) or "unknown"
     requested = [str(c.get("left")) for c in (entry_conditions or []) if c.get("left")]
     intended_automatic_profile = (
-        selection_mode == "automatic" and profile == "academic_momentum_trend"
+        selection_mode == "automatic" and profile in AUTOMATIC_TOURNAMENT_PROFILES
     )
     substituted = profile != "compiled_conditions" and not intended_automatic_profile
 
@@ -412,11 +413,7 @@ def _initialize_candidate_worker(
 def _evaluate_candidate_worker(
     task: tuple[Mapping[str, Any], Sequence[int] | None, str],
 ) -> _CandidateEvaluation:
-    if (
-        _WORKER_STRATEGY is None
-        or _WORKER_PRICE_ROWS is None
-        or _WORKER_PREPARED_MARKET is None
-    ):
+    if _WORKER_STRATEGY is None or _WORKER_PRICE_ROWS is None or _WORKER_PREPARED_MARKET is None:
         raise RuntimeError("candidate worker was not initialized")
     candidate_payload, actions, metrics_mode = task
     return _evaluate_candidate(
@@ -432,14 +429,12 @@ def _evaluate_candidate_worker(
 class _DiskEvaluationCache:
     def __init__(self) -> None:
         configured = os.getenv(BACKTEST_CACHE_DIR_ENV)
-        self.root = Path(configured) if configured else Path(gettempdir()) / "quantagent-backtest-v2"
+        self.root = (
+            Path(configured) if configured else Path(gettempdir()) / "quantagent-backtest-v2"
+        )
         self.root.mkdir(parents=True, exist_ok=True)
-        self.ttl_seconds = _positive_int_env(
-            BACKTEST_CACHE_TTL_ENV, DEFAULT_CACHE_TTL_SECONDS
-        )
-        self.max_bytes = _positive_int_env(
-            BACKTEST_CACHE_MAX_BYTES_ENV, DEFAULT_CACHE_MAX_BYTES
-        )
+        self.ttl_seconds = _positive_int_env(BACKTEST_CACHE_TTL_ENV, DEFAULT_CACHE_TTL_SECONDS)
+        self.max_bytes = _positive_int_env(BACKTEST_CACHE_MAX_BYTES_ENV, DEFAULT_CACHE_MAX_BYTES)
         self._cleanup()
 
     def load(
@@ -478,9 +473,7 @@ class _DiskEvaluationCache:
                 ]
                 or None,
                 objective_score=payload.get("objective_score"),
-                quantstats_dependency_error=bool(
-                    payload.get("quantstats_dependency_error", False)
-                ),
+                quantstats_dependency_error=bool(payload.get("quantstats_dependency_error", False)),
                 diagnostics=diagnostics,
             )
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
@@ -616,9 +609,7 @@ class _CandidateBacktestSession:
                 ),
             )
 
-        self.preparation_phases = {
-            name: round(seconds, 6) for name, seconds in phases.items()
-        }
+        self.preparation_phases = {name: round(seconds, 6) for name, seconds in phases.items()}
         self.preparation_seconds = time.perf_counter() - prep_started
         self._cache: dict[tuple[str, bool, str], _CandidateEvaluation] = {}
         self._disk_cache = _DiskEvaluationCache()
@@ -707,24 +698,17 @@ class _CandidateBacktestSession:
                 for candidate in missing
             ]
             requires_isolation = any(
-                candidate.representation == "python_fallback"
-                for candidate in missing
+                candidate.representation == "python_fallback" for candidate in missing
             )
             reuse_executor = self._executor is not None
-            if (
-                round_worker_count == 1
-                and not requires_isolation
-                and not reuse_executor
-            ):
+            if round_worker_count == 1 and not requires_isolation and not reuse_executor:
                 evaluations = [
                     _evaluate_candidate(
                         self.strategy,
                         candidate,
                         self.price_rows,
                         prepared_market=self.prepared_market,
-                        generated_actions=actions_by_identity[
-                            _candidate_identity(candidate)
-                        ],
+                        generated_actions=actions_by_identity[_candidate_identity(candidate)],
                         metrics_mode=metrics_mode,
                     )
                     for candidate in missing
@@ -733,20 +717,14 @@ class _CandidateBacktestSession:
                 evaluations = self._evaluate_parallel(
                     tasks,
                     missing,
-                    (
-                        self._executor_workers
-                        if reuse_executor
-                        else max(1, round_worker_count)
-                    ),
+                    (self._executor_workers if reuse_executor else max(1, round_worker_count)),
                 )
             for candidate, evaluation in zip(missing, evaluations, strict=True):
                 memory_key = _candidate_cache_key(candidate, metrics_mode)
                 self._cache[memory_key] = evaluation
                 disk_key = self._disk_cache_key(candidate, metrics_mode)
                 try:
-                    self.disk_cache_bytes_written += self._disk_cache.store(
-                        disk_key, evaluation
-                    )
+                    self.disk_cache_bytes_written += self._disk_cache.store(disk_key, evaluation)
                 except (OSError, TypeError, ValueError):
                     pass
 
@@ -761,11 +739,7 @@ class _CandidateBacktestSession:
                 "worker_count": round_worker_count,
                 "action_build_seconds": round(action_build_seconds, 6),
                 "cumulative_candidates": len(
-                    {
-                        key[0]
-                        for key in self._cache
-                        if key[2] == "selection"
-                    }
+                    {key[0] for key in self._cache if key[2] == "selection"}
                 ),
                 "wall_seconds": round(time.perf_counter() - round_started, 6),
             }
@@ -774,9 +748,7 @@ class _CandidateBacktestSession:
             _rebind_evaluation(
                 self._cache[_candidate_cache_key(candidate, metrics_mode)],
                 candidate,
-                cache_level=cache_levels.get(
-                    _candidate_cache_key(candidate, metrics_mode)
-                ),
+                cache_level=cache_levels.get(_candidate_cache_key(candidate, metrics_mode)),
             )
             for candidate in candidates
         ]
@@ -846,11 +818,7 @@ class _CandidateBacktestSession:
 
         if any(evaluation is None for evaluation in evaluations):
             raise RuntimeError("candidate worker completed without an evaluation")
-        return [
-            evaluation
-            for evaluation in evaluations
-            if evaluation is not None
-        ]
+        return [evaluation for evaluation in evaluations if evaluation is not None]
 
     def _terminate_executor(self) -> None:
         executor = self._executor
@@ -910,9 +878,8 @@ def _candidate_worker_count(candidate_count: int, *, row_count: int = 0) -> int:
     # object into every worker; the measured Windows production input tripled RSS for
     # only a small wall-time gain. Keep spawn serial unless an operator explicitly opts
     # into that memory trade-off.
-    if (
-        "fork" not in get_all_start_methods()
-        and not _truthy_env(AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV)
+    if "fork" not in get_all_start_methods() and not _truthy_env(
+        AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV
     ):
         return 1
     return requested
@@ -1390,7 +1357,14 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         all_candidates = candidates
         seen_candidates = {_candidate_identity(candidate) for candidate in all_candidates}
         fallback_reasons = list(state.get("backtest_code", {}).get("fallback_reasons", []))
-        for iteration in range(1, MAX_SELF_IMPROVEMENT_ROUNDS + 1):
+        # The automatic mode already compares three pre-registered strategy families.
+        # Searching fresh thresholds only after seeing that they missed the objective
+        # would fit the training history, so refinement remains available only for a
+        # user's explicit/named rule.
+        self_improvement_rounds = (
+            0 if strategy_a.selection_mode == "automatic" else MAX_SELF_IMPROVEMENT_ROUNDS
+        )
+        for iteration in range(1, self_improvement_rounds + 1):
             if _passes_objective_floor(result):
                 break
             if time.perf_counter() - node_started >= _wall_budget_seconds():
@@ -1456,12 +1430,16 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                 "execution_stats": {
                     **result.execution_stats,
                     **session.execution_stats(),
-                    "total_backtest_wall_seconds": round(
-                        time.perf_counter() - node_started, 6
-                    ),
+                    "total_backtest_wall_seconds": round(time.perf_counter() - node_started, 6),
                     "configured_workers": _configured_worker_limit(),
                     "candidate_timeout_seconds": _candidate_timeout_seconds(),
                     "wall_budget_seconds": _wall_budget_seconds(),
+                    "selection_policy": (
+                        "pre_registered_three_family_holdout"
+                        if strategy_a.selection_mode == "automatic"
+                        else "bounded_candidate_refinement"
+                    ),
+                    "self_improvement_rounds_limit": self_improvement_rounds,
                 },
             }
         )
@@ -1527,9 +1505,7 @@ def _compact_actions_from_signals(
         if ticker is None:
             tickers = tickers_by_date.get(signal.date, [])
             if len(tickers) != 1:
-                raise ValueError(
-                    f"generated signal date {signal.date} is ambiguous without ticker"
-                )
+                raise ValueError(f"generated signal date {signal.date} is ambiguous without ticker")
             ticker = tickers[0]
         key = (date.fromisoformat(signal.date), ticker)
         index = prepared_market.row_index_by_key.get(key)
@@ -1895,9 +1871,7 @@ def _sharpe_like(
 def _native_returns_from_equity_curve(equity_curve: Sequence[Any]) -> list[float]:
     values = [float(point.total_equity) for point in equity_curve]
     return [
-        current / previous - 1.0
-        for previous, current in zip(values, values[1:])
-        if previous != 0.0
+        current / previous - 1.0 for previous, current in zip(values, values[1:]) if previous != 0.0
     ]
 
 
@@ -1911,9 +1885,7 @@ def _native_sharpe_like(
     if len(daily_returns) < 2:
         return 0.0
     mean_return = sum(daily_returns) / len(daily_returns)
-    variance = sum(
-        (value - mean_return) ** 2 for value in daily_returns
-    ) / (len(daily_returns) - 1)
+    variance = sum((value - mean_return) ** 2 for value in daily_returns) / (len(daily_returns) - 1)
     return mean_return / math.sqrt(variance) * math.sqrt(252.0) if variance > 0.0 else 0.0
 
 
@@ -1988,9 +1960,7 @@ def _objective_score(
     selection_days = max(
         1, int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION)
     )
-    annual_return = _annualized_return(
-        metrics.in_sample_return, trading_days=selection_days
-    )
+    annual_return = _annualized_return(metrics.in_sample_return, trading_days=selection_days)
     calmar = _calmar_ratio(annual_return, metrics.in_sample_max_drawdown)
     trading_days = selection_days
     annual_turnover = trade_count * 252.0 / trading_days
@@ -2051,7 +2021,7 @@ def _profit_factor(engine_summary: Mapping[str, Any]) -> float:
 
 
 def _equal_weight_benchmark_curve(
-    price_rows: Sequence[Mapping[str, Any]]
+    price_rows: Sequence[Mapping[str, Any]],
 ) -> tuple[list[BacktestEquityPoint], float | None]:
     if not price_rows:
         return [], None
@@ -2077,17 +2047,13 @@ def _equal_weight_benchmark_curve(
     )
     if not universe:
         return [], None
-    universe = tuple(
-        ticker for ticker in universe if rows_by_ticker[ticker][first_date] > 0.0
-    )
+    universe = tuple(ticker for ticker in universe if rows_by_ticker[ticker][first_date] > 0.0)
     if not universe:
         return [], None
 
     initial_prices = {ticker: rows_by_ticker[ticker][first_date] for ticker in universe}
     latest_prices = dict(initial_prices)
-    curve: list[BacktestEquityPoint] = [
-        BacktestEquityPoint(date=first_date, cumulative_return=0.0)
-    ]
+    curve: list[BacktestEquityPoint] = [BacktestEquityPoint(date=first_date, cumulative_return=0.0)]
     for date in dates[1:]:
         values: list[float] = []
         for ticker in universe:
