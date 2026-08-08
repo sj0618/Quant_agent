@@ -186,13 +186,16 @@ def _is_user_rule(candidate: Any) -> bool:
 
 
 def rule_provenance(
-    backtest: Mapping[str, Any], entry_conditions: Sequence[Mapping[str, Any]] | None
+    backtest: Mapping[str, Any],
+    entry_conditions: Sequence[Mapping[str, Any]] | None,
+    *,
+    selection_mode: str | None = None,
 ) -> dict[str, Any]:
     """Which rule the backtest actually traded, stated by the backtest.
 
-    `compiled_conditions` means the strategy's own compiled rule was traded. Any other
-    profile is a generic template that stood in for it because the conditions could not
-    be translated - a substitution that previously left no trace anywhere in the result.
+    `compiled_conditions` means the user's concrete rule was traded. The cited academic
+    profile is also the intended rule when the user explicitly requested automatic
+    selection. Any other generic profile is a substitution that must remain visible.
     """
 
     from ai_graph.nodes.condition_compiler import compile_conditions
@@ -201,7 +204,10 @@ def rule_provenance(
     selected = backtest.get("selected_candidate") or {}
     profile = ((selected.get("parameters") or {}).get("profile")) or "unknown"
     requested = [str(c.get("left")) for c in (entry_conditions or []) if c.get("left")]
-    substituted = profile != "compiled_conditions"
+    intended_automatic_profile = (
+        selection_mode == "automatic" and profile == "academic_momentum_trend"
+    )
+    substituted = profile != "compiled_conditions" and not intended_automatic_profile
 
     untranslatable: list[str] = []
     if substituted and entry_conditions:
@@ -238,8 +244,14 @@ def rule_provenance(
         )
     else:
         reason = "사용자 조건이 백테스트 후보에 포함되지 않았습니다."
+    if profile == "compiled_conditions":
+        evaluated_rule = "user_conditions"
+    elif intended_automatic_profile:
+        evaluated_rule = f"automatic_profile:{profile}"
+    else:
+        evaluated_rule = f"template:{profile}"
     return {
-        "evaluated_rule": "user_conditions" if not substituted else f"template:{profile}",
+        "evaluated_rule": evaluated_rule,
         "substituted": substituted,
         "requested_conditions": requested,
         "untranslatable_conditions": untranslatable,

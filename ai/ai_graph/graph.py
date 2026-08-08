@@ -573,7 +573,11 @@ def _rule_provenance(state: Mapping[str, Any]) -> dict[str, Any] | None:
     from ai_graph.nodes.backtest import rule_provenance
 
     spec = state.get("strategy_spec") or {}
-    return rule_provenance(backtest, spec.get("entry_conditions"))
+    return rule_provenance(
+        backtest,
+        spec.get("entry_conditions"),
+        selection_mode=spec.get("selection_mode"),
+    )
 
 
 def _strategy_query(state: Mapping[str, Any]) -> str:
