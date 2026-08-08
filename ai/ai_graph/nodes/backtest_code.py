@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 import json
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -22,6 +23,7 @@ from ai_graph.nodes.position_sizing import (
     applied_max_positions,
     available_ticker_count,
     max_position_pct_from_risk_constraints,
+    requested_max_positions,
 )
 from ai_graph.schemas import (
     CandidateParameters,
@@ -35,7 +37,14 @@ from ai_graph.nodes.condition_compiler import (
     compile_conditions,
     indicator_row_keys,
 )
-from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
+from ai_graph.quant_strategy import (
+    AQR_TIME_SERIES_MOMENTUM_SOURCE,
+    KEN_FRENCH_MOMENTUM_SOURCE,
+    MSCI_MOMENTUM_METHODOLOGY_SOURCE,
+    NBER_MOMENTUM_CRASH_SOURCE,
+    automatic_candidate_lookbacks,
+    automatic_candidate_profiles,
+)
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
@@ -67,6 +76,25 @@ class FeatureMapping(BaseModel):
     proxy_used: list[str] = Field(default_factory=list)
 
 
+class GeneratedStrategyBlueprint(BaseModel):
+    """A strategy created before returns are inspected and later sent to backtest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    blueprint_id: str = Field(min_length=1)
+    profile: StructuredProfile
+    title: str = Field(min_length=1)
+    formula: str = Field(min_length=1)
+    derivation: str = Field(min_length=1)
+    why_generated: str = Field(min_length=1)
+    lookback: int = Field(ge=3, le=252)
+    max_positions: int = Field(gt=0, le=1000)
+    rebalance_interval_days: int = Field(ge=5, le=63)
+    stop_loss_pct: float = Field(gt=0.0, le=1.0)
+    trailing_stop_pct: float = Field(gt=0.0, le=0.75)
+    source_refs: list[str] = Field(default_factory=list)
+
+
 class CodeGenerationPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -79,6 +107,15 @@ class CodeGenerationPlan(BaseModel):
     stop_loss_pct: float = 0.08
     take_profit_pct: float = 0.45
     expected_trade_frequency: str
+    candidate_profiles: list[StructuredProfile] = Field(default_factory=list)
+    customization_style: Literal["aggressive", "balanced", "defensive"] = "balanced"
+    investment_horizon: Literal["short", "medium", "long"] = "medium"
+    rebalance_interval_days: int = Field(default=21, ge=5, le=63)
+    trailing_stop_pct: float = Field(default=0.25, gt=0.0, le=0.75)
+    medium_momentum_weight: float = Field(default=0.60, ge=0.0, le=1.0)
+    benchmark_objective: bool = False
+    customization_summary: str | None = None
+    generated_strategies: list[GeneratedStrategyBlueprint] = Field(default_factory=list)
 
 
 class Loop3Request(BaseModel):
@@ -201,6 +238,19 @@ def _normalized_parameter_sets(
                 "take_profit_pct": float(
                     strategy.risk_constraints.get("take_profit_pct", item.take_profit_pct)
                 ),
+                "rebalance_interval_days": int(
+                    strategy.risk_constraints.get(
+                        "rebalance_interval_days", plan.rebalance_interval_days
+                    )
+                ),
+                "trailing_stop_pct": float(
+                    strategy.risk_constraints.get("trailing_stop_pct", plan.trailing_stop_pct)
+                ),
+                "medium_momentum_weight": float(
+                    strategy.risk_constraints.get(
+                        "medium_momentum_weight", plan.medium_momentum_weight
+                    )
+                ),
             }
         )
         identity = _parameter_identity(candidate)
@@ -223,7 +273,7 @@ def _default_parameter_sets(
     profiles = _candidate_profiles(plan)
     compiled = compile_conditions(strategy.entry_conditions) is not None
     if plan.entry_feature == "performance_momentum_tournament":
-        selected_profiles = list(AUTOMATIC_TOURNAMENT_PROFILES)
+        selected_profiles = profiles
     elif plan.entry_feature == "academic_momentum_trend":
         selected_profiles = ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES
     elif compiled:
@@ -240,6 +290,9 @@ def _default_parameter_sets(
             stop_loss_pct=stop_loss,
             take_profit_pct=take_profit,
             max_positions=max_positions,
+            rebalance_interval_days=plan.rebalance_interval_days,
+            trailing_stop_pct=plan.trailing_stop_pct,
+            medium_momentum_weight=plan.medium_momentum_weight,
         )
         for index, profile in enumerate(selected_profiles)
     ]
@@ -300,6 +353,9 @@ def _render_structured_reference_code(
     profile = {parameters.profile!r}
     threshold = {float(parameters.threshold)!r}
     max_positions = {parameters.max_positions}
+    rebalance_interval_days = {parameters.rebalance_interval_days}
+    trailing_stop_pct = {float(parameters.trailing_stop_pct)!r}
+    medium_momentum_weight = {float(parameters.medium_momentum_weight)!r}
     strategy_id = {strategy_ir.strategy_id!r}
     for row in prices:
         ticker = str(row.get("ticker", "000000"))
@@ -623,22 +679,147 @@ def map_strategy_features(strategy: StrategySpec) -> FeatureMapping:
     )
 
 
+def _automatic_strategy_blueprints(
+    strategy: StrategySpec,
+    *,
+    profiles: tuple[str, str, str],
+    lookbacks: list[int],
+    style: Literal["aggressive", "balanced", "defensive"],
+    horizon: Literal["short", "medium", "long"],
+    rebalance_interval_days: int,
+    trailing_stop_pct: float,
+    medium_momentum_weight: float,
+) -> list[GeneratedStrategyBlueprint]:
+    max_positions = requested_max_positions(
+        max_position_pct_from_risk_constraints(strategy.risk_constraints)
+    )
+    stop_loss_pct = float(strategy.risk_constraints.get("stop_loss_pct", 0.20))
+    style_label = {
+        "aggressive": "공격형",
+        "balanced": "균형형",
+        "defensive": "방어형",
+    }[style]
+    horizon_label = {
+        "short": "단기",
+        "medium": "중기",
+        "long": "장기",
+    }[horizon]
+    profile_details = {
+        "relative_momentum_rotation": {
+            "title": "12-1 상대강도 순환",
+            "formula": "점수 = 백분위순위(P(t-21)/P(t-252)-1)",
+            "derivation": (
+                "약 1년 중 최근 한 달을 제외하는 학술 모멘텀 정의를 사용해 "
+                "단기 반전보다 지속된 상대강도를 측정합니다."
+            ),
+            "source_refs": [KEN_FRENCH_MOMENTUM_SOURCE],
+        },
+        "risk_adjusted_momentum_rotation": {
+            "title": "장·중기 위험조정 모멘텀 순환",
+            "formula": "점수 = 0.5×순위(M12-1/σ21) + 0.5×순위(M중기/σ21)",
+            "derivation": (
+                "MSCI 공개 방법의 핵심인 두 기간 위험조정과 50:50 결합을 참고하되, "
+                "현재 제품 데이터에 맞춰 3년 주간 변동성·z점수 대신 21일 일간변동성·"
+                "백분위순위를 쓰는 단순화입니다. 사후 최적 가중치는 사용하지 않습니다."
+            ),
+            "source_refs": [MSCI_MOMENTUM_METHODOLOGY_SOURCE],
+        },
+        "trend_leader_rotation": {
+            "title": "사용자기간 맞춤 추세 주도주 순환",
+            "formula": (
+                f"점수 = {medium_momentum_weight:.0%}×중기순위 + "
+                f"{1.0 - medium_momentum_weight:.0%}×12-1순위"
+            ),
+            "derivation": (
+                "중기와 장기 추세를 함께 쓰되 사용자 투자기간이 짧을수록 중기 비중을 "
+                "높이는 사전 규칙입니다."
+            ),
+            "source_refs": [AQR_TIME_SERIES_MOMENTUM_SOURCE, KEN_FRENCH_MOMENTUM_SOURCE],
+        },
+    }
+    return [
+        GeneratedStrategyBlueprint(
+            blueprint_id=f"automatic-{index}-{profile}",
+            profile=profile,  # type: ignore[arg-type]
+            title=str(profile_details[profile]["title"]),
+            formula=str(profile_details[profile]["formula"]),
+            derivation=str(profile_details[profile]["derivation"]),
+            why_generated=(
+                f"사용자 입력을 {style_label}·{horizon_label}으로 해석해 생성한 독립 전략 {index}입니다. "
+                "아직 승자를 정하지 않았으며 이후 백테스트가 별도로 비교합니다."
+            ),
+            lookback=lookbacks[index - 1],
+            max_positions=max_positions,
+            rebalance_interval_days=rebalance_interval_days,
+            stop_loss_pct=stop_loss_pct,
+            trailing_stop_pct=trailing_stop_pct,
+            source_refs=[
+                *profile_details[profile]["source_refs"],  # type: ignore[misc]
+                NBER_MOMENTUM_CRASH_SOURCE,
+            ],
+        )
+        for index, profile in enumerate(profiles, start=1)
+    ]
+
+
 def build_code_generation_plan(
     strategy: StrategySpec, feature_mapping: FeatureMapping
 ) -> CodeGenerationPlan:
     strategy_id = strategy.strategy_id
     requested_text = " ".join(feature_mapping.requested_features + strategy.indicators).lower()
     if strategy.selection_mode == "automatic":
+        raw_style = str(strategy.risk_constraints.get("strategy_style", "balanced"))
+        style: Literal["aggressive", "balanced", "defensive"] = (
+            raw_style if raw_style in {"aggressive", "balanced", "defensive"} else "balanced"
+        )  # type: ignore[assignment]
+        raw_horizon = str(strategy.risk_constraints.get("investment_horizon", "medium"))
+        horizon: Literal["short", "medium", "long"] = (
+            raw_horizon if raw_horizon in {"short", "medium", "long"} else "medium"
+        )  # type: ignore[assignment]
+        profiles = automatic_candidate_profiles(style, horizon)
+        lookbacks = automatic_candidate_lookbacks(
+            profiles,
+            risk_style=style,
+            horizon=horizon,
+        )
+        rebalance_interval_days = int(strategy.risk_constraints.get("rebalance_interval_days", 21))
+        trailing_stop_pct = float(strategy.risk_constraints.get("trailing_stop_pct", 0.25))
+        medium_momentum_weight = float(
+            strategy.risk_constraints.get("medium_momentum_weight", 0.60)
+        )
+        generated_strategies = _automatic_strategy_blueprints(
+            strategy,
+            profiles=profiles,
+            lookbacks=lookbacks,
+            style=style,
+            horizon=horizon,
+            rebalance_interval_days=rebalance_interval_days,
+            trailing_stop_pct=trailing_stop_pct,
+            medium_momentum_weight=medium_momentum_weight,
+        )
         return CodeGenerationPlan(
             strategy_id=strategy_id,
             entry_feature="performance_momentum_tournament",
-            exit_feature="monthly_rank_or_emergency_stop",
+            exit_feature="scheduled_rank_or_emergency_stop",
             proxy_feature="past_only_price_factors",
-            lookbacks=[252, 252, 252],
+            lookbacks=lookbacks,
             thresholds=[0.0, 0.0, 0.0],
-            stop_loss_pct=0.20,
+            stop_loss_pct=float(strategy.risk_constraints.get("stop_loss_pct", 0.20)),
             take_profit_pct=10.0,
-            expected_trade_frequency="monthly_rotation",
+            expected_trade_frequency=f"every_{rebalance_interval_days}_trading_days",
+            candidate_profiles=list(profiles),  # type: ignore[arg-type]
+            customization_style=style,
+            investment_horizon=horizon,
+            rebalance_interval_days=rebalance_interval_days,
+            trailing_stop_pct=trailing_stop_pct,
+            medium_momentum_weight=medium_momentum_weight,
+            benchmark_objective=True,
+            customization_summary=(
+                f"{style}/{horizon}: {len(profiles)}개 사전등록 후보, "
+                f"{rebalance_interval_days}거래일 교체, "
+                "126거래일 구간 벤치마크 승패 검증"
+            ),
+            generated_strategies=generated_strategies,
         )
     if strategy_id.startswith("automatic_academic_momentum"):
         return CodeGenerationPlan(
@@ -903,8 +1084,16 @@ def _generated_strategy_candidates(
 
 
 def _candidate_profiles(plan: CodeGenerationPlan) -> list[StructuredProfile]:
+    if plan.generated_strategies:
+        return [blueprint.profile for blueprint in plan.generated_strategies]
+    if plan.candidate_profiles:
+        return list(plan.candidate_profiles)
     if plan.entry_feature == "performance_momentum_tournament":
-        return list(AUTOMATIC_TOURNAMENT_PROFILES)  # type: ignore[return-value]
+        return [
+            "relative_momentum_rotation",
+            "risk_adjusted_momentum_rotation",
+            "trend_leader_rotation",
+        ]
     if plan.entry_feature == "academic_momentum_trend":
         return ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES
     base = [
@@ -1237,6 +1426,9 @@ def generate_self_improvement_candidates(
             stop_loss_pct=stop_loss,
             take_profit_pct=take_profit,
             max_positions=max_positions,
+            rebalance_interval_days=plan.rebalance_interval_days,
+            trailing_stop_pct=plan.trailing_stop_pct,
+            medium_momentum_weight=plan.medium_momentum_weight,
         )
         identity = _parameter_identity(parameters)
         if identity in seen:

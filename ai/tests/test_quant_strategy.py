@@ -20,9 +20,11 @@ from ai_graph.quant_strategy import (
     AUTOMATIC_TOURNAMENT_PROFILES,
     BACKTEST_OVERFITTING_SOURCE,
     KEN_FRENCH_MOMENTUM_SOURCE,
+    MSCI_MOMENTUM_METHODOLOGY_SOURCE,
     build_strategy_explanation,
     classify_strategy_request,
     compute_academic_factor_arrays,
+    infer_automatic_strategy_preferences,
 )
 from ai_graph.schemas import CandidateParameters, StrategyIR
 
@@ -93,6 +95,11 @@ def test_vague_request_runs_the_full_automatic_pipeline() -> None:
     assert envelope.strategy_spec.strategy_id.startswith("automatic_performance_momentum")
     assert envelope.rule_provenance is not None
     assert envelope.rule_provenance.substituted is False
+    assert envelope.user_payload.performance is not None
+    public_explanation = envelope.user_payload.performance.strategy_explanation
+    assert public_explanation is not None
+    assert len(public_explanation.generated_strategies) == 3
+    assert len({item["profile"] for item in public_explanation.generated_strategies}) == 3
 
 
 def test_academic_factors_match_exact_12_1_and_sma_boundaries() -> None:
@@ -158,6 +165,7 @@ def test_automatic_request_builds_cited_three_family_tournament() -> None:
     assert strategy.strategy_id.startswith("automatic_performance_momentum")
     assert AQR_TREND_SOURCE in strategy.source_refs
     assert KEN_FRENCH_MOMENTUM_SOURCE in strategy.source_refs
+    assert MSCI_MOMENTUM_METHODOLOGY_SOURCE in strategy.source_refs
     assert BACKTEST_OVERFITTING_SOURCE in strategy.source_refs
     plan = build_code_generation_plan(strategy, map_strategy_features(strategy))
     assert plan.entry_feature == "performance_momentum_tournament"
@@ -201,7 +209,113 @@ def test_automatic_request_builds_cited_three_family_tournament() -> None:
         "momentum_blend",
         "winner_hold",
         "crash_risk_guard",
+        "portfolio_customization",
+        "benchmark_period_gate",
     }
+
+
+def test_user_risk_and_horizon_customize_the_automatic_candidate_menu() -> None:
+    aggressive = build_strategy_spec(
+        "5종목으로 단기 고수익 집중 모멘텀 전략 만들어줘",
+        variant="A",
+        semantic_slots={},
+    )
+    assert aggressive.selection_mode == "automatic"
+    assert (
+        infer_automatic_strategy_preferences(
+            "5종목으로 단기 고수익 집중 모멘텀 전략 만들어줘"
+        ).risk_style
+        == "aggressive"
+    )
+    aggressive_plan = build_code_generation_plan(
+        aggressive,
+        map_strategy_features(aggressive),
+    )
+    assert aggressive_plan.customization_style == "aggressive"
+    assert aggressive_plan.investment_horizon == "short"
+    assert aggressive_plan.rebalance_interval_days == 10
+    assert aggressive_plan.trailing_stop_pct == 0.30
+    assert aggressive_plan.medium_momentum_weight == 0.70
+    assert aggressive_plan.lookbacks == [126, 126, 252]
+    assert aggressive_plan.candidate_profiles == [
+        "trend_leader_rotation",
+        "risk_adjusted_momentum_rotation",
+        "relative_momentum_rotation",
+    ]
+    assert len(aggressive_plan.generated_strategies) == 3
+    assert len({item.profile for item in aggressive_plan.generated_strategies}) == 3
+    assert all(
+        "아직 승자를 정하지 않았으며" in item.why_generated and item.formula and item.derivation
+        for item in aggressive_plan.generated_strategies
+    )
+    aggressive_candidates = generate_loop3_candidates(
+        Loop3Request(
+            strategy=aggressive,
+            variant="A",
+            trace_id="aggressive-custom",
+            max_positions=5,
+        )
+    ).candidates
+    assert all(
+        candidate.parameters is not None
+        and candidate.parameters.max_positions == 5
+        and candidate.parameters.stop_loss_pct == 0.25
+        and candidate.parameters.rebalance_interval_days == 10
+        for candidate in aggressive_candidates
+    )
+
+    defensive = build_strategy_spec(
+        "손실을 최소화하는 장기 저변동 15종목 전략 만들어줘",
+        variant="A",
+        semantic_slots={},
+    )
+    defensive_plan = build_code_generation_plan(
+        defensive,
+        map_strategy_features(defensive),
+    )
+    assert defensive_plan.customization_style == "defensive"
+    assert defensive_plan.investment_horizon == "long"
+    assert defensive_plan.rebalance_interval_days == 42
+    assert defensive_plan.lookbacks == [252, 252, 252]
+    assert defensive_plan.candidate_profiles == [
+        "risk_adjusted_momentum_rotation",
+        "relative_momentum_rotation",
+        "trend_leader_rotation",
+    ]
+    assert defensive.risk_constraints["stop_loss_pct"] == 0.12
+    assert defensive.risk_constraints["trailing_stop_pct"] == 0.15
+
+
+def test_automatic_indicator_explanations_show_formula_derivation_and_customization() -> None:
+    strategy = build_strategy_spec(
+        "5종목으로 단기 고수익 집중 모멘텀 전략 만들어줘",
+        variant="A",
+        semantic_slots={},
+    )
+    parameters = CandidateParameters(
+        profile="trend_leader_rotation",
+        lookback=126,
+        threshold=0.0,
+        stop_loss_pct=0.25,
+        take_profit_pct=10.0,
+        max_positions=5,
+        rebalance_interval_days=10,
+        trailing_stop_pct=0.30,
+        medium_momentum_weight=0.70,
+    )
+    explanation = build_strategy_explanation(
+        strategy,
+        selected_profile=parameters.profile,
+        selected_parameters=parameters,
+    )
+    indicators = {item["key"]: item for item in explanation["indicators"]}
+
+    assert "70%×중기모멘텀순위" in indicators["momentum_blend"]["formula"]
+    assert "입력 투자기간" in indicators["momentum_blend"]["customization"]
+    assert "손절 25%" in indicators["crash_risk_guard"]["customization"]
+    assert "최대 5종목" in indicators["portfolio_customization"]["plain_explanation"]
+    assert "패배율 ≥ 50%이면 실패" in indicators["benchmark_period_gate"]["formula"]
+    assert all(item.get("formula") and item.get("derivation") for item in indicators.values())
 
 
 def test_original_vague_request_survives_a_concrete_interpreter_rewrite() -> None:
@@ -293,10 +407,7 @@ def test_automatic_tournament_does_not_tune_after_seeing_returns() -> None:
     )
 
     stats = output["backtest"]["execution_stats"]
-    assert (
-        stats["selection_policy"]
-        == "performance_momentum_train_select_holdout_validate"
-    )
+    assert stats["selection_policy"] == "performance_momentum_train_select_holdout_validate"
     assert stats["self_improvement_rounds_limit"] == 0
     assert len(output["backtest"]["candidates"]) == 3
 
@@ -367,3 +478,10 @@ def test_concrete_strategy_is_not_replaced_by_automatic_profile() -> None:
     assert strategy.selection_mode == "user_defined"
     assert not strategy.strategy_id.startswith("automatic_performance_momentum")
     assert any("rsi" in indicator.casefold() for indicator in strategy.indicators)
+    plan = build_code_generation_plan(strategy, map_strategy_features(strategy))
+    assert plan.entry_feature == "rsi_rebound"
+    assert plan.generated_strategies == []
+    explanation = build_strategy_explanation(strategy)
+    rsi = next(item for item in explanation["indicators"] if item["key"] == "rsi")
+    assert "100 - 100/(1 +" in rsi["formula"]
+    assert rsi["derivation"]

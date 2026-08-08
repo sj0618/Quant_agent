@@ -130,8 +130,7 @@ def test_breakout_volume_strategy_uses_strategy_specific_candidates() -> None:
     assert all(candidate.validation_ok for candidate in result_a.candidates)
     assert len(result_a.candidates) == 3
     assert any(
-        candidate.parameters is not None
-        and candidate.parameters.profile == "breakout_volume"
+        candidate.parameters is not None and candidate.parameters.profile == "breakout_volume"
         for candidate in result_a.candidates
     )
 
@@ -354,6 +353,48 @@ def test_metrics_from_engine_result_uses_equity_pct_change_for_split_sharpes(mon
     assert len(captured_returns) == 2
     assert captured_returns[0] == pytest.approx([0.1, 0.1])
     assert captured_returns[1] == pytest.approx([-0.1, 0.1])
+
+
+def test_metrics_measure_fixed_period_excess_against_the_same_price_rows() -> None:
+    start = date(2024, 1, 1)
+    days = 500
+    engine_result = SimpleNamespace(
+        summary={
+            "sharpe": 1.0,
+            "max_drawdown": -0.05,
+            "win_rate": 0.6,
+            "total_return": 1.002 ** (days - 1) - 1.0,
+            "metric_warnings": [],
+        },
+        equity_curve=[
+            SimpleNamespace(
+                date=(start + timedelta(days=index)).isoformat(),
+                total_equity=100.0 * (1.002**index),
+                daily_return=0.002 if index else 0.0,
+            )
+            for index in range(days)
+        ],
+    )
+    price_rows = [
+        {
+            "date": (start + timedelta(days=index)).isoformat(),
+            "ticker": "000001",
+            "close": 100.0 * (1.001**index),
+        }
+        for index in range(days)
+    ]
+
+    metrics = backtest_node._metrics_from_engine_result(
+        engine_result,
+        price_rows=price_rows,
+    )
+
+    assert metrics.in_sample_excess_return > 0.0
+    assert metrics.out_sample_excess_return > 0.0
+    assert metrics.benchmark_period_count == 3
+    assert metrics.benchmark_period_loss_rate == 0.0
+    assert metrics.out_sample_benchmark_period_count == 1
+    assert metrics.out_sample_benchmark_period_loss_rate == 0.0
 
 
 def test_candidate_backtest_surfaces_quantstats_install_error(monkeypatch) -> None:

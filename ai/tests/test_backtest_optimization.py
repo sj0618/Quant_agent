@@ -32,12 +32,8 @@ def _strategy() -> StrategySpec:
         name="Optimized RSI",
         market="KRX",
         timeframe="daily",
-        entry_conditions=[
-            Condition(left="rsi", operator=ConditionOperator.LTE, right=40.0)
-        ],
-        exit_conditions=[
-            Condition(left="rsi", operator=ConditionOperator.GTE, right=70.0)
-        ],
+        entry_conditions=[Condition(left="rsi", operator=ConditionOperator.LTE, right=40.0)],
+        exit_conditions=[Condition(left="rsi", operator=ConditionOperator.GTE, right=70.0)],
         indicators=["rsi"],
         risk_constraints={
             "max_position_pct": 0.2,
@@ -80,9 +76,7 @@ def _rows(days: int = 80, tickers: int = 6) -> list[dict[str, object]]:
 def _canonical_hash(result) -> str:
     payload = {
         "selected_candidate": result.selected_candidate.model_dump(mode="json"),
-        "equity_curve": [
-            point.model_dump(mode="json") for point in result.equity_curve
-        ],
+        "equity_curve": [point.model_dump(mode="json") for point in result.equity_curve],
         "engine_summary": result.engine_summary,
         "objective_scores": result.objective_scores_by_candidate,
     }
@@ -172,9 +166,7 @@ def test_rank_only_and_consecutive_conditions_emit_compiled_actions() -> None:
             ],
         }
     )
-    consecutive_actions = PreparedFeatureStore(rows).build_actions(
-        consecutive_ir, parameters
-    )
+    consecutive_actions = PreparedFeatureStore(rows).build_actions(consecutive_ir, parameters)
     assert sum(action == 1 for action in consecutive_actions) == 1
     assert consecutive_actions[2] == 1
 
@@ -226,9 +218,7 @@ def test_structured_profile_actions_match_legacy_reference() -> None:
             namespace,
         )
         legacy_signals = namespace["build_signals"](rows)  # type: ignore[operator]
-        legacy_actions = [
-            action_values[str(signal["action"])] for signal in legacy_signals
-        ]
+        legacy_actions = [action_values[str(signal["action"])] for signal in legacy_signals]
 
         assert list(store.build_actions(strategy_ir, parameters)) == legacy_actions
 
@@ -244,16 +234,12 @@ def test_worker_count_and_disk_cache_are_deterministic(monkeypatch, tmp_path) ->
     cache_one = tmp_path / "worker-one"
     monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(cache_one))
     monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
-    result_one = backtest_node.run_candidate_backtest(
-        strategy, candidates, price_rows=rows
-    )
+    result_one = backtest_node.run_candidate_backtest(strategy, candidates, price_rows=rows)
 
     cache_two = tmp_path / "worker-two"
     monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(cache_two))
     monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "2")
-    result_two = backtest_node.run_candidate_backtest(
-        strategy, candidates, price_rows=rows
-    )
+    result_two = backtest_node.run_candidate_backtest(strategy, candidates, price_rows=rows)
 
     assert _canonical_hash(result_one) == _canonical_hash(result_two)
 
@@ -349,7 +335,12 @@ def test_improvement_candidates_are_bounded_and_normalized() -> None:
 
     assert 1 <= len(improved) <= 6
     assert len(identities) == len(improved)
-    assert sum(item.parameters.profile == "compiled_conditions" for item in improved if item.parameters) >= 2
+    assert (
+        sum(
+            item.parameters.profile == "compiled_conditions" for item in improved if item.parameters
+        )
+        >= 2
+    )
 
 
 def test_candidate_profiles_are_schema_profiles_only() -> None:
@@ -377,9 +368,9 @@ def test_selection_score_does_not_peek_at_holdout_sharpe() -> None:
     strong_holdout = BacktestMetrics(**common, out_sample_sharpe=5.0)
     summary = {"effective_trade_count": 8, "trade_win_rate": 0.6}
 
-    assert backtest_node._objective_score(weak_holdout, summary, rows) == backtest_node._objective_score(
-        strong_holdout, summary, rows
-    )
+    assert backtest_node._objective_score(
+        weak_holdout, summary, rows
+    ) == backtest_node._objective_score(strong_holdout, summary, rows)
 
 
 def test_selection_score_rewards_training_return_when_risk_is_equal() -> None:
@@ -424,6 +415,68 @@ def test_temporary_relaxed_objective_floor_boundaries() -> None:
     result.selected_candidate.metrics = metrics.model_copy(update={"out_sample_sharpe": -0.01})
     assert not backtest_node._passes_objective_floor(result)
     result.selected_candidate.metrics = metrics.model_copy(update={"max_drawdown": -0.501})
+    assert not backtest_node._passes_objective_floor(result)
+
+
+def test_fixed_period_benchmark_rule_allows_large_regime_wins() -> None:
+    period = backtest_node.BENCHMARK_EVALUATION_PERIOD_DAYS
+    benchmark_returns = [0.0] * (period * 4)
+    strategy_returns = [
+        *([0.002] * period),
+        *([-0.001] * period),
+        *([0.004] * period),
+        *([0.0] * period),
+    ]
+
+    stats = backtest_node._benchmark_period_stats(strategy_returns, benchmark_returns)
+
+    assert stats.count == 4
+    assert stats.win_rate == 0.5
+    assert stats.loss_rate == 0.25
+
+
+def test_automatic_benchmark_gate_treats_exactly_half_losing_periods_as_defeat() -> None:
+    metrics = BacktestMetrics(
+        sharpe_ratio=0.9,
+        max_drawdown=-0.25,
+        win_rate=0.55,
+        total_return=0.60,
+        in_sample_sharpe=0.8,
+        out_sample_sharpe=0.7,
+        degradation=0.1,
+        in_sample_return=0.30,
+        out_sample_return=0.23,
+        in_sample_benchmark_return=0.20,
+        out_sample_benchmark_return=0.10,
+        in_sample_excess_return=0.10,
+        out_sample_excess_return=0.13,
+        benchmark_period_count=8,
+        benchmark_period_win_rate=0.50,
+        benchmark_period_loss_rate=0.375,
+        in_sample_benchmark_period_count=5,
+        in_sample_benchmark_period_win_rate=0.60,
+        in_sample_benchmark_period_loss_rate=0.40,
+        out_sample_benchmark_period_count=3,
+        out_sample_benchmark_period_win_rate=2 / 3,
+        out_sample_benchmark_period_loss_rate=1 / 3,
+    )
+    result = SimpleNamespace(
+        strategy_a=SimpleNamespace(selection_mode="automatic"),
+        selected_candidate=SimpleNamespace(candidate_id="benchmark-winner", metrics=metrics),
+        engine_summary={"effective_trade_count": 20},
+        backtest_payload={"benchmark_return": 0.32},
+    )
+
+    assert backtest_node._passes_objective_floor(result)
+
+    result.selected_candidate.metrics = metrics.model_copy(
+        update={"benchmark_period_loss_rate": 0.50}
+    )
+    assert not backtest_node._passes_objective_floor(result)
+
+    result.selected_candidate.metrics = metrics.model_copy(
+        update={"out_sample_benchmark_period_loss_rate": 0.50}
+    )
     assert not backtest_node._passes_objective_floor(result)
 
 

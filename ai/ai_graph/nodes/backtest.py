@@ -55,6 +55,8 @@ BENCHMARK_WARNING = (
 # Candidates are selected using only the first 70% of the history.  The final 30%
 # is deliberately kept untouched until after selection, so it is a real hold-out.
 BACKTEST_SPLIT_FRACTION = 0.7
+BENCHMARK_EVALUATION_PERIOD_DAYS = 126
+MAX_AUTOMATIC_BENCHMARK_LOSS_RATE = 0.50
 PUBLIC_EQUITY_CURVE_POINTS = 12
 MIN_OBJECTIVE_TRADES = 5
 # Below this many matched names, a backtest describes the names, not the strategy, and
@@ -86,7 +88,7 @@ DEFAULT_WALL_BUDGET_SECONDS = 540.0
 MAX_SELF_IMPROVEMENT_ROUNDS = 2
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
 BACKTEST_ENGINE_VERSION = "candidate-engine.v2"
-BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v2"
+BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v3"
 BACKTEST_CACHE_DIR_ENV = "AI_BACKTEST_CACHE_DIR"
 BACKTEST_CACHE_TTL_ENV = "AI_BACKTEST_CACHE_TTL_SECONDS"
 BACKTEST_CACHE_MAX_BYTES_ENV = "AI_BACKTEST_CACHE_MAX_BYTES"
@@ -343,6 +345,13 @@ class GeneratedSignal(BaseModel):
     ticker: str | None = None
     action: str = Field(pattern="^(BUY|SELL|HOLD)$")
     price: float = Field(gt=0.0)
+
+
+@dataclass(frozen=True)
+class _BenchmarkPeriodStats:
+    count: int
+    win_rate: float
+    loss_rate: float
 
 
 @dataclass(frozen=True)
@@ -1135,7 +1144,7 @@ def _evaluate_candidate(
             diagnostics=diagnostics,
         )
 
-    metrics = _metrics_from_engine_result(engine_result)
+    metrics = _metrics_from_engine_result(engine_result, price_rows=rows)
     enriched_candidate = candidate.model_copy(update={"metrics": metrics})
     engine_summary = dict(engine_result.summary)
     engine_summary["buy_signal_count"] = _signal_action_count(engine_result, "BUY")
@@ -1427,6 +1436,11 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         result = result.model_copy(
             update={
                 "fallback_reasons": fallback_reasons,
+                "generated_strategy_blueprints": list(
+                    state.get("backtest_code", {})
+                    .get("code_plan", {})
+                    .get("generated_strategies", [])
+                ),
                 "execution_stats": {
                     **result.execution_stats,
                     **session.execution_stats(),
@@ -1736,7 +1750,11 @@ def _execution_audit(engine_result: Any) -> dict[str, Any]:
     }
 
 
-def _metrics_from_engine_result(engine_result) -> BacktestMetrics:
+def _metrics_from_engine_result(
+    engine_result,
+    *,
+    price_rows: Sequence[Mapping[str, Any]] | None = None,
+) -> BacktestMetrics:
     summary = engine_result.summary
     metric_warnings = _summary_warning_list(summary)
     selection_mode = summary.get("metrics_mode") == "selection"
@@ -1756,6 +1774,30 @@ def _metrics_from_engine_result(engine_result) -> BacktestMetrics:
     degradation = _degradation(in_sample_sharpe, out_sample_sharpe)
     split_index = max(1, int(len(daily_returns) * BACKTEST_SPLIT_FRACTION))
     in_sample_returns = daily_returns[:split_index]
+    out_sample_returns = daily_returns[split_index:]
+    benchmark_returns = _benchmark_daily_returns(price_rows or ())
+    comparison_length = min(len(daily_returns), len(benchmark_returns))
+    strategy_comparison_returns = daily_returns[:comparison_length]
+    benchmark_comparison_returns = benchmark_returns[:comparison_length]
+    comparison_split_index = min(split_index, comparison_length)
+    in_sample_benchmark_returns = benchmark_comparison_returns[:comparison_split_index]
+    out_sample_benchmark_returns = benchmark_comparison_returns[comparison_split_index:]
+    in_sample_benchmark_return = _compound_returns(in_sample_benchmark_returns)
+    out_sample_benchmark_return = _compound_returns(out_sample_benchmark_returns)
+    in_sample_return = _compound_returns(in_sample_returns)
+    out_sample_return = _compound_returns(out_sample_returns)
+    period_stats = _benchmark_period_stats(
+        strategy_comparison_returns,
+        benchmark_comparison_returns,
+    )
+    in_sample_period_stats = _benchmark_period_stats(
+        strategy_comparison_returns[:comparison_split_index],
+        in_sample_benchmark_returns,
+    )
+    out_sample_period_stats = _benchmark_period_stats(
+        strategy_comparison_returns[comparison_split_index:],
+        out_sample_benchmark_returns,
+    )
     return BacktestMetrics(
         sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
         max_drawdown=round(_summary_float(summary, "max_drawdown"), METRIC_ROUND_DIGITS),
@@ -1769,9 +1811,37 @@ def _metrics_from_engine_result(engine_result) -> BacktestMetrics:
         in_sample_sharpe=round(in_sample_sharpe, METRIC_ROUND_DIGITS),
         out_sample_sharpe=round(out_sample_sharpe, METRIC_ROUND_DIGITS),
         degradation=round(degradation, METRIC_ROUND_DIGITS),
-        in_sample_return=round(_compound_returns(in_sample_returns), METRIC_ROUND_DIGITS),
+        in_sample_return=round(in_sample_return, METRIC_ROUND_DIGITS),
         in_sample_max_drawdown=round(
             _max_drawdown_from_returns(in_sample_returns), METRIC_ROUND_DIGITS
+        ),
+        out_sample_return=round(out_sample_return, METRIC_ROUND_DIGITS),
+        in_sample_benchmark_return=round(in_sample_benchmark_return, METRIC_ROUND_DIGITS),
+        out_sample_benchmark_return=round(out_sample_benchmark_return, METRIC_ROUND_DIGITS),
+        in_sample_excess_return=round(
+            in_sample_return - in_sample_benchmark_return,
+            METRIC_ROUND_DIGITS,
+        ),
+        out_sample_excess_return=round(
+            out_sample_return - out_sample_benchmark_return,
+            METRIC_ROUND_DIGITS,
+        ),
+        benchmark_period_count=period_stats.count,
+        benchmark_period_win_rate=round(period_stats.win_rate, METRIC_ROUND_DIGITS),
+        benchmark_period_loss_rate=round(period_stats.loss_rate, METRIC_ROUND_DIGITS),
+        in_sample_benchmark_period_count=in_sample_period_stats.count,
+        in_sample_benchmark_period_win_rate=round(
+            in_sample_period_stats.win_rate, METRIC_ROUND_DIGITS
+        ),
+        in_sample_benchmark_period_loss_rate=round(
+            in_sample_period_stats.loss_rate, METRIC_ROUND_DIGITS
+        ),
+        out_sample_benchmark_period_count=out_sample_period_stats.count,
+        out_sample_benchmark_period_win_rate=round(
+            out_sample_period_stats.win_rate, METRIC_ROUND_DIGITS
+        ),
+        out_sample_benchmark_period_loss_rate=round(
+            out_sample_period_stats.loss_rate, METRIC_ROUND_DIGITS
         ),
     )
 
@@ -1841,6 +1911,53 @@ def _compound_returns(daily_returns: Sequence[float]) -> float:
     for daily_return in daily_returns:
         equity *= 1.0 + daily_return
     return equity - 1.0
+
+
+def _benchmark_daily_returns(
+    price_rows: Sequence[Mapping[str, Any]],
+) -> list[float]:
+    curve, _ = _equal_weight_benchmark_curve(price_rows)
+    if len(curve) < 2:
+        return []
+    returns: list[float] = []
+    previous_equity = 1.0 + float(curve[0].cumulative_return)
+    for point in curve[1:]:
+        current_equity = 1.0 + float(point.cumulative_return)
+        if previous_equity <= 0.0:
+            return []
+        returns.append(current_equity / previous_equity - 1.0)
+        previous_equity = current_equity
+    return returns
+
+
+def _benchmark_period_stats(
+    strategy_returns: Sequence[float],
+    benchmark_returns: Sequence[float],
+) -> _BenchmarkPeriodStats:
+    """Compare fixed half-year blocks without cherry-picking favourable dates."""
+
+    length = min(len(strategy_returns), len(benchmark_returns))
+    wins = 0
+    losses = 0
+    count = 0
+    for start in range(0, length, BENCHMARK_EVALUATION_PERIOD_DAYS):
+        end = min(length, start + BENCHMARK_EVALUATION_PERIOD_DAYS)
+        if end - start < BENCHMARK_EVALUATION_PERIOD_DAYS:
+            break
+        strategy_return = _compound_returns(strategy_returns[start:end])
+        benchmark_return = _compound_returns(benchmark_returns[start:end])
+        count += 1
+        if strategy_return > benchmark_return + 1e-12:
+            wins += 1
+        elif strategy_return < benchmark_return - 1e-12:
+            losses += 1
+    if count == 0:
+        return _BenchmarkPeriodStats(count=0, win_rate=0.0, loss_rate=0.0)
+    return _BenchmarkPeriodStats(
+        count=count,
+        win_rate=wins / count,
+        loss_rate=losses / count,
+    )
 
 
 def _max_drawdown_from_returns(daily_returns: Sequence[float]) -> float:
@@ -1937,12 +2054,56 @@ def _selection_signal_action_count(
 def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
     metrics = _candidate_metrics(result.selected_candidate)
     trade_count = _summary_float_default(result.engine_summary, "effective_trade_count", 0.0)
-    return (
+    passes_basic_floor = (
         trade_count >= MIN_OBJECTIVE_TRADES
         # This gate is a report/acceptance check, so it uses the untouched hold-out.
         and metrics.out_sample_sharpe >= MIN_OBJECTIVE_SHARPE
         and metrics.max_drawdown >= MAX_OBJECTIVE_DRAWDOWN
     )
+    if not passes_basic_floor:
+        return False
+    strategy = getattr(result, "strategy_a", None)
+    if getattr(strategy, "selection_mode", "standard") != "automatic":
+        return True
+    payload = getattr(result, "backtest_payload", {}) or {}
+    benchmark_return = payload.get("benchmark_return") if isinstance(payload, Mapping) else None
+    return not _benchmark_objective_reasons(metrics, benchmark_return=benchmark_return)
+
+
+def _benchmark_objective_reasons(
+    metrics: BacktestMetrics,
+    *,
+    benchmark_return: Any | None = None,
+) -> list[str]:
+    """Why an automatic strategy failed the benchmark-relative acceptance rule."""
+
+    reasons: list[str] = []
+    if metrics.benchmark_period_count <= 0:
+        reasons.append("126거래일 벤치마크 비교 구간이 없습니다")
+    elif metrics.benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:
+        reasons.append(
+            "전체 구간의 벤치마크 패배 비율 "
+            f"{metrics.benchmark_period_loss_rate:.1%} >= "
+            f"{MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:.0%}"
+        )
+    if metrics.out_sample_benchmark_period_count <= 0:
+        reasons.append("최종 미사용 구간의 벤치마크 비교 구간이 없습니다")
+    elif metrics.out_sample_benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:
+        reasons.append(
+            "최종 미사용 구간의 벤치마크 패배 비율 "
+            f"{metrics.out_sample_benchmark_period_loss_rate:.1%} >= "
+            f"{MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:.0%}"
+        )
+    if metrics.out_sample_excess_return <= 0.0:
+        reasons.append(f"최종 미사용 구간 초과수익률 {metrics.out_sample_excess_return:.2%} <= 0%")
+    parsed_benchmark = float(benchmark_return) if _is_numeric_metric(benchmark_return) else None
+    if parsed_benchmark is None:
+        parsed_benchmark = (1.0 + metrics.in_sample_benchmark_return) * (
+            1.0 + metrics.out_sample_benchmark_return
+        ) - 1.0
+    if metrics.total_return <= parsed_benchmark:
+        reasons.append(f"전체 수익률 {metrics.total_return:.2%} <= 벤치마크 {parsed_benchmark:.2%}")
+    return reasons
 
 
 def _selected_objective_score(result: CandidateBacktestResult) -> float:
@@ -1971,16 +2132,20 @@ def _objective_score(
         trading_days=selection_days,
     )
     annual_excess_return = annual_return - annual_benchmark_return
+    benchmark_consistency = (
+        metrics.in_sample_benchmark_period_win_rate - metrics.in_sample_benchmark_period_loss_rate
+    )
     trading_days = selection_days
     annual_turnover = trade_count * 252.0 / trading_days
     turnover_penalty = min(1.0, annual_turnover / 24.0)
     # The hold-out must not affect selection.  It is only used by the objective floor
     # after a candidate has been selected.
     score = (
-        0.65 * metrics.in_sample_sharpe
+        0.35 * metrics.in_sample_sharpe
         + 0.15 * calmar
-        + 0.55 * annual_return
-        + 0.20 * annual_excess_return
+        + 0.10 * annual_return
+        + 1.00 * annual_excess_return
+        + 0.20 * benchmark_consistency
         - 0.05 * turnover_penalty
     )
     if trade_count < MIN_OBJECTIVE_TRADES:
@@ -1993,6 +2158,13 @@ def _objective_score(
         score -= (MIN_OBJECTIVE_SHARPE - metrics.in_sample_sharpe) * 0.25
     if annual_return <= 0.0:
         score -= 0.25 + abs(annual_return) * 0.5
+    if annual_excess_return <= 0.0:
+        score -= 0.35 + abs(annual_excess_return)
+    if (
+        metrics.in_sample_benchmark_period_count > 0
+        and metrics.in_sample_benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE
+    ):
+        score -= 0.25 + metrics.in_sample_benchmark_period_loss_rate
     return round(score, METRIC_ROUND_DIGITS)
 
 

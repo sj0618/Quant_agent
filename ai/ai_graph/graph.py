@@ -40,6 +40,7 @@ from ai_graph.nodes.backtest import (
     MIN_OBJECTIVE_TRADES,
     METRIC_ROUND_DIGITS,
     _annualized_return,
+    _benchmark_objective_reasons,
     _calmar_ratio,
     _equal_weight_benchmark_curve,
     _is_numeric_metric,
@@ -52,6 +53,7 @@ from ai_graph.nodes.backtest import (
 from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_strategy import (
     classify_strategy_request,
+    infer_automatic_strategy_preferences,
     robust_strategy_source_refs,
 )
 from ai_graph.nodes.backtest_code import backtest_code_node
@@ -1759,7 +1761,13 @@ def build_strategy_spec(
     # The interpreter may turn "알아서 좋은 거" into a concrete RSI sentence.  That
     # resolution is useful for data lookup but it must not erase the user's original
     # lack of a rule; otherwise an arbitrary interpreter default becomes user intent.
-    selection_mode = classify_strategy_request(original_query or query)
+    preference_query = original_query or query
+    selection_mode = classify_strategy_request(preference_query)
+    automatic_preferences = (
+        infer_automatic_strategy_preferences(preference_query)
+        if selection_mode == "automatic"
+        else None
+    )
     profile = _strategy_profile(
         query,
         semantic_slots=semantic_slots,
@@ -1785,30 +1793,65 @@ def build_strategy_spec(
             fallback=fallback_conditions,
         )
     )
+    risk_constraints: dict[str, float | int | str | bool] = {
+        "max_position_pct": 0.1,
+        "stop_loss_pct": 0.08,
+    }
+    customization_assumptions: list[str] = []
+    strategy_name = str(profile["name"])
+    if automatic_preferences is not None:
+        medium_momentum_weight = {
+            "short": 0.70,
+            "medium": 0.60,
+            "long": 0.40,
+        }[automatic_preferences.horizon]
+        risk_constraints = {
+            "max_position_pct": round(1.0 / automatic_preferences.max_positions, 6),
+            "stop_loss_pct": automatic_preferences.stop_loss_pct,
+            "take_profit_pct": 10.0,
+            "trailing_stop_pct": automatic_preferences.trailing_stop_pct,
+            "rebalance_interval_days": automatic_preferences.rebalance_interval_days,
+            "medium_momentum_weight": medium_momentum_weight,
+            "strategy_style": automatic_preferences.risk_style,
+            "investment_horizon": automatic_preferences.horizon,
+            "benchmark_objective": "fixed_universe_excess_return",
+            "benchmark_evaluation_period_days": 126,
+        }
+        style_label = {
+            "aggressive": "공격형",
+            "balanced": "균형형",
+            "defensive": "방어형",
+        }[automatic_preferences.risk_style]
+        horizon_label = {
+            "short": "단기",
+            "medium": "중기",
+            "long": "장기",
+        }[automatic_preferences.horizon]
+        strategy_name = f"{style_label}·{horizon_label} {strategy_name}"
+        customization_assumptions = [
+            f"사용자 입력을 {style_label}·{horizon_label} 성향으로 해석",
+            (
+                f"최대 {automatic_preferences.max_positions}종목, "
+                f"{automatic_preferences.rebalance_interval_days}거래일 교체, "
+                f"손절 {automatic_preferences.stop_loss_pct:.0%}, "
+                f"고점 추적손절 {automatic_preferences.trailing_stop_pct:.0%}"
+            ),
+            "126거래일 고정 구간 중 벤치마크 패배 구간이 50% 이상이면 검증 실패",
+        ]
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
-        name=str(profile["name"]),
+        name=strategy_name,
         market="KRX",
         sector=sector,
         timeframe="daily",
         entry_conditions=conditions.entry_conditions,
         exit_conditions=conditions.exit_conditions,
         indicators=conditions.indicators or profile["indicators"],
-        risk_constraints={
-            "max_position_pct": 0.1,
-            "stop_loss_pct": 0.20 if selection_mode == "automatic" else 0.08,
-            **(
-                {
-                    "take_profit_pct": 10.0,
-                    "rebalance_interval_days": 21,
-                }
-                if selection_mode == "automatic"
-                else {}
-            ),
-        },
+        risk_constraints=risk_constraints,
         assumptions=[
             f"sector filter: {sector}" if sector else "all matching listed common stocks",
             "daily adjusted close data",
+            *customization_assumptions,
             *profile["assumptions"],
         ],
         source_refs=list(profile.get("source_refs", [])),
@@ -1850,7 +1893,7 @@ def _strategy_profile_base(
     if (selection_mode or classify_strategy_request(query)) == "automatic":
         return {
             "strategy_id": "automatic_performance_momentum",
-            "name": "성과 우선 모멘텀 순환 전략 자동선택",
+            "name": "벤치마크 초과수익 맞춤 모멘텀 전략군",
             "entry_conditions": [
                 Condition(
                     left="past_only_signal",
@@ -1887,13 +1930,15 @@ def _strategy_profile_base(
                 "realized_volatility_21d",
                 "rebalance_21d",
                 "crash_risk_guard",
+                "benchmark_period_gate",
             ],
             "assumptions": [
-                "12-1 상대강도, 변동성 조절 복합 모멘텀, 6개월·12-1 주도주 순환을 고정 후보로 사용",
+                "사용자 위험성향과 투자기간에 맞는 독립 모멘텀 전략 3개를 백테스트 전에 생성",
                 "앞 70% 구간만 후보 선택에 사용하고 마지막 30%는 별도 검증",
+                "126거래일 고정 구간 중 벤치마크에 진 구간이 50% 이상이면 패배",
                 "지표는 평가 시점까지 알려진 조정 종가만 사용",
-                "45% 같은 조기 고정 익절로 큰 승자를 자르지 않고 월간 상대 순위와 장기 추세가 유지되면 보유",
-                "종목당 10%, 최대 10종목 분산과 20% 손실 제한을 적용",
+                "45% 같은 조기 고정 익절로 큰 승자를 자르지 않고 상대 순위와 장기 추세가 유지되면 보유",
+                "보유 종목 수·교체 주기·손실 제한은 사용자 입력에서 수익률을 보기 전에 결정",
                 "후보 수와 기본 파라미터를 백테스트 전에 고정해 과최적화 탐색을 제한",
                 "과거 연구와 백테스트는 미래 수익을 보장하지 않음",
             ],
@@ -3111,7 +3156,12 @@ def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
             reason="검증 대상 백테스트 지표가 없어 추천 규칙 통과 여부를 판단할 수 없습니다.",
         )
 
-    reasons = _objective_gate_reasons(selected.metrics, backtest.engine_summary)
+    reasons = _objective_gate_reasons(
+        selected.metrics,
+        backtest.engine_summary,
+        selection_mode=backtest.strategy_a.selection_mode,
+        benchmark_return=backtest.backtest_payload.get("benchmark_return"),
+    )
     validated = not reasons
     reason = (
         "objective gate를 모두 통과해 오늘의 추천을 유지합니다."
@@ -3124,6 +3174,9 @@ def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
 def _objective_gate_reasons(
     metrics: BacktestMetrics,
     engine_summary: Mapping[str, Any],
+    *,
+    selection_mode: str = "standard",
+    benchmark_return: Any | None = None,
 ) -> list[str]:
     trade_count = _summary_float_default(engine_summary, "effective_trade_count", 0.0)
     reasons: list[str] = []
@@ -3138,6 +3191,13 @@ def _objective_gate_reasons(
     if metrics.max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
         reasons.append(
             f"최대 낙폭 {metrics.max_drawdown:.4f} < {MAX_OBJECTIVE_DRAWDOWN:.2f} (리스크 허용치 미달)"
+        )
+    if selection_mode == "automatic":
+        reasons.extend(
+            _benchmark_objective_reasons(
+                metrics,
+                benchmark_return=benchmark_return,
+            )
         )
     return reasons
 

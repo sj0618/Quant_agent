@@ -53,6 +53,7 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
     ];
   const reliability = performance.reliability;
   const strategyExplanation = performance.strategyExplanation;
+  const generatedStrategies = strategyExplanation?.generated_strategies ?? [];
 
   return (
     <div className="workspace-content">
@@ -109,11 +110,36 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
         <Card className="strategy-explanation">
           <div className="strategy-explanation__head">
             <div>
-              <Badge variant="info">{strategyExplanation.selection_mode === "automatic" ? "자동 선택" : "입력 규칙"}</Badge>
+              <Badge variant="info">{strategyExplanation.selection_mode === "automatic" ? "전략 생성 · 별도 평가" : "입력 규칙"}</Badge>
               <h2>{strategyExplanation.title}</h2>
             </div>
           </div>
           <p>{strategyExplanation.summary}</p>
+          {generatedStrategies.length ? (
+            <section className="strategy-blueprints">
+              <div className="strategy-blueprints__head">
+                <strong>백테스트 전에 생성한 전략 목록</strong>
+                <p>아직 승자를 정하지 않은 독립 전략들입니다. 아래 백테스트가 별도로 비교합니다.</p>
+              </div>
+              <div className="strategy-blueprints__grid">
+                {generatedStrategies.map((blueprint, index) => (
+                  <article key={blueprint.blueprint_id}>
+                    <Badge variant="soft">전략 {index + 1}</Badge>
+                    <h3>{blueprint.title}</h3>
+                    <p><b>계산식</b><code>{blueprint.formula}</code></p>
+                    <p><b>도출 근거</b>{blueprint.derivation}</p>
+                    <p><b>생성 이유</b>{blueprint.why_generated}</p>
+                    <dl>
+                      <div><dt>보유</dt><dd>최대 {blueprint.max_positions}종목</dd></div>
+                      <div><dt>교체</dt><dd>{blueprint.rebalance_interval_days}거래일</dd></div>
+                      <div><dt>손절</dt><dd>{formatPercent(blueprint.stop_loss_pct)}</dd></div>
+                      <div><dt>추적손절</dt><dd>{formatPercent(blueprint.trailing_stop_pct)}</dd></div>
+                    </dl>
+                  </article>
+                ))}
+              </div>
+            </section>
+          ) : null}
           <p><b>왜 이 전략인가요?</b>{strategyExplanation.why_selected}</p>
           {strategyExplanation.rebalance_explanation ? <p><b>매매 주기</b>{strategyExplanation.rebalance_explanation}</p> : null}
           <div className="strategy-explanation__indicators">
@@ -121,6 +147,9 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
               <article key={indicator.key}>
                 <strong>{indicator.label}</strong>
                 <p>{indicator.plain_explanation}</p>
+                {indicator.formula ? <p><b>계산식</b><code>{indicator.formula}</code></p> : null}
+                {indicator.derivation ? <p><b>도출 근거</b>{indicator.derivation}</p> : null}
+                {indicator.customization ? <p><b>입력별 변경</b>{indicator.customization}</p> : null}
                 <p><b>사용 이유</b>{indicator.why_used}</p>
                 <p><b>주의</b>{indicator.caution}</p>
                 {indicator.source_refs.length ? (
@@ -253,4 +282,8 @@ function formatHistoryPeriod(start: string | null, end: string | null) {
     return "기간 없음";
   }
   return `${start || "?"} ~ ${end || "?"}`;
+}
+
+function formatPercent(value: number) {
+  return `${(value * 100).toLocaleString("ko-KR", { maximumFractionDigits: 1 })}%`;
 }

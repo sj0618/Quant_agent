@@ -38,6 +38,10 @@ _METRIC_DETAIL_KEYS = (
     "profit_factor",
     "benchmark_return",
     "excess_return",
+    "out_sample_excess_return",
+    "benchmark_period_win_rate",
+    "benchmark_period_loss_rate",
+    "out_sample_benchmark_period_loss_rate",
     "in_sample_sharpe",
     "out_sample_sharpe",
     "degradation",
@@ -87,6 +91,7 @@ def build_public_backtest_performance(
                 selected_parameters.profile if selected_parameters is not None else None
             ),
             selected_parameters=selected_parameters,
+            generated_strategies=result.generated_strategy_blueprints,
         ),
     )
 
@@ -252,6 +257,12 @@ def _build_public_metric_details(
         "in_sample_sharpe": _safe_metric(metrics.in_sample_sharpe),
         "out_sample_sharpe": _safe_metric(metrics.out_sample_sharpe),
         "degradation": _safe_metric(metrics.degradation),
+        "out_sample_excess_return": _safe_metric(metrics.out_sample_excess_return),
+        "benchmark_period_win_rate": _safe_metric(metrics.benchmark_period_win_rate),
+        "benchmark_period_loss_rate": _safe_metric(metrics.benchmark_period_loss_rate),
+        "out_sample_benchmark_period_loss_rate": _safe_metric(
+            metrics.out_sample_benchmark_period_loss_rate
+        ),
     }
 
     if reliability.status == "insufficient":
