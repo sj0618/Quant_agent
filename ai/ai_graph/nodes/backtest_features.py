@@ -8,6 +8,7 @@ from math import isfinite, sqrt
 from typing import Any
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 from ai_graph.nodes.condition_compiler import (
     boolean_comparison,
@@ -165,15 +166,19 @@ class PreparedFeatureStore:
         for indices in self.indices_by_ticker.values():
             closes = self.close[indices]
             volumes = self.volume[indices]
+            count = len(indices)
+            if count <= 1:
+                continue
             academic_factors = compute_academic_factor_arrays(closes)
             close_prefix = np.concatenate(([0.0], np.cumsum(closes)))
             volume_prefix = np.concatenate(([0.0], np.cumsum(volumes)))
-            returns = np.zeros(len(indices), dtype=np.float64)
-            if len(indices) > 1:
-                before = closes[:-1]
-                after = closes[1:]
-                valid = before != 0.0
-                returns[1:][valid] = after[valid] / before[valid] - 1.0
+            returns = np.zeros(count, dtype=np.float64)
+            before = closes[:-1]
+            after = closes[1:]
+            nonzero_before = before != 0.0
+            returns[1:][nonzero_before] = (
+                after[nonzero_before] / before[nonzero_before] - 1.0
+            )
             return_prefix = np.concatenate(([0.0], np.cumsum(returns)))
             return_square_prefix = np.concatenate(([0.0], np.cumsum(returns * returns)))
             main_highs = _prior_rolling_extreme(closes, lookback, maximum=True)
@@ -181,81 +186,98 @@ class PreparedFeatureStore:
             long_limit = max(60, lookback)
             long_highs = _prior_rolling_extreme(closes, long_limit, maximum=True)
 
-            for local_index, global_index in enumerate(indices):
-                window = min(lookback, local_index)
-                if window <= 0:
-                    continue
-                start = local_index - window
-                short_window = min(max(3, window // 4), local_index)
-                medium_window = min(max(5, window // 2), local_index)
-                long_window = min(long_limit, local_index)
-                medium_start = local_index - medium_window
-                long_start = local_index - long_window
+            local = np.arange(count, dtype=np.int64)
+            valid = local > 0
+            target = indices[valid]
+            window = np.minimum(lookback, local)
+            start = local - window
+            short_window = np.minimum(np.maximum(3, window // 4), local)
+            medium_window = np.minimum(np.maximum(5, window // 2), local)
+            long_window = np.minimum(long_limit, local)
+            short_start = local - short_window
+            medium_start = local - medium_window
+            long_start = local - long_window
 
-                average = _prefix_average(close_prefix, start, local_index)
-                short_average = _prefix_average(
-                    close_prefix, local_index - short_window, local_index
-                )
-                medium_average = _prefix_average(close_prefix, medium_start, local_index)
-                long_average = _prefix_average(close_prefix, long_start, local_index)
-                high = main_highs[local_index]
-                low = main_lows[local_index]
-                long_high = long_highs[local_index]
-                close = closes[local_index]
-                first = closes[start]
-                medium_first = closes[medium_start]
-                long_first = closes[long_start]
-                trend = close / first - 1.0 if first else 0.0
-                medium_return = close / medium_first - 1.0 if medium_first else 0.0
-                long_return = close / long_first - 1.0 if long_first else 0.0
-                pullback = (high - close) / high if high > 0.0 else 0.0
-                volatility = (high - low) / average if average else 0.0
-                long_drawdown = (long_high - close) / long_high if long_high > 0.0 else 0.0
-                return_count = max(0, window - 1)
-                if return_count:
-                    return_start = start + 1
-                    total = return_prefix[local_index] - return_prefix[return_start]
-                    square_total = (
-                        return_square_prefix[local_index] - return_square_prefix[return_start]
-                    )
-                    mean_return = total / return_count
-                    variance = max(
-                        0.0,
-                        square_total / return_count - mean_return * mean_return,
-                    )
-                    rolling_sharpe = mean_return / sqrt(variance) if variance > 0.0 else 0.0
-                else:
-                    rolling_sharpe = 0.0
-                average_volume = _prefix_average(volume_prefix, start, local_index)
-                volume_ratio = (
-                    volumes[local_index] / average_volume if average_volume > 0.0 else 1.0
-                )
-                return_to_volatility = trend / volatility if volatility > 0.0 else 0.0
-                matrix[global_index] = (
-                    1.0,
-                    average,
-                    short_average,
-                    medium_average,
-                    high,
-                    low,
-                    closes[local_index - 1],
-                    trend,
-                    medium_return,
-                    volatility,
-                    long_average,
-                    long_high,
-                    long_return,
-                    long_drawdown,
-                    rolling_sharpe,
-                    volume_ratio,
-                    return_to_volatility,
-                    pullback,
-                    academic_factors.momentum_12_1[local_index],
-                    academic_factors.sma_50[local_index],
-                    academic_factors.sma_200[local_index],
-                    academic_factors.realized_volatility_21d[local_index],
-                    float(academic_factors.rebalance_eligible[local_index]),
-                )
+            average = np.zeros(count, dtype=np.float64)
+            short_average = np.zeros(count, dtype=np.float64)
+            medium_average = np.zeros(count, dtype=np.float64)
+            long_average = np.zeros(count, dtype=np.float64)
+            average[valid] = (
+                close_prefix[local[valid]] - close_prefix[start[valid]]
+            ) / window[valid]
+            short_average[valid] = (
+                close_prefix[local[valid]] - close_prefix[short_start[valid]]
+            ) / short_window[valid]
+            medium_average[valid] = (
+                close_prefix[local[valid]] - close_prefix[medium_start[valid]]
+            ) / medium_window[valid]
+            long_average[valid] = (
+                close_prefix[local[valid]] - close_prefix[long_start[valid]]
+            ) / long_window[valid]
+
+            trend = _safe_return(closes, closes[start])
+            medium_return = _safe_return(closes, closes[medium_start])
+            long_return = _safe_return(closes, closes[long_start])
+            pullback = _safe_ratio(main_highs - closes, main_highs, positive=True)
+            volatility = _safe_ratio(main_highs - main_lows, average)
+            long_drawdown = _safe_ratio(long_highs - closes, long_highs, positive=True)
+
+            return_count = np.maximum(0, window - 1)
+            return_valid = return_count > 0
+            return_start = start + 1
+            total = return_prefix[local] - return_prefix[return_start]
+            square_total = return_square_prefix[local] - return_square_prefix[return_start]
+            mean_return = np.zeros(count, dtype=np.float64)
+            mean_return[return_valid] = total[return_valid] / return_count[return_valid]
+            variance = np.zeros(count, dtype=np.float64)
+            variance[return_valid] = np.maximum(
+                0.0,
+                square_total[return_valid] / return_count[return_valid]
+                - mean_return[return_valid] * mean_return[return_valid],
+            )
+            rolling_sharpe = np.zeros(count, dtype=np.float64)
+            nonzero_variance = variance > 0.0
+            rolling_sharpe[nonzero_variance] = (
+                mean_return[nonzero_variance] / np.sqrt(variance[nonzero_variance])
+            )
+
+            average_volume = np.zeros(count, dtype=np.float64)
+            average_volume[valid] = (
+                volume_prefix[local[valid]] - volume_prefix[start[valid]]
+            ) / window[valid]
+            volume_ratio = np.zeros(count, dtype=np.float64)
+            positive_average_volume = valid & (average_volume > 0.0)
+            volume_ratio[valid] = 1.0
+            volume_ratio[positive_average_volume] = (
+                volumes[positive_average_volume] / average_volume[positive_average_volume]
+            )
+            return_to_volatility = _safe_ratio(trend, volatility, positive=True)
+
+            matrix[target, READY] = 1.0
+            matrix[target, AVERAGE] = average[valid]
+            matrix[target, SHORT_AVERAGE] = short_average[valid]
+            matrix[target, MEDIUM_AVERAGE] = medium_average[valid]
+            matrix[target, HIGH] = main_highs[valid]
+            matrix[target, LOW] = main_lows[valid]
+            matrix[target, PREVIOUS] = closes[local[valid] - 1]
+            matrix[target, TREND] = trend[valid]
+            matrix[target, MEDIUM_RETURN] = medium_return[valid]
+            matrix[target, VOLATILITY] = volatility[valid]
+            matrix[target, LONG_AVERAGE] = long_average[valid]
+            matrix[target, LONG_HIGH] = long_highs[valid]
+            matrix[target, LONG_RETURN] = long_return[valid]
+            matrix[target, LONG_DRAWDOWN] = long_drawdown[valid]
+            matrix[target, ROLLING_SHARPE] = rolling_sharpe[valid]
+            matrix[target, VOLUME_RATIO] = volume_ratio[valid]
+            matrix[target, RETURN_TO_VOLATILITY] = return_to_volatility[valid]
+            matrix[target, PULLBACK] = pullback[valid]
+            matrix[target, MOMENTUM_12_1] = academic_factors.momentum_12_1[valid]
+            matrix[target, SMA_50] = academic_factors.sma_50[valid]
+            matrix[target, SMA_200] = academic_factors.sma_200[valid]
+            matrix[target, REALIZED_VOLATILITY_21D] = (
+                academic_factors.realized_volatility_21d[valid]
+            )
+            matrix[target, REBALANCE_ELIGIBLE] = academic_factors.rebalance_eligible[valid]
         matrix.setflags(write=False)
         self._lookback_cache[lookback] = matrix
         return matrix
@@ -1079,9 +1101,23 @@ def _flag_is_asserted(condition: Condition) -> bool | None:
     return None
 
 
-def _prefix_average(prefix: np.ndarray, start: int, end: int) -> float:
-    count = end - start
-    return float((prefix[end] - prefix[start]) / count) if count > 0 else 0.0
+def _safe_return(values: np.ndarray, bases: np.ndarray) -> np.ndarray:
+    output = np.zeros(len(values), dtype=np.float64)
+    valid = bases != 0.0
+    output[valid] = values[valid] / bases[valid] - 1.0
+    return output
+
+
+def _safe_ratio(
+    numerators: np.ndarray,
+    denominators: np.ndarray,
+    *,
+    positive: bool = False,
+) -> np.ndarray:
+    output = np.zeros(len(numerators), dtype=np.float64)
+    valid = denominators > 0.0 if positive else denominators != 0.0
+    output[valid] = numerators[valid] / denominators[valid]
+    return output
 
 
 def _prior_rolling_extreme(
@@ -1091,20 +1127,13 @@ def _prior_rolling_extreme(
     maximum: bool,
 ) -> np.ndarray:
     output = np.zeros(len(values), dtype=np.float64)
-    candidates: deque[int] = deque()
-    for index in range(len(values)):
-        prior = index - 1
-        if prior >= 0:
-            while candidates and (
-                values[candidates[-1]] <= values[prior]
-                if maximum
-                else values[candidates[-1]] >= values[prior]
-            ):
-                candidates.pop()
-            candidates.append(prior)
-        start = max(0, index - window)
-        while candidates and candidates[0] < start:
-            candidates.popleft()
-        if candidates:
-            output[index] = values[candidates[0]]
+    if len(values) <= 1 or window <= 0:
+        return output
+    prefix_end = min(window, len(values))
+    accumulate = np.maximum.accumulate if maximum else np.minimum.accumulate
+    if prefix_end > 1:
+        output[1:prefix_end] = accumulate(values[: prefix_end - 1])
+    if window < len(values):
+        windows = sliding_window_view(values[:-1], window)
+        output[window:] = windows.max(axis=1) if maximum else windows.min(axis=1)
     return output

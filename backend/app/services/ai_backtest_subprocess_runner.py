@@ -67,7 +67,7 @@ def _execute_generated_backtest(
     *,
     trace_id: UUID,
 ) -> CodeExecutionResult:
-    from ai_graph.data_sources.db import load_pipeline_data_from_env
+    from ai_graph.data_sources import load_pipeline_data_from_env
     from ai_graph.graph import build_strategy_spec
     from ai_graph.nodes import backtest as ai_backtest
     from ai_graph.schemas import CodeCandidate, StrategySpec

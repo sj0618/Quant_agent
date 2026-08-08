@@ -372,6 +372,25 @@ class _CandidateEvaluation:
 
 
 @dataclass(frozen=True)
+class _CandidateTaskResult:
+    evaluation: _CandidateEvaluation
+    generated_actions: Sequence[int] | None
+    action_build_seconds: float
+    action_cache_hit: bool
+    worker_pid: int
+    feature_cached_lookbacks: tuple[int, ...]
+    feature_estimated_bytes: int
+
+
+@dataclass(frozen=True)
+class _BenchmarkContext:
+    daily_returns: tuple[float, ...]
+    selection_days: int
+    selection_return: float
+    total_return: float
+
+
+@dataclass(frozen=True)
 class _PreparedMarketCacheEntry:
     price_rows: tuple[Mapping[str, Any], ...]
     prepared_market: EnginePreparedMarketData
@@ -413,30 +432,45 @@ def _clear_prepared_market_cache() -> None:
 _WORKER_STRATEGY: AIStrategySpec | None = None
 _WORKER_PRICE_ROWS: Sequence[Mapping[str, Any]] | None = None
 _WORKER_PREPARED_MARKET: EnginePreparedMarketData | None = None
+_WORKER_FEATURE_STORE: PreparedFeatureStore | None = None
+_WORKER_BENCHMARK_CONTEXT: _BenchmarkContext | None = None
 
 
 def _initialize_candidate_worker(
     strategy_payload: Mapping[str, Any],
     price_rows: Sequence[Mapping[str, Any]],
     prepared_market: EnginePreparedMarketData,
+    feature_store: PreparedFeatureStore,
+    benchmark_context: _BenchmarkContext,
 ) -> None:
     global _WORKER_STRATEGY, _WORKER_PRICE_ROWS, _WORKER_PREPARED_MARKET
+    global _WORKER_FEATURE_STORE, _WORKER_BENCHMARK_CONTEXT
     _WORKER_STRATEGY = AIStrategySpec.model_validate(strategy_payload)
     _WORKER_PRICE_ROWS = price_rows
     _WORKER_PREPARED_MARKET = prepared_market
+    _WORKER_FEATURE_STORE = feature_store
+    _WORKER_BENCHMARK_CONTEXT = benchmark_context
 
 
 def _evaluate_candidate_worker(
     task: tuple[Mapping[str, Any], Sequence[int] | None, str],
-) -> _CandidateEvaluation:
-    if _WORKER_STRATEGY is None or _WORKER_PRICE_ROWS is None or _WORKER_PREPARED_MARKET is None:
+) -> _CandidateTaskResult:
+    if (
+        _WORKER_STRATEGY is None
+        or _WORKER_PRICE_ROWS is None
+        or _WORKER_PREPARED_MARKET is None
+        or _WORKER_FEATURE_STORE is None
+        or _WORKER_BENCHMARK_CONTEXT is None
+    ):
         raise RuntimeError("candidate worker was not initialized")
     candidate_payload, actions, metrics_mode = task
-    return _evaluate_candidate(
+    return _evaluate_candidate_task(
         _WORKER_STRATEGY,
         CodeCandidate.model_validate(candidate_payload),
         _WORKER_PRICE_ROWS,
         prepared_market=_WORKER_PREPARED_MARKET,
+        feature_store=_WORKER_FEATURE_STORE,
+        benchmark_context=_WORKER_BENCHMARK_CONTEXT,
         generated_actions=actions,
         metrics_mode=metrics_mode,
     )
@@ -625,9 +659,17 @@ class _CandidateBacktestSession:
                 ),
             )
 
+        started = time.perf_counter()
+        self.benchmark_context = _build_benchmark_context(self.price_rows)
+        phases["benchmark_context_seconds"] = time.perf_counter() - started
+
         self.preparation_phases = {name: round(seconds, 6) for name, seconds in phases.items()}
         self.preparation_seconds = time.perf_counter() - prep_started
+        self._base_feature_estimated_bytes = self.feature_store.stats().estimated_bytes
         self._cache: dict[tuple[str, bool, str], _CandidateEvaluation] = {}
+        self._action_cache: dict[str, Sequence[int]] = {}
+        self._worker_feature_bytes: dict[int, int] = {}
+        self._worker_feature_lookbacks: set[int] = set()
         self._disk_cache = _DiskEvaluationCache()
         self._executor: ProcessPoolExecutor | None = None
         self._executor_workers = 0
@@ -682,24 +724,9 @@ class _CandidateBacktestSession:
                 missing_keys.add(memory_key)
             self.cache_misses += 1
 
-        actions_started = time.perf_counter()
-        actions_by_identity: dict[str, Sequence[int] | None] = {}
-        for candidate in missing:
-            identity = _candidate_identity(candidate)
-            if identity in actions_by_identity:
-                continue
-            actions_by_identity[identity] = (
-                self.feature_store.build_actions(
-                    candidate.strategy_ir,
-                    candidate.parameters,
-                )
-                if candidate.representation == "structured"
-                and candidate.strategy_ir is not None
-                and candidate.parameters is not None
-                else None
-            )
-        action_build_seconds = time.perf_counter() - actions_started
-
+        round_action_cache_hits = sum(
+            _candidate_identity(candidate) in self._action_cache for candidate in missing
+        )
         if missing:
             round_worker_count = _candidate_worker_count(
                 len(missing),
@@ -708,7 +735,7 @@ class _CandidateBacktestSession:
             tasks = [
                 (
                     candidate.model_dump(mode="python"),
-                    actions_by_identity[_candidate_identity(candidate)],
+                    self._action_cache.get(_candidate_identity(candidate)),
                     metrics_mode,
                 )
                 for candidate in missing
@@ -718,24 +745,46 @@ class _CandidateBacktestSession:
             )
             reuse_executor = self._executor is not None
             if round_worker_count == 1 and not requires_isolation and not reuse_executor:
-                evaluations = [
-                    _evaluate_candidate(
+                task_results = [
+                    _evaluate_candidate_task(
                         self.strategy,
                         candidate,
                         self.price_rows,
                         prepared_market=self.prepared_market,
-                        generated_actions=actions_by_identity[_candidate_identity(candidate)],
+                        feature_store=self.feature_store,
+                        benchmark_context=self.benchmark_context,
+                        generated_actions=self._action_cache.get(_candidate_identity(candidate)),
                         metrics_mode=metrics_mode,
                     )
                     for candidate in missing
                 ]
             else:
-                evaluations = self._evaluate_parallel(
+                task_results = self._evaluate_parallel(
                     tasks,
                     missing,
                     (self._executor_workers if reuse_executor else max(1, round_worker_count)),
                 )
-            for candidate, evaluation in zip(missing, evaluations, strict=True):
+            action_seconds_by_pid: dict[int, float] = {}
+            for result in task_results:
+                if result.action_build_seconds > 0.0:
+                    action_seconds_by_pid[result.worker_pid] = (
+                        action_seconds_by_pid.get(result.worker_pid, 0.0)
+                        + result.action_build_seconds
+                    )
+                if result.generated_actions is not None:
+                    self._action_cache[_candidate_identity(result.evaluation.candidate)] = (
+                        result.generated_actions
+                    )
+                if result.worker_pid != os.getpid():
+                    self._worker_feature_bytes[result.worker_pid] = max(
+                        self._worker_feature_bytes.get(result.worker_pid, 0),
+                        result.feature_estimated_bytes,
+                    )
+                    self._worker_feature_lookbacks.update(result.feature_cached_lookbacks)
+            action_build_seconds = max(action_seconds_by_pid.values(), default=0.0)
+            action_build_total_seconds = sum(action_seconds_by_pid.values())
+            for candidate, result in zip(missing, task_results, strict=True):
+                evaluation = result.evaluation
                 memory_key = _candidate_cache_key(candidate, metrics_mode)
                 self._cache[memory_key] = evaluation
                 disk_key = self._disk_cache_key(candidate, metrics_mode)
@@ -743,6 +792,9 @@ class _CandidateBacktestSession:
                     self.disk_cache_bytes_written += self._disk_cache.store(disk_key, evaluation)
                 except (OSError, TypeError, ValueError):
                     pass
+        else:
+            action_build_total_seconds = 0.0
+            action_seconds_by_pid = {}
 
         self.evaluation_rounds.append(
             {
@@ -754,6 +806,9 @@ class _CandidateBacktestSession:
                 "disk_cache_hits": disk_hits,
                 "worker_count": round_worker_count,
                 "action_build_seconds": round(action_build_seconds, 6),
+                "action_build_total_seconds": round(action_build_total_seconds, 6),
+                "action_worker_pids": sorted(action_seconds_by_pid),
+                "action_cache_hits": round_action_cache_hits,
                 "cumulative_candidates": len(
                     {key[0] for key in self._cache if key[2] == "selection"}
                 ),
@@ -774,7 +829,7 @@ class _CandidateBacktestSession:
         tasks: list[tuple[Mapping[str, Any], Sequence[int] | None, str]],
         candidates: list[CodeCandidate],
         worker_count: int,
-    ) -> list[_CandidateEvaluation]:
+    ) -> list[_CandidateTaskResult]:
         if self._executor is not None and self._executor_workers != worker_count:
             self._executor.shutdown(wait=True, cancel_futures=True)
             self._executor = None
@@ -789,6 +844,8 @@ class _CandidateBacktestSession:
                     self.strategy.model_dump(mode="python"),
                     self.price_rows,
                     self.prepared_market,
+                    self.feature_store,
+                    self.benchmark_context,
                 ),
             )
             self._executor_workers = worker_count
@@ -800,11 +857,11 @@ class _CandidateBacktestSession:
         # still receive a full execution budget.
         wave_count = max(1, math.ceil(len(futures) / max(1, worker_count)))
         deadline = time.perf_counter() + timeout * wave_count
-        evaluations: list[_CandidateEvaluation | None] = [None] * len(futures)
-        future_indexes: dict[Future[_CandidateEvaluation], int] = {
+        evaluations: list[_CandidateTaskResult | None] = [None] * len(futures)
+        future_indexes: dict[Future[_CandidateTaskResult], int] = {
             future: index for index, future in enumerate(futures)
         }
-        pending: set[Future[_CandidateEvaluation]] = set(futures)
+        pending: set[Future[_CandidateTaskResult]] = set(futures)
         while pending:
             remaining_seconds = deadline - time.perf_counter()
             if remaining_seconds <= 0:
@@ -830,7 +887,15 @@ class _CandidateBacktestSession:
             for future in pending:
                 future.cancel()
                 index = future_indexes[future]
-                evaluations[index] = _timeout_evaluation(candidates[index], timeout)
+                evaluations[index] = _CandidateTaskResult(
+                    evaluation=_timeout_evaluation(candidates[index], timeout),
+                    generated_actions=None,
+                    action_build_seconds=0.0,
+                    action_cache_hit=False,
+                    worker_pid=0,
+                    feature_cached_lookbacks=(),
+                    feature_estimated_bytes=0,
+                )
 
         if any(evaluation is None for evaluation in evaluations):
             raise RuntimeError("candidate worker completed without an evaluation")
@@ -866,6 +931,10 @@ class _CandidateBacktestSession:
 
     def execution_stats(self) -> dict[str, Any]:
         feature_stats = self.feature_store.stats()
+        worker_feature_bytes = sum(
+            max(0, size - self._base_feature_estimated_bytes)
+            for size in self._worker_feature_bytes.values()
+        )
         return {
             "engine_version": BACKTEST_ENGINE_VERSION,
             "feature_version": FEATURE_DEFINITION_VERSION,
@@ -873,8 +942,10 @@ class _CandidateBacktestSession:
             "feature_preparation_seconds": round(self.preparation_seconds, 6),
             "feature_preparation_phases": dict(self.preparation_phases),
             "prepared_market_cache_hit": self.prepared_market_cache_hit,
-            "feature_estimated_bytes": feature_stats.estimated_bytes,
-            "feature_cached_lookbacks": list(feature_stats.cached_lookbacks),
+            "feature_estimated_bytes": feature_stats.estimated_bytes + worker_feature_bytes,
+            "feature_cached_lookbacks": sorted(
+                {*feature_stats.cached_lookbacks, *self._worker_feature_lookbacks}
+            ),
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "disk_cache_bytes_written": self.disk_cache_bytes_written,
@@ -1091,67 +1162,119 @@ def _peak_rss_bytes() -> int | None:
         return None
 
 
-def _evaluate_candidate(
+def _evaluate_candidate_task(
     strategy_a: AIStrategySpec,
     candidate: CodeCandidate,
     rows: Sequence[Mapping[str, Any]],
     *,
     prepared_market: EnginePreparedMarketData,
+    feature_store: PreparedFeatureStore,
+    benchmark_context: _BenchmarkContext,
     generated_actions: Sequence[int] | None,
     metrics_mode: str,
-) -> _CandidateEvaluation:
+) -> _CandidateTaskResult:
     wall_started = time.perf_counter()
     cpu_started = time.process_time()
+    worker_pid = os.getpid()
+    action_cache_hit = generated_actions is not None
+    action_build_started = time.perf_counter()
+    actions = generated_actions
     if not candidate.validation_ok:
-        return _CandidateEvaluation(
-            candidate=candidate,
-            diagnostics={
-                "candidate_id": candidate.candidate_id,
-                "stage": "validation",
-                "input_rows": len(rows),
-                "generated_signals": 0,
-                "cache_hit": False,
-                "wall_seconds": 0.0,
-                "cpu_seconds": 0.0,
-            },
+        feature_stats = feature_store.stats()
+        return _CandidateTaskResult(
+            evaluation=_CandidateEvaluation(
+                candidate=candidate,
+                diagnostics={
+                    "candidate_id": candidate.candidate_id,
+                    "stage": "validation",
+                    "input_rows": len(rows),
+                    "generated_signals": 0,
+                    "cache_hit": False,
+                    "wall_seconds": 0.0,
+                    "cpu_seconds": 0.0,
+                    "action_build_seconds": 0.0,
+                    "action_cache_hit": action_cache_hit,
+                    "worker_pid": worker_pid,
+                },
+            ),
+            generated_actions=actions,
+            action_build_seconds=0.0,
+            action_cache_hit=action_cache_hit,
+            worker_pid=worker_pid,
+            feature_cached_lookbacks=feature_stats.cached_lookbacks,
+            feature_estimated_bytes=feature_stats.estimated_bytes,
         )
     try:
+        if actions is None:
+            if (
+                candidate.representation == "structured"
+                and candidate.strategy_ir is not None
+                and candidate.parameters is not None
+            ):
+                actions = feature_store.build_actions(
+                    candidate.strategy_ir,
+                    candidate.parameters,
+                )
+            else:
+                generated_signals = _execute_candidate_code(candidate, rows)
+                actions = _compact_actions_from_signals(prepared_market, generated_signals)
+        action_build_seconds = (
+            0.0 if action_cache_hit else time.perf_counter() - action_build_started
+        )
         engine_result = _run_candidate_backtest(
             strategy_a,
             candidate,
             rows,
             prepared_market=prepared_market,
-            generated_actions=generated_actions,
+            generated_actions=actions,
             metrics_mode=metrics_mode,
         )
     except Exception as exc:
+        action_build_seconds = (
+            0.0 if action_cache_hit else time.perf_counter() - action_build_started
+        )
         diagnostics = {
             "candidate_id": candidate.candidate_id,
             "stage": "candidate_evaluation",
             "input_rows": len(rows),
-            "generated_signals": len(generated_actions or ()),
+            "generated_signals": len(actions or ()),
             "cache_hit": False,
             "wall_seconds": round(time.perf_counter() - wall_started, 6),
             "cpu_seconds": round(time.process_time() - cpu_started, 6),
             "error_type": type(exc).__name__,
+            "action_build_seconds": round(action_build_seconds, 6),
+            "action_cache_hit": action_cache_hit,
+            "worker_pid": worker_pid,
         }
+        feature_stats = feature_store.stats()
         if _is_quantstats_dependency_error(exc):
-            return _CandidateEvaluation(
-                candidate=candidate,
-                quantstats_dependency_error=True,
+            evaluation = _CandidateEvaluation(
+                candidate=candidate, quantstats_dependency_error=True, diagnostics=diagnostics
+            )
+        else:
+            evaluation = _CandidateEvaluation(
+                candidate=candidate.model_copy(
+                    update={
+                        "validation_ok": False,
+                        "violations": [*candidate.violations, f"engine backtest failed: {exc}"],
+                    }
+                ),
                 diagnostics=diagnostics,
             )
-        return _CandidateEvaluation(
-            candidate=candidate.model_copy(
-                update={
-                    "validation_ok": False,
-                    "violations": [*candidate.violations, f"engine backtest failed: {exc}"],
-                }
-            ),
-            diagnostics=diagnostics,
+        return _CandidateTaskResult(
+            evaluation=evaluation,
+            generated_actions=actions,
+            action_build_seconds=action_build_seconds,
+            action_cache_hit=action_cache_hit,
+            worker_pid=worker_pid,
+            feature_cached_lookbacks=feature_stats.cached_lookbacks,
+            feature_estimated_bytes=feature_stats.estimated_bytes,
         )
 
-    metrics = _metrics_from_engine_result(engine_result, price_rows=rows)
+    metrics = _metrics_from_engine_result(
+        engine_result,
+        benchmark_returns=benchmark_context.daily_returns,
+    )
     enriched_candidate = candidate.model_copy(update={"metrics": metrics})
     engine_summary = dict(engine_result.summary)
     engine_summary["buy_signal_count"] = _signal_action_count(engine_result, "BUY")
@@ -1174,22 +1297,40 @@ def _evaluate_candidate(
     engine_summary["selection_buy_count"] = _selection_signal_action_count(
         engine_result, rows, "BUY"
     )
-    return _CandidateEvaluation(
+    evaluation = _CandidateEvaluation(
         candidate=enriched_candidate,
         engine_summary=engine_summary,
         equity_curve=_public_equity_curve(engine_result),
-        objective_score=_objective_score(metrics, engine_summary, rows),
+        objective_score=_objective_score(
+            metrics,
+            engine_summary,
+            rows,
+            benchmark_context=benchmark_context,
+        ),
         diagnostics={
             "candidate_id": candidate.candidate_id,
             "stage": "candidate_evaluation",
             "metrics_mode": metrics_mode,
             "input_rows": len(rows),
-            "generated_signals": len(generated_actions or ()),
+            "generated_signals": len(actions or ()),
             "cache_hit": False,
             "wall_seconds": round(time.perf_counter() - wall_started, 6),
             "cpu_seconds": round(time.process_time() - cpu_started, 6),
             "peak_rss_bytes": _peak_rss_bytes(),
+            "action_build_seconds": round(action_build_seconds, 6),
+            "action_cache_hit": action_cache_hit,
+            "worker_pid": worker_pid,
         },
+    )
+    feature_stats = feature_store.stats()
+    return _CandidateTaskResult(
+        evaluation=evaluation,
+        generated_actions=actions,
+        action_build_seconds=action_build_seconds,
+        action_cache_hit=action_cache_hit,
+        worker_pid=worker_pid,
+        feature_cached_lookbacks=feature_stats.cached_lookbacks,
+        feature_estimated_bytes=feature_stats.estimated_bytes,
     )
 
 
@@ -1312,7 +1453,11 @@ def run_candidate_backtest(
             engine_summary=engine_summaries_by_candidate[selected.candidate_id],
             engine_summaries_by_candidate=engine_summaries_by_candidate,
             objective_scores_by_candidate=objective_scores_by_candidate,
-            backtest_payload=_backtest_payload(strategy_a, rows),
+            backtest_payload=_backtest_payload(
+                strategy_a,
+                rows,
+                benchmark_return=session.benchmark_context.total_return,
+            ),
             feature_coverage=dict(feature_coverage or {}),
             fallback_reasons=list(fallback_reasons or ()),
             execution_stats={
@@ -1761,6 +1906,7 @@ def _metrics_from_engine_result(
     engine_result,
     *,
     price_rows: Sequence[Mapping[str, Any]] | None = None,
+    benchmark_returns: Sequence[float] | None = None,
 ) -> BacktestMetrics:
     summary = engine_result.summary
     metric_warnings = _summary_warning_list(summary)
@@ -1782,10 +1928,14 @@ def _metrics_from_engine_result(
     split_index = max(1, int(len(daily_returns) * BACKTEST_SPLIT_FRACTION))
     in_sample_returns = daily_returns[:split_index]
     out_sample_returns = daily_returns[split_index:]
-    benchmark_returns = _benchmark_daily_returns(price_rows or ())
-    comparison_length = min(len(daily_returns), len(benchmark_returns))
+    resolved_benchmark_returns = (
+        benchmark_returns
+        if benchmark_returns is not None
+        else _benchmark_daily_returns(price_rows or ())
+    )
+    comparison_length = min(len(daily_returns), len(resolved_benchmark_returns))
     strategy_comparison_returns = daily_returns[:comparison_length]
-    benchmark_comparison_returns = benchmark_returns[:comparison_length]
+    benchmark_comparison_returns = resolved_benchmark_returns[:comparison_length]
     comparison_split_index = min(split_index, comparison_length)
     in_sample_benchmark_returns = benchmark_comparison_returns[:comparison_split_index]
     out_sample_benchmark_returns = benchmark_comparison_returns[comparison_split_index:]
@@ -1924,6 +2074,12 @@ def _benchmark_daily_returns(
     price_rows: Sequence[Mapping[str, Any]],
 ) -> list[float]:
     curve, _ = _equal_weight_benchmark_curve(price_rows)
+    return _daily_returns_from_benchmark_curve(curve)
+
+
+def _daily_returns_from_benchmark_curve(
+    curve: Sequence[BacktestEquityPoint],
+) -> list[float]:
     if len(curve) < 2:
         return []
     returns: list[float] = []
@@ -1935,6 +2091,26 @@ def _benchmark_daily_returns(
         returns.append(current_equity / previous_equity - 1.0)
         previous_equity = current_equity
     return returns
+
+
+def _build_benchmark_context(
+    price_rows: Sequence[Mapping[str, Any]],
+) -> _BenchmarkContext:
+    curve, total_return = _equal_weight_benchmark_curve(price_rows)
+    selection_days = max(
+        1,
+        int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION),
+    )
+    selection_index = min(max(0, selection_days - 1), len(curve) - 1)
+    selection_return = (
+        float(curve[selection_index].cumulative_return) if curve else 0.0
+    )
+    return _BenchmarkContext(
+        daily_returns=tuple(_daily_returns_from_benchmark_curve(curve)),
+        selection_days=selection_days,
+        selection_return=selection_return,
+        total_return=float(total_return or 0.0),
+    )
 
 
 def _benchmark_period_stats(
@@ -2123,17 +2299,27 @@ def _objective_score(
     metrics: BacktestMetrics,
     engine_summary: Mapping[str, Any],
     price_rows: Sequence[Mapping[str, Any]],
+    *,
+    benchmark_context: _BenchmarkContext | None = None,
 ) -> float:
     trade_count = _summary_float_default(engine_summary, "selection_buy_count", 0.0)
-    selection_days = max(
-        1, int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION)
+    selection_days = (
+        benchmark_context.selection_days
+        if benchmark_context is not None
+        else max(
+            1,
+            int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION),
+        )
     )
     annual_return = _annualized_return(metrics.in_sample_return, trading_days=selection_days)
     calmar = _calmar_ratio(annual_return, metrics.in_sample_max_drawdown)
-    dates = sorted({str(row.get("date")) for row in price_rows})
-    cutoff = dates[max(0, selection_days - 1)] if dates else ""
-    selection_rows = [row for row in price_rows if str(row.get("date")) <= cutoff]
-    _, benchmark_return = _equal_weight_benchmark_curve(selection_rows)
+    if benchmark_context is None:
+        dates = sorted({str(row.get("date")) for row in price_rows})
+        cutoff = dates[max(0, selection_days - 1)] if dates else ""
+        selection_rows = [row for row in price_rows if str(row.get("date")) <= cutoff]
+        _, benchmark_return = _equal_weight_benchmark_curve(selection_rows)
+    else:
+        benchmark_return = benchmark_context.selection_return
     annual_benchmark_return = _annualized_return(
         float(benchmark_return or 0.0),
         trading_days=selection_days,
@@ -2277,7 +2463,10 @@ def _benchmark_return(price_rows: Sequence[Mapping[str, Any]]) -> float:
 
 
 def _backtest_payload(
-    strategy: AIStrategySpec, rows: Sequence[Mapping[str, Any]]
+    strategy: AIStrategySpec,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    benchmark_return: float | None = None,
 ) -> dict[str, Any]:
     tickers = sorted({str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6) for row in rows})
     payload = {
@@ -2287,7 +2476,10 @@ def _backtest_payload(
         "price_rows": len(rows),
         "first_date": str(rows[0].get("date")) if rows else None,
         "last_date": str(rows[-1].get("date")) if rows else None,
-        "benchmark_return": round(_benchmark_return(rows), METRIC_ROUND_DIGITS),
+        "benchmark_return": round(
+            _benchmark_return(rows) if benchmark_return is None else benchmark_return,
+            METRIC_ROUND_DIGITS,
+        ),
         "benchmark_method": BENCHMARK_METHOD,
         "benchmark_warning": BENCHMARK_WARNING,
     }
