@@ -1,4 +1,6 @@
-﻿import pytest
+from datetime import datetime, timedelta
+
+import pytest
 
 from ai_graph.graph import _recommendation_gate
 from ai_graph.graph import build_public_backtest_performance
@@ -37,7 +39,9 @@ def make_strategy() -> StrategySpec:
     )
 
 
-def _performance_payload(metrics: BacktestMetrics, engine_summary: dict | None = None) -> dict:
+def _performance_payload(
+    metrics: BacktestMetrics, engine_summary: dict | None = None
+) -> dict:
     candidate = CodeCandidate(
         candidate_id="A2",
         variant="A",
@@ -76,10 +80,32 @@ def _fixture_rows(row_count: int = 4, ticker: str = "005930") -> list[dict[str, 
     ]
 
 
+def _sequential_rows(
+    start: datetime, days: int, ticker_count: int = 5
+) -> list[dict[str, object]]:
+    tickers = [f"{i:06d}" for i in range(1, ticker_count + 1)]
+    rows: list[dict[str, object]] = []
+    for day in range(days):
+        date = (start + timedelta(days=day)).date().isoformat()
+        for idx, ticker in enumerate(tickers):
+            rows.append(
+                {
+                    "date": date,
+                    "ticker": ticker,
+                    "open": 100.0 + day + idx / 10.0,
+                    "high": 100.2 + day + idx / 10.0,
+                    "low": 99.8 + day + idx / 10.0,
+                    "close": 100.0 + day + idx / 10.0,
+                    "volume": 1_000_000.0,
+                    "rsi": 30.0,
+                }
+            )
+    return rows
+
+
 def test_risk_manager_overrides_buy_to_hold_on_kospi_drop() -> None:
     decision = apply_risk_rules(
-        make_signal(),
-        MacroSnapshot(kospi_close_change_pct=-0.051, fx_daily_change_pct=0.0, vkospi=20),
+        make_signal(), MacroSnapshot(kospi_close_change_pct=-0.051, fx_daily_change_pct=0.0, vkospi=20)
     )
 
     assert decision.signal.action == "HOLD"
@@ -188,20 +214,7 @@ def test_public_performance_reliability_marks_fixture_4row_single_ticker_as_insu
 
 
 def test_public_performance_reliability_marks_multi_ticker_postgres_as_sufficient_for_long_history() -> None:
-    price_rows = [
-        {
-            "date": f"2025-12-{day + 1:02d}",
-            "ticker": ticker,
-            "open": 100.0 + day + float(idx) / 10.0,
-            "high": 100.2 + day + float(idx) / 10.0,
-            "low": 99.8 + day + float(idx) / 10.0,
-            "close": 100.0 + day + float(idx) / 10.0,
-            "volume": 1_000_000.0,
-            "rsi": 30.0,
-        }
-        for day in range(95)
-        for idx, ticker in enumerate(("000001", "000002", "000003"))
-    ]
+    price_rows = _sequential_rows(datetime(2025, 1, 1), 252, ticker_count=5)
     performance = build_public_backtest_performance(
         _performance_payload(
             BacktestMetrics(
@@ -222,20 +235,68 @@ def test_public_performance_reliability_marks_multi_ticker_postgres_as_sufficien
     assert performance is not None
     assert performance.reliability is not None
     assert performance.reliability.status == "sufficient"
-    assert performance.reliability.ticker_count == 3
-    assert performance.reliability.trading_days == 95
+    assert performance.reliability.ticker_count == 5
+    assert performance.reliability.trading_days == 252
     assert performance.reliability.source == "postgres"
     assert not performance.reliability.warnings
 
 
 def test_public_performance_benchmark_and_excess_return_are_visible() -> None:
     benchmark_rows = [
-        {"date": "2026-01-01", "ticker": "005930", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1_000_000.0},
-        {"date": "2026-01-01", "ticker": "000001", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1_000_000.0},
-        {"date": "2026-01-02", "ticker": "005930", "open": 100.0, "high": 111.0, "low": 99.0, "close": 110.0, "volume": 1_000_000.0},
-        {"date": "2026-01-02", "ticker": "000001", "open": 100.0, "high": 111.0, "low": 99.0, "close": 110.0, "volume": 1_000_000.0},
-        {"date": "2026-01-03", "ticker": "005930", "open": 110.0, "high": 122.0, "low": 108.0, "close": 121.0, "volume": 1_000_000.0},
-        {"date": "2026-01-03", "ticker": "000001", "open": 110.0, "high": 121.0, "low": 108.0, "close": 121.0, "volume": 1_000_000.0},
+        {
+            "date": "2026-01-01",
+            "ticker": "005930",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1_000_000.0,
+        },
+        {
+            "date": "2026-01-01",
+            "ticker": "000001",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1_000_000.0,
+        },
+        {
+            "date": "2026-01-02",
+            "ticker": "005930",
+            "open": 100.0,
+            "high": 111.0,
+            "low": 99.0,
+            "close": 110.0,
+            "volume": 1_000_000.0,
+        },
+        {
+            "date": "2026-01-02",
+            "ticker": "000001",
+            "open": 100.0,
+            "high": 111.0,
+            "low": 99.0,
+            "close": 110.0,
+            "volume": 1_000_000.0,
+        },
+        {
+            "date": "2026-01-03",
+            "ticker": "005930",
+            "open": 110.0,
+            "high": 122.0,
+            "low": 108.0,
+            "close": 121.0,
+            "volume": 1_000_000.0,
+        },
+        {
+            "date": "2026-01-03",
+            "ticker": "000001",
+            "open": 110.0,
+            "high": 121.0,
+            "low": 108.0,
+            "close": 121.0,
+            "volume": 1_000_000.0,
+        },
     ]
     performance = build_public_backtest_performance(
         _performance_payload(
@@ -309,6 +370,11 @@ def test_public_performance_metric_details_have_explanations_and_flags() -> None
         assert detail.plain_explanation
         assert detail.why_used
         assert detail.caution
+        assert detail.source_refs is not None
+
+    details_by_key = {detail.key: detail for detail in performance.metric_details}
+    assert "trade_win_rate" in details_by_key["win_rate"].plain_explanation
+    assert "period-return" in details_by_key["profit_factor"].plain_explanation
 
 
 def test_public_performance_unavailable_benchmark_returns_turn_null_not_zero() -> None:
@@ -342,6 +408,51 @@ def test_public_performance_unavailable_benchmark_returns_turn_null_not_zero() -
     assert benchmark_metric.is_available is False
     assert excess_metric.value is None
     assert excess_metric.is_available is False
+
+
+def test_benchmark_curve_uses_fixed_universe_buy_and_hold() -> None:
+    benchmark_rows = [
+        {"date": "2026-01-01", "ticker": "000001", "close": 100.0},
+        {"date": "2026-01-01", "ticker": "000002", "close": 100.0},
+        {"date": "2026-01-02", "ticker": "000001", "close": 200.0},
+        {"date": "2026-01-02", "ticker": "000002", "close": 50.0},
+        {"date": "2026-01-03", "ticker": "000001", "close": 100.0},
+        {"date": "2026-01-03", "ticker": "000002", "close": 100.0},
+    ]
+    performance = build_public_backtest_performance(
+        _performance_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.5,
+                max_drawdown=-0.03,
+                win_rate=0.56,
+                total_return=0.05,
+                in_sample_sharpe=0.51,
+                out_sample_sharpe=0.4,
+                degradation=0.1,
+            ),
+            engine_summary={"effective_trade_count": 8},
+        ),
+        price_rows=benchmark_rows,
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    assert performance.benchmark is not None
+    assert performance.benchmark.total_return == pytest.approx(0.0)
+    assert performance.benchmark.cumulative_curve[1].cumulative_return == pytest.approx(0.25)
+    assert performance.benchmark.cumulative_curve[-1].cumulative_return == pytest.approx(0.0)
+
+    # Daily rebalanced (equal shares each date) would not stay at 0% here.
+    # A 100->200->100 and B 100->50->100 yields a fixed-share buy-and-hold end = 0%.
+    benchmark_two_days = (
+        (
+            (200.0 / 100.0)
+            + (50.0 / 100.0)
+        )
+        / 2.0
+        - 1.0
+    )
+    assert benchmark_two_days != 0.0
 
 
 def test_recommendation_gate_reasons_follow_objective_floor() -> None:

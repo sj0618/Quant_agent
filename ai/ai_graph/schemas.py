@@ -343,6 +343,7 @@ class PublicMetricDetail(BaseModel):
     plain_explanation: str = Field(min_length=1)
     why_used: str = Field(min_length=1)
     caution: str = Field(min_length=1)
+    source_refs: list[str] = Field(default_factory=list)
 
 
 class BacktestReliability(BaseModel):

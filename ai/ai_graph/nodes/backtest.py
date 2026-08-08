@@ -2065,26 +2065,29 @@ def _equal_weight_benchmark_curve(
     )
     if not universe:
         return [], None
+    universe = tuple(
+        ticker for ticker in universe if rows_by_ticker[ticker][first_date] > 0.0
+    )
+    if not universe:
+        return [], None
 
-    previous = {ticker: rows_by_ticker[ticker][first_date] for ticker in universe}
+    initial_prices = {ticker: rows_by_ticker[ticker][first_date] for ticker in universe}
+    latest_prices = dict(initial_prices)
     curve: list[BacktestEquityPoint] = [
         BacktestEquityPoint(date=first_date, cumulative_return=0.0)
     ]
-    cumulative_return = 1.0
     for date in dates[1:]:
-        returns = []
+        values: list[float] = []
         for ticker in universe:
-            current = rows_by_ticker[ticker].get(date)
-            if current is None:
-                returns.append(0.0)
+            current = rows_by_ticker[ticker].get(date, latest_prices[ticker])
+            latest_prices[ticker] = current
+            initial_price = initial_prices[ticker]
+            if initial_price <= 0:
                 continue
-            prior = previous[ticker]
-            if prior > 0:
-                returns.append((current / prior) - 1.0)
-            previous[ticker] = current
-        if not returns:
+            values.append(current / initial_price)
+        if not values:
             continue
-        cumulative_return *= 1.0 + sum(returns) / len(returns)
+        cumulative_return = sum(values) / len(universe)
         curve.append(
             BacktestEquityPoint(
                 date=date,
