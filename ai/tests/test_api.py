@@ -231,7 +231,7 @@ def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> Non
     assert result["status"] == "ready"
     assert result["strategy_spec"]["selection_mode"] == "automatic"
     assert result["strategy_spec"]["strategy_id"].startswith(
-        "automatic_robust_tournament"
+        "automatic_performance_momentum"
     )
     assert result["rule_provenance"]["substituted"] is False
     explanation = result["user_payload"]["performance"]["strategy_explanation"]

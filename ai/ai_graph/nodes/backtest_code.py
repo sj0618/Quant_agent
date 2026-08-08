@@ -222,7 +222,7 @@ def _default_parameter_sets(
 ) -> list[CandidateParameters]:
     profiles = _candidate_profiles(plan)
     compiled = compile_conditions(strategy.entry_conditions) is not None
-    if plan.entry_feature == "robust_strategy_tournament":
+    if plan.entry_feature == "performance_momentum_tournament":
         selected_profiles = list(AUTOMATIC_TOURNAMENT_PROFILES)
     elif plan.entry_feature == "academic_momentum_trend":
         selected_profiles = ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES
@@ -631,12 +631,14 @@ def build_code_generation_plan(
     if strategy.selection_mode == "automatic":
         return CodeGenerationPlan(
             strategy_id=strategy_id,
-            entry_feature="robust_strategy_tournament",
-            exit_feature="selected_profile_trend_or_stop",
+            entry_feature="performance_momentum_tournament",
+            exit_feature="monthly_rank_or_emergency_stop",
             proxy_feature="past_only_price_factors",
-            lookbacks=[252, 200, 126],
-            thresholds=[0.0, 0.0, 0.03],
-            expected_trade_frequency="monthly_or_signal_change",
+            lookbacks=[252, 252, 252],
+            thresholds=[0.0, 0.0, 0.0],
+            stop_loss_pct=0.20,
+            take_profit_pct=10.0,
+            expected_trade_frequency="monthly_rotation",
         )
     if strategy_id.startswith("automatic_academic_momentum"):
         return CodeGenerationPlan(
@@ -901,7 +903,7 @@ def _generated_strategy_candidates(
 
 
 def _candidate_profiles(plan: CodeGenerationPlan) -> list[StructuredProfile]:
-    if plan.entry_feature == "robust_strategy_tournament":
+    if plan.entry_feature == "performance_momentum_tournament":
         return list(AUTOMATIC_TOURNAMENT_PROFILES)  # type: ignore[return-value]
     if plan.entry_feature == "academic_momentum_trend":
         return ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES

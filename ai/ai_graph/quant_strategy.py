@@ -25,15 +25,19 @@ KEN_FRENCH_MOMENTUM_SOURCE = (
     "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/Data_Library/det_mom_factor_daily.html"
 )
 NBER_VOLATILITY_SOURCE = "https://www.nber.org/papers/w22208"
+NBER_MOMENTUM_CRASH_SOURCE = "https://www.nber.org/papers/w20439"
+AQR_TIME_SERIES_MOMENTUM_SOURCE = (
+    "https://www.aqr.com/Insights/Research/Journal-Article/Time-Series-Momentum"
+)
 BACKTEST_OVERFITTING_SOURCE = "https://academic.oup.com/jrssig/article/18/6/22/7038278"
 
-# These are deliberately three different ideas, not three nearby thresholds of one
-# idea.  Keeping the menu small and fixed before a backtest limits the chance that the
-# apparent winner is merely the luckiest of many data-mined variants.
+# These are three pre-registered momentum constructions, not dozens of thresholds
+# searched after seeing returns. Keeping the menu small and fixed limits the chance
+# that the apparent winner is merely the luckiest data-mined variant.
 AUTOMATIC_TOURNAMENT_PROFILES = (
-    "academic_momentum_trend",
-    "dual_sma_trend",
-    "low_vol_momentum",
+    "relative_momentum_rotation",
+    "risk_adjusted_momentum_rotation",
+    "trend_leader_rotation",
 )
 
 _AUTOMATIC_TERMS = (
@@ -372,7 +376,12 @@ def academic_strategy_source_refs() -> list[str]:
 
 
 def robust_strategy_source_refs() -> list[str]:
-    return [*academic_strategy_source_refs(), BACKTEST_OVERFITTING_SOURCE]
+    return [
+        *academic_strategy_source_refs(),
+        AQR_TIME_SERIES_MOMENTUM_SOURCE,
+        NBER_MOMENTUM_CRASH_SOURCE,
+        BACKTEST_OVERFITTING_SOURCE,
+    ]
 
 
 def _automatic_profile_explanation(
@@ -383,10 +392,65 @@ def _automatic_profile_explanation(
     lookback = _parameter_value(selected_parameters, "lookback")
     threshold = _parameter_value(selected_parameters, "threshold")
     selection_reason = (
-        "서로 원리가 다른 고정 후보 3개를 같은 비용 가정으로 비교했습니다. "
-        "앞 70% 구간의 샤프지수·손실폭·거래회전율·거래 수를 함께 본 점수로 "
-        "이 후보를 골랐고, 마지막 30% 구간은 선택에 쓰지 않고 별도로 표시합니다."
+        "수익을 내는 방식이 다른 고정 후보 3개를 같은 비용 가정으로 비교했습니다. "
+        "앞 70% 구간의 연환산 수익률·벤치마크 초과수익·샤프지수·손실폭·회전율을 "
+        "함께 본 점수로 골랐고, 마지막 30%는 선택에 쓰지 않고 별도로 검증합니다."
     )
+    if selected_profile == "relative_momentum_rotation":
+        return {
+            "indicator_keys": (
+                "cross_sectional_rank",
+                "momentum_12_1",
+                "sma_200_regime",
+                "winner_hold",
+                "crash_risk_guard",
+            ),
+            "title": "12-1 상대강도 승자 순환 전략",
+            "summary": (
+                "한 달 전까지의 약 1년 수익률로 모든 종목의 순위를 매기고, "
+                "200일선 위이면서 모멘텀이 양수인 상위 종목을 매달 교체합니다."
+            ),
+            "why_selected": selection_reason,
+            "rebalance": (
+                "21거래일마다 상위 종목을 다시 선정하고, 순위에서 밀린 종목은 팔되 "
+                "계속 강한 승자는 45% 같은 조기 고정 익절 없이 보유합니다."
+            ),
+        }
+    if selected_profile == "risk_adjusted_momentum_rotation":
+        return {
+            "indicator_keys": (
+                "cross_sectional_rank",
+                "momentum_blend",
+                "realized_volatility_21d",
+                "sma_200_regime",
+                "winner_hold",
+                "crash_risk_guard",
+            ),
+            "title": "변동성 조절 복합 모멘텀 순환 전략",
+            "summary": (
+                "12-1 모멘텀과 약 6개월 모멘텀 순위를 합치고, 최근 변동성이 큰 "
+                "종목에는 감점을 줘 상승 힘 대비 위험이 나은 종목을 매달 고릅니다."
+            ),
+            "why_selected": selection_reason,
+            "rebalance": "21거래일마다 순위를 갱신하고 고변동 종목과 추세 이탈 종목을 교체합니다.",
+        }
+    if selected_profile == "trend_leader_rotation":
+        return {
+            "indicator_keys": (
+                "cross_sectional_rank",
+                "momentum_blend",
+                "sma_200_regime",
+                "winner_hold",
+                "crash_risk_guard",
+            ),
+            "title": "6개월·12-1 추세 주도주 순환 전략",
+            "summary": (
+                "약 6개월 상승률에 더 큰 비중을 두고 12-1 모멘텀을 함께 봐, "
+                "최근과 중장기 구간에서 동시에 강한 200일선 위 종목을 보유합니다."
+            ),
+            "why_selected": selection_reason,
+            "rebalance": "21거래일마다 주도주 순위를 다시 계산해 강한 승자는 유지하고 약해진 종목만 바꿉니다.",
+        }
     if selected_profile == "academic_momentum_trend":
         return {
             "indicator_keys": (
@@ -436,20 +500,22 @@ def _automatic_profile_explanation(
     return {
         "indicator_keys": (
             "strategy_tournament",
+            "cross_sectional_rank",
             "momentum_12_1",
-            "dual_sma_trend",
-            "price_range_volatility",
+            "momentum_blend",
+            "winner_hold",
+            "crash_risk_guard",
         ),
-        "title": "연구 기반 3계열 퀀트 전략 자동선택",
+        "title": "성과 우선 모멘텀 순환 전략 자동선택",
         "summary": (
-            "12-1 모멘텀·장기 추세, 다중 이동평균 추세, 저변동 모멘텀을 "
+            "12-1 상대강도, 변동성 조절 복합 모멘텀, 6개월·12-1 주도주 순환을 "
             "고정 후보로 만들고 동일한 과거 데이터와 비용 가정으로 비교합니다."
         ),
         "why_selected": (
-            "요청이 짧거나 조건이 없어서 임의의 RSI 하나를 가정하지 않고, 서로 다른 "
-            "시장 원리를 쓰는 세 전략 중 위험조정 결과가 나은 전략을 자동 선택합니다."
+            "애매한 요청에 방어적인 RSI 하나를 가정하지 않고, 상승이 이어지는 승자를 "
+            "상대 순위로 오래 보유하는 세 설계 중 수익과 위험을 함께 충족한 전략을 자동으로 고릅니다."
         ),
-        "rebalance": "선택된 후보 자체의 정기 점검 또는 추세 훼손 규칙을 적용합니다.",
+        "rebalance": "21거래일마다 순위를 갱신하되 매일 사고팔지 않아 비용을 제한합니다.",
     }
 
 
@@ -541,6 +607,57 @@ def _indicator_explanation(key: str) -> dict[str, Any]:
             ),
             "caution": "후보를 세 개로 제한해도 과거의 승자가 미래에도 이긴다는 보장은 없습니다.",
             "source_refs": [BACKTEST_OVERFITTING_SOURCE],
+        },
+        "cross_sectional_rank": {
+            "label": "종목 간 상대강도 순위",
+            "plain_explanation": (
+                "각 종목의 상승률을 따로 합격·불합격 처리하지 않고 같은 날 모든 종목과 "
+                "비교해 가장 강한 종목부터 순위를 매깁니다."
+            ),
+            "why_used": "시장 전체가 오를 때도 그중 자금이 더 강하게 몰리는 주도주를 고르기 위해 사용합니다.",
+            "caution": "현재 유니버스가 너무 작거나 생존 종목만 포함하면 순위 결과가 왜곡될 수 있습니다.",
+            "source_refs": [JEGADEESH_TITMAN_SOURCE, KEN_FRENCH_MOMENTUM_SOURCE],
+        },
+        "momentum_blend": {
+            "label": "6개월·12-1 복합 모멘텀",
+            "plain_explanation": (
+                "약 6개월 상승률과 최근 한 달을 뺀 약 1년 상승률을 함께 순위화합니다. "
+                "한 기간에만 우연히 급등한 종목보다 여러 기간에서 강한 종목이 위로 갑니다."
+            ),
+            "why_used": "중기와 장기 추세가 동시에 이어지는 주도주를 찾기 위해 사용합니다.",
+            "caution": "급격한 시장 반등에서는 과거의 패자가 갑자기 올라 순위 전략이 뒤처질 수 있습니다.",
+            "source_refs": [
+                AQR_TIME_SERIES_MOMENTUM_SOURCE,
+                KEN_FRENCH_MOMENTUM_SOURCE,
+                NBER_MOMENTUM_CRASH_SOURCE,
+            ],
+        },
+        "sma_200_regime": {
+            "label": "200일 추세 필터",
+            "plain_explanation": "현재 가격이 약 1년 평균 가격인 200일선 위에 있는지 확인합니다.",
+            "why_used": "상대 순위가 높아도 장기 하락 추세인 종목을 사는 일을 줄이기 위해 사용합니다.",
+            "caution": "급반등 초반에는 200일선을 아직 회복하지 못해 진입이 늦을 수 있습니다.",
+            "source_refs": [AQR_TREND_SOURCE, FABER_TACTICAL_SOURCE],
+        },
+        "winner_hold": {
+            "label": "승자 장기보유·월간 교체",
+            "plain_explanation": (
+                "일반적인 단기 익절 목표에 도달했다고 바로 팔지 않고, 상대 순위와 "
+                "장기 추세가 유지되는 동안 계속 보유합니다."
+            ),
+            "why_used": "소수의 큰 상승 종목이 포트폴리오 전체 수익을 끌어올리는 효과를 잘라내지 않기 위해 사용합니다.",
+            "caution": "승자를 오래 보유하는 만큼 고점 이후 되돌림이 커질 수 있어 손실 제한과 분산이 필요합니다.",
+            "source_refs": [AQR_TIME_SERIES_MOMENTUM_SOURCE, NBER_MOMENTUM_CRASH_SOURCE],
+        },
+        "crash_risk_guard": {
+            "label": "모멘텀 급락 안전장치",
+            "plain_explanation": (
+                "매수가보다 20% 이상 하락하거나 보유 중 최고가에서 25% 이상 밀리면 "
+                "다음 월간 교체일까지 기다리지 않고 빠져나옵니다."
+            ),
+            "why_used": "모멘텀 전략이 시장 급반등 국면에서 드물지만 크게 손실 나는 위험을 제한하기 위해 사용합니다.",
+            "caution": "급락 직후 바로 반등하면 손실을 확정하고 재진입이 늦어질 수 있습니다.",
+            "source_refs": [NBER_MOMENTUM_CRASH_SOURCE],
         },
         "dual_sma_trend": {
             "label": "단기·중기·장기 이동평균 정렬",

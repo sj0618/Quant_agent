@@ -408,6 +408,9 @@ class BacktestEquityPoint(BaseModel):
 StructuredProfile = Literal[
     "compiled_conditions",
     "academic_momentum_trend",
+    "relative_momentum_rotation",
+    "risk_adjusted_momentum_rotation",
+    "trend_leader_rotation",
     "long_regime_momentum",
     "quality_trend_hold",
     "volatility_breakout_hold",

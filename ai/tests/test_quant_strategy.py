@@ -41,6 +41,26 @@ def _trend_rows(days: int = 300) -> list[dict[str, object]]:
     ]
 
 
+def _cross_sectional_rows(days: int = 300) -> list[dict[str, object]]:
+    start = date(2024, 1, 1)
+    daily_growth = {
+        "000001": 1.004,
+        "000002": 1.002,
+        "000003": 0.999,
+    }
+    return [
+        {
+            "date": (start + timedelta(days=day_index)).isoformat(),
+            "ticker": ticker,
+            "close": 100.0 * (growth**day_index),
+            "volume": 1_000_000.0,
+            "rsi": 50.0,
+        }
+        for day_index in range(days)
+        for ticker, growth in daily_growth.items()
+    ]
+
+
 def test_concrete_rule_wins_over_automatic_request() -> None:
     assert (
         classify_strategy_request("검증된 전략을 추천하되 RSI 30 이하에서 매수") == "user_defined"
@@ -70,7 +90,7 @@ def test_vague_request_runs_the_full_automatic_pipeline() -> None:
     assert envelope.status == "ready"
     assert envelope.strategy_spec is not None
     assert envelope.strategy_spec.selection_mode == "automatic"
-    assert envelope.strategy_spec.strategy_id.startswith("automatic_robust_tournament")
+    assert envelope.strategy_spec.strategy_id.startswith("automatic_performance_momentum")
     assert envelope.rule_provenance is not None
     assert envelope.rule_provenance.substituted is False
 
@@ -135,12 +155,12 @@ def test_automatic_request_builds_cited_three_family_tournament() -> None:
     )
 
     assert strategy.selection_mode == "automatic"
-    assert strategy.strategy_id.startswith("automatic_robust_tournament")
+    assert strategy.strategy_id.startswith("automatic_performance_momentum")
     assert AQR_TREND_SOURCE in strategy.source_refs
     assert KEN_FRENCH_MOMENTUM_SOURCE in strategy.source_refs
     assert BACKTEST_OVERFITTING_SOURCE in strategy.source_refs
     plan = build_code_generation_plan(strategy, map_strategy_features(strategy))
-    assert plan.entry_feature == "robust_strategy_tournament"
+    assert plan.entry_feature == "performance_momentum_tournament"
     assert tuple(_candidate_profiles(plan)) == AUTOMATIC_TOURNAMENT_PROFILES
     candidates = generate_loop3_candidates(
         Loop3Request(strategy=strategy, variant="A", trace_id="robust-tournament-contract")
@@ -155,23 +175,32 @@ def test_automatic_request_builds_cited_three_family_tournament() -> None:
     )
     assert [candidate.parameters.lookback for candidate in candidates if candidate.parameters] == [
         252,
-        200,
-        126,
+        252,
+        252,
     ]
     assert [candidate.parameters.threshold for candidate in candidates if candidate.parameters] == [
         0.0,
         0.0,
-        0.03,
+        0.0,
     ]
+    assert all(
+        candidate.parameters is not None
+        and candidate.parameters.stop_loss_pct == 0.20
+        and candidate.parameters.take_profit_pct == 10.0
+        and candidate.parameters.max_positions == 10
+        for candidate in candidates
+    )
 
     explanation = build_strategy_explanation(strategy)
     assert explanation["selection_mode"] == "automatic"
     assert "미래 수익을 보장하지 않습니다" in explanation["caution"]
     assert {item["key"] for item in explanation["indicators"]} == {
         "strategy_tournament",
+        "cross_sectional_rank",
         "momentum_12_1",
-        "dual_sma_trend",
-        "price_range_volatility",
+        "momentum_blend",
+        "winner_hold",
+        "crash_risk_guard",
     }
 
 
@@ -184,7 +213,7 @@ def test_original_vague_request_survives_a_concrete_interpreter_rewrite() -> Non
     )
 
     assert strategy.selection_mode == "automatic"
-    assert strategy.strategy_id.startswith("automatic_robust_tournament")
+    assert strategy.strategy_id.startswith("automatic_performance_momentum")
     assert strategy.entry_conditions[0].left == "past_only_signal"
 
 
@@ -264,9 +293,68 @@ def test_automatic_tournament_does_not_tune_after_seeing_returns() -> None:
     )
 
     stats = output["backtest"]["execution_stats"]
-    assert stats["selection_policy"] == "pre_registered_three_family_holdout"
+    assert (
+        stats["selection_policy"]
+        == "performance_momentum_train_select_holdout_validate"
+    )
     assert stats["self_improvement_rounds_limit"] == 0
     assert len(output["backtest"]["candidates"]) == 3
+
+
+def test_relative_momentum_rotation_selects_and_keeps_the_strongest_winner() -> None:
+    rows = _cross_sectional_rows()
+    store = PreparedFeatureStore(rows)
+    strategy_ir = StrategyIR(
+        strategy_id="automatic_performance_momentum",
+        entry_feature="performance_momentum_tournament",
+        exit_feature="monthly_rank_or_emergency_stop",
+        proxy_feature="past_only_price_factors",
+    )
+    parameters = CandidateParameters(
+        profile="relative_momentum_rotation",
+        lookback=252,
+        threshold=0.0,
+        stop_loss_pct=0.20,
+        take_profit_pct=10.0,
+        max_positions=1,
+    )
+
+    actions = store.build_actions(strategy_ir, parameters)
+    first_rotation = {
+        store.tickers[index]: actions[index]
+        for index, value in enumerate(store.dates)
+        if value == (date(2024, 1, 1) + timedelta(days=252)).isoformat()
+    }
+
+    assert first_rotation == {"000001": 1, "000002": 0, "000003": 0}
+    assert -1 not in actions[253 * 3 : 273 * 3]
+
+
+def test_relative_momentum_rotation_does_not_read_future_rows() -> None:
+    rows = _cross_sectional_rows()
+    strategy_ir = StrategyIR(
+        strategy_id="automatic_performance_momentum",
+        entry_feature="performance_momentum_tournament",
+        exit_feature="monthly_rank_or_emergency_stop",
+        proxy_feature="past_only_price_factors",
+    )
+    parameters = CandidateParameters(
+        profile="risk_adjusted_momentum_rotation",
+        lookback=252,
+        threshold=0.0,
+        stop_loss_pct=0.20,
+        take_profit_pct=10.0,
+        max_positions=2,
+    )
+    prefix_length = 270 * 3
+
+    full_actions = PreparedFeatureStore(rows).build_actions(strategy_ir, parameters)
+    prefix_actions = PreparedFeatureStore(rows[:prefix_length]).build_actions(
+        strategy_ir,
+        parameters,
+    )
+
+    assert list(full_actions[:prefix_length]) == list(prefix_actions)
 
 
 def test_concrete_strategy_is_not_replaced_by_automatic_profile() -> None:
@@ -277,5 +365,5 @@ def test_concrete_strategy_is_not_replaced_by_automatic_profile() -> None:
     )
 
     assert strategy.selection_mode == "user_defined"
-    assert not strategy.strategy_id.startswith("automatic_robust_tournament")
+    assert not strategy.strategy_id.startswith("automatic_performance_momentum")
     assert any("rsi" in indicator.casefold() for indicator in strategy.indicators)
