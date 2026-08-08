@@ -2702,3 +2702,7 @@ def _sortino_ratio(total_return: float, returns: Sequence[float]) -> float | Non
     if downside_std == 0.0:
         return None
     return total_return / downside_std
+
+
+# Public performance helpers are sourced from quant_performance for a stable behavior contract.
+from ai_graph.quant_performance import build_public_backtest_performance as build_public_backtest_performance
