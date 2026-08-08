@@ -355,7 +355,7 @@ jobs:
             --connect-timeout 10 --max-time 30 \
             https://qt-agent.kro.kr/ai-api/health
 
-      - name: Run production analysis with two workers
+      - name: Benchmark internal backtest on two CPU cores
         if: ${{ inputs.mode == 'deployed-backtest' }}
         run: |
           ssh -o BatchMode=yes \
@@ -377,17 +377,17 @@ jobs:
           fi
 
           test -x "$APP_DIR/ai/.venv/bin/python"
-          test -f "$APP_DIR/ai/scripts/run_production_backtest_benchmark.py"
+          test -f "$APP_DIR/ai/scripts/benchmark_backtest_optimization.py"
+          command -v taskset >/dev/null
 
           cd "$APP_DIR/ai"
-          export AI_LLM_PROVIDER=mock
-          export AI_DB_STATEMENT_TIMEOUT_MS=180000
-          export AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS=300000
-          export AI_BACKTEST_WORKERS=2
-          export AI_BACKTEST_WALL_BUDGET_SECONDS=540
-          export AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS=180
-          "$APP_DIR/ai/.venv/bin/python" -u \
-            "$APP_DIR/ai/scripts/run_production_backtest_benchmark.py" \
-            --max-wall-seconds 600 \
-            --repeat-cache
+          export OMP_NUM_THREADS=1
+          export OPENBLAS_NUM_THREADS=1
+          export MKL_NUM_THREADS=1
+          export NUMEXPR_NUM_THREADS=1
+          for _ in 1 2 3; do
+            taskset --cpu-list 0,1 "$APP_DIR/ai/.venv/bin/python" -u \
+              "$APP_DIR/ai/scripts/benchmark_backtest_optimization.py" \
+              --tickers 203 --days 2520 --workers 2 --candidates 3
+          done
           REMOTE
