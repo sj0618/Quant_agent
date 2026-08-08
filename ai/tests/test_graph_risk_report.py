@@ -1,7 +1,17 @@
+﻿import pytest
+
+from ai_graph.graph import _recommendation_gate
 from ai_graph.graph import build_public_backtest_performance
+from ai_graph.nodes.backtest import BENCHMARK_METHOD, BENCHMARK_WARNING
 from ai_graph.nodes.report import build_report_bundle
 from ai_graph.nodes.risk_manager import MacroSnapshot, apply_risk_rules
-from ai_graph.schemas import BacktestMetrics, CodeCandidate, Condition, SignalDecision, StrategySpec
+from ai_graph.schemas import (
+    BacktestMetrics,
+    CodeCandidate,
+    Condition,
+    SignalDecision,
+    StrategySpec,
+)
 
 
 def make_signal() -> SignalDecision:
@@ -25,6 +35,45 @@ def make_strategy() -> StrategySpec:
         indicators=["RSI"],
         confidence=0.8,
     )
+
+
+def _performance_payload(metrics: BacktestMetrics, engine_summary: dict | None = None) -> dict:
+    candidate = CodeCandidate(
+        candidate_id="A2",
+        variant="A",
+        code="pass",
+        validation_ok=True,
+        metrics=metrics,
+    )
+    return {
+        "strategy_a": make_strategy().model_dump(),
+        "candidates": [candidate.model_dump()],
+        "selected_candidate": candidate.model_dump(),
+        "equity_curve": [],
+        "engine_summary": engine_summary
+        or {
+            "effective_trade_count": 110,
+            "montecarlo": ["large internal-only payload"],
+            "rolling_sharpe": [0.1, 0.2],
+        },
+    }
+
+
+def _fixture_rows(row_count: int = 4, ticker: str = "005930") -> list[dict[str, object]]:
+    base = 100.0
+    return [
+        {
+            "date": f"2026-01-0{index + 2}",
+            "ticker": ticker,
+            "open": base + index,
+            "high": base + index + 1,
+            "low": base + index - 1,
+            "close": base + index,
+            "volume": 1_000_000.0,
+            "rsi": 50.0,
+        }
+        for index in range(row_count)
+    ]
 
 
 def test_risk_manager_overrides_buy_to_hold_on_kospi_drop() -> None:
@@ -61,27 +110,41 @@ def test_report_builds_web_and_email_projection_from_same_decision() -> None:
 
 
 def test_public_performance_excludes_oversized_engine_arrays() -> None:
-    metrics = BacktestMetrics(
-        sharpe_ratio=0.28,
-        max_drawdown=-0.0776,
-        win_rate=0.3364,
-        total_return=0.0898,
-        in_sample_sharpe=0.3,
-        out_sample_sharpe=0.1,
-        degradation=0.0,
-    )
-    candidate = CodeCandidate(
-        candidate_id="A2",
-        variant="A",
-        code="pass",
-        validation_ok=True,
-        metrics=metrics,
-    )
     performance = build_public_backtest_performance(
         {
             "strategy_a": make_strategy().model_dump(),
-            "candidates": [candidate.model_dump()],
-            "selected_candidate": candidate.model_dump(),
+            "candidates": [
+                CodeCandidate(
+                    candidate_id="A2",
+                    variant="A",
+                    code="pass",
+                    validation_ok=True,
+                    metrics=BacktestMetrics(
+                        sharpe_ratio=0.28,
+                        max_drawdown=-0.0776,
+                        win_rate=0.3364,
+                        total_return=0.0898,
+                        in_sample_sharpe=0.3,
+                        out_sample_sharpe=0.1,
+                        degradation=0.0,
+                    ),
+                ).model_dump()
+            ],
+            "selected_candidate": CodeCandidate(
+                candidate_id="A2",
+                variant="A",
+                code="pass",
+                validation_ok=True,
+                metrics=BacktestMetrics(
+                    sharpe_ratio=0.28,
+                    max_drawdown=-0.0776,
+                    win_rate=0.3364,
+                    total_return=0.0898,
+                    in_sample_sharpe=0.3,
+                    out_sample_sharpe=0.1,
+                    degradation=0.0,
+                ),
+            ).model_dump(),
             "equity_curve": [],
             "engine_summary": {
                 "effective_trade_count": 110,
@@ -93,3 +156,256 @@ def test_public_performance_excludes_oversized_engine_arrays() -> None:
 
     assert performance is not None
     assert performance.engine_summary == {"effective_trade_count": 110}
+
+
+def test_public_performance_reliability_marks_fixture_4row_single_ticker_as_insufficient() -> None:
+    performance = build_public_backtest_performance(
+        _performance_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.28,
+                max_drawdown=-0.0776,
+                win_rate=0.3364,
+                total_return=0.0898,
+                in_sample_sharpe=0.3,
+                out_sample_sharpe=0.1,
+                degradation=0.0,
+            ),
+            engine_summary={"effective_trade_count": 2},
+        ),
+        price_rows=_fixture_rows(),
+        pipeline_data_source={"source": "fixture"},
+    )
+
+    assert performance is not None
+    assert performance.reliability is not None
+    assert performance.reliability.source == "fixture"
+    assert performance.reliability.status == "insufficient"
+    assert performance.reliability.row_count == 4
+    assert performance.reliability.ticker_count == 1
+    assert performance.reliability.trading_days == 4
+    assert any("fixture" in reason for reason in performance.reliability.reasons)
+    assert any("신뢰도" in quality for quality in performance.data_quality)
+
+
+def test_public_performance_reliability_marks_multi_ticker_postgres_as_sufficient_for_long_history() -> None:
+    price_rows = [
+        {
+            "date": f"2025-12-{day + 1:02d}",
+            "ticker": ticker,
+            "open": 100.0 + day + float(idx) / 10.0,
+            "high": 100.2 + day + float(idx) / 10.0,
+            "low": 99.8 + day + float(idx) / 10.0,
+            "close": 100.0 + day + float(idx) / 10.0,
+            "volume": 1_000_000.0,
+            "rsi": 30.0,
+        }
+        for day in range(95)
+        for idx, ticker in enumerate(("000001", "000002", "000003"))
+    ]
+    performance = build_public_backtest_performance(
+        _performance_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.4,
+                max_drawdown=-0.2,
+                win_rate=0.45,
+                total_return=0.15,
+                in_sample_sharpe=0.32,
+                out_sample_sharpe=0.12,
+                degradation=0.02,
+            ),
+            engine_summary={"effective_trade_count": 10},
+        ),
+        price_rows=price_rows,
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    assert performance.reliability is not None
+    assert performance.reliability.status == "sufficient"
+    assert performance.reliability.ticker_count == 3
+    assert performance.reliability.trading_days == 95
+    assert performance.reliability.source == "postgres"
+    assert not performance.reliability.warnings
+
+
+def test_public_performance_benchmark_and_excess_return_are_visible() -> None:
+    benchmark_rows = [
+        {"date": "2026-01-01", "ticker": "005930", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1_000_000.0},
+        {"date": "2026-01-01", "ticker": "000001", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1_000_000.0},
+        {"date": "2026-01-02", "ticker": "005930", "open": 100.0, "high": 111.0, "low": 99.0, "close": 110.0, "volume": 1_000_000.0},
+        {"date": "2026-01-02", "ticker": "000001", "open": 100.0, "high": 111.0, "low": 99.0, "close": 110.0, "volume": 1_000_000.0},
+        {"date": "2026-01-03", "ticker": "005930", "open": 110.0, "high": 122.0, "low": 108.0, "close": 121.0, "volume": 1_000_000.0},
+        {"date": "2026-01-03", "ticker": "000001", "open": 110.0, "high": 121.0, "low": 108.0, "close": 121.0, "volume": 1_000_000.0},
+    ]
+    performance = build_public_backtest_performance(
+        _performance_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.5,
+                max_drawdown=-0.03,
+                win_rate=0.56,
+                total_return=0.05,
+                in_sample_sharpe=0.51,
+                out_sample_sharpe=0.4,
+                degradation=0.1,
+            ),
+            engine_summary={"effective_trade_count": 8},
+        ),
+        price_rows=benchmark_rows,
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    assert performance.benchmark is not None
+    assert performance.benchmark.is_available is True
+    assert performance.benchmark.method == BENCHMARK_METHOD
+    assert "KOSPI200" not in performance.benchmark.label
+    assert BENCHMARK_WARNING in performance.benchmark.warning
+    assert performance.benchmark.total_return == pytest.approx(0.21)
+    benchmark_metric = next(
+        metric for metric in performance.metric_details if metric.key == "benchmark_return"
+    )
+    excess_metric = next(
+        metric for metric in performance.metric_details if metric.key == "excess_return"
+    )
+    assert benchmark_metric.value == pytest.approx(0.21)
+    assert excess_metric.value == pytest.approx(-0.16)
+
+
+def test_public_performance_metric_details_have_explanations_and_flags() -> None:
+    performance = build_public_backtest_performance(
+        _performance_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.28,
+                max_drawdown=-0.0776,
+                win_rate=0.3364,
+                total_return=0.0898,
+                in_sample_sharpe=0.3,
+                out_sample_sharpe=0.1,
+                degradation=0.0,
+            )
+        )
+    )
+
+    assert performance is not None
+    assert {item.key for item in performance.metric_details} == {
+        "total_return",
+        "cagr",
+        "annualized_volatility",
+        "sharpe_ratio",
+        "sortino_ratio",
+        "max_drawdown",
+        "calmar_ratio",
+        "win_rate",
+        "profit_factor",
+        "benchmark_return",
+        "excess_return",
+        "in_sample_sharpe",
+        "out_sample_sharpe",
+        "degradation",
+    }
+    for detail in performance.metric_details:
+        assert detail.label
+        assert detail.unit
+        assert detail.plain_explanation
+        assert detail.why_used
+        assert detail.caution
+
+
+def test_public_performance_unavailable_benchmark_returns_turn_null_not_zero() -> None:
+    performance = build_public_backtest_performance(
+        _performance_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.28,
+                max_drawdown=-0.0776,
+                win_rate=0.3364,
+                total_return=0.0898,
+                in_sample_sharpe=0.3,
+                out_sample_sharpe=0.1,
+                degradation=0.0,
+            )
+        ),
+        price_rows=[],
+        pipeline_data_source={},
+    )
+
+    assert performance is not None
+    assert performance.benchmark is not None
+    assert performance.benchmark.is_available is False
+    assert performance.benchmark.total_return is None
+    benchmark_metric = next(
+        metric for metric in performance.metric_details if metric.key == "benchmark_return"
+    )
+    excess_metric = next(
+        metric for metric in performance.metric_details if metric.key == "excess_return"
+    )
+    assert benchmark_metric.value is None
+    assert benchmark_metric.is_available is False
+    assert excess_metric.value is None
+    assert excess_metric.is_available is False
+
+
+def test_recommendation_gate_reasons_follow_objective_floor() -> None:
+    metrics = BacktestMetrics(
+        sharpe_ratio=0.5,
+        max_drawdown=-0.4,
+        win_rate=0.6,
+        total_return=0.1,
+        in_sample_sharpe=0.1,
+        out_sample_sharpe=-0.2,
+        degradation=0.05,
+    )
+    candidate = CodeCandidate(
+        candidate_id="A2",
+        variant="A",
+        code="pass",
+        validation_ok=True,
+        metrics=metrics,
+    )
+    gate = _recommendation_gate(
+        {
+            "backtest": {
+                "strategy_a": make_strategy().model_dump(),
+                "candidates": [candidate.model_dump()],
+                "selected_candidate": candidate.model_dump(),
+                "equity_curve": [],
+                "engine_summary": {"effective_trade_count": 3},
+            }
+        }
+    )
+    assert gate is not None
+    assert gate.validated is False
+    assert "샤프" in gate.reason
+    assert "benchmark" not in gate.reason
+
+
+def test_recommendation_gate_accepts_valid_objective() -> None:
+    metrics = BacktestMetrics(
+        sharpe_ratio=1.2,
+        max_drawdown=-0.3,
+        win_rate=0.6,
+        total_return=0.5,
+        in_sample_sharpe=0.6,
+        out_sample_sharpe=0.5,
+        degradation=0.1,
+    )
+    candidate = CodeCandidate(
+        candidate_id="A2",
+        variant="A",
+        code="pass",
+        validation_ok=True,
+        metrics=metrics,
+    )
+    gate = _recommendation_gate(
+        {
+            "backtest": {
+                "strategy_a": make_strategy().model_dump(),
+                "candidates": [candidate.model_dump()],
+                "selected_candidate": candidate.model_dump(),
+                "equity_curve": [],
+                "engine_summary": {"effective_trade_count": 10},
+            }
+        }
+    )
+    assert gate is not None
+    assert gate.validated is True
+    assert "통과" in gate.reason

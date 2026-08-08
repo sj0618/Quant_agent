@@ -331,6 +331,47 @@ class BacktestMetrics(BaseModel):
     in_sample_max_drawdown: float = 0.0
 
 
+class PublicMetricDetail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    value: float | None
+    unit: str = Field(min_length=1)
+    is_available: bool
+    unavailable_reason: str | None = None
+    plain_explanation: str = Field(min_length=1)
+    why_used: str = Field(min_length=1)
+    caution: str = Field(min_length=1)
+
+
+class BacktestReliability(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["fixture", "postgres", "unknown"] = "unknown"
+    status: Literal["sufficient", "limited", "insufficient"]
+    row_count: int = Field(ge=0)
+    ticker_count: int = Field(ge=0)
+    trading_days: int = Field(ge=0)
+    history_start: str | None = None
+    history_end: str | None = None
+    trade_count: int = Field(ge=0)
+    reasons: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BacktestBenchmark(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1)
+    method: str = Field(min_length=1)
+    warning: str | None = None
+    total_return: float | None
+    cumulative_curve: list[BacktestEquityPoint] = Field(default_factory=list)
+    is_available: bool = True
+    unavailable_reason: str | None = None
+
+
 class BacktestEquityPoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -498,6 +539,10 @@ class BacktestPerformance(BaseModel):
     metrics: BacktestMetrics
     equity_curve: list[BacktestEquityPoint]
     engine_summary: dict[str, Any] = Field(default_factory=dict)
+    reliability: BacktestReliability | None = None
+    data_quality: list[str] = Field(default_factory=list)
+    benchmark: BacktestBenchmark | None = None
+    metric_details: list[PublicMetricDetail] = Field(default_factory=list)
 
 
 class InternalPayload(BaseModel):
