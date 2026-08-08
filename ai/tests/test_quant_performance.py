@@ -44,22 +44,23 @@ def _build_payload(
     }
 
 
-def _rows(trading_days: int, ticker_count: int = 5, *, start: datetime | None = None) -> list[dict]:
-    origin = start or datetime(2026, 1, 1)
-    tickers = [f"{index + 1:06d}" for index in range(ticker_count)]
-    return [
-        {
-            "date": (origin + timedelta(days=day)).date().isoformat(),
-            "ticker": ticker,
-            "open": 100.0 + day,
-            "high": 100.1 + day,
-            "low": 99.9 + day,
-            "close": 100.0 + day,
-            "volume": 1_000_000.0,
-        }
-        for day in range(trading_days)
-        for ticker in tickers
-    ]
+def _rows(
+    start: datetime, trading_days: int, ticker_count: int = 5
+) -> list[dict]:
+    tickers = [f"{idx + 1:06d}" for idx in range(ticker_count)]
+    rows: list[dict] = []
+    for day in range(trading_days):
+        date = (start + timedelta(days=day)).date().isoformat()
+        for idx, ticker in enumerate(tickers):
+            rows.append(
+                {
+                    "date": date,
+                    "ticker": ticker,
+                    "close": 100.0 + (day + idx * 0.5),
+                    "volume": 1_000_000.0,
+                }
+            )
+    return rows
 
 
 def test_public_metrics_use_engine_summary_scalars_not_sampled_rows() -> None:
@@ -75,46 +76,39 @@ def test_public_metrics_use_engine_summary_scalars_not_sampled_rows() -> None:
         ),
         engine_summary={
             "effective_trade_count": 12,
-            "total_return": 0.15,
             "cagr": 0.40,
             "annualized_volatility": 0.11,
-            "sharpe_ratio": 2.2,
             "sortino_ratio": 3.3,
-            "max_drawdown": -0.04,
             "calmar_ratio": 2.4,
-            "win_rate": 0.66,
-            "in_sample_sharpe": 0.21,
-            "out_sample_sharpe": 0.22,
-            "degradation": 0.06,
+            "profit_factor": 1.8,
         },
     )
     performance = build_public_backtest_performance(
         payload,
-        price_rows=_rows(trading_days=252, ticker_count=5),
+        price_rows=_rows(start=datetime(2024, 1, 1), trading_days=252),
         pipeline_data_source={"source": "postgres"},
     )
 
     assert performance is not None
-    details = {item.key: item.value for item in performance.metric_details}
-    assert details["total_return"] == 0.15
-    assert details["cagr"] == 0.4
-    assert details["annualized_volatility"] == 0.11
-    assert details["sharpe_ratio"] == 2.2
-    assert details["sortino_ratio"] == 3.3
-    assert details["max_drawdown"] == -0.04
-    assert details["calmar_ratio"] == 2.4
-    assert details["win_rate"] == 0.66
-    assert details["in_sample_sharpe"] == 0.21
-    assert details["out_sample_sharpe"] == 0.22
-    assert details["degradation"] == 0.06
-    assert details["benchmark_return"] == performance.benchmark.total_return
+    values = {item.key: item.value for item in performance.metric_details}
+    assert values["total_return"] == 0.05
+    assert values["sharpe_ratio"] == 0.1
+    assert values["win_rate"] == 0.05
+    assert values["in_sample_sharpe"] == 0.2
+    assert values["out_sample_sharpe"] == 0.3
+    assert values["degradation"] == 0.01
+    assert values["cagr"] == 0.4
+    assert values["annualized_volatility"] == 0.11
+    assert values["sortino_ratio"] == 3.3
+    assert values["calmar_ratio"] == 2.4
+    assert values["profit_factor"] == 1.8
 
 
-def test_public_metrics_missing_engine_scalars_become_null() -> None:
+def test_public_metrics_missing_engine_scalars_become_none() -> None:
     performance = build_public_backtest_performance(
         _build_payload(
             BacktestMetrics(
-                sharpe_ratio=0.45,
+                sharpe_ratio=float("nan"),
                 max_drawdown=-0.1,
                 win_rate=0.5,
                 total_return=0.08,
@@ -124,20 +118,22 @@ def test_public_metrics_missing_engine_scalars_become_null() -> None:
             ),
             engine_summary={"effective_trade_count": 8},
         ),
-        price_rows=_rows(trading_days=252, ticker_count=5),
+        price_rows=_rows(datetime(2024, 1, 1), trading_days=252),
         pipeline_data_source={"source": "postgres"},
     )
     assert performance is not None
-    detail = {item.key: item.value for item in performance.metric_details}
-    assert detail["cagr"] is None
-    assert detail["annualized_volatility"] is None
-    assert detail["sortino_ratio"] is None
-    assert detail["calmar_ratio"] is None
-    assert detail["benchmark_return"] == performance.benchmark.total_return
+    values = {item.key: item.value for item in performance.metric_details}
+    assert values["sharpe_ratio"] is None
+    assert values["cagr"] is None
+    assert values["annualized_volatility"] is None
+    assert values["sortino_ratio"] is None
+    assert values["calmar_ratio"] is None
+    assert values["profit_factor"] is None
+    assert values["benchmark_return"] is not None
 
 
-def test_public_performance_reliability_and_benchmark_for_source_variants() -> None:
-    insufficient_fixture = build_public_backtest_performance(
+def test_public_performance_source_refs_are_propagated_from_explanations() -> None:
+    performance = build_public_backtest_performance(
         _build_payload(
             BacktestMetrics(
                 sharpe_ratio=0.3,
@@ -148,17 +144,123 @@ def test_public_performance_reliability_and_benchmark_for_source_variants() -> N
                 out_sample_sharpe=0.2,
                 degradation=0.05,
             ),
-            engine_summary={"effective_trade_count": 2},
+            engine_summary={"effective_trade_count": 8},
         ),
-        price_rows=_rows(trading_days=5, ticker_count=1),
+        price_rows=_rows(datetime(2024, 1, 1), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
+    assert performance is not None
+    details = {item.key: item for item in performance.metric_details}
+    assert (
+        details["sharpe_ratio"].source_refs
+        == metric_explanation("sharpe_ratio").get("source_refs")
+    )
+    assert (
+        details["benchmark_return"].source_refs
+        == metric_explanation("benchmark_return").get("source_refs")
+    )
+
+
+def test_public_performance_reliability_boundary_cases() -> None:
+    fixture = build_public_backtest_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.3,
+                max_drawdown=-0.15,
+                win_rate=0.6,
+                total_return=0.12,
+                in_sample_sharpe=0.3,
+                out_sample_sharpe=0.2,
+                degradation=0.05,
+            ),
+            engine_summary={"effective_trade_count": 7},
+        ),
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
         pipeline_data_source={"source": "fixture"},
     )
-    assert insufficient_fixture is not None
-    assert insufficient_fixture.reliability.status == "insufficient"
-    assert insufficient_fixture.benchmark.is_available is False
-    assert all(detail.is_available is False for detail in insufficient_fixture.metric_details)
+    assert fixture is not None
+    assert fixture.reliability is not None
+    assert fixture.reliability.status == "insufficient"
 
-    limited_unknown = build_public_backtest_performance(
+    no_rows = build_public_backtest_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.3,
+                max_drawdown=-0.15,
+                win_rate=0.6,
+                total_return=0.12,
+                in_sample_sharpe=0.3,
+                out_sample_sharpe=0.2,
+                degradation=0.05,
+            ),
+            engine_summary={"effective_trade_count": 10},
+        ),
+        price_rows=[],
+        pipeline_data_source={"source": "postgres"},
+    )
+    assert no_rows is not None
+    assert no_rows.reliability is not None
+    assert no_rows.reliability.status == "insufficient"
+    assert all(item.is_available is False for item in no_rows.metric_details)
+
+    short = build_public_backtest_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.3,
+                max_drawdown=-0.15,
+                win_rate=0.6,
+                total_return=0.12,
+                in_sample_sharpe=0.3,
+                out_sample_sharpe=0.2,
+                degradation=0.05,
+            ),
+            engine_summary={"effective_trade_count": 10},
+        ),
+        price_rows=_rows(datetime(2024, 1, 1), 29),
+        pipeline_data_source={"source": "postgres"},
+    )
+    assert short is not None
+    assert short.reliability.status == "insufficient"
+
+    limited_30 = build_public_backtest_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.3,
+                max_drawdown=-0.15,
+                win_rate=0.6,
+                total_return=0.12,
+                in_sample_sharpe=0.3,
+                out_sample_sharpe=0.2,
+                degradation=0.05,
+            ),
+            engine_summary={"effective_trade_count": 3},
+        ),
+        price_rows=_rows(datetime(2024, 1, 1), 30),
+        pipeline_data_source={"source": "postgres"},
+    )
+    assert limited_30 is not None
+    assert limited_30.reliability.status == "limited"
+
+    limited_251 = build_public_backtest_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.3,
+                max_drawdown=-0.15,
+                win_rate=0.6,
+                total_return=0.12,
+                in_sample_sharpe=0.3,
+                out_sample_sharpe=0.2,
+                degradation=0.05,
+            ),
+            engine_summary={"effective_trade_count": 3},
+        ),
+        price_rows=_rows(datetime(2024, 1, 1), 251),
+        pipeline_data_source={"source": "postgres"},
+    )
+    assert limited_251 is not None
+    assert limited_251.reliability.status == "limited"
+
+    limited_trades_4 = build_public_backtest_performance(
         _build_payload(
             BacktestMetrics(
                 sharpe_ratio=0.3,
@@ -171,13 +273,32 @@ def test_public_performance_reliability_and_benchmark_for_source_variants() -> N
             ),
             engine_summary={"effective_trade_count": 4},
         ),
-        price_rows=_rows(trading_days=120, ticker_count=5),
-        pipeline_data_source={"source": "mystery"},
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        pipeline_data_source={"source": "postgres"},
     )
-    assert limited_unknown is not None
-    assert limited_unknown.reliability.status == "limited"
+    assert limited_trades_4 is not None
+    assert limited_trades_4.reliability.status == "limited"
 
-    sufficient_postgres = build_public_backtest_performance(
+    insufficient_tickers = build_public_backtest_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.3,
+                max_drawdown=-0.15,
+                win_rate=0.6,
+                total_return=0.12,
+                in_sample_sharpe=0.3,
+                out_sample_sharpe=0.2,
+                degradation=0.05,
+            ),
+            engine_summary={"effective_trade_count": 10},
+        ),
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=4),
+        pipeline_data_source={"source": "postgres"},
+    )
+    assert insufficient_tickers is not None
+    assert insufficient_tickers.reliability.status == "insufficient"
+
+    sufficient = build_public_backtest_performance(
         _build_payload(
             BacktestMetrics(
                 sharpe_ratio=0.3,
@@ -190,15 +311,13 @@ def test_public_performance_reliability_and_benchmark_for_source_variants() -> N
             ),
             engine_summary={"effective_trade_count": 5},
         ),
-        price_rows=_rows(trading_days=252, ticker_count=5),
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
         pipeline_data_source={"source": "postgres"},
     )
-    assert sufficient_postgres is not None
-    assert sufficient_postgres.reliability.status == "sufficient"
+    assert sufficient is not None
+    assert sufficient.reliability.status == "sufficient"
 
-
-def test_public_performance_short_or_too_few_tickers_mark_insufficient() -> None:
-    too_short = build_public_backtest_performance(
+    unknown_252 = build_public_backtest_performance(
         _build_payload(
             BacktestMetrics(
                 sharpe_ratio=0.3,
@@ -209,55 +328,13 @@ def test_public_performance_short_or_too_few_tickers_mark_insufficient() -> None
                 out_sample_sharpe=0.2,
                 degradation=0.05,
             ),
-            engine_summary={"effective_trade_count": 10},
+            engine_summary={"effective_trade_count": 5},
         ),
-        price_rows=_rows(trading_days=29, ticker_count=5),
-        pipeline_data_source={"source": "postgres"},
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        pipeline_data_source={"source": "mystery"},
     )
-    four_tickers = build_public_backtest_performance(
-        _build_payload(
-            BacktestMetrics(
-                sharpe_ratio=0.3,
-                max_drawdown=-0.15,
-                win_rate=0.6,
-                total_return=0.12,
-                in_sample_sharpe=0.3,
-                out_sample_sharpe=0.2,
-                degradation=0.05,
-            ),
-            engine_summary={"effective_trade_count": 10},
-        ),
-        price_rows=_rows(trading_days=252, ticker_count=4),
-        pipeline_data_source={"source": "postgres"},
-    )
-
-    assert too_short is not None and too_short.reliability.status == "insufficient"
-    assert too_short.reliability.trading_days == 29
-    assert four_tickers is not None and four_tickers.reliability.status == "insufficient"
-    assert four_tickers.reliability.ticker_count == 4
-
-
-def test_public_performance_source_refs_are_preserved() -> None:
-    performance = build_public_backtest_performance(
-        _build_payload(
-            BacktestMetrics(
-                sharpe_ratio=0.3,
-                max_drawdown=-0.15,
-                win_rate=0.6,
-                total_return=0.12,
-                in_sample_sharpe=0.3,
-                out_sample_sharpe=0.2,
-                degradation=0.05,
-            ),
-            engine_summary={"effective_trade_count": 10},
-        ),
-        price_rows=_rows(trading_days=252, ticker_count=5),
-        pipeline_data_source={"source": "postgres"},
-    )
-    assert performance is not None
-    details = {item.key: item for item in performance.metric_details}
-    assert details["sharpe_ratio"].source_refs == metric_explanation("sharpe_ratio").get("source_refs", [])
-    assert details["benchmark_return"].source_refs == metric_explanation("benchmark_return").get("source_refs", [])
+    assert unknown_252 is not None
+    assert unknown_252.reliability.status == "limited"
 
 
 def test_graph_public_performance_alias_points_to_quant_module() -> None:

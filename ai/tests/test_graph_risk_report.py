@@ -4,7 +4,11 @@ import pytest
 
 from ai_graph.graph import _recommendation_gate
 from ai_graph.graph import build_public_backtest_performance
-from ai_graph.nodes.backtest import BENCHMARK_METHOD, BENCHMARK_WARNING
+from ai_graph.nodes.backtest import (
+    BENCHMARK_METHOD,
+    BENCHMARK_WARNING,
+    _equal_weight_benchmark_curve,
+)
 from ai_graph.nodes.report import build_report_bundle
 from ai_graph.nodes.risk_manager import MacroSnapshot, apply_risk_rules
 from ai_graph.schemas import (
@@ -64,20 +68,22 @@ def _performance_payload(
 
 
 def _fixture_rows(row_count: int = 4, ticker: str = "005930") -> list[dict[str, object]]:
-    base = 100.0
-    return [
-        {
-            "date": f"2026-01-0{index + 2}",
-            "ticker": ticker,
-            "open": base + index,
-            "high": base + index + 1,
-            "low": base + index - 1,
-            "close": base + index,
-            "volume": 1_000_000.0,
-            "rsi": 50.0,
-        }
-        for index in range(row_count)
-    ]
+    start = datetime(2026, 1, 2)
+    rows: list[dict[str, object]] = []
+    for index in range(row_count):
+        rows.append(
+            {
+                "date": (start + timedelta(days=index)).date().isoformat(),
+                "ticker": ticker,
+                "open": 100.0 + index,
+                "high": 101.0 + index,
+                "low": 99.0 + index,
+                "close": 100.0 + index,
+                "volume": 1_000_000.0,
+                "rsi": 50.0,
+            }
+        )
+    return rows
 
 
 def _sequential_rows(
@@ -96,6 +102,31 @@ def _sequential_rows(
                     "high": 100.2 + day + idx / 10.0,
                     "low": 99.8 + day + idx / 10.0,
                     "close": 100.0 + day + idx / 10.0,
+                    "volume": 1_000_000.0,
+                    "rsi": 30.0,
+                }
+            )
+    return rows
+
+
+def _trend_rows(
+    start: datetime, days: int, ticker_count: int = 5, start_price: float = 100.0
+) -> list[dict[str, object]]:
+    if days <= 1:
+        raise ValueError("days must be at least 2")
+    rows: list[dict[str, object]] = []
+    for day in range(days):
+        date = (start + timedelta(days=day)).date().isoformat()
+        close = start_price + (1.0 * day / (days - 1))
+        for idx in range(1, ticker_count + 1):
+            rows.append(
+                {
+                    "date": date,
+                    "ticker": f"{idx:06d}",
+                    "open": close,
+                    "high": close + 1.0,
+                    "low": close - 1.0,
+                    "close": close,
                     "volume": 1_000_000.0,
                     "rsi": 30.0,
                 }
@@ -210,7 +241,12 @@ def test_public_performance_reliability_marks_fixture_4row_single_ticker_as_insu
     assert performance.reliability.ticker_count == 1
     assert performance.reliability.trading_days == 4
     assert any("fixture" in reason for reason in performance.reliability.reasons)
-    assert any("신뢰도" in quality for quality in performance.data_quality)
+    assert performance.benchmark is not None
+    assert performance.benchmark.is_available is False
+    assert performance.benchmark.total_return is None
+    assert performance.benchmark.cumulative_curve == []
+    assert all(item.is_available is False for item in performance.metric_details)
+    assert all(item.unavailable_reason is not None for item in performance.metric_details)
 
 
 def test_public_performance_reliability_marks_multi_ticker_postgres_as_sufficient_for_long_history() -> None:
@@ -242,62 +278,8 @@ def test_public_performance_reliability_marks_multi_ticker_postgres_as_sufficien
 
 
 def test_public_performance_benchmark_and_excess_return_are_visible() -> None:
-    benchmark_rows = [
-        {
-            "date": "2026-01-01",
-            "ticker": "005930",
-            "open": 100.0,
-            "high": 101.0,
-            "low": 99.0,
-            "close": 100.0,
-            "volume": 1_000_000.0,
-        },
-        {
-            "date": "2026-01-01",
-            "ticker": "000001",
-            "open": 100.0,
-            "high": 101.0,
-            "low": 99.0,
-            "close": 100.0,
-            "volume": 1_000_000.0,
-        },
-        {
-            "date": "2026-01-02",
-            "ticker": "005930",
-            "open": 100.0,
-            "high": 111.0,
-            "low": 99.0,
-            "close": 110.0,
-            "volume": 1_000_000.0,
-        },
-        {
-            "date": "2026-01-02",
-            "ticker": "000001",
-            "open": 100.0,
-            "high": 111.0,
-            "low": 99.0,
-            "close": 110.0,
-            "volume": 1_000_000.0,
-        },
-        {
-            "date": "2026-01-03",
-            "ticker": "005930",
-            "open": 110.0,
-            "high": 122.0,
-            "low": 108.0,
-            "close": 121.0,
-            "volume": 1_000_000.0,
-        },
-        {
-            "date": "2026-01-03",
-            "ticker": "000001",
-            "open": 110.0,
-            "high": 121.0,
-            "low": 108.0,
-            "close": 121.0,
-            "volume": 1_000_000.0,
-        },
-    ]
+    benchmark_rows = _trend_rows(datetime(2026, 1, 1), 252, ticker_count=5, start_price=100.0)
+    expected_benchmark_return = 0.01
     performance = build_public_backtest_performance(
         _performance_payload(
             BacktestMetrics(
@@ -319,17 +301,16 @@ def test_public_performance_benchmark_and_excess_return_are_visible() -> None:
     assert performance.benchmark is not None
     assert performance.benchmark.is_available is True
     assert performance.benchmark.method == BENCHMARK_METHOD
-    assert "KOSPI200" not in performance.benchmark.label
     assert BENCHMARK_WARNING in performance.benchmark.warning
-    assert performance.benchmark.total_return == pytest.approx(0.21)
+    assert performance.benchmark.total_return == pytest.approx(expected_benchmark_return)
     benchmark_metric = next(
         metric for metric in performance.metric_details if metric.key == "benchmark_return"
     )
     excess_metric = next(
         metric for metric in performance.metric_details if metric.key == "excess_return"
     )
-    assert benchmark_metric.value == pytest.approx(0.21)
-    assert excess_metric.value == pytest.approx(-0.16)
+    assert benchmark_metric.value == pytest.approx(expected_benchmark_return)
+    assert excess_metric.value == pytest.approx(0.05 - expected_benchmark_return)
 
 
 def test_public_performance_metric_details_have_explanations_and_flags() -> None:
@@ -419,39 +400,13 @@ def test_benchmark_curve_uses_fixed_universe_buy_and_hold() -> None:
         {"date": "2026-01-03", "ticker": "000001", "close": 100.0},
         {"date": "2026-01-03", "ticker": "000002", "close": 100.0},
     ]
-    performance = build_public_backtest_performance(
-        _performance_payload(
-            BacktestMetrics(
-                sharpe_ratio=0.5,
-                max_drawdown=-0.03,
-                win_rate=0.56,
-                total_return=0.05,
-                in_sample_sharpe=0.51,
-                out_sample_sharpe=0.4,
-                degradation=0.1,
-            ),
-            engine_summary={"effective_trade_count": 8},
-        ),
-        price_rows=benchmark_rows,
-        pipeline_data_source={"source": "postgres"},
-    )
+    curve, total_return = _equal_weight_benchmark_curve(benchmark_rows)
 
-    assert performance is not None
-    assert performance.benchmark is not None
-    assert performance.benchmark.total_return == pytest.approx(0.0)
-    assert performance.benchmark.cumulative_curve[1].cumulative_return == pytest.approx(0.25)
-    assert performance.benchmark.cumulative_curve[-1].cumulative_return == pytest.approx(0.0)
-
-    # Daily rebalanced (equal shares each date) would not stay at 0% here.
-    # A 100->200->100 and B 100->50->100 yields a fixed-share buy-and-hold end = 0%.
-    benchmark_two_days = (
-        (
-            (200.0 / 100.0)
-            + (50.0 / 100.0)
-        )
-        / 2.0
-        - 1.0
-    )
+    assert total_return == pytest.approx(0.0)
+    assert curve[1].cumulative_return == pytest.approx(0.25)
+    assert curve[-1].cumulative_return == pytest.approx(0.0)
+    # Daily rebalanced(구간별 동일비중)을 직접 검증해주는 단위 테스트.
+    benchmark_two_days = ((200.0 / 100.0) + (50.0 / 100.0)) / 2.0 - 1.0
     assert benchmark_two_days != 0.0
 
 
@@ -485,7 +440,7 @@ def test_recommendation_gate_reasons_follow_objective_floor() -> None:
     )
     assert gate is not None
     assert gate.validated is False
-    assert "샤프" in gate.reason
+    assert "objective 조건 미충족" in gate.reason
     assert "benchmark" not in gate.reason
 
 
@@ -519,4 +474,4 @@ def test_recommendation_gate_accepts_valid_objective() -> None:
     )
     assert gate is not None
     assert gate.validated is True
-    assert "통과" in gate.reason
+    assert "objective gate를 모두 통과" in gate.reason

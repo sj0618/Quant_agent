@@ -2705,4 +2705,4 @@ def _sortino_ratio(total_return: float, returns: Sequence[float]) -> float | Non
 
 
 # Public performance helpers are sourced from quant_performance for a stable behavior contract.
-from ai_graph.quant_performance import build_public_backtest_performance as build_public_backtest_performance
+from ai_graph.quant_performance import build_public_backtest_performance as build_public_backtest_performance  # noqa: E402, F811

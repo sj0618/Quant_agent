@@ -123,7 +123,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
 }
 
 
-def metric_explanation(key: str) -> dict[str, str]:
+def metric_explanation(key: str) -> dict[str, Any]:
     return _METRIC_EXPLANATIONS.get(
         key,
         {
