@@ -75,6 +75,7 @@ x-airflow-common:
     QUANT_DB_EXECUTION_MODE: psycopg
     QUANT_AIRFLOW_LOAD_DOTENV: 'false'
     QUANT_TA_MAX_WORKERS: '2'
+    AI_DATA_SOURCE_VARIANT: ${AI_DATA_SOURCE_VARIANT:-db}
     # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
     # for other purpose (development, test and especially production usage) build/extend Airflow image.
     # The following line can be used to set a custom config file, stored in the local config folder

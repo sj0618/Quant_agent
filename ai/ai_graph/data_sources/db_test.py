@@ -18,8 +18,11 @@ from typing import Any
 from .db import *  # noqa: F401,F403 - re-export the baseline public API
 from .db import (
     DATABASE_DSN_ENV_CANDIDATES,
+    DataSourceConfig,
+    INDICATOR_FIELDS,
     KIS_FEATURE_FRAME_VIEW,
     PostgresPipelineDataSource as _BasePostgresPipelineDataSource,
+    PipelineDataBundle,
     _fixture_bundle,
     _financial_sql,
     _mart_frame_sql,
