@@ -4,11 +4,13 @@ import math
 import warnings
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
+from threading import Lock
 
 ROUND_DIGITS = 10
 DEFAULT_ROLLING_PERIOD = 126
 MONTECARLO_SIMULATION_COUNT = 250
 MONTECARLO_RANDOM_SEED = 42
+_PANDAS_MONTHLY_RETURNS_LOCK = Lock()
 QUANTSTATS_REQUIRED_MESSAGE = (
     "quantstats is required for performance metrics. Install with: python -m pip install quantstats"
 )
@@ -176,7 +178,7 @@ def calculate_quantstats_metrics(
         ),
         "monthly_returns": _safe_metric(
             "monthly_returns",
-            lambda: _dataframe_to_records(qs_stats.monthly_returns(returns), pd=pd, np=np),
+            lambda: _monthly_returns_records(returns, qs_stats=qs_stats, pd=pd, np=np),
             metric_warnings,
         ),
         "drawdown_series": _json_safe(drawdown_series) if drawdown_series is not None else None,
@@ -412,6 +414,15 @@ def _raw_metric(metric_name: str, callback, metric_warnings: list[dict[str, str]
     except Exception as exc:
         metric_warnings.append({"metric": metric_name, "warning": f"{type(exc).__name__}: {exc}"})
         return None
+
+
+def _monthly_returns_records(returns, *, qs_stats, pd, np):
+    # Pandas 3 defaults strftime results to Arrow strings. PyArrow can segfault when
+    # QuantStats monthly tables are built concurrently by API worker threads, so keep
+    # this one conversion on Pandas' stable Python-string path.
+    with _PANDAS_MONTHLY_RETURNS_LOCK:
+        with pd.option_context("future.infer_string", False):
+            return _dataframe_to_records(qs_stats.monthly_returns(returns), pd=pd, np=np)
 
 
 def _compare_detail(aligned_returns, aligned_benchmark, *, greeks, qs_stats, np, pd, metric_warnings):

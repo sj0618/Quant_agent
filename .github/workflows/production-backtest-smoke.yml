@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout branch benchmark
-        if: ${{ inputs.mode == 'live-aoai' || inputs.mode == 'live-full-analysis' }}
+        if: ${{ inputs.mode == 'deployed-backtest' || inputs.mode == 'live-aoai' || inputs.mode == 'live-full-analysis' }}
         uses: actions/checkout@v4
 
       - name: Validate required secret
@@ -51,7 +51,7 @@ jobs:
           chmod 644 "$HOME/.ssh/known_hosts"
 
       - name: Stage branch benchmark without deploying
-        if: ${{ inputs.mode == 'live-aoai' || inputs.mode == 'live-full-analysis' }}
+        if: ${{ inputs.mode == 'deployed-backtest' || inputs.mode == 'live-aoai' || inputs.mode == 'live-full-analysis' }}
         run: |
           tar -czf branch-source.tgz ai backtest_module
           scp -o BatchMode=yes \
@@ -366,10 +366,21 @@ jobs:
             -i "$HOME/.ssh/id_ed25519" \
             -p "$SERVER_PORT" \
             "$SERVER_USER@$SERVER_HOST" \
-            bash -s -- "$SERVER_APP_DIR" <<'REMOTE'
+            bash -s -- "$SERVER_APP_DIR" "$AOAI_RUN_ROOT" <<'REMOTE'
           set -Eeuo pipefail
 
           APP_DIR="$1"
+          RUN_ROOT="$2"
+          ARCHIVE="$RUN_ROOT.tgz"
+          case "$RUN_ROOT" in
+            /tmp/quant-agent-aoai-[0-9]*) ;;
+            *) printf 'Unsafe benchmark path: %s\n' "$RUN_ROOT" >&2; exit 2 ;;
+          esac
+          trap 'rm -rf -- "$RUN_ROOT"; rm -f -- "$ARCHIVE"' EXIT
+          rm -rf -- "$RUN_ROOT"
+          mkdir -p "$RUN_ROOT"
+          tar -xzf "$ARCHIVE" -C "$RUN_ROOT"
+
           if [ -f "$HOME/.bashrc" ]; then
             set +u
             source "$HOME/.bashrc"
@@ -377,18 +388,48 @@ jobs:
           fi
 
           test -x "$APP_DIR/ai/.venv/bin/python"
-          test -f "$APP_DIR/ai/scripts/benchmark_backtest_optimization.py"
+          test -f "$RUN_ROOT/ai/scripts/benchmark_backtest_optimization.py"
           command -v taskset >/dev/null
 
-          cd "$APP_DIR/ai"
+          cd "$RUN_ROOT/ai"
           export AI_LLM_PROVIDER=mock
           export OMP_NUM_THREADS=1
           export OPENBLAS_NUM_THREADS=1
           export MKL_NUM_THREADS=1
           export NUMEXPR_NUM_THREADS=1
+          RESULTS_FILE="$RUN_ROOT/results.jsonl"
           for _ in 1 2 3; do
-            taskset --cpu-list 0,1 "$APP_DIR/ai/.venv/bin/python" -u \
-              "$APP_DIR/ai/scripts/benchmark_backtest_optimization.py" \
-              --tickers 203 --days 2520 --workers 2 --candidates 3
+            PYTHONPATH="$RUN_ROOT/ai:$RUN_ROOT/backtest_module" \
+              taskset --cpu-list 0,1 "$APP_DIR/ai/.venv/bin/python" -u \
+                "$RUN_ROOT/ai/scripts/benchmark_backtest_optimization.py" \
+                --tickers 203 --days 2520 --workers 2 --candidates 3 \
+              | tee -a "$RESULTS_FILE"
           done
+          "$APP_DIR/ai/.venv/bin/python" - "$RESULTS_FILE" <<'PY'
+          import json
+          from pathlib import Path
+          from statistics import median
+          import sys
+
+          results = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+          hashes = {result["canonical_sha256"] for result in results}
+          walls = [float(result["wall_seconds"]) for result in results]
+          for result in results:
+              selection, full = result["execution_stats"]["rounds"][:2]
+              if len(selection["action_worker_pids"]) != 2:
+                  raise RuntimeError("structured actions did not use both workers")
+              if full["action_cache_hits"] != 1 or full["action_build_seconds"] != 0.0:
+                  raise RuntimeError("selected actions were rebuilt for full evaluation")
+          wall_median = median(walls)
+          if len(hashes) != 1:
+              raise RuntimeError("parallel benchmark result was not deterministic")
+          if wall_median > 40.0:
+              raise RuntimeError(f"two-core median {wall_median:.6f}s exceeded 40s")
+          print(json.dumps({
+              "canonical_sha256": next(iter(hashes)),
+              "median_wall_seconds": wall_median,
+              "runs": walls,
+              "status": "pass",
+          }, sort_keys=True))
+          PY
           REMOTE

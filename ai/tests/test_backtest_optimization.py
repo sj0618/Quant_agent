@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import date, timedelta
 from hashlib import sha256
 import json
+import os
+import time
 from types import SimpleNamespace
+
+import pytest
 
 from ai_graph.nodes import backtest as backtest_node
 from ai_graph.nodes.backtest_code import (
@@ -242,6 +246,68 @@ def test_worker_count_and_disk_cache_are_deterministic(monkeypatch, tmp_path) ->
     result_two = backtest_node.run_candidate_backtest(strategy, candidates, price_rows=rows)
 
     assert _canonical_hash(result_one) == _canonical_hash(result_two)
+
+
+@pytest.mark.skipif(
+    "fork" not in backtest_node.get_all_start_methods(),
+    reason="structured action workers share prepared arrays through fork",
+)
+def test_structured_actions_run_in_workers_and_are_reused_for_full(
+    monkeypatch, tmp_path
+) -> None:
+    strategy = _strategy()
+    rows = _rows(days=45)
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="parallel-actions")
+    ).candidates
+    original_build_actions = PreparedFeatureStore.build_actions
+
+    def delayed_build_actions(self, strategy_ir, parameters):
+        time.sleep(0.05)
+        return original_build_actions(self, strategy_ir, parameters)
+
+    monkeypatch.setattr(PreparedFeatureStore, "build_actions", delayed_build_actions)
+    monkeypatch.setattr(backtest_node, "SERIAL_EVALUATION_WORK_ITEMS", 0)
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "parallel-actions"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "2")
+
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        selection = session.evaluate(candidates)
+        full = session.evaluate([selection[0].candidate], metrics_mode="full")
+        rounds = session.execution_stats()["rounds"]
+
+    selection_pids = {item.diagnostics["worker_pid"] for item in selection}
+    assert len(selection_pids) == 2
+    assert os.getpid() not in selection_pids
+    assert set(rounds[0]["action_worker_pids"]) == selection_pids
+    assert rounds[0]["action_cache_hits"] == 0
+    assert full[0].diagnostics["action_cache_hit"] is True
+    assert full[0].diagnostics["action_build_seconds"] == 0.0
+    assert rounds[1]["action_cache_hits"] == 1
+    assert rounds[1]["action_worker_pids"] == []
+
+
+def test_market_benchmark_is_prepared_once_per_session(monkeypatch, tmp_path) -> None:
+    strategy = _strategy()
+    rows = _rows(days=45)
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="benchmark-context")
+    ).candidates
+    original = backtest_node._equal_weight_benchmark_curve
+    calls = 0
+
+    def counted(price_rows):
+        nonlocal calls
+        calls += 1
+        return original(price_rows)
+
+    monkeypatch.setattr(backtest_node, "_equal_weight_benchmark_curve", counted)
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "benchmark-context"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
+
+    backtest_node.run_candidate_backtest(strategy, candidates, price_rows=rows)
+
+    assert calls == 1
 
 
 def test_fresh_and_disk_cache_results_are_identical(monkeypatch, tmp_path) -> None:
