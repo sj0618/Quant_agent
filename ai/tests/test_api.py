@@ -217,6 +217,28 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert performance["equity_curve"][-1]["cumulative_return"] > 0
 
 
+def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    created = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={"query": "뭐 좀 괜찮은 거 없냐"},
+    )
+    assert created.status_code == 201
+
+    result = _poll_job(client, created.json()["job_id"])["result"]
+
+    assert result["status"] == "ready"
+    assert result["strategy_spec"]["selection_mode"] == "automatic"
+    assert result["strategy_spec"]["strategy_id"].startswith(
+        "automatic_robust_tournament"
+    )
+    assert result["rule_provenance"]["substituted"] is False
+    explanation = result["user_payload"]["performance"]["strategy_explanation"]
+    assert explanation["selection_mode"] == "automatic"
+    assert explanation["source_refs"]
+
+
 def test_analysis_job_api_lists_only_authenticated_users_jobs_newest_first() -> None:
     store = InMemoryAnalysisJobStore()
     client = TestClient(create_app(store))

@@ -6,6 +6,7 @@ import numpy as np
 
 from ai_graph import run_analysis
 from ai_graph.graph import build_strategy_spec
+from ai_graph.nodes.backtest import backtest_node, rule_provenance
 from ai_graph.nodes.backtest_code import (
     Loop3Request,
     _candidate_profiles,
@@ -16,6 +17,8 @@ from ai_graph.nodes.backtest_code import (
 from ai_graph.nodes.backtest_features import PreparedFeatureStore
 from ai_graph.quant_strategy import (
     AQR_TREND_SOURCE,
+    AUTOMATIC_TOURNAMENT_PROFILES,
+    BACKTEST_OVERFITTING_SOURCE,
     KEN_FRENCH_MOMENTUM_SOURCE,
     build_strategy_explanation,
     classify_strategy_request,
@@ -39,11 +42,37 @@ def _trend_rows(days: int = 300) -> list[dict[str, object]]:
 
 
 def test_concrete_rule_wins_over_automatic_request() -> None:
-    assert classify_strategy_request("검증된 전략을 추천하되 RSI 30 이하에서 매수") == "user_defined"
+    assert (
+        classify_strategy_request("검증된 전략을 추천하되 RSI 30 이하에서 매수") == "user_defined"
+    )
     assert classify_strategy_request("자동 추천하되 주가가 10000원 아래면 매수") == "user_defined"
     assert classify_strategy_request("매수할 종목을 자동 추천해줘") == "automatic"
     assert classify_strategy_request("인기 있는 모멘텀 퀀트 전략을 자동 추천해줘") == "automatic"
     assert classify_strategy_request("시장 상황을 설명해줘") == "standard"
+
+
+def test_vague_strategy_requests_become_automatic_without_magic_words() -> None:
+    assert classify_strategy_request("돈 좀 벌게 아무거나 괜찮은 걸로 해봐") == "automatic"
+    assert classify_strategy_request("뭐 좀 괜찮은 거 없냐") == "automatic"
+    assert classify_strategy_request("종목 좀 골라줘") == "automatic"
+    assert classify_strategy_request("RSI 눌림목으로 해줘") == "standard"
+    assert classify_strategy_request("배당 방어주 전략") == "standard"
+    assert classify_strategy_request("저PER 종목으로 골라줘") == "standard"
+    assert classify_strategy_request("FCF 좋은 기업으로 해줘") == "standard"
+
+
+def test_vague_request_runs_the_full_automatic_pipeline() -> None:
+    envelope = run_analysis(
+        "뭐 좀 괜찮은 거 없냐",
+        trace_id="vague-automatic-full-pipeline",
+    )
+
+    assert envelope.status == "ready"
+    assert envelope.strategy_spec is not None
+    assert envelope.strategy_spec.selection_mode == "automatic"
+    assert envelope.strategy_spec.strategy_id.startswith("automatic_robust_tournament")
+    assert envelope.rule_provenance is not None
+    assert envelope.rule_provenance.substituted is False
 
 
 def test_academic_factors_match_exact_12_1_and_sma_boundaries() -> None:
@@ -98,7 +127,7 @@ def test_realized_volatility_uses_exactly_21_past_daily_returns() -> None:
     assert np.isnan(invalid.realized_volatility_21d[index])
 
 
-def test_automatic_request_builds_cited_academic_plan() -> None:
+def test_automatic_request_builds_cited_three_family_tournament() -> None:
     strategy = build_strategy_spec(
         "사람들이 많이 쓰는 검증된 퀀트 전략으로 자동 추천해줘",
         variant="A",
@@ -106,30 +135,57 @@ def test_automatic_request_builds_cited_academic_plan() -> None:
     )
 
     assert strategy.selection_mode == "automatic"
-    assert strategy.strategy_id.startswith("automatic_academic_momentum")
+    assert strategy.strategy_id.startswith("automatic_robust_tournament")
     assert AQR_TREND_SOURCE in strategy.source_refs
     assert KEN_FRENCH_MOMENTUM_SOURCE in strategy.source_refs
+    assert BACKTEST_OVERFITTING_SOURCE in strategy.source_refs
     plan = build_code_generation_plan(strategy, map_strategy_features(strategy))
-    assert plan.entry_feature == "academic_momentum_trend"
-    assert _candidate_profiles(plan)[0] == "academic_momentum_trend"
+    assert plan.entry_feature == "robust_strategy_tournament"
+    assert tuple(_candidate_profiles(plan)) == AUTOMATIC_TOURNAMENT_PROFILES
     candidates = generate_loop3_candidates(
-        Loop3Request(strategy=strategy, variant="A", trace_id="academic-profile-contract")
+        Loop3Request(strategy=strategy, variant="A", trace_id="robust-tournament-contract")
     ).candidates
-    assert all(
-        candidate.parameters is not None
-        and candidate.parameters.profile == "academic_momentum_trend"
-        for candidate in candidates
+    assert (
+        tuple(
+            candidate.parameters.profile
+            for candidate in candidates
+            if candidate.parameters is not None
+        )
+        == AUTOMATIC_TOURNAMENT_PROFILES
     )
+    assert [candidate.parameters.lookback for candidate in candidates if candidate.parameters] == [
+        252,
+        200,
+        126,
+    ]
+    assert [candidate.parameters.threshold for candidate in candidates if candidate.parameters] == [
+        0.0,
+        0.0,
+        0.03,
+    ]
 
     explanation = build_strategy_explanation(strategy)
     assert explanation["selection_mode"] == "automatic"
     assert "미래 수익을 보장하지 않습니다" in explanation["caution"]
     assert {item["key"] for item in explanation["indicators"]} == {
+        "strategy_tournament",
         "momentum_12_1",
-        "sma_50_200",
-        "realized_volatility_21d",
-        "rebalance_21d",
+        "dual_sma_trend",
+        "price_range_volatility",
     }
+
+
+def test_original_vague_request_survives_a_concrete_interpreter_rewrite() -> None:
+    strategy = build_strategy_spec(
+        "RSI가 30 이하일 때 매수하고 70 이상이면 매도",
+        original_query="대충 좋은 걸로 돈 좀 벌게 해봐",
+        variant="A",
+        semantic_slots={},
+    )
+
+    assert strategy.selection_mode == "automatic"
+    assert strategy.strategy_id.startswith("automatic_robust_tournament")
+    assert strategy.entry_conditions[0].left == "past_only_signal"
 
 
 def test_automatic_profile_is_reported_as_the_intended_rule() -> None:
@@ -143,11 +199,26 @@ def test_automatic_profile_is_reported_as_the_intended_rule() -> None:
     assert envelope.strategy_spec.selection_mode == "automatic"
     assert envelope.rule_provenance is not None
     assert envelope.rule_provenance.substituted is False
-    assert (
-        envelope.rule_provenance.evaluated_rule
-        == "automatic_profile:academic_momentum_trend"
-    )
+    assert envelope.rule_provenance.evaluated_rule in {
+        f"automatic_profile:{profile}" for profile in AUTOMATIC_TOURNAMENT_PROFILES
+    }
     assert envelope.rule_provenance.untranslatable_conditions == []
+
+
+def test_every_pre_registered_automatic_profile_has_truthful_provenance() -> None:
+    for profile in AUTOMATIC_TOURNAMENT_PROFILES:
+        provenance = rule_provenance(
+            {
+                "selected_candidate": {"parameters": {"profile": profile}},
+                "candidates": [],
+            },
+            [{"left": "past_only_signal", "operator": "eq", "right": 1}],
+            selection_mode="automatic",
+        )
+
+        assert provenance["evaluated_rule"] == f"automatic_profile:{profile}"
+        assert provenance["substituted"] is False
+        assert provenance["reason"] is None
 
 
 def test_automatic_profile_waits_for_history_and_monthly_rebalance() -> None:
@@ -174,6 +245,30 @@ def test_automatic_profile_waits_for_history_and_monthly_rebalance() -> None:
     assert actions[252] == 1
 
 
+def test_automatic_tournament_does_not_tune_after_seeing_returns() -> None:
+    strategy = build_strategy_spec(
+        "뭐 좀 괜찮은 거 없냐",
+        variant="A",
+        semantic_slots={},
+    )
+    generated = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="fixed-auto-tournament")
+    )
+
+    output = backtest_node(
+        {
+            "strategy_spec": strategy.model_dump(),
+            "backtest_code": generated.model_dump(),
+            "price_rows": _trend_rows(),
+        }
+    )
+
+    stats = output["backtest"]["execution_stats"]
+    assert stats["selection_policy"] == "pre_registered_three_family_holdout"
+    assert stats["self_improvement_rounds_limit"] == 0
+    assert len(output["backtest"]["candidates"]) == 3
+
+
 def test_concrete_strategy_is_not_replaced_by_automatic_profile() -> None:
     strategy = build_strategy_spec(
         "자동 추천도 좋지만 RSI가 30 이하일 때 매수하고 70 이상일 때 매도",
@@ -182,5 +277,5 @@ def test_concrete_strategy_is_not_replaced_by_automatic_profile() -> None:
     )
 
     assert strategy.selection_mode == "user_defined"
-    assert not strategy.strategy_id.startswith("automatic_academic_momentum")
+    assert not strategy.strategy_id.startswith("automatic_robust_tournament")
     assert any("rsi" in indicator.casefold() for indicator in strategy.indicators)
