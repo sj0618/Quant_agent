@@ -278,6 +278,44 @@ h6 { font-size: 0.67em; }
 .source-strip { display: flex; gap: 8px; align-items: center; color: var(--subdued); font-size: 12px; }
 .source-strip a { margin-left: auto; color: var(--blue); font-weight: 800; }
 .metric-card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+.metric-card__explanation { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 12px; }
+.metric-card__explanation summary { cursor: pointer; color: var(--ink); font-size: 11px; font-weight: 800; }
+.metric-card__explanation p { display: grid; gap: 3px; }
+.metric-card__explanation b { color: var(--subdued); font-size: 10px; }
+.metric-card__sources { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.metric-card__sources a, .strategy-explanation a { color: var(--blue); font-size: 11px; font-weight: 800; }
+.reliability-panel { border-left: 4px solid var(--line); }
+.reliability-panel--sufficient { border-left-color: var(--buy); }
+.reliability-panel--limited { border-left-color: #d97706; }
+.reliability-panel--insufficient { border-left-color: var(--drop); }
+.reliability-panel__head, .overview-reliability > div { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.reliability-panel__head p, .overview-reliability p { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 4px; }
+.reliability-panel__samples { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 16px 0 0; }
+.reliability-panel__samples div { border-radius: 8px; background: var(--soft); padding: 10px; }
+.reliability-panel__samples dt { color: var(--subdued); font-size: 10px; }
+.reliability-panel__samples dd { color: var(--ink); font-size: 12px; font-weight: 800; margin: 4px 0 0; }
+.reliability-panel__reasons { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 12px 0 0; padding-left: 18px; }
+.overview-reliability { border-left: 4px solid var(--line); }
+.overview-reliability--sufficient { border-left-color: var(--buy); }
+.overview-reliability--limited { border-left-color: #d97706; }
+.overview-reliability--insufficient { border-left-color: var(--drop); }
+.overview-reliability span { color: var(--muted); font-size: 11px; }
+.performance-empty { display: flex; flex-direction: column; gap: 6px; }
+.performance-empty p, .performance-empty__inline { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.performance-empty__inline { padding: 16px 20px; }
+.benchmark-note { border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 6px 12px; padding: 12px 20px; color: var(--muted); font-size: 11px; }
+.benchmark-note strong { color: var(--ink); }
+.benchmark-note p { width: 100%; }
+.strategy-explanation { display: flex; flex-direction: column; gap: 10px; }
+.strategy-explanation__head > div { display: flex; align-items: center; gap: 10px; }
+.strategy-explanation h2 { font-size: 17px; }
+.strategy-explanation > p { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.strategy-explanation > p b, .strategy-explanation article b { color: var(--ink); display: block; font-size: 11px; margin-bottom: 2px; }
+.strategy-explanation__indicators { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.strategy-explanation__indicators article { border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+.strategy-explanation__indicators article > p { color: var(--muted); font-size: 11px; line-height: 1.55; margin-top: 8px; }
+.strategy-explanation__indicators article > div { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.strategy-explanation__caution { border-radius: 8px; background: var(--soft); padding: 10px 12px; }
 .segmented { display: flex; gap: 2px; background: var(--soft); border-radius: 8px; padding: 3px; }
 .segmented button { border: 0; border-radius: 6px; padding: 6px 14px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 800; }
 .segmented .is-active { background: #fff; color: var(--ink); border: 1px solid var(--line); }
@@ -520,6 +558,7 @@ h6 { font-size: 0.67em; }
   .workspace-progress { padding: 18px; }
   .workspace-progress__steps { grid-template-columns: 1fr; }
   .summary-grid, .metric-grid, .signal-grid, .step-grid, .principle-grid, .hero__stats, .sample-market-grid, .axis-grid, .report-metrics, .form-grid, .legal-grid, .search-form, .search-result-row { grid-template-columns: 1fr; }
+  .reliability-panel__samples, .strategy-explanation__indicators { grid-template-columns: 1fr; }
   .landing-section, .landing-cta, .site-footer { padding: 56px 24px; }
   .reports-page, .report-detail-layout, .strategy-report-page, .auth-page, .legal-page, .settings-page, .search-page, .strategy-page { padding: 24px; }
   .report-row { grid-template-columns: 1fr; }

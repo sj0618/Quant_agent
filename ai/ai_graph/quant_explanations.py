@@ -10,7 +10,7 @@ _QUANTSTATS_SOURCE = "https://github.com/ranaroussi/quantstats"
 _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     "total_return": {
         "label": "누적수익률",
-        "unit": "ratio",
+        "unit": "percent",
         "plain_explanation": "전 기간 기준 투자금 변화율입니다.",
         "why_used": "전략의 기본 성과 크기를 판단해 추천의 수익성 가능성을 보여줍니다.",
         "caution": "과거구간 특성에 따라 과대·과소 추정될 수 있으므로 향후 구간은 별도 확인해야 합니다.",
@@ -18,7 +18,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     },
     "cagr": {
         "label": "연환산수익률(CAGR)",
-        "unit": "ratio",
+        "unit": "percent",
         "plain_explanation": "누적수익률을 연 단위로 환산한 값입니다.",
         "why_used": "분석 기간 길이가 다를 때 서로 다른 전략을 기간 기준으로 비교할 수 있습니다.",
         "caution": "거래일 수가 짧으면 연환산이 과대해질 수 있습니다.",
@@ -26,7 +26,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     },
     "annualized_volatility": {
         "label": "연환산 변동성",
-        "unit": "ratio",
+        "unit": "percent",
         "plain_explanation": "일별 수익률 표준편차를 연환산한 위험 지표입니다.",
         "why_used": "수익률 대비 리스크를 정량화해 전략 안정성을 보조적으로 평가합니다.",
         "caution": "극단치에 민감하고 표본 수가 적으면 불안정해질 수 있습니다.",
@@ -50,7 +50,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     },
     "max_drawdown": {
         "label": "최대낙폭",
-        "unit": "ratio",
+        "unit": "percent",
         "plain_explanation": "누적수익곡선 기준 누적 최고점 대비 최저점 하락 폭의 최대값입니다.",
         "why_used": "심각한 손실 구간을 빠르게 파악해 전략의 방어력을 판단합니다.",
         "caution": "짧은 구간에서는 실전 극단 구간을 충분히 반영하지 못할 수 있습니다.",
@@ -66,7 +66,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     },
     "win_rate": {
         "label": "승률",
-        "unit": "ratio",
+        "unit": "percent",
         "plain_explanation": "매매에서 수익 거래 비중입니다. 백테스트 메트릭의 trade_win_rate를 사용합니다.",
         "why_used": "진입/청산 패턴의 일관성과 안정적 신호 빈도를 보조 점검합니다.",
         "caution": "수익률 크기 없이 단순 횟수 중심으로 계산되어 성능을 완전히 설명하지 못할 수 있습니다.",
@@ -82,7 +82,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     },
     "benchmark_return": {
         "label": "프록시 벤치마크 수익률",
-        "unit": "ratio",
+        "unit": "percent",
         "plain_explanation": "가격열 상위집합의 고정 유니버스 동등가중 보유수익률입니다.",
         "why_used": "전략 성과를 동일 기간의 대체 기준과 비교해 초과 성과를 점검합니다.",
         "caution": "과거 살아남은 종목만으로 구성된 고정 유니버스여서 생존편향 경고가 포함됩니다.",
@@ -90,7 +90,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     },
     "excess_return": {
         "label": "초과수익률",
-        "unit": "ratio",
+        "unit": "percent",
         "plain_explanation": "전략 누적수익률에서 벤치마크 누적수익률을 뺀 값입니다.",
         "why_used": "기준 대비 전략의 상대적 우위를 직관적으로 확인하기 위해 사용합니다.",
         "caution": "벤치마크가 계산되지 않으면 비교값이 없습니다.",
@@ -114,7 +114,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     },
     "degradation": {
         "label": "열화도",
-        "unit": "ratio",
+        "unit": "percent",
         "plain_explanation": "학습구간 대비 홀드아웃 구간 성과 하락 정도입니다.",
         "why_used": "과적합 또는 구간 의존성을 점검하는 보조 지표로 사용합니다.",
         "caution": "매우 짧은 홀드아웃 구간에서는 불안정하게 나타날 수 있습니다.",

@@ -295,6 +295,7 @@ class StrategySpec(BaseModel):
     risk_constraints: dict[str, float | int | str | bool] = Field(default_factory=dict)
     assumptions: list[str] = Field(default_factory=list)
     source_refs: list[str] = Field(default_factory=list)
+    selection_mode: Literal["standard", "automatic", "user_defined"] = "standard"
     confidence: float = Field(ge=0.0, le=1.0)
 
     @field_validator("strategy_id")
@@ -346,6 +347,30 @@ class PublicMetricDetail(BaseModel):
     source_refs: list[str] = Field(default_factory=list)
 
 
+class PublicIndicatorExplanation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    plain_explanation: str = Field(min_length=1)
+    why_used: str = Field(min_length=1)
+    caution: str = Field(min_length=1)
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class PublicStrategyExplanation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selection_mode: Literal["standard", "automatic", "user_defined"]
+    title: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    why_selected: str = Field(min_length=1)
+    rebalance_explanation: str | None = None
+    caution: str = Field(min_length=1)
+    indicators: list[PublicIndicatorExplanation] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
+
+
 class BacktestReliability(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -382,6 +407,7 @@ class BacktestEquityPoint(BaseModel):
 
 StructuredProfile = Literal[
     "compiled_conditions",
+    "academic_momentum_trend",
     "long_regime_momentum",
     "quality_trend_hold",
     "volatility_breakout_hold",
@@ -544,6 +570,7 @@ class BacktestPerformance(BaseModel):
     data_quality: list[str] = Field(default_factory=list)
     benchmark: BacktestBenchmark | None = None
     metric_details: list[PublicMetricDetail] = Field(default_factory=list)
+    strategy_explanation: PublicStrategyExplanation | None = None
 
 
 class InternalPayload(BaseModel):

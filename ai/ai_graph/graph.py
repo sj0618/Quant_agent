@@ -50,6 +50,10 @@ from ai_graph.nodes.backtest import (
     backtest_node,
 )
 from ai_graph.quant_explanations import metric_explanation
+from ai_graph.quant_strategy import (
+    academic_strategy_source_refs,
+    classify_strategy_request,
+)
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
@@ -1662,18 +1666,27 @@ def build_strategy_spec(
     variant: str,
     semantic_slots: Mapping[str, Any] | None = None,
 ) -> StrategySpec:
+    selection_mode = classify_strategy_request(query)
     profile = _strategy_profile(query, semantic_slots=semantic_slots)
     slots = semantic_slots or {}
     sector = slots.get("sector")
-    conditions = generate_strategy_conditions(
-        query=query,
-        semantic_slots=dict(slots),
-        fallback=StrategyConditionsPayload(
-            entry_conditions=profile["entry_conditions"],
-            exit_conditions=profile["exit_conditions"],
-            indicators=profile["indicators"],
-            confidence=float(profile["confidence"]),
-        ),
+    fallback_conditions = StrategyConditionsPayload(
+        entry_conditions=profile["entry_conditions"],
+        exit_conditions=profile["exit_conditions"],
+        indicators=profile["indicators"],
+        confidence=float(profile["confidence"]),
+    )
+    # Automatic mode is a deterministic, cited strategy.  Letting the language model
+    # rewrite its conditions would make the displayed rationale differ from the rule
+    # actually backtested.  Concrete user rules continue through the normal parser.
+    conditions = (
+        fallback_conditions
+        if selection_mode == "automatic"
+        else generate_strategy_conditions(
+            query=query,
+            semantic_slots=dict(slots),
+            fallback=fallback_conditions,
+        )
     )
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
@@ -1684,12 +1697,22 @@ def build_strategy_spec(
         entry_conditions=conditions.entry_conditions,
         exit_conditions=conditions.exit_conditions,
         indicators=conditions.indicators or profile["indicators"],
-        risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
+        risk_constraints={
+            "max_position_pct": 0.1,
+            "stop_loss_pct": 0.08,
+            **(
+                {"rebalance_interval_days": 21}
+                if selection_mode == "automatic"
+                else {}
+            ),
+        },
         assumptions=[
             f"sector filter: {sector}" if sector else "all matching listed common stocks",
             "daily adjusted close data",
             *profile["assumptions"],
         ],
+        source_refs=list(profile.get("source_refs", [])),
+        selection_mode=selection_mode,
         confidence=float(conditions.confidence),
     )
 
@@ -1710,6 +1733,54 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     lowered = query.lower()
     slot_indicator = set(semantic_slots.get("indicator", [])) if semantic_slots else set()
     slot_event = set(semantic_slots.get("event", [])) if semantic_slots else set()
+    if classify_strategy_request(query) == "automatic":
+        return {
+            "strategy_id": "automatic_academic_momentum",
+            "name": "검증 근거 기반 월간 모멘텀·추세",
+            "entry_conditions": [
+                Condition(
+                    left="momentum_12_1",
+                    operator="gt",
+                    right=0,
+                    description="최근 1개월을 제외한 12-1 모멘텀이 양수",
+                ),
+                Condition(
+                    left="sma_50_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="50일 이동평균이 200일 이동평균 이상",
+                ),
+                Condition(
+                    left="realized_volatility_21d",
+                    operator="lte",
+                    right=0.35,
+                    description="최근 21일 연환산 변동성 35% 이하",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="장기 추세 훼손 또는 손절 규칙",
+                )
+            ],
+            "indicators": [
+                "momentum_12_1",
+                "SMA50",
+                "SMA200",
+                "realized_volatility_21d",
+                "rebalance_21d",
+            ],
+            "assumptions": [
+                "12-1 모멘텀은 t-252 가격과 t-21 가격만 사용",
+                "신규 종목 선정은 21거래일마다 수행",
+                "SMA와 변동성은 해당 시점까지 알려진 종가만 사용",
+                "과거 연구와 백테스트는 미래 수익을 보장하지 않음",
+            ],
+            "source_refs": academic_strategy_source_refs(),
+            "confidence": 0.78,
+        }
     if _is_pullback_rsi_volume_query(query):
         return {
             "strategy_id": "pullback_rsi_volume",

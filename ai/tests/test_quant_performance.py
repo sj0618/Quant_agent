@@ -159,6 +159,47 @@ def test_public_performance_source_refs_are_propagated_from_explanations() -> No
         details["benchmark_return"].source_refs
         == metric_explanation("benchmark_return").get("source_refs")
     )
+    assert details["total_return"].unit == "percent"
+
+
+def test_public_performance_includes_beginner_strategy_explanation() -> None:
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.8,
+            max_drawdown=-0.1,
+            win_rate=0.55,
+            total_return=0.12,
+            in_sample_sharpe=0.9,
+            out_sample_sharpe=0.7,
+            degradation=0.1,
+        ),
+        engine_summary={"effective_trade_count": 8},
+    )
+    payload["strategy_a"]["selection_mode"] = "automatic"
+    payload["strategy_a"]["strategy_id"] = "automatic_academic_momentum_a"
+    payload["strategy_a"]["indicators"] = [
+        "momentum_12_1",
+        "SMA50",
+        "SMA200",
+        "realized_volatility_21d",
+    ]
+
+    performance = build_public_backtest_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    assert performance.strategy_explanation is not None
+    assert performance.strategy_explanation.selection_mode == "automatic"
+    assert "자동" in performance.strategy_explanation.why_selected
+    assert "미래 수익을 보장하지 않습니다" in performance.strategy_explanation.caution
+    assert any(
+        item.key == "momentum_12_1"
+        and item.source_refs
+        for item in performance.strategy_explanation.indicators
+    )
 
 
 def test_public_performance_reliability_boundary_cases() -> None:

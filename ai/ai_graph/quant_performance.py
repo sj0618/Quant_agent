@@ -17,6 +17,7 @@ from ai_graph.nodes.backtest import (
     _summary_float_default,
 )
 from ai_graph.quant_explanations import metric_explanation
+from ai_graph.quant_strategy import build_strategy_explanation
 from ai_graph.schemas import (
     BacktestBenchmark,
     BacktestPerformance,
@@ -79,6 +80,7 @@ def build_public_backtest_performance(
             reliability=reliability,
             benchmark=benchmark,
         ),
+        strategy_explanation=build_strategy_explanation(result.strategy_a),
     )
 
 

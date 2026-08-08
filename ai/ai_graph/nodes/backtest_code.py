@@ -178,7 +178,11 @@ def _normalized_parameter_sets(
 ) -> list[CandidateParameters]:
     compiled = compile_conditions(strategy.entry_conditions) is not None
     defaults = _default_parameter_sets(strategy, plan, max_positions)
-    pool = [*proposed, *defaults]
+    # Automatic mode has a public, cited behavior contract.  Model-proposed generic
+    # profiles could win the objective score while the UI still explained 12-1 momentum;
+    # compare threshold variants of the cited profile only so execution and explanation
+    # remain the same strategy.
+    pool = defaults if strategy.selection_mode == "automatic" else [*proposed, *defaults]
     normalized: list[CandidateParameters] = []
     seen: set[str] = set()
     for index, item in enumerate(pool):
@@ -216,11 +220,12 @@ def _default_parameter_sets(
 ) -> list[CandidateParameters]:
     profiles = _candidate_profiles(plan)
     compiled = compile_conditions(strategy.entry_conditions) is not None
-    selected_profiles = [
-        "compiled_conditions" if compiled else profiles[0],
-        profiles[0] if not compiled or profiles[0] != "compiled_conditions" else profiles[1],
-        profiles[1] if not compiled else profiles[2],
-    ]
+    if plan.entry_feature == "academic_momentum_trend":
+        selected_profiles = ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES
+    elif compiled:
+        selected_profiles = ["compiled_conditions", profiles[0], profiles[1]]
+    else:
+        selected_profiles = profiles[:MIN_GENERATED_CANDIDATES]
     stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct))
     take_profit = float(strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct))
     return [
@@ -615,6 +620,18 @@ def build_code_generation_plan(
 ) -> CodeGenerationPlan:
     strategy_id = strategy.strategy_id
     requested_text = " ".join(feature_mapping.requested_features + strategy.indicators).lower()
+    if strategy.selection_mode == "automatic" or strategy_id.startswith(
+        "automatic_academic_momentum"
+    ):
+        return CodeGenerationPlan(
+            strategy_id=strategy_id,
+            entry_feature="academic_momentum_trend",
+            exit_feature="monthly_trend_or_stop",
+            proxy_feature="past_only_price_factors",
+            lookbacks=[252],
+            thresholds=[0.0, 0.05, 0.1],
+            expected_trade_frequency="monthly",
+        )
     if "rsi" in requested_text:
         return CodeGenerationPlan(
             strategy_id=strategy_id,
@@ -866,6 +883,8 @@ def _generated_strategy_candidates(
 
 
 def _candidate_profiles(plan: CodeGenerationPlan) -> list[StructuredProfile]:
+    if plan.entry_feature == "academic_momentum_trend":
+        return ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES
     base = [
         "long_regime_momentum",
         "quality_trend_hold",
@@ -1001,7 +1020,44 @@ def _render_adaptive_signal_code(
                 volume_ratio = volume / avg_volume if avg_volume > 0 else 1
                 trailing_stop = state["peak"] > 0 and close < state["peak"] * 0.93
                 score = rolling_sharpe + medium_return * 4 + long_return * 2 - volatility
-                if profile == "long_regime_momentum":
+                if profile == "academic_momentum_trend" and len(closes) >= 252:
+                    momentum_12_1 = closes[-21] / closes[-252] - 1
+                    sma_50 = (sum(closes[-49:]) + close) / 50
+                    sma_200 = (sum(closes[-199:]) + close) / 200
+                    volatility_closes = closes[-21:] + [close]
+                    daily_returns = [
+                        after / before - 1
+                        for before, after in zip(
+                            volatility_closes[:-1], volatility_closes[1:]
+                        )
+                        if before
+                    ]
+                    daily_mean = sum(daily_returns) / len(daily_returns)
+                    daily_variance = sum(
+                        (item - daily_mean) ** 2 for item in daily_returns
+                    ) / len(daily_returns)
+                    realized_volatility_21d = daily_variance ** 0.5 * (252 ** 0.5)
+                    rebalance_eligible = (len(closes) - 252) % 21 == 0
+                    score = (
+                        momentum_12_1 * 4
+                        + (sma_50 / sma_200 - 1) * 2
+                        - realized_volatility_21d
+                    )
+                    buy = (
+                        rebalance_eligible
+                        and momentum_12_1 > threshold
+                        and close >= sma_200
+                        and sma_50 >= sma_200
+                        and realized_volatility_21d <= 0.35
+                    )
+                    sell = state["in_position"] and (
+                        close < sma_200 * 0.95
+                        or (
+                            rebalance_eligible
+                            and (momentum_12_1 <= 0 or sma_50 < sma_200)
+                        )
+                    )
+                elif profile == "long_regime_momentum":
                     score = rolling_sharpe + long_return * 3 + medium_return * 2 - volatility
                     buy = close >= long_average and medium_average >= long_average * 0.98 and long_return > 0
                     sell = state["in_position"] and (close < long_average * 0.97 or long_drawdown > 0.18)
