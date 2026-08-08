@@ -131,6 +131,7 @@ export interface AIStrategySpec {
   risk_constraints: Record<string, number | string | boolean>;
   assumptions: string[];
   source_refs: string[];
+  selection_mode?: "standard" | "automatic" | "user_defined";
   confidence: number;
 }
 
@@ -194,11 +195,72 @@ export interface AIBacktestEquityPoint {
   cumulative_return: number;
 }
 
+export interface AIBacktestReliability {
+  source: "fixture" | "postgres" | "unknown";
+  status: "sufficient" | "limited" | "insufficient";
+  row_count: number;
+  ticker_count: number;
+  trading_days: number;
+  history_start: string | null;
+  history_end: string | null;
+  trade_count: number;
+  reasons: string[];
+  warnings: string[];
+}
+
+export interface AIBacktestBenchmark {
+  label: string;
+  method: string;
+  warning: string | null;
+  total_return: number | null;
+  cumulative_curve: AIBacktestEquityPoint[];
+  is_available: boolean;
+  unavailable_reason: string | null;
+}
+
+export interface AIBacktestMetricDetail {
+  key: string;
+  label: string;
+  value: number | null;
+  unit: "percent" | "ratio" | string;
+  is_available: boolean;
+  unavailable_reason: string | null;
+  plain_explanation: string;
+  why_used: string;
+  caution: string;
+  source_refs: string[];
+}
+
+export interface AIIndicatorExplanation {
+  key: string;
+  label: string;
+  plain_explanation: string;
+  why_used: string;
+  caution: string;
+  source_refs: string[];
+}
+
+export interface AIStrategyExplanation {
+  selection_mode: "standard" | "automatic" | "user_defined";
+  title: string;
+  summary: string;
+  why_selected: string;
+  rebalance_explanation: string | null;
+  caution: string;
+  indicators: AIIndicatorExplanation[];
+  source_refs: string[];
+}
+
 export interface AIBacktestPerformance {
   selected_candidate_id: string;
   metrics: AIBacktestMetrics;
   equity_curve: AIBacktestEquityPoint[];
   engine_summary?: Record<string, unknown>;
+  reliability?: AIBacktestReliability | null;
+  data_quality?: string[];
+  benchmark?: AIBacktestBenchmark | null;
+  metric_details?: AIBacktestMetricDetail[];
+  strategy_explanation?: AIStrategyExplanation | null;
 }
 
 export interface AIRecommendationGate {
@@ -281,13 +343,17 @@ export interface BacktestMetric {
   delta?: string;
   tone: Tone;
   caption: string;
+  plainExplanation?: string;
+  whyUsed?: string;
+  caution?: string;
+  sourceRefs?: string[];
 }
 
 export interface EquityPoint {
   date: string;
   strategy: number;
-  original: number;
-  benchmark: number;
+  original?: number;
+  benchmark?: number;
 }
 
 export interface PerformanceComparisonRow {
@@ -314,6 +380,11 @@ export interface PerformanceSummary {
   equityCurve: EquityPoint[];
   comparison: PerformanceComparisonRow[];
   macroEvents: MacroEvent[];
+  reliability?: AIBacktestReliability | null;
+  dataQuality?: string[];
+  benchmark?: AIBacktestBenchmark;
+  metricDetails?: AIBacktestMetricDetail[];
+  strategyExplanation?: AIStrategyExplanation | null;
   disclaimer: string;
 }
 

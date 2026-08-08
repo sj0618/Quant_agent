@@ -17,6 +17,7 @@ from ai_graph.nodes.condition_compiler import (
     derived_series_spec,
     percent_scale,
 )
+from ai_graph.quant_strategy import compute_academic_factor_arrays
 from ai_graph.schemas import CandidateParameters, Condition, ConditionOperator, StrategyIR
 
 
@@ -40,7 +41,12 @@ ROLLING_SHARPE = 14
 VOLUME_RATIO = 15
 RETURN_TO_VOLATILITY = 16
 PULLBACK = 17
-FEATURE_COLUMN_COUNT = 18
+MOMENTUM_12_1 = 18
+SMA_50 = 19
+SMA_200 = 20
+REALIZED_VOLATILITY_21D = 21
+REBALANCE_ELIGIBLE = 22
+FEATURE_COLUMN_COUNT = 23
 
 
 @dataclass(frozen=True)
@@ -158,6 +164,7 @@ class PreparedFeatureStore:
         for indices in self.indices_by_ticker.values():
             closes = self.close[indices]
             volumes = self.volume[indices]
+            academic_factors = compute_academic_factor_arrays(closes)
             close_prefix = np.concatenate(([0.0], np.cumsum(closes)))
             volume_prefix = np.concatenate(([0.0], np.cumsum(volumes)))
             returns = np.zeros(len(indices), dtype=np.float64)
@@ -255,6 +262,11 @@ class PreparedFeatureStore:
                     volume_ratio,
                     return_to_volatility,
                     pullback,
+                    academic_factors.momentum_12_1[local_index],
+                    academic_factors.sma_50[local_index],
+                    academic_factors.sma_200[local_index],
+                    academic_factors.realized_volatility_21d[local_index],
+                    float(academic_factors.rebalance_eligible[local_index]),
                 )
         matrix.setflags(write=False)
         self._lookback_cache[lookback] = matrix
@@ -293,6 +305,11 @@ class PreparedFeatureStore:
                     volume_ratio = row[VOLUME_RATIO]
                     return_to_volatility = row[RETURN_TO_VOLATILITY]
                     pullback = row[PULLBACK]
+                    momentum_12_1 = row[MOMENTUM_12_1]
+                    sma_50 = row[SMA_50]
+                    sma_200 = row[SMA_200]
+                    realized_volatility_21d = row[REALIZED_VOLATILITY_21D]
+                    rebalance_eligible = bool(row[REBALANCE_ELIGIBLE])
                     rsi = self.rsi[index]
                     in_position = bool(state[0])
                     score = (
@@ -301,7 +318,40 @@ class PreparedFeatureStore:
                         + long_return * 2.0
                         - volatility
                     )
-                    if profile == "long_regime_momentum":
+                    if profile == "academic_momentum_trend":
+                        factors_available = all(
+                            isfinite(value)
+                            for value in (
+                                momentum_12_1,
+                                sma_50,
+                                sma_200,
+                                realized_volatility_21d,
+                            )
+                        )
+                        if factors_available:
+                            score = (
+                                momentum_12_1 * 4.0
+                                + (sma_50 / sma_200 - 1.0) * 2.0
+                                - realized_volatility_21d
+                            )
+                            buy = (
+                                rebalance_eligible
+                                and momentum_12_1 > threshold
+                                and close >= sma_200
+                                and sma_50 >= sma_200
+                                and realized_volatility_21d <= 0.35
+                            )
+                            sell = in_position and (
+                                close < sma_200 * 0.95
+                                or (
+                                    rebalance_eligible
+                                    and (
+                                        momentum_12_1 <= 0.0
+                                        or sma_50 < sma_200
+                                    )
+                                )
+                            )
+                    elif profile == "long_regime_momentum":
                         score = (
                             rolling_sharpe
                             + long_return * 3.0

@@ -114,7 +114,11 @@ export function PerformanceChart({
   const scaleX = (index: number) => PAD_LEFT + index * xStep;
 
   const buildPolyline = (key: EquitySeriesKey) =>
-    points.map((point, index) => `${scaleX(index)},${scaleY(Number(point[key]))}`).join(" ");
+    points
+      .map((point, index) => ({ index, value: Number(point[key]) }))
+      .filter((point) => Number.isFinite(point.value))
+      .map((point) => `${scaleX(point.index)},${scaleY(point.value)}`)
+      .join(" ");
 
   const yTicks = buildYTicks(domain);
   const zeroInRange = domain.min <= 0 && domain.max >= 0;

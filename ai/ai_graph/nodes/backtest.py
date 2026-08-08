@@ -5,6 +5,7 @@ import json
 import os
 import pickle
 import sys
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
@@ -44,6 +45,12 @@ DEFAULT_FIXTURE_VOLUME = 1_000_000.0
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 METRIC_ROUND_DIGITS = 6
 MIN_RETURNS_FOR_SPLIT = 4
+BENCHMARK_LABEL = "동일가중 매수-보유 프록시"
+BENCHMARK_METHOD = "fixed_universe_equal_weight_buy_and_hold"
+BENCHMARK_WARNING = (
+    "이 벤치마크는 분석 대상 유니버스의 초기 구성으로 고정해 계산합니다. "
+    "구성 종목의 상폐/신규 편입 반영이 늦어져 생존편향 경고가 남습니다."
+)
 # Candidates are selected using only the first 70% of the history.  The final 30%
 # is deliberately kept untouched until after selection, so it is a real hold-out.
 BACKTEST_SPLIT_FRACTION = 0.7
@@ -2031,25 +2038,73 @@ def _profit_factor(engine_summary: Mapping[str, Any]) -> float:
     return min(3.0, win_rate / max(1.0 - win_rate, 0.01))
 
 
-def _benchmark_return(price_rows: Sequence[Mapping[str, Any]]) -> float:
-    if len(price_rows) < 2:
-        return 0.0
-    rows_by_ticker: dict[str, list[Mapping[str, Any]]] = {}
+def _equal_weight_benchmark_curve(
+    price_rows: Sequence[Mapping[str, Any]]
+) -> tuple[list[BacktestEquityPoint], float | None]:
+    if not price_rows:
+        return [], None
+
+    rows_by_ticker: dict[str, dict[str, float]] = defaultdict(dict)
     for row in price_rows:
         ticker = str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
-        rows_by_ticker.setdefault(ticker, []).append(row)
-    returns: list[float] = []
-    for ticker, rows in rows_by_ticker.items():
-        sorted_rows = sorted(rows, key=lambda item: str(item["date"]))
-        if len(sorted_rows) < 2:
+        date = str(row.get("date"))
+        close = _finite_float(row.get("close"), f"{ticker}_close")
+        if close > 0:
+            rows_by_ticker[ticker][date] = close
+
+    if not rows_by_ticker:
+        return [], None
+
+    dates = sorted({str(row.get("date")) for row in price_rows})
+    if not dates:
+        return [], None
+
+    first_date = dates[0]
+    universe = tuple(
+        sorted(ticker for ticker, rows in rows_by_ticker.items() if first_date in rows)
+    )
+    if not universe:
+        return [], None
+    universe = tuple(
+        ticker for ticker in universe if rows_by_ticker[ticker][first_date] > 0.0
+    )
+    if not universe:
+        return [], None
+
+    initial_prices = {ticker: rows_by_ticker[ticker][first_date] for ticker in universe}
+    latest_prices = dict(initial_prices)
+    curve: list[BacktestEquityPoint] = [
+        BacktestEquityPoint(date=first_date, cumulative_return=0.0)
+    ]
+    for date in dates[1:]:
+        values: list[float] = []
+        for ticker in universe:
+            current = rows_by_ticker[ticker].get(date, latest_prices[ticker])
+            latest_prices[ticker] = current
+            initial_price = initial_prices[ticker]
+            if initial_price <= 0:
+                continue
+            values.append(current / initial_price)
+        if not values:
             continue
-        first = _finite_float(sorted_rows[0]["close"], f"{ticker}_benchmark_first_close")
-        last = _finite_float(sorted_rows[-1]["close"], f"{ticker}_benchmark_last_close")
-        if first:
-            returns.append(last / first - 1)
-    if not returns:
+        cumulative_return = sum(values) / len(universe)
+        curve.append(
+            BacktestEquityPoint(
+                date=date,
+                cumulative_return=round(cumulative_return - 1.0, METRIC_ROUND_DIGITS),
+            )
+        )
+
+    if not curve:
+        return [], None
+    return curve, round(curve[-1].cumulative_return, METRIC_ROUND_DIGITS)
+
+
+def _benchmark_return(price_rows: Sequence[Mapping[str, Any]]) -> float:
+    _, total_return = _equal_weight_benchmark_curve(price_rows)
+    if total_return is None:
         return 0.0
-    return sum(returns) / len(returns)
+    return total_return
 
 
 def _backtest_payload(
@@ -2064,11 +2119,8 @@ def _backtest_payload(
         "first_date": str(rows[0].get("date")) if rows else None,
         "last_date": str(rows[-1].get("date")) if rows else None,
         "benchmark_return": round(_benchmark_return(rows), METRIC_ROUND_DIGITS),
-        "benchmark_method": "static_universe_equal_weight_buy_and_hold",
-        "benchmark_warning": (
-            "This is not the KOSPI200 index. The static universe can contain "
-            "survivorship bias; benchmark comparison is informational only."
-        ),
+        "benchmark_method": BENCHMARK_METHOD,
+        "benchmark_warning": BENCHMARK_WARNING,
     }
     fingerprint = repr(sorted(payload.items())).encode("utf-8")
     return {**payload, "payload_hash": sha256(fingerprint).hexdigest()[:16]}

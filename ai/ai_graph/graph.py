@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import math
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from ai_graph.audit import (
@@ -30,7 +31,29 @@ from ai_graph.llm.role_calls import (
     generate_strategy_conditions,
     resolve_strategy_intent,
 )
-from ai_graph.nodes.backtest import _public_engine_summary, backtest_node
+from ai_graph.nodes.backtest import (
+    BENCHMARK_LABEL,
+    BENCHMARK_METHOD,
+    BENCHMARK_WARNING,
+    MAX_OBJECTIVE_DRAWDOWN,
+    MIN_OBJECTIVE_SHARPE,
+    MIN_OBJECTIVE_TRADES,
+    METRIC_ROUND_DIGITS,
+    _annualized_return,
+    _calmar_ratio,
+    _equal_weight_benchmark_curve,
+    _is_numeric_metric,
+    _price_rows,
+    _profit_factor,
+    _public_engine_summary,
+    _summary_float_default,
+    backtest_node,
+)
+from ai_graph.quant_explanations import metric_explanation
+from ai_graph.quant_strategy import (
+    academic_strategy_source_refs,
+    classify_strategy_request,
+)
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
@@ -38,8 +61,13 @@ from ai_graph.nodes.signal import signal_node
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
+    BacktestBenchmark,
     BacktestPerformance,
+    BacktestReliability,
+    BacktestEquityPoint,
     CandidateBacktestResult,
+    BacktestMetrics,
+    PublicMetricDetail,
     ClarificationOption,
     Condition,
     DataRequirement,
@@ -71,6 +99,31 @@ NODE_SEQUENCE = (
     "Report",
 )
 _NODE_ERROR_RECORDED: ContextVar[bool] = ContextVar("node_error_recorded", default=False)
+_PUBLIC_METRIC_UNAVAILABLE_REASON = "metric unavailable in this analysis window"
+_BENCHMARK_UNAVAILABLE_REASON = (
+    "benchmark curve requires at least one non-empty trading date and valid closes"
+)
+
+_METRIC_DETAIL_KEYS = (
+    "total_return",
+    "cagr",
+    "annualized_volatility",
+    "sharpe_ratio",
+    "sortino_ratio",
+    "max_drawdown",
+    "calmar_ratio",
+    "win_rate",
+    "profit_factor",
+    "benchmark_return",
+    "excess_return",
+    "in_sample_sharpe",
+    "out_sample_sharpe",
+    "degradation",
+)
+_RELIABILITY_WARN_UNTIL_DAYS = 30
+_RELIABILITY_SUFFICIENT_DAYS = 90
+_RELIABILITY_MIN_TICKERS = 2
+_UNAVAILABLE_METRIC_REASON = "benchmark cannot be calculated from current data"
 
 
 class FallbackGraph:
@@ -742,7 +795,11 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             ],
             "candidate_cards": cards,
             "report": report,
-            "performance": build_public_backtest_performance(state.get("backtest")),
+            "performance": build_public_backtest_performance(
+                state.get("backtest"),
+                price_rows=state.get("price_rows"),
+                pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
+            ),
             "recommendation_gate": gate,
         }
     elif state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
@@ -830,8 +887,16 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
     pipeline = data.get("pipeline_data_source") or {}
     relaxation = pipeline.get("screening_relaxation") or {}
     availability = data.get("data_availability") or {}
-    performance = build_public_backtest_performance(state.get("backtest")) or {}
-    metrics = performance.get("metrics") if isinstance(performance, dict) else None
+    performance = (
+        build_public_backtest_performance(
+            state.get("backtest"),
+            price_rows=state.get("price_rows"),
+            pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
+        )
+        or {}
+    )
+    payload = performance.model_dump() if isinstance(performance, BacktestPerformance) else performance
+    metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
 
     try:
         memory.record(
@@ -1601,18 +1666,27 @@ def build_strategy_spec(
     variant: str,
     semantic_slots: Mapping[str, Any] | None = None,
 ) -> StrategySpec:
+    selection_mode = classify_strategy_request(query)
     profile = _strategy_profile(query, semantic_slots=semantic_slots)
     slots = semantic_slots or {}
     sector = slots.get("sector")
-    conditions = generate_strategy_conditions(
-        query=query,
-        semantic_slots=dict(slots),
-        fallback=StrategyConditionsPayload(
-            entry_conditions=profile["entry_conditions"],
-            exit_conditions=profile["exit_conditions"],
-            indicators=profile["indicators"],
-            confidence=float(profile["confidence"]),
-        ),
+    fallback_conditions = StrategyConditionsPayload(
+        entry_conditions=profile["entry_conditions"],
+        exit_conditions=profile["exit_conditions"],
+        indicators=profile["indicators"],
+        confidence=float(profile["confidence"]),
+    )
+    # Automatic mode is a deterministic, cited strategy.  Letting the language model
+    # rewrite its conditions would make the displayed rationale differ from the rule
+    # actually backtested.  Concrete user rules continue through the normal parser.
+    conditions = (
+        fallback_conditions
+        if selection_mode == "automatic"
+        else generate_strategy_conditions(
+            query=query,
+            semantic_slots=dict(slots),
+            fallback=fallback_conditions,
+        )
     )
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
@@ -1623,12 +1697,22 @@ def build_strategy_spec(
         entry_conditions=conditions.entry_conditions,
         exit_conditions=conditions.exit_conditions,
         indicators=conditions.indicators or profile["indicators"],
-        risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
+        risk_constraints={
+            "max_position_pct": 0.1,
+            "stop_loss_pct": 0.08,
+            **(
+                {"rebalance_interval_days": 21}
+                if selection_mode == "automatic"
+                else {}
+            ),
+        },
         assumptions=[
             f"sector filter: {sector}" if sector else "all matching listed common stocks",
             "daily adjusted close data",
             *profile["assumptions"],
         ],
+        source_refs=list(profile.get("source_refs", [])),
+        selection_mode=selection_mode,
         confidence=float(conditions.confidence),
     )
 
@@ -1649,6 +1733,54 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
     lowered = query.lower()
     slot_indicator = set(semantic_slots.get("indicator", [])) if semantic_slots else set()
     slot_event = set(semantic_slots.get("event", [])) if semantic_slots else set()
+    if classify_strategy_request(query) == "automatic":
+        return {
+            "strategy_id": "automatic_academic_momentum",
+            "name": "검증 근거 기반 월간 모멘텀·추세",
+            "entry_conditions": [
+                Condition(
+                    left="momentum_12_1",
+                    operator="gt",
+                    right=0,
+                    description="최근 1개월을 제외한 12-1 모멘텀이 양수",
+                ),
+                Condition(
+                    left="sma_50_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="50일 이동평균이 200일 이동평균 이상",
+                ),
+                Condition(
+                    left="realized_volatility_21d",
+                    operator="lte",
+                    right=0.35,
+                    description="최근 21일 연환산 변동성 35% 이하",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="장기 추세 훼손 또는 손절 규칙",
+                )
+            ],
+            "indicators": [
+                "momentum_12_1",
+                "SMA50",
+                "SMA200",
+                "realized_volatility_21d",
+                "rebalance_21d",
+            ],
+            "assumptions": [
+                "12-1 모멘텀은 t-252 가격과 t-21 가격만 사용",
+                "신규 종목 선정은 21거래일마다 수행",
+                "SMA와 변동성은 해당 시점까지 알려진 종가만 사용",
+                "과거 연구와 백테스트는 미래 수익을 보장하지 않음",
+            ],
+            "source_refs": academic_strategy_source_refs(),
+            "confidence": 0.78,
+        }
     if _is_pullback_rsi_volume_query(query):
         return {
             "strategy_id": "pullback_rsi_volume",
@@ -2311,3 +2443,337 @@ def _route_after_data(state: QuantAgentState) -> str:
 
 def _trace_id(value: str) -> str:
     return sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _pipeline_source(
+    pipeline_data_source: Mapping[str, Any] | None,
+) -> Literal["fixture", "postgres", "unknown"]:
+    if not isinstance(pipeline_data_source, Mapping):
+        return "unknown"
+    source = pipeline_data_source.get("source")
+    if source in {"fixture", "postgres"}:
+        return source
+    return "unknown"
+
+
+def build_public_backtest_performance(
+    backtest: Mapping[str, Any] | None,
+    *,
+    price_rows: Sequence[Mapping[str, Any]] | None = None,
+    pipeline_data_source: Mapping[str, Any] | None = None,
+) -> BacktestPerformance | None:
+    if not backtest:
+        return None
+
+    result = CandidateBacktestResult.model_validate(backtest)
+    if result.selected_candidate.metrics is None:
+        return None
+
+    normalized_rows = _price_rows(price_rows)
+    source = _pipeline_source(pipeline_data_source)
+    reliability = _build_backtest_reliability(result, normalized_rows, source=source)
+    benchmark = _build_public_benchmark(normalized_rows)
+    return BacktestPerformance(
+        selected_candidate_id=result.selected_candidate.candidate_id,
+        metrics=result.selected_candidate.metrics,
+        equity_curve=result.equity_curve,
+        engine_summary=_public_engine_summary(result.engine_summary),
+        reliability=reliability,
+        data_quality=_build_data_quality(reliability),
+        benchmark=benchmark,
+        metric_details=_build_public_metric_details(
+            result,
+            price_rows=normalized_rows,
+            benchmark=benchmark,
+        ),
+    )
+
+
+def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
+    backtest_payload = state.get("backtest")
+    if backtest_payload is None:
+        return None
+    try:
+        backtest = CandidateBacktestResult.model_validate(backtest_payload)
+    except Exception:
+        return RecommendationGate(
+            validated=False,
+            reason="백테스트 결과를 해석할 수 없어 추천 규칙 통과 여부를 판단할 수 없습니다.",
+        )
+
+    selected = backtest.selected_candidate
+    if selected.metrics is None:
+        return RecommendationGate(
+            validated=False,
+            reason="검증 대상 백테스트 지표가 없어 추천 규칙 통과 여부를 판단할 수 없습니다.",
+        )
+
+    reasons = _objective_gate_reasons(selected.metrics, backtest.engine_summary)
+    validated = not reasons
+    reason = (
+        "objective gate를 모두 통과해 오늘의 추천을 유지합니다."
+        if validated
+        else "objective 조건 미충족: " + ", ".join(reasons)
+    )
+    return RecommendationGate(validated=validated, reason=reason)
+
+
+def _objective_gate_reasons(
+    metrics: BacktestMetrics,
+    engine_summary: Mapping[str, Any],
+) -> list[str]:
+    trade_count = _summary_float_default(engine_summary, "effective_trade_count", 0.0)
+    reasons: list[str] = []
+    if trade_count < MIN_OBJECTIVE_TRADES:
+        reasons.append(
+            f"거래 횟수 {trade_count:.0f}회로 MIN_OBJECTIVE_TRADES={MIN_OBJECTIVE_TRADES} 조건 미달"
+        )
+    if metrics.out_sample_sharpe < MIN_OBJECTIVE_SHARPE:
+        reasons.append(
+            f"보유 구간 외부 샤프비율 {metrics.out_sample_sharpe:.4f} < {MIN_OBJECTIVE_SHARPE:.2f}"
+        )
+    if metrics.max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
+        reasons.append(
+            f"최대 낙폭 {metrics.max_drawdown:.4f} < {MAX_OBJECTIVE_DRAWDOWN:.2f} (리스크 허용치 미달)"
+        )
+    return reasons
+
+
+def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> None:
+    """Note how this run turned out, for the next analysis of the same strategy."""
+
+    memory = AnalysisMemory.from_env()
+    if not memory.enabled:
+        return
+    strategy = state.get("strategy_spec") or {}
+    strategy_id = str(strategy.get("strategy_id") or "")
+    if not strategy_id:
+        return
+
+    data = state.get("data") or {}
+    pipeline = data.get("pipeline_data_source") or {}
+    relaxation = pipeline.get("screening_relaxation") or {}
+    availability = data.get("data_availability") or {}
+    performance = (
+        build_public_backtest_performance(
+            state.get("backtest"),
+            price_rows=state.get("price_rows"),
+            pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
+        )
+        or {}
+    )
+    payload = performance.model_dump() if isinstance(performance, BacktestPerformance) else performance
+    metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
+
+    try:
+        memory.record(
+            strategy_id,
+            query=str(state.get("user_query") or ""),
+            outcome=status.value,
+            candidate_count=len(data.get("screening_candidates") or []),
+            metrics=metrics or {},
+            relaxation_rounds=int(relaxation.get("relaxation_rounds") or 0),
+            unmet_requirements=[
+                str(item.get("label"))
+                for item in availability.get("unsupported_capabilities") or []
+            ],
+            note=(state.get("strategy_revision") or {}).get("rationale"),
+        )
+    except Exception:
+        # Memory is an optimisation; never let it take down a completed analysis.
+        _logger.warning("could not record analysis memory", exc_info=True)
+
+
+def _build_backtest_reliability(
+    result: CandidateBacktestResult,
+    price_rows: Sequence[Mapping[str, Any]],
+    *,
+    source: Literal["fixture", "postgres", "unknown"],
+) -> BacktestReliability:
+    row_count = len(price_rows)
+    dates = sorted({str(row.get("date")) for row in price_rows if row.get("date") is not None})
+    trading_days = len(dates)
+    ticker_count = len(
+        {
+            str(row.get("ticker") or "005930").zfill(6)
+            for row in price_rows
+            if row.get("ticker") is not None
+        }
+    )
+    trade_count = int(
+        _summary_float_default(result.engine_summary, "effective_trade_count", 0.0)
+    )
+    reasons: list[str] = []
+    warnings: list[str] = []
+
+    if row_count == 0:
+        reasons.append("가격 행이 없습니다.")
+    if trading_days < _RELIABILITY_WARN_UNTIL_DAYS:
+        reasons.append("거래일 수가 너무 적어 통계 신뢰도가 낮습니다.")
+    elif trading_days < _RELIABILITY_SUFFICIENT_DAYS:
+        warnings.append("거래일 수가 90일 미만으로 품질이 제한적입니다.")
+    if ticker_count < _RELIABILITY_MIN_TICKERS:
+        reasons.append("티커 수가 2개 미만입니다.")
+    if source == "fixture" and row_count <= 4 and ticker_count == 1:
+        reasons.append("기본 fixture 샘플(4개 행/1종목)에서는 안정적 통계 산출이 제한됩니다.")
+    if trade_count < MIN_OBJECTIVE_TRADES:
+        warnings.append(
+            f"실제 거래 횟수 {trade_count}회로 MIN_OBJECTIVE_TRADES={MIN_OBJECTIVE_TRADES} 미만입니다."
+        )
+
+    if reasons:
+        status = "insufficient"
+    elif warnings:
+        status = "limited"
+    else:
+        status = "sufficient"
+
+    return BacktestReliability(
+        source=source,
+        status=status,
+        row_count=row_count,
+        ticker_count=ticker_count,
+        trading_days=trading_days,
+        history_start=dates[0] if dates else None,
+        history_end=dates[-1] if dates else None,
+        trade_count=trade_count,
+        reasons=reasons,
+        warnings=warnings,
+    )
+
+
+def _build_data_quality(reliability: BacktestReliability) -> list[str]:
+    quality = [
+        f"source:{reliability.source}",
+        f"rows:{reliability.row_count}",
+        f"tickers:{reliability.ticker_count}",
+        f"trading_days:{reliability.trading_days}",
+        f"trades:{reliability.trade_count}",
+    ]
+    if reliability.status == "insufficient":
+        quality.append("신뢰도: 불충분")
+    elif reliability.status == "limited":
+        quality.append("신뢰도: 제한적")
+    else:
+        quality.append("신뢰도: 충분")
+    return quality
+
+
+def _build_public_benchmark(price_rows: Sequence[Mapping[str, Any]]) -> BacktestBenchmark:
+    curve, total_return = _equal_weight_benchmark_curve(price_rows)
+    if not curve:
+        return BacktestBenchmark(
+            label=BENCHMARK_LABEL,
+            method=BENCHMARK_METHOD,
+            warning=BENCHMARK_WARNING,
+            total_return=None,
+            cumulative_curve=[],
+            is_available=False,
+            unavailable_reason=_BENCHMARK_UNAVAILABLE_REASON,
+        )
+    return BacktestBenchmark(
+        label=BENCHMARK_LABEL,
+        method=BENCHMARK_METHOD,
+        warning=BENCHMARK_WARNING,
+        total_return=total_return,
+        cumulative_curve=curve,
+        is_available=True,
+        unavailable_reason=None,
+    )
+
+
+def _build_public_metric_details(
+    result: CandidateBacktestResult,
+    *,
+    price_rows: Sequence[Mapping[str, Any]],
+    benchmark: BacktestBenchmark,
+) -> list[PublicMetricDetail]:
+    metrics = result.selected_candidate.metrics
+    if metrics is None:
+        return []
+
+    trading_days = len({str(row.get("date")) for row in price_rows if row.get("date") is not None})
+    equity_returns = _equity_returns(result.equity_curve)
+    benchmark_return = benchmark.total_return if benchmark.is_available else None
+    cagr = _annualized_return(metrics.total_return, trading_days=trading_days)
+    calmar = _calmar_ratio(cagr, metrics.max_drawdown)
+
+    values: dict[str, float | None] = {
+        "total_return": metrics.total_return,
+        "cagr": cagr,
+        "annualized_volatility": _annualized_volatility(equity_returns),
+        "sharpe_ratio": metrics.sharpe_ratio,
+        "sortino_ratio": _sortino_ratio(cagr, equity_returns),
+        "max_drawdown": metrics.max_drawdown,
+        "calmar_ratio": calmar,
+        "win_rate": metrics.win_rate,
+        "profit_factor": _profit_factor(result.engine_summary),
+        "benchmark_return": benchmark_return,
+        "excess_return": (
+            metrics.total_return - benchmark_return if _is_numeric_metric(benchmark_return) else None
+        ),
+        "in_sample_sharpe": metrics.in_sample_sharpe,
+        "out_sample_sharpe": metrics.out_sample_sharpe,
+        "degradation": metrics.degradation,
+    }
+
+    return [_metric_detail(key, values.get(key)) for key in _METRIC_DETAIL_KEYS]
+
+
+def _metric_detail(key: str, value: float | None) -> PublicMetricDetail:
+    explanation = metric_explanation(key)
+    is_available = _is_numeric_metric(value)
+    return PublicMetricDetail(
+        key=key,
+        label=explanation["label"],
+        value=round(float(value), METRIC_ROUND_DIGITS) if is_available else None,
+        unit=explanation["unit"],
+        is_available=is_available,
+        unavailable_reason=None if is_available else _UNAVAILABLE_METRIC_REASON,
+        plain_explanation=explanation["plain_explanation"],
+        why_used=explanation["why_used"],
+        caution=explanation["caution"],
+    )
+
+
+def _equity_returns(equity_curve: Sequence[BacktestEquityPoint]) -> list[float]:
+    if len(equity_curve) < 2:
+        return []
+    returns: list[float] = []
+    for previous, current in zip(equity_curve, equity_curve[1:]):
+        previous_value = previous.cumulative_return + 1.0
+        current_value = current.cumulative_return + 1.0
+        if previous_value == 0.0:
+            return []
+        returns.append(current_value / previous_value - 1.0)
+    return returns
+
+
+def _annualized_volatility(returns: Sequence[float]) -> float | None:
+    if len(returns) < 2:
+        return None
+    mean_return = sum(returns) / len(returns)
+    variance = sum((value - mean_return) ** 2 for value in returns) / (len(returns) - 1)
+    if variance <= 0.0:
+        return 0.0
+    return math.sqrt(variance) * math.sqrt(252.0)
+
+
+def _sortino_ratio(total_return: float, returns: Sequence[float]) -> float | None:
+    if len(returns) < 2:
+        return None
+    downside = [value for value in returns if value < 0.0]
+    if not downside:
+        return None
+    downside_mean = sum(downside) / len(downside)
+    downside_variance = sum((value - downside_mean) ** 2 for value in downside) / len(downside)
+    if downside_variance <= 0.0:
+        return None
+    downside_std = math.sqrt(downside_variance) * math.sqrt(252.0)
+    if downside_std == 0.0:
+        return None
+    return total_return / downside_std
+
+
+# Public performance helpers are sourced from quant_performance for a stable behavior contract.
+from ai_graph.quant_performance import build_public_backtest_performance as build_public_backtest_performance  # noqa: E402, F811
