@@ -10,8 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 SCHEMA_VERSION = "ai-mvp.v1"
 
 
-
-
 SemanticParseStatus = Literal["ready", "needs_clarification", "failed"]
 SourceType = Literal["internal_db", "krx", "dart", "aoai_web_search", "analyst_evidence", "none"]
 FreshnessStatus = Literal["fresh", "stale", "unknown", "not_time_sensitive"]
@@ -101,7 +99,9 @@ class DataRequirement(BaseModel):
         "analyst_evidence",
     ]
     required: bool = True
-    availability: Literal["available", "derivable", "partial", "unavailable", "outside_owner", "not_required"]
+    availability: Literal[
+        "available", "derivable", "partial", "unavailable", "outside_owner", "not_required"
+    ]
     owner: Literal["ai_graph", "data_source_config", "product_data_gap", "outside_owner", "unknown"]
     preferred_source: SourceType
     fallback_sources: list[SourceType] = Field(default_factory=list)
@@ -139,7 +139,9 @@ class FailureDiagnostic(BaseModel):
     category: FailureCategory
     subcause: FailureSubcause
     failure_stage: str = Field(min_length=1)
-    owner: Literal["ai_graph", "data_source_config", "fe_state", "outside_owner", "product_data_gap", "unknown"]
+    owner: Literal[
+        "ai_graph", "data_source_config", "fe_state", "outside_owner", "product_data_gap", "unknown"
+    ]
     retryable: bool
     safe_message: str = Field(min_length=1)
     evidence_refs: list[str] = Field(default_factory=list)
@@ -330,6 +332,20 @@ class BacktestMetrics(BaseModel):
     # result payloads that predate the real hold-out split.
     in_sample_return: float = 0.0
     in_sample_max_drawdown: float = 0.0
+    out_sample_return: float = 0.0
+    in_sample_benchmark_return: float = 0.0
+    out_sample_benchmark_return: float = 0.0
+    in_sample_excess_return: float = 0.0
+    out_sample_excess_return: float = 0.0
+    benchmark_period_count: int = Field(default=0, ge=0)
+    benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    in_sample_benchmark_period_count: int = Field(default=0, ge=0)
+    in_sample_benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    in_sample_benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    out_sample_benchmark_period_count: int = Field(default=0, ge=0)
+    out_sample_benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    out_sample_benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class PublicMetricDetail(BaseModel):
@@ -354,6 +370,9 @@ class PublicIndicatorExplanation(BaseModel):
     label: str = Field(min_length=1)
     plain_explanation: str = Field(min_length=1)
     why_used: str = Field(min_length=1)
+    formula: str | None = None
+    derivation: str | None = None
+    customization: str | None = None
     caution: str = Field(min_length=1)
     source_refs: list[str] = Field(default_factory=list)
 
@@ -368,6 +387,7 @@ class PublicStrategyExplanation(BaseModel):
     rebalance_explanation: str | None = None
     caution: str = Field(min_length=1)
     indicators: list[PublicIndicatorExplanation] = Field(default_factory=list)
+    generated_strategies: list[dict[str, Any]] = Field(default_factory=list)
     source_refs: list[str] = Field(default_factory=list)
 
 
@@ -452,6 +472,9 @@ class CandidateParameters(BaseModel):
     stop_loss_pct: float = Field(gt=0.0, le=1.0)
     take_profit_pct: float = Field(gt=0.0, le=10.0)
     max_positions: int = Field(gt=0, le=1000)
+    rebalance_interval_days: int = Field(default=21, ge=5, le=63)
+    trailing_stop_pct: float = Field(default=0.25, gt=0.0, le=0.75)
+    medium_momentum_weight: float = Field(default=0.60, ge=0.0, le=1.0)
 
 
 class CodeCandidate(BaseModel):
@@ -490,6 +513,7 @@ class CandidateBacktestResult(BaseModel):
     feature_coverage: dict[str, Any] = Field(default_factory=dict)
     fallback_reasons: list[str] = Field(default_factory=list)
     execution_stats: dict[str, Any] = Field(default_factory=dict)
+    generated_strategy_blueprints: list[dict[str, Any]] = Field(default_factory=list)
 
 
 SignalAction = Literal["BUY", "HOLD", "DROP"]

@@ -43,9 +43,7 @@ def make_strategy() -> StrategySpec:
     )
 
 
-def _performance_payload(
-    metrics: BacktestMetrics, engine_summary: dict | None = None
-) -> dict:
+def _performance_payload(metrics: BacktestMetrics, engine_summary: dict | None = None) -> dict:
     candidate = CodeCandidate(
         candidate_id="A2",
         variant="A",
@@ -86,9 +84,7 @@ def _fixture_rows(row_count: int = 4, ticker: str = "005930") -> list[dict[str, 
     return rows
 
 
-def _sequential_rows(
-    start: datetime, days: int, ticker_count: int = 5
-) -> list[dict[str, object]]:
+def _sequential_rows(start: datetime, days: int, ticker_count: int = 5) -> list[dict[str, object]]:
     tickers = [f"{i:06d}" for i in range(1, ticker_count + 1)]
     rows: list[dict[str, object]] = []
     for day in range(days):
@@ -136,7 +132,8 @@ def _trend_rows(
 
 def test_risk_manager_overrides_buy_to_hold_on_kospi_drop() -> None:
     decision = apply_risk_rules(
-        make_signal(), MacroSnapshot(kospi_close_change_pct=-0.051, fx_daily_change_pct=0.0, vkospi=20)
+        make_signal(),
+        MacroSnapshot(kospi_close_change_pct=-0.051, fx_daily_change_pct=0.0, vkospi=20),
     )
 
     assert decision.signal.action == "HOLD"
@@ -249,7 +246,9 @@ def test_public_performance_reliability_marks_fixture_4row_single_ticker_as_insu
     assert all(item.unavailable_reason is not None for item in performance.metric_details)
 
 
-def test_public_performance_reliability_marks_multi_ticker_postgres_as_sufficient_for_long_history() -> None:
+def test_public_performance_reliability_marks_multi_ticker_postgres_as_sufficient_for_long_history() -> (
+    None
+):
     price_rows = _sequential_rows(datetime(2025, 1, 1), 252, ticker_count=5)
     performance = build_public_backtest_performance(
         _performance_payload(
@@ -341,6 +340,10 @@ def test_public_performance_metric_details_have_explanations_and_flags() -> None
         "profit_factor",
         "benchmark_return",
         "excess_return",
+        "out_sample_excess_return",
+        "benchmark_period_win_rate",
+        "benchmark_period_loss_rate",
+        "out_sample_benchmark_period_loss_rate",
         "in_sample_sharpe",
         "out_sample_sharpe",
         "degradation",

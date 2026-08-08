@@ -248,7 +248,10 @@ def test_public_explanation_matches_the_selected_automatic_profile() -> None:
         "sma_200_regime",
         "winner_hold",
         "crash_risk_guard",
+        "portfolio_customization",
+        "benchmark_period_gate",
     }
+    assert all(item.formula and item.derivation for item in explanation.indicators)
 
 
 def test_public_performance_reliability_boundary_cases() -> None:

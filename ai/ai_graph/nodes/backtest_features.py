@@ -20,13 +20,12 @@ from ai_graph.nodes.condition_compiler import (
 from ai_graph.quant_strategy import (
     AUTOMATIC_TOURNAMENT_PROFILES,
     MOMENTUM_LONG_LOOKBACK,
-    REBALANCE_INTERVAL_DAYS,
     compute_academic_factor_arrays,
 )
 from ai_graph.schemas import CandidateParameters, Condition, ConditionOperator, StrategyIR
 
 
-FEATURE_DEFINITION_VERSION = "structured-features.v2"
+FEATURE_DEFINITION_VERSION = "structured-features.v3"
 
 READY = 0
 AVERAGE = 1
@@ -85,9 +84,7 @@ class PreparedFeatureStore:
             )
         )
         self.dates = tuple(str(row.get("date") or "") for row in self.rows)
-        self.tickers = tuple(
-            str(row.get("ticker") or "000000").zfill(6) for row in self.rows
-        )
+        self.tickers = tuple(str(row.get("ticker") or "000000").zfill(6) for row in self.rows)
         self.close = np.asarray([float(row["close"]) for row in self.rows], dtype=np.float64)
         self.volume = np.asarray(
             [float(row.get("volume", 0.0) or 0.0) for row in self.rows],
@@ -108,8 +105,7 @@ class PreparedFeatureStore:
         for index, ticker in enumerate(self.tickers):
             groups.setdefault(ticker, []).append(index)
         self.indices_by_ticker = {
-            ticker: np.asarray(indices, dtype=np.int64)
-            for ticker, indices in groups.items()
+            ticker: np.asarray(indices, dtype=np.int64) for ticker, indices in groups.items()
         }
         for indices in self.indices_by_ticker.values():
             indices.setflags(write=False)
@@ -200,9 +196,7 @@ class PreparedFeatureStore:
                 short_average = _prefix_average(
                     close_prefix, local_index - short_window, local_index
                 )
-                medium_average = _prefix_average(
-                    close_prefix, medium_start, local_index
-                )
+                medium_average = _prefix_average(close_prefix, medium_start, local_index)
                 long_average = _prefix_average(close_prefix, long_start, local_index)
                 high = main_highs[local_index]
                 low = main_lows[local_index]
@@ -216,38 +210,27 @@ class PreparedFeatureStore:
                 long_return = close / long_first - 1.0 if long_first else 0.0
                 pullback = (high - close) / high if high > 0.0 else 0.0
                 volatility = (high - low) / average if average else 0.0
-                long_drawdown = (
-                    (long_high - close) / long_high if long_high > 0.0 else 0.0
-                )
+                long_drawdown = (long_high - close) / long_high if long_high > 0.0 else 0.0
                 return_count = max(0, window - 1)
                 if return_count:
                     return_start = start + 1
                     total = return_prefix[local_index] - return_prefix[return_start]
                     square_total = (
-                        return_square_prefix[local_index]
-                        - return_square_prefix[return_start]
+                        return_square_prefix[local_index] - return_square_prefix[return_start]
                     )
                     mean_return = total / return_count
                     variance = max(
                         0.0,
                         square_total / return_count - mean_return * mean_return,
                     )
-                    rolling_sharpe = (
-                        mean_return / sqrt(variance) if variance > 0.0 else 0.0
-                    )
+                    rolling_sharpe = mean_return / sqrt(variance) if variance > 0.0 else 0.0
                 else:
                     rolling_sharpe = 0.0
-                average_volume = _prefix_average(
-                    volume_prefix, start, local_index
-                )
+                average_volume = _prefix_average(volume_prefix, start, local_index)
                 volume_ratio = (
-                    volumes[local_index] / average_volume
-                    if average_volume > 0.0
-                    else 1.0
+                    volumes[local_index] / average_volume if average_volume > 0.0 else 1.0
                 )
-                return_to_volatility = (
-                    trend / volatility if volatility > 0.0 else 0.0
-                )
+                return_to_volatility = trend / volatility if volatility > 0.0 else 0.0
                 matrix[global_index] = (
                     1.0,
                     average,
@@ -286,7 +269,9 @@ class PreparedFeatureStore:
         profile = parameters.profile
         threshold = parameters.threshold
         for start, end in self.date_ranges:
-            evaluations: list[tuple[int, str, float, bool, bool, float, list[float | bool | int]]] = []
+            evaluations: list[
+                tuple[int, str, float, bool, bool, float, list[float | bool | int]]
+            ] = []
             for index in range(start, end):
                 ticker = self.tickers[index]
                 close = self.close[index]
@@ -319,12 +304,7 @@ class PreparedFeatureStore:
                     rebalance_eligible = bool(row[REBALANCE_ELIGIBLE])
                     rsi = self.rsi[index]
                     in_position = bool(state[0])
-                    score = (
-                        rolling_sharpe
-                        + medium_return * 4.0
-                        + long_return * 2.0
-                        - volatility
-                    )
+                    score = rolling_sharpe + medium_return * 4.0 + long_return * 2.0 - volatility
                     if profile == "academic_momentum_trend":
                         factors_available = all(
                             isfinite(value)
@@ -352,27 +332,19 @@ class PreparedFeatureStore:
                                 close < sma_200 * 0.95
                                 or (
                                     rebalance_eligible
-                                    and (
-                                        momentum_12_1 <= 0.0
-                                        or sma_50 < sma_200
-                                    )
+                                    and (momentum_12_1 <= 0.0 or sma_50 < sma_200)
                                 )
                             )
                     elif profile == "long_regime_momentum":
                         score = (
-                            rolling_sharpe
-                            + long_return * 3.0
-                            + medium_return * 2.0
-                            - volatility
+                            rolling_sharpe + long_return * 3.0 + medium_return * 2.0 - volatility
                         )
                         buy = (
                             close >= long_average
                             and medium_average >= long_average * 0.98
                             and long_return > 0.0
                         )
-                        sell = in_position and (
-                            close < long_average * 0.97 or long_drawdown > 0.18
-                        )
+                        sell = in_position and (close < long_average * 0.97 or long_drawdown > 0.18)
                     elif profile == "quality_trend_hold":
                         score = (
                             medium_return * 3.0
@@ -414,13 +386,10 @@ class PreparedFeatureStore:
                             and close >= medium_average
                             and trend > 0.0
                         )
-                        sell = in_position and (
-                            rolling_sharpe <= 0.0 or close < medium_average
-                        )
+                        sell = in_position and (rolling_sharpe <= 0.0 or close < medium_average)
                     elif profile == "dual_sma_trend":
                         score = (
-                            medium_return * 3.0
-                            + (short_average / medium_average - 1.0) * 8.0
+                            medium_return * 3.0 + (short_average / medium_average - 1.0) * 8.0
                             if medium_average
                             else 0.0
                         )
@@ -428,9 +397,7 @@ class PreparedFeatureStore:
                             short_average > medium_average > average * 0.98
                             and close >= short_average
                         )
-                        sell = in_position and (
-                            short_average < medium_average or close < average
-                        )
+                        sell = in_position and (short_average < medium_average or close < average)
                     elif profile == "low_vol_momentum":
                         score = trend * 3.0 + medium_return * 2.0 - volatility * 1.5
                         buy = (
@@ -446,9 +413,7 @@ class PreparedFeatureStore:
                         )
                     elif profile == "breakout_volume":
                         score = (
-                            (close / high - 0.99) * 10.0
-                            + volume_ratio * 0.2
-                            + trend * 2.0
+                            (close / high - 0.99) * 10.0 + volume_ratio * 0.2 + trend * 2.0
                             if high
                             else -999.0
                         )
@@ -460,77 +425,49 @@ class PreparedFeatureStore:
                         )
                         sell = in_position and close < short_average
                     elif profile == "rsi_trend_rebound":
-                        score = (
-                            medium_return * 3.0
-                            + (55.0 - abs(rsi - 45.0)) / 50.0
-                            - volatility
-                        )
+                        score = medium_return * 3.0 + (55.0 - abs(rsi - 45.0)) / 50.0 - volatility
                         buy = (
                             close >= medium_average
                             and trend >= 0.0
                             and 35.0 <= rsi <= 62.0
                             and close >= previous
                         )
-                        sell = in_position and (
-                            rsi >= 72.0 or close < medium_average
-                        )
+                        sell = in_position and (rsi >= 72.0 or close < medium_average)
                     elif profile == "mean_reversion_band":
                         score = pullback * 2.0 + (50.0 - rsi) / 50.0 - volatility
                         buy = (
-                            close
-                            <= average * (1.0 - max(0.0, min(0.20, threshold)))
+                            close <= average * (1.0 - max(0.0, min(0.20, threshold)))
                             and rsi <= 45.0
                         )
-                        sell = in_position and (
-                            close >= medium_average or rsi >= 60.0
-                        )
+                        sell = in_position and (close >= medium_average or rsi >= 60.0)
                     elif profile == "return_to_volatility":
                         score = return_to_volatility + medium_return * 2.0
-                        buy = (
-                            return_to_volatility >= threshold * 4.0
-                            and close >= medium_average
-                        )
+                        buy = return_to_volatility >= threshold * 4.0 and close >= medium_average
                         sell = in_position and (
                             return_to_volatility <= 0.0 or close < medium_average
                         )
                     elif profile == "cash_preserving_trend":
                         score = rolling_sharpe + trend * 2.0 - volatility * 2.0
-                        buy = (
-                            trend >= threshold
-                            and rolling_sharpe > 0.05
-                            and volatility <= 0.3
-                        )
-                        sell = in_position and (
-                            trend < 0.01 or rolling_sharpe < 0.0
-                        )
+                        buy = trend >= threshold and rolling_sharpe > 0.05 and volatility <= 0.3
+                        sell = in_position and (trend < 0.01 or rolling_sharpe < 0.0)
                     else:
                         score = trend * 2.0 + medium_return - volatility
-                        buy = (
-                            trend >= threshold
-                            and close >= average
-                            and close >= previous
-                        )
+                        buy = trend >= threshold and close >= average and close >= previous
                         sell = in_position and close < average
                     if in_position and float(state[1]) > 0.0:
                         pnl = close / float(state[1]) - 1.0
-                        trailing_stop = (
-                            float(state[3]) > 0.0 and close < float(state[3]) * 0.93
-                        )
+                        trailing_stop = float(state[3]) > 0.0 and close < float(state[3]) * 0.93
                         sell = (
                             sell
                             or pnl <= -parameters.stop_loss_pct
                             or pnl >= parameters.take_profit_pct
                             or trailing_stop
                         )
-                evaluations.append(
-                    (index, ticker, close, buy, sell, score, state)
-                )
+                evaluations.append((index, ticker, close, buy, sell, score, state))
 
             open_positions = sum(1 for state in states.values() if bool(state[0]))
             open_slots = max(0, parameters.max_positions - open_positions)
-            ranked = [
-                item for item in evaluations if item[3] and not bool(item[6][0])
-            ]
+            ranked = [item for item in evaluations if item[3] and not bool(item[6][0])]
             ranked.sort(key=lambda item: (item[5], item[1]), reverse=True)
             selected = {item[1] for item in ranked[:open_slots]}
             for index, ticker, close, _, sell, _, state in evaluations:
@@ -567,7 +504,7 @@ class PreparedFeatureStore:
         for date_index, (start, end) in enumerate(self.date_ranges):
             rotation_day = (
                 date_index >= MOMENTUM_LONG_LOOKBACK
-                and (date_index - MOMENTUM_LONG_LOOKBACK) % REBALANCE_INTERVAL_DAYS == 0
+                and (date_index - MOMENTUM_LONG_LOOKBACK) % parameters.rebalance_interval_days == 0
             )
             observations: list[tuple[int, str, float, float, float, float, float]] = []
             for index in range(start, end):
@@ -603,11 +540,21 @@ class PreparedFeatureStore:
                 medium_ranks = _percentile_ranks(
                     [(ticker, medium) for _, ticker, _, _, medium, _, _ in observations]
                 )
-                volatility_ranks = (
+                risk_adjusted_long_ranks = (
                     _percentile_ranks(
                         [
-                            (ticker, volatility)
-                            for _, ticker, _, _, _, volatility, _ in observations
+                            (ticker, momentum / max(volatility, 0.05))
+                            for _, ticker, _, momentum, _, volatility, _ in observations
+                        ]
+                    )
+                    if profile == "risk_adjusted_momentum_rotation"
+                    else {}
+                )
+                risk_adjusted_medium_ranks = (
+                    _percentile_ranks(
+                        [
+                            (ticker, medium / max(volatility, 0.05))
+                            for _, ticker, _, _, medium, volatility, _ in observations
                         ]
                     )
                     if profile == "risk_adjusted_momentum_rotation"
@@ -625,16 +572,20 @@ class PreparedFeatureStore:
                             and close >= sma_200
                             and volatility <= 0.65
                         )
+                        # Borrow only MSCI's pre-registered idea of risk-adjusting two
+                        # horizons and combining them equally. This implementation is
+                        # deliberately labelled as a simplification: it uses 21-day
+                        # daily volatility and percentile ranks, not MSCI's three-year
+                        # weekly volatility and z-score construction.
                         score = (
-                            momentum_ranks[ticker] * 0.55
-                            + medium_ranks[ticker] * 0.30
-                            - volatility_ranks[ticker] * 0.15
+                            risk_adjusted_long_ranks[ticker] * 0.50
+                            + risk_adjusted_medium_ranks[ticker] * 0.50
                         )
                     else:
                         eligible = medium > threshold and close >= sma_200
-                        score = (
-                            medium_ranks[ticker] * 0.65
-                            + momentum_ranks[ticker] * 0.35
+                        medium_weight = parameters.medium_momentum_weight
+                        score = medium_ranks[ticker] * medium_weight + momentum_ranks[ticker] * (
+                            1.0 - medium_weight
                         )
                     if eligible:
                         ranked.append((score, ticker))
@@ -651,7 +602,9 @@ class PreparedFeatureStore:
                     state[2] = int(state[2]) + 1
                     state[3] = max(float(state[3]), close)
                     pnl = close / float(state[1]) - 1.0
-                    trailing_stop = float(state[3]) > 0.0 and close < float(state[3]) * 0.75
+                    trailing_stop = float(state[3]) > 0.0 and close < float(state[3]) * (
+                        1.0 - parameters.trailing_stop_pct
+                    )
                     risk_exit = (
                         pnl <= -parameters.stop_loss_pct
                         or pnl >= parameters.take_profit_pct
@@ -692,8 +645,7 @@ class PreparedFeatureStore:
                 state = states.setdefault(ticker, [False, 0.0])
                 if bool(state[0]):
                     exit_match = bool(exit_conditions) and all(
-                        self._condition_matches(condition, index)
-                        for condition in exit_conditions
+                        self._condition_matches(condition, index) for condition in exit_conditions
                     )
                     entry_price = float(state[1])
                     pnl = close / entry_price - 1.0 if entry_price else 0.0
@@ -704,8 +656,7 @@ class PreparedFeatureStore:
                     ):
                         exits.append((index, ticker))
                 elif all(
-                    self._condition_matches(condition, index)
-                    for condition in entry_conditions
+                    self._condition_matches(condition, index) for condition in entry_conditions
                 ):
                     entries.append((index, ticker, close))
 
@@ -997,9 +948,7 @@ class PreparedFeatureStore:
                 if len(closes) > window:
                     prior, later = closes[:-window], closes[window:]
                     with np.errstate(divide="ignore", invalid="ignore"):
-                        own[indices[window:]] = np.where(
-                            prior > 0.0, later / prior - 1.0, np.nan
-                        )
+                        own[indices[window:]] = np.where(prior > 0.0, later / prior - 1.0, np.nan)
             # Excess over the same-date universe mean, so "상대강도" means the same
             # thing here as it does in the screen.
             for start, end in self.date_ranges:
@@ -1037,9 +986,7 @@ class PreparedFeatureStore:
             values = source[indices]
             finite = np.isfinite(values)
             if normalized_aggregate in {"avg", "sum"}:
-                totals = np.concatenate(
-                    ([0.0], np.cumsum(np.where(finite, values, 0.0)))
-                )
+                totals = np.concatenate(([0.0], np.cumsum(np.where(finite, values, 0.0))))
                 counts = np.concatenate(([0], np.cumsum(finite, dtype=np.int64)))
                 for local_index, global_index in enumerate(indices):
                     start = max(0, local_index - window)
@@ -1047,9 +994,7 @@ class PreparedFeatureStore:
                     if count:
                         total = float(totals[local_index] - totals[start])
                         output[global_index] = (
-                            total / count
-                            if normalized_aggregate == "avg"
-                            else total
+                            total / count if normalized_aggregate == "avg" else total
                         )
                 continue
 
@@ -1069,11 +1014,7 @@ class PreparedFeatureStore:
                     candidates.popleft()
                 if not candidates:
                     continue
-                selected = (
-                    candidates[-1]
-                    if normalized_aggregate == "last"
-                    else candidates[0]
-                )
+                selected = candidates[-1] if normalized_aggregate == "last" else candidates[0]
                 output[global_index] = float(values[selected])
         output.setflags(write=False)
         self._rolling_cache[key] = output

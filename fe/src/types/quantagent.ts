@@ -236,7 +236,25 @@ export interface AIIndicatorExplanation {
   label: string;
   plain_explanation: string;
   why_used: string;
+  formula?: string | null;
+  derivation?: string | null;
+  customization?: string | null;
   caution: string;
+  source_refs: string[];
+}
+
+export interface AIGeneratedStrategyBlueprint {
+  blueprint_id: string;
+  profile: string;
+  title: string;
+  formula: string;
+  derivation: string;
+  why_generated: string;
+  lookback: number;
+  max_positions: number;
+  rebalance_interval_days: number;
+  stop_loss_pct: number;
+  trailing_stop_pct: number;
   source_refs: string[];
 }
 
@@ -248,6 +266,7 @@ export interface AIStrategyExplanation {
   rebalance_explanation: string | null;
   caution: string;
   indicators: AIIndicatorExplanation[];
+  generated_strategies?: AIGeneratedStrategyBlueprint[];
   source_refs: string[];
 }
 

@@ -61,3 +61,14 @@ test("metric and strategy explanations expose cautions and source links", async 
   assert.match(performance, /strategyExplanation\.indicators/);
   assert.match(performance, /indicator\.source_refs/);
 });
+
+test("generated strategies stay visible as pre-backtest blueprints with derivations", async () => {
+  const performance = await source("../src/features/app/PerformanceTab.tsx");
+
+  assert.match(performance, /strategyExplanation\?\.generated_strategies/);
+  assert.match(performance, /generatedStrategies\.map/);
+  assert.match(performance, /blueprint\.formula/);
+  assert.match(performance, /blueprint\.derivation/);
+  assert.match(performance, /blueprint\.why_generated/);
+  assert.match(performance, /indicator\.customization/);
+});
