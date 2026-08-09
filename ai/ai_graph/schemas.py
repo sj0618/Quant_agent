@@ -202,13 +202,11 @@ class Condition(BaseModel):
         elif self.operator in {ConditionOperator.CROSS_ABOVE, ConditionOperator.CROSS_BELOW}:
             if not isinstance(self.right, str):
                 raise ValueError("cross operators require a metric name")
-        elif not isinstance(self.right, (int, float)):
-            # A metric name on the right is allowed once the condition compares against a
-            # windowed/derived series - "close >= 252-day max of high", "operating_income
-            # > its previous quarter". Absolute comparisons still require a number.
-            structured = self.window is not None or self.consecutive is not None
-            if not (structured and isinstance(self.right, str)):
-                raise ValueError("scalar operators require a numeric right side")
+        elif not isinstance(self.right, (int, float, str)):
+            # Metric-to-metric comparisons are first-class rules (close > SMA, +DI >
+            # -DI).  Requiring a fake one-period window changed "current versus
+            # current" into "current versus yesterday" in the executable evaluator.
+            raise ValueError("scalar operators require a number or metric name")
         return self
 
 
@@ -459,6 +457,12 @@ class StrategyIR(BaseModel):
     entry_conditions: list[Condition] = Field(default_factory=list)
     exit_conditions: list[Condition] = Field(default_factory=list)
     ranking: Literal["score_desc_ticker_desc", "none"] = "score_desc_ticker_desc"
+    # Catalog strategies carry their own ranking formula.  This is deliberately part
+    # of the executable IR (rather than display-only blueprint metadata), so the rule
+    # described to the user is the rule that decides which names receive scarce slots.
+    ranking_metric: str | None = None
+    ranking_direction: Literal["desc", "asc"] = "desc"
+    execution_mode: Literal["event_driven", "scheduled_rotation"] = "event_driven"
 
 
 class CandidateParameters(BaseModel):
@@ -467,6 +471,9 @@ class CandidateParameters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     profile: StructuredProfile
+    # Stable provenance for an independently defined catalog strategy.  Parameter
+    # variants may share a profile, but two catalog rules never share this identity.
+    blueprint_id: str | None = None
     lookback: int = Field(ge=3, le=252)
     threshold: float = Field(ge=-1.0, le=100.0)
     stop_loss_pct: float = Field(gt=0.0, le=1.0)

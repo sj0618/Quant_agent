@@ -525,7 +525,47 @@ def build_strategy_explanation(
 ) -> dict[str, Any]:
     mode: StrategyRequestMode = getattr(strategy, "selection_mode", "standard")
     indicators = [str(item) for item in getattr(strategy, "indicators", [])]
-    if mode == "automatic":
+    generated_strategy_payloads = _generated_strategy_payloads(generated_strategies)
+    selected_blueprint_id = str(
+        _parameter_value(selected_parameters, "blueprint_id") or ""
+    )
+    selected_blueprint = next(
+        (
+            item
+            for item in generated_strategy_payloads
+            if str(item.get("blueprint_id") or "") == selected_blueprint_id
+        ),
+        None,
+    )
+    if mode == "automatic" and selected_blueprint is not None:
+        indicator_keys: tuple[str, ...] = ()
+        title = str(selected_blueprint.get("title") or "자동 퀀트 전략")
+        summary = str(
+            selected_blueprint.get("plain_explanation")
+            or selected_blueprint.get("formula")
+            or "사전등록 산식을 실행한 자동 전략입니다."
+        )
+        why_selected = " ".join(
+            str(value)
+            for value in (
+                selected_blueprint.get("why_generated"),
+                selected_blueprint.get("why_used"),
+            )
+            if value
+        )
+        if selected_blueprint.get("execution_mode") == "scheduled_rotation":
+            days = int(
+                _parameter_value(selected_parameters, "rebalance_interval_days") or 21
+            )
+            rebalance = f"{days}거래일마다 조건과 순위를 다시 계산해 목표 종목을 교체합니다."
+        else:
+            rebalance = "고정 교체일까지 기다리지 않고 전략 고유의 진입·청산 신호가 발생할 때 매매합니다."
+        explanations = [
+            dict(item)
+            for item in selected_blueprint.get("indicator_explanations", [])
+            if isinstance(item, Mapping)
+        ]
+    elif mode == "automatic":
         automatic = _automatic_profile_explanation(
             strategy,
             selected_profile,
@@ -547,16 +587,15 @@ def build_strategy_explanation(
             else "입력 문장에서 확인된 지표와 조건을 기준으로 구성했습니다."
         )
         rebalance = None
-
-    explanations = [
-        _indicator_explanation(
-            key,
-            strategy=strategy,
-            selected_parameters=selected_parameters,
-        )
-        for key in dict.fromkeys(indicator_keys)
-    ]
-    generated_strategy_payloads = _generated_strategy_payloads(generated_strategies)
+    if not (mode == "automatic" and selected_blueprint is not None):
+        explanations = [
+            _indicator_explanation(
+                key,
+                strategy=strategy,
+                selected_parameters=selected_parameters,
+            )
+            for key in dict.fromkeys(indicator_keys)
+        ]
     source_refs = list(
         dict.fromkeys(
             [
@@ -565,6 +604,13 @@ def build_strategy_explanation(
                     str(source)
                     for item in generated_strategy_payloads
                     for source in item.get("source_refs", [])
+                ),
+                *(
+                    str(source)
+                    for item in generated_strategy_payloads
+                    for indicator in item.get("indicator_explanations", [])
+                    if isinstance(indicator, Mapping)
+                    for source in indicator.get("source_refs", [])
                 ),
             ]
         )
@@ -655,7 +701,7 @@ def _automatic_profile_explanation(
         f"입력을 {style_label}·{horizon_label}으로 해석해 최대 {max_positions}종목, "
         f"{rebalance_days}거래일 교체 조건에 맞는 후보 3개만 비교했습니다. "
         "앞 70%에서는 벤치마크 초과수익을 가장 크게 반영해 선택하고, 마지막 30%는 "
-        "선택에 쓰지 않습니다. 126거래일 단위 패배 구간이 50% 이상이거나 최종 "
+        "선택에 쓰지 않습니다. 63거래일 단위 패배 구간이 50% 이상이거나 최종 "
         "누적 초과수익이 음수이면 검증 실패입니다."
     )
     if selected_profile == "relative_momentum_rotation":
@@ -784,7 +830,7 @@ def _automatic_profile_explanation(
         ),
         "why_selected": (
             f"사용자의 {style_label}·{horizon_label} 입력에 맞지 않는 후보는 제외하고, "
-            "학습구간 초과수익과 고정 126거래일 승패를 자동으로 비교합니다. 마지막 30%에서도 "
+            "학습구간 초과수익과 고정 63거래일 승패를 자동으로 비교합니다. 마지막 30%에서도 "
             "패배 구간이 절반 미만이고 누적 초과수익이 양수여야 추천으로 인정합니다."
         ),
         "rebalance": f"{rebalance_days}거래일마다 순위를 갱신하되 매일 사고팔지 않아 비용을 제한합니다.",
@@ -990,16 +1036,17 @@ def _indicator_explanation(
         "benchmark_period_gate": {
             "label": "고정구간 벤치마크 승패 판정",
             "plain_explanation": (
-                "전 기간을 약 6개월인 126거래일씩 고정 분할해 각 구간의 전략 수익률과 "
+                "전 기간을 약 3개월인 63거래일씩 고정 분할해 각 구간의 전략 수익률과 "
                 "벤치마크 수익률을 비교합니다."
             ),
             "why_used": "몇 번의 큰 초과수익은 허용하되 대부분의 시장 구간에서 지는 전략을 성공으로 포장하지 않기 위해 사용합니다.",
             "formula": (
-                "패배율 = 벤치마크보다 수익률이 낮은 126일 구간 수 / 유효 구간 수; "
+                "패배율 = 벤치마크보다 수익률이 낮은 63일 구간 수 / 유효 구간 수; "
                 "패배율 ≥ 50%이면 실패"
             ),
             "derivation": (
-                "126일은 월간 순환 전략을 여섯 번가량 관찰할 수 있는 반년입니다. 구간 길이와 50% 문턱은 "
+                "63일은 단기 시장 국면을 분리하면서 월간 순환을 세 번가량 관찰하는 한 분기입니다. "
+                "구간 길이와 50% 문턱은 "
                 "사용자 기준으로 사전에 고정하며 결과에 맞춰 이동시키지 않습니다."
             ),
             "caution": "실제 KOSPI 지수열이 없는 환경에서는 분석 유니버스의 고정 동일가중 매수·보유 프록시와 비교합니다.",
@@ -1146,7 +1193,7 @@ def _indicator_explanation(
         )
     elif key == "benchmark_period_gate":
         item["caution"] = (
-            "126거래일을 채우지 못한 마지막 미완료 구간은 승패 계산에서 제외합니다. "
+            "63거래일을 채우지 못한 마지막 미완료 구간은 승패 계산에서 제외합니다. "
             "실제 KOSPI 지수열이 없는 환경에서는 고정 동일가중 매수·보유 프록시를 사용합니다."
         )
         item["customization"] = (

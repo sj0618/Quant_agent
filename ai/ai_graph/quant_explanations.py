@@ -107,7 +107,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     "benchmark_period_win_rate": {
         "label": "벤치마크 승리 구간 비율",
         "unit": "percent",
-        "plain_explanation": "고정된 126거래일 구간 중 전략 수익률이 벤치마크보다 높았던 구간의 비율입니다.",
+        "plain_explanation": "고정된 63거래일 구간 중 전략 수익률이 벤치마크보다 높았던 구간의 비율입니다.",
         "why_used": "몇 번의 큰 성공뿐 아니라 서로 다른 시장 구간에서 초과성과가 반복되는지 확인합니다.",
         "caution": "구간 길이는 결과를 본 뒤 바꾸지 않으며, 126일 미만의 마지막 미완료 구간은 제외합니다.",
         "source_refs": [],
@@ -115,7 +115,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     "benchmark_period_loss_rate": {
         "label": "벤치마크 패배 구간 비율",
         "unit": "percent",
-        "plain_explanation": "고정된 126거래일 구간 중 전략 수익률이 벤치마크보다 낮았던 구간의 비율입니다.",
+        "plain_explanation": "고정된 63거래일 구간 중 전략 수익률이 벤치마크보다 낮았던 구간의 비율입니다.",
         "why_used": "사용자 기준에 따라 이 값이 50% 이상이면 자동 전략을 패배로 판정합니다.",
         "caution": "큰 초과수익 구간이 있어도 패배 구간이 절반 이상이면 검증을 통과하지 못합니다.",
         "source_refs": [],
@@ -123,7 +123,7 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     "out_sample_benchmark_period_loss_rate": {
         "label": "검증구간 벤치마크 패배 비율",
         "unit": "percent",
-        "plain_explanation": "마지막 30%를 다시 126거래일 단위로 나눴을 때 벤치마크에 진 구간의 비율입니다.",
+        "plain_explanation": "마지막 30%를 다시 63거래일 단위로 나눴을 때 벤치마크에 진 구간의 비율입니다.",
         "why_used": "전략 선택 이후의 데이터에서도 패배 구간이 절반 미만인지 확인합니다.",
         "caution": "검증기간이 짧으면 비교 구간 수가 적어 비율 하나의 영향이 커집니다.",
         "source_refs": [],

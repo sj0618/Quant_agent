@@ -99,7 +99,24 @@ def test_vague_request_runs_the_full_automatic_pipeline() -> None:
     public_explanation = envelope.user_payload.performance.strategy_explanation
     assert public_explanation is not None
     assert len(public_explanation.generated_strategies) == 3
-    assert len({item["profile"] for item in public_explanation.generated_strategies}) == 3
+    assert len(
+        {item["execution_signature"] for item in public_explanation.generated_strategies}
+    ) == 3
+    assert all(item["profile"] == "compiled_conditions" for item in public_explanation.generated_strategies)
+    selected_blueprint_id = envelope.rule_provenance.evaluated_rule.removeprefix(
+        "automatic_blueprint:"
+    )
+    selected_blueprint = next(
+        item
+        for item in public_explanation.generated_strategies
+        if item["blueprint_id"] == selected_blueprint_id
+    )
+    assert public_explanation.title == selected_blueprint["title"]
+    assert public_explanation.indicators
+    assert all(
+        item.formula and item.derivation and item.why_used
+        for item in public_explanation.indicators
+    )
 
 
 def test_academic_factors_match_exact_12_1_and_sma_boundaries() -> None:
@@ -169,7 +186,8 @@ def test_automatic_request_builds_cited_three_family_tournament() -> None:
     assert BACKTEST_OVERFITTING_SOURCE in strategy.source_refs
     plan = build_code_generation_plan(strategy, map_strategy_features(strategy))
     assert plan.entry_feature == "performance_momentum_tournament"
-    assert tuple(_candidate_profiles(plan)) == AUTOMATIC_TOURNAMENT_PROFILES
+    assert tuple(_candidate_profiles(plan)) == ("compiled_conditions",) * 3
+    assert len({item.execution_signature for item in plan.generated_strategies}) == 3
     candidates = generate_loop3_candidates(
         Loop3Request(strategy=strategy, variant="A", trace_id="robust-tournament-contract")
     ).candidates
@@ -179,7 +197,7 @@ def test_automatic_request_builds_cited_three_family_tournament() -> None:
             for candidate in candidates
             if candidate.parameters is not None
         )
-        == AUTOMATIC_TOURNAMENT_PROFILES
+        == ("compiled_conditions",) * 3
     )
     assert [candidate.parameters.lookback for candidate in candidates if candidate.parameters] == [
         252,
@@ -236,14 +254,14 @@ def test_user_risk_and_horizon_customize_the_automatic_candidate_menu() -> None:
     assert aggressive_plan.rebalance_interval_days == 10
     assert aggressive_plan.trailing_stop_pct == 0.30
     assert aggressive_plan.medium_momentum_weight == 0.70
-    assert aggressive_plan.lookbacks == [126, 126, 252]
-    assert aggressive_plan.candidate_profiles == [
-        "trend_leader_rotation",
-        "risk_adjusted_momentum_rotation",
-        "relative_momentum_rotation",
+    assert aggressive_plan.lookbacks == [20, 20, 20]
+    assert [item.blueprint_id for item in aggressive_plan.generated_strategies] == [
+        "qb-v2-donchian-price-breakout",
+        "qb-v2-atr-range-expansion-breakout",
+        "qb-v2-bollinger-volatility-breakout",
     ]
     assert len(aggressive_plan.generated_strategies) == 3
-    assert len({item.profile for item in aggressive_plan.generated_strategies}) == 3
+    assert len({item.execution_signature for item in aggressive_plan.generated_strategies}) == 3
     assert all(
         "아직 승자를 정하지 않았으며" in item.why_generated and item.formula and item.derivation
         for item in aggressive_plan.generated_strategies
@@ -276,11 +294,11 @@ def test_user_risk_and_horizon_customize_the_automatic_candidate_menu() -> None:
     assert defensive_plan.customization_style == "defensive"
     assert defensive_plan.investment_horizon == "long"
     assert defensive_plan.rebalance_interval_days == 42
-    assert defensive_plan.lookbacks == [252, 252, 252]
-    assert defensive_plan.candidate_profiles == [
-        "risk_adjusted_momentum_rotation",
-        "low_vol_momentum",
-        "quality_trend_hold",
+    assert defensive_plan.lookbacks == [126, 200, 126]
+    assert [item.blueprint_id for item in defensive_plan.generated_strategies] == [
+        "qb-v2-low-volatility-momentum",
+        "qb-v2-pure-low-volatility-trend",
+        "qb-v2-ulcer-index-trend",
     ]
     assert defensive.risk_constraints["stop_loss_pct"] == 0.12
     assert defensive.risk_constraints["trailing_stop_pct"] == 0.15
@@ -342,9 +360,7 @@ def test_automatic_profile_is_reported_as_the_intended_rule() -> None:
     assert envelope.strategy_spec.selection_mode == "automatic"
     assert envelope.rule_provenance is not None
     assert envelope.rule_provenance.substituted is False
-    assert envelope.rule_provenance.evaluated_rule in {
-        f"automatic_profile:{profile}" for profile in AUTOMATIC_TOURNAMENT_PROFILES
-    }
+    assert envelope.rule_provenance.evaluated_rule.startswith("automatic_blueprint:qb-v2-")
     assert envelope.rule_provenance.untranslatable_conditions == []
 
 

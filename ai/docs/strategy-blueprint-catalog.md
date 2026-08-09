@@ -1,75 +1,65 @@
-# Strategy blueprint catalog
+# Independent strategy blueprint catalog
 
 ## Decision
 
-The canonical strategy definitions live in the versioned Python catalog
-`ai_graph.strategy_blueprint_catalog`, not in the application database.
+Canonical formulas live in the versioned Python catalog
+`ai_graph.strategy_blueprint_catalog`, not in mutable database rows.
 
-This is deliberate:
+This keeps formula, executable conditions, explanation, parameter bounds, citations, tests, catalog
+version, and SHA-256 fingerprint in one reviewed change. A database outage therefore cannot change
+the rule being evaluated, and a historical result can be reproduced from its catalog ID and data
+snapshot.
 
-- a strategy formula, explanation, parameter range, and citation change together in code review;
-- the same commit always produces the same 100 definitions and SHA-256 fingerprint;
-- a database outage cannot silently change which strategy is considered canonical;
-- test runs and production runs can record the catalog ID and version and remain reproducible;
-- runtime selection does not need another network round trip.
+The database remains appropriate for mutable records only:
 
-The database remains useful for mutable facts. A later persistence layer should store only:
-
-1. `user_strategy_config`: user, catalog ID, catalog version, parameter overrides, creation time;
-2. `strategy_evaluation`: catalog ID, data snapshot ID, costs, metrics, benchmark, and holdout result;
+1. `user_strategy_config`: user, catalog ID/version, risk overrides, and creation time;
+2. `strategy_evaluation`: catalog ID, data snapshot, costs, metrics, benchmark periods, and holdout;
 3. `catalog_release`: version, fingerprint, deployment commit, and activation time.
 
-It should not become a second editable copy of the formula text. If database seeding is needed, rows
-should be generated from the code manifest and treated as read-only projections.
+If a UI needs database rows, they should be read-only projections generated from this manifest, not
+a second editable copy of the formulas.
 
-## Catalog shape
+## V2 catalog shape
 
-The catalog contains exactly 100 pre-registered definitions:
+V1's advertised 100 rows were 20 formulas multiplied by five parameter presets. V2 removes that
+counting shortcut. It currently contains 56 independently executable formulas:
 
-- 20 research or practitioner archetypes;
-- 5 operating presets per archetype: fast, tactical, core, patient, and shield;
-- 100 stable `qb-v1-*` IDs;
-- one catalog version and deterministic SHA-256 fingerprint.
+- one stable `qb-v2-*` ID per formula;
+- one unique hash over entry conditions, exit conditions, ranking, and execution mode;
+- no parameter preset counted as another strategy;
+- six families: momentum, trend, breakout, mean reversion, volume flow, and defensive;
+- adjusted daily OHLCV as the honest common data boundary;
+- papers or official quant/indicator projects as provenance.
 
-Every definition contains:
+Every formula stores the exact `Condition` objects and ranking metric sent to `StrategyIR`. It also
+stores a plain explanation, mathematical formula, derivation, selection reason, caveats, and a
+separate explanation for every indicator: what it means, how its number is calculated, and why it is
+used.
 
-- executable structured profile;
-- plain-language explanation;
-- formula and derivation;
-- reason for using the indicators;
-- default parameter values and allowed ranges;
-- risk style and investment horizon;
-- required data;
-- primary research or official methodology links;
-- limitations and implementation differences.
+Formula windows are fixed. For example, changing SMA(20/50) to SMA(10/40) does not manufacture a new
+catalog row. User intent may customize position count, rebalance cadence, stop loss, take profit, and
+trailing stop within declared bounds without changing formula identity.
 
 ## Runtime behavior
 
-The service does not backtest all 100 definitions and choose the luckiest result. It first reads only
-the user's words, risk style, horizon, and requested number of positions. It then selects three
-distinct executable profiles before return data is inspected. Only those three enter the existing
-70/30 tournament and benchmark gate.
+The service does not test all 56 against the same history and report the luckiest one. Before seeing
+returns it maps the user's words, risk style, and horizon to three distinct execution signatures.
+Those three rules then run through the same next-open, cost-aware backtest and benchmark gate.
 
-This keeps the broad catalog useful for personalization without turning every request into a
-100-way data-mining exercise.
+Each selected candidate carries its `blueprint_id` from input interpretation through generated plan,
+candidate parameters, executing `StrategyIR`, logs, and result provenance. Cross-sectional formulas
+rotate on the configured schedule; event-driven formulas enter on their own signal. Scarce position
+slots are assigned using the blueprint's declared ranking metric rather than ticker order.
 
-Examples:
+All catalog indicators can be derived from current-and-past OHLCV inside `PreparedFeatureStore`.
+Point-in-time warehouse values take precedence when present, and the local derivation fills missing
+values. Signals use end-of-day information and orders fill only at the next available open.
 
-- vague automatic request -> the established three momentum rotation profiles;
-- short concentrated momentum -> trend-leader, risk-adjusted momentum, relative momentum;
-- long low-volatility request -> risk-adjusted momentum, low-volatility momentum, quality-trend
-  proxy;
-- volume breakout request -> volume breakout and volatility breakout receive priority.
+## Verification boundary
 
-Explicit user controls override only bounded parameters such as position count, lookback, rebalance
-interval, stop loss, take profit, and trailing stop. Formula identity and source provenance stay tied
-to the catalog ID.
-
-## Honesty boundaries
-
-- `quality-trend-proxy` is an OHLCV proxy, not an accounting-quality implementation.
-- volatility-managed momentum uses a security filter, not the exposure-scaling portfolio from the
-  source paper.
-- 52-week high uses a maximum 252-trading-day window rather than a calendar-year window.
-- research evidence and historical backtests do not guarantee future returns.
-- user-facing validation must still pass minimum data, holdout, cost, drawdown, and benchmark rules.
+- Catalog tests require at least 50 unique IDs, formulas, and execution signatures.
+- Every formula must emit both buy and sell actions on deterministic multi-regime QA data.
+- Every formula is recomputed on a truncated prefix; prefix actions must exactly match the same
+  segment of a longer run, proving future rows did not alter past signals.
+- Source links and per-indicator formula/derivation/reason fields are mandatory.
+- Research evidence and historical backtests never imply guaranteed future returns.

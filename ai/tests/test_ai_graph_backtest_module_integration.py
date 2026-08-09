@@ -391,9 +391,9 @@ def test_metrics_measure_fixed_period_excess_against_the_same_price_rows() -> No
 
     assert metrics.in_sample_excess_return > 0.0
     assert metrics.out_sample_excess_return > 0.0
-    assert metrics.benchmark_period_count == 3
+    assert metrics.benchmark_period_count == 7
     assert metrics.benchmark_period_loss_rate == 0.0
-    assert metrics.out_sample_benchmark_period_count == 1
+    assert metrics.out_sample_benchmark_period_count == 2
     assert metrics.out_sample_benchmark_period_loss_rate == 0.0
 
 

@@ -1840,7 +1840,7 @@ def build_strategy_spec(
                 f"손절 {automatic_preferences.stop_loss_pct:.0%}, "
                 f"고점 추적손절 {automatic_preferences.trailing_stop_pct:.0%}"
             ),
-            "126거래일 고정 구간 중 벤치마크 패배 구간이 50% 이상이면 검증 실패",
+            "63거래일 고정 구간 중 벤치마크 패배 구간이 50% 이상이면 검증 실패",
         ]
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
@@ -1939,7 +1939,7 @@ def _strategy_profile_base(
             "assumptions": [
                 "사용자 위험성향과 투자기간에 맞는 독립 모멘텀 전략 3개를 백테스트 전에 생성",
                 "앞 70% 구간만 후보 선택에 사용하고 마지막 30%는 별도 검증",
-                "126거래일 고정 구간 중 벤치마크에 진 구간이 50% 이상이면 패배",
+                "63거래일 고정 구간 중 벤치마크에 진 구간이 50% 이상이면 패배",
                 "지표는 평가 시점까지 알려진 조정 종가만 사용",
                 "45% 같은 조기 고정 익절로 큰 승자를 자르지 않고 상대 순위와 장기 추세가 유지되면 보유",
                 "보유 종목 수·교체 주기·손실 제한은 사용자 입력에서 수익률을 보기 전에 결정",

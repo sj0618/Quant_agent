@@ -28,6 +28,7 @@ from ai_graph.nodes.position_sizing import (
 from ai_graph.schemas import (
     CandidateParameters,
     CodeCandidate,
+    Condition,
     StrategyIR,
     StrategySpec,
     StructuredProfile,
@@ -97,6 +98,13 @@ class GeneratedStrategyBlueprint(BaseModel):
     formula: str = Field(min_length=1)
     derivation: str = Field(min_length=1)
     why_used: str | None = None
+    entry_conditions: list[Condition] = Field(min_length=1)
+    exit_conditions: list[Condition] = Field(min_length=1)
+    ranking_metric: str = Field(min_length=1)
+    ranking_direction: Literal["desc", "asc"] = "desc"
+    execution_mode: Literal["event_driven", "scheduled_rotation"] = "event_driven"
+    execution_signature: str = Field(pattern=r"^[a-f0-9]{64}$")
+    indicator_explanations: list[dict[str, object]] = Field(min_length=1)
     why_generated: str = Field(min_length=1)
     lookback: int = Field(ge=3, le=252)
     threshold: float = Field(default=0.0, ge=-1.0, le=100.0)
@@ -182,7 +190,12 @@ def generate_loop3_candidates(
             code_plan,
             request.max_positions,
         )
-        candidates = _structured_candidates(request, strategy_ir, parameter_sets)
+        candidates = _structured_candidates(
+            request,
+            strategy_ir,
+            parameter_sets,
+            generated_strategies=code_plan.generated_strategies,
+        )
         invalid_fallbacks = [
             violation.message
             for code in output.fallback_code
@@ -249,7 +262,11 @@ def _normalized_parameter_sets(
     seen: set[str] = set()
     for index, item in enumerate(pool):
         profile = item.profile
-        if profile == "compiled_conditions" and not compiled:
+        if (
+            profile == "compiled_conditions"
+            and not compiled
+            and strategy.selection_mode != "automatic"
+        ):
             profile = defaults[min(index, len(defaults) - 1)].profile
         candidate = item.model_copy(
             update={
@@ -297,6 +314,7 @@ def _default_parameter_sets(
         return [
             CandidateParameters(
                 profile=blueprint.profile,
+                blueprint_id=blueprint.blueprint_id,
                 lookback=blueprint.lookback,
                 threshold=blueprint.threshold,
                 stop_loss_pct=blueprint.stop_loss_pct,
@@ -340,10 +358,29 @@ def _structured_candidates(
     request: Loop3Request,
     strategy_ir: StrategyIR,
     parameter_sets: list[CandidateParameters],
+    *,
+    generated_strategies: list[GeneratedStrategyBlueprint] | None = None,
 ) -> list[CodeCandidate]:
+    blueprint_by_id = {
+        item.blueprint_id: item for item in (generated_strategies or [])
+    }
     candidates: list[CodeCandidate] = []
     for index, parameters in enumerate(parameter_sets[:MAX_GENERATED_CANDIDATES], start=1):
-        code = _render_structured_reference_code(strategy_ir, parameters)
+        blueprint = blueprint_by_id.get(parameters.blueprint_id or "")
+        candidate_ir = strategy_ir
+        if blueprint is not None:
+            candidate_ir = StrategyIR(
+                strategy_id=blueprint.blueprint_id,
+                entry_feature=f"catalog:{blueprint.blueprint_id}:entry",
+                exit_feature=f"catalog:{blueprint.blueprint_id}:exit",
+                proxy_feature="past_only_adjusted_ohlcv",
+                entry_conditions=blueprint.entry_conditions,
+                exit_conditions=blueprint.exit_conditions,
+                ranking_metric=blueprint.ranking_metric,
+                ranking_direction=blueprint.ranking_direction,
+                execution_mode=blueprint.execution_mode,
+            )
+        code = _render_structured_reference_code(candidate_ir, parameters)
         validation = validate_backtest_code(code)
         candidates.append(
             CodeCandidate(
@@ -353,7 +390,7 @@ def _structured_candidates(
                 validation_ok=validation.ok,
                 violations=[violation.message for violation in validation.violations],
                 representation="structured",
-                strategy_ir=strategy_ir,
+                strategy_ir=candidate_ir,
                 parameters=parameters,
             )
         )
@@ -773,8 +810,18 @@ def _automatic_strategy_blueprints(
                 formula=template.formula,
                 derivation=template.derivation,
                 why_used=template.why_used,
+                entry_conditions=template.entry_conditions,
+                exit_conditions=template.exit_conditions,
+                ranking_metric=template.ranking_metric,
+                ranking_direction=template.ranking_direction,
+                execution_mode=template.execution_mode,
+                execution_signature=template.execution_signature,
+                indicator_explanations=[
+                    item.model_dump(mode="json")
+                    for item in template.indicator_explanations
+                ],
                 why_generated=(
-                    f"100개 사전등록 카탈로그에서 사용자 입력을 "
+                    f"{len(strategy_blueprint_catalog())}개 독립 산식 카탈로그에서 사용자 입력을 "
                     f"{style_label}·{horizon_label} 설정으로 "
                     f"해석해 고른 후보 {index}입니다. {match_reason}"
                     "아직 승자를 정하지 않았으며 이후 백테스트가 별도로 비교합니다."
@@ -877,9 +924,10 @@ def build_code_generation_plan(
             medium_momentum_weight=medium_momentum_weight,
             benchmark_objective=True,
             customization_summary=(
-                f"{style}/{horizon}: 100개 카탈로그에서 {len(profiles)}개 사전등록 후보 선택, "
+                f"{style}/{horizon}: {len(strategy_blueprint_catalog())}개 독립 산식에서 "
+                f"{len(profiles)}개 사전등록 후보 선택, "
                 f"{rebalance_interval_days}거래일 교체, "
-                "126거래일 구간 벤치마크 승패 검증"
+                "63거래일 구간 벤치마크 승패 검증"
             ),
             generated_strategies=generated_strategies,
             catalog_version=CATALOG_VERSION,

@@ -55,7 +55,10 @@ BENCHMARK_WARNING = (
 # Candidates are selected using only the first 70% of the history.  The final 30%
 # is deliberately kept untouched until after selection, so it is a real hold-out.
 BACKTEST_SPLIT_FRACTION = 0.7
-BENCHMARK_EVALUATION_PERIOD_DAYS = 126
+# A quarter is short enough to expose regime-specific wins/losses instead of letting a
+# ten-year total hide them. A strategy may win by a lot in some blocks, but losing at
+# least half of these fixed, non-overlapping blocks is still an automatic failure.
+BENCHMARK_EVALUATION_PERIOD_DAYS = 63
 MAX_AUTOMATIC_BENCHMARK_LOSS_RATE = 0.50
 PUBLIC_EQUITY_CURVE_POINTS = 12
 MIN_OBJECTIVE_TRADES = 5
@@ -183,9 +186,11 @@ def _is_user_rule(candidate: Any) -> bool:
 
     parameters = getattr(candidate, "parameters", None)
     profile = getattr(parameters, "profile", None)
+    blueprint_id = getattr(parameters, "blueprint_id", None)
     if profile is None and isinstance(parameters, Mapping):
         profile = parameters.get("profile")
-    return profile == "compiled_conditions"
+        blueprint_id = parameters.get("blueprint_id")
+    return profile == "compiled_conditions" and not blueprint_id
 
 
 def rule_provenance(
@@ -207,6 +212,7 @@ def rule_provenance(
 
     selected = backtest.get("selected_candidate") or {}
     profile = ((selected.get("parameters") or {}).get("profile")) or "unknown"
+    blueprint_id = (selected.get("parameters") or {}).get("blueprint_id")
     requested = [str(c.get("left")) for c in (entry_conditions or []) if c.get("left")]
     catalog_profiles = {
         str(item.get("profile"))
@@ -214,7 +220,8 @@ def rule_provenance(
         if isinstance(item, Mapping) and item.get("profile")
     }
     intended_automatic_profile = selection_mode == "automatic" and (
-        profile in catalog_profiles
+        bool(blueprint_id)
+        or profile in catalog_profiles
         or (not catalog_profiles and profile in AUTOMATIC_TOURNAMENT_PROFILES)
     )
     substituted = profile != "compiled_conditions" and not intended_automatic_profile
@@ -238,6 +245,7 @@ def rule_provenance(
     # to remove.
     ran_own_rule = any(
         ((c.get("parameters") or {}).get("profile")) == "compiled_conditions"
+        and not ((c.get("parameters") or {}).get("blueprint_id"))
         for c in (backtest.get("candidates") or [])
     )
     if not substituted:
@@ -254,7 +262,9 @@ def rule_provenance(
         )
     else:
         reason = "사용자 조건이 백테스트 후보에 포함되지 않았습니다."
-    if profile == "compiled_conditions":
+    if intended_automatic_profile and blueprint_id:
+        evaluated_rule = f"automatic_blueprint:{blueprint_id}"
+    elif profile == "compiled_conditions":
         evaluated_rule = "user_conditions"
     elif intended_automatic_profile:
         evaluated_rule = f"automatic_profile:{profile}"
@@ -2117,7 +2127,7 @@ def _benchmark_period_stats(
     strategy_returns: Sequence[float],
     benchmark_returns: Sequence[float],
 ) -> _BenchmarkPeriodStats:
-    """Compare fixed half-year blocks without cherry-picking favourable dates."""
+    """Compare fixed quarter blocks without cherry-picking favourable dates."""
 
     length = min(len(strategy_returns), len(benchmark_returns))
     wins = 0
@@ -2262,7 +2272,9 @@ def _benchmark_objective_reasons(
 
     reasons: list[str] = []
     if metrics.benchmark_period_count <= 0:
-        reasons.append("126거래일 벤치마크 비교 구간이 없습니다")
+        reasons.append(
+            f"{BENCHMARK_EVALUATION_PERIOD_DAYS}거래일 벤치마크 비교 구간이 없습니다"
+        )
     elif metrics.benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:
         reasons.append(
             "전체 구간의 벤치마크 패배 비율 "

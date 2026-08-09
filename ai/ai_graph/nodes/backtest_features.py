@@ -5,6 +5,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite, sqrt
+import re
 from typing import Any
 
 import numpy as np
@@ -87,6 +88,18 @@ class PreparedFeatureStore:
         self.dates = tuple(str(row.get("date") or "") for row in self.rows)
         self.tickers = tuple(str(row.get("ticker") or "000000").zfill(6) for row in self.rows)
         self.close = np.asarray([float(row["close"]) for row in self.rows], dtype=np.float64)
+        self.open = np.asarray(
+            [float(row.get("open", row["close"]) or row["close"]) for row in self.rows],
+            dtype=np.float64,
+        )
+        self.high = np.asarray(
+            [float(row.get("high", row["close"]) or row["close"]) for row in self.rows],
+            dtype=np.float64,
+        )
+        self.low = np.asarray(
+            [float(row.get("low", row["close"]) or row["close"]) for row in self.rows],
+            dtype=np.float64,
+        )
         self.volume = np.asarray(
             [float(row.get("volume", 0.0) or 0.0) for row in self.rows],
             dtype=np.float64,
@@ -100,6 +113,9 @@ class PreparedFeatureStore:
             dtype=np.float64,
         )
         self.close.setflags(write=False)
+        self.open.setflags(write=False)
+        self.high.setflags(write=False)
+        self.low.setflags(write=False)
         self.volume.setflags(write=False)
         self.rsi.setflags(write=False)
         groups: dict[str, list[int]] = {}
@@ -135,6 +151,9 @@ class PreparedFeatureStore:
     def stats(self) -> FeaturePreparationStats:
         estimated = (
             self.close.nbytes
+            + self.open.nbytes
+            + self.high.nbytes
+            + self.low.nbytes
             + self.volume.nbytes
             + self.rsi.nbytes
             + sum(value.nbytes for value in self._lookback_cache.values())
@@ -650,6 +669,7 @@ class PreparedFeatureStore:
         parameters: CandidateParameters,
     ) -> array:
         actions = array("b", [0]) * len(self.rows)
+        # in_position, entry_price, highest_close_since_entry
         states: dict[str, list[float | bool]] = {}
         entry_conditions = [
             item for item in strategy_ir.entry_conditions if item.universe_rank_pct is None
@@ -660,29 +680,46 @@ class PreparedFeatureStore:
         exit_conditions = [
             item for item in strategy_ir.exit_conditions if item.universe_rank_pct is None
         ]
-        for start, end in self.date_ranges:
-            entries: list[tuple[int, str, float]] = []
+        for date_number, (start, end) in enumerate(self.date_ranges):
+            eligible: list[tuple[int, str, float, float]] = []
             exits: list[tuple[int, str]] = []
             for index in range(start, end):
                 ticker = self.tickers[index]
                 close = self.close[index]
-                state = states.setdefault(ticker, [False, 0.0])
-                if bool(state[0]):
+                state = states.setdefault(ticker, [False, 0.0, 0.0])
+                in_position = bool(state[0])
+                if in_position:
+                    state[2] = max(float(state[2]), close)
+                matches_entry = all(
+                    self._condition_matches(condition, index)
+                    for condition in entry_conditions
+                )
+                if matches_entry:
+                    score = 0.0
+                    if strategy_ir.ranking_metric:
+                        measured = self._current_metric(strategy_ir.ranking_metric, index)
+                        if measured is None:
+                            matches_entry = False
+                        else:
+                            score = measured
+                    if matches_entry:
+                        eligible.append((index, ticker, close, score))
+                if in_position:
                     exit_match = bool(exit_conditions) and all(
                         self._condition_matches(condition, index) for condition in exit_conditions
                     )
                     entry_price = float(state[1])
                     pnl = close / entry_price - 1.0 if entry_price else 0.0
+                    trailing_stop = float(state[2]) > 0.0 and close < float(state[2]) * (
+                        1.0 - parameters.trailing_stop_pct
+                    )
                     if (
                         exit_match
                         or pnl <= -parameters.stop_loss_pct
                         or pnl >= parameters.take_profit_pct
+                        or trailing_stop
                     ):
                         exits.append((index, ticker))
-                elif all(
-                    self._condition_matches(condition, index) for condition in entry_conditions
-                ):
-                    entries.append((index, ticker, close))
 
             for condition in rank_conditions:
                 scored: list[tuple[str, float]] = []
@@ -700,17 +737,48 @@ class PreparedFeatureStore:
                     int(len(scored) * float(condition.universe_rank_pct or 0.0)),
                 )
                 kept = {ticker for ticker, _ in scored[:cutoff]}
-                entries = [entry for entry in entries if entry[1] in kept]
+                eligible = [entry for entry in eligible if entry[1] in kept]
 
+            if strategy_ir.ranking_metric:
+                eligible.sort(
+                    key=lambda item: (item[3], item[1]),
+                    reverse=strategy_ir.ranking_direction == "desc",
+                )
+            rotation_day = (
+                strategy_ir.execution_mode == "scheduled_rotation"
+                and date_number % parameters.rebalance_interval_days == 0
+            )
+            target = {
+                item[1] for item in eligible[: parameters.max_positions]
+            } if rotation_day else set()
+            if rotation_day:
+                for index in range(start, end):
+                    ticker = self.tickers[index]
+                    if bool(states.setdefault(ticker, [False, 0.0, 0.0])[0]) and ticker not in target:
+                        exits.append((index, ticker))
+
+            exited: set[str] = set()
             for index, ticker in exits:
+                if ticker in exited or not bool(states[ticker][0]):
+                    continue
                 actions[index] = -1
-                states[ticker] = [False, 0.0]
+                states[ticker] = [False, 0.0, 0.0]
+                exited.add(ticker)
             held = sum(1 for state in states.values() if bool(state[0]))
-            for index, ticker, close in entries:
+            entries = (
+                [item for item in eligible if item[1] in target]
+                if strategy_ir.execution_mode == "scheduled_rotation"
+                else eligible
+            )
+            if strategy_ir.execution_mode == "scheduled_rotation" and not rotation_day:
+                entries = []
+            for index, ticker, close, _ in entries:
                 if held >= parameters.max_positions:
                     break
+                if ticker in exited or bool(states[ticker][0]):
+                    continue
                 actions[index] = 1
-                states[ticker] = [True, close]
+                states[ticker] = [True, close, close]
                 held += 1
         return actions
 
@@ -871,10 +939,20 @@ class PreparedFeatureStore:
             return cached
         if normalized in {"price", "close"}:
             return self.close
+        if normalized == "open":
+            return self.open
+        if normalized == "high":
+            return self.high
+        if normalized == "low":
+            return self.low
         if normalized == "volume":
             return self.volume
         if normalized == "rsi":
-            return self.rsi
+            computed = self._rsi_series(14)
+            series = np.where(np.isfinite(self.rsi), self.rsi, computed)
+            series.setflags(write=False)
+            self._metric_cache[normalized] = series
+            return series
         ratio = derived_ratio(metric)
         if ratio is not None:
             series = self._derived_ratio_series(ratio)
@@ -885,6 +963,25 @@ class PreparedFeatureStore:
             series = self._derived_from_bars(spec)
             self._metric_cache[normalized] = series
             return series
+        catalog_series = self._catalog_metric_series(normalized)
+        if catalog_series is not None:
+            # Point-in-time warehouse indicators are authoritative when present; the
+            # OHLCV implementation fills only missing values.  This preserves exact
+            # production indicator policy while keeping the catalog executable on raw
+            # OHLCV fixtures and preventing the old "missing means neutral" fallback.
+            row_series = self._row_metric_series(metric, normalized)
+            if np.any(np.isfinite(row_series)):
+                catalog_series = np.where(
+                    np.isfinite(row_series), row_series, catalog_series
+                )
+            catalog_series.setflags(write=False)
+            self._metric_cache[normalized] = catalog_series
+            return catalog_series
+        source = self._row_metric_series(metric, normalized)
+        self._metric_cache[normalized] = source
+        return source
+
+    def _row_metric_series(self, metric: str, normalized: str) -> np.ndarray:
         values: list[float] = []
         for row in self.rows:
             raw = row.get(metric)
@@ -897,8 +994,655 @@ class PreparedFeatureStore:
             values.append(parsed if isfinite(parsed) else np.nan)
         source = np.asarray(values, dtype=np.float64)
         source.setflags(write=False)
-        self._metric_cache[normalized] = source
         return source
+
+    def _catalog_metric_series(self, name: str) -> np.ndarray | None:
+        """Derive every V2 catalog metric from same-day-and-earlier OHLCV only."""
+
+        match = re.fullmatch(r"return_(\d+)d", name)
+        if match:
+            return self._period_return(int(match.group(1)))
+        if name == "momentum_12_1":
+            return self._skip_month_momentum()
+        match = re.fullmatch(r"sma_?(\d+)", name)
+        if match:
+            return self._inclusive_rolling(self.close, int(match.group(1)), "avg")
+        match = re.fullmatch(r"ema_?(\d+)", name)
+        if match:
+            return self._ema(self.close, int(match.group(1)))
+        match = re.fullmatch(r"close_to_high_(\d+)", name)
+        if match:
+            high = self._inclusive_rolling(self.close, int(match.group(1)), "max")
+            return _array_ratio(self.close, high)
+        match = re.fullmatch(r"sharpe_(\d+)", name)
+        if match:
+            return self._return_ratio(int(match.group(1)), downside=False)
+        match = re.fullmatch(r"sortino_(\d+)", name)
+        if match:
+            return self._return_ratio(int(match.group(1)), downside=True)
+        match = re.fullmatch(r"return_vol_ratio_(\d+)", name)
+        if match:
+            window = int(match.group(1))
+            returns = self._period_return(window)
+            volatility = self._realized_volatility(window)
+            return _array_ratio(returns, volatility)
+        match = re.fullmatch(r"price_volume_score_(\d+)", name)
+        if match:
+            window = int(match.group(1))
+            returns = self._period_return(window)
+            volume_ratio = self._volume_ratio(20)
+            return returns * (0.5 + np.nan_to_num(volume_ratio, nan=0.0))
+        if name == "momentum_blend":
+            return (
+                0.5 * self._period_return(63)
+                + 0.3 * self._period_return(126)
+                + 0.2 * self._period_return(252)
+            )
+        if name in {"macd", "macd_signal", "macd_hist"}:
+            return self._macd_series(name)
+        if name in {"ppo", "ppo_signal", "ppo_hist"}:
+            return self._ppo_series(name, self.close)
+        match = re.fullmatch(r"(adx|plus_di|minus_di)_(\d+)", name)
+        if match:
+            return self._directional_movement(int(match.group(2)), match.group(1))
+        match = re.fullmatch(r"aroon_(up|down)_(\d+)", name)
+        if match:
+            return self._aroon(int(match.group(2)), match.group(1))
+        match = re.fullmatch(r"(slope|r_squared)_(\d+)", name)
+        if match:
+            return self._regression(self.close, int(match.group(2)), match.group(1))
+        match = re.fullmatch(r"efficiency_ratio_(\d+)", name)
+        if match:
+            return self._efficiency_ratio(int(match.group(1)))
+        match = re.fullmatch(r"trix_(\d+)", name)
+        if match:
+            return self._trix(int(match.group(1)))
+        if name == "trix_signal_9":
+            return self._ema(self._metric_series("trix_15"), 9)
+        if name == "supertrend_direction_10_3":
+            return self._supertrend_direction(10, 3.0)
+        match = re.fullmatch(r"donchian_(high|low)_(\d+)", name)
+        if match:
+            source = self.high if match.group(1) == "high" else self.low
+            aggregate = "max" if match.group(1) == "high" else "min"
+            return self._rolling_from_array(
+                source,
+                int(match.group(2)),
+                aggregate,
+                prior=True,
+            )
+        match = re.fullmatch(r"bollinger_(upper|lower|middle|width|pct)_(\d+)", name)
+        if match:
+            return self._bollinger(int(match.group(2)), match.group(1))
+        match = re.fullmatch(r"keltner_(upper|lower)_(\d+)", name)
+        if match:
+            middle = self._ema(self.close, int(match.group(2)))
+            atr = self._atr(10)
+            return middle + (2.0 * atr if match.group(1) == "upper" else -2.0 * atr)
+        match = re.fullmatch(r"atr_expansion_(\d+)", name)
+        if match:
+            return _array_ratio(self._true_range(), self._atr(int(match.group(1))))
+        match = re.fullmatch(r"atr_trailing_floor_(\d+)", name)
+        if match:
+            window = int(match.group(1))
+            return self._metric_series(f"donchian_high_{window}") - 3.0 * self._atr(window)
+        if name == "squeeze_breakout":
+            width = self._metric_series("bollinger_width_20")
+            usual_width = self._rolling_from_array(width, 120, "avg", prior=True)
+            high = self._metric_series("donchian_high_20")
+            return ((width < 0.6 * usual_width) & (self.close > high)).astype(np.float64)
+        if name == "nr7_breakout":
+            return self._nr7_breakout()
+        if name == "inside_bar_breakout":
+            return self._inside_bar_breakout()
+        if name == "outside_bar_continuation":
+            previous_high = self._shift(self.high, 1)
+            previous_low = self._shift(self.low, 1)
+            return (
+                (self.high > previous_high)
+                & (self.low < previous_low)
+                & (self.close > self.open)
+            ).astype(np.float64)
+        if name == "gap_pct":
+            return _array_return(self.open, self._shift(self.close, 1))
+        if name == "gap_up_volume_breakout":
+            gap = self._metric_series("gap_pct")
+            volume_ratio = self._volume_ratio(20)
+            return (
+                (gap > 0.02) & (self.close > self.open) & (volume_ratio > 1.5)
+            ).astype(np.float64)
+        if name == "range_expansion_breakout":
+            expansion = self._metric_series("atr_expansion_20")
+            high = self._metric_series("donchian_high_20")
+            location = _array_ratio(self.close - self.low, self.high - self.low)
+            return (
+                (expansion > 1.5) & (location > 0.8) & (self.close > high)
+            ).astype(np.float64)
+        match = re.fullmatch(r"price_zscore_(\d+)", name)
+        if match:
+            window = int(match.group(1))
+            mean = self._inclusive_rolling(self.close, window, "avg")
+            std = self._inclusive_rolling(self.close, window, "std")
+            return _array_ratio(self.close - mean, std)
+        match = re.fullmatch(r"stoch_k_(\d+)", name)
+        if match:
+            return self._stochastic(int(match.group(1)))
+        if name == "stoch_d_3":
+            return self._rolling_from_array(self._metric_series("stoch_k_14"), 3, "avg")
+        match = re.fullmatch(r"williams_r_(\d+)", name)
+        if match:
+            window = int(match.group(1))
+            high = self._inclusive_rolling(self.high, window, "max")
+            low = self._inclusive_rolling(self.low, window, "min")
+            return -100.0 * _array_ratio(high - self.close, high - low)
+        match = re.fullmatch(r"cci_(\d+)", name)
+        if match:
+            return self._cci(int(match.group(1)))
+        match = re.fullmatch(r"mfi_(\d+)", name)
+        if match:
+            return self._mfi(int(match.group(1)))
+        match = re.fullmatch(r"close_to_vwap_(\d+)", name)
+        if match:
+            return _array_ratio(self.close, self._vwap(int(match.group(1))))
+        if name == "loss_streak":
+            return self._loss_streak()
+        if name == "obv":
+            return self._obv()
+        match = re.fullmatch(r"obv_slope_(\d+)", name)
+        if match:
+            return self._regression(self._metric_series("obv"), int(match.group(1)), "slope_raw")
+        match = re.fullmatch(r"cmf_(\d+)", name)
+        if match:
+            return self._cmf(int(match.group(1)))
+        if name == "adl":
+            return self._adl()
+        match = re.fullmatch(r"adl_slope_(\d+)", name)
+        if match:
+            return self._regression(self._metric_series("adl"), int(match.group(1)), "slope_raw")
+        if name in {"pvi", "nvi"}:
+            return self._volume_index(positive=name == "pvi")
+        if name in {"pvi_sma_100", "nvi_sma_100"}:
+            return self._rolling_from_array(self._metric_series(name[:3]), 100, "avg")
+        if name in {"pvi_trend_gap", "nvi_trend_gap"}:
+            base = name[:3]
+            return self._metric_series(base) - self._metric_series(f"{base}_sma_100")
+        match = re.fullmatch(r"force_index_(\d+)", name)
+        if match:
+            raw = (self.close - self._shift(self.close, 1)) * self.volume
+            return self._ema(raw, int(match.group(1)))
+        match = re.fullmatch(r"eom_(\d+)", name)
+        if match:
+            midpoint = (self.high + self.low) / 2.0
+            raw = _array_ratio(
+                (midpoint - self._shift(midpoint, 1)) * (self.high - self.low),
+                self.volume,
+            )
+            return self._rolling_from_array(raw, int(match.group(1)), "avg")
+        if name in {"pvo", "pvo_signal", "pvo_hist"}:
+            return self._ppo_series(name, self.volume, prefix="pvo")
+        match = re.fullmatch(r"ulcer_index_(\d+)", name)
+        if match:
+            return self._ulcer_index(int(match.group(1)))
+        match = re.fullmatch(r"drawdown_(\d+)", name)
+        if match:
+            peak = self._inclusive_rolling(self.close, int(match.group(1)), "max")
+            return _array_return(self.close, peak)
+        match = re.fullmatch(r"drawdown_recovery_(\d+)", name)
+        if match:
+            drawdown = np.abs(self._metric_series(f"drawdown_{match.group(1)}"))
+            return _array_ratio(self._period_return(20), drawdown)
+        return None
+
+    def _period_return(self, window: int) -> np.ndarray:
+        return _array_return(self.close, self._shift(self.close, window))
+
+    def _skip_month_momentum(self) -> np.ndarray:
+        past_month = self._shift(self.close, 21)
+        year_ago = self._shift(self.close, 252)
+        return _array_return(past_month, year_ago)
+
+    def _shift(self, source: np.ndarray, periods: int) -> np.ndarray:
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            if len(indices) > periods:
+                output[indices[periods:]] = source[indices[:-periods]]
+        return output
+
+    def _inclusive_rolling(
+        self, source: np.ndarray, window: int, aggregate: str
+    ) -> np.ndarray:
+        return self._rolling_from_array(source, window, aggregate, prior=False)
+
+    def _rolling_from_array(
+        self,
+        source: np.ndarray,
+        window: int,
+        aggregate: str,
+        *,
+        prior: bool = False,
+    ) -> np.ndarray:
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            values = source[indices]
+            if prior:
+                values = np.concatenate(([np.nan], values[:-1]))
+            if len(values) < window:
+                continue
+            windows = sliding_window_view(values, window)
+            finite = np.all(np.isfinite(windows), axis=1)
+            if aggregate == "avg":
+                reduced = np.mean(windows, axis=1)
+            elif aggregate == "sum":
+                reduced = np.sum(windows, axis=1)
+            elif aggregate == "max":
+                reduced = np.max(windows, axis=1)
+            elif aggregate == "min":
+                reduced = np.min(windows, axis=1)
+            elif aggregate == "std":
+                reduced = np.std(windows, axis=1, ddof=0)
+            else:
+                raise ValueError(f"unsupported rolling aggregate: {aggregate}")
+            reduced = np.where(finite, reduced, np.nan)
+            output[indices[window - 1 :]] = reduced
+        return output
+
+    def _ema(self, source: np.ndarray, period: int) -> np.ndarray:
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        alpha = 2.0 / (period + 1.0)
+        for indices in self.indices_by_ticker.values():
+            values = source[indices]
+            finite_positions = np.flatnonzero(np.isfinite(values))
+            if finite_positions.size < period:
+                continue
+            seed_positions = finite_positions[:period]
+            if int(seed_positions[-1] - seed_positions[0]) != period - 1:
+                continue
+            seed_at = int(seed_positions[-1])
+            ema = float(np.mean(values[seed_positions]))
+            output[indices[seed_at]] = ema
+            for position in range(seed_at + 1, len(indices)):
+                value = values[position]
+                if not isfinite(float(value)):
+                    continue
+                ema = alpha * float(value) + (1.0 - alpha) * ema
+                output[indices[position]] = ema
+        return output
+
+    def _wilder(self, source: np.ndarray, period: int) -> np.ndarray:
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            values = source[indices]
+            finite_positions = np.flatnonzero(np.isfinite(values))
+            if finite_positions.size < period:
+                continue
+            seed_positions = finite_positions[:period]
+            if int(seed_positions[-1] - seed_positions[0]) != period - 1:
+                continue
+            seed_at = int(seed_positions[-1])
+            average = float(np.mean(values[seed_positions]))
+            output[indices[seed_at]] = average
+            for position in range(seed_at + 1, len(indices)):
+                value = float(values[position])
+                if not isfinite(value):
+                    continue
+                average = (average * (period - 1) + value) / period
+                output[indices[position]] = average
+        return output
+
+    def _realized_volatility(self, window: int) -> np.ndarray:
+        returns = self._daily_returns()
+        std = self._rolling_from_array(returns, window, "std")
+        return std * sqrt(252)
+
+    def _return_ratio(self, window: int, *, downside: bool) -> np.ndarray:
+        returns = self._daily_returns()
+        mean = self._rolling_from_array(returns, window, "avg")
+        if not downside:
+            risk = self._rolling_from_array(returns, window, "std")
+        else:
+            downside_returns = np.minimum(np.nan_to_num(returns, nan=np.nan), 0.0)
+            squared = downside_returns * downside_returns
+            risk = np.sqrt(self._rolling_from_array(squared, window, "avg"))
+        return _array_ratio(mean, risk) * sqrt(252)
+
+    def _volume_ratio(self, window: int) -> np.ndarray:
+        average = self._rolling_from_array(self.volume, window, "avg", prior=True)
+        return _array_ratio(self.volume, average)
+
+    def _macd_series(self, name: str) -> np.ndarray:
+        fast = self._ema(self.close, 12)
+        slow = self._ema(self.close, 26)
+        line = fast - slow
+        signal = self._ema(line, 9)
+        values = {"macd": line, "macd_signal": signal, "macd_hist": line - signal}
+        for key, value in values.items():
+            value.setflags(write=False)
+            self._metric_cache.setdefault(key, value)
+        return values[name]
+
+    def _ppo_series(
+        self, name: str, source: np.ndarray, *, prefix: str = "ppo"
+    ) -> np.ndarray:
+        fast = self._ema(source, 12)
+        slow = self._ema(source, 26)
+        line = 100.0 * _array_ratio(fast - slow, slow)
+        signal = self._ema(line, 9)
+        values = {
+            prefix: line,
+            f"{prefix}_signal": signal,
+            f"{prefix}_hist": line - signal,
+        }
+        for key, value in values.items():
+            value.setflags(write=False)
+            self._metric_cache.setdefault(key, value)
+        return values[name]
+
+    def _true_range(self) -> np.ndarray:
+        cached = self._metric_cache.get("__true_range__")
+        if cached is not None:
+            return cached
+        previous_close = self._shift(self.close, 1)
+        output = np.maximum(
+            self.high - self.low,
+            np.maximum(np.abs(self.high - previous_close), np.abs(self.low - previous_close)),
+        )
+        missing_previous = ~np.isfinite(previous_close)
+        output[missing_previous] = self.high[missing_previous] - self.low[missing_previous]
+        output.setflags(write=False)
+        self._metric_cache["__true_range__"] = output
+        return output
+
+    def _atr(self, period: int) -> np.ndarray:
+        key = f"atr_{period}"
+        cached = self._metric_cache.get(key)
+        if cached is not None:
+            return cached
+        output = self._wilder(self._true_range(), period)
+        output.setflags(write=False)
+        self._metric_cache[key] = output
+        return output
+
+    def _directional_movement(self, period: int, requested: str) -> np.ndarray:
+        keys = {item: f"{item}_{period}" for item in ("adx", "plus_di", "minus_di")}
+        cached = self._metric_cache.get(keys[requested])
+        if cached is not None:
+            return cached
+        previous_high = self._shift(self.high, 1)
+        previous_low = self._shift(self.low, 1)
+        up = self.high - previous_high
+        down = previous_low - self.low
+        plus_dm = np.where((up > down) & (up > 0.0), up, 0.0)
+        minus_dm = np.where((down > up) & (down > 0.0), down, 0.0)
+        atr = self._atr(period)
+        plus_di = 100.0 * _array_ratio(self._wilder(plus_dm, period), atr)
+        minus_di = 100.0 * _array_ratio(self._wilder(minus_dm, period), atr)
+        dx = 100.0 * _array_ratio(np.abs(plus_di - minus_di), plus_di + minus_di)
+        adx = self._wilder(dx, period)
+        values = {"adx": adx, "plus_di": plus_di, "minus_di": minus_di}
+        for item, value in values.items():
+            value.setflags(write=False)
+            self._metric_cache[keys[item]] = value
+        return values[requested]
+
+    def _aroon(self, window: int, direction: str) -> np.ndarray:
+        source = self.high if direction == "up" else self.low
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            values = source[indices]
+            if len(values) < window:
+                continue
+            windows = sliding_window_view(values, window)
+            if direction == "up":
+                positions = window - 1 - np.argmax(windows[:, ::-1], axis=1)
+            else:
+                positions = window - 1 - np.argmin(windows[:, ::-1], axis=1)
+            output[indices[window - 1 :]] = 100.0 * positions / max(1, window - 1)
+        return output
+
+    def _regression(self, source: np.ndarray, window: int, kind: str) -> np.ndarray:
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        x = np.arange(window, dtype=np.float64)
+        centered_x = x - float(x.mean())
+        denominator = float(np.sum(centered_x * centered_x))
+        for indices in self.indices_by_ticker.values():
+            values = source[indices]
+            if len(values) < window:
+                continue
+            windows = sliding_window_view(values, window)
+            finite = np.all(np.isfinite(windows), axis=1)
+            means = np.mean(windows, axis=1)
+            slopes = np.sum((windows - means[:, None]) * centered_x, axis=1) / denominator
+            if kind == "slope":
+                result = _array_ratio(slopes, means)
+            elif kind == "slope_raw":
+                result = slopes
+            else:
+                fitted = means[:, None] + slopes[:, None] * centered_x
+                residual = np.sum((windows - fitted) ** 2, axis=1)
+                total = np.sum((windows - means[:, None]) ** 2, axis=1)
+                result = 1.0 - _array_ratio(residual, total)
+            result = np.where(finite, result, np.nan)
+            output[indices[window - 1 :]] = result
+        return output
+
+    def _efficiency_ratio(self, window: int) -> np.ndarray:
+        direction = np.abs(self.close - self._shift(self.close, window))
+        changes = np.abs(self.close - self._shift(self.close, 1))
+        distance = self._rolling_from_array(changes, window, "sum")
+        return _array_ratio(direction, distance)
+
+    def _trix(self, period: int) -> np.ndarray:
+        first = self._ema(self.close, period)
+        second = self._ema(first, period)
+        third = self._ema(second, period)
+        return 100.0 * _array_return(third, self._shift(third, 1))
+
+    def _supertrend_direction(self, period: int, multiplier: float) -> np.ndarray:
+        atr = self._atr(period)
+        midpoint = (self.high + self.low) / 2.0
+        upper = midpoint + multiplier * atr
+        lower = midpoint - multiplier * atr
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            local_upper = upper[indices].copy()
+            local_lower = lower[indices].copy()
+            closes = self.close[indices]
+            direction = 1.0
+            for position in range(len(indices)):
+                if not isfinite(float(local_upper[position])):
+                    continue
+                if position > 0 and isfinite(float(local_upper[position - 1])):
+                    if closes[position - 1] <= local_upper[position - 1]:
+                        local_upper[position] = min(local_upper[position], local_upper[position - 1])
+                    if closes[position - 1] >= local_lower[position - 1]:
+                        local_lower[position] = max(local_lower[position], local_lower[position - 1])
+                    if direction < 0.0 and closes[position] > local_upper[position - 1]:
+                        direction = 1.0
+                    elif direction > 0.0 and closes[position] < local_lower[position - 1]:
+                        direction = -1.0
+                output[indices[position]] = direction
+        return output
+
+    def _bollinger(self, window: int, part: str) -> np.ndarray:
+        middle = self._inclusive_rolling(self.close, window, "avg")
+        std = self._inclusive_rolling(self.close, window, "std")
+        upper = middle + 2.0 * std
+        lower = middle - 2.0 * std
+        values = {
+            "upper": upper,
+            "lower": lower,
+            "middle": middle,
+            "width": _array_ratio(upper - lower, middle),
+            "pct": _array_ratio(self.close - lower, upper - lower),
+        }
+        return values[part]
+
+    def _nr7_breakout(self) -> np.ndarray:
+        output = np.zeros(len(self.rows), dtype=np.float64)
+        ranges = self.high - self.low
+        for indices in self.indices_by_ticker.values():
+            for position in range(7, len(indices)):
+                previous = position - 1
+                prior_ranges = ranges[indices[position - 7 : position]]
+                if ranges[indices[previous]] <= float(np.min(prior_ranges)) and (
+                    self.close[indices[position]] > self.high[indices[previous]]
+                ):
+                    output[indices[position]] = 1.0
+        return output
+
+    def _inside_bar_breakout(self) -> np.ndarray:
+        output = np.zeros(len(self.rows), dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            for position in range(2, len(indices)):
+                current = indices[position]
+                previous = indices[position - 1]
+                before = indices[position - 2]
+                if (
+                    self.high[previous] < self.high[before]
+                    and self.low[previous] > self.low[before]
+                    and self.close[current] > self.high[previous]
+                ):
+                    output[current] = 1.0
+        return output
+
+    def _rsi_series(self, period: int) -> np.ndarray:
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            closes = self.close[indices]
+            if len(closes) <= period:
+                continue
+            changes = np.diff(closes)
+            gains = np.maximum(changes, 0.0)
+            losses = np.maximum(-changes, 0.0)
+            average_gain = float(np.mean(gains[:period]))
+            average_loss = float(np.mean(losses[:period]))
+
+            def value() -> float:
+                if average_loss == 0.0:
+                    return 100.0 if average_gain > 0.0 else 50.0
+                relative_strength = average_gain / average_loss
+                return 100.0 - 100.0 / (1.0 + relative_strength)
+
+            output[indices[period]] = value()
+            for position in range(period + 1, len(indices)):
+                change_index = position - 1
+                average_gain = (
+                    average_gain * (period - 1) + float(gains[change_index])
+                ) / period
+                average_loss = (
+                    average_loss * (period - 1) + float(losses[change_index])
+                ) / period
+                output[indices[position]] = value()
+        return output
+
+    def _stochastic(self, window: int) -> np.ndarray:
+        high = self._inclusive_rolling(self.high, window, "max")
+        low = self._inclusive_rolling(self.low, window, "min")
+        return 100.0 * _array_ratio(self.close - low, high - low)
+
+    def _cci(self, window: int) -> np.ndarray:
+        typical = (self.high + self.low + self.close) / 3.0
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            values = typical[indices]
+            if len(values) < window:
+                continue
+            windows = sliding_window_view(values, window)
+            means = np.mean(windows, axis=1)
+            deviations = np.mean(np.abs(windows - means[:, None]), axis=1)
+            output[indices[window - 1 :]] = _array_ratio(
+                values[window - 1 :] - means,
+                0.015 * deviations,
+            )
+        return output
+
+    def _mfi(self, window: int) -> np.ndarray:
+        typical = (self.high + self.low + self.close) / 3.0
+        previous = self._shift(typical, 1)
+        money = typical * self.volume
+        positive = np.where(typical > previous, money, 0.0)
+        negative = np.where(typical < previous, money, 0.0)
+        positive_sum = self._rolling_from_array(positive, window, "sum")
+        negative_sum = self._rolling_from_array(negative, window, "sum")
+        ratio = _array_ratio(positive_sum, negative_sum)
+        output = 100.0 - 100.0 / (1.0 + ratio)
+        output[(negative_sum == 0.0) & (positive_sum > 0.0)] = 100.0
+        return output
+
+    def _vwap(self, window: int) -> np.ndarray:
+        typical = (self.high + self.low + self.close) / 3.0
+        numerator = self._rolling_from_array(typical * self.volume, window, "sum")
+        denominator = self._rolling_from_array(self.volume, window, "sum")
+        return _array_ratio(numerator, denominator)
+
+    def _loss_streak(self) -> np.ndarray:
+        output = np.zeros(len(self.rows), dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            streak = 0
+            for position in range(1, len(indices)):
+                current = indices[position]
+                previous = indices[position - 1]
+                streak = streak + 1 if self.close[current] < self.close[previous] else 0
+                output[current] = float(streak)
+        return output
+
+    def _obv(self) -> np.ndarray:
+        output = np.zeros(len(self.rows), dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            value = 0.0
+            for position in range(1, len(indices)):
+                current = indices[position]
+                previous = indices[position - 1]
+                value += float(np.sign(self.close[current] - self.close[previous])) * self.volume[current]
+                output[current] = value
+        return output
+
+    def _money_flow_multiplier(self) -> np.ndarray:
+        return _array_ratio(2.0 * self.close - self.high - self.low, self.high - self.low)
+
+    def _cmf(self, window: int) -> np.ndarray:
+        flow = self._money_flow_multiplier() * self.volume
+        return _array_ratio(
+            self._rolling_from_array(flow, window, "sum"),
+            self._rolling_from_array(self.volume, window, "sum"),
+        )
+
+    def _adl(self) -> np.ndarray:
+        flow = np.nan_to_num(self._money_flow_multiplier(), nan=0.0) * self.volume
+        output = np.zeros(len(self.rows), dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            output[indices] = np.cumsum(flow[indices])
+        return output
+
+    def _volume_index(self, *, positive: bool) -> np.ndarray:
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            value = 1000.0
+            if len(indices):
+                output[indices[0]] = value
+            for position in range(1, len(indices)):
+                current = indices[position]
+                previous = indices[position - 1]
+                volume_matches = (
+                    self.volume[current] > self.volume[previous]
+                    if positive
+                    else self.volume[current] < self.volume[previous]
+                )
+                if volume_matches and self.close[previous] != 0.0:
+                    value *= self.close[current] / self.close[previous]
+                output[current] = value
+        return output
+
+    def _ulcer_index(self, window: int) -> np.ndarray:
+        output = np.full(len(self.rows), np.nan, dtype=np.float64)
+        for indices in self.indices_by_ticker.values():
+            values = self.close[indices]
+            for position in range(window - 1, len(indices)):
+                sample = values[position - window + 1 : position + 1]
+                peaks = np.maximum.accumulate(sample)
+                drawdowns = 100.0 * (sample / peaks - 1.0)
+                output[indices[position]] = sqrt(float(np.mean(drawdowns * drawdowns)))
+        return output
 
     def _derived_ratio_series(self, ratio: tuple[str, str, int]) -> np.ndarray:
         """A ratio metric like volume_ratio_20, evaluated the compiler's way.
@@ -1105,6 +1849,25 @@ def _safe_return(values: np.ndarray, bases: np.ndarray) -> np.ndarray:
     output = np.zeros(len(values), dtype=np.float64)
     valid = bases != 0.0
     output[valid] = values[valid] / bases[valid] - 1.0
+    return output
+
+
+def _array_ratio(numerators: np.ndarray, denominators: np.ndarray) -> np.ndarray:
+    """NaN-preserving division used by the catalog's indicator formulas."""
+
+    output = np.full(np.shape(numerators), np.nan, dtype=np.float64)
+    valid = (
+        np.isfinite(numerators)
+        & np.isfinite(denominators)
+        & (denominators != 0.0)
+    )
+    np.divide(numerators, denominators, out=output, where=valid)
+    return output
+
+
+def _array_return(values: np.ndarray, bases: np.ndarray) -> np.ndarray:
+    output = _array_ratio(values, bases)
+    output[np.isfinite(output)] -= 1.0
     return output
 
 
