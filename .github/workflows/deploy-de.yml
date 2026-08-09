@@ -80,6 +80,8 @@ jobs:
             set -euo pipefail
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             cd "$APP_DIR/DE"
+            docker compose -f compose.yaml up -d --wait db
+            test "$(docker compose -f compose.yaml exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SHOW max_locks_per_transaction"')" = 1024
             docker compose -f docker-compose-airflow-dev.yaml down
             docker compose -f docker-compose-airflow-dev.yaml up -d --build
           REMOTE
