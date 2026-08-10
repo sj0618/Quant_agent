@@ -42,3 +42,11 @@ def test_data_sources_can_switch_to_db_test_variant() -> None:
     assert module.ACTIVE_DATA_SOURCE_VARIANT == "db_test"
     assert module.PostgresPipelineDataSource.__module__.endswith(".db_test")
     assert module.load_pipeline_data_from_env.__module__.endswith(".db_test")
+
+
+def test_data_sources_can_switch_to_profile_aware_variant() -> None:
+    module = _load_data_sources_module("profile_aware")
+
+    assert module.ACTIVE_DATA_SOURCE_VARIANT == "profile_aware"
+    assert module.PostgresPipelineDataSource.__module__.endswith(".profile_aware")
+    assert module.load_pipeline_data_from_env.__module__.endswith(".profile_aware")
