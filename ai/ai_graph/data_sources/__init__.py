@@ -10,6 +10,7 @@ _DEFAULT_DATA_SOURCE_VARIANT = "db"
 _DATA_SOURCE_VARIANT_ALIASES = {
     "benchmark": "db_test",
     "db": "db",
+    "db_split": "db_split",
     "db_test": "db_test",
     "fast": "db_test",
     "test": "db_test",
