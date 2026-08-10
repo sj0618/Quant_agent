@@ -12,6 +12,7 @@ _DATA_SOURCE_VARIANT_ALIASES = {
     "db": "db",
     "db_split": "db_split",
     "db_test": "db_test",
+    "db_test_profile_aware": "profile_aware",
     "profile_aware": "profile_aware",
     "fast": "db_test",
     "test": "db_test",
