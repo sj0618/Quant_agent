@@ -19,15 +19,26 @@ from .db import *  # noqa: F401,F403 - re-export the baseline public API
 from .db import (
     DATABASE_DSN_ENV_CANDIDATES,
     DataSourceConfig,
-    INDICATOR_FIELDS,
+    INDICATOR_FAMILY_BY_METRIC,
+    KIS_ADJUSTED_OHLCV_TABLE,
     KIS_FEATURE_FRAME_VIEW,
+    SYMBOL_MASTER_TABLE,
+    TA_MOMENTUM_TICKER_TABLE,
+    TA_TREND_TICKER_TABLE,
+    TA_VOLATILITY_TICKER_TABLE,
     PostgresPipelineDataSource as _BasePostgresPipelineDataSource,
     PipelineDataBundle,
     _fixture_bundle,
     _financial_sql,
     _mart_frame_sql,
     _optional_float_value,
-    _prev_rsi_sql,
+    _BB_BANDWIDTH_KEY,
+    _BB_BANDWIDTH_SCALE,
+    _MOMENTUM_KEYS,
+    _TREND_KEYS,
+    _VOLATILITY_KEYS,
+    _jsonb_projection,
+    _key_spellings,
 )
 
 
@@ -47,6 +58,134 @@ _FAST_PROFILE_REQUIRES_DART = {
     "quality_growth",
     "growth_momentum",
 }
+
+_FAST_PROFILE_INDICATOR_FIELDS: dict[str, tuple[str, ...]] = {
+    "rsi_rebound": ("rsi",),
+    "pullback_trend": ("sma20", "sma200"),
+    "bollinger_squeeze": ("bb_upper", "bb_width"),
+    "value_quality": (),
+    "quality_growth": (),
+    "growth_momentum": ("sma50",),
+}
+
+_FAST_PROFILE_JOIN_SPECS: dict[str, tuple[str, ...]] = {
+    "rsi_rebound": ("momentum",),
+    "pullback_trend": ("trend",),
+    "bollinger_squeeze": ("volatility",),
+    "value_quality": (),
+    "quality_growth": (),
+    "growth_momentum": ("trend",),
+}
+
+
+def _fast_profile_indicator_fields(profile: str) -> tuple[str, ...]:
+    return _FAST_PROFILE_INDICATOR_FIELDS.get(profile, ())
+
+
+def _fast_profile_indicator_families(profile: str) -> tuple[str, ...]:
+    families: list[str] = []
+    for metric in _fast_profile_indicator_fields(profile):
+        family = INDICATOR_FAMILY_BY_METRIC.get(metric)
+        if family is not None and family not in families:
+            families.append(family)
+    return tuple(families)
+
+
+def _bb_width_projection(column: str) -> str:
+    reads = ", ".join(f"{column}->>'{name}'" for name in _key_spellings(_BB_BANDWIDTH_KEY))
+    return f"(COALESCE({reads}))::numeric / {_BB_BANDWIDTH_SCALE} AS bb_width"
+
+
+def _fast_screening_frame_sql(*, sector: bool, profile: str) -> str:
+    families = _FAST_PROFILE_JOIN_SPECS.get(profile)
+    if families is None:
+        return _mart_frame_sql(sector=sector)
+
+    select_parts = [
+        "a.ticker",
+        "sm.name",
+        "sm.market_segment",
+        "sm.market_segment AS market",
+        "sm.sector",
+        'a."time" AS time',
+        "a.adj_open AS open",
+        "a.adj_high AS high",
+        "a.adj_low AS low",
+        "a.adj_close AS close",
+        "a.adj_volume AS volume",
+    ]
+    joins = [
+        f"JOIN {SYMBOL_MASTER_TABLE} sm ON sm.symbol = a.ticker",
+    ]
+    sector_predicate = "\n          AND sm.sector = %(sector)s" if sector else ""
+
+    if profile == "rsi_rebound":
+        joins.append(
+            f"LEFT JOIN {TA_MOMENTUM_TICKER_TABLE} tm "
+            "ON tm.ticker = a.ticker AND tm.\"time\" = a.\"time\""
+        )
+        select_parts.append(
+            _jsonb_projection("tm.values_jsonb", {"rsi": _MOMENTUM_KEYS["rsi"]})
+        )
+    elif profile == "pullback_trend":
+        joins.append(
+            f"LEFT JOIN {TA_TREND_TICKER_TABLE} tt "
+            "ON tt.ticker = a.ticker AND tt.\"time\" = a.\"time\""
+        )
+        select_parts.append(
+            _jsonb_projection(
+                "tt.values_jsonb",
+                {
+                    "sma20": _TREND_KEYS["sma20"],
+                    "sma200": _TREND_KEYS["sma200"],
+                },
+            )
+        )
+    elif profile == "bollinger_squeeze":
+        joins.append(
+            f"LEFT JOIN {TA_VOLATILITY_TICKER_TABLE} tv "
+            "ON tv.ticker = a.ticker AND tv.\"time\" = a.\"time\""
+        )
+        select_parts.extend(
+            [
+                _jsonb_projection("tv.values_jsonb", {"bb_upper": _VOLATILITY_KEYS["bb_upper"]}),
+                _bb_width_projection("tv.values_jsonb"),
+            ]
+        )
+    elif profile == "growth_momentum":
+        joins.append(
+            f"LEFT JOIN {TA_TREND_TICKER_TABLE} tt "
+            "ON tt.ticker = a.ticker AND tt.\"time\" = a.\"time\""
+        )
+        select_parts.append(
+            _jsonb_projection("tt.values_jsonb", {"sma50": _TREND_KEYS["sma50"]})
+        )
+
+    joins_sql = "\n        ".join(joins)
+    select_sql = ",\n            ".join(select_parts)
+    return f"""
+        SELECT DISTINCT ON (a.ticker)
+            {select_sql}
+        FROM {KIS_ADJUSTED_OHLCV_TABLE} a
+        {joins_sql}
+        WHERE a."time" = %(as_of)s::date
+          AND a.quality_flags->>'adjusted_price_method' = 'kis_official_adjusted'{sector_predicate}
+        ORDER BY a.ticker
+    """
+
+
+def _fast_prev_rsi_sql() -> str:
+    return f"""
+        SELECT DISTINCT ON (a.ticker)
+            a.ticker,
+            (tm.values_jsonb->>'{_MOMENTUM_KEYS["rsi"]}')::numeric AS prev_rsi
+        FROM {KIS_ADJUSTED_OHLCV_TABLE} a
+        LEFT JOIN {TA_MOMENTUM_TICKER_TABLE} tm
+               ON tm.ticker = a.ticker AND tm."time" = a."time"
+        WHERE a."time" = %(prev)s::date
+          AND a.quality_flags->>'adjusted_price_method' = 'kis_official_adjusted'
+        ORDER BY a.ticker
+    """
 
 
 def _proxy_ranking_score(profile: str, row: Mapping[str, Any]) -> tuple[float | None, str]:
@@ -130,7 +269,7 @@ class FastPostgresPipelineDataSource(_BasePostgresPipelineDataSource):
             return [], {"as_of_date": None, "reason": "no recent rows in the price table"}
 
         frame_rows = conn.execute(
-            _mart_frame_sql(sector=bool(sector)),
+            _fast_screening_frame_sql(sector=bool(sector), profile=profile),
             {"as_of": as_of, "sector": sector},
         ).fetchall()
 
@@ -139,7 +278,7 @@ class FastPostgresPipelineDataSource(_BasePostgresPipelineDataSource):
         if profile == "rsi_rebound" and prev_date is not None:
             prev_rsi_by_ticker = {
                 str(row["ticker"]).zfill(6): row.get("prev_rsi")
-                for row in conn.execute(_prev_rsi_sql(), {"prev": prev_date}).fetchall()
+                for row in conn.execute(_fast_prev_rsi_sql(), {"prev": prev_date}).fetchall()
             }
 
         financials_by_symbol: dict[str, Mapping[str, Any]] = {}
@@ -184,7 +323,8 @@ class FastPostgresPipelineDataSource(_BasePostgresPipelineDataSource):
             "as_of_date": as_of.isoformat(),
             "previous_trading_date": prev_date.isoformat() if prev_date else None,
             "indicator_source": KIS_FEATURE_FRAME_VIEW,
-            "indicators_read": list(INDICATOR_FIELDS),
+            "indicator_families": list(_fast_profile_indicator_families(profile)),
+            "indicators_read": list(_fast_profile_indicator_fields(profile)),
             "path_features_computed": [],
             "path_lookback_days": 0,
             "frame_rows": len(frame_rows),
