@@ -2,16 +2,16 @@
 
 This module keeps the public API of the data-source layer but exposes the
 profile-aware loader under the report-facing module name. The implementation is
-delegated to :mod:`ai_graph.data_sources.db_split`, which keeps the same public
-surface while allowing the load path to be exercised through the split-mode
-variant used by the benchmark and deployment experiments.
+delegated to :mod:`ai_graph.data_sources.db_test`, which preserves the fast
+screening path used by the benchmark and deployment experiments while keeping
+the public surface stable.
 """
 
 from __future__ import annotations
 
-from . import db_split as _impl
-from .db_split import *  # noqa: F401,F403 - re-export the benchmark public API
-from .db_split import (
+from . import db_test as _impl
+from .db_test import *  # noqa: F401,F403 - re-export the benchmark public API
+from .db_test import (
     DATABASE_DSN_ENV_CANDIDATES,
     DataSourceConfig,
     PipelineDataBundle,

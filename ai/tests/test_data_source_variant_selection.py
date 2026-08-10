@@ -50,8 +50,7 @@ def test_data_sources_can_switch_to_profile_aware_variant() -> None:
     assert module.ACTIVE_DATA_SOURCE_VARIANT == "profile_aware"
     assert module.PostgresPipelineDataSource.__module__.endswith(".profile_aware")
     assert module.load_pipeline_data_from_env.__module__.endswith(".profile_aware")
-    assert module.screening_profile.__module__.endswith(".db_split")
-    assert module.screening_data_families.__module__.endswith(".db_split")
+    assert module.PostgresPipelineDataSource.__mro__[1].__module__.endswith(".db_test")
 
 
 def test_data_sources_accept_the_report_label_alias_for_profile_aware() -> None:
