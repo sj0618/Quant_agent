@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from ai_graph.audit import RecordingAuditSink, bind_audit_context, create_audit_correlation
+from ai_graph.llm import aoai as aoai_module
 from ai_graph.llm.aoai import AOAIResponsesClient
 from ai_graph.llm.base import (
     LLMClientError,
@@ -692,3 +693,95 @@ def test_llm_factory_falls_back_to_global_model_without_role_override() -> None:
 def test_llm_factory_requires_all_aoai_env_values() -> None:
     with pytest.raises(LLMProviderConfigError):
         create_llm_client({"AI_LLM_PROVIDER": "aoai"})
+
+
+def test_response_start_deadline_measures_silence_not_thinking_time(monkeypatch) -> None:
+    """A reasoning deployment that emits progress events must not be cut off.
+
+    The deadline used to run from the start of the attempt to the first text delta, so a
+    model that searched and reasoned for longer than 10s was killed as a dead stream even
+    though it was sending events the whole time. In production that was every
+    `strategy_intent` call ever made: 13 of 13 over 14 days, each dying at 33-40s after
+    its retries, on a call whose whole job is to web-search a vague request into a
+    concrete strategy.
+
+    The clock is faked so the test asserts the rule rather than waiting on it. Each gap
+    below is under the deadline, but they total well over it - which only passes if the
+    deadline measures silence rather than elapsed time.
+    """
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(aoai_module.time, "perf_counter", lambda: clock["now"])
+
+    events = [
+        b'data: {"type":"response.created"}',
+        b'data: {"type":"response.in_progress"}',
+        b'data: {"type":"response.web_search_call.searching","item_id":"ws_1"}',
+        b'data: {"type":"response.output_text.delta","delta":"{\\"message\\":"}',
+        b'data: {"type":"response.output_text.delta","delta":"\\"ok\\"}"}',
+        b'data: {"type":"response.completed","response":{"output":[{"type":"message",'
+        b'"content":[{"type":"output_text","text":"{\\"message\\":\\"ok\\"}"}]}]}}',
+    ]
+
+    class ThinkingStream(httpx.SyncByteStream):
+        def __init__(self, request: httpx.Request) -> None:
+            self.request = request
+
+        def __iter__(self):
+            for index, event in enumerate(events):
+                if index < 3:
+                    clock["now"] += 8.0
+                yield event + b"\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=ThinkingStream(request),
+        )
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        timeout_seconds=120.0,
+        response_start_timeout_seconds=10.0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    # 24 simulated seconds of searching before the first token, on a 10s deadline.
+    assert client.generate_json(make_request()) == {"message": "ok"}
+    assert clock["now"] >= 24.0
+
+
+def test_response_start_deadline_still_fires_on_a_silent_stream(monkeypatch) -> None:
+    """The deadline must keep catching a stream that genuinely stops producing."""
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(aoai_module.time, "perf_counter", lambda: clock["now"])
+
+    class SilentStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'data: {"type":"response.created"}\n\n'
+            clock["now"] += 30.0
+            yield b'data: {"type":"response.in_progress"}\n\n'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=SilentStream(),
+        )
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        timeout_seconds=120.0,
+        response_start_timeout_seconds=10.0,
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(LLMClientError):
+        client.generate_json(make_request())

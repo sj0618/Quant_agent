@@ -43,6 +43,9 @@ FailureSubcause = Literal[
     "freshness_gap",
     "external_source_rate_limited",
     "aoai_capacity_exhausted",
+    # The provider took the request and then did not answer within the client's budget,
+    # as opposed to refusing it for capacity (aoai_capacity_exhausted above).
+    "aoai_response_timeout",
     "parser_low_confidence",
     "source_conflict",
     "data_required",

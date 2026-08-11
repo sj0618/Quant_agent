@@ -549,6 +549,24 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             safe_message="현재 AI 분석 요청이 몰려 대기 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:aoai_capacity_exhausted"],
         )
+    # The provider accepted the request and then stopped producing, so retries burned the
+    # budget without a usable answer. Its message says "Model request timed out after
+    # retry attempts", which contains none of the substrings the heuristics below look for
+    # - they are all about the warehouse - so a run killed by a slow deployment was
+    # reported as "분류되지 않은 오류" and read as a bug in the analysis rather than a
+    # provider that needed more time.
+    if type(exc).__name__ in {"LLMClientError", "LLMTimeoutError"} and "timed out" in str(exc).lower():
+        return FailureDiagnostic(
+            category="infrastructure_failure",
+            subcause="aoai_response_timeout",
+            failure_stage=stage,
+            owner="ai_graph",
+            retryable=True,
+            safe_message=(
+                "AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요."
+            ),
+            evidence_refs=["failure:aoai_response_timeout"],
+        )
     # psycopg raises OutOfMemory for the server's "out of shared memory", which here has
     # only ever meant the lock table filled up: a query touched more partitions than
     # max_locks_per_transaction x max_connections leaves room for. Matched by type name
