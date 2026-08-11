@@ -386,7 +386,12 @@ def run_job_sync(
             ),
         )
     except Exception as exc:
-        diagnostic = classify_failure(exc, stage=Stage.FINALIZING.value)
+        # The stage the graph had actually reached, not FINALIZING. `job` was read before
+        # the run and never advances, so reporting its stage said every failure happened
+        # while finalizing - including ones that died in the Data node minutes earlier,
+        # which sent anyone reading the envelope to the wrong end of the pipeline.
+        failed_job = store.get_job(job_id) or job
+        diagnostic = classify_failure(exc, stage=failed_job.polling_stage.value)
         # The public envelope deliberately hides the original error behind debug_ref,
         # so this is the only place it is ever recorded. Without it a failure is
         # untraceable - doubly so now that jobs run as a background task, where the
@@ -543,6 +548,26 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             retryable=True,
             safe_message="현재 AI 분석 요청이 몰려 대기 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:aoai_capacity_exhausted"],
+        )
+    # psycopg raises OutOfMemory for the server's "out of shared memory", which here has
+    # only ever meant the lock table filled up: a query touched more partitions than
+    # max_locks_per_transaction x max_connections leaves room for. Matched by type name
+    # rather than message because the message heuristics below never caught it - it
+    # contains none of "timeout", "validation" or "schema", so a run that died this way
+    # was reported as "분류되지 않은 오류", which told the user nothing and hid a
+    # warehouse-side cause behind a message that reads like an AI bug.
+    if type(exc).__name__ == "OutOfMemory" or "out of shared memory" in str(exc).lower():
+        return FailureDiagnostic(
+            category="infrastructure_failure",
+            subcause="db_lock_capacity_exhausted",
+            failure_stage=stage,
+            owner="data_source_config",
+            retryable=True,
+            safe_message=(
+                "데이터 조회가 서버 자원 한도에 걸려 중단했습니다. "
+                "일시적인 부하일 수 있으니 잠시 후 다시 시도해 주세요."
+            ),
+            evidence_refs=["failure:db_lock_capacity_exhausted"],
         )
     # The warehouse answered, it just had nothing to run this strategy on. That is an
     # answer for the user, not a crash: sorted into unknown_failure it produced "분류되지

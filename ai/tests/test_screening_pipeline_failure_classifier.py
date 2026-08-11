@@ -84,3 +84,43 @@ def test_run_job_sync_uses_safe_failed_envelope_instead_of_raw_exception() -> No
     assert failed.result.failure_cause is not None
     assert failed.result.failure_cause.subcause == "db_connect_timeout"
     assert "raw host" not in failed.result.user_payload.message
+
+
+def test_lock_exhaustion_is_named_not_swallowed_as_unknown() -> None:
+    """`out of shared memory` is a warehouse capacity fault, not a mystery.
+
+    psycopg surfaces the server's lock-table exhaustion as OutOfMemory, whose message
+    carries none of the words the string heuristics look for. A production run died this
+    way in the Data node and was reported as "분류되지 않은 오류", which reads as an AI
+    bug and gave the user no reason to retry - the one thing that would have worked.
+    """
+
+    class OutOfMemory(Exception):
+        """Stands in for psycopg.errors.OutOfMemory, matched by type name."""
+
+    diagnostic = classify_failure(
+        OutOfMemory("out of shared memory\nHINT: You might need to increase max_locks_per_transaction."),
+        stage="data_collect",
+    )
+
+    assert diagnostic.category == "infrastructure_failure"
+    assert diagnostic.subcause == "db_lock_capacity_exhausted"
+    assert diagnostic.owner == "data_source_config"
+    # Retrying is the correct advice: the lock table is shared, so the same query
+    # succeeds once whatever else was holding chunks finishes.
+    assert diagnostic.retryable is True
+    # The stage the caller reached is preserved rather than replaced with finalizing.
+    assert diagnostic.failure_stage == "data_collect"
+    # Server internals stay out of the public message.
+    assert "shared memory" not in diagnostic.safe_message
+    assert "max_locks" not in diagnostic.safe_message
+
+
+def test_lock_exhaustion_matches_on_message_when_type_name_differs() -> None:
+    """Drivers other than psycopg raise their own class for the same server error."""
+
+    diagnostic = classify_failure(
+        RuntimeError("ERROR: out of shared memory"), stage="data_collect"
+    )
+
+    assert diagnostic.subcause == "db_lock_capacity_exhausted"
