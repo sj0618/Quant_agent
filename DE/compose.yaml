@@ -3,6 +3,7 @@ name: ${COMPOSE_PROJECT_NAME:-quant-agent}
 services:
   db:
     image: ${TIMESCALEDB_IMAGE:-timescale/timescaledb:latest-pg17}
+    command: ["postgres", "-c", "max_locks_per_transaction=1024"]
     container_name: ${QUANT_DB_CONTAINER_NAME:-quant-agent-db}
     restart: unless-stopped
     environment:
@@ -25,4 +26,3 @@ services:
 volumes:
   quant_agent_pgdata:
     name: ${QUANT_DB_VOLUME_NAME:-quant-agent-pgdata}
-

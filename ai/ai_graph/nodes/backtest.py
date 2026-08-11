@@ -3,7 +3,9 @@ from __future__ import annotations
 import math
 import json
 import os
+import pickle
 import sys
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
@@ -12,6 +14,7 @@ from hashlib import sha256
 from multiprocessing import get_all_start_methods, get_context
 from pathlib import Path
 from tempfile import gettempdir
+from threading import Lock
 import time
 from typing import Any
 
@@ -32,6 +35,7 @@ from ai_graph.nodes.position_sizing import (
     available_ticker_count as _shared_available_ticker_count,
     requested_max_positions as _shared_requested_max_positions,
 )
+from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
 from ai_graph.security.ast_validator import validate_backtest_code
 
 
@@ -42,9 +46,20 @@ DEFAULT_FIXTURE_VOLUME = 1_000_000.0
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 METRIC_ROUND_DIGITS = 6
 MIN_RETURNS_FOR_SPLIT = 4
+BENCHMARK_LABEL = "동일가중 매수-보유 프록시"
+BENCHMARK_METHOD = "fixed_universe_equal_weight_buy_and_hold"
+BENCHMARK_WARNING = (
+    "이 벤치마크는 분석 대상 유니버스의 초기 구성으로 고정해 계산합니다. "
+    "구성 종목의 상폐/신규 편입 반영이 늦어져 생존편향 경고가 남습니다."
+)
 # Candidates are selected using only the first 70% of the history.  The final 30%
 # is deliberately kept untouched until after selection, so it is a real hold-out.
 BACKTEST_SPLIT_FRACTION = 0.7
+# A quarter is short enough to expose regime-specific wins/losses instead of letting a
+# ten-year total hide them. A strategy may win by a lot in some blocks, but losing at
+# least half of these fixed, non-overlapping blocks is still an automatic failure.
+BENCHMARK_EVALUATION_PERIOD_DAYS = 63
+MAX_AUTOMATIC_BENCHMARK_LOSS_RATE = 0.50
 PUBLIC_EQUITY_CURVE_POINTS = 12
 MIN_OBJECTIVE_TRADES = 5
 # Below this many matched names, a backtest describes the names, not the strategy, and
@@ -80,7 +95,7 @@ DEFAULT_WALL_BUDGET_SECONDS = 540.0
 MAX_SELF_IMPROVEMENT_ROUNDS = 2
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
 BACKTEST_ENGINE_VERSION = "candidate-engine.v2"
-BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v2"
+BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v3"
 BACKTEST_CACHE_DIR_ENV = "AI_BACKTEST_CACHE_DIR"
 BACKTEST_CACHE_TTL_ENV = "AI_BACKTEST_CACHE_TTL_SECONDS"
 BACKTEST_CACHE_MAX_BYTES_ENV = "AI_BACKTEST_CACHE_MAX_BYTES"
@@ -175,19 +190,25 @@ def _is_user_rule(candidate: Any) -> bool:
 
     parameters = getattr(candidate, "parameters", None)
     profile = getattr(parameters, "profile", None)
+    blueprint_id = getattr(parameters, "blueprint_id", None)
     if profile is None and isinstance(parameters, Mapping):
         profile = parameters.get("profile")
-    return profile == "compiled_conditions"
+        blueprint_id = parameters.get("blueprint_id")
+    return profile == "compiled_conditions" and not blueprint_id
 
 
 def rule_provenance(
-    backtest: Mapping[str, Any], entry_conditions: Sequence[Mapping[str, Any]] | None
+    backtest: Mapping[str, Any],
+    entry_conditions: Sequence[Mapping[str, Any]] | None,
+    *,
+    selection_mode: str | None = None,
 ) -> dict[str, Any]:
     """Which rule the backtest actually traded, stated by the backtest.
 
-    `compiled_conditions` means the strategy's own compiled rule was traded. Any other
-    profile is a generic template that stood in for it because the conditions could not
-    be translated - a substitution that previously left no trace anywhere in the result.
+    `compiled_conditions` means the user's concrete rule was traded. Profiles recorded
+    in the catalog blueprints are also intended rules when the user delegated selection.
+    Any other generic profile is a substitution that must remain visible. The legacy
+    three-profile menu is accepted only for older results without catalog metadata.
     """
 
     from ai_graph.nodes.condition_compiler import compile_conditions
@@ -195,8 +216,19 @@ def rule_provenance(
 
     selected = backtest.get("selected_candidate") or {}
     profile = ((selected.get("parameters") or {}).get("profile")) or "unknown"
+    blueprint_id = (selected.get("parameters") or {}).get("blueprint_id")
     requested = [str(c.get("left")) for c in (entry_conditions or []) if c.get("left")]
-    substituted = profile != "compiled_conditions"
+    catalog_profiles = {
+        str(item.get("profile"))
+        for item in (backtest.get("generated_strategy_blueprints") or [])
+        if isinstance(item, Mapping) and item.get("profile")
+    }
+    intended_automatic_profile = selection_mode == "automatic" and (
+        bool(blueprint_id)
+        or profile in catalog_profiles
+        or (not catalog_profiles and profile in AUTOMATIC_TOURNAMENT_PROFILES)
+    )
+    substituted = profile != "compiled_conditions" and not intended_automatic_profile
 
     untranslatable: list[str] = []
     if substituted and entry_conditions:
@@ -217,6 +249,7 @@ def rule_provenance(
     # to remove.
     ran_own_rule = any(
         ((c.get("parameters") or {}).get("profile")) == "compiled_conditions"
+        and not ((c.get("parameters") or {}).get("blueprint_id"))
         for c in (backtest.get("candidates") or [])
     )
     if not substituted:
@@ -233,8 +266,16 @@ def rule_provenance(
         )
     else:
         reason = "사용자 조건이 백테스트 후보에 포함되지 않았습니다."
+    if intended_automatic_profile and blueprint_id:
+        evaluated_rule = f"automatic_blueprint:{blueprint_id}"
+    elif profile == "compiled_conditions":
+        evaluated_rule = "user_conditions"
+    elif intended_automatic_profile:
+        evaluated_rule = f"automatic_profile:{profile}"
+    else:
+        evaluated_rule = f"template:{profile}"
     return {
-        "evaluated_rule": "user_conditions" if not substituted else f"template:{profile}",
+        "evaluated_rule": evaluated_rule,
         "substituted": substituted,
         "requested_conditions": requested,
         "untranslatable_conditions": untranslatable,
@@ -364,6 +405,13 @@ class GeneratedSignal(BaseModel):
 
 
 @dataclass(frozen=True)
+class _BenchmarkPeriodStats:
+    count: int
+    win_rate: float
+    loss_rate: float
+
+
+@dataclass(frozen=True)
 class _CandidateEvaluation:
     candidate: CodeCandidate
     engine_summary: dict[str, Any] | None = None
@@ -373,37 +421,106 @@ class _CandidateEvaluation:
     diagnostics: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class _CandidateTaskResult:
+    evaluation: _CandidateEvaluation
+    generated_actions: Sequence[int] | None
+    action_build_seconds: float
+    action_cache_hit: bool
+    worker_pid: int
+    feature_cached_lookbacks: tuple[int, ...]
+    feature_estimated_bytes: int
+
+
+@dataclass(frozen=True)
+class _BenchmarkContext:
+    daily_returns: tuple[float, ...]
+    selection_days: int
+    selection_return: float
+    total_return: float
+
+
+@dataclass(frozen=True)
+class _PreparedMarketCacheEntry:
+    price_rows: tuple[Mapping[str, Any], ...]
+    prepared_market: EnginePreparedMarketData
+
+
+class _DigestWriter:
+    def __init__(self, digest: Any) -> None:
+        self.digest = digest
+
+    def write(self, payload: bytes) -> int:
+        self.digest.update(payload)
+        return len(payload)
+
+
+# ponytail: one process-local entry bounds retained memory; use a shared cache only
+# when cross-process hit rates justify serializing the full prepared market.
+_PREPARED_MARKET_CACHE: tuple[tuple[str, str], _PreparedMarketCacheEntry] | None = None
+_PREPARED_MARKET_CACHE_LOCK = Lock()
+
+
+def _get_prepared_market(key: tuple[str, str]) -> _PreparedMarketCacheEntry | None:
+    with _PREPARED_MARKET_CACHE_LOCK:
+        cached = _PREPARED_MARKET_CACHE
+    return cached[1] if cached is not None and cached[0] == key else None
+
+
+def _store_prepared_market(key: tuple[str, str], entry: _PreparedMarketCacheEntry) -> None:
+    global _PREPARED_MARKET_CACHE
+    with _PREPARED_MARKET_CACHE_LOCK:
+        _PREPARED_MARKET_CACHE = (key, entry)
+
+
+def _clear_prepared_market_cache() -> None:
+    global _PREPARED_MARKET_CACHE
+    with _PREPARED_MARKET_CACHE_LOCK:
+        _PREPARED_MARKET_CACHE = None
+
+
 _WORKER_STRATEGY: AIStrategySpec | None = None
 _WORKER_PRICE_ROWS: Sequence[Mapping[str, Any]] | None = None
 _WORKER_PREPARED_MARKET: EnginePreparedMarketData | None = None
+_WORKER_FEATURE_STORE: PreparedFeatureStore | None = None
+_WORKER_BENCHMARK_CONTEXT: _BenchmarkContext | None = None
 
 
 def _initialize_candidate_worker(
     strategy_payload: Mapping[str, Any],
     price_rows: Sequence[Mapping[str, Any]],
     prepared_market: EnginePreparedMarketData,
+    feature_store: PreparedFeatureStore,
+    benchmark_context: _BenchmarkContext,
 ) -> None:
     global _WORKER_STRATEGY, _WORKER_PRICE_ROWS, _WORKER_PREPARED_MARKET
+    global _WORKER_FEATURE_STORE, _WORKER_BENCHMARK_CONTEXT
     _WORKER_STRATEGY = AIStrategySpec.model_validate(strategy_payload)
     _WORKER_PRICE_ROWS = price_rows
     _WORKER_PREPARED_MARKET = prepared_market
+    _WORKER_FEATURE_STORE = feature_store
+    _WORKER_BENCHMARK_CONTEXT = benchmark_context
 
 
 def _evaluate_candidate_worker(
     task: tuple[Mapping[str, Any], Sequence[int] | None, str],
-) -> _CandidateEvaluation:
+) -> _CandidateTaskResult:
     if (
         _WORKER_STRATEGY is None
         or _WORKER_PRICE_ROWS is None
         or _WORKER_PREPARED_MARKET is None
+        or _WORKER_FEATURE_STORE is None
+        or _WORKER_BENCHMARK_CONTEXT is None
     ):
         raise RuntimeError("candidate worker was not initialized")
     candidate_payload, actions, metrics_mode = task
-    return _evaluate_candidate(
+    return _evaluate_candidate_task(
         _WORKER_STRATEGY,
         CodeCandidate.model_validate(candidate_payload),
         _WORKER_PRICE_ROWS,
         prepared_market=_WORKER_PREPARED_MARKET,
+        feature_store=_WORKER_FEATURE_STORE,
+        benchmark_context=_WORKER_BENCHMARK_CONTEXT,
         generated_actions=actions,
         metrics_mode=metrics_mode,
     )
@@ -412,14 +529,12 @@ def _evaluate_candidate_worker(
 class _DiskEvaluationCache:
     def __init__(self) -> None:
         configured = os.getenv(BACKTEST_CACHE_DIR_ENV)
-        self.root = Path(configured) if configured else Path(gettempdir()) / "quantagent-backtest-v2"
+        self.root = (
+            Path(configured) if configured else Path(gettempdir()) / "quantagent-backtest-v2"
+        )
         self.root.mkdir(parents=True, exist_ok=True)
-        self.ttl_seconds = _positive_int_env(
-            BACKTEST_CACHE_TTL_ENV, DEFAULT_CACHE_TTL_SECONDS
-        )
-        self.max_bytes = _positive_int_env(
-            BACKTEST_CACHE_MAX_BYTES_ENV, DEFAULT_CACHE_MAX_BYTES
-        )
+        self.ttl_seconds = _positive_int_env(BACKTEST_CACHE_TTL_ENV, DEFAULT_CACHE_TTL_SECONDS)
+        self.max_bytes = _positive_int_env(BACKTEST_CACHE_MAX_BYTES_ENV, DEFAULT_CACHE_MAX_BYTES)
         self._cleanup()
 
     def load(
@@ -458,9 +573,7 @@ class _DiskEvaluationCache:
                 ]
                 or None,
                 objective_score=payload.get("objective_score"),
-                quantstats_dependency_error=bool(
-                    payload.get("quantstats_dependency_error", False)
-                ),
+                quantstats_dependency_error=bool(payload.get("quantstats_dependency_error", False)),
                 diagnostics=diagnostics,
             )
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
@@ -525,36 +638,88 @@ class _CandidateBacktestSession:
     ) -> None:
         prep_started = time.perf_counter()
         self.strategy = strategy
-        self.feature_store = PreparedFeatureStore(price_rows)
-        self.price_rows = self.feature_store.rows
-        ohlcv_rows, metric_rows = _engine_market_rows(self.price_rows)
-        preparation_candidate = CodeCandidate(
-            candidate_id="prepare",
-            variant="A",
-            code="def build_signals(prices):\n    return []\n",
-            validation_ok=True,
-        )
-        preparation_spec = _engine_strategy_spec(
-            strategy,
-            preparation_candidate,
-            available_ticker_count=_available_ticker_count(self.price_rows),
-        )
-        engine_config = EngineBacktestRunConfig(
-            initial_capital=DEFAULT_INITIAL_CAPITAL,
-            write_outputs=False,
-            talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
-            metrics_mode="selection",
-        )
-        self.prepared_market = prepare_engine_market_data(
-            preparation_spec,
-            ohlcv_rows=ohlcv_rows,
-            metric_rows=metric_rows,
-            config=engine_config,
-        )
-        self.data_fingerprint, self.data_descriptor = _data_fingerprint(self.price_rows)
+        phases: dict[str, float] = {}
+
+        started = time.perf_counter()
+        self.data_fingerprint, self.data_descriptor = _data_fingerprint(price_rows)
         self.strategy_fingerprint = _strategy_fingerprint(strategy)
+        phases["fingerprint_seconds"] = time.perf_counter() - started
+
+        cache_key = (self.data_fingerprint, self.strategy_fingerprint)
+        started = time.perf_counter()
+        cached = _get_prepared_market(cache_key)
+        phases["cache_lookup_seconds"] = time.perf_counter() - started
+
+        started = time.perf_counter()
+        if cached is None:
+            self.feature_store = PreparedFeatureStore(
+                price_rows,
+                rows_are_sorted=bool(self.data_descriptor["rows_are_sorted"]),
+            )
+            self.price_rows = self.feature_store.rows
+        else:
+            self.price_rows = cached.price_rows
+            self.feature_store = PreparedFeatureStore(
+                self.price_rows,
+                rows_are_sorted=True,
+            )
+        phases["feature_store_seconds"] = time.perf_counter() - started
+
+        self.prepared_market_cache_hit = cached is not None
+        if cached is not None:
+            self.prepared_market = cached.prepared_market
+            phases["engine_row_conversion_seconds"] = 0.0
+            phases["engine_market_index_seconds"] = 0.0
+        else:
+            started = time.perf_counter()
+            ohlcv_rows, metric_rows = _engine_market_rows(self.price_rows)
+            phases["engine_row_conversion_seconds"] = time.perf_counter() - started
+
+            preparation_candidate = CodeCandidate(
+                candidate_id="prepare",
+                variant="A",
+                code="def build_signals(prices):\n    return []\n",
+                validation_ok=True,
+            )
+            preparation_spec = _engine_strategy_spec(
+                strategy,
+                preparation_candidate,
+                available_ticker_count=_available_ticker_count(self.price_rows),
+            )
+            engine_config = EngineBacktestRunConfig(
+                initial_capital=DEFAULT_INITIAL_CAPITAL,
+                write_outputs=False,
+                talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
+                metrics_mode="selection",
+            )
+            started = time.perf_counter()
+            self.prepared_market = prepare_engine_market_data(
+                preparation_spec,
+                ohlcv_rows=ohlcv_rows,
+                metric_rows=metric_rows,
+                config=engine_config,
+                inputs_normalized=True,
+            )
+            phases["engine_market_index_seconds"] = time.perf_counter() - started
+            _store_prepared_market(
+                cache_key,
+                _PreparedMarketCacheEntry(
+                    price_rows=self.price_rows,
+                    prepared_market=self.prepared_market,
+                ),
+            )
+
+        started = time.perf_counter()
+        self.benchmark_context = _build_benchmark_context(self.price_rows)
+        phases["benchmark_context_seconds"] = time.perf_counter() - started
+
+        self.preparation_phases = {name: round(seconds, 6) for name, seconds in phases.items()}
         self.preparation_seconds = time.perf_counter() - prep_started
+        self._base_feature_estimated_bytes = self.feature_store.stats().estimated_bytes
         self._cache: dict[tuple[str, bool, str], _CandidateEvaluation] = {}
+        self._action_cache: dict[str, Sequence[int]] = {}
+        self._worker_feature_bytes: dict[int, int] = {}
+        self._worker_feature_lookbacks: set[int] = set()
         self._disk_cache = _DiskEvaluationCache()
         self._executor: ProcessPoolExecutor | None = None
         self._executor_workers = 0
@@ -609,24 +774,9 @@ class _CandidateBacktestSession:
                 missing_keys.add(memory_key)
             self.cache_misses += 1
 
-        actions_started = time.perf_counter()
-        actions_by_identity: dict[str, Sequence[int] | None] = {}
-        for candidate in missing:
-            identity = _candidate_identity(candidate)
-            if identity in actions_by_identity:
-                continue
-            actions_by_identity[identity] = (
-                self.feature_store.build_actions(
-                    candidate.strategy_ir,
-                    candidate.parameters,
-                )
-                if candidate.representation == "structured"
-                and candidate.strategy_ir is not None
-                and candidate.parameters is not None
-                else None
-            )
-        action_build_seconds = time.perf_counter() - actions_started
-
+        round_action_cache_hits = sum(
+            _candidate_identity(candidate) in self._action_cache for candidate in missing
+        )
         if missing:
             round_worker_count = _candidate_worker_count(
                 len(missing),
@@ -635,54 +785,66 @@ class _CandidateBacktestSession:
             tasks = [
                 (
                     candidate.model_dump(mode="python"),
-                    actions_by_identity[_candidate_identity(candidate)],
+                    self._action_cache.get(_candidate_identity(candidate)),
                     metrics_mode,
                 )
                 for candidate in missing
             ]
             requires_isolation = any(
-                candidate.representation == "python_fallback"
-                for candidate in missing
+                candidate.representation == "python_fallback" for candidate in missing
             )
             reuse_executor = self._executor is not None
-            if (
-                round_worker_count == 1
-                and not requires_isolation
-                and not reuse_executor
-            ):
-                evaluations = [
-                    _evaluate_candidate(
+            if round_worker_count == 1 and not requires_isolation and not reuse_executor:
+                task_results = [
+                    _evaluate_candidate_task(
                         self.strategy,
                         candidate,
                         self.price_rows,
                         prepared_market=self.prepared_market,
-                        generated_actions=actions_by_identity[
-                            _candidate_identity(candidate)
-                        ],
+                        feature_store=self.feature_store,
+                        benchmark_context=self.benchmark_context,
+                        generated_actions=self._action_cache.get(_candidate_identity(candidate)),
                         metrics_mode=metrics_mode,
                     )
                     for candidate in missing
                 ]
             else:
-                evaluations = self._evaluate_parallel(
+                task_results = self._evaluate_parallel(
                     tasks,
                     missing,
-                    (
-                        self._executor_workers
-                        if reuse_executor
-                        else max(1, round_worker_count)
-                    ),
+                    (self._executor_workers if reuse_executor else max(1, round_worker_count)),
                 )
-            for candidate, evaluation in zip(missing, evaluations, strict=True):
+            action_seconds_by_pid: dict[int, float] = {}
+            for result in task_results:
+                if result.action_build_seconds > 0.0:
+                    action_seconds_by_pid[result.worker_pid] = (
+                        action_seconds_by_pid.get(result.worker_pid, 0.0)
+                        + result.action_build_seconds
+                    )
+                if result.generated_actions is not None:
+                    self._action_cache[_candidate_identity(result.evaluation.candidate)] = (
+                        result.generated_actions
+                    )
+                if result.worker_pid != os.getpid():
+                    self._worker_feature_bytes[result.worker_pid] = max(
+                        self._worker_feature_bytes.get(result.worker_pid, 0),
+                        result.feature_estimated_bytes,
+                    )
+                    self._worker_feature_lookbacks.update(result.feature_cached_lookbacks)
+            action_build_seconds = max(action_seconds_by_pid.values(), default=0.0)
+            action_build_total_seconds = sum(action_seconds_by_pid.values())
+            for candidate, result in zip(missing, task_results, strict=True):
+                evaluation = result.evaluation
                 memory_key = _candidate_cache_key(candidate, metrics_mode)
                 self._cache[memory_key] = evaluation
                 disk_key = self._disk_cache_key(candidate, metrics_mode)
                 try:
-                    self.disk_cache_bytes_written += self._disk_cache.store(
-                        disk_key, evaluation
-                    )
+                    self.disk_cache_bytes_written += self._disk_cache.store(disk_key, evaluation)
                 except (OSError, TypeError, ValueError):
                     pass
+        else:
+            action_build_total_seconds = 0.0
+            action_seconds_by_pid = {}
 
         self.evaluation_rounds.append(
             {
@@ -694,12 +856,11 @@ class _CandidateBacktestSession:
                 "disk_cache_hits": disk_hits,
                 "worker_count": round_worker_count,
                 "action_build_seconds": round(action_build_seconds, 6),
+                "action_build_total_seconds": round(action_build_total_seconds, 6),
+                "action_worker_pids": sorted(action_seconds_by_pid),
+                "action_cache_hits": round_action_cache_hits,
                 "cumulative_candidates": len(
-                    {
-                        key[0]
-                        for key in self._cache
-                        if key[2] == "selection"
-                    }
+                    {key[0] for key in self._cache if key[2] == "selection"}
                 ),
                 "wall_seconds": round(time.perf_counter() - round_started, 6),
             }
@@ -708,9 +869,7 @@ class _CandidateBacktestSession:
             _rebind_evaluation(
                 self._cache[_candidate_cache_key(candidate, metrics_mode)],
                 candidate,
-                cache_level=cache_levels.get(
-                    _candidate_cache_key(candidate, metrics_mode)
-                ),
+                cache_level=cache_levels.get(_candidate_cache_key(candidate, metrics_mode)),
             )
             for candidate in candidates
         ]
@@ -720,7 +879,7 @@ class _CandidateBacktestSession:
         tasks: list[tuple[Mapping[str, Any], Sequence[int] | None, str]],
         candidates: list[CodeCandidate],
         worker_count: int,
-    ) -> list[_CandidateEvaluation]:
+    ) -> list[_CandidateTaskResult]:
         if self._executor is not None and self._executor_workers != worker_count:
             self._executor.shutdown(wait=True, cancel_futures=True)
             self._executor = None
@@ -735,6 +894,8 @@ class _CandidateBacktestSession:
                     self.strategy.model_dump(mode="python"),
                     self.price_rows,
                     self.prepared_market,
+                    self.feature_store,
+                    self.benchmark_context,
                 ),
             )
             self._executor_workers = worker_count
@@ -746,11 +907,11 @@ class _CandidateBacktestSession:
         # still receive a full execution budget.
         wave_count = max(1, math.ceil(len(futures) / max(1, worker_count)))
         deadline = time.perf_counter() + timeout * wave_count
-        evaluations: list[_CandidateEvaluation | None] = [None] * len(futures)
-        future_indexes: dict[Future[_CandidateEvaluation], int] = {
+        evaluations: list[_CandidateTaskResult | None] = [None] * len(futures)
+        future_indexes: dict[Future[_CandidateTaskResult], int] = {
             future: index for index, future in enumerate(futures)
         }
-        pending: set[Future[_CandidateEvaluation]] = set(futures)
+        pending: set[Future[_CandidateTaskResult]] = set(futures)
         while pending:
             remaining_seconds = deadline - time.perf_counter()
             if remaining_seconds <= 0:
@@ -776,15 +937,19 @@ class _CandidateBacktestSession:
             for future in pending:
                 future.cancel()
                 index = future_indexes[future]
-                evaluations[index] = _timeout_evaluation(candidates[index], timeout)
+                evaluations[index] = _CandidateTaskResult(
+                    evaluation=_timeout_evaluation(candidates[index], timeout),
+                    generated_actions=None,
+                    action_build_seconds=0.0,
+                    action_cache_hit=False,
+                    worker_pid=0,
+                    feature_cached_lookbacks=(),
+                    feature_estimated_bytes=0,
+                )
 
         if any(evaluation is None for evaluation in evaluations):
             raise RuntimeError("candidate worker completed without an evaluation")
-        return [
-            evaluation
-            for evaluation in evaluations
-            if evaluation is not None
-        ]
+        return [evaluation for evaluation in evaluations if evaluation is not None]
 
     def _terminate_executor(self) -> None:
         executor = self._executor
@@ -816,13 +981,21 @@ class _CandidateBacktestSession:
 
     def execution_stats(self) -> dict[str, Any]:
         feature_stats = self.feature_store.stats()
+        worker_feature_bytes = sum(
+            max(0, size - self._base_feature_estimated_bytes)
+            for size in self._worker_feature_bytes.values()
+        )
         return {
             "engine_version": BACKTEST_ENGINE_VERSION,
             "feature_version": FEATURE_DEFINITION_VERSION,
             "data_fingerprint": self.data_fingerprint,
             "feature_preparation_seconds": round(self.preparation_seconds, 6),
-            "feature_estimated_bytes": feature_stats.estimated_bytes,
-            "feature_cached_lookbacks": list(feature_stats.cached_lookbacks),
+            "feature_preparation_phases": dict(self.preparation_phases),
+            "prepared_market_cache_hit": self.prepared_market_cache_hit,
+            "feature_estimated_bytes": feature_stats.estimated_bytes + worker_feature_bytes,
+            "feature_cached_lookbacks": sorted(
+                {*feature_stats.cached_lookbacks, *self._worker_feature_lookbacks}
+            ),
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "disk_cache_bytes_written": self.disk_cache_bytes_written,
@@ -842,9 +1015,8 @@ def _candidate_worker_count(candidate_count: int, *, row_count: int = 0) -> int:
     # object into every worker; the measured Windows production input tripled RSS for
     # only a small wall-time gain. Keep spawn serial unless an operator explicitly opts
     # into that memory trade-off.
-    if (
-        "fork" not in get_all_start_methods()
-        and not _truthy_env(AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV)
+    if "fork" not in get_all_start_methods() and not _truthy_env(
+        AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV
     ):
         return 1
     return requested
@@ -916,31 +1088,44 @@ def _rebind_evaluation(
 def _data_fingerprint(
     rows: Sequence[Mapping[str, Any]],
 ) -> tuple[str, dict[str, Any]]:
-    digest = sha256()
     tickers: set[str] = set()
     first_date: str | None = None
     last_date: str | None = None
+    previous_sort_key: tuple[str, str] | None = None
+    rows_are_sorted = True
     for row in rows:
         ticker = str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
         row_date = str(row.get("date") or "")
         tickers.add(ticker)
         first_date = row_date if first_date is None else min(first_date, row_date)
         last_date = row_date if last_date is None else max(last_date, row_date)
-        encoded = json.dumps(
-            dict(row),
-            ensure_ascii=True,
-            default=str,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        digest.update(encoded.encode("utf-8"))
-        digest.update(b"\n")
+        sort_key = (row_date, ticker)
+        if previous_sort_key is not None and sort_key < previous_sort_key:
+            rows_are_sorted = False
+        previous_sort_key = sort_key
+
+    digest = sha256()
+    try:
+        pickle.Pickler(_DigestWriter(digest), protocol=pickle.HIGHEST_PROTOCOL).dump(rows)
+    except (AttributeError, pickle.PicklingError, TypeError):
+        digest = sha256()
+        for row in rows:
+            encoded = json.dumps(
+                dict(row),
+                ensure_ascii=True,
+                default=str,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            digest.update(encoded.encode("utf-8"))
+            digest.update(b"\n")
     descriptor = {
         "row_count": len(rows),
         "ticker_count": len(tickers),
         "tickers_sha": sha256(",".join(sorted(tickers)).encode("utf-8")).hexdigest(),
         "first_date": first_date,
         "last_date": last_date,
+        "rows_are_sorted": rows_are_sorted,
     }
     return digest.hexdigest(), descriptor
 
@@ -1027,67 +1212,119 @@ def _peak_rss_bytes() -> int | None:
         return None
 
 
-def _evaluate_candidate(
+def _evaluate_candidate_task(
     strategy_a: AIStrategySpec,
     candidate: CodeCandidate,
     rows: Sequence[Mapping[str, Any]],
     *,
     prepared_market: EnginePreparedMarketData,
+    feature_store: PreparedFeatureStore,
+    benchmark_context: _BenchmarkContext,
     generated_actions: Sequence[int] | None,
     metrics_mode: str,
-) -> _CandidateEvaluation:
+) -> _CandidateTaskResult:
     wall_started = time.perf_counter()
     cpu_started = time.process_time()
+    worker_pid = os.getpid()
+    action_cache_hit = generated_actions is not None
+    action_build_started = time.perf_counter()
+    actions = generated_actions
     if not candidate.validation_ok:
-        return _CandidateEvaluation(
-            candidate=candidate,
-            diagnostics={
-                "candidate_id": candidate.candidate_id,
-                "stage": "validation",
-                "input_rows": len(rows),
-                "generated_signals": 0,
-                "cache_hit": False,
-                "wall_seconds": 0.0,
-                "cpu_seconds": 0.0,
-            },
+        feature_stats = feature_store.stats()
+        return _CandidateTaskResult(
+            evaluation=_CandidateEvaluation(
+                candidate=candidate,
+                diagnostics={
+                    "candidate_id": candidate.candidate_id,
+                    "stage": "validation",
+                    "input_rows": len(rows),
+                    "generated_signals": 0,
+                    "cache_hit": False,
+                    "wall_seconds": 0.0,
+                    "cpu_seconds": 0.0,
+                    "action_build_seconds": 0.0,
+                    "action_cache_hit": action_cache_hit,
+                    "worker_pid": worker_pid,
+                },
+            ),
+            generated_actions=actions,
+            action_build_seconds=0.0,
+            action_cache_hit=action_cache_hit,
+            worker_pid=worker_pid,
+            feature_cached_lookbacks=feature_stats.cached_lookbacks,
+            feature_estimated_bytes=feature_stats.estimated_bytes,
         )
     try:
+        if actions is None:
+            if (
+                candidate.representation == "structured"
+                and candidate.strategy_ir is not None
+                and candidate.parameters is not None
+            ):
+                actions = feature_store.build_actions(
+                    candidate.strategy_ir,
+                    candidate.parameters,
+                )
+            else:
+                generated_signals = _execute_candidate_code(candidate, rows)
+                actions = _compact_actions_from_signals(prepared_market, generated_signals)
+        action_build_seconds = (
+            0.0 if action_cache_hit else time.perf_counter() - action_build_started
+        )
         engine_result = _run_candidate_backtest(
             strategy_a,
             candidate,
             rows,
             prepared_market=prepared_market,
-            generated_actions=generated_actions,
+            generated_actions=actions,
             metrics_mode=metrics_mode,
         )
     except Exception as exc:
+        action_build_seconds = (
+            0.0 if action_cache_hit else time.perf_counter() - action_build_started
+        )
         diagnostics = {
             "candidate_id": candidate.candidate_id,
             "stage": "candidate_evaluation",
             "input_rows": len(rows),
-            "generated_signals": len(generated_actions or ()),
+            "generated_signals": len(actions or ()),
             "cache_hit": False,
             "wall_seconds": round(time.perf_counter() - wall_started, 6),
             "cpu_seconds": round(time.process_time() - cpu_started, 6),
             "error_type": type(exc).__name__,
+            "action_build_seconds": round(action_build_seconds, 6),
+            "action_cache_hit": action_cache_hit,
+            "worker_pid": worker_pid,
         }
+        feature_stats = feature_store.stats()
         if _is_quantstats_dependency_error(exc):
-            return _CandidateEvaluation(
-                candidate=candidate,
-                quantstats_dependency_error=True,
+            evaluation = _CandidateEvaluation(
+                candidate=candidate, quantstats_dependency_error=True, diagnostics=diagnostics
+            )
+        else:
+            evaluation = _CandidateEvaluation(
+                candidate=candidate.model_copy(
+                    update={
+                        "validation_ok": False,
+                        "violations": [*candidate.violations, f"engine backtest failed: {exc}"],
+                    }
+                ),
                 diagnostics=diagnostics,
             )
-        return _CandidateEvaluation(
-            candidate=candidate.model_copy(
-                update={
-                    "validation_ok": False,
-                    "violations": [*candidate.violations, f"engine backtest failed: {exc}"],
-                }
-            ),
-            diagnostics=diagnostics,
+        return _CandidateTaskResult(
+            evaluation=evaluation,
+            generated_actions=actions,
+            action_build_seconds=action_build_seconds,
+            action_cache_hit=action_cache_hit,
+            worker_pid=worker_pid,
+            feature_cached_lookbacks=feature_stats.cached_lookbacks,
+            feature_estimated_bytes=feature_stats.estimated_bytes,
         )
 
-    metrics = _metrics_from_engine_result(engine_result)
+    metrics = _metrics_from_engine_result(
+        engine_result,
+        benchmark_returns=benchmark_context.daily_returns,
+    )
     enriched_candidate = candidate.model_copy(update={"metrics": metrics})
     engine_summary = dict(engine_result.summary)
     engine_summary["buy_signal_count"] = _signal_action_count(engine_result, "BUY")
@@ -1110,22 +1347,40 @@ def _evaluate_candidate(
     engine_summary["selection_buy_count"] = _selection_signal_action_count(
         engine_result, rows, "BUY"
     )
-    return _CandidateEvaluation(
+    evaluation = _CandidateEvaluation(
         candidate=enriched_candidate,
         engine_summary=engine_summary,
         equity_curve=_public_equity_curve(engine_result),
-        objective_score=_objective_score(metrics, engine_summary, rows),
+        objective_score=_objective_score(
+            metrics,
+            engine_summary,
+            rows,
+            benchmark_context=benchmark_context,
+        ),
         diagnostics={
             "candidate_id": candidate.candidate_id,
             "stage": "candidate_evaluation",
             "metrics_mode": metrics_mode,
             "input_rows": len(rows),
-            "generated_signals": len(generated_actions or ()),
+            "generated_signals": len(actions or ()),
             "cache_hit": False,
             "wall_seconds": round(time.perf_counter() - wall_started, 6),
             "cpu_seconds": round(time.process_time() - cpu_started, 6),
             "peak_rss_bytes": _peak_rss_bytes(),
+            "action_build_seconds": round(action_build_seconds, 6),
+            "action_cache_hit": action_cache_hit,
+            "worker_pid": worker_pid,
         },
+    )
+    feature_stats = feature_store.stats()
+    return _CandidateTaskResult(
+        evaluation=evaluation,
+        generated_actions=actions,
+        action_build_seconds=action_build_seconds,
+        action_cache_hit=action_cache_hit,
+        worker_pid=worker_pid,
+        feature_cached_lookbacks=feature_stats.cached_lookbacks,
+        feature_estimated_bytes=feature_stats.estimated_bytes,
     )
 
 
@@ -1248,7 +1503,11 @@ def run_candidate_backtest(
             engine_summary=engine_summaries_by_candidate[selected.candidate_id],
             engine_summaries_by_candidate=engine_summaries_by_candidate,
             objective_scores_by_candidate=objective_scores_by_candidate,
-            backtest_payload=_backtest_payload(strategy_a, rows),
+            backtest_payload=_backtest_payload(
+                strategy_a,
+                rows,
+                benchmark_return=session.benchmark_context.total_return,
+            ),
             feature_coverage=dict(feature_coverage or {}),
             fallback_reasons=list(fallback_reasons or ()),
             execution_stats={
@@ -1309,7 +1568,14 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         all_candidates = candidates
         seen_candidates = {_candidate_identity(candidate) for candidate in all_candidates}
         fallback_reasons = list(state.get("backtest_code", {}).get("fallback_reasons", []))
-        for iteration in range(1, MAX_SELF_IMPROVEMENT_ROUNDS + 1):
+        # The automatic mode already compares three pre-registered strategy families.
+        # Searching fresh thresholds only after seeing that they missed the objective
+        # would fit the training history, so refinement remains available only for a
+        # user's explicit/named rule.
+        self_improvement_rounds = (
+            0 if strategy_a.selection_mode == "automatic" else MAX_SELF_IMPROVEMENT_ROUNDS
+        )
+        for iteration in range(1, self_improvement_rounds + 1):
             if _passes_objective_floor(result):
                 break
             if time.perf_counter() - node_started >= _wall_budget_seconds():
@@ -1376,15 +1642,24 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         result = result.model_copy(
             update={
                 "fallback_reasons": fallback_reasons,
+                "generated_strategy_blueprints": list(
+                    state.get("backtest_code", {})
+                    .get("code_plan", {})
+                    .get("generated_strategies", [])
+                ),
                 "execution_stats": {
                     **result.execution_stats,
                     **session.execution_stats(),
-                    "total_backtest_wall_seconds": round(
-                        time.perf_counter() - node_started, 6
-                    ),
+                    "total_backtest_wall_seconds": round(time.perf_counter() - node_started, 6),
                     "configured_workers": _configured_worker_limit(),
                     "candidate_timeout_seconds": _candidate_timeout_seconds(),
                     "wall_budget_seconds": _wall_budget_seconds(),
+                    "selection_policy": (
+                        "performance_momentum_train_select_holdout_validate"
+                        if strategy_a.selection_mode == "automatic"
+                        else "bounded_candidate_refinement"
+                    ),
+                    "self_improvement_rounds_limit": self_improvement_rounds,
                 },
             }
         )
@@ -1483,9 +1758,7 @@ def _compact_actions_from_signals(
         if ticker is None:
             tickers = tickers_by_date.get(signal.date, [])
             if len(tickers) != 1:
-                raise ValueError(
-                    f"generated signal date {signal.date} is ambiguous without ticker"
-                )
+                raise ValueError(f"generated signal date {signal.date} is ambiguous without ticker")
             ticker = tickers[0]
         key = (date.fromisoformat(signal.date), ticker)
         index = prepared_market.row_index_by_key.get(key)
@@ -1530,17 +1803,15 @@ def _generated_signal_from_raw(signal: object) -> GeneratedSignal:
 
 def _engine_market_rows(
     price_rows: Sequence[Mapping[str, Any]],
-) -> tuple[list[Any], list[dict[str, object]]]:
+) -> tuple[list[Any], dict[tuple[date, str], dict[str, float]]]:
     ohlcv_rows: list[Any] = []
-    metric_rows: list[dict[str, object]] = []
-    tickers: set[str] = set()
+    metric_rows: dict[tuple[date, str], dict[str, float]] = {}
 
     for raw in price_rows:
         if "date" not in raw or "close" not in raw:
             raise ValueError("price rows must include date and close")
         row_date = date.fromisoformat(str(raw["date"]))
         ticker = str(raw.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
-        tickers.add(ticker)
         close = _finite_float(raw["close"], "close")
         open_price = _finite_float(raw.get("open", close), "open")
         high = _finite_float(raw.get("high", max(open_price, close)), "high")
@@ -1559,12 +1830,12 @@ def _engine_market_rows(
                 volume=volume,
             )
         )
-        metric_row: dict[str, object] = {"date": row_date.isoformat(), "ticker": ticker}
+        metric_row: dict[str, float] = {}
         for key, value in raw.items():
             if str(key) in PRICE_FIELD_NAMES or not _is_numeric_metric(value):
                 continue
             metric_row[str(key)] = float(value)
-        metric_rows.append(metric_row)
+        metric_rows[(row_date, ticker)] = metric_row
 
     return ohlcv_rows, metric_rows
 
@@ -1787,7 +2058,13 @@ def _normal_quantile(p: float) -> float:
     )
 
 
-def _metrics_from_engine_result(engine_result, *, candidate_count: int = 1) -> BacktestMetrics:
+def _metrics_from_engine_result(
+    engine_result,
+    *,
+    price_rows: Sequence[Mapping[str, Any]] | None = None,
+    benchmark_returns: Sequence[float] | None = None,
+    candidate_count: int = 1,
+) -> BacktestMetrics:
     summary = engine_result.summary
     metric_warnings = _summary_warning_list(summary)
     selection_mode = summary.get("metrics_mode") == "selection"
@@ -1811,6 +2088,33 @@ def _metrics_from_engine_result(engine_result, *, candidate_count: int = 1) -> B
     selection_adjusted_sharpe = in_sample_sharpe - _expected_max_sharpe(
         candidate_count, len(in_sample_returns)
     )
+    resolved_benchmark_returns = (
+        benchmark_returns
+        if benchmark_returns is not None
+        else _benchmark_daily_returns(price_rows or ())
+    )
+    comparison_length = min(len(daily_returns), len(resolved_benchmark_returns))
+    strategy_comparison_returns = daily_returns[:comparison_length]
+    benchmark_comparison_returns = resolved_benchmark_returns[:comparison_length]
+    comparison_split_index = min(split_index, comparison_length)
+    in_sample_benchmark_returns = benchmark_comparison_returns[:comparison_split_index]
+    out_sample_benchmark_returns = benchmark_comparison_returns[comparison_split_index:]
+    in_sample_benchmark_return = _compound_returns(in_sample_benchmark_returns)
+    out_sample_benchmark_return = _compound_returns(out_sample_benchmark_returns)
+    in_sample_return = _compound_returns(in_sample_returns)
+    out_sample_return = _compound_returns(out_sample_returns)
+    period_stats = _benchmark_period_stats(
+        strategy_comparison_returns,
+        benchmark_comparison_returns,
+    )
+    in_sample_period_stats = _benchmark_period_stats(
+        strategy_comparison_returns[:comparison_split_index],
+        in_sample_benchmark_returns,
+    )
+    out_sample_period_stats = _benchmark_period_stats(
+        strategy_comparison_returns[comparison_split_index:],
+        out_sample_benchmark_returns,
+    )
     return BacktestMetrics(
         sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
         max_drawdown=round(_summary_float(summary, "max_drawdown"), METRIC_ROUND_DIGITS),
@@ -1824,17 +2128,44 @@ def _metrics_from_engine_result(engine_result, *, candidate_count: int = 1) -> B
         in_sample_sharpe=round(in_sample_sharpe, METRIC_ROUND_DIGITS),
         out_sample_sharpe=round(out_sample_sharpe, METRIC_ROUND_DIGITS),
         degradation=round(degradation, METRIC_ROUND_DIGITS),
-        in_sample_return=round(_compound_returns(in_sample_returns), METRIC_ROUND_DIGITS),
+        in_sample_return=round(in_sample_return, METRIC_ROUND_DIGITS),
         in_sample_max_drawdown=round(
             _max_drawdown_from_returns(in_sample_returns), METRIC_ROUND_DIGITS
         ),
-        out_sample_return=round(_compound_returns(out_sample_returns), METRIC_ROUND_DIGITS),
+        out_sample_return=round(out_sample_return, METRIC_ROUND_DIGITS),
         out_sample_max_drawdown=round(
             _max_drawdown_from_returns(out_sample_returns), METRIC_ROUND_DIGITS
         ),
         in_sample_observations=len(in_sample_returns),
         candidates_evaluated=max(1, candidate_count),
         selection_adjusted_sharpe=round(selection_adjusted_sharpe, METRIC_ROUND_DIGITS),
+        in_sample_benchmark_return=round(in_sample_benchmark_return, METRIC_ROUND_DIGITS),
+        out_sample_benchmark_return=round(out_sample_benchmark_return, METRIC_ROUND_DIGITS),
+        in_sample_excess_return=round(
+            in_sample_return - in_sample_benchmark_return,
+            METRIC_ROUND_DIGITS,
+        ),
+        out_sample_excess_return=round(
+            out_sample_return - out_sample_benchmark_return,
+            METRIC_ROUND_DIGITS,
+        ),
+        benchmark_period_count=period_stats.count,
+        benchmark_period_win_rate=round(period_stats.win_rate, METRIC_ROUND_DIGITS),
+        benchmark_period_loss_rate=round(period_stats.loss_rate, METRIC_ROUND_DIGITS),
+        in_sample_benchmark_period_count=in_sample_period_stats.count,
+        in_sample_benchmark_period_win_rate=round(
+            in_sample_period_stats.win_rate, METRIC_ROUND_DIGITS
+        ),
+        in_sample_benchmark_period_loss_rate=round(
+            in_sample_period_stats.loss_rate, METRIC_ROUND_DIGITS
+        ),
+        out_sample_benchmark_period_count=out_sample_period_stats.count,
+        out_sample_benchmark_period_win_rate=round(
+            out_sample_period_stats.win_rate, METRIC_ROUND_DIGITS
+        ),
+        out_sample_benchmark_period_loss_rate=round(
+            out_sample_period_stats.loss_rate, METRIC_ROUND_DIGITS
+        ),
     )
 
 
@@ -1905,6 +2236,79 @@ def _compound_returns(daily_returns: Sequence[float]) -> float:
     return equity - 1.0
 
 
+def _benchmark_daily_returns(
+    price_rows: Sequence[Mapping[str, Any]],
+) -> list[float]:
+    curve, _ = _equal_weight_benchmark_curve(price_rows)
+    return _daily_returns_from_benchmark_curve(curve)
+
+
+def _daily_returns_from_benchmark_curve(
+    curve: Sequence[BacktestEquityPoint],
+) -> list[float]:
+    if len(curve) < 2:
+        return []
+    returns: list[float] = []
+    previous_equity = 1.0 + float(curve[0].cumulative_return)
+    for point in curve[1:]:
+        current_equity = 1.0 + float(point.cumulative_return)
+        if previous_equity <= 0.0:
+            return []
+        returns.append(current_equity / previous_equity - 1.0)
+        previous_equity = current_equity
+    return returns
+
+
+def _build_benchmark_context(
+    price_rows: Sequence[Mapping[str, Any]],
+) -> _BenchmarkContext:
+    curve, total_return = _equal_weight_benchmark_curve(price_rows)
+    selection_days = max(
+        1,
+        int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION),
+    )
+    selection_index = min(max(0, selection_days - 1), len(curve) - 1)
+    selection_return = (
+        float(curve[selection_index].cumulative_return) if curve else 0.0
+    )
+    return _BenchmarkContext(
+        daily_returns=tuple(_daily_returns_from_benchmark_curve(curve)),
+        selection_days=selection_days,
+        selection_return=selection_return,
+        total_return=float(total_return or 0.0),
+    )
+
+
+def _benchmark_period_stats(
+    strategy_returns: Sequence[float],
+    benchmark_returns: Sequence[float],
+) -> _BenchmarkPeriodStats:
+    """Compare fixed quarter blocks without cherry-picking favourable dates."""
+
+    length = min(len(strategy_returns), len(benchmark_returns))
+    wins = 0
+    losses = 0
+    count = 0
+    for start in range(0, length, BENCHMARK_EVALUATION_PERIOD_DAYS):
+        end = min(length, start + BENCHMARK_EVALUATION_PERIOD_DAYS)
+        if end - start < BENCHMARK_EVALUATION_PERIOD_DAYS:
+            break
+        strategy_return = _compound_returns(strategy_returns[start:end])
+        benchmark_return = _compound_returns(benchmark_returns[start:end])
+        count += 1
+        if strategy_return > benchmark_return + 1e-12:
+            wins += 1
+        elif strategy_return < benchmark_return - 1e-12:
+            losses += 1
+    if count == 0:
+        return _BenchmarkPeriodStats(count=0, win_rate=0.0, loss_rate=0.0)
+    return _BenchmarkPeriodStats(
+        count=count,
+        win_rate=wins / count,
+        loss_rate=losses / count,
+    )
+
+
 def _max_drawdown_from_returns(daily_returns: Sequence[float]) -> float:
     equity = 1.0
     peak = equity
@@ -1933,9 +2337,7 @@ def _sharpe_like(
 def _native_returns_from_equity_curve(equity_curve: Sequence[Any]) -> list[float]:
     values = [float(point.total_equity) for point in equity_curve]
     return [
-        current / previous - 1.0
-        for previous, current in zip(values, values[1:])
-        if previous != 0.0
+        current / previous - 1.0 for previous, current in zip(values, values[1:]) if previous != 0.0
     ]
 
 
@@ -1949,9 +2351,7 @@ def _native_sharpe_like(
     if len(daily_returns) < 2:
         return 0.0
     mean_return = sum(daily_returns) / len(daily_returns)
-    variance = sum(
-        (value - mean_return) ** 2 for value in daily_returns
-    ) / (len(daily_returns) - 1)
+    variance = sum((value - mean_return) ** 2 for value in daily_returns) / (len(daily_returns) - 1)
     return mean_return / math.sqrt(variance) * math.sqrt(252.0) if variance > 0.0 else 0.0
 
 
@@ -2003,7 +2403,7 @@ def _selection_signal_action_count(
 def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
     metrics = _candidate_metrics(result.selected_candidate)
     trade_count = _summary_float_default(result.engine_summary, "effective_trade_count", 0.0)
-    return (
+    passes_basic_floor = (
         trade_count >= MIN_OBJECTIVE_TRADES
         # This gate is a report/acceptance check, so it uses the untouched hold-out.
         and metrics.out_sample_sharpe >= MIN_OBJECTIVE_SHARPE
@@ -2015,6 +2415,52 @@ def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
         # term at in_sample_sharpe and changes no single-candidate behaviour.
         and metrics.selection_adjusted_sharpe >= MIN_SELECTION_ADJUSTED_SHARPE
     )
+    if not passes_basic_floor:
+        return False
+    strategy = getattr(result, "strategy_a", None)
+    if getattr(strategy, "selection_mode", "standard") != "automatic":
+        return True
+    payload = getattr(result, "backtest_payload", {}) or {}
+    benchmark_return = payload.get("benchmark_return") if isinstance(payload, Mapping) else None
+    return not _benchmark_objective_reasons(metrics, benchmark_return=benchmark_return)
+
+
+def _benchmark_objective_reasons(
+    metrics: BacktestMetrics,
+    *,
+    benchmark_return: Any | None = None,
+) -> list[str]:
+    """Why an automatic strategy failed the benchmark-relative acceptance rule."""
+
+    reasons: list[str] = []
+    if metrics.benchmark_period_count <= 0:
+        reasons.append(
+            f"{BENCHMARK_EVALUATION_PERIOD_DAYS}거래일 벤치마크 비교 구간이 없습니다"
+        )
+    elif metrics.benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:
+        reasons.append(
+            "전체 구간의 벤치마크 패배 비율 "
+            f"{metrics.benchmark_period_loss_rate:.1%} >= "
+            f"{MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:.0%}"
+        )
+    if metrics.out_sample_benchmark_period_count <= 0:
+        reasons.append("최종 미사용 구간의 벤치마크 비교 구간이 없습니다")
+    elif metrics.out_sample_benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:
+        reasons.append(
+            "최종 미사용 구간의 벤치마크 패배 비율 "
+            f"{metrics.out_sample_benchmark_period_loss_rate:.1%} >= "
+            f"{MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:.0%}"
+        )
+    if metrics.out_sample_excess_return <= 0.0:
+        reasons.append(f"최종 미사용 구간 초과수익률 {metrics.out_sample_excess_return:.2%} <= 0%")
+    parsed_benchmark = float(benchmark_return) if _is_numeric_metric(benchmark_return) else None
+    if parsed_benchmark is None:
+        parsed_benchmark = (1.0 + metrics.in_sample_benchmark_return) * (
+            1.0 + metrics.out_sample_benchmark_return
+        ) - 1.0
+    if metrics.total_return <= parsed_benchmark:
+        reasons.append(f"전체 수익률 {metrics.total_return:.2%} <= 벤치마크 {parsed_benchmark:.2%}")
+    return reasons
 
 
 def _selected_objective_score(result: CandidateBacktestResult) -> float:
@@ -2027,25 +2473,47 @@ def _objective_score(
     metrics: BacktestMetrics,
     engine_summary: Mapping[str, Any],
     price_rows: Sequence[Mapping[str, Any]],
+    *,
+    benchmark_context: _BenchmarkContext | None = None,
 ) -> float:
     trade_count = _summary_float_default(engine_summary, "selection_buy_count", 0.0)
-    selection_days = max(
-        1, int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION)
+    selection_days = (
+        benchmark_context.selection_days
+        if benchmark_context is not None
+        else max(
+            1,
+            int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION),
+        )
     )
-    annual_return = _annualized_return(
-        metrics.in_sample_return, trading_days=selection_days
-    )
+    annual_return = _annualized_return(metrics.in_sample_return, trading_days=selection_days)
     calmar = _calmar_ratio(annual_return, metrics.in_sample_max_drawdown)
+    if benchmark_context is None:
+        dates = sorted({str(row.get("date")) for row in price_rows})
+        cutoff = dates[max(0, selection_days - 1)] if dates else ""
+        selection_rows = [row for row in price_rows if str(row.get("date")) <= cutoff]
+        _, benchmark_return = _equal_weight_benchmark_curve(selection_rows)
+    else:
+        benchmark_return = benchmark_context.selection_return
+    annual_benchmark_return = _annualized_return(
+        float(benchmark_return or 0.0),
+        trading_days=selection_days,
+    )
+    annual_excess_return = annual_return - annual_benchmark_return
+    benchmark_consistency = (
+        metrics.in_sample_benchmark_period_win_rate - metrics.in_sample_benchmark_period_loss_rate
+    )
     trading_days = selection_days
     annual_turnover = trade_count * 252.0 / trading_days
     turnover_penalty = min(1.0, annual_turnover / 24.0)
     # The hold-out must not affect selection.  It is only used by the objective floor
     # after a candidate has been selected.
     score = (
-        1.00 * metrics.in_sample_sharpe
-        + 0.05 * calmar
-        + 0.02 * annual_return
-        - 0.08 * turnover_penalty
+        0.35 * metrics.in_sample_sharpe
+        + 0.15 * calmar
+        + 0.10 * annual_return
+        + 1.00 * annual_excess_return
+        + 0.20 * benchmark_consistency
+        - 0.05 * turnover_penalty
     )
     if trade_count < MIN_OBJECTIVE_TRADES:
         score -= (MIN_OBJECTIVE_TRADES - trade_count) * 0.05
@@ -2055,6 +2523,15 @@ def _objective_score(
         score -= abs(metrics.in_sample_max_drawdown - MAX_OBJECTIVE_DRAWDOWN)
     if metrics.in_sample_sharpe < MIN_OBJECTIVE_SHARPE:
         score -= (MIN_OBJECTIVE_SHARPE - metrics.in_sample_sharpe) * 0.25
+    if annual_return <= 0.0:
+        score -= 0.25 + abs(annual_return) * 0.5
+    if annual_excess_return <= 0.0:
+        score -= 0.35 + abs(annual_excess_return)
+    if (
+        metrics.in_sample_benchmark_period_count > 0
+        and metrics.in_sample_benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE
+    ):
+        score -= 0.25 + metrics.in_sample_benchmark_period_loss_rate
     return round(score, METRIC_ROUND_DIGITS)
 
 
@@ -2094,29 +2571,76 @@ def _profit_factor(engine_summary: Mapping[str, Any]) -> float:
     return min(3.0, win_rate / max(1.0 - win_rate, 0.01))
 
 
-def _benchmark_return(price_rows: Sequence[Mapping[str, Any]]) -> float:
-    if len(price_rows) < 2:
-        return 0.0
-    rows_by_ticker: dict[str, list[Mapping[str, Any]]] = {}
+def _equal_weight_benchmark_curve(
+    price_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[BacktestEquityPoint], float | None]:
+    if not price_rows:
+        return [], None
+
+    rows_by_ticker: dict[str, dict[str, float]] = defaultdict(dict)
     for row in price_rows:
         ticker = str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
-        rows_by_ticker.setdefault(ticker, []).append(row)
-    returns: list[float] = []
-    for ticker, rows in rows_by_ticker.items():
-        sorted_rows = sorted(rows, key=lambda item: str(item["date"]))
-        if len(sorted_rows) < 2:
+        date = str(row.get("date"))
+        close = _finite_float(row.get("close"), f"{ticker}_close")
+        if close > 0:
+            rows_by_ticker[ticker][date] = close
+
+    if not rows_by_ticker:
+        return [], None
+
+    dates = sorted({str(row.get("date")) for row in price_rows})
+    if not dates:
+        return [], None
+
+    first_date = dates[0]
+    universe = tuple(
+        sorted(ticker for ticker, rows in rows_by_ticker.items() if first_date in rows)
+    )
+    if not universe:
+        return [], None
+    universe = tuple(ticker for ticker in universe if rows_by_ticker[ticker][first_date] > 0.0)
+    if not universe:
+        return [], None
+
+    initial_prices = {ticker: rows_by_ticker[ticker][first_date] for ticker in universe}
+    latest_prices = dict(initial_prices)
+    curve: list[BacktestEquityPoint] = [BacktestEquityPoint(date=first_date, cumulative_return=0.0)]
+    for date in dates[1:]:
+        values: list[float] = []
+        for ticker in universe:
+            current = rows_by_ticker[ticker].get(date, latest_prices[ticker])
+            latest_prices[ticker] = current
+            initial_price = initial_prices[ticker]
+            if initial_price <= 0:
+                continue
+            values.append(current / initial_price)
+        if not values:
             continue
-        first = _finite_float(sorted_rows[0]["close"], f"{ticker}_benchmark_first_close")
-        last = _finite_float(sorted_rows[-1]["close"], f"{ticker}_benchmark_last_close")
-        if first:
-            returns.append(last / first - 1)
-    if not returns:
+        cumulative_return = sum(values) / len(universe)
+        curve.append(
+            BacktestEquityPoint(
+                date=date,
+                cumulative_return=round(cumulative_return - 1.0, METRIC_ROUND_DIGITS),
+            )
+        )
+
+    if not curve:
+        return [], None
+    return curve, round(curve[-1].cumulative_return, METRIC_ROUND_DIGITS)
+
+
+def _benchmark_return(price_rows: Sequence[Mapping[str, Any]]) -> float:
+    _, total_return = _equal_weight_benchmark_curve(price_rows)
+    if total_return is None:
         return 0.0
-    return sum(returns) / len(returns)
+    return total_return
 
 
 def _backtest_payload(
-    strategy: AIStrategySpec, rows: Sequence[Mapping[str, Any]]
+    strategy: AIStrategySpec,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    benchmark_return: float | None = None,
 ) -> dict[str, Any]:
     tickers = sorted({str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6) for row in rows})
     payload = {
@@ -2126,12 +2650,12 @@ def _backtest_payload(
         "price_rows": len(rows),
         "first_date": str(rows[0].get("date")) if rows else None,
         "last_date": str(rows[-1].get("date")) if rows else None,
-        "benchmark_return": round(_benchmark_return(rows), METRIC_ROUND_DIGITS),
-        "benchmark_method": "static_universe_equal_weight_buy_and_hold",
-        "benchmark_warning": (
-            "This is not the KOSPI200 index. The static universe can contain "
-            "survivorship bias; benchmark comparison is informational only."
+        "benchmark_return": round(
+            _benchmark_return(rows) if benchmark_return is None else benchmark_return,
+            METRIC_ROUND_DIGITS,
         ),
+        "benchmark_method": BENCHMARK_METHOD,
+        "benchmark_warning": BENCHMARK_WARNING,
     }
     fingerprint = repr(sorted(payload.items())).encode("utf-8")
     return {**payload, "payload_hash": sha256(fingerprint).hexdigest()[:16]}

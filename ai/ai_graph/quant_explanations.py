@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+_SHARPE_SOURCE = "https://web.stanford.edu/~wfsharpe/art/sr/SR.htm"
+_QUANTSTATS_SOURCE = "https://github.com/ranaroussi/quantstats"
+
+
+_METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
+    "total_return": {
+        "label": "누적수익률",
+        "unit": "percent",
+        "plain_explanation": "전 기간 기준 투자금 변화율입니다.",
+        "why_used": "전략의 기본 성과 크기를 판단해 추천의 수익성 가능성을 보여줍니다.",
+        "caution": "과거구간 특성에 따라 과대·과소 추정될 수 있으므로 향후 구간은 별도 확인해야 합니다.",
+        "source_refs": [],
+    },
+    "cagr": {
+        "label": "연환산수익률(CAGR)",
+        "unit": "percent",
+        "plain_explanation": "누적수익률을 연 단위로 환산한 값입니다.",
+        "why_used": "분석 기간 길이가 다를 때 서로 다른 전략을 기간 기준으로 비교할 수 있습니다.",
+        "caution": "거래일 수가 짧으면 연환산이 과대해질 수 있습니다.",
+        "source_refs": [_QUANTSTATS_SOURCE],
+    },
+    "annualized_volatility": {
+        "label": "연환산 변동성",
+        "unit": "percent",
+        "plain_explanation": "일별 수익률 표준편차를 연환산한 위험 지표입니다.",
+        "why_used": "수익률 대비 리스크를 정량화해 전략 안정성을 보조적으로 평가합니다.",
+        "caution": "극단치에 민감하고 표본 수가 적으면 불안정해질 수 있습니다.",
+        "source_refs": [_QUANTSTATS_SOURCE],
+    },
+    "sharpe_ratio": {
+        "label": "샤프비율",
+        "unit": "ratio",
+        "plain_explanation": "초과수익 대비 변동성 위험 비율입니다.",
+        "why_used": "위험 대비 보상 효율을 측정해 전략 적합성을 비교합니다.",
+        "caution": "참조 무위험 수익률 가정이 간단할수록 수치 해석이 제한됩니다.",
+        "source_refs": [_SHARPE_SOURCE, _QUANTSTATS_SOURCE],
+    },
+    "sortino_ratio": {
+        "label": "소르티노비율",
+        "unit": "ratio",
+        "plain_explanation": "음의 변동만을 위험으로 본 샤프 유사 지표입니다.",
+        "why_used": "하방 위험을 중심으로 손실 구간의 전략 성격을 점검합니다.",
+        "caution": "하방 표본이 적으면 해석이 제한됩니다.",
+        "source_refs": [_QUANTSTATS_SOURCE],
+    },
+    "max_drawdown": {
+        "label": "최대낙폭",
+        "unit": "percent",
+        "plain_explanation": "누적수익곡선 기준 누적 최고점 대비 최저점 하락 폭의 최대값입니다.",
+        "why_used": "심각한 손실 구간을 빠르게 파악해 전략의 방어력을 판단합니다.",
+        "caution": "짧은 구간에서는 실전 극단 구간을 충분히 반영하지 못할 수 있습니다.",
+        "source_refs": [],
+    },
+    "calmar_ratio": {
+        "label": "칼마비율",
+        "unit": "ratio",
+        "plain_explanation": "연환산수익률을 최대낙폭으로 나눈 값입니다.",
+        "why_used": "수익과 하락 리스크를 하나의 지표로 비교하기 위해 사용합니다.",
+        "caution": "낙폭이 매우 작으면 분모가 불안정해질 수 있습니다.",
+        "source_refs": [_QUANTSTATS_SOURCE],
+    },
+    "win_rate": {
+        "label": "승률",
+        "unit": "percent",
+        "plain_explanation": "매매에서 수익 거래 비중입니다. 백테스트 메트릭의 trade_win_rate를 사용합니다.",
+        "why_used": "진입/청산 패턴의 일관성과 안정적 신호 빈도를 보조 점검합니다.",
+        "caution": "수익률 크기 없이 단순 횟수 중심으로 계산되어 성능을 완전히 설명하지 못할 수 있습니다.",
+        "source_refs": [],
+    },
+    "profit_factor": {
+        "label": "수익팩터",
+        "unit": "ratio",
+        "plain_explanation": "총이익을 총손실로 나눈 값입니다. 수익분포 기반 period-return 값이며, 거래 수량 근사값이 아닙니다.",
+        "why_used": "이익 기여 구간과 손실 구간의 상대 비율을 보조적으로 보여줍니다.",
+        "caution": "거래 수가 적으면 과도하게 변동할 수 있습니다.",
+        "source_refs": [_QUANTSTATS_SOURCE],
+    },
+    "benchmark_return": {
+        "label": "프록시 벤치마크 수익률",
+        "unit": "percent",
+        "plain_explanation": "가격열 상위집합의 고정 유니버스 동등가중 보유수익률입니다.",
+        "why_used": "전략 성과를 동일 기간의 대체 기준과 비교해 초과 성과를 점검합니다.",
+        "caution": "과거 살아남은 종목만으로 구성된 고정 유니버스여서 생존편향 경고가 포함됩니다.",
+        "source_refs": [],
+    },
+    "excess_return": {
+        "label": "초과수익률",
+        "unit": "percent",
+        "plain_explanation": "전략 누적수익률에서 벤치마크 누적수익률을 뺀 값입니다.",
+        "why_used": "기준 대비 전략의 상대적 우위를 직관적으로 확인하기 위해 사용합니다.",
+        "caution": "벤치마크가 계산되지 않으면 비교값이 없습니다.",
+        "source_refs": [],
+    },
+    "out_sample_excess_return": {
+        "label": "검증구간 초과수익률",
+        "unit": "percent",
+        "plain_explanation": "후보 선택에 쓰지 않은 마지막 30%에서 전략 수익률과 벤치마크 수익률의 차이입니다.",
+        "why_used": "과거 학습구간에서만 지수를 이긴 과최적화 전략을 걸러내기 위해 사용합니다.",
+        "caution": "한 번의 홀드아웃 결과만으로 미래의 모든 시장 국면을 대표할 수는 없습니다.",
+        "source_refs": [],
+    },
+    "benchmark_period_win_rate": {
+        "label": "벤치마크 승리 구간 비율",
+        "unit": "percent",
+        "plain_explanation": "고정된 63거래일 구간 중 전략 수익률이 벤치마크보다 높았던 구간의 비율입니다.",
+        "why_used": "몇 번의 큰 성공뿐 아니라 서로 다른 시장 구간에서 초과성과가 반복되는지 확인합니다.",
+        "caution": "구간 길이는 결과를 본 뒤 바꾸지 않으며, 126일 미만의 마지막 미완료 구간은 제외합니다.",
+        "source_refs": [],
+    },
+    "benchmark_period_loss_rate": {
+        "label": "벤치마크 패배 구간 비율",
+        "unit": "percent",
+        "plain_explanation": "고정된 63거래일 구간 중 전략 수익률이 벤치마크보다 낮았던 구간의 비율입니다.",
+        "why_used": "사용자 기준에 따라 이 값이 50% 이상이면 자동 전략을 패배로 판정합니다.",
+        "caution": "큰 초과수익 구간이 있어도 패배 구간이 절반 이상이면 검증을 통과하지 못합니다.",
+        "source_refs": [],
+    },
+    "out_sample_benchmark_period_loss_rate": {
+        "label": "검증구간 벤치마크 패배 비율",
+        "unit": "percent",
+        "plain_explanation": "마지막 30%를 다시 63거래일 단위로 나눴을 때 벤치마크에 진 구간의 비율입니다.",
+        "why_used": "전략 선택 이후의 데이터에서도 패배 구간이 절반 미만인지 확인합니다.",
+        "caution": "검증기간이 짧으면 비교 구간 수가 적어 비율 하나의 영향이 커집니다.",
+        "source_refs": [],
+    },
+    "in_sample_sharpe": {
+        "label": "학습구간 샤프비율",
+        "unit": "ratio",
+        "plain_explanation": "데이터 1차 분할 구간 샤프비율입니다.",
+        "why_used": "개선·선택 단계의 내부 지표 추적에 활용합니다.",
+        "caution": "교차검증 구간과 다를 수 있어 실제 운영 성과로 과잉해석하지 않습니다.",
+        "source_refs": [_QUANTSTATS_SOURCE],
+    },
+    "out_sample_sharpe": {
+        "label": "검증구간 샤프비율",
+        "unit": "ratio",
+        "plain_explanation": "홀드아웃 구간 샤프비율입니다.",
+        "why_used": "선택 후 일반화 성능을 가늠해 객관적 문턱을 적용합니다.",
+        "caution": "홀드아웃 기간 분산이 낮으면 오차가 커질 수 있습니다.",
+        "source_refs": [_QUANTSTATS_SOURCE],
+    },
+    "degradation": {
+        "label": "열화도",
+        "unit": "percent",
+        "plain_explanation": "학습구간 대비 홀드아웃 구간 성과 하락 정도입니다.",
+        "why_used": "과적합 또는 구간 의존성을 점검하는 보조 지표로 사용합니다.",
+        "caution": "매우 짧은 홀드아웃 구간에서는 불안정하게 나타날 수 있습니다.",
+        "source_refs": [],
+    },
+}
+
+
+def metric_explanation(key: str) -> dict[str, Any]:
+    return _METRIC_EXPLANATIONS.get(
+        key,
+        {
+            "label": key,
+            "unit": "ratio",
+            "plain_explanation": f"{key}는 백테스트 성능 지표입니다.",
+            "why_used": "성능의 보조 판별값으로 사용됩니다.",
+            "caution": "지표 정의가 제한되어 있어 보조적으로 해석합니다.",
+            "source_refs": [],
+        },
+    )

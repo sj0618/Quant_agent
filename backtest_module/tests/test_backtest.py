@@ -14,6 +14,7 @@ from backtest_module import (
 )
 from backtest_module.backtest import (
     BacktestRunConfig,
+    EquityPoint,
     OhlcvBar,
     TalibIndicatorConfig,
     build_sample_spec,
@@ -577,3 +578,33 @@ def test_write_off_respects_the_grace_period_and_the_recovery_rate():
     write_off = next(t for t in partial.trades if t.reason == "delisted_write_off")
     assert write_off.exit_price == 50.0
     assert partial.summary["delisting"]["recovery_rate"] == 0.5
+
+def test_selection_metrics_vectorized_formula_matches_reference():
+    from backtest_module.backtest import _calculate_selection_metrics
+    import math
+
+    equity_curve = [
+        EquityPoint(date="2026-01-01", cash=100.0, positions_value=0.0, total_equity=100.0, daily_return=0.0),
+        EquityPoint(date="2026-01-02", cash=102.0, positions_value=0.0, total_equity=102.0, daily_return=0.02),
+        EquityPoint(date="2026-01-03", cash=101.0, positions_value=0.0, total_equity=101.0, daily_return=-0.01),
+        EquityPoint(date="2026-01-04", cash=103.0, positions_value=0.0, total_equity=103.0, daily_return=0.02),
+    ]
+    metrics = _calculate_selection_metrics(equity_curve)
+
+    usable = [0.02, -0.01, 0.02]
+    mean_return = sum(usable) / len(usable)
+    variance = ((0.02 - mean_return) ** 2 + (-0.01 - mean_return) ** 2 + (0.02 - mean_return) ** 2) / (len(usable) - 1)
+    expected_sharpe = mean_return / math.sqrt(variance) * (252.0**0.5)
+    expected_max_drawdown = min(
+        0.0,
+        102.0 / 102.0 - 1.0,
+        101.0 / 102.0 - 1.0,
+        103.0 / 103.0 - 1.0,
+    )
+
+    assert metrics["total_return"] == pytest.approx((103.0 / 100.0) - 1.0, rel=1e-10)
+    assert metrics["cagr"] == pytest.approx((103.0 / 100.0) ** (365.0 / 3.0) - 1.0, rel=1e-10)
+    assert metrics["sharpe"] == pytest.approx(round(expected_sharpe, 10), rel=1e-10)
+    assert metrics["max_drawdown"] == pytest.approx(round(expected_max_drawdown, 10), rel=1e-10)
+    assert metrics["win_rate"] == pytest.approx(2.0 / 3.0, rel=1e-10)
+    assert metrics["profit_factor"] == pytest.approx(0.04 / 0.01, rel=1e-10)

@@ -10,8 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 SCHEMA_VERSION = "ai-mvp.v1"
 
 
-
-
 SemanticParseStatus = Literal["ready", "needs_clarification", "failed"]
 SourceType = Literal["internal_db", "krx", "dart", "aoai_web_search", "analyst_evidence", "none"]
 FreshnessStatus = Literal["fresh", "stale", "unknown", "not_time_sensitive"]
@@ -27,6 +25,10 @@ FailureCategory = Literal[
 FailureSubcause = Literal[
     "db_connect_timeout",
     "db_statement_timeout",
+    # The warehouse ran out of lock-table slots ("out of shared memory"), which a query
+    # touching many hypertable chunks can do on its own. Distinct from the timeouts
+    # above: nothing was slow, the statement was refused before it read a row.
+    "db_lock_capacity_exhausted",
     "semantic_drift",
     "missing_data_policy_gap",
     "clarification_quality_gap",
@@ -101,7 +103,9 @@ class DataRequirement(BaseModel):
         "analyst_evidence",
     ]
     required: bool = True
-    availability: Literal["available", "derivable", "partial", "unavailable", "outside_owner", "not_required"]
+    availability: Literal[
+        "available", "derivable", "partial", "unavailable", "outside_owner", "not_required"
+    ]
     owner: Literal["ai_graph", "data_source_config", "product_data_gap", "outside_owner", "unknown"]
     preferred_source: SourceType
     fallback_sources: list[SourceType] = Field(default_factory=list)
@@ -139,7 +143,9 @@ class FailureDiagnostic(BaseModel):
     category: FailureCategory
     subcause: FailureSubcause
     failure_stage: str = Field(min_length=1)
-    owner: Literal["ai_graph", "data_source_config", "fe_state", "outside_owner", "product_data_gap", "unknown"]
+    owner: Literal[
+        "ai_graph", "data_source_config", "fe_state", "outside_owner", "product_data_gap", "unknown"
+    ]
     retryable: bool
     safe_message: str = Field(min_length=1)
     evidence_refs: list[str] = Field(default_factory=list)
@@ -200,13 +206,11 @@ class Condition(BaseModel):
         elif self.operator in {ConditionOperator.CROSS_ABOVE, ConditionOperator.CROSS_BELOW}:
             if not isinstance(self.right, str):
                 raise ValueError("cross operators require a metric name")
-        elif not isinstance(self.right, (int, float)):
-            # A metric name on the right is allowed once the condition compares against a
-            # windowed/derived series - "close >= 252-day max of high", "operating_income
-            # > its previous quarter". Absolute comparisons still require a number.
-            structured = self.window is not None or self.consecutive is not None
-            if not (structured and isinstance(self.right, str)):
-                raise ValueError("scalar operators require a numeric right side")
+        elif not isinstance(self.right, (int, float, str)):
+            # Metric-to-metric comparisons are first-class rules (close > SMA, +DI >
+            # -DI).  Requiring a fake one-period window changed "current versus
+            # current" into "current versus yesterday" in the executable evaluator.
+            raise ValueError("scalar operators require a number or metric name")
         return self
 
 
@@ -295,6 +299,7 @@ class StrategySpec(BaseModel):
     risk_constraints: dict[str, float | int | str | bool] = Field(default_factory=dict)
     assumptions: list[str] = Field(default_factory=list)
     source_refs: list[str] = Field(default_factory=list)
+    selection_mode: Literal["standard", "automatic", "user_defined"] = "standard"
     confidence: float = Field(ge=0.0, le=1.0)
 
     @field_validator("strategy_id")
@@ -348,6 +353,89 @@ class BacktestMetrics(BaseModel):
     # best-of-N a skill-free search would be expected to produce; at or below zero means
     # the result is not distinguishable from having tried N things and kept the luckiest.
     selection_adjusted_sharpe: float = 0.0
+    in_sample_benchmark_return: float = 0.0
+    out_sample_benchmark_return: float = 0.0
+    in_sample_excess_return: float = 0.0
+    out_sample_excess_return: float = 0.0
+    benchmark_period_count: int = Field(default=0, ge=0)
+    benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    in_sample_benchmark_period_count: int = Field(default=0, ge=0)
+    in_sample_benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    in_sample_benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    out_sample_benchmark_period_count: int = Field(default=0, ge=0)
+    out_sample_benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    out_sample_benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class PublicMetricDetail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    value: float | None
+    unit: str = Field(min_length=1)
+    is_available: bool
+    unavailable_reason: str | None = None
+    plain_explanation: str = Field(min_length=1)
+    why_used: str = Field(min_length=1)
+    caution: str = Field(min_length=1)
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class PublicIndicatorExplanation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    plain_explanation: str = Field(min_length=1)
+    why_used: str = Field(min_length=1)
+    formula: str | None = None
+    derivation: str | None = None
+    customization: str | None = None
+    caution: str = Field(min_length=1)
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class PublicStrategyExplanation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selection_mode: Literal["standard", "automatic", "user_defined"]
+    title: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    why_selected: str = Field(min_length=1)
+    rebalance_explanation: str | None = None
+    caution: str = Field(min_length=1)
+    indicators: list[PublicIndicatorExplanation] = Field(default_factory=list)
+    generated_strategies: list[dict[str, Any]] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class BacktestReliability(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["fixture", "postgres", "unknown"] = "unknown"
+    status: Literal["sufficient", "limited", "insufficient"]
+    row_count: int = Field(ge=0)
+    ticker_count: int = Field(ge=0)
+    trading_days: int = Field(ge=0)
+    history_start: str | None = None
+    history_end: str | None = None
+    trade_count: int = Field(ge=0)
+    reasons: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BacktestBenchmark(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1)
+    method: str = Field(min_length=1)
+    warning: str | None = None
+    total_return: float | None
+    cumulative_curve: list[BacktestEquityPoint] = Field(default_factory=list)
+    is_available: bool = True
+    unavailable_reason: str | None = None
 
 
 class BacktestEquityPoint(BaseModel):
@@ -359,6 +447,10 @@ class BacktestEquityPoint(BaseModel):
 
 StructuredProfile = Literal[
     "compiled_conditions",
+    "academic_momentum_trend",
+    "relative_momentum_rotation",
+    "risk_adjusted_momentum_rotation",
+    "trend_leader_rotation",
     "long_regime_momentum",
     "quality_trend_hold",
     "volatility_breakout_hold",
@@ -387,6 +479,12 @@ class StrategyIR(BaseModel):
     entry_conditions: list[Condition] = Field(default_factory=list)
     exit_conditions: list[Condition] = Field(default_factory=list)
     ranking: Literal["score_desc_ticker_desc", "none"] = "score_desc_ticker_desc"
+    # Catalog strategies carry their own ranking formula.  This is deliberately part
+    # of the executable IR (rather than display-only blueprint metadata), so the rule
+    # described to the user is the rule that decides which names receive scarce slots.
+    ranking_metric: str | None = None
+    ranking_direction: Literal["desc", "asc"] = "desc"
+    execution_mode: Literal["event_driven", "scheduled_rotation"] = "event_driven"
 
 
 class CandidateParameters(BaseModel):
@@ -395,11 +493,17 @@ class CandidateParameters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     profile: StructuredProfile
+    # Stable provenance for an independently defined catalog strategy.  Parameter
+    # variants may share a profile, but two catalog rules never share this identity.
+    blueprint_id: str | None = None
     lookback: int = Field(ge=3, le=252)
     threshold: float = Field(ge=-1.0, le=100.0)
     stop_loss_pct: float = Field(gt=0.0, le=1.0)
     take_profit_pct: float = Field(gt=0.0, le=10.0)
     max_positions: int = Field(gt=0, le=1000)
+    rebalance_interval_days: int = Field(default=21, ge=5, le=63)
+    trailing_stop_pct: float = Field(default=0.25, gt=0.0, le=0.75)
+    medium_momentum_weight: float = Field(default=0.60, ge=0.0, le=1.0)
 
 
 class CodeCandidate(BaseModel):
@@ -438,6 +542,7 @@ class CandidateBacktestResult(BaseModel):
     feature_coverage: dict[str, Any] = Field(default_factory=dict)
     fallback_reasons: list[str] = Field(default_factory=list)
     execution_stats: dict[str, Any] = Field(default_factory=dict)
+    generated_strategy_blueprints: list[dict[str, Any]] = Field(default_factory=list)
 
 
 SignalAction = Literal["BUY", "HOLD", "DROP"]
@@ -517,6 +622,11 @@ class BacktestPerformance(BaseModel):
     metrics: BacktestMetrics
     equity_curve: list[BacktestEquityPoint]
     engine_summary: dict[str, Any] = Field(default_factory=dict)
+    reliability: BacktestReliability | None = None
+    data_quality: list[str] = Field(default_factory=list)
+    benchmark: BacktestBenchmark | None = None
+    metric_details: list[PublicMetricDetail] = Field(default_factory=list)
+    strategy_explanation: PublicStrategyExplanation | None = None
 
 
 class InternalPayload(BaseModel):

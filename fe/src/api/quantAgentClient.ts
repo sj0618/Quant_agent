@@ -6,8 +6,12 @@ import { reportDetails } from "../mocks/reports.mock";
 import { formatScoreValue, SCORE_SCALE, selectRecommendationConfidence } from "../utils/score";
 import { clearUserScopedStorage } from "../utils/userScopedStorage";
 import type {
+  AIBacktestBenchmark,
+  AIBacktestEquityPoint,
+  AIBacktestMetricDetail,
   AIBacktestMetrics,
   AIBacktestPerformance,
+  AIBacktestReliability,
   AICondition,
   AIEnvelopeStatus,
   AIJobStage,
@@ -42,7 +46,6 @@ const PERCENT_SCALE = 100;
 const TRACE_PREVIEW_LENGTH = 8;
 const PERCENT_DISPLAY_DIGITS = 2;
 const DECIMAL_DISPLAY_DIGITS = 2;
-const BASELINE_RETURN_PERCENT = 0;
 const AI_REQUEST_TIMEOUT_MS = 1_200_000;
 const STORAGE_KEY_LATEST_ANALYSIS_JOB = "quantagent.latest-analysis-job.v1";
 const AI_REPORT_ID_PREFIX = "ai-job:";
@@ -770,26 +773,88 @@ function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: Perf
   const aiPerformance = job.result?.user_payload.performance;
   const selectedMetrics = aiPerformance?.metrics ?? null;
   if (!aiPerformance || !selectedMetrics) {
-    return fallback;
+    return job.result?.status === "ready"
+      ? buildUnavailableAiPerformanceSummary(fallback, job.updated_at)
+      : fallback;
   }
 
-  const equityCurve = buildAIEquityCurve(aiPerformance);
-  const comparison = buildAIComparisonRows(selectedMetrics, aiPerformance.engine_summary);
+  const reliability = parseAIBacktestReliability(aiPerformance.reliability);
+  const metricDetails = parseAIBacktestMetricDetails(aiPerformance.metric_details);
+  const benchmark = parseAIBacktestBenchmark(aiPerformance.benchmark);
+  const isInsufficient = reliability?.status === "insufficient";
+  const benchmarkCurve = benchmark?.is_available ? benchmark.cumulative_curve : [];
+  const equityCurve = isInsufficient
+    ? []
+    : buildAIEquityCurve(aiPerformance.equity_curve, benchmarkCurve);
+  const metrics = isInsufficient
+    ? []
+    : metricDetails.length
+      ? buildAIMetricCardsFromDetails(metricDetails)
+      : buildAIMetricCards(selectedMetrics, aiPerformance.engine_summary);
+  const comparison = isInsufficient
+    ? []
+    : buildAIComparisonRows(selectedMetrics, aiPerformance.engine_summary);
 
   return {
     ...fallback,
-    headline: "AI 전략 검증 결과",
+    headline: "AI 백테스트 결과",
     source: "ai",
     period: `후보 코드 백테스트 · ${aiPerformance.selected_candidate_id} 선택 · ${formatDateTime(job.updated_at)}`,
-    benchmarkLabel: "검증 기준선",
-    metrics: buildAIMetricCards(selectedMetrics, aiPerformance.engine_summary),
+    benchmarkLabel: benchmark?.label || "벤치마크",
+    metrics,
     equityCurve,
     comparison,
+    reliability,
+    dataQuality: parseStringList(aiPerformance.data_quality),
+    benchmark: benchmark ?? undefined,
+    metricDetails,
+    strategyExplanation: aiPerformance.strategy_explanation ?? null,
     macroEvents: [],
-    disclaimer:
-      `AI 백테스트 엔진이 후보 코드 중 ${aiPerformance.selected_candidate_id}를 선택했습니다. ` +
-      "벤치마크 데이터가 없는 검증 응답은 0% 기준선과 함께 표시합니다.",
+    disclaimer: buildPerformanceDisclaimer(
+      aiPerformance.selected_candidate_id,
+      reliability,
+      benchmark,
+    ),
   };
+}
+
+function buildUnavailableAiPerformanceSummary(
+  fallback: PerformanceSummary,
+  completedAt: string,
+): PerformanceSummary {
+  return {
+    ...fallback,
+    source: "ai",
+    headline: "AI 백테스트 결과 없음",
+    period: `완료 시각 ${formatDateTime(completedAt)}`,
+    benchmarkLabel: "벤치마크",
+    metrics: [],
+    equityCurve: [],
+    comparison: [],
+    reliability: null,
+    dataQuality: [],
+    benchmark: undefined,
+    metricDetails: [],
+    strategyExplanation: null,
+    macroEvents: [],
+    disclaimer: "완료된 AI 분석에 검증 가능한 성과 데이터가 포함되지 않았습니다.",
+  };
+}
+
+function buildAIMetricCardsFromDetails(details: AIBacktestMetricDetail[]): BacktestMetric[] {
+  return details
+    .filter((detail) => detail.is_available && detail.value !== null && Number.isFinite(detail.value))
+    .map((detail) => ({
+      key: metricCardKey(detail.key),
+      label: detail.label,
+      value: detail.unit === "percent" ? formatPercent(detail.value as number) : formatDecimal(detail.value as number),
+      tone: toneForPublicMetric(detail.key, detail.value as number),
+      caption: detail.plain_explanation,
+      plainExplanation: detail.plain_explanation,
+      whyUsed: detail.why_used,
+      caution: detail.caution,
+      sourceRefs: detail.source_refs,
+    }));
 }
 
 function buildAIMetricCards(selected: AIBacktestMetrics, engineSummary?: Record<string, unknown>): BacktestMetric[] {
@@ -872,18 +937,131 @@ function buildAIComparisonRows(selected: AIBacktestMetrics, engineSummary?: Reco
   ];
 }
 
-function buildAIEquityCurve(performance: AIBacktestPerformance): EquityPoint[] {
-  const sourceCurve = performance.equity_curve ?? [];
+function buildAIEquityCurve(
+  sourceCurve: AIBacktestEquityPoint[] = [],
+  benchmarkCurve: AIBacktestEquityPoint[] = [],
+): EquityPoint[] {
   if (!sourceCurve.length) {
     return [];
   }
 
-  return sourceCurve.map((point) => ({
-    date: formatEquityPointLabel(point.date),
-    strategy: ratioToPercent(point.cumulative_return),
-    original: BASELINE_RETURN_PERCENT,
-    benchmark: BASELINE_RETURN_PERCENT,
-  }));
+  const benchmarkByDate = new Map(
+    benchmarkCurve
+      .filter((point) => Number.isFinite(point.cumulative_return))
+      .map((point) => [point.date, ratioToPercent(point.cumulative_return)]),
+  );
+  return sourceCurve
+    .filter((point) => Number.isFinite(point.cumulative_return))
+    .map((point) => {
+      const benchmarkValue = benchmarkByDate.get(point.date);
+      return {
+        date: formatEquityPointLabel(point.date),
+        strategy: ratioToPercent(point.cumulative_return),
+        ...(benchmarkValue === undefined ? {} : { benchmark: benchmarkValue }),
+      };
+    });
+}
+
+function parseAIBacktestReliability(
+  reliability: AIBacktestPerformance["reliability"],
+): AIBacktestReliability | null {
+  if (!reliability) {
+    return null;
+  }
+  return {
+    ...reliability,
+    reasons: parseStringList(reliability.reasons),
+    warnings: parseStringList(reliability.warnings),
+  };
+}
+
+function parseAIBacktestBenchmark(
+  benchmark: AIBacktestPerformance["benchmark"],
+): AIBacktestBenchmark | null {
+  if (!benchmark) {
+    return null;
+  }
+  const curve = benchmark.cumulative_curve.filter(
+    (point) => typeof point.date === "string" && Number.isFinite(point.cumulative_return),
+  );
+  return {
+    ...benchmark,
+    total_return:
+      benchmark.total_return !== null && Number.isFinite(benchmark.total_return)
+        ? benchmark.total_return
+        : null,
+    cumulative_curve: curve,
+    is_available: benchmark.is_available && curve.length > 0,
+  };
+}
+
+function parseAIBacktestMetricDetails(
+  details: AIBacktestPerformance["metric_details"],
+): AIBacktestMetricDetail[] {
+  if (!Array.isArray(details)) {
+    return [];
+  }
+  return details
+    .filter((detail) => typeof detail.key === "string" && detail.key.length > 0)
+    .map((detail) => ({
+      ...detail,
+      value:
+        detail.value !== null && Number.isFinite(detail.value)
+          ? detail.value
+          : null,
+      source_refs: parseStringList(detail.source_refs),
+    }));
+}
+
+function parseStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : [];
+}
+
+function metricCardKey(key: string) {
+  return {
+    total_return: "totalReturn",
+    sharpe_ratio: "sharpe",
+    max_drawdown: "mdd",
+    win_rate: "winRate",
+  }[key] ?? key;
+}
+
+function toneForPublicMetric(key: string, value: number): Tone {
+  if (key === "max_drawdown") {
+    return value >= -0.1 ? "positive" : value >= -0.2 ? "neutral" : "negative";
+  }
+  if (key === "annualized_volatility" || key === "degradation") {
+    return value <= 0.2 ? "positive" : value <= 0.35 ? "neutral" : "negative";
+  }
+  if (key === "win_rate") {
+    return value >= 0.5 ? "positive" : value >= 0.4 ? "neutral" : "negative";
+  }
+  if (key.includes("sharpe") || key.includes("sortino") || key.includes("calmar")) {
+    return value >= 1 ? "positive" : value >= 0.5 ? "neutral" : "negative";
+  }
+  return value > 0 ? "positive" : value < 0 ? "negative" : "neutral";
+}
+
+function buildPerformanceDisclaimer(
+  candidateId: string,
+  reliability: AIBacktestReliability | null,
+  benchmark: AIBacktestBenchmark | null,
+) {
+  if (reliability?.status === "insufficient") {
+    return `후보 ${candidateId}: 표본이 부족해 수익률과 지표를 공개하지 않습니다.`;
+  }
+  const reliabilityNote = reliability?.status === "limited"
+    ? "제한된 표본이므로 결과를 참고용으로만 해석하세요."
+    : "충분 조건을 충족한 표본입니다.";
+  const benchmarkNote = benchmark?.is_available
+    ? `벤치마크는 ${benchmark.method} 방식입니다.`
+    : "사용 가능한 벤치마크 곡선이 없어 비교선을 표시하지 않습니다.";
+  return `후보 ${candidateId}: ${reliabilityNote} ${benchmarkNote}`;
 }
 
 function extractFinalSignal(report: AIReportBundle) {

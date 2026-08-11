@@ -9,9 +9,10 @@ from ai_graph.data_sources.db import (
     AI_DATABASE_DSN_ENV,
     DATABASE_URL_ENV,
     DEFAULT_BACKTEST_LOOKBACK_DAYS,
+    ADJUSTED_OHLCV_TABLE,
     DataSourceConfig,
+    FEATURE_FRAME_MARKER,
     PostgresPipelineDataSource,
-    KIS_FEATURE_FRAME_VIEW,
     QUANT_DB_DSN_ENV,
     RSI_OVERSOLD_THRESHOLD,
     ScreeningThresholds,
@@ -106,12 +107,12 @@ class FakeScreeningConnection:
             return FakeResult(row={"previous_date": PREVIOUS_TRADING_DAY})
         if "min(time) AS date_floor" in query:
             return FakeResult(row={"date_floor": AS_OF})
-        if KIS_FEATURE_FRAME_VIEW in query and "prev_rsi" in query:
+        if FEATURE_FRAME_MARKER in query and "prev_rsi" in query:
             return FakeResult(rows=[
                 {"ticker": row["ticker"], "prev_rsi": row.get("prev_rsi")}
                 for row in self.frame_rows
             ])
-        if KIS_FEATURE_FRAME_VIEW in query:
+        if FEATURE_FRAME_MARKER in query:
             self.frame_reads += 1
             return FakeResult(rows=[dict(row) for row in self.frame_rows])
         if "WITH path AS" in query:
@@ -378,6 +379,13 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
         "SELECT set_config('statement_timeout', %s, true)",
         ["12345ms"],
     )
+    price_query = next(
+        query
+        for query, _ in source.conn.calls
+        if "WHERE ticker = ANY(%s)" in query
+    )
+    assert "time >= %s::date" in price_query
+    assert "ORDER BY ticker, time" in price_query
 
 
 def test_postgres_data_source_broad_screening_uses_screening_candidates() -> None:
@@ -399,7 +407,7 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
     assert bundle.data_availability["price_ta"] == "available"
     # Indicators are read, not recomputed.
     frame = bundle.metadata["screening_relaxation"]["frame"]
-    assert frame["indicator_source"] == KIS_FEATURE_FRAME_VIEW
+    assert frame["indicator_source"] == ADJUSTED_OHLCV_TABLE
     assert frame["as_of_date"] == AS_OF.isoformat()
 
 
@@ -439,7 +447,7 @@ def test_postgres_data_source_filters_screening_by_sector() -> None:
     frame_queries = [
         (query, params)
         for query, params in source.conn.calls
-        if KIS_FEATURE_FRAME_VIEW in query and "base_ticker" in query
+        if FEATURE_FRAME_MARKER in query and "base_ticker" in query
     ]
     assert frame_queries
     query, params = frame_queries[0]
@@ -469,7 +477,7 @@ def test_postgres_data_source_screening_without_sector_has_no_sector_predicate()
     frame_queries = [
         query
         for query, _ in source.conn.calls
-        if KIS_FEATURE_FRAME_VIEW in query and "base_ticker" in query
+        if FEATURE_FRAME_MARKER in query and "base_ticker" in query
     ]
     assert frame_queries
     assert "%(sector)s" not in frame_queries[0]
@@ -539,7 +547,7 @@ def test_screening_frame_reads_indicators_from_the_mart_view() -> None:
         rows, trace = source._load_screening_frame(conn, sector=None, profile="relative_strength")
 
     assert rows
-    assert trace["indicator_source"] == "mart.kis_adjusted_feature_frame_asof"
+    assert trace["indicator_source"] == "feature.adjusted_ohlcv_daily"
     # The 52-week high is the single most expensive path feature; a relative-strength
     # screen never reads it and must not pay for it.
     assert "high_252" not in trace["path_features_computed"]
@@ -570,8 +578,8 @@ def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     assert any(row.get("rsi", 100) <= RSI_OVERSOLD_THRESHOLD for row in bundle.price_rows)
 
 
-def test_empty_screen_is_not_re_run_for_the_same_query() -> None:
-    """A screen that matched nothing must not be repeated inside the same load().
+def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -> None:
+    """A screen that matched nothing must not block or repeat the backtest load.
 
     The baseline screen scans every ticker in feature.kis_adjusted_ohlcv_daily with six
     window functions over 420 days and runs on the widened backtest statement budget.
@@ -607,7 +615,7 @@ def test_empty_screen_is_not_re_run_for_the_same_query() -> None:
             return None
 
         def execute(self, query: str, params: object | None = None) -> Result:
-            if KIS_FEATURE_FRAME_VIEW in query and "base_ticker" in query:
+            if FEATURE_FRAME_MARKER in query and "base_ticker" in query:
                 self.baseline_screens += 1
             # The frame loader anchors on the price table before anything else; with no
             # date it short-circuits, which would hide the duplicate-screen bug this
@@ -618,14 +626,58 @@ def test_empty_screen_is_not_re_run_for_the_same_query() -> None:
                 return Result([{"present": True}])
             return Result([])
 
-    connection = CountingConnection()
-    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://fake/fake"))
-    source._connect = lambda: connection  # type: ignore[method-assign]
+    class EmptyScreenDataSource(PostgresPipelineDataSource):
+        def _connect(self) -> CountingConnection:
+            return connection
 
-    with pytest.raises(ValueError, match="no screening candidates"):
-        source.load("RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어", "trace-dup")
+        def _fetch_backtest_universe(
+            self, _conn: object, recommended: list[str]
+        ) -> tuple[list[str], dict[str, object]]:
+            assert recommended == []
+            return ["000660"], {"selection": "stub"}
+
+        def _fetch_symbol_info_map(
+            self, _conn: object, tickers: list[str]
+        ) -> dict[str, dict[str, object]]:
+            return {ticker: {"ticker": ticker, "included": True} for ticker in tickers}
+
+        def _fetch_price_rows(
+            self,
+            _conn: object,
+            tickers: list[str],
+            _symbol_info: object,
+            _query: str,
+            _indicator_families: object | None = None,
+        ) -> tuple[list[dict[str, object]], int]:
+            return [
+                {
+                    "date": "2016-08-03",
+                    "ticker": tickers[0],
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 1_000,
+                }
+            ], DEFAULT_BACKTEST_LOOKBACK_DAYS
+
+        def _fetch_macro_status(self, _conn: object) -> dict[str, object]:
+            return {}
+
+    connection = CountingConnection()
+    source = EmptyScreenDataSource(
+        DataSourceConfig(database_dsn="postgresql://fake/fake")
+    )
+
+    bundle = source.load(
+        "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어",
+        "trace-dup",
+    )
 
     assert connection.baseline_screens == 1
+    assert bundle.metadata["recommended_tickers"] == []
+    assert bundle.metadata["tickers"] == ["000660"]
+    assert bundle.price_rows[0]["ticker"] == "000660"
 
 
 def test_indicator_reads_are_anchored_by_bind_parameter_not_a_subquery() -> None:
@@ -934,3 +986,70 @@ def test_backtest_universe_unions_recommendations_without_duplicating_them() -> 
     assert inside_descriptor["recommended_unioned"] == 0
     assert outside == ["999999", "000660"]
     assert outside_descriptor["recommended_unioned"] == 1
+
+
+def test_screening_frame_does_not_read_the_mart_view() -> None:
+    """The one-date frame must not go through mart.kis_adjusted_feature_frame_asof.
+
+    The view LEFT JOINs five indicator hypertables to the price table on `ta.time =
+    a.time`. Restricting the view to one date restricts only the price side - PostgreSQL
+    does not propagate that equality across an outer join to the nullable side - so every
+    chunk of every ta_* table is locked before a row is read. Measured against production
+    that is 8,582 lock entries for one screen, against a cluster whose entire lock table
+    holds 6,400, which is the "out of shared memory" that killed analysis runs. The same
+    read built here takes 48.
+    """
+
+    for sql in (_mart_frame_sql(sector=False), _mart_frame_sql(sector=True), _prev_rsi_sql()):
+        assert "mart.kis_adjusted_feature_frame_asof" not in sql
+        assert "mart.symbol_feature_frame_asof" not in sql
+
+
+def test_every_indicator_table_carries_its_own_date_restriction() -> None:
+    """Each ta_* table needs a prunable date qual, and it has to survive planning.
+
+    MATERIALIZED is what makes it survive: an ordinary subquery is pulled up into the
+    outer join and its WHERE degrades back into a join qual, which prunes nothing.
+    Measured per table, 2,150 lock entries pulled up against 18 when blocked - so a plain
+    subquery here would look correct and quietly restore the original failure.
+    """
+
+    sql = _mart_frame_sql(sector=False)
+    indicator_tables = (
+        "feature.ta_trend_ticker_daily",
+        "feature.ta_momentum_ticker_daily",
+        "feature.ta_volatility_ticker_daily",
+        "feature.ta_volume_ticker_daily",
+    )
+    for table in indicator_tables:
+        # ... AS MATERIALIZED ( SELECT ... FROM <table> WHERE time = %(as_of)s::date )
+        # The qual is the first thing after the table name, so a short window is enough
+        # and does not depend on how the statement is wrapped or indented.
+        block = sql.split(table, 1)[1][:80]
+        assert "WHERE time = %(as_of)s::date" in block, f"{table} has no prunable date qual"
+
+    assert sql.count("AS MATERIALIZED") == len(indicator_tables) + 1  # + the price bars
+
+
+def test_screening_date_bound_is_a_plan_time_constant() -> None:
+    """CURRENT_DATE is STABLE, so chunks are excluded only after every one is locked.
+
+    The scan reads the same handful of chunks either way, which is why this looked fixed
+    when it was measured by runtime. By locks it is 2,142 against 62.
+    """
+
+    captured: list[tuple[str, object]] = []
+
+    class RecordingConnection:
+        def execute(self, query, params=None):
+            captured.append((query, params))
+            return FakeResult(row={"as_of_date": AS_OF})
+
+    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+    resolved = source._resolve_screening_date(RecordingConnection())
+
+    assert resolved == AS_OF
+    query, params = captured[0]
+    assert "CURRENT_DATE" not in query
+    assert "%(floor)s::date" in query
+    assert isinstance(params["floor"], date)

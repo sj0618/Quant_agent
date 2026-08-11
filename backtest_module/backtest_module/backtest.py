@@ -5,6 +5,7 @@ import csv
 import gzip
 import json
 import math
+import numpy as np
 from functools import lru_cache
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -599,12 +600,18 @@ def compute_talib_metrics_for_bars(
 def compute_derived_metrics_for_bars(
     bars: Sequence[OhlcvBar],
     required_metrics: set[str],
+    *,
+    rows_are_sorted: bool = False,
 ) -> tuple[dict[tuple[date, str], dict[str, float]], list[str]]:
-    sorted_bars = sorted(bars, key=lambda row: row.date)
+    requested = {METRIC_ALIASES.get(metric, metric).lower() for metric in required_metrics}
+    if not requested.intersection(
+        {"volume_ratio_20", "rolling_high_60", "rolling_high_252", "days_since_breakout"}
+    ):
+        return {}, []
+    sorted_bars = list(bars) if rows_are_sorted else sorted(bars, key=lambda row: row.date)
     if not sorted_bars:
         return {}, []
     ticker = sorted_bars[0].ticker
-    requested = {METRIC_ALIASES.get(metric, metric).lower() for metric in required_metrics}
     metric_rows: dict[tuple[date, str], dict[str, float]] = {(bar.date, ticker): {} for bar in sorted_bars}
     computed: set[str] = set()
 
@@ -670,15 +677,25 @@ class BacktestEngine:
         config: BacktestRunConfig | None = None,
         prepared_market_data: PreparedMarketData | None = None,
         generated_actions: Sequence[int] | None = None,
+        inputs_normalized: bool = False,
     ):
         self.spec = spec
         self.strategy = QuantStrategy(spec)
         self.config = config or BacktestRunConfig()
         self.prepared_market_data = prepared_market_data
         self.generated_actions = generated_actions
+        self.inputs_normalized = inputs_normalized
         if prepared_market_data is None:
-            self.ohlcv_rows = sorted(ohlcv_rows, key=lambda row: (row.date, row.ticker))
-            self.metric_rows = normalize_metric_rows(metric_rows)
+            self.ohlcv_rows = (
+                list(ohlcv_rows)
+                if inputs_normalized
+                else sorted(ohlcv_rows, key=lambda row: (row.date, row.ticker))
+            )
+            self.metric_rows = (
+                dict(metric_rows)
+                if inputs_normalized and isinstance(metric_rows, Mapping)
+                else normalize_metric_rows(metric_rows)
+            )
         else:
             self.ohlcv_rows = list(prepared_market_data.ohlcv_rows)
             self.metric_rows = {}
@@ -827,7 +844,9 @@ class BacktestEngine:
             talib_metrics, ticker_report = compute_talib_metrics_for_bars(bars, computations)
             for key, row_metrics in talib_metrics.items():
                 metrics_by_key.setdefault(key, {}).update(row_metrics)
-            derived_metrics, derived_metric_names = compute_derived_metrics_for_bars(bars, required)
+            derived_metrics, derived_metric_names = compute_derived_metrics_for_bars(
+                bars, required, rows_are_sorted=self.inputs_normalized
+            )
             for key, row_metrics in derived_metrics.items():
                 metrics_by_key.setdefault(key, {}).update(row_metrics)
             computed_functions.update(ticker_report["computed_functions"])  # type: ignore[arg-type]
@@ -841,7 +860,8 @@ class BacktestEngine:
 
         for ticker, bars in bars_by_ticker.items():
             previous: dict[str, float] | None = None
-            for bar in sorted(bars, key=lambda item: item.date):
+            ordered_bars = bars if self.inputs_normalized else sorted(bars, key=lambda item: item.date)
+            for bar in ordered_bars:
                 previous_metrics_by_key[(bar.date, ticker)] = previous
                 previous = metrics_by_key[(bar.date, ticker)]
         report.update(
@@ -861,11 +881,19 @@ class BacktestEngine:
         except Exception as exc:  # pragma: no cover
             report["catalog_error"] = f"{type(exc).__name__}: {exc}"
         self.indicator_report = report
-        dates = tuple(sorted(day for day, by_ticker in bars_by_date.items() if by_ticker))
-        sorted_rows = tuple(
-            bar
-            for day in dates
-            for _, bar in sorted(bars_by_date[day].items())
+        dates = tuple(
+            (day for day, by_ticker in bars_by_date.items() if by_ticker)
+            if self.inputs_normalized
+            else sorted(day for day, by_ticker in bars_by_date.items() if by_ticker)
+        )
+        sorted_rows = (
+            tuple(self.ohlcv_rows)
+            if self.inputs_normalized
+            else tuple(
+                bar
+                for day in dates
+                for _, bar in sorted(bars_by_date[day].items())
+            )
         )
         row_index_by_key = {
             (bar.date, bar.ticker): index for index, bar in enumerate(sorted_rows)
@@ -873,11 +901,11 @@ class BacktestEngine:
         return PreparedMarketData(
             ohlcv_rows=sorted_rows,
             bars_by_ticker={
-                ticker: tuple(sorted(bars, key=lambda item: item.date))
+                ticker: tuple(bars if self.inputs_normalized else sorted(bars, key=lambda item: item.date))
                 for ticker, bars in bars_by_ticker.items()
             },
             bars_by_date={
-                day: dict(sorted(by_ticker.items()))
+                day: dict(by_ticker) if self.inputs_normalized else dict(sorted(by_ticker.items()))
                 for day, by_ticker in bars_by_date.items()
             },
             metrics_by_key=metrics_by_key,
@@ -1597,38 +1625,27 @@ def _calculate_selection_metrics(equity_curve: Sequence[EquityPoint]) -> dict[st
     initial = float(equity_curve[0].total_equity)
     final = float(equity_curve[-1].total_equity)
     total_return = final / initial - 1.0 if initial else 0.0
-    returns = [float(point.daily_return) for point in equity_curve]
-    usable = returns[1:] if len(returns) > 1 else []
-    mean_return = sum(usable) / len(usable) if usable else 0.0
-    variance = (
-        sum((value - mean_return) ** 2 for value in usable) / (len(usable) - 1)
-        if len(usable) > 1
-        else 0.0
-    )
+    returns = np.fromiter((float(point.daily_return) for point in equity_curve), dtype=np.float64)
+    usable = returns[1:] if returns.size > 1 else np.array([], dtype=np.float64)
+    mean_return = float(np.mean(usable)) if usable.size else 0.0
+    variance = float(np.var(usable, ddof=1)) if usable.size > 1 else 0.0
     volatility = math.sqrt(variance)
     sharpe = mean_return / volatility * math.sqrt(252.0) if volatility > 0.0 else 0.0
 
-    peak = float(equity_curve[0].total_equity)
-    max_drawdown = 0.0
-    for point in equity_curve:
-        value = float(point.total_equity)
-        peak = max(peak, value)
-        drawdown = value / peak - 1.0 if peak else 0.0
-        max_drawdown = min(max_drawdown, drawdown)
+    equity = np.fromiter((float(point.total_equity) for point in equity_curve), dtype=np.float64)
+    peaks = np.maximum.accumulate(equity)
+    drawdown_series = np.divide(equity, peaks, out=np.ones_like(equity), where=peaks != 0) - 1.0
+    max_drawdown = float(np.min(drawdown_series))
 
-    positive = sum(value for value in usable if value > 0.0)
-    negative = -sum(value for value in usable if value < 0.0)
+    positive = float(np.sum(usable[usable > 0.0])) if usable.size else 0.0
+    negative = -float(np.sum(usable[usable < 0.0])) if usable.size else 0.0
     profit_factor = positive / negative if negative > 0.0 else (1.0 if positive > 0.0 else 0.0)
     elapsed_days = max(
         1,
         (date.fromisoformat(equity_curve[-1].date) - date.fromisoformat(equity_curve[0].date)).days,
     )
     cagr = (final / initial) ** (365.0 / elapsed_days) - 1.0 if initial > 0.0 and final > 0.0 else 0.0
-    win_rate = (
-        sum(1 for value in usable if value > 0.0) / len(usable)
-        if usable
-        else 0.0
-    )
+    win_rate = float(np.mean(usable > 0.0)) if usable.size else 0.0
     return {
         "total_return": round(total_return, 10),
         "cagr": round(cagr, 10),
@@ -1674,6 +1691,7 @@ def prepare_market_data(
     ohlcv_rows: Sequence[OhlcvBar],
     metric_rows: Mapping[tuple[date | str, str], Mapping[str, object]] | Iterable[Mapping[str, object]] | None = None,
     config: BacktestRunConfig | None = None,
+    inputs_normalized: bool = False,
 ) -> PreparedMarketData:
     """Normalize, sort, index, and calculate common metrics once for many candidates."""
 
@@ -1682,6 +1700,7 @@ def prepare_market_data(
         ohlcv_rows,
         metric_rows=metric_rows,
         config=config,
+        inputs_normalized=inputs_normalized,
     )
     return engine._prepare_market_data()
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 from hashlib import sha256
 import json
+import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -34,12 +36,8 @@ def _strategy() -> StrategySpec:
         name="Optimized RSI",
         market="KRX",
         timeframe="daily",
-        entry_conditions=[
-            Condition(left="rsi", operator=ConditionOperator.LTE, right=40.0)
-        ],
-        exit_conditions=[
-            Condition(left="rsi", operator=ConditionOperator.GTE, right=70.0)
-        ],
+        entry_conditions=[Condition(left="rsi", operator=ConditionOperator.LTE, right=40.0)],
+        exit_conditions=[Condition(left="rsi", operator=ConditionOperator.GTE, right=70.0)],
         indicators=["rsi"],
         risk_constraints={
             "max_position_pct": 0.2,
@@ -82,9 +80,7 @@ def _rows(days: int = 80, tickers: int = 6) -> list[dict[str, object]]:
 def _canonical_hash(result) -> str:
     payload = {
         "selected_candidate": result.selected_candidate.model_dump(mode="json"),
-        "equity_curve": [
-            point.model_dump(mode="json") for point in result.equity_curve
-        ],
+        "equity_curve": [point.model_dump(mode="json") for point in result.equity_curve],
         "engine_summary": result.engine_summary,
         "objective_scores": result.objective_scores_by_candidate,
     }
@@ -174,9 +170,7 @@ def test_rank_only_and_consecutive_conditions_emit_compiled_actions() -> None:
             ],
         }
     )
-    consecutive_actions = PreparedFeatureStore(rows).build_actions(
-        consecutive_ir, parameters
-    )
+    consecutive_actions = PreparedFeatureStore(rows).build_actions(consecutive_ir, parameters)
     assert sum(action == 1 for action in consecutive_actions) == 1
     assert consecutive_actions[2] == 1
 
@@ -228,9 +222,7 @@ def test_structured_profile_actions_match_legacy_reference() -> None:
             namespace,
         )
         legacy_signals = namespace["build_signals"](rows)  # type: ignore[operator]
-        legacy_actions = [
-            action_values[str(signal["action"])] for signal in legacy_signals
-        ]
+        legacy_actions = [action_values[str(signal["action"])] for signal in legacy_signals]
 
         assert list(store.build_actions(strategy_ir, parameters)) == legacy_actions
 
@@ -246,18 +238,76 @@ def test_worker_count_and_disk_cache_are_deterministic(monkeypatch, tmp_path) ->
     cache_one = tmp_path / "worker-one"
     monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(cache_one))
     monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
-    result_one = backtest_node.run_candidate_backtest(
-        strategy, candidates, price_rows=rows
-    )
+    result_one = backtest_node.run_candidate_backtest(strategy, candidates, price_rows=rows)
 
     cache_two = tmp_path / "worker-two"
     monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(cache_two))
     monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "2")
-    result_two = backtest_node.run_candidate_backtest(
-        strategy, candidates, price_rows=rows
-    )
+    result_two = backtest_node.run_candidate_backtest(strategy, candidates, price_rows=rows)
 
     assert _canonical_hash(result_one) == _canonical_hash(result_two)
+
+
+@pytest.mark.skipif(
+    "fork" not in backtest_node.get_all_start_methods(),
+    reason="structured action workers share prepared arrays through fork",
+)
+def test_structured_actions_run_in_workers_and_are_reused_for_full(
+    monkeypatch, tmp_path
+) -> None:
+    strategy = _strategy()
+    rows = _rows(days=45)
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="parallel-actions")
+    ).candidates
+    original_build_actions = PreparedFeatureStore.build_actions
+
+    def delayed_build_actions(self, strategy_ir, parameters):
+        time.sleep(0.05)
+        return original_build_actions(self, strategy_ir, parameters)
+
+    monkeypatch.setattr(PreparedFeatureStore, "build_actions", delayed_build_actions)
+    monkeypatch.setattr(backtest_node, "SERIAL_EVALUATION_WORK_ITEMS", 0)
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "parallel-actions"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "2")
+
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        selection = session.evaluate(candidates)
+        full = session.evaluate([selection[0].candidate], metrics_mode="full")
+        rounds = session.execution_stats()["rounds"]
+
+    selection_pids = {item.diagnostics["worker_pid"] for item in selection}
+    assert len(selection_pids) == 2
+    assert os.getpid() not in selection_pids
+    assert set(rounds[0]["action_worker_pids"]) == selection_pids
+    assert rounds[0]["action_cache_hits"] == 0
+    assert full[0].diagnostics["action_cache_hit"] is True
+    assert full[0].diagnostics["action_build_seconds"] == 0.0
+    assert rounds[1]["action_cache_hits"] == 1
+    assert rounds[1]["action_worker_pids"] == []
+
+
+def test_market_benchmark_is_prepared_once_per_session(monkeypatch, tmp_path) -> None:
+    strategy = _strategy()
+    rows = _rows(days=45)
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="benchmark-context")
+    ).candidates
+    original = backtest_node._equal_weight_benchmark_curve
+    calls = 0
+
+    def counted(price_rows):
+        nonlocal calls
+        calls += 1
+        return original(price_rows)
+
+    monkeypatch.setattr(backtest_node, "_equal_weight_benchmark_curve", counted)
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "benchmark-context"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
+
+    backtest_node.run_candidate_backtest(strategy, candidates, price_rows=rows)
+
+    assert calls == 1
 
 
 def test_fresh_and_disk_cache_results_are_identical(monkeypatch, tmp_path) -> None:
@@ -292,6 +342,49 @@ def test_fresh_and_disk_cache_results_are_identical(monkeypatch, tmp_path) -> No
     assert fresh_payload == cached_payload
 
 
+def test_prepared_market_cache_skips_repeated_engine_conversion(monkeypatch) -> None:
+    strategy = _strategy()
+    rows = _rows(days=12, tickers=3)
+    original = backtest_node._engine_market_rows
+    calls = 0
+
+    def counted(price_rows):
+        nonlocal calls
+        calls += 1
+        return original(price_rows)
+
+    backtest_node._clear_prepared_market_cache()
+    monkeypatch.setattr(backtest_node, "_engine_market_rows", counted)
+    try:
+        with backtest_node._CandidateBacktestSession(strategy, rows) as first:
+            assert not first.prepared_market_cache_hit
+        with backtest_node._CandidateBacktestSession(strategy, rows) as second:
+            assert second.prepared_market_cache_hit
+            assert second.preparation_phases["engine_row_conversion_seconds"] == 0.0
+            assert second.preparation_phases["engine_market_index_seconds"] == 0.0
+    finally:
+        backtest_node._clear_prepared_market_cache()
+
+    assert calls == 1
+
+
+def test_data_fingerprint_tracks_content_and_input_order() -> None:
+    rows = _rows(days=3, tickers=2)
+    same_rows = [dict(row) for row in rows]
+    changed_rows = [dict(row) for row in rows]
+    changed_rows[-1]["rsi"] = float(changed_rows[-1]["rsi"]) + 1.0
+
+    fingerprint, descriptor = backtest_node._data_fingerprint(rows)
+    same_fingerprint, _ = backtest_node._data_fingerprint(same_rows)
+    changed_fingerprint, _ = backtest_node._data_fingerprint(changed_rows)
+    _, reversed_descriptor = backtest_node._data_fingerprint(list(reversed(rows)))
+
+    assert fingerprint == same_fingerprint
+    assert fingerprint != changed_fingerprint
+    assert descriptor["rows_are_sorted"] is True
+    assert reversed_descriptor["rows_are_sorted"] is False
+
+
 def test_improvement_candidates_are_bounded_and_normalized() -> None:
     strategy = _strategy()
     generated = generate_loop3_candidates(
@@ -308,7 +401,12 @@ def test_improvement_candidates_are_bounded_and_normalized() -> None:
 
     assert 1 <= len(improved) <= 6
     assert len(identities) == len(improved)
-    assert sum(item.parameters.profile == "compiled_conditions" for item in improved if item.parameters) >= 2
+    assert (
+        sum(
+            item.parameters.profile == "compiled_conditions" for item in improved if item.parameters
+        )
+        >= 2
+    )
 
 
 def test_candidate_profiles_are_schema_profiles_only() -> None:
@@ -336,9 +434,32 @@ def test_selection_score_does_not_peek_at_holdout_sharpe() -> None:
     strong_holdout = BacktestMetrics(**common, out_sample_sharpe=5.0)
     summary = {"effective_trade_count": 8, "trade_win_rate": 0.6}
 
-    assert backtest_node._objective_score(weak_holdout, summary, rows) == backtest_node._objective_score(
-        strong_holdout, summary, rows
+    assert backtest_node._objective_score(
+        weak_holdout, summary, rows
+    ) == backtest_node._objective_score(strong_holdout, summary, rows)
+
+
+def test_selection_score_rewards_training_return_when_risk_is_equal() -> None:
+    rows = _rows(days=300)
+    common = dict(
+        sharpe_ratio=0.8,
+        max_drawdown=-0.15,
+        win_rate=0.55,
+        total_return=0.4,
+        in_sample_sharpe=0.8,
+        out_sample_sharpe=0.7,
+        degradation=0.1,
+        in_sample_max_drawdown=-0.15,
     )
+    lower_return = BacktestMetrics(**common, in_sample_return=0.10)
+    higher_return = BacktestMetrics(**common, in_sample_return=0.30)
+    summary = {"selection_buy_count": 12}
+
+    assert backtest_node._objective_score(
+        higher_return,
+        summary,
+        rows,
+    ) > backtest_node._objective_score(lower_return, summary, rows)
 
 
 def test_temporary_relaxed_objective_floor_boundaries() -> None:
@@ -360,6 +481,68 @@ def test_temporary_relaxed_objective_floor_boundaries() -> None:
     result.selected_candidate.metrics = metrics.model_copy(update={"out_sample_sharpe": -0.01})
     assert not backtest_node._passes_objective_floor(result)
     result.selected_candidate.metrics = metrics.model_copy(update={"max_drawdown": -0.501})
+    assert not backtest_node._passes_objective_floor(result)
+
+
+def test_fixed_period_benchmark_rule_allows_large_regime_wins() -> None:
+    period = backtest_node.BENCHMARK_EVALUATION_PERIOD_DAYS
+    benchmark_returns = [0.0] * (period * 4)
+    strategy_returns = [
+        *([0.002] * period),
+        *([-0.001] * period),
+        *([0.004] * period),
+        *([0.0] * period),
+    ]
+
+    stats = backtest_node._benchmark_period_stats(strategy_returns, benchmark_returns)
+
+    assert stats.count == 4
+    assert stats.win_rate == 0.5
+    assert stats.loss_rate == 0.25
+
+
+def test_automatic_benchmark_gate_treats_exactly_half_losing_periods_as_defeat() -> None:
+    metrics = BacktestMetrics(
+        sharpe_ratio=0.9,
+        max_drawdown=-0.25,
+        win_rate=0.55,
+        total_return=0.60,
+        in_sample_sharpe=0.8,
+        out_sample_sharpe=0.7,
+        degradation=0.1,
+        in_sample_return=0.30,
+        out_sample_return=0.23,
+        in_sample_benchmark_return=0.20,
+        out_sample_benchmark_return=0.10,
+        in_sample_excess_return=0.10,
+        out_sample_excess_return=0.13,
+        benchmark_period_count=8,
+        benchmark_period_win_rate=0.50,
+        benchmark_period_loss_rate=0.375,
+        in_sample_benchmark_period_count=5,
+        in_sample_benchmark_period_win_rate=0.60,
+        in_sample_benchmark_period_loss_rate=0.40,
+        out_sample_benchmark_period_count=3,
+        out_sample_benchmark_period_win_rate=2 / 3,
+        out_sample_benchmark_period_loss_rate=1 / 3,
+    )
+    result = SimpleNamespace(
+        strategy_a=SimpleNamespace(selection_mode="automatic"),
+        selected_candidate=SimpleNamespace(candidate_id="benchmark-winner", metrics=metrics),
+        engine_summary={"effective_trade_count": 20},
+        backtest_payload={"benchmark_return": 0.32},
+    )
+
+    assert backtest_node._passes_objective_floor(result)
+
+    result.selected_candidate.metrics = metrics.model_copy(
+        update={"benchmark_period_loss_rate": 0.50}
+    )
+    assert not backtest_node._passes_objective_floor(result)
+
+    result.selected_candidate.metrics = metrics.model_copy(
+        update={"out_sample_benchmark_period_loss_rate": 0.50}
+    )
     assert not backtest_node._passes_objective_floor(result)
 
 

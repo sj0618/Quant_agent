@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 import json
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -22,10 +23,12 @@ from ai_graph.nodes.position_sizing import (
     applied_max_positions,
     available_ticker_count,
     max_position_pct_from_risk_constraints,
+    requested_max_positions,
 )
 from ai_graph.schemas import (
     CandidateParameters,
     CodeCandidate,
+    Condition,
     StrategyIR,
     StrategySpec,
     StructuredProfile,
@@ -35,7 +38,21 @@ from ai_graph.nodes.condition_compiler import (
     compile_conditions,
     indicator_row_keys,
 )
+from ai_graph.quant_strategy import (
+    AUTOMATIC_TOURNAMENT_PROFILES,
+    automatic_candidate_lookbacks,
+    automatic_candidate_profiles,
+)
 from ai_graph.security.ast_validator import validate_backtest_code
+from ai_graph.strategy_blueprint_catalog import (
+    CATALOG_VERSION,
+    StrategyBlueprintTemplate,
+    catalog_selection_terms,
+    customize_blueprint_parameters,
+    select_strategy_blueprints,
+    strategy_blueprint_catalog,
+    strategy_blueprint_catalog_fingerprint,
+)
 
 
 MOCK_BACKTEST_CODE_LLM = MockBacktestCodeLLM()
@@ -66,6 +83,45 @@ class FeatureMapping(BaseModel):
     proxy_used: list[str] = Field(default_factory=list)
 
 
+class GeneratedStrategyBlueprint(BaseModel):
+    """A strategy created before returns are inspected and later sent to backtest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    blueprint_id: str = Field(min_length=1)
+    profile: StructuredProfile
+    title: str = Field(min_length=1)
+    catalog_version: str | None = None
+    catalog_family: str | None = None
+    preset_id: str | None = None
+    plain_explanation: str | None = None
+    formula: str = Field(min_length=1)
+    derivation: str = Field(min_length=1)
+    why_used: str | None = None
+    entry_conditions: list[Condition] = Field(min_length=1)
+    exit_conditions: list[Condition] = Field(min_length=1)
+    ranking_metric: str = Field(min_length=1)
+    ranking_direction: Literal["desc", "asc"] = "desc"
+    execution_mode: Literal["event_driven", "scheduled_rotation"] = "event_driven"
+    execution_signature: str = Field(pattern=r"^[a-f0-9]{64}$")
+    indicator_explanations: list[dict[str, object]] = Field(min_length=1)
+    why_generated: str = Field(min_length=1)
+    lookback: int = Field(ge=3, le=252)
+    threshold: float = Field(default=0.0, ge=-1.0, le=100.0)
+    max_positions: int = Field(gt=0, le=1000)
+    rebalance_interval_days: int = Field(ge=5, le=63)
+    stop_loss_pct: float = Field(gt=0.0, le=1.0)
+    take_profit_pct: float = Field(default=10.0, gt=0.0, le=10.0)
+    trailing_stop_pct: float = Field(gt=0.0, le=0.75)
+    matched_terms: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    required_data: list[str] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+    implementation_notes: str | None = None
+    parameter_schema: dict[str, dict[str, object]] = Field(default_factory=dict)
+
+
 class CodeGenerationPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -78,6 +134,18 @@ class CodeGenerationPlan(BaseModel):
     stop_loss_pct: float = 0.08
     take_profit_pct: float = 0.45
     expected_trade_frequency: str
+    candidate_profiles: list[StructuredProfile] = Field(default_factory=list)
+    customization_style: Literal["aggressive", "balanced", "defensive"] = "balanced"
+    investment_horizon: Literal["short", "medium", "long"] = "medium"
+    rebalance_interval_days: int = Field(default=21, ge=5, le=63)
+    trailing_stop_pct: float = Field(default=0.25, gt=0.0, le=0.75)
+    medium_momentum_weight: float = Field(default=0.60, ge=0.0, le=1.0)
+    benchmark_objective: bool = False
+    customization_summary: str | None = None
+    generated_strategies: list[GeneratedStrategyBlueprint] = Field(default_factory=list)
+    catalog_version: str | None = None
+    catalog_size: int = Field(default=0, ge=0)
+    catalog_fingerprint: str | None = None
 
 
 class Loop3Request(BaseModel):
@@ -93,7 +161,9 @@ class Loop3Result(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     variant: str
-    candidates: list[CodeCandidate] = Field(min_length=MIN_GENERATED_CANDIDATES, max_length=MAX_GENERATED_CANDIDATES)
+    candidates: list[CodeCandidate] = Field(
+        min_length=MIN_GENERATED_CANDIDATES, max_length=MAX_GENERATED_CANDIDATES
+    )
     selected_candidate: CodeCandidate
     feature_mapping: FeatureMapping
     code_plan: CodeGenerationPlan
@@ -120,7 +190,12 @@ def generate_loop3_candidates(
             code_plan,
             request.max_positions,
         )
-        candidates = _structured_candidates(request, strategy_ir, parameter_sets)
+        candidates = _structured_candidates(
+            request,
+            strategy_ir,
+            parameter_sets,
+            generated_strategies=code_plan.generated_strategies,
+        )
         invalid_fallbacks = [
             violation.message
             for code in output.fallback_code
@@ -178,12 +253,20 @@ def _normalized_parameter_sets(
 ) -> list[CandidateParameters]:
     compiled = compile_conditions(strategy.entry_conditions) is not None
     defaults = _default_parameter_sets(strategy, plan, max_positions)
-    pool = [*proposed, *defaults]
+    # Automatic mode has a public, cited behavior contract. Model-proposed profiles are
+    # intentionally ignored: three catalog blueprints are selected from the request
+    # before seeing returns, so a language-model suggestion cannot expand the search
+    # after the fact.
+    pool = defaults if strategy.selection_mode == "automatic" else [*proposed, *defaults]
     normalized: list[CandidateParameters] = []
     seen: set[str] = set()
     for index, item in enumerate(pool):
         profile = item.profile
-        if profile == "compiled_conditions" and not compiled:
+        if (
+            profile == "compiled_conditions"
+            and not compiled
+            and strategy.selection_mode != "automatic"
+        ):
             profile = defaults[min(index, len(defaults) - 1)].profile
         candidate = item.model_copy(
             update={
@@ -194,6 +277,19 @@ def _normalized_parameter_sets(
                 ),
                 "take_profit_pct": float(
                     strategy.risk_constraints.get("take_profit_pct", item.take_profit_pct)
+                ),
+                "rebalance_interval_days": int(
+                    strategy.risk_constraints.get(
+                        "rebalance_interval_days", plan.rebalance_interval_days
+                    )
+                ),
+                "trailing_stop_pct": float(
+                    strategy.risk_constraints.get("trailing_stop_pct", plan.trailing_stop_pct)
+                ),
+                "medium_momentum_weight": float(
+                    strategy.risk_constraints.get(
+                        "medium_momentum_weight", plan.medium_momentum_weight
+                    )
                 ),
             }
         )
@@ -214,13 +310,32 @@ def _default_parameter_sets(
     plan: CodeGenerationPlan,
     max_positions: int,
 ) -> list[CandidateParameters]:
+    if plan.generated_strategies:
+        return [
+            CandidateParameters(
+                profile=blueprint.profile,
+                blueprint_id=blueprint.blueprint_id,
+                lookback=blueprint.lookback,
+                threshold=blueprint.threshold,
+                stop_loss_pct=blueprint.stop_loss_pct,
+                take_profit_pct=blueprint.take_profit_pct,
+                max_positions=max_positions,
+                rebalance_interval_days=blueprint.rebalance_interval_days,
+                trailing_stop_pct=blueprint.trailing_stop_pct,
+                medium_momentum_weight=plan.medium_momentum_weight,
+            )
+            for blueprint in plan.generated_strategies
+        ]
     profiles = _candidate_profiles(plan)
     compiled = compile_conditions(strategy.entry_conditions) is not None
-    selected_profiles = [
-        "compiled_conditions" if compiled else profiles[0],
-        profiles[0] if not compiled or profiles[0] != "compiled_conditions" else profiles[1],
-        profiles[1] if not compiled else profiles[2],
-    ]
+    if plan.entry_feature == "performance_momentum_tournament":
+        selected_profiles = profiles
+    elif plan.entry_feature == "academic_momentum_trend":
+        selected_profiles = ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES
+    elif compiled:
+        selected_profiles = ["compiled_conditions", profiles[0], profiles[1]]
+    else:
+        selected_profiles = profiles[:MIN_GENERATED_CANDIDATES]
     stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct))
     take_profit = float(strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct))
     return [
@@ -231,6 +346,9 @@ def _default_parameter_sets(
             stop_loss_pct=stop_loss,
             take_profit_pct=take_profit,
             max_positions=max_positions,
+            rebalance_interval_days=plan.rebalance_interval_days,
+            trailing_stop_pct=plan.trailing_stop_pct,
+            medium_momentum_weight=plan.medium_momentum_weight,
         )
         for index, profile in enumerate(selected_profiles)
     ]
@@ -240,10 +358,29 @@ def _structured_candidates(
     request: Loop3Request,
     strategy_ir: StrategyIR,
     parameter_sets: list[CandidateParameters],
+    *,
+    generated_strategies: list[GeneratedStrategyBlueprint] | None = None,
 ) -> list[CodeCandidate]:
+    blueprint_by_id = {
+        item.blueprint_id: item for item in (generated_strategies or [])
+    }
     candidates: list[CodeCandidate] = []
     for index, parameters in enumerate(parameter_sets[:MAX_GENERATED_CANDIDATES], start=1):
-        code = _render_structured_reference_code(strategy_ir, parameters)
+        blueprint = blueprint_by_id.get(parameters.blueprint_id or "")
+        candidate_ir = strategy_ir
+        if blueprint is not None:
+            candidate_ir = StrategyIR(
+                strategy_id=blueprint.blueprint_id,
+                entry_feature=f"catalog:{blueprint.blueprint_id}:entry",
+                exit_feature=f"catalog:{blueprint.blueprint_id}:exit",
+                proxy_feature="past_only_adjusted_ohlcv",
+                entry_conditions=blueprint.entry_conditions,
+                exit_conditions=blueprint.exit_conditions,
+                ranking_metric=blueprint.ranking_metric,
+                ranking_direction=blueprint.ranking_direction,
+                execution_mode=blueprint.execution_mode,
+            )
+        code = _render_structured_reference_code(candidate_ir, parameters)
         validation = validate_backtest_code(code)
         candidates.append(
             CodeCandidate(
@@ -253,7 +390,7 @@ def _structured_candidates(
                 validation_ok=validation.ok,
                 violations=[violation.message for violation in validation.violations],
                 representation="structured",
-                strategy_ir=strategy_ir,
+                strategy_ir=candidate_ir,
                 parameters=parameters,
             )
         )
@@ -291,6 +428,9 @@ def _render_structured_reference_code(
     profile = {parameters.profile!r}
     threshold = {float(parameters.threshold)!r}
     max_positions = {parameters.max_positions}
+    rebalance_interval_days = {parameters.rebalance_interval_days}
+    trailing_stop_pct = {float(parameters.trailing_stop_pct)!r}
+    medium_momentum_weight = {float(parameters.medium_momentum_weight)!r}
     strategy_id = {strategy_ir.strategy_id!r}
     for row in prices:
         ticker = str(row.get("ticker", "000000"))
@@ -474,7 +614,9 @@ def _generate_backtest_code_output(
                     request.max_positions,
                 ),
                 fallback_code=legacy_code[:MAX_GENERATED_CANDIDATES],
-                fallback_reasons=["Accepted legacy v1 response through the isolated Python fallback."],
+                fallback_reasons=[
+                    "Accepted legacy v1 response through the isolated Python fallback."
+                ],
             )
         else:
             output = BacktestCodeLLMOutput.model_validate(raw_output)
@@ -566,7 +708,9 @@ def _schema_validation_feedback(exc: ValidationError) -> list[str]:
 
 
 def map_strategy_features(strategy: StrategySpec) -> FeatureMapping:
-    requested = [condition.left for condition in strategy.entry_conditions + strategy.exit_conditions]
+    requested = [
+        condition.left for condition in strategy.entry_conditions + strategy.exit_conditions
+    ]
     direct_vocab = {
         "rsi",
         "relative_strength_20d",
@@ -610,11 +754,196 @@ def map_strategy_features(strategy: StrategySpec) -> FeatureMapping:
     )
 
 
+def _automatic_strategy_blueprints(
+    strategy: StrategySpec,
+    *,
+    templates: list[StrategyBlueprintTemplate],
+    preferred_lookbacks: list[int],
+    selection_text: str,
+    style: Literal["aggressive", "balanced", "defensive"],
+    horizon: Literal["short", "medium", "long"],
+    rebalance_interval_days: int,
+    trailing_stop_pct: float,
+) -> list[GeneratedStrategyBlueprint]:
+    max_positions = requested_max_positions(
+        max_position_pct_from_risk_constraints(strategy.risk_constraints)
+    )
+    stop_loss_pct = float(strategy.risk_constraints.get("stop_loss_pct", 0.20))
+    take_profit_pct = float(strategy.risk_constraints.get("take_profit_pct", 10.0))
+    style_label = {
+        "aggressive": "공격형",
+        "balanced": "균형형",
+        "defensive": "방어형",
+    }[style]
+    horizon_label = {
+        "short": "단기",
+        "medium": "중기",
+        "long": "장기",
+    }[horizon]
+    matches = catalog_selection_terms(selection_text, templates)
+    generated: list[GeneratedStrategyBlueprint] = []
+    for index, template in enumerate(templates, start=1):
+        parameters = customize_blueprint_parameters(
+            template,
+            max_positions=max_positions,
+            rebalance_interval_days=rebalance_interval_days,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            trailing_stop_pct=trailing_stop_pct,
+            preferred_lookback=preferred_lookbacks[index - 1],
+        )
+        matched_terms = matches.get(template.catalog_id, [])
+        match_reason = (
+            f"입력에서 {', '.join(matched_terms)} 표현이 일치했습니다. "
+            if matched_terms
+            else "입력이 특정 산식을 지정하지 않아 위험성향·기간 기본 우선순위를 사용했습니다. "
+        )
+        generated.append(
+            GeneratedStrategyBlueprint(
+                blueprint_id=template.catalog_id,
+                profile=template.profile,
+                title=template.title,
+                catalog_version=template.catalog_version,
+                catalog_family=template.family,
+                preset_id=template.preset_id,
+                plain_explanation=template.plain_explanation,
+                formula=template.formula,
+                derivation=template.derivation,
+                why_used=template.why_used,
+                entry_conditions=template.entry_conditions,
+                exit_conditions=template.exit_conditions,
+                ranking_metric=template.ranking_metric,
+                ranking_direction=template.ranking_direction,
+                execution_mode=template.execution_mode,
+                execution_signature=template.execution_signature,
+                indicator_explanations=[
+                    item.model_dump(mode="json")
+                    for item in template.indicator_explanations
+                ],
+                why_generated=(
+                    f"{len(strategy_blueprint_catalog())}개 독립 산식 카탈로그에서 사용자 입력을 "
+                    f"{style_label}·{horizon_label} 설정으로 "
+                    f"해석해 고른 후보 {index}입니다. {match_reason}"
+                    "아직 승자를 정하지 않았으며 이후 백테스트가 별도로 비교합니다."
+                ),
+                lookback=parameters.lookback,
+                threshold=parameters.threshold,
+                max_positions=parameters.max_positions,
+                rebalance_interval_days=parameters.rebalance_interval_days,
+                stop_loss_pct=parameters.stop_loss_pct,
+                take_profit_pct=parameters.take_profit_pct,
+                trailing_stop_pct=parameters.trailing_stop_pct,
+                matched_terms=matched_terms,
+                tags=template.tags,
+                required_data=template.required_data,
+                source_refs=template.source_refs,
+                caveats=template.caveats,
+                implementation_notes=template.implementation_notes,
+                parameter_schema={
+                    key: rule.model_dump(mode="json")
+                    for key, rule in template.parameter_schema.items()
+                },
+            )
+        )
+    return generated
+
+
 def build_code_generation_plan(
     strategy: StrategySpec, feature_mapping: FeatureMapping
 ) -> CodeGenerationPlan:
     strategy_id = strategy.strategy_id
     requested_text = " ".join(feature_mapping.requested_features + strategy.indicators).lower()
+    if strategy.selection_mode == "automatic":
+        raw_style = str(strategy.risk_constraints.get("strategy_style", "balanced"))
+        style: Literal["aggressive", "balanced", "defensive"] = (
+            raw_style if raw_style in {"aggressive", "balanced", "defensive"} else "balanced"
+        )  # type: ignore[assignment]
+        raw_horizon = str(strategy.risk_constraints.get("investment_horizon", "medium"))
+        horizon: Literal["short", "medium", "long"] = (
+            raw_horizon if raw_horizon in {"short", "medium", "long"} else "medium"
+        )  # type: ignore[assignment]
+        profile_priority = automatic_candidate_profiles(style, horizon)
+        catalog_query = str(strategy.risk_constraints.get("catalog_query", "")).strip()
+        selection_text = catalog_query or " ".join([strategy.name, requested_text])
+        selected_templates = select_strategy_blueprints(
+            selection_text,
+            risk_style=style,
+            horizon=horizon,
+            profile_priority=profile_priority,  # type: ignore[arg-type]
+            limit=MAX_GENERATED_CANDIDATES,
+        )
+        selected_profiles = tuple(template.profile for template in selected_templates)
+        rotation_lookbacks = automatic_candidate_lookbacks(
+            selected_profiles,
+            risk_style=style,
+            horizon=horizon,
+        )
+        preferred_lookbacks = [
+            int(template.parameter_schema["lookback"].maximum)
+            if horizon == "long"
+            else (
+                rotation_lookbacks[index]
+                if template.profile in AUTOMATIC_TOURNAMENT_PROFILES
+                else template.default_parameters.lookback
+            )
+            for index, template in enumerate(selected_templates)
+        ]
+        rebalance_interval_days = int(strategy.risk_constraints.get("rebalance_interval_days", 21))
+        trailing_stop_pct = float(strategy.risk_constraints.get("trailing_stop_pct", 0.25))
+        medium_momentum_weight = float(
+            strategy.risk_constraints.get("medium_momentum_weight", 0.60)
+        )
+        generated_strategies = _automatic_strategy_blueprints(
+            strategy,
+            templates=selected_templates,
+            preferred_lookbacks=preferred_lookbacks,
+            selection_text=selection_text,
+            style=style,
+            horizon=horizon,
+            rebalance_interval_days=rebalance_interval_days,
+            trailing_stop_pct=trailing_stop_pct,
+        )
+        profiles = [item.profile for item in generated_strategies]
+        lookbacks = [item.lookback for item in generated_strategies]
+        thresholds = [item.threshold for item in generated_strategies]
+        return CodeGenerationPlan(
+            strategy_id=strategy_id,
+            entry_feature="performance_momentum_tournament",
+            exit_feature="scheduled_rank_or_emergency_stop",
+            proxy_feature="past_only_price_factors",
+            lookbacks=lookbacks,
+            thresholds=thresholds,
+            stop_loss_pct=float(strategy.risk_constraints.get("stop_loss_pct", 0.20)),
+            take_profit_pct=10.0,
+            expected_trade_frequency=f"every_{rebalance_interval_days}_trading_days",
+            candidate_profiles=profiles,
+            customization_style=style,
+            investment_horizon=horizon,
+            rebalance_interval_days=rebalance_interval_days,
+            trailing_stop_pct=trailing_stop_pct,
+            medium_momentum_weight=medium_momentum_weight,
+            benchmark_objective=True,
+            customization_summary=(
+                f"{style}/{horizon}: {len(strategy_blueprint_catalog())}개 독립 산식에서 "
+                f"{len(profiles)}개 사전등록 후보 선택, "
+                f"{rebalance_interval_days}거래일 교체, "
+                "63거래일 구간 벤치마크 승패 검증"
+            ),
+            generated_strategies=generated_strategies,
+            catalog_version=CATALOG_VERSION,
+            catalog_size=len(strategy_blueprint_catalog()),
+            catalog_fingerprint=strategy_blueprint_catalog_fingerprint(),
+        )
+    if strategy_id.startswith("automatic_academic_momentum"):
+        return CodeGenerationPlan(
+            strategy_id=strategy_id,
+            entry_feature="academic_momentum_trend",
+            exit_feature="monthly_trend_or_stop",
+            proxy_feature="past_only_price_factors",
+            lookbacks=[252],
+            thresholds=[0.0, 0.05, 0.1],
+            expected_trade_frequency="monthly",
+        )
     if "rsi" in requested_text:
         return CodeGenerationPlan(
             strategy_id=strategy_id,
@@ -699,7 +1028,9 @@ def _deterministic_fallback_candidates(
     plan: CodeGenerationPlan,
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> list[str]:
-    templates = _strategy_template_candidates(strategy) or MOCK_BACKTEST_CODE_LLM.generate_backtest_candidates(strategy, "A")
+    templates = _strategy_template_candidates(
+        strategy
+    ) or MOCK_BACKTEST_CODE_LLM.generate_backtest_candidates(strategy, "A")
     generated = _generated_strategy_candidates(strategy, plan, max_positions)
     return (generated + templates)[:MAX_GENERATED_CANDIDATES]
 
@@ -728,7 +1059,7 @@ def _render_condition_signal_code(
     indicator_bindings = "\n            ".join(
         f'{key} = _ind(row, "{key}")' for key in indicator_row_keys()
     )
-    return f'''def build_signals(prices):
+    return f"""def build_signals(prices):
     def _avg(xs):
         return sum(xs) / len(xs) if xs else 0.0
     def _fin(row, key):
@@ -833,7 +1164,7 @@ def _render_condition_signal_code(
             states[ticker]["entry_price"] = price
             held += 1
     return signals
-'''
+"""
 
 
 def _generated_strategy_candidates(
@@ -872,6 +1203,18 @@ def _generated_strategy_candidates(
 
 
 def _candidate_profiles(plan: CodeGenerationPlan) -> list[StructuredProfile]:
+    if plan.generated_strategies:
+        return [blueprint.profile for blueprint in plan.generated_strategies]
+    if plan.candidate_profiles:
+        return list(plan.candidate_profiles)
+    if plan.entry_feature == "performance_momentum_tournament":
+        return [
+            "relative_momentum_rotation",
+            "risk_adjusted_momentum_rotation",
+            "trend_leader_rotation",
+        ]
+    if plan.entry_feature == "academic_momentum_trend":
+        return ["academic_momentum_trend"] * MIN_GENERATED_CANDIDATES
     base = [
         "long_regime_momentum",
         "quality_trend_hold",
@@ -941,7 +1284,7 @@ def _render_adaptive_signal_code(
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> str:
     mode = plan.entry_feature
-    return f'''def build_signals(prices):
+    return f"""def build_signals(prices):
     signals = []
     rows_by_date = {{}}
     for row in sorted(prices, key=lambda item: (item["date"], item.get("ticker", "000000"))):
@@ -952,6 +1295,7 @@ def _render_adaptive_signal_code(
     threshold = {float(threshold)!r}
     stop_loss = {float(stop_loss)!r}
     take_profit = {float(take_profit)!r}
+    trailing_stop_pct = {float(plan.trailing_stop_pct)!r}
     mode = {mode!r}
     profile = {profile!r}
     strategy_id = {strategy_id!r}
@@ -1008,9 +1352,46 @@ def _render_adaptive_signal_code(
                 return_to_volatility = trend / volatility if volatility > 0 else 0
                 avg_volume = sum(volumes[-window:]) / window if volumes[-window:] else 0
                 volume_ratio = volume / avg_volume if avg_volume > 0 else 1
-                trailing_stop = state["peak"] > 0 and close < state["peak"] * 0.93
+                trailing_stop = state["peak"] > 0 and close < state["peak"] * (1 - trailing_stop_pct)
                 score = rolling_sharpe + medium_return * 4 + long_return * 2 - volatility
-                if profile == "long_regime_momentum":
+                if profile == "academic_momentum_trend" and len(closes) >= 252:
+                    momentum_12_1 = closes[-21] / closes[-252] - 1
+                    sma_50 = (sum(closes[-49:]) + close) / 50
+                    sma_200 = (sum(closes[-199:]) + close) / 200
+                    volatility_closes = closes[-21:] + [close]
+                    daily_returns = [
+                        after / before - 1
+                        for before, after in zip(
+                            volatility_closes[:-1], volatility_closes[1:]
+                        )
+                        if before
+                    ]
+                    daily_mean = sum(daily_returns) / len(daily_returns)
+                    daily_variance = sum(
+                        (item - daily_mean) ** 2 for item in daily_returns
+                    ) / len(daily_returns)
+                    realized_volatility_21d = daily_variance ** 0.5 * (252 ** 0.5)
+                    rebalance_eligible = (len(closes) - 252) % 21 == 0
+                    score = (
+                        momentum_12_1 * 4
+                        + (sma_50 / sma_200 - 1) * 2
+                        - realized_volatility_21d
+                    )
+                    buy = (
+                        rebalance_eligible
+                        and momentum_12_1 > threshold
+                        and close >= sma_200
+                        and sma_50 >= sma_200
+                        and realized_volatility_21d <= 0.35
+                    )
+                    sell = state["in_position"] and (
+                        close < sma_200 * 0.95
+                        or (
+                            rebalance_eligible
+                            and (momentum_12_1 <= 0 or sma_50 < sma_200)
+                        )
+                    )
+                elif profile == "long_regime_momentum":
                     score = rolling_sharpe + long_return * 3 + medium_return * 2 - volatility
                     buy = close >= long_average and medium_average >= long_average * 0.98 and long_return > 0
                     sell = state["in_position"] and (close < long_average * 0.97 or long_drawdown > 0.18)
@@ -1095,7 +1476,7 @@ def _render_adaptive_signal_code(
             item["history"]["closes"].append(close)
             item["history"]["volumes"].append(item["volume"])
     return signals
-'''
+"""
 
 
 def generate_self_improvement_candidates(
@@ -1113,14 +1494,11 @@ def generate_self_improvement_candidates(
     # refinement. Generic profiles are comparisons, not replacements for that rule.
     if compile_conditions(strategy.entry_conditions) is not None:
         profiles = ["compiled_conditions", "compiled_conditions", *profiles]
-    lookbacks = [
-        max(3, int(value) - iteration * 2) for value in plan.lookbacks
-    ] + [
+    lookbacks = [max(3, int(value) - iteration * 2) for value in plan.lookbacks] + [
         min(252, int(value) + iteration * 10) for value in plan.lookbacks
     ]
     thresholds = [
-        _adjust_threshold(float(value), plan.entry_feature, iteration)
-        for value in plan.thresholds
+        _adjust_threshold(float(value), plan.entry_feature, iteration) for value in plan.thresholds
     ] + [
         _selective_threshold(float(value), plan.entry_feature, iteration)
         for value in plan.thresholds
@@ -1132,7 +1510,11 @@ def generate_self_improvement_candidates(
     # A compact Cartesian traversal varies one axis at a time before combining
     # changes.  The prior modulo zip moved every axis together along one diagonal.
     compiled_variants = [
-        ("compiled_conditions", lookbacks[index % len(lookbacks)], thresholds[index % len(thresholds)])
+        (
+            "compiled_conditions",
+            lookbacks[index % len(lookbacks)],
+            thresholds[index % len(thresholds)],
+        )
         for index in range(2)
         if "compiled_conditions" in profiles
     ]
@@ -1167,6 +1549,9 @@ def generate_self_improvement_candidates(
             stop_loss_pct=stop_loss,
             take_profit_pct=take_profit,
             max_positions=max_positions,
+            rebalance_interval_days=plan.rebalance_interval_days,
+            trailing_stop_pct=plan.trailing_stop_pct,
+            medium_momentum_weight=plan.medium_momentum_weight,
         )
         identity = _parameter_identity(parameters)
         if identity in seen:
@@ -1257,14 +1642,10 @@ def _self_improvement_grid_codes(
                     lookback=lookback,
                     threshold=threshold,
                     stop_loss=float(
-                        strategy.risk_constraints.get(
-                            "stop_loss_pct", plan.stop_loss_pct
-                        )
+                        strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct)
                     ),
                     take_profit=float(
-                        strategy.risk_constraints.get(
-                            "take_profit_pct", plan.take_profit_pct
-                        )
+                        strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct)
                     ),
                     max_positions=max_positions,
                 )

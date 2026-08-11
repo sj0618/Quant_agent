@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import math
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from ai_graph.audit import (
@@ -30,7 +31,31 @@ from ai_graph.llm.role_calls import (
     generate_strategy_conditions,
     resolve_strategy_intent,
 )
-from ai_graph.nodes.backtest import _public_engine_summary, backtest_node
+from ai_graph.nodes.backtest import (
+    BENCHMARK_LABEL,
+    BENCHMARK_METHOD,
+    BENCHMARK_WARNING,
+    MAX_OBJECTIVE_DRAWDOWN,
+    MIN_OBJECTIVE_SHARPE,
+    MIN_OBJECTIVE_TRADES,
+    METRIC_ROUND_DIGITS,
+    _annualized_return,
+    _benchmark_objective_reasons,
+    _calmar_ratio,
+    _equal_weight_benchmark_curve,
+    _is_numeric_metric,
+    _price_rows,
+    _profit_factor,
+    _public_engine_summary,
+    _summary_float_default,
+    backtest_node,
+)
+from ai_graph.quant_explanations import metric_explanation
+from ai_graph.quant_strategy import (
+    classify_strategy_request,
+    infer_automatic_strategy_preferences,
+    robust_strategy_source_refs,
+)
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
@@ -38,8 +63,13 @@ from ai_graph.nodes.signal import signal_node
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
+    BacktestBenchmark,
     BacktestPerformance,
+    BacktestReliability,
+    BacktestEquityPoint,
     CandidateBacktestResult,
+    BacktestMetrics,
+    PublicMetricDetail,
     ClarificationOption,
     Condition,
     DataRequirement,
@@ -71,6 +101,31 @@ NODE_SEQUENCE = (
     "Report",
 )
 _NODE_ERROR_RECORDED: ContextVar[bool] = ContextVar("node_error_recorded", default=False)
+_PUBLIC_METRIC_UNAVAILABLE_REASON = "metric unavailable in this analysis window"
+_BENCHMARK_UNAVAILABLE_REASON = (
+    "benchmark curve requires at least one non-empty trading date and valid closes"
+)
+
+_METRIC_DETAIL_KEYS = (
+    "total_return",
+    "cagr",
+    "annualized_volatility",
+    "sharpe_ratio",
+    "sortino_ratio",
+    "max_drawdown",
+    "calmar_ratio",
+    "win_rate",
+    "profit_factor",
+    "benchmark_return",
+    "excess_return",
+    "in_sample_sharpe",
+    "out_sample_sharpe",
+    "degradation",
+)
+_RELIABILITY_WARN_UNTIL_DAYS = 30
+_RELIABILITY_SUFFICIENT_DAYS = 90
+_RELIABILITY_MIN_TICKERS = 2
+_UNAVAILABLE_METRIC_REASON = "benchmark cannot be calculated from current data"
 
 
 class FallbackGraph:
@@ -148,6 +203,7 @@ def build_graph(audit_session: AuditSession | None = None) -> Any:
     graph.add_edge("Envelope", END)
     return graph.compile()
 
+
 def run_analysis(
     user_query: str,
     trace_id: str | None = None,
@@ -185,7 +241,9 @@ def run_analysis(
             error_type="ValueError",
             message="ValueError raised during analysis input validation",
         )
-        _record_finalization(session, "failed", message="analysis execution failed before graph invocation")
+        _record_finalization(
+            session, "failed", message="analysis execution failed before graph invocation"
+        )
         raise ValueError("user_query must not be empty")
     _record_step(session, "analysis_started", message="analysis execution started")
     node_error_token = _NODE_ERROR_RECORDED.set(False)
@@ -324,7 +382,9 @@ def supervisor_node(state: QuantAgentState) -> QuantAgentState:
         str(state.get("user_query", "")),
         trace_id=state.get("trace_id") or None,
     )
-    report_activity("step", label="요청 접수", detail=_activity_query_preview(prepared["user_query"]))
+    report_activity(
+        "step", label="요청 접수", detail=_activity_query_preview(prepared["user_query"])
+    )
     return {**state, **prepared}
 
 
@@ -475,8 +535,10 @@ def _ambiguity_state(
         "reason": reason if category != AmbiguityCode.READY else _ambiguity_reason(category),
         "ambiguity_reasons": _ambiguity_reasons(category, query),
         "ambiguity_dimensions": _ambiguity_dimensions(category, query),
-        "source_resolvable": category in {AmbiguityCode.INPUT_AMBIGUOUS, AmbiguityCode.TERM_UNKNOWN},
-        "needs_clarification_after_source_check": category not in {
+        "source_resolvable": category
+        in {AmbiguityCode.INPUT_AMBIGUOUS, AmbiguityCode.TERM_UNKNOWN},
+        "needs_clarification_after_source_check": category
+        not in {
             AmbiguityCode.READY,
             AmbiguityCode.NO_STRATEGY_INTENT,
         },
@@ -520,7 +582,11 @@ def _rule_provenance(state: Mapping[str, Any]) -> dict[str, Any] | None:
     from ai_graph.nodes.backtest import rule_provenance
 
     spec = state.get("strategy_spec") or {}
-    return rule_provenance(backtest, spec.get("entry_conditions"))
+    return rule_provenance(
+        backtest,
+        spec.get("entry_conditions"),
+        selection_mode=spec.get("selection_mode"),
+    )
 
 
 def _strategy_query(state: Mapping[str, Any]) -> str:
@@ -648,8 +714,7 @@ def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[st
         "needs_clarification_after_source_check": True,
         "clarification_blocker_type": "missing_data_source",
         "clarification_question": (
-            f"{joined} 조건은 현재 적재된 데이터로 검증할 수 없습니다. "
-            "해당 조건을 빼고 검증할까요?"
+            f"{joined} 조건은 현재 적재된 데이터로 검증할 수 없습니다. 해당 조건을 빼고 검증할까요?"
         ),
         "question_reason": "검증 불가한 조건을 가격 지표로 대체하면 확인되지 않은 결과가 사실처럼 보입니다.",
         # ClarificationOption takes label and reason only, and forbids extras - the
@@ -686,6 +751,7 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
         _strategy_query(state),
         variant="A",
         semantic_slots=state.get("semantic_slots"),
+        original_query=state.get("user_query"),
     )
 
     # If the screen already expressed the rule as structured conditions, adopt them as
@@ -696,7 +762,7 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
     relaxation = screening.get("screening_relaxation") or {}
     screen_entry = relaxation.get("entry_conditions") or []
     screen_exit = relaxation.get("exit_conditions") or []
-    if screen_entry:
+    if screen_entry and strategy_a.selection_mode != "automatic":
         try:
             strategy_a = strategy_a.model_copy(
                 update={
@@ -742,7 +808,11 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             ],
             "candidate_cards": cards,
             "report": report,
-            "performance": build_public_backtest_performance(state.get("backtest")),
+            "performance": build_public_backtest_performance(
+                state.get("backtest"),
+                price_rows=state.get("price_rows"),
+                pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
+            ),
             "recommendation_gate": gate,
         }
     elif state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
@@ -808,7 +878,9 @@ def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
         else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
     )
     ambiguity = state.get("ambiguity") or {}
-    assumptions = [str(item).strip() for item in ambiguity.get("assumptions", []) if str(item).strip()]
+    assumptions = [
+        str(item).strip() for item in ambiguity.get("assumptions", []) if str(item).strip()
+    ]
     if not assumptions:
         return base
     listed = "\n".join(f"- {item}" for item in assumptions[:5])
@@ -830,8 +902,18 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
     pipeline = data.get("pipeline_data_source") or {}
     relaxation = pipeline.get("screening_relaxation") or {}
     availability = data.get("data_availability") or {}
-    performance = build_public_backtest_performance(state.get("backtest")) or {}
-    metrics = performance.get("metrics") if isinstance(performance, dict) else None
+    performance = (
+        build_public_backtest_performance(
+            state.get("backtest"),
+            price_rows=state.get("price_rows"),
+            pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
+        )
+        or {}
+    )
+    payload = (
+        performance.model_dump() if isinstance(performance, BacktestPerformance) else performance
+    )
+    metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
 
     try:
         memory.record(
@@ -871,19 +953,52 @@ def classify_query(query: str) -> AmbiguityCode:
 
 def _is_unsupported_asset_class(query: str) -> bool:
     lowered = query.lower()
-    return any(term in lowered for term in ("옵션", "양매도", "선물", "crypto", "가상화폐", "비트코인"))
+    return any(
+        term in lowered for term in ("옵션", "양매도", "선물", "crypto", "가상화폐", "비트코인")
+    )
 
 
 # Greetings, thanks and idle questions - a backtest is not an answer to any of them.
 _SMALL_TALK_TERMS = (
-    "안녕", "ㅎㅇ", "하이", "반가", "고마", "감사", "ㄳ", "수고", "잘 지내",
-    "날씨", "몇 시", "누구야", "누구세요", "뭐 해", "뭐해", "심심",
+    "안녕",
+    "ㅎㅇ",
+    "하이",
+    "반가",
+    "고마",
+    "감사",
+    "ㄳ",
+    "수고",
+    "잘 지내",
+    "날씨",
+    "몇 시",
+    "누구야",
+    "누구세요",
+    "뭐 해",
+    "뭐해",
+    "심심",
 )
 # Anything the warehouse can act on. Present only to keep the check above from firing
 # on a real request that happens to be polite.
 _MARKET_TERMS = (
-    "주", "종목", "매수", "매도", "전략", "투자", "수익", "차트", "코스피", "코스닥",
-    "백테스트", "포트폴리오", "배당", "실적", "지수", "stock", "buy", "sell", "strategy",
+    "주",
+    "종목",
+    "매수",
+    "매도",
+    "전략",
+    "투자",
+    "수익",
+    "차트",
+    "코스피",
+    "코스닥",
+    "백테스트",
+    "포트폴리오",
+    "배당",
+    "실적",
+    "지수",
+    "stock",
+    "buy",
+    "sell",
+    "strategy",
 )
 _SMALL_TALK_LENGTH_LIMIT = 20
 
@@ -983,7 +1098,11 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
         contradictions.append("low_volatility_vs_short_term_surge")
 
     confidence = 0.9 if indicator and not contradictions else 0.62 if indicator else 0.45
-    parse_status = "ready" if confidence >= 0.65 and not contradictions and not missing_slots else "needs_clarification"
+    parse_status = (
+        "ready"
+        if confidence >= 0.65 and not contradictions and not missing_slots
+        else "needs_clarification"
+    )
     return SemanticSlots(
         indicator=_unique(indicator),
         threshold=_unique(threshold),
@@ -1119,11 +1238,27 @@ def build_evidence_refs(source_usage: list[SourceUsage], *, trace_id: str) -> li
 
 def data_source_inventory() -> list[dict[str, Any]]:
     return [
-        {"source_type": "internal_db", "families": ["ohlcv_ta", "analyst_evidence"], "live_required": False},
+        {
+            "source_type": "internal_db",
+            "families": ["ohlcv_ta", "analyst_evidence"],
+            "live_required": False,
+        },
         {"source_type": "krx", "families": ["ohlcv_ta"], "live_required": False},
-        {"source_type": "dart", "families": ["disclosure", "event", "fundamentals"], "live_required": False},
-        {"source_type": "aoai_web_search", "families": ["event", "macro_fx_rates_commodities", "consensus_guidance"], "live_required": False},
-        {"source_type": "analyst_evidence", "families": ["analyst_evidence", "consensus_guidance"], "live_required": False},
+        {
+            "source_type": "dart",
+            "families": ["disclosure", "event", "fundamentals"],
+            "live_required": False,
+        },
+        {
+            "source_type": "aoai_web_search",
+            "families": ["event", "macro_fx_rates_commodities", "consensus_guidance"],
+            "live_required": False,
+        },
+        {
+            "source_type": "analyst_evidence",
+            "families": ["analyst_evidence", "consensus_guidance"],
+            "live_required": False,
+        },
     ]
 
 
@@ -1140,7 +1275,12 @@ def _proxy_disclosure(requirements: list[DataRequirement]) -> dict[str, str] | N
     proxied = [requirement for requirement in requirements if requirement.proxy_used]
     if not proxied:
         return None
-    return {requirement.family: requirement.proxy_disclosure.get("reason", "proxy used") if requirement.proxy_disclosure else "proxy used" for requirement in proxied}
+    return {
+        requirement.family: requirement.proxy_disclosure.get("reason", "proxy used")
+        if requirement.proxy_disclosure
+        else "proxy used"
+        for requirement in proxied
+    }
 
 
 def _unique(values: list[str]) -> list[str]:
@@ -1167,10 +1307,9 @@ def _attach_screening_matches(
 ) -> list[StrategyCandidateCard]:
     if not cards:
         return cards
-    filtered = (
-        [c for c in screening_candidates if not sector or c.get("sector") == sector]
-        or screening_candidates
-    )
+    filtered = [
+        c for c in screening_candidates if not sector or c.get("sector") == sector
+    ] or screening_candidates
     matches = [
         ScreeningMatch(
             ticker=c["ticker"],
@@ -1330,7 +1469,10 @@ def _static_strategy_candidate_cards(query: str) -> list[StrategyCandidateCard]:
                 reason="성장 조건의 시장 반응을 가격 추세로 확인합니다.",
             ),
         ]
-    if any(term in lowered or term in query for term in ("per", "pbr", "roe", "저평가", "가치", "부채", "순현금", "배당", "fcf")):
+    if any(
+        term in lowered or term in query
+        for term in ("per", "pbr", "roe", "저평가", "가치", "부채", "순현금", "배당", "fcf")
+    ):
         return [
             StrategyCandidateCard(
                 strategy_id="value_quality",
@@ -1357,7 +1499,10 @@ def _static_strategy_candidate_cards(query: str) -> list[StrategyCandidateCard]:
                 reason="성장성과 밸류에이션을 함께 요구하는 입력에 가장 가까운 후보입니다.",
             ),
         ]
-    if any(term in query for term in ("신고가", "거래량", "모멘텀", "돌파", "상대강도", "주도주", "숏커버링", "갭")):
+    if any(
+        term in query
+        for term in ("신고가", "거래량", "모멘텀", "돌파", "상대강도", "주도주", "숏커버링", "갭")
+    ):
         return [
             StrategyCandidateCard(
                 strategy_id="breakout_volume_momentum",
@@ -1411,7 +1556,13 @@ def _static_strategy_candidate_cards(query: str) -> list[StrategyCandidateCard]:
                 reason="조정 뒤 변동성 회복을 확인하는 대체 후보입니다.",
             ),
         ]
-    if any(term in query for term in ("눌림목", "200일", "20일선", "120일", "볼린저", "변동성", "반등")) or "rsi" in lowered:
+    if (
+        any(
+            term in query
+            for term in ("눌림목", "200일", "20일선", "120일", "볼린저", "변동성", "반등")
+        )
+        or "rsi" in lowered
+    ):
         return [
             StrategyCandidateCard(
                 strategy_id="rsi_rebound",
@@ -1483,9 +1634,15 @@ def build_clarification_prompt(category: AmbiguityCode, query: str) -> dict[str,
         }
     if category == AmbiguityCode.INFEASIBLE:
         options = [
-            ClarificationOption(label="KRX 현물로 대체", reason="현재 실행 가능한 데이터/백테스트 범위입니다."),
-            ClarificationOption(label="기술 신호만 분석", reason="파생상품 노출 대신 현물 proxy 신호를 확인합니다."),
-            ClarificationOption(label="지원 범위 확인", reason="지원하지 않는 자산군을 명확히 분리합니다."),
+            ClarificationOption(
+                label="KRX 현물로 대체", reason="현재 실행 가능한 데이터/백테스트 범위입니다."
+            ),
+            ClarificationOption(
+                label="기술 신호만 분석", reason="파생상품 노출 대신 현물 proxy 신호를 확인합니다."
+            ),
+            ClarificationOption(
+                label="지원 범위 확인", reason="지원하지 않는 자산군을 명확히 분리합니다."
+            ),
         ]
         return _clarification(
             question="KRX 현물 주식 전략으로 바꿔서 볼까요?",
@@ -1536,8 +1693,7 @@ def _clarification_from_ambiguity(ambiguity: dict[str, Any]) -> dict[str, Any]:
     return {
         "question": ambiguity.get("clarification_question"),
         "options": [
-            ClarificationOption.model_validate(option)
-            for option in ambiguity.get("options", [])
+            ClarificationOption.model_validate(option) for option in ambiguity.get("options", [])
         ],
         "recommended": ambiguity.get("recommended_option"),
     }
@@ -1600,41 +1756,125 @@ def build_strategy_spec(
     *,
     variant: str,
     semantic_slots: Mapping[str, Any] | None = None,
+    original_query: str | None = None,
 ) -> StrategySpec:
-    profile = _strategy_profile(query, semantic_slots=semantic_slots)
+    # The interpreter may turn "알아서 좋은 거" into a concrete RSI sentence.  That
+    # resolution is useful for data lookup but it must not erase the user's original
+    # lack of a rule; otherwise an arbitrary interpreter default becomes user intent.
+    preference_query = original_query or query
+    selection_mode = classify_strategy_request(preference_query)
+    automatic_preferences = (
+        infer_automatic_strategy_preferences(preference_query)
+        if selection_mode == "automatic"
+        else None
+    )
+    profile = _strategy_profile(
+        query,
+        semantic_slots=semantic_slots,
+        selection_mode=selection_mode,
+    )
     slots = semantic_slots or {}
     sector = slots.get("sector")
-    conditions = generate_strategy_conditions(
-        query=query,
-        semantic_slots=dict(slots),
-        fallback=StrategyConditionsPayload(
-            entry_conditions=profile["entry_conditions"],
-            exit_conditions=profile["exit_conditions"],
-            indicators=profile["indicators"],
-            confidence=float(profile["confidence"]),
-        ),
+    fallback_conditions = StrategyConditionsPayload(
+        entry_conditions=profile["entry_conditions"],
+        exit_conditions=profile["exit_conditions"],
+        indicators=profile["indicators"],
+        confidence=float(profile["confidence"]),
     )
+    # Automatic mode is a deterministic, cited strategy.  Letting the language model
+    # rewrite its conditions would make the displayed rationale differ from the rule
+    # actually backtested.  Concrete user rules continue through the normal parser.
+    conditions = (
+        fallback_conditions
+        if selection_mode == "automatic"
+        else generate_strategy_conditions(
+            query=query,
+            semantic_slots=dict(slots),
+            fallback=fallback_conditions,
+        )
+    )
+    risk_constraints: dict[str, float | int | str | bool] = {
+        "max_position_pct": 0.1,
+        "stop_loss_pct": 0.08,
+    }
+    customization_assumptions: list[str] = []
+    strategy_name = str(profile["name"])
+    if automatic_preferences is not None:
+        medium_momentum_weight = {
+            "short": 0.70,
+            "medium": 0.60,
+            "long": 0.40,
+        }[automatic_preferences.horizon]
+        risk_constraints = {
+            "max_position_pct": round(1.0 / automatic_preferences.max_positions, 6),
+            "stop_loss_pct": automatic_preferences.stop_loss_pct,
+            "take_profit_pct": 10.0,
+            "trailing_stop_pct": automatic_preferences.trailing_stop_pct,
+            "rebalance_interval_days": automatic_preferences.rebalance_interval_days,
+            "medium_momentum_weight": medium_momentum_weight,
+            "strategy_style": automatic_preferences.risk_style,
+            "investment_horizon": automatic_preferences.horizon,
+            "benchmark_objective": "fixed_universe_excess_return",
+            "benchmark_evaluation_period_days": 126,
+            # The generic automatic StrategySpec intentionally has broad indicators.
+            # Preserve the normalized request so the pre-registered catalog can tell
+            # "low volatility" from "breakout" without inspecting any return data.
+            "catalog_query": preference_query,
+        }
+        style_label = {
+            "aggressive": "공격형",
+            "balanced": "균형형",
+            "defensive": "방어형",
+        }[automatic_preferences.risk_style]
+        horizon_label = {
+            "short": "단기",
+            "medium": "중기",
+            "long": "장기",
+        }[automatic_preferences.horizon]
+        strategy_name = f"{style_label}·{horizon_label} {strategy_name}"
+        customization_assumptions = [
+            f"사용자 입력을 {style_label}·{horizon_label} 성향으로 해석",
+            (
+                f"최대 {automatic_preferences.max_positions}종목, "
+                f"{automatic_preferences.rebalance_interval_days}거래일 교체, "
+                f"손절 {automatic_preferences.stop_loss_pct:.0%}, "
+                f"고점 추적손절 {automatic_preferences.trailing_stop_pct:.0%}"
+            ),
+            "63거래일 고정 구간 중 벤치마크 패배 구간이 50% 이상이면 검증 실패",
+        ]
     return StrategySpec(
         strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
-        name=str(profile["name"]),
+        name=strategy_name,
         market="KRX",
         sector=sector,
         timeframe="daily",
         entry_conditions=conditions.entry_conditions,
         exit_conditions=conditions.exit_conditions,
         indicators=conditions.indicators or profile["indicators"],
-        risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
+        risk_constraints=risk_constraints,
         assumptions=[
             f"sector filter: {sector}" if sector else "all matching listed common stocks",
             "daily adjusted close data",
+            *customization_assumptions,
             *profile["assumptions"],
         ],
+        source_refs=list(profile.get("source_refs", [])),
+        selection_mode=selection_mode,
         confidence=float(conditions.confidence),
     )
 
 
-def _strategy_profile(query: str, *, semantic_slots: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    profile = _strategy_profile_base(query, semantic_slots=semantic_slots)
+def _strategy_profile(
+    query: str,
+    *,
+    semantic_slots: Mapping[str, Any] | None = None,
+    selection_mode: str | None = None,
+) -> dict[str, Any]:
+    profile = _strategy_profile_base(
+        query,
+        semantic_slots=semantic_slots,
+        selection_mode=selection_mode,
+    )
     sector = semantic_slots.get("sector") if semantic_slots else None
     if sector:
         profile = {
@@ -1645,22 +1885,94 @@ def _strategy_profile(query: str, *, semantic_slots: Mapping[str, Any] | None = 
     return profile
 
 
-def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def _strategy_profile_base(
+    query: str,
+    *,
+    semantic_slots: Mapping[str, Any] | None = None,
+    selection_mode: str | None = None,
+) -> dict[str, Any]:
     lowered = query.lower()
     slot_indicator = set(semantic_slots.get("indicator", [])) if semantic_slots else set()
     slot_event = set(semantic_slots.get("event", [])) if semantic_slots else set()
+    if (selection_mode or classify_strategy_request(query)) == "automatic":
+        return {
+            "strategy_id": "automatic_performance_momentum",
+            "name": "벤치마크 초과수익 맞춤 모멘텀 전략군",
+            "entry_conditions": [
+                Condition(
+                    left="past_only_signal",
+                    operator="eq",
+                    right=1,
+                    description="미래 데이터를 쓰지 않은 모멘텀·추세 신호가 매수 상태",
+                ),
+                Condition(
+                    left="trend_confirmation",
+                    operator="eq",
+                    right=1,
+                    description="후보 전략의 중기 또는 장기 상승 추세 확인",
+                ),
+                Condition(
+                    left="risk_filter",
+                    operator="eq",
+                    right=1,
+                    description="변동성·손실 제한 조건 통과",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="selected_profile_exit",
+                    operator="eq",
+                    right=1,
+                    description="선택된 전략의 추세 훼손 또는 손실 제한 규칙",
+                )
+            ],
+            "indicators": [
+                "cross_sectional_rank",
+                "momentum_12_1",
+                "medium_momentum_126d",
+                "SMA200",
+                "realized_volatility_21d",
+                "rebalance_21d",
+                "crash_risk_guard",
+                "benchmark_period_gate",
+            ],
+            "assumptions": [
+                "사용자 위험성향과 투자기간에 맞는 독립 모멘텀 전략 3개를 백테스트 전에 생성",
+                "앞 70% 구간만 후보 선택에 사용하고 마지막 30%는 별도 검증",
+                "63거래일 고정 구간 중 벤치마크에 진 구간이 50% 이상이면 패배",
+                "지표는 평가 시점까지 알려진 조정 종가만 사용",
+                "45% 같은 조기 고정 익절로 큰 승자를 자르지 않고 상대 순위와 장기 추세가 유지되면 보유",
+                "보유 종목 수·교체 주기·손실 제한은 사용자 입력에서 수익률을 보기 전에 결정",
+                "후보 수와 기본 파라미터를 백테스트 전에 고정해 과최적화 탐색을 제한",
+                "과거 연구와 백테스트는 미래 수익을 보장하지 않음",
+            ],
+            "source_refs": robust_strategy_source_refs(),
+            "confidence": 0.84,
+        }
     if _is_pullback_rsi_volume_query(query):
         return {
             "strategy_id": "pullback_rsi_volume",
             "name": "RSI40 거래량 눌림목",
             "entry_conditions": [
-                Condition(left="close_above_sma_200", operator="eq", right=1, description="주가가 200일선 위"),
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="주가가 200일선 위",
+                ),
                 Condition(left="rsi", operator="lte", right=40, description="RSI(14) <= 40 눌림"),
-                Condition(left="volume_ratio_20", operator="gte", right=1.0, description="거래량이 20일 평균 이상"),
+                Condition(
+                    left="volume_ratio_20",
+                    operator="gte",
+                    right=1.0,
+                    description="거래량이 20일 평균 이상",
+                ),
             ],
             "exit_conditions": [
                 Condition(left="rsi", operator="gte", right=60, description="RSI >= 60 회복"),
-                Condition(left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈"),
+                Condition(
+                    left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈"
+                ),
             ],
             "indicators": ["SMA200", "RSI", "volume_ratio_20"],
             "assumptions": [
@@ -1675,13 +1987,32 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "dividend_defensive",
             "name": "배당 방어주",
             "entry_conditions": [
-                Condition(left="dividend_yield", operator="gte", right=0.04, description="배당수익률 4% 이상"),
-                Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
-                Condition(left="dividend_cut_5y", operator="eq", right=0, description="최근 5년 배당 삭감 없음"),
-                Condition(left="close_above_sma_200", operator="eq", right=1, description="200일선 위 기술 확인"),
+                Condition(
+                    left="dividend_yield",
+                    operator="gte",
+                    right=0.04,
+                    description="배당수익률 4% 이상",
+                ),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="dividend_cut_5y",
+                    operator="eq",
+                    right=0,
+                    description="최근 5년 배당 삭감 없음",
+                ),
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="200일선 위 기술 확인",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈")
+                Condition(
+                    left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈"
+                )
             ],
             "indicators": ["dividend_yield", "debt_ratio", "dividend_cut_5y", "SMA200"],
             "assumptions": [
@@ -1695,13 +2026,30 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "value_quality",
             "name": "저평가 퀄리티",
             "entry_conditions": [
-                Condition(left="per_percentile", operator="lte", right=0.4, description="PER 업종/시장 하위권"),
+                Condition(
+                    left="per_percentile",
+                    operator="lte",
+                    right=0.4,
+                    description="PER 업종/시장 하위권",
+                ),
                 Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
-                Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
-                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="relative_strength_20d", operator="lt", right=0, description="단기 상대강도 약화")
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="단기 상대강도 약화",
+                )
             ],
             "indicators": ["PER", "ROE", "debt_ratio", "relative_strength_20d"],
             "assumptions": ["재무 조건은 후보 필터, OHLCV 기반 상대강도는 검증 proxy로 사용"],
@@ -1713,12 +2061,26 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "name": "합리적 성장주",
             "entry_conditions": [
                 Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
-                Condition(left="sales_growth", operator="gte", right=0.1, description="매출 성장률 10% 이상"),
-                Condition(left="per_vs_industry", operator="lte", right=1, description="PER 업종 평균 이하"),
-                Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위"),
+                Condition(
+                    left="sales_growth",
+                    operator="gte",
+                    right=0.1,
+                    description="매출 성장률 10% 이상",
+                ),
+                Condition(
+                    left="per_vs_industry",
+                    operator="lte",
+                    right=1,
+                    description="PER 업종 평균 이하",
+                ),
+                Condition(
+                    left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
             ],
             "indicators": ["ROE", "sales_growth", "PER", "SMA50"],
             "assumptions": ["성장성과 밸류에이션을 결합한 GARP 후보로 확정"],
@@ -1731,28 +2093,58 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "entry_conditions": [
                 Condition(left="pbr", operator="lte", right=1, description="PBR 1배 이하"),
                 Condition(left="net_cash", operator="gte", right=1, description="순현금 보유"),
-                Condition(left="buyback_notice", operator="eq", right=1, description="자사주 매입 공시"),
-                Condition(left="close_above_sma_20", operator="eq", right=1, description="20일선 위 기술 확인"),
+                Condition(
+                    left="buyback_notice", operator="eq", right=1, description="자사주 매입 공시"
+                ),
+                Condition(
+                    left="close_above_sma_20",
+                    operator="eq",
+                    right=1,
+                    description="20일선 위 기술 확인",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
             ],
             "indicators": ["PBR", "net_cash", "buyback_notice", "SMA20"],
-            "assumptions": ["공시/재무 조건은 후보 필터, OHLCV 기반 추세 회복은 백테스트 proxy로 사용"],
+            "assumptions": [
+                "공시/재무 조건은 후보 필터, OHLCV 기반 추세 회복은 백테스트 proxy로 사용"
+            ],
             "confidence": 0.69,
         }
-    if any(term in lowered or term in query for term in ("저per", "per", "pbr", "저평가", "가치주")):
+    if any(
+        term in lowered or term in query for term in ("저per", "per", "pbr", "저평가", "가치주")
+    ):
         return {
             "strategy_id": "value_quality",
             "name": "저평가 퀄리티",
             "entry_conditions": [
-                Condition(left="per_percentile", operator="lte", right=0.4, description="PER 업종/시장 하위권"),
+                Condition(
+                    left="per_percentile",
+                    operator="lte",
+                    right=0.4,
+                    description="PER 업종/시장 하위권",
+                ),
                 Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
-                Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
-                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="relative_strength_20d", operator="lt", right=0, description="단기 상대강도 약화")
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="단기 상대강도 약화",
+                )
             ],
             "indicators": ["PER", "ROE", "debt_ratio", "relative_strength_20d"],
             "assumptions": ["재무 조건은 후보 필터, OHLCV 기반 상대강도는 검증 proxy로 사용"],
@@ -1763,15 +2155,39 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "low_vol_defensive",
             "name": "저변동 배당 방어주",
             "entry_conditions": [
-                Condition(left="realized_volatility_20d", operator="lte", right=0.25, description="20일 변동성 낮음"),
-                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 시장 대비 우위"),
-                Condition(left="dividend_yield", operator="gte", right=0.04, description="배당수익률 양호"),
-                Condition(left="close_above_sma_20", operator="eq", right=1, description="20일선 위"),
+                Condition(
+                    left="realized_volatility_20d",
+                    operator="lte",
+                    right=0.25,
+                    description="20일 변동성 낮음",
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 시장 대비 우위",
+                ),
+                Condition(
+                    left="dividend_yield", operator="gte", right=0.04, description="배당수익률 양호"
+                ),
+                Condition(
+                    left="close_above_sma_20", operator="eq", right=1, description="20일선 위"
+                ),
             ],
             "exit_conditions": [
-                Condition(left="relative_strength_20d", operator="lt", right=0, description="상대강도 약화")
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="상대강도 약화",
+                )
             ],
-            "indicators": ["realized_volatility_20d", "relative_strength_20d", "dividend_yield", "SMA20"],
+            "indicators": [
+                "realized_volatility_20d",
+                "relative_strength_20d",
+                "dividend_yield",
+                "SMA20",
+            ],
             "assumptions": ["방어주 성격은 저변동성과 배당 조건, 진입 타이밍은 OHLCV proxy로 검증"],
             "confidence": 0.7,
         }
@@ -1780,12 +2196,29 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "rate_sensitive_income",
             "name": "금리 민감 인컴주",
             "entry_conditions": [
-                Condition(left="rate_down_proxy", operator="eq", right=1, description="금리 하락기 강세 업종 후보"),
-                Condition(left="dividend_yield", operator="gte", right=0.04, description="배당 또는 인컴 성격"),
-                Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위 기술 상승"),
+                Condition(
+                    left="rate_down_proxy",
+                    operator="eq",
+                    right=1,
+                    description="금리 하락기 강세 업종 후보",
+                ),
+                Condition(
+                    left="dividend_yield",
+                    operator="gte",
+                    right=0.04,
+                    description="배당 또는 인컴 성격",
+                ),
+                Condition(
+                    left="close_above_sma_50",
+                    operator="eq",
+                    right=1,
+                    description="50일선 위 기술 상승",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
             ],
             "indicators": ["rate_down_proxy", "dividend_yield", "SMA50"],
             "assumptions": ["금리 민감도와 업종 분류는 후보 필터, 현재 검증은 추세 proxy로 수행"],
@@ -1796,13 +2229,32 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "dividend_defensive",
             "name": "배당 방어주",
             "entry_conditions": [
-                Condition(left="dividend_yield", operator="gte", right=0.04, description="배당수익률 4% 이상"),
-                Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
-                Condition(left="dividend_cut_5y", operator="eq", right=0, description="최근 5년 배당 삭감 없음"),
-                Condition(left="close_above_sma_200", operator="eq", right=1, description="200일선 위 기술 확인"),
+                Condition(
+                    left="dividend_yield",
+                    operator="gte",
+                    right=0.04,
+                    description="배당수익률 4% 이상",
+                ),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="dividend_cut_5y",
+                    operator="eq",
+                    right=0,
+                    description="최근 5년 배당 삭감 없음",
+                ),
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="200일선 위 기술 확인",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈")
+                Condition(
+                    left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈"
+                )
             ],
             "indicators": ["dividend_yield", "debt_ratio", "dividend_cut_5y", "SMA200"],
             "assumptions": [
@@ -1816,15 +2268,37 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "fx_exporter_revision",
             "name": "환율 수혜 이익상향",
             "entry_conditions": [
-                Condition(left="fx_benefit_proxy", operator="eq", right=1, description="환율 상승 수혜 업종 후보"),
-                Condition(left="earnings_revision_3m", operator="gte", right=0, description="이익 전망 상향"),
-                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+                Condition(
+                    left="fx_benefit_proxy",
+                    operator="eq",
+                    right=1,
+                    description="환율 상승 수혜 업종 후보",
+                ),
+                Condition(
+                    left="earnings_revision_3m",
+                    operator="gte",
+                    right=0,
+                    description="이익 전망 상향",
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="relative_strength_20d", operator="lt", right=0, description="상대강도 약화")
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="상대강도 약화",
+                )
             ],
             "indicators": ["fx_benefit_proxy", "earnings_revision_3m", "relative_strength_20d"],
-            "assumptions": ["환율 수혜와 이익 전망은 후보 필터, OHLCV 상대강도는 검증 proxy로 사용"],
+            "assumptions": [
+                "환율 수혜와 이익 전망은 후보 필터, OHLCV 상대강도는 검증 proxy로 사용"
+            ],
             "confidence": 0.65,
         }
     if any(term in query for term in ("원자재", "마진 개선", "화학", "운송", "소비재")):
@@ -1832,12 +2306,26 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "margin_improvement",
             "name": "원가하락 마진 개선",
             "entry_conditions": [
-                Condition(left="input_cost_tailwind_proxy", operator="eq", right=1, description="원자재 가격 하락 수혜 후보"),
-                Condition(left="operating_margin_improving", operator="eq", right=1, description="영업이익률 개선"),
-                Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위"),
+                Condition(
+                    left="input_cost_tailwind_proxy",
+                    operator="eq",
+                    right=1,
+                    description="원자재 가격 하락 수혜 후보",
+                ),
+                Condition(
+                    left="operating_margin_improving",
+                    operator="eq",
+                    right=1,
+                    description="영업이익률 개선",
+                ),
+                Condition(
+                    left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
             ],
             "indicators": ["input_cost_tailwind_proxy", "operating_margin", "SMA50"],
             "assumptions": ["원자재/업종 민감도는 후보 필터, 기술 추세는 검증 proxy로 사용"],
@@ -1848,12 +2336,26 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "margin_inventory_quality",
             "name": "마진·재고 퀄리티",
             "entry_conditions": [
-                Condition(left="gross_margin_streak", operator="gte", right=3, description="매출총이익률 3개 분기 개선"),
-                Condition(left="inventory_growth_vs_sales", operator="lte", right=1, description="재고 증가율이 매출 증가율 이하"),
-                Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위"),
+                Condition(
+                    left="gross_margin_streak",
+                    operator="gte",
+                    right=3,
+                    description="매출총이익률 3개 분기 개선",
+                ),
+                Condition(
+                    left="inventory_growth_vs_sales",
+                    operator="lte",
+                    right=1,
+                    description="재고 증가율이 매출 증가율 이하",
+                ),
+                Condition(
+                    left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
             ],
             "indicators": ["gross_margin", "inventory_growth", "sales_growth", "SMA50"],
             "assumptions": ["분기 재무 품질 조건은 후보 필터, 가격 추세로 타이밍을 검증"],
@@ -1864,12 +2366,23 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "fcf_recovery",
             "name": "FCF 회복주",
             "entry_conditions": [
-                Condition(left="fcf_yield", operator="gte", right=0.05, description="FCF 수익률 양호"),
-                Condition(left="cashflow_stability", operator="eq", right=1, description="현금흐름 안정"),
-                Condition(left="close_above_sma_200", operator="eq", right=1, description="200일선 위 회복"),
+                Condition(
+                    left="fcf_yield", operator="gte", right=0.05, description="FCF 수익률 양호"
+                ),
+                Condition(
+                    left="cashflow_stability", operator="eq", right=1, description="현금흐름 안정"
+                ),
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="200일선 위 회복",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_200", operator="eq", right=1, description="200일선 재이탈")
+                Condition(
+                    left="close_below_sma_200", operator="eq", right=1, description="200일선 재이탈"
+                )
             ],
             "indicators": ["FCF_yield", "cashflow_stability", "SMA200"],
             "assumptions": ["현금흐름 조건은 후보 필터, 200일선 회복은 기술 proxy로 검증"],
@@ -1880,12 +2393,32 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "operating_profit_pullback",
             "name": "이익성장 조정주",
             "entry_conditions": [
-                Condition(left="operating_profit_growth_streak", operator="gte", right=4, description="4분기 연속 영업이익 증가"),
-                Condition(left="drawdown_60d", operator="lte", right=-0.1, description="60일 고점 대비 10% 이상 조정"),
-                Condition(left="relative_strength_60d", operator="gte", right=0, description="중기 상대강도 유지"),
+                Condition(
+                    left="operating_profit_growth_streak",
+                    operator="gte",
+                    right=4,
+                    description="4분기 연속 영업이익 증가",
+                ),
+                Condition(
+                    left="drawdown_60d",
+                    operator="lte",
+                    right=-0.1,
+                    description="60일 고점 대비 10% 이상 조정",
+                ),
+                Condition(
+                    left="relative_strength_60d",
+                    operator="gte",
+                    right=0,
+                    description="중기 상대강도 유지",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="relative_strength_60d", operator="lt", right=0, description="중기 상대강도 훼손")
+                Condition(
+                    left="relative_strength_60d",
+                    operator="lt",
+                    right=0,
+                    description="중기 상대강도 훼손",
+                )
             ],
             "indicators": ["operating_profit_growth", "drawdown_60d", "relative_strength_60d"],
             "assumptions": ["분기 이익 조건은 후보 필터, 조정 폭과 상대강도는 OHLCV proxy로 검증"],
@@ -1897,8 +2430,18 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
                 "strategy_id": "oversold_quality",
                 "name": "과매도 우량주",
                 "entry_conditions": [
-                    Condition(left="drawdown_60d", operator="lte", right=-0.2, description="60일 고점 대비 20% 이상 하락"),
-                    Condition(left="earnings_revision_3m", operator="gte", right=0, description="실적 컨센서스 유지"),
+                    Condition(
+                        left="drawdown_60d",
+                        operator="lte",
+                        right=-0.2,
+                        description="60일 고점 대비 20% 이상 하락",
+                    ),
+                    Condition(
+                        left="earnings_revision_3m",
+                        operator="gte",
+                        right=0,
+                        description="실적 컨센서스 유지",
+                    ),
                     Condition(left="rsi", operator="lte", right=35, description="과매도권"),
                 ],
                 "exit_conditions": [
@@ -1918,15 +2461,37 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": strategy_id,
             "name": name,
             "entry_conditions": [
-                Condition(left="earnings_revision_3m", operator="gte", right=0, description="최근 3개월 이익 전망 상향"),
-                Condition(left="breakout_high", operator="eq", right=1, description="20일 신고가 또는 상단 돌파"),
-                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+                Condition(
+                    left="earnings_revision_3m",
+                    operator="gte",
+                    right=0,
+                    description="최근 3개월 이익 전망 상향",
+                ),
+                Condition(
+                    left="breakout_high",
+                    operator="eq",
+                    right=1,
+                    description="20일 신고가 또는 상단 돌파",
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="relative_strength_20d", operator="lt", right=0, description="상대강도 약화")
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="상대강도 약화",
+                )
             ],
             "indicators": ["earnings_revision_3m", "rolling_high", "relative_strength_20d"],
-            "assumptions": ["실적/가이던스 조건은 후보 필터, 신고가와 상대강도는 검증 proxy로 사용"],
+            "assumptions": [
+                "실적/가이던스 조건은 후보 필터, 신고가와 상대강도는 검증 proxy로 사용"
+            ],
             "confidence": 0.72,
         }
     if any(term in query for term in ("기관", "외국인")):
@@ -1934,12 +2499,23 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "flow_accumulation",
             "name": "기관·외국인 수급 모멘텀",
             "entry_conditions": [
-                Condition(left="net_buy_streak_5d", operator="gte", right=5, description="기관·외국인 5거래일 순매수"),
-                Condition(left="close_above_sma_20", operator="eq", right=1, description="주가 20일선 위"),
-                Condition(left="volume_ratio_20", operator="gte", right=1, description="거래량 확인"),
+                Condition(
+                    left="net_buy_streak_5d",
+                    operator="gte",
+                    right=5,
+                    description="기관·외국인 5거래일 순매수",
+                ),
+                Condition(
+                    left="close_above_sma_20", operator="eq", right=1, description="주가 20일선 위"
+                ),
+                Condition(
+                    left="volume_ratio_20", operator="gte", right=1, description="거래량 확인"
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
             ],
             "indicators": ["net_buy_streak_5d", "SMA20", "volume_ratio_20"],
             "assumptions": ["수급 데이터가 없으면 거래량과 20일선 proxy로 검증"],
@@ -1950,12 +2526,21 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "short_covering_proxy",
             "name": "숏커버링 proxy",
             "entry_conditions": [
-                Condition(left="short_balance_high", operator="eq", right=1, description="공매도 잔고 높은 후보"),
-                Condition(left="volume_ratio_20", operator="gte", right=1.5, description="거래량 증가"),
+                Condition(
+                    left="short_balance_high",
+                    operator="eq",
+                    right=1,
+                    description="공매도 잔고 높은 후보",
+                ),
+                Condition(
+                    left="volume_ratio_20", operator="gte", right=1.5, description="거래량 증가"
+                ),
                 Condition(left="bullish_breakout", operator="eq", right=1, description="양봉 돌파"),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
             ],
             "indicators": ["short_balance", "volume_ratio_20", "bullish_breakout"],
             "assumptions": ["공매도 잔고는 후보 필터, 거래량·양봉 돌파는 백테스트 proxy로 사용"],
@@ -1967,8 +2552,15 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "name": "갭 유지 수급 모멘텀",
             "entry_conditions": [
                 Condition(left="gap_up", operator="eq", right=1, description="최근 갭 상승"),
-                Condition(left="gap_unfilled", operator="eq", right=1, description="갭 미충족 횡보"),
-                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+                Condition(
+                    left="gap_unfilled", operator="eq", right=1, description="갭 미충족 횡보"
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
             ],
             "exit_conditions": [
                 Condition(left="gap_filled", operator="eq", right=1, description="갭 메움")
@@ -1977,26 +2569,64 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "assumptions": ["갭 유지 여부는 OHLCV 패턴으로 검증"],
             "confidence": 0.67,
         }
-    if "bollinger" in slot_indicator or "lower_band_reentry" in slot_event or "볼린저" in query or "변동성" in query:
-        lower_reentry = "lower_band_reentry" in slot_event or any(term in query for term in ("하단", "재진입", "반등"))
+    if (
+        "bollinger" in slot_indicator
+        or "lower_band_reentry" in slot_event
+        or "볼린저" in query
+        or "변동성" in query
+    ):
+        lower_reentry = "lower_band_reentry" in slot_event or any(
+            term in query for term in ("하단", "재진입", "반등")
+        )
         return {
-            "strategy_id": "bollinger_lower_reentry" if lower_reentry else "bollinger_squeeze_breakout",
+            "strategy_id": "bollinger_lower_reentry"
+            if lower_reentry
+            else "bollinger_squeeze_breakout",
             "name": "볼린저 하단 재진입" if lower_reentry else "볼린저 스퀴즈 돌파",
             "entry_conditions": [
-                Condition(left="close_below_lower_band_recent", operator="eq", right=1, description="최근 종가가 볼린저 하단 밴드 아래를 확인"),
-                Condition(left="close_cross_above_lower_band", operator="eq", right=1, description="종가가 하단 밴드 위로 재진입"),
-            ] if lower_reentry else [
-                Condition(left="bb_width_percentile", operator="lte", right=0.25, description="밴드 폭 축소"),
-                Condition(left="bollinger_breakout", operator="eq", right=1, description="상단 돌파 또는 밴드 재진입"),
+                Condition(
+                    left="close_below_lower_band_recent",
+                    operator="eq",
+                    right=1,
+                    description="최근 종가가 볼린저 하단 밴드 아래를 확인",
+                ),
+                Condition(
+                    left="close_cross_above_lower_band",
+                    operator="eq",
+                    right=1,
+                    description="종가가 하단 밴드 위로 재진입",
+                ),
+            ]
+            if lower_reentry
+            else [
+                Condition(
+                    left="bb_width_percentile",
+                    operator="lte",
+                    right=0.25,
+                    description="밴드 폭 축소",
+                ),
+                Condition(
+                    left="bollinger_breakout",
+                    operator="eq",
+                    right=1,
+                    description="상단 돌파 또는 밴드 재진입",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_middle_band", operator="eq", right=1, description="중심선 이탈")
+                Condition(
+                    left="close_below_middle_band",
+                    operator="eq",
+                    right=1,
+                    description="중심선 이탈",
+                )
             ],
             "indicators": ["Bollinger Bands", "close"],
             "assumptions": [
                 "볼린저 하단 재진입은 RSI 반등과 별도 의미로 보존",
                 "판정 기준은 종가 기준으로 고정",
-            ] if lower_reentry else ["상단 돌파와 하단 재진입은 입력 문맥에 따라 L2에서 분기"],
+            ]
+            if lower_reentry
+            else ["상단 돌파와 하단 재진입은 입력 문맥에 따라 L2에서 분기"],
             "confidence": 0.8 if lower_reentry else 0.74,
         }
     if "200일" in query and "rsi" in lowered:
@@ -2004,12 +2634,24 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "trend_rsi_volume_pullback",
             "name": "추세 내 RSI 눌림목",
             "entry_conditions": [
-                Condition(left="close_above_sma_200", operator="eq", right=1, description="200일선 위 상승추세"),
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="200일선 위 상승추세",
+                ),
                 Condition(left="rsi", operator="lte", right=40, description="RSI 40 이하 눌림"),
-                Condition(left="volume_ratio_20", operator="gte", right=1, description="거래량 20일 평균 이상"),
+                Condition(
+                    left="volume_ratio_20",
+                    operator="gte",
+                    right=1,
+                    description="거래량 20일 평균 이상",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
             ],
             "indicators": ["SMA200", "RSI", "volume_ratio_20"],
             "assumptions": ["장기 추세는 200일선, 단기 눌림은 RSI와 거래량으로 검증"],
@@ -2020,12 +2662,29 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "midterm_pullback",
             "name": "중기 상승추세 눌림목",
             "entry_conditions": [
-                Condition(left="relative_strength_20d", operator="lt", right=0, description="최근 1개월 시장 대비 약세"),
-                Condition(left="relative_strength_120d", operator="gte", right=0, description="6개월 시장 대비 강세"),
-                Condition(left="close_above_sma_200", operator="eq", right=1, description="장기 추세 유지"),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="최근 1개월 시장 대비 약세",
+                ),
+                Condition(
+                    left="relative_strength_120d",
+                    operator="gte",
+                    right=0,
+                    description="6개월 시장 대비 강세",
+                ),
+                Condition(
+                    left="close_above_sma_200", operator="eq", right=1, description="장기 추세 유지"
+                ),
             ],
             "exit_conditions": [
-                Condition(left="relative_strength_120d", operator="lt", right=0, description="중기 상대강도 훼손")
+                Condition(
+                    left="relative_strength_120d",
+                    operator="lt",
+                    right=0,
+                    description="중기 상대강도 훼손",
+                )
             ],
             "indicators": ["relative_strength_20d", "relative_strength_120d", "SMA200"],
             "assumptions": ["중기 추세와 단기 조정의 조합을 OHLCV proxy로 검증"],
@@ -2036,12 +2695,29 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "breakout_pullback",
             "name": "신고가 돌파 후 되돌림",
             "entry_conditions": [
-                Condition(left="breakout_high", operator="eq", right=1, description="120일 신고가 돌파 이력"),
-                Condition(left="pullback_to_sma_20", operator="eq", right=1, description="20일선까지 되돌림"),
-                Condition(left="relative_strength_60d", operator="gte", right=0, description="중기 상대강도 유지"),
+                Condition(
+                    left="breakout_high",
+                    operator="eq",
+                    right=1,
+                    description="120일 신고가 돌파 이력",
+                ),
+                Condition(
+                    left="pullback_to_sma_20",
+                    operator="eq",
+                    right=1,
+                    description="20일선까지 되돌림",
+                ),
+                Condition(
+                    left="relative_strength_60d",
+                    operator="gte",
+                    right=0,
+                    description="중기 상대강도 유지",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
             ],
             "indicators": ["rolling_high", "SMA20", "relative_strength_60d"],
             "assumptions": ["신고가 이후 눌림목을 추세 지속 proxy로 검증"],
@@ -2052,47 +2728,89 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "breakout_setup",
             "name": "돌파 대기",
             "entry_conditions": [
-                Condition(left="near_recent_high", operator="eq", right=1, description="최근 신고가 근처"),
-                Condition(left="volume_dry_up", operator="eq", right=1, description="거래량 감소 횡보"),
-                Condition(left="turnover_sufficient", operator="eq", right=1, description="거래대금 충분"),
+                Condition(
+                    left="near_recent_high", operator="eq", right=1, description="최근 신고가 근처"
+                ),
+                Condition(
+                    left="volume_dry_up", operator="eq", right=1, description="거래량 감소 횡보"
+                ),
+                Condition(
+                    left="turnover_sufficient", operator="eq", right=1, description="거래대금 충분"
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
             ],
             "indicators": ["near_recent_high", "volume_dry_up", "turnover"],
             "assumptions": ["거래대금과 횡보 압축은 OHLCV proxy로 검증"],
             "confidence": 0.68,
         }
-    if any(term in query for term in ("영업이익률", "영업이익", "매출 성장률", "퀄리티 성장", "성장주")):
+    if any(
+        term in query for term in ("영업이익률", "영업이익", "매출 성장률", "퀄리티 성장", "성장주")
+    ):
         if "ROE 15%" in query or "합리적 성장주" in query or "PER" in query:
             return {
                 "strategy_id": "reasonable_growth",
                 "name": "합리적 성장주",
                 "entry_conditions": [
                     Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
-                    Condition(left="sales_growth", operator="gte", right=0.1, description="매출 성장률 10% 이상"),
-                    Condition(left="per_vs_industry", operator="lte", right=1, description="PER 업종 평균 이하"),
-                    Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위"),
+                    Condition(
+                        left="sales_growth",
+                        operator="gte",
+                        right=0.1,
+                        description="매출 성장률 10% 이상",
+                    ),
+                    Condition(
+                        left="per_vs_industry",
+                        operator="lte",
+                        right=1,
+                        description="PER 업종 평균 이하",
+                    ),
+                    Condition(
+                        left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                    ),
                 ],
                 "exit_conditions": [
-                    Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+                    Condition(
+                        left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                    )
                 ],
                 "indicators": ["ROE", "sales_growth", "PER", "SMA50"],
                 "assumptions": ["성장성과 밸류에이션을 결합한 GARP 후보로 확정"],
                 "confidence": 0.72,
             }
-        strategy_id = "quality_growth" if "ROE" in query or "업종 평균" in query else "growth_momentum"
+        strategy_id = (
+            "quality_growth" if "ROE" in query or "업종 평균" in query else "growth_momentum"
+        )
         return {
             "strategy_id": strategy_id,
             "name": "퀄리티 성장주" if strategy_id == "quality_growth" else "성장 모멘텀",
             "entry_conditions": [
-                Condition(left="sales_growth", operator="gte", right=0.2 if "20%" in query else 0.1, description="매출 성장률 양호"),
-                Condition(left="operating_margin_improving", operator="eq", right=1, description="영업이익률 개선"),
-                Condition(left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"),
-                Condition(left="close_above_sma_50", operator="eq", right=1, description="50일선 위"),
+                Condition(
+                    left="sales_growth",
+                    operator="gte",
+                    right=0.2 if "20%" in query else 0.1,
+                    description="매출 성장률 양호",
+                ),
+                Condition(
+                    left="operating_margin_improving",
+                    operator="eq",
+                    right=1,
+                    description="영업이익률 개선",
+                ),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈")
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
             ],
             "indicators": ["sales_growth", "operating_margin", "debt_ratio", "SMA50"],
             "assumptions": ["성장·수익성 조건은 후보 필터, 추세는 OHLCV proxy로 검증"],
@@ -2103,7 +2821,9 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "rsi_rebound",
             "name": "RSI 과매도 반등",
             "entry_conditions": [
-                Condition(left="rsi", operator="lte", right=30, description="RSI <= 30 또는 30 상향 회복")
+                Condition(
+                    left="rsi", operator="lte", right=30, description="RSI <= 30 또는 30 상향 회복"
+                )
             ],
             "exit_conditions": [
                 Condition(left="rsi", operator="gte", right=70, description="RSI >= 70")
@@ -2117,13 +2837,35 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "breakout_volume_momentum",
             "name": "거래량 돌파 모멘텀",
             "entry_conditions": [
-                Condition(left="breakout_high", operator="eq", right=1, description="신고가 또는 상단 돌파"),
-                Condition(left="volume_ratio_20", operator="gte", right=1.5, description="20일 평균 대비 거래량 150% 이상"),
-                Condition(left="close_above_sma_20", operator="eq", right=1, description="종가가 20일선 위"),
-                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 상대강도 양호"),
+                Condition(
+                    left="breakout_high",
+                    operator="eq",
+                    right=1,
+                    description="신고가 또는 상단 돌파",
+                ),
+                Condition(
+                    left="volume_ratio_20",
+                    operator="gte",
+                    right=1.5,
+                    description="20일 평균 대비 거래량 150% 이상",
+                ),
+                Condition(
+                    left="close_above_sma_20",
+                    operator="eq",
+                    right=1,
+                    description="종가가 20일선 위",
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
             ],
             "indicators": ["rolling_high", "volume_ratio_20", "SMA20", "relative_strength_20d"],
             "assumptions": ["신고가 기간은 입력의 52주/120일/20일 표현에 맞춰 L2에서 선택"],
@@ -2134,11 +2876,23 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "pullback_trend",
             "name": "상승추세 눌림목",
             "entry_conditions": [
-                Condition(left="close_above_sma_200", operator="eq", right=1, description="주가가 200일선 위"),
-                Condition(left="pullback_to_sma_20", operator="eq", right=1, description="20일선 근처 조정"),
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="주가가 200일선 위",
+                ),
+                Condition(
+                    left="pullback_to_sma_20",
+                    operator="eq",
+                    right=1,
+                    description="20일선 근처 조정",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈")
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
             ],
             "indicators": ["SMA20", "SMA200"],
             "assumptions": ["눌림목은 L1 정의에 따라 장기 상승추세 안의 단기 조정으로 해석"],
@@ -2149,11 +2903,26 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "bollinger_squeeze_breakout",
             "name": "볼린저 스퀴즈 돌파",
             "entry_conditions": [
-                Condition(left="bb_width_percentile", operator="lte", right=0.25, description="밴드 폭 축소"),
-                Condition(left="bollinger_breakout", operator="eq", right=1, description="상단 돌파 또는 밴드 재진입"),
+                Condition(
+                    left="bb_width_percentile",
+                    operator="lte",
+                    right=0.25,
+                    description="밴드 폭 축소",
+                ),
+                Condition(
+                    left="bollinger_breakout",
+                    operator="eq",
+                    right=1,
+                    description="상단 돌파 또는 밴드 재진입",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="close_below_middle_band", operator="eq", right=1, description="중심선 이탈")
+                Condition(
+                    left="close_below_middle_band",
+                    operator="eq",
+                    right=1,
+                    description="중심선 이탈",
+                )
             ],
             "indicators": ["Bollinger Bands", "realized_volatility"],
             "assumptions": ["상단 돌파와 하단 재진입은 입력 문맥에 따라 L2에서 분기"],
@@ -2164,11 +2933,26 @@ def _strategy_profile_base(query: str, *, semantic_slots: Mapping[str, Any] | No
             "strategy_id": "relative_strength_leader",
             "name": "상대강도 주도주",
             "entry_conditions": [
-                Condition(left="relative_strength_20d", operator="gte", right=0, description="20일 시장 대비 초과수익"),
-                Condition(left="relative_strength_60d", operator="gte", right=0, description="60일 시장 대비 초과수익"),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 시장 대비 초과수익",
+                ),
+                Condition(
+                    left="relative_strength_60d",
+                    operator="gte",
+                    right=0,
+                    description="60일 시장 대비 초과수익",
+                ),
             ],
             "exit_conditions": [
-                Condition(left="relative_strength_20d", operator="lt", right=0, description="단기 상대강도 약화")
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="단기 상대강도 약화",
+                )
             ],
             "indicators": ["relative_strength_20d", "relative_strength_60d"],
             "assumptions": ["시장 대표 수익률을 비교 기준으로 해석"],
@@ -2233,7 +3017,7 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
     )
 
 
-def build_public_backtest_performance(
+def build_public_backtest_performance(  # noqa: F811
     backtest: Mapping[str, Any] | None,
 ) -> BacktestPerformance | None:
     if not backtest:
@@ -2311,3 +3095,354 @@ def _route_after_data(state: QuantAgentState) -> str:
 
 def _trace_id(value: str) -> str:
     return sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _pipeline_source(
+    pipeline_data_source: Mapping[str, Any] | None,
+) -> Literal["fixture", "postgres", "unknown"]:
+    if not isinstance(pipeline_data_source, Mapping):
+        return "unknown"
+    source = pipeline_data_source.get("source")
+    if source in {"fixture", "postgres"}:
+        return source
+    return "unknown"
+
+
+def build_public_backtest_performance(  # noqa: F811
+    backtest: Mapping[str, Any] | None,
+    *,
+    price_rows: Sequence[Mapping[str, Any]] | None = None,
+    pipeline_data_source: Mapping[str, Any] | None = None,
+) -> BacktestPerformance | None:
+    if not backtest:
+        return None
+
+    result = CandidateBacktestResult.model_validate(backtest)
+    if result.selected_candidate.metrics is None:
+        return None
+
+    normalized_rows = _price_rows(price_rows)
+    source = _pipeline_source(pipeline_data_source)
+    reliability = _build_backtest_reliability(result, normalized_rows, source=source)
+    benchmark = _build_public_benchmark(normalized_rows)
+    return BacktestPerformance(
+        selected_candidate_id=result.selected_candidate.candidate_id,
+        metrics=result.selected_candidate.metrics,
+        equity_curve=result.equity_curve,
+        engine_summary=_public_engine_summary(result.engine_summary),
+        reliability=reliability,
+        data_quality=_build_data_quality(reliability),
+        benchmark=benchmark,
+        metric_details=_build_public_metric_details(
+            result,
+            price_rows=normalized_rows,
+            benchmark=benchmark,
+        ),
+    )
+
+
+def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
+    backtest_payload = state.get("backtest")
+    if backtest_payload is None:
+        return None
+    try:
+        backtest = CandidateBacktestResult.model_validate(backtest_payload)
+    except Exception:
+        return RecommendationGate(
+            validated=False,
+            reason="백테스트 결과를 해석할 수 없어 추천 규칙 통과 여부를 판단할 수 없습니다.",
+        )
+
+    selected = backtest.selected_candidate
+    if selected.metrics is None:
+        return RecommendationGate(
+            validated=False,
+            reason="검증 대상 백테스트 지표가 없어 추천 규칙 통과 여부를 판단할 수 없습니다.",
+        )
+
+    reasons = _objective_gate_reasons(
+        selected.metrics,
+        backtest.engine_summary,
+        selection_mode=backtest.strategy_a.selection_mode,
+        benchmark_return=backtest.backtest_payload.get("benchmark_return"),
+    )
+    validated = not reasons
+    reason = (
+        "objective gate를 모두 통과해 오늘의 추천을 유지합니다."
+        if validated
+        else "objective 조건 미충족: " + ", ".join(reasons)
+    )
+    return RecommendationGate(validated=validated, reason=reason)
+
+
+def _objective_gate_reasons(
+    metrics: BacktestMetrics,
+    engine_summary: Mapping[str, Any],
+    *,
+    selection_mode: str = "standard",
+    benchmark_return: Any | None = None,
+) -> list[str]:
+    trade_count = _summary_float_default(engine_summary, "effective_trade_count", 0.0)
+    reasons: list[str] = []
+    if trade_count < MIN_OBJECTIVE_TRADES:
+        reasons.append(
+            f"거래 횟수 {trade_count:.0f}회로 MIN_OBJECTIVE_TRADES={MIN_OBJECTIVE_TRADES} 조건 미달"
+        )
+    if metrics.out_sample_sharpe < MIN_OBJECTIVE_SHARPE:
+        reasons.append(
+            f"보유 구간 외부 샤프비율 {metrics.out_sample_sharpe:.4f} < {MIN_OBJECTIVE_SHARPE:.2f}"
+        )
+    if metrics.max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
+        reasons.append(
+            f"최대 낙폭 {metrics.max_drawdown:.4f} < {MAX_OBJECTIVE_DRAWDOWN:.2f} (리스크 허용치 미달)"
+        )
+    if selection_mode == "automatic":
+        reasons.extend(
+            _benchmark_objective_reasons(
+                metrics,
+                benchmark_return=benchmark_return,
+            )
+        )
+    return reasons
+
+
+def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> None:
+    """Note how this run turned out, for the next analysis of the same strategy."""
+
+    memory = AnalysisMemory.from_env()
+    if not memory.enabled:
+        return
+    strategy = state.get("strategy_spec") or {}
+    strategy_id = str(strategy.get("strategy_id") or "")
+    if not strategy_id:
+        return
+
+    data = state.get("data") or {}
+    pipeline = data.get("pipeline_data_source") or {}
+    relaxation = pipeline.get("screening_relaxation") or {}
+    availability = data.get("data_availability") or {}
+    performance = (
+        build_public_backtest_performance(
+            state.get("backtest"),
+            price_rows=state.get("price_rows"),
+            pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
+        )
+        or {}
+    )
+    payload = (
+        performance.model_dump() if isinstance(performance, BacktestPerformance) else performance
+    )
+    metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
+
+    try:
+        memory.record(
+            strategy_id,
+            query=str(state.get("user_query") or ""),
+            outcome=status.value,
+            candidate_count=len(data.get("screening_candidates") or []),
+            metrics=metrics or {},
+            relaxation_rounds=int(relaxation.get("relaxation_rounds") or 0),
+            unmet_requirements=[
+                str(item.get("label"))
+                for item in availability.get("unsupported_capabilities") or []
+            ],
+            note=(state.get("strategy_revision") or {}).get("rationale"),
+        )
+    except Exception:
+        # Memory is an optimisation; never let it take down a completed analysis.
+        _logger.warning("could not record analysis memory", exc_info=True)
+
+
+def _build_backtest_reliability(
+    result: CandidateBacktestResult,
+    price_rows: Sequence[Mapping[str, Any]],
+    *,
+    source: Literal["fixture", "postgres", "unknown"],
+) -> BacktestReliability:
+    row_count = len(price_rows)
+    dates = sorted({str(row.get("date")) for row in price_rows if row.get("date") is not None})
+    trading_days = len(dates)
+    ticker_count = len(
+        {
+            str(row.get("ticker") or "005930").zfill(6)
+            for row in price_rows
+            if row.get("ticker") is not None
+        }
+    )
+    trade_count = int(_summary_float_default(result.engine_summary, "effective_trade_count", 0.0))
+    reasons: list[str] = []
+    warnings: list[str] = []
+
+    if row_count == 0:
+        reasons.append("가격 행이 없습니다.")
+    if trading_days < _RELIABILITY_WARN_UNTIL_DAYS:
+        reasons.append("거래일 수가 너무 적어 통계 신뢰도가 낮습니다.")
+    elif trading_days < _RELIABILITY_SUFFICIENT_DAYS:
+        warnings.append("거래일 수가 90일 미만으로 품질이 제한적입니다.")
+    if ticker_count < _RELIABILITY_MIN_TICKERS:
+        reasons.append("티커 수가 2개 미만입니다.")
+    if source == "fixture" and row_count <= 4 and ticker_count == 1:
+        reasons.append("기본 fixture 샘플(4개 행/1종목)에서는 안정적 통계 산출이 제한됩니다.")
+    if trade_count < MIN_OBJECTIVE_TRADES:
+        warnings.append(
+            f"실제 거래 횟수 {trade_count}회로 MIN_OBJECTIVE_TRADES={MIN_OBJECTIVE_TRADES} 미만입니다."
+        )
+
+    if reasons:
+        status = "insufficient"
+    elif warnings:
+        status = "limited"
+    else:
+        status = "sufficient"
+
+    return BacktestReliability(
+        source=source,
+        status=status,
+        row_count=row_count,
+        ticker_count=ticker_count,
+        trading_days=trading_days,
+        history_start=dates[0] if dates else None,
+        history_end=dates[-1] if dates else None,
+        trade_count=trade_count,
+        reasons=reasons,
+        warnings=warnings,
+    )
+
+
+def _build_data_quality(reliability: BacktestReliability) -> list[str]:
+    quality = [
+        f"source:{reliability.source}",
+        f"rows:{reliability.row_count}",
+        f"tickers:{reliability.ticker_count}",
+        f"trading_days:{reliability.trading_days}",
+        f"trades:{reliability.trade_count}",
+    ]
+    if reliability.status == "insufficient":
+        quality.append("신뢰도: 불충분")
+    elif reliability.status == "limited":
+        quality.append("신뢰도: 제한적")
+    else:
+        quality.append("신뢰도: 충분")
+    return quality
+
+
+def _build_public_benchmark(price_rows: Sequence[Mapping[str, Any]]) -> BacktestBenchmark:
+    curve, total_return = _equal_weight_benchmark_curve(price_rows)
+    if not curve:
+        return BacktestBenchmark(
+            label=BENCHMARK_LABEL,
+            method=BENCHMARK_METHOD,
+            warning=BENCHMARK_WARNING,
+            total_return=None,
+            cumulative_curve=[],
+            is_available=False,
+            unavailable_reason=_BENCHMARK_UNAVAILABLE_REASON,
+        )
+    return BacktestBenchmark(
+        label=BENCHMARK_LABEL,
+        method=BENCHMARK_METHOD,
+        warning=BENCHMARK_WARNING,
+        total_return=total_return,
+        cumulative_curve=curve,
+        is_available=True,
+        unavailable_reason=None,
+    )
+
+
+def _build_public_metric_details(
+    result: CandidateBacktestResult,
+    *,
+    price_rows: Sequence[Mapping[str, Any]],
+    benchmark: BacktestBenchmark,
+) -> list[PublicMetricDetail]:
+    metrics = result.selected_candidate.metrics
+    if metrics is None:
+        return []
+
+    trading_days = len({str(row.get("date")) for row in price_rows if row.get("date") is not None})
+    equity_returns = _equity_returns(result.equity_curve)
+    benchmark_return = benchmark.total_return if benchmark.is_available else None
+    cagr = _annualized_return(metrics.total_return, trading_days=trading_days)
+    calmar = _calmar_ratio(cagr, metrics.max_drawdown)
+
+    values: dict[str, float | None] = {
+        "total_return": metrics.total_return,
+        "cagr": cagr,
+        "annualized_volatility": _annualized_volatility(equity_returns),
+        "sharpe_ratio": metrics.sharpe_ratio,
+        "sortino_ratio": _sortino_ratio(cagr, equity_returns),
+        "max_drawdown": metrics.max_drawdown,
+        "calmar_ratio": calmar,
+        "win_rate": metrics.win_rate,
+        "profit_factor": _profit_factor(result.engine_summary),
+        "benchmark_return": benchmark_return,
+        "excess_return": (
+            metrics.total_return - benchmark_return
+            if _is_numeric_metric(benchmark_return)
+            else None
+        ),
+        "in_sample_sharpe": metrics.in_sample_sharpe,
+        "out_sample_sharpe": metrics.out_sample_sharpe,
+        "degradation": metrics.degradation,
+    }
+
+    return [_metric_detail(key, values.get(key)) for key in _METRIC_DETAIL_KEYS]
+
+
+def _metric_detail(key: str, value: float | None) -> PublicMetricDetail:
+    explanation = metric_explanation(key)
+    is_available = _is_numeric_metric(value)
+    return PublicMetricDetail(
+        key=key,
+        label=explanation["label"],
+        value=round(float(value), METRIC_ROUND_DIGITS) if is_available else None,
+        unit=explanation["unit"],
+        is_available=is_available,
+        unavailable_reason=None if is_available else _UNAVAILABLE_METRIC_REASON,
+        plain_explanation=explanation["plain_explanation"],
+        why_used=explanation["why_used"],
+        caution=explanation["caution"],
+    )
+
+
+def _equity_returns(equity_curve: Sequence[BacktestEquityPoint]) -> list[float]:
+    if len(equity_curve) < 2:
+        return []
+    returns: list[float] = []
+    for previous, current in zip(equity_curve, equity_curve[1:]):
+        previous_value = previous.cumulative_return + 1.0
+        current_value = current.cumulative_return + 1.0
+        if previous_value == 0.0:
+            return []
+        returns.append(current_value / previous_value - 1.0)
+    return returns
+
+
+def _annualized_volatility(returns: Sequence[float]) -> float | None:
+    if len(returns) < 2:
+        return None
+    mean_return = sum(returns) / len(returns)
+    variance = sum((value - mean_return) ** 2 for value in returns) / (len(returns) - 1)
+    if variance <= 0.0:
+        return 0.0
+    return math.sqrt(variance) * math.sqrt(252.0)
+
+
+def _sortino_ratio(total_return: float, returns: Sequence[float]) -> float | None:
+    if len(returns) < 2:
+        return None
+    downside = [value for value in returns if value < 0.0]
+    if not downside:
+        return None
+    downside_mean = sum(downside) / len(downside)
+    downside_variance = sum((value - downside_mean) ** 2 for value in downside) / len(downside)
+    if downside_variance <= 0.0:
+        return None
+    downside_std = math.sqrt(downside_variance) * math.sqrt(252.0)
+    if downside_std == 0.0:
+        return None
+    return total_return / downside_std
+
+
+# Public performance helpers are sourced from quant_performance for a stable behavior contract.
+from ai_graph.quant_performance import build_public_backtest_performance  # noqa: E402, F811
