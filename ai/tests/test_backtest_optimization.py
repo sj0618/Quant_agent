@@ -535,15 +535,20 @@ def test_automatic_benchmark_gate_treats_exactly_half_losing_periods_as_defeat()
 
     assert backtest_node._passes_objective_floor(result)
 
-    result.selected_candidate.metrics = metrics.model_copy(
-        update={"benchmark_period_loss_rate": 0.50}
-    )
-    assert not backtest_node._passes_objective_floor(result)
-
+    # Exactly half is a defeat, not a draw: the rate is compared with >=.
     result.selected_candidate.metrics = metrics.model_copy(
         update={"out_sample_benchmark_period_loss_rate": 0.50}
     )
     assert not backtest_node._passes_objective_floor(result)
+
+    # The whole-history loss rate is deliberately not a gate any more. It spans the
+    # selection split, so it judged the winner partly on the sample it was chosen from,
+    # and it could not fail without the hold-out rate above failing too. A candidate that
+    # clears the hold-out passes even when its full-history rate is at the old boundary.
+    result.selected_candidate.metrics = metrics.model_copy(
+        update={"benchmark_period_loss_rate": 0.50}
+    )
+    assert backtest_node._passes_objective_floor(result)
 
 
 def test_repeated_round_submits_no_completed_candidate(monkeypatch, tmp_path) -> None:

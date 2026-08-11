@@ -81,6 +81,7 @@ from ai_graph.schemas import (
     SourceUsage,
     RecommendationGate,
     StrategyCandidateCard,
+    TickerAction,
     StrategySpec,
 )
 from ai_graph.state import QuantAgentState
@@ -814,6 +815,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
                 pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
             ),
             "recommendation_gate": gate,
+            "ticker_actions": _ticker_actions(state, cards),
         }
     elif state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
         clarification = _clarification_from_ambiguity(state["ambiguity"])
@@ -3036,6 +3038,43 @@ def build_public_backtest_performance(  # noqa: F811
     )
 
 
+def _ticker_actions(
+    state: QuantAgentState, cards: list[StrategyCandidateCard]
+) -> list[TickerAction]:
+    """Per-stock BUY/SELL/HOLD, plus WATCH for screened names the rule is not acting on.
+
+    The backtest reports only the names it acts on, because "no signal, no position" is
+    not a recommendation it can make about a stock it never looked at. The screen, on the
+    other hand, hands the user a specific list and that list needs a verdict for every
+    row - otherwise a name silently disappearing reads as "sell". So screened names with
+    no action from the backtest come back as WATCH, explicitly.
+    """
+
+    backtest = state.get("backtest") or {}
+    actions = [
+        TickerAction.model_validate(item) for item in backtest.get("ticker_actions") or []
+    ]
+    decided = {action.ticker for action in actions}
+    as_of = actions[0].as_of_date if actions else None
+    for card in cards:
+        for match in card.matches:
+            if match.ticker in decided:
+                continue
+            decided.add(match.ticker)
+            actions.append(
+                TickerAction(
+                    ticker=match.ticker,
+                    name=match.name or match.ticker,
+                    action="WATCH",
+                    reason="스크리닝에는 걸렸으나 전략의 진입 조건은 아직 충족하지 않았습니다.",
+                    as_of_date=as_of or match.as_of_date,
+                    close=match.close,
+                )
+            )
+    order = {"SELL": 0, "BUY": 1, "HOLD": 2, "WATCH": 3}
+    return sorted(actions, key=lambda a: (order[a.action], a.ticker))
+
+
 def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
     """Gate today's picks on the backtest of the strategy that produced them.
 
@@ -3197,12 +3236,7 @@ def _objective_gate_reasons(
             f"최대 낙폭 {metrics.max_drawdown:.4f} < {MAX_OBJECTIVE_DRAWDOWN:.2f} (리스크 허용치 미달)"
         )
     if selection_mode == "automatic":
-        reasons.extend(
-            _benchmark_objective_reasons(
-                metrics,
-                benchmark_return=benchmark_return,
-            )
-        )
+        reasons.extend(_benchmark_objective_reasons(metrics))
     return reasons
 
 

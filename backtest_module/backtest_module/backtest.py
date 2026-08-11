@@ -1464,6 +1464,11 @@ class BacktestEngine:
             "cash": round(cash, 6),
             "final_cash": round(cash, 6),
             "open_positions": len(positions),
+            # Which names are still held, not just how many. A per-ticker BUY/SELL/HOLD
+            # verdict cannot be derived from the signal stream alone: the engine skips
+            # buys it has no cash or slot for, so "the rule said buy" and "the book is
+            # long" are different facts, and only this one says what is actually held.
+            "open_position_tickers": sorted(positions),
             "metrics": metrics,
             "period_return": metrics.get("total_return"),
             "total_return": metrics.get("total_return"),

@@ -528,6 +528,31 @@ class CodeCandidate(BaseModel):
         return self
 
 
+TickerActionType = Literal["BUY", "SELL", "HOLD", "WATCH"]
+
+
+class TickerAction(BaseModel):
+    """What to do with one stock today, according to the strategy that was validated.
+
+    The backtest ends on the most recent bar, so it already knows both halves of this:
+    what the rule signals now, and what the book is holding now. Emitting the verdict
+    from that same run is the only way the recommendation and the performance figure can
+    be guaranteed to describe the same strategy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    action: TickerActionType
+    reason: str = Field(min_length=1)
+    as_of_date: str = Field(min_length=1)
+    close: float | None = None
+    # Which candidate produced it, so a recommendation can be traced to the run that
+    # was measured rather than to "the strategy" in general.
+    source_candidate_id: str | None = None
+
+
 class CandidateBacktestResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -535,6 +560,8 @@ class CandidateBacktestResult(BaseModel):
     candidates: list[CodeCandidate] = Field(min_length=1)
     selected_candidate: CodeCandidate
     equity_curve: list[BacktestEquityPoint]
+    # Per-stock BUY/SELL/HOLD for the final bar of the selected candidate's run.
+    ticker_actions: list[TickerAction] = Field(default_factory=list)
     engine_summary: dict[str, Any] = Field(default_factory=dict)
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = Field(default_factory=dict)
     objective_scores_by_candidate: dict[str, float] = Field(default_factory=dict)
@@ -688,6 +715,7 @@ class UserPayload(BaseModel):
     report: ReportBundle | None = None
     performance: BacktestPerformance | None = None
     recommendation_gate: RecommendationGate | None = None
+    ticker_actions: list[TickerAction] = Field(default_factory=list)
     question: str | None = None
     options: list[ClarificationOption] = Field(default_factory=list, max_length=3)
     recommended: int | None = Field(default=None, ge=0, le=2)

@@ -451,3 +451,55 @@ def test_candidate_backtest_session_only_evaluates_new_candidates(monkeypatch, t
     assert rounds[0]["new_candidates"] == 1
     assert rounds[1]["new_candidates"] == 0
     assert rounds[1]["cached_candidates"] == 3
+
+
+def test_ticker_actions_agree_with_the_position_book_of_the_same_run() -> None:
+    """The per-stock verdict has to come from the run that produced the numbers.
+
+    Anything derived in a second code path can disagree with the backtest it is presented
+    beside, so this checks the two against each other: the names the engine still holds
+    are exactly the names told to HOLD or SELL, and a held name is never a BUY.
+    """
+
+    strategy = make_strategy("ticker-actions", "Ticker Actions")
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="trace-ticker-actions")
+    ).candidates
+
+    price_rows = []
+    start = date(2026, 1, 1)
+    for day_index in range(120):
+        row_date = (start + timedelta(days=day_index)).isoformat()
+        for ticker_index, ticker in enumerate(("000001", "000002", "000003", "000004")):
+            close = 100 + day_index * (ticker_index + 1) * 0.05
+            price_rows.append(
+                {
+                    "date": row_date,
+                    "ticker": ticker,
+                    "name": f"NAME{ticker}",
+                    "open": close * 0.995,
+                    "high": close * 1.002,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": 1_000_000 * (4 if day_index % 10 == 0 else 1),
+                    "rsi": 25 + ticker_index if day_index % 7 == 0 else 55 + ticker_index,
+                }
+            )
+
+    result = run_candidate_backtest(strategy, candidates, price_rows=price_rows)
+    actions = result.ticker_actions
+    last_date = max(row["date"] for row in price_rows)
+    held = set(result.engine_summary.get("open_position_tickers") or [])
+
+    assert {action.as_of_date for action in actions} <= {last_date}
+    assert {action.ticker for action in actions} <= {
+        "000001",
+        "000002",
+        "000003",
+        "000004",
+    }
+    assert {a.ticker for a in actions if a.action in {"HOLD", "SELL"}} == held
+    assert not [a for a in actions if a.action == "BUY" and a.ticker in held]
+    assert {a.source_candidate_id for a in actions} <= {
+        result.selected_candidate.candidate_id
+    }

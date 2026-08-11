@@ -6,7 +6,7 @@ import numpy as np
 
 from ai_graph import run_analysis
 from ai_graph.graph import build_strategy_spec
-from ai_graph.nodes.backtest import backtest_node, rule_provenance
+from ai_graph.nodes.backtest import BACKTEST_SPLIT_FRACTION, backtest_node, rule_provenance
 from ai_graph.nodes.backtest_code import (
     Loop3Request,
     _candidate_profiles,
@@ -405,6 +405,19 @@ def test_automatic_profile_waits_for_history_and_monthly_rebalance() -> None:
 
 
 def test_automatic_tournament_does_not_tune_after_seeing_returns() -> None:
+    """Changing only the hold-out must not change which candidate is selected.
+
+    This used to be enforced by giving automatic mode zero self-improvement rounds, on
+    the grounds that refining after an objective miss fits the training history. The
+    search never needed that restriction - candidates are accepted on the selection-split
+    objective score - and the restriction cost automatic mode every attempt at a gate it
+    also had to clear on benchmark-relative terms, which is why it never passed one.
+
+    So the property is asserted where it actually lives: run the same selection split
+    against two different futures and require the same winner. A search that peeked at
+    the hold-out would pick differently when the hold-out flips from a rally to a crash.
+    """
+
     strategy = build_strategy_spec(
         "뭐 좀 괜찮은 거 없냐",
         variant="A",
@@ -414,18 +427,43 @@ def test_automatic_tournament_does_not_tune_after_seeing_returns() -> None:
         Loop3Request(strategy=strategy, variant="A", trace_id="fixed-auto-tournament")
     )
 
-    output = backtest_node(
-        {
-            "strategy_spec": strategy.model_dump(),
-            "backtest_code": generated.model_dump(),
-            "price_rows": _trend_rows(),
-        }
+    def run(rows: list[dict[str, object]]) -> dict:
+        return backtest_node(
+            {
+                "strategy_spec": strategy.model_dump(),
+                "backtest_code": generated.model_dump(),
+                "price_rows": rows,
+            }
+        )["backtest"]
+
+    rising = _trend_rows()
+    # BACKTEST_SPLIT_FRACTION is 0.7, so the first 210 of 300 days are the selection
+    # split. Leave those byte-identical and invert only what comes after.
+    split_index = int(len(rising) * BACKTEST_SPLIT_FRACTION)
+    crashing = [dict(row) for row in rising]
+    for offset, row in enumerate(crashing[split_index:]):
+        row["close"] = float(crashing[split_index - 1]["close"]) * (0.98 ** (offset + 1))
+
+    rally, crash = run(rising), run(crashing)
+
+    assert [r["close"] for r in rising[:split_index]] == [
+        r["close"] for r in crashing[:split_index]
+    ], "the selection split must be identical for this test to mean anything"
+    assert rally["selected_candidate"]["candidate_id"] == (
+        crash["selected_candidate"]["candidate_id"]
     )
 
-    stats = output["backtest"]["execution_stats"]
+    stats = rally["execution_stats"]
     assert stats["selection_policy"] == "performance_momentum_train_select_holdout_validate"
-    assert stats["self_improvement_rounds_limit"] == 0
-    assert len(output["backtest"]["candidates"]) == 3
+    # The search may now widen past the three pre-registered families. What must hold is
+    # that the winner is discounted for however many were tried - see
+    # _apply_selection_correction - not that the search was never allowed to run.
+    # `candidates` lists the winning round's candidates; `candidates_evaluated` counts
+    # every one the search touched, and that is the N the Sharpe discount uses.
+    assert len(rally["candidates"]) >= 3
+    assert rally["selected_candidate"]["metrics"]["candidates_evaluated"] > 3, (
+        "automatic mode should now search past the three pre-registered families"
+    )
 
 
 def test_relative_momentum_rotation_selects_and_keeps_the_strongest_winner() -> None:
