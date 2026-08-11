@@ -43,17 +43,9 @@ const MAX_POLL_FAILURES = 3;
 // recorded) returns clean 200s with result:null and would otherwise spin the progress bar
 // indefinitely. Past this age we surface a timeout instead of leaving the user watching
 // forever. Generous on purpose - a 200-name universe backtest legitimately takes minutes.
-// How long the server may go without advancing a job before the client calls it stuck.
-// Deliberately a stall budget rather than a total-runtime budget: real analyses run 479s,
-// 482s, 498s, so the old ten-minute cap on total elapsed time was about to fail every run
-// outright while the backend was working normally and going on to store a good report.
-//
-// Sized from what silence actually looks like on a healthy run. `updated_at` moves on
-// public stage transitions, not on every graph node, and `interpreting` alone covers
-// Supervisor -> Ambiguity Classifier -> Data -> Research: measured at 295s end to end,
-// with the Data node contributing 254s of it by itself. Eight minutes leaves that room
-// and still catches a genuinely frozen run.
-const MAX_ANALYSIS_STALL_MS = 8 * 60_000;
+// There is deliberately no client-side deadline for a running analysis. See the polling
+// effect for why: neither total runtime nor time-since-progress is evidence the client
+// can convict on, and a wrong verdict discards a finished analysis.
 const PROGRESS_TICK_INTERVAL_MS = 250;
 const CLIENT_PROGRESS_DURATION_MS = 90_000;
 const CLIENT_PROGRESS_START_PERCENT = 6;
@@ -403,47 +395,40 @@ export function AppPage() {
             debugRef: job.result?.debug_ref ?? undefined,
           };
         }
-        // A job that finished clears whatever the client concluded about it earlier.
-        // Without this a single premature give-up was permanent: the job leaves
-        // `pollingJobs` the moment it has an error, so the result that arrived a minute
-        // later was never fetched, and a completed run with a stored report kept showing
-        // "분석을 이어갈 수 없습니다".
+        // A finished job is the server's verdict, and it voids whatever the client
+        // concluded while waiting. The failure_cause recorded just above survives - the
+        // deletions this drives are applied before this round's findings, not after.
         if (job.result) {
           recovered.add(job.job_id);
-          delete failures[job.job_id];
-          continue;
         }
-        // Stuck means the server stopped making progress, not that the analysis is
-        // taking long. This used to be a fixed ten-minute cap on total elapsed time,
-        // which the analysis itself has grown into - the last three real runs took 479s,
-        // 482s and 498s, so the cap was roughly a minute and a half away from failing
-        // every run outright while the backend was still working normally and went on to
-        // store a perfectly good report. `updated_at` moves on every stage transition, so
-        // a run that is still advancing is given as long as it needs.
-        if (!failures[job.job_id]) {
-          const lastProgressAt = Date.parse(job.updated_at || job.created_at);
-          if (
-            Number.isFinite(lastProgressAt) &&
-            Date.now() - lastProgressAt > MAX_ANALYSIS_STALL_MS
-          ) {
-            failures[job.job_id] = {
-              message: "분석이 더 이상 진행되지 않아 중단했습니다. 잠시 후 다시 시도해 주세요.",
-              category: "client_timeout",
-              // polling_stage is excluded from the public job model, so name the stage
-              // from the progress the client can actually see.
-              stage: job.stages.find((step) => step.status === "running")?.stage,
-              retryable: true,
-            };
-          }
-        }
+        // Nothing else is decided here. The client used to convict a running job on its
+        // own clock, first at ten minutes of total runtime and then at eight minutes
+        // without a progress update, and both were wrong for the same reason: neither is
+        // evidence about the server.
+        //
+        // Runtime is not, because a healthy analysis takes 457-498s and is getting
+        // slower. Silence is not either, because progress reporting is explicitly
+        // best-effort - report_node_stage logs and swallows a failed status write, so the
+        // analysis carries on while `updated_at` stops moving, which is indistinguishable
+        // from a hang no matter how the budget is tuned.
+        //
+        // What the client can actually observe is whether the server answers. A poll that
+        // succeeds and says "running" is proof of life; polls that keep failing are
+        // already handled above as `fe_polling`. Between those two there is nothing left
+        // for a timer to add, and getting it wrong throws away a completed analysis and
+        // the report the backend has already stored. The user has a stop button for the
+        // case where they simply do not want to wait any longer.
       }
       if (Object.keys(failures).length || recovered.size) {
         setJobErrors((current) => {
-          const next = { ...current, ...failures };
+          const next = { ...current };
+          // Clear first, then apply: a job that finished drops the guess the client was
+          // holding, but a failure_cause the server returned in this same round has to
+          // land on top of that and stay.
           for (const jobId of recovered) {
             delete next[jobId];
           }
-          return next;
+          return { ...next, ...failures };
         });
       }
 
