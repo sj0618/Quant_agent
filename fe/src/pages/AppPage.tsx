@@ -43,7 +43,17 @@ const MAX_POLL_FAILURES = 3;
 // recorded) returns clean 200s with result:null and would otherwise spin the progress bar
 // indefinitely. Past this age we surface a timeout instead of leaving the user watching
 // forever. Generous on purpose - a 200-name universe backtest legitimately takes minutes.
-const MAX_ANALYSIS_DURATION_MS = 10 * 60_000;
+// How long the server may go without advancing a job before the client calls it stuck.
+// Deliberately a stall budget rather than a total-runtime budget: real analyses run 479s,
+// 482s, 498s, so the old ten-minute cap on total elapsed time was about to fail every run
+// outright while the backend was working normally and going on to store a good report.
+//
+// Sized from what silence actually looks like on a healthy run. `updated_at` moves on
+// public stage transitions, not on every graph node, and `interpreting` alone covers
+// Supervisor -> Ambiguity Classifier -> Data -> Research: measured at 295s end to end,
+// with the Data node contributing 254s of it by itself. Eight minutes leaves that room
+// and still catches a genuinely frozen run.
+const MAX_ANALYSIS_STALL_MS = 8 * 60_000;
 const PROGRESS_TICK_INTERVAL_MS = 250;
 const CLIENT_PROGRESS_DURATION_MS = 90_000;
 const CLIENT_PROGRESS_START_PERCENT = 6;
@@ -93,6 +103,14 @@ interface JobFailure {
   owner?: string;
   retryable?: boolean;
   debugRef?: string;
+}
+
+// Categories the client assigns to itself when it cannot see the server, as opposed to a
+// failure_cause the server actually returned. Only the latter ends a job.
+const CLIENT_SIDE_FAILURE_CATEGORIES = new Set(["client_timeout", "fe_polling"]);
+
+function isServerReportedFailure(failure: JobFailure | undefined): boolean {
+  return failure !== undefined && !CLIENT_SIDE_FAILURE_CATEGORIES.has(failure.category ?? "");
 }
 
 function getInitialTab(): WorkspaceTab {
@@ -310,8 +328,15 @@ export function AppPage() {
   }, [analysisJobs, inertJobIds, pendingAnalysis]);
 
   useEffect(() => {
+    // A client-side conclusion is a guess about the server, so it must not be the thing
+    // that stops us asking the server. Give-ups from `fe_polling` and `client_timeout`
+    // keep polling and clear themselves the moment a result appears; only a verdict the
+    // server actually reported is terminal.
     const pollingJobs = analysisJobs.filter(
-      (job) => !job.result && !jobErrors[job.job_id] && !inertJobIds.includes(job.job_id),
+      (job) =>
+        !job.result &&
+        !inertJobIds.includes(job.job_id) &&
+        !isServerReportedFailure(jobErrors[job.job_id]),
     );
     if (!pollingJobs.length) {
       return undefined;
@@ -320,6 +345,7 @@ export function AppPage() {
     let cancelled = false;
     const timeoutId = window.setTimeout(async () => {
       const failures: Record<string, JobFailure> = {};
+      const recovered = new Set<string>();
       const missingJobIds = new Set<string>();
       const refreshedJobs = await Promise.all(
         pollingJobs.map(async (job) => {
@@ -377,13 +403,31 @@ export function AppPage() {
             debugRef: job.result?.debug_ref ?? undefined,
           };
         }
-        // A job the server keeps reporting as still-running past the wall-clock cap is
-        // treated as stuck: successful polls alone would never end the loading state.
-        if (!job.result && !failures[job.job_id]) {
-          const startedAt = Date.parse(job.created_at);
-          if (Number.isFinite(startedAt) && Date.now() - startedAt > MAX_ANALYSIS_DURATION_MS) {
+        // A job that finished clears whatever the client concluded about it earlier.
+        // Without this a single premature give-up was permanent: the job leaves
+        // `pollingJobs` the moment it has an error, so the result that arrived a minute
+        // later was never fetched, and a completed run with a stored report kept showing
+        // "분석을 이어갈 수 없습니다".
+        if (job.result) {
+          recovered.add(job.job_id);
+          delete failures[job.job_id];
+          continue;
+        }
+        // Stuck means the server stopped making progress, not that the analysis is
+        // taking long. This used to be a fixed ten-minute cap on total elapsed time,
+        // which the analysis itself has grown into - the last three real runs took 479s,
+        // 482s and 498s, so the cap was roughly a minute and a half away from failing
+        // every run outright while the backend was still working normally and went on to
+        // store a perfectly good report. `updated_at` moves on every stage transition, so
+        // a run that is still advancing is given as long as it needs.
+        if (!failures[job.job_id]) {
+          const lastProgressAt = Date.parse(job.updated_at || job.created_at);
+          if (
+            Number.isFinite(lastProgressAt) &&
+            Date.now() - lastProgressAt > MAX_ANALYSIS_STALL_MS
+          ) {
             failures[job.job_id] = {
-              message: "분석이 시간 내에 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.",
+              message: "분석이 더 이상 진행되지 않아 중단했습니다. 잠시 후 다시 시도해 주세요.",
               category: "client_timeout",
               // polling_stage is excluded from the public job model, so name the stage
               // from the progress the client can actually see.
@@ -393,8 +437,14 @@ export function AppPage() {
           }
         }
       }
-      if (Object.keys(failures).length) {
-        setJobErrors((current) => ({ ...current, ...failures }));
+      if (Object.keys(failures).length || recovered.size) {
+        setJobErrors((current) => {
+          const next = { ...current, ...failures };
+          for (const jobId of recovered) {
+            delete next[jobId];
+          }
+          return next;
+        });
       }
 
       setAnalysisJobs((jobs) =>
