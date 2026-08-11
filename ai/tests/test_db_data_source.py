@@ -23,6 +23,7 @@ from ai_graph.data_sources.db import (
     _screening_matcher,
     load_pipeline_data_from_env,
     resolve_database_dsn_from_env,
+    screening_profile,
 )
 from ai_graph.data_sources.sectors import clear_sector_cache
 
@@ -780,6 +781,21 @@ def test_all_null_rsi_cannot_be_rescued_by_relaxation() -> None:
 
     # rsi_max really was being widened; the rows just cannot match.
     assert thresholds.rsi_max > ScreeningThresholds().rsi_max
+
+
+def test_inverse_rsi_screen_matches_overbought_entry_and_relaxes_downward() -> None:
+    query = "RSI가 30미만일때 매도 70이상일때 매수하는 전략"
+
+    assert screening_profile(query) == "rsi_overbought"
+    thresholds = ScreeningThresholds()
+    matcher = _screening_matcher("rsi_overbought", thresholds)
+    assert matcher({"rsi": 69}) is False
+    assert matcher({"rsi": 70}) is True
+    assert matcher({"rsi": 30}) is False
+
+    relaxed = _relaxed_thresholds(thresholds, 0, profile="rsi_overbought")
+    assert relaxed.rsi_min == 65
+    assert relaxed.rsi_max == thresholds.rsi_max
 
 
 def test_missing_capability_stops_before_the_screen_spends_relaxation_rounds() -> None:

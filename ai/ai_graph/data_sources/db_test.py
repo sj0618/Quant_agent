@@ -45,6 +45,7 @@ from .db import (
 _FAST_SCREENING_PROFILES = {
     # Pure TA screens that can be ranked without the market-relative path scan.
     "rsi_rebound",
+    "rsi_overbought",
     "pullback_trend",
     "bollinger_squeeze",
     # Fundamental profiles can reuse the frame + DART snapshot and a cheap proxy.
@@ -61,6 +62,7 @@ _FAST_PROFILE_REQUIRES_DART = {
 
 _FAST_PROFILE_INDICATOR_FIELDS: dict[str, tuple[str, ...]] = {
     "rsi_rebound": ("rsi",),
+    "rsi_overbought": ("rsi",),
     "pullback_trend": ("sma20", "sma200"),
     "bollinger_squeeze": ("bb_upper", "bb_width"),
     "value_quality": (),
@@ -70,6 +72,7 @@ _FAST_PROFILE_INDICATOR_FIELDS: dict[str, tuple[str, ...]] = {
 
 _FAST_PROFILE_JOIN_SPECS: dict[str, tuple[str, ...]] = {
     "rsi_rebound": ("momentum",),
+    "rsi_overbought": ("momentum",),
     "pullback_trend": ("trend",),
     "bollinger_squeeze": ("volatility",),
     "value_quality": (),
@@ -119,7 +122,7 @@ def _fast_screening_frame_sql(*, sector: bool, profile: str) -> str:
     ]
     sector_predicate = "\n          AND sm.sector = %(sector)s" if sector else ""
 
-    if profile == "rsi_rebound":
+    if profile in {"rsi_rebound", "rsi_overbought"}:
         joins.append(
             f"LEFT JOIN {TA_MOMENTUM_TICKER_TABLE} tm "
             "ON tm.ticker = a.ticker AND tm.\"time\" = a.\"time\""
@@ -200,6 +203,12 @@ def _proxy_ranking_score(profile: str, row: Mapping[str, Any]) -> tuple[float | 
         if rsi is None:
             return None, "rsi"
         return 100.0 - rsi, "100 - rsi"
+
+    if profile == "rsi_overbought":
+        rsi = _optional_float_value(row.get("rsi"))
+        if rsi is None:
+            return None, "rsi"
+        return rsi, "rsi"
 
     if profile == "pullback_trend":
         close = _optional_float_value(row.get("close"))
