@@ -64,7 +64,7 @@ export function OverviewTab({ overview }: OverviewTabProps) {
             caption: totalReturnMetric?.caption ?? `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`,
           },
           {
-            label: "Sharpe (Walk-forward)",
+            label: "Sharpe (홀드아웃)",
             value: sharpeMetric?.value ?? "-",
             delta: sharpeMetric?.delta,
             caption: sharpeMetric?.caption ?? "AI 전략 검증 결과",

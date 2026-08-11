@@ -66,7 +66,7 @@ export const landingSample: LandingSample = {
     {
       label: "TRANSPARENCY",
       title: "투명한 거래비용 모델",
-      description: "수수료 0.015% · 거래세 0.23% · 슬리피지 0.1%를 백테스트에 반영. walk-forward로 과적합도 방지합니다.",
+      description: "수수료 0.015% · 거래세 0.23% · 슬리피지 0.1%를 백테스트에 반영. 마지막 30%는 전략 선택에 쓰지 않는 홀드아웃으로 남겨 과적합을 점검합니다.",
     },
     {
       label: "COMPLIANCE",

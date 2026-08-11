@@ -589,3 +589,210 @@ def test_python_fallback_timeout_terminates_worker(monkeypatch, tmp_path) -> Non
         assert not evaluation.candidate.validation_ok
         assert any("timeout" in item for item in evaluation.candidate.violations)
         assert session._executor is None
+
+
+def test_expected_max_sharpe_grows_with_the_number_of_candidates():
+    """Picking the best of N noisy estimates is biased upward by construction.
+
+    Measured with candidates whose trades were random on real prices: the average
+    candidate returned -3.7% and the best-of-six returned +16.2%, with nine of twelve
+    trials producing a "profitable" winner out of pure noise. A headline that does not
+    subtract this reports the width of the search as if it were skill.
+    """
+
+    observations = 1764  # ~7y of daily bars, the in-sample side of a 10y run
+
+    one = backtest_node._expected_max_sharpe(1, observations)
+    six = backtest_node._expected_max_sharpe(6, observations)
+    fifteen = backtest_node._expected_max_sharpe(15, observations)
+
+    assert one == 0.0
+    assert 0.0 < six < fifteen
+    # A shorter sample makes the same search more dangerous, not less.
+    assert backtest_node._expected_max_sharpe(6, 252) > six
+
+
+def test_selection_correction_records_the_search_width_without_changing_the_winner():
+    metrics = BacktestMetrics(
+        sharpe_ratio=0.9,
+        max_drawdown=-0.2,
+        win_rate=0.5,
+        total_return=0.4,
+        in_sample_sharpe=0.9,
+        out_sample_sharpe=0.1,
+        degradation=0.9,
+        in_sample_observations=1764,
+    )
+    candidate = CodeCandidate(
+        candidate_id="A1", variant="A", code="def build_signals(p):\n    return []\n",
+        validation_ok=True, metrics=metrics,
+    )
+    result = SimpleNamespace(
+        selected_candidate=candidate,
+        model_copy=lambda update: SimpleNamespace(**{**result.__dict__, **update}),
+    )
+
+    corrected = backtest_node._apply_selection_correction(result, 15)
+
+    assert corrected.selected_candidate.candidate_id == "A1"
+    assert corrected.selected_candidate.metrics.candidates_evaluated == 15
+    assert corrected.selected_candidate.metrics.selection_adjusted_sharpe < 0.9
+    # The uncorrected figures are untouched - the correction adds context, it does not
+    # rewrite what the run measured.
+    assert corrected.selected_candidate.metrics.in_sample_sharpe == 0.9
+
+
+def test_headline_reports_the_hold_out_not_the_period_selection_optimised_against():
+    headline = backtest_node._headline_metrics(
+        {
+            "total_return": 0.42,
+            "sharpe_ratio": 0.9,
+            "max_drawdown": -0.2,
+            "in_sample_return": 0.60,
+            "in_sample_sharpe": 1.3,
+            "in_sample_max_drawdown": -0.15,
+            "out_sample_return": -0.08,
+            "out_sample_sharpe": -0.25,
+            "out_sample_max_drawdown": -0.3,
+            "candidates_evaluated": 15,
+            "selection_adjusted_sharpe": -0.1,
+        }
+    )
+
+    assert headline["basis"] == "hold_out"
+    assert headline["total_return"] == -0.08
+    assert headline["sharpe_ratio"] == -0.25
+    assert headline["candidates_evaluated"] == 15
+    # Both other bases stay reachable, explicitly labelled.
+    assert headline["in_sample"]["sharpe_ratio"] == 1.3
+    assert headline["full_period"]["sharpe_ratio"] == 0.9
+
+
+def _warmup_store(bars=400, tickers=("000001", "000002")):
+    rows = []
+    for ticker in tickers:
+        price = 10_000.0
+        for index in range(bars):
+            price *= 1.004 if index % 3 else 0.997
+            rows.append(
+                {
+                    "date": (date(2016, 1, 1) + timedelta(days=index)).isoformat(),
+                    "ticker": ticker,
+                    "open": price,
+                    "high": price * 1.01,
+                    "low": price * 0.99,
+                    "close": price,
+                    "volume": 1_000_000.0,
+                    "rsi": 40.0,
+                }
+            )
+    return PreparedFeatureStore(rows), len(tickers)
+
+
+def test_indicator_windows_wait_for_a_full_lookback():
+    """A 20-day average must not be the previous close on the second bar.
+
+    features() computed every window as min(lookback, index), so each indicator reported
+    a shorter one under its own name and `high` could be a single prior close - letting a
+    breakout fire on bar two. The rows inside the warm-up now stay unready.
+    """
+
+    store, ticker_count = _warmup_store()
+    lookback = 60
+
+    matrix = store.features(lookback)
+    not_ready = int((matrix[:, 0] == 0).sum())
+
+    # Exactly the warm-up rows of each ticker, not just each ticker's first bar.
+    assert not_ready == lookback * ticker_count
+
+    closes = store.close[store.indices_by_ticker["000001"]]
+    first_ready = store.indices_by_ticker["000001"][lookback]
+    # The reported average is the real lookback-bar mean, not a truncated one.
+    assert matrix[first_ready][1] == pytest.approx(closes[0:lookback].mean())
+
+
+def test_no_action_fires_before_its_lookback_has_elapsed():
+    store, _ = _warmup_store()
+    parameters = CandidateParameters(
+        profile="long_regime_momentum",
+        lookback=60,
+        threshold=0.05,
+        stop_loss_pct=0.08,
+        take_profit_pct=0.25,
+        max_positions=5,
+    )
+    ir = StrategyIR(
+        strategy_id="warmup",
+        entry_feature="close",
+        exit_feature="close",
+        proxy_feature="close",
+    )
+
+    actions = list(store.build_actions(ir, parameters))
+
+    ordinal = {}
+    for indices in store.indices_by_ticker.values():
+        for position, index in enumerate(indices):
+            ordinal[index] = position
+    fired = [ordinal[i] for i, a in enumerate(actions) if a != 0]
+    assert fired, "the fixture should still produce signals after the warm-up"
+    assert min(fired) >= parameters.lookback
+
+
+def test_candidate_stop_and_target_reach_the_engine():
+    """The engine is the only place a stop is applied, so the search values must get there.
+
+    Stop-loss used to be evaluated twice: once by the action generator against the
+    signal-day close, once by the engine against the price actually paid at the next
+    open. Removing the first copy is only correct if the candidate's own stop/target
+    still reach the second - otherwise the search over them quietly stops mattering.
+    """
+
+    strategy = StrategySpec(
+        strategy_id="stops",
+        name="Stops",
+        market="KOSPI",
+        timeframe="1d",
+        entry_conditions=[Condition(left="rsi", operator=ConditionOperator.LT, right=30.0)],
+        risk_constraints={"stop_loss_pct": 0.08, "take_profit_pct": 0.2},
+        confidence=0.5,
+    )
+    parameters = CandidateParameters(
+        profile="long_regime_momentum",
+        lookback=60,
+        threshold=0.05,
+        stop_loss_pct=0.03,
+        take_profit_pct=0.45,
+        max_positions=5,
+    )
+    ir = StrategyIR(
+        strategy_id="stops", entry_feature="close", exit_feature="close", proxy_feature="close"
+    )
+    candidate = CodeCandidate(
+        candidate_id="A1", variant="A", code="def build_signals(p):\n    return []\n",
+        validation_ok=True, representation="structured", strategy_ir=ir, parameters=parameters,
+    )
+
+    controls = backtest_node._engine_risk_controls(strategy, candidate=candidate)
+
+    assert controls.stop_loss_pct == 0.03
+    assert controls.take_profit_pct == 0.45
+    # With no candidate the strategy's own constraints still apply.
+    plain = backtest_node._engine_risk_controls(strategy)
+    assert plain.stop_loss_pct == 0.08
+    assert plain.take_profit_pct == 0.2
+
+
+def test_action_generator_no_longer_emits_its_own_stop_loss_exits():
+    """Only rule exits and the profile's trailing stop come from the generator."""
+
+    import inspect
+
+    from ai_graph.nodes import backtest_features
+
+    source = inspect.getsource(backtest_features.PreparedFeatureStore)
+    assert "parameters.stop_loss_pct" not in source
+    assert "parameters.take_profit_pct" not in source
+    # The trailing stop is the profile's own rule and the engine does not model it.
+    assert "trailing_stop" in source

@@ -74,6 +74,10 @@ MIN_RELIABLE_TICKERS = 5
 # 잡았다. 테스트가 끝나면 운영 기준을 다시 정하고 이 두 값을 함께 교체할 것.
 MIN_OBJECTIVE_SHARPE = 0.0
 MAX_OBJECTIVE_DRAWDOWN = -0.50
+# The winner's in-sample Sharpe, less what an argmax over the same number of skill-free
+# candidates would be expected to reach. Zero is the honest floor: below it the result is
+# not distinguishable from having tried N things and kept the luckiest one.
+MIN_SELECTION_ADJUSTED_SHARPE = 0.0
 GENERATED_SIGNAL_METRIC = "generated_signal"
 BUY_SIGNAL_VALUE = 1.0
 SELL_SIGNAL_VALUE = -1.0
@@ -294,6 +298,42 @@ def summarize_backtest(backtest: Mapping[str, Any]) -> dict[str, Any]:
         # sufficient for interpretation; detailed arrays remain in debug artifacts.
         "engine_summary": _public_engine_summary(engine_summary),
         "objective_score": (backtest.get("objective_scores_by_candidate") or {}).get(selected_id),
+        "headline": _headline_metrics(selected.get("metrics") or {}),
+    }
+
+
+def _headline_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """The numbers a reader may treat as a forecast, taken from the hold-out only.
+
+    `sharpe_ratio`, `total_return` and `max_drawdown` span the whole period, of which the
+    first 70% is what selection optimised against. Presenting them as the result of the
+    backtest states an in-sample fit as though it were an out-of-sample finding. The
+    hold-out figures are the same run, restricted to the part no candidate was chosen on.
+
+    `basis` and `candidates_evaluated` travel with the numbers so the reader is never
+    left to assume which period they cover or how wide the search behind them was.
+    """
+
+    return {
+        "basis": "hold_out",
+        "hold_out_fraction": round(1.0 - BACKTEST_SPLIT_FRACTION, 4),
+        "total_return": metrics.get("out_sample_return"),
+        "sharpe_ratio": metrics.get("out_sample_sharpe"),
+        "max_drawdown": metrics.get("out_sample_max_drawdown"),
+        "candidates_evaluated": metrics.get("candidates_evaluated"),
+        "selection_adjusted_sharpe": metrics.get("selection_adjusted_sharpe"),
+        # Kept alongside, explicitly labelled, so the in-sample figures remain available
+        # without being the ones on the headline.
+        "in_sample": {
+            "total_return": metrics.get("in_sample_return"),
+            "sharpe_ratio": metrics.get("in_sample_sharpe"),
+            "max_drawdown": metrics.get("in_sample_max_drawdown"),
+        },
+        "full_period": {
+            "total_return": metrics.get("total_return"),
+            "sharpe_ratio": metrics.get("sharpe_ratio"),
+            "max_drawdown": metrics.get("max_drawdown"),
+        },
     }
 
 
@@ -1595,6 +1635,10 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                     label=f"자가개선 {iteration}차 · 개선 없음",
                     detail="선택 구간에서 개선은 없었습니다. 다음 제한 탐색 구간을 확인합니다.",
                 )
+        # The winner was chosen by argmax over every candidate tried, so its in-sample
+        # numbers carry the bias of that search. N is only known here - the per-candidate
+        # evaluations are cached and must not depend on how many siblings they had.
+        result = _apply_selection_correction(result, len(all_candidates))
         result = result.model_copy(
             update={
                 "fallback_reasons": fallback_reasons,
@@ -1625,6 +1669,39 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         "backtest": result.model_dump(),
         "strategy_validated": _passes_objective_floor(result),
     }
+
+
+def _apply_selection_correction(
+    result: CandidateBacktestResult, candidate_count: int
+) -> CandidateBacktestResult:
+    """Record how wide the search was, and deflate the winner's Sharpe for it.
+
+    Nothing about the run changes - the same candidate stays selected. What changes is
+    that the headline now carries the size of the search that produced it, so an argmax
+    over fifteen tries cannot be read as one strategy that happened to work.
+    """
+
+    metrics = result.selected_candidate.metrics
+    if metrics is None:
+        return result
+    observations = max(1, metrics.in_sample_observations)
+    adjusted = metrics.model_copy(
+        update={
+            "candidates_evaluated": max(1, candidate_count),
+            "selection_adjusted_sharpe": round(
+                metrics.in_sample_sharpe
+                - _expected_max_sharpe(candidate_count, observations),
+                METRIC_ROUND_DIGITS,
+            ),
+        }
+    )
+    return result.model_copy(
+        update={
+            "selected_candidate": result.selected_candidate.model_copy(
+                update={"metrics": adjusted}
+            )
+        }
+    )
 
 
 def _selected_candidate_detail(result: CandidateBacktestResult) -> str:
@@ -1825,7 +1902,7 @@ def _engine_strategy_spec(
             strategy,
             available_ticker_count=available_ticker_count,
         ),
-        risk_controls=_engine_risk_controls(strategy),
+        risk_controls=_engine_risk_controls(strategy, candidate=candidate),
     )
 
 
@@ -1838,13 +1915,26 @@ def _engine_position_sizing(
     return EnginePositionSizing(max_positions=applied_max_positions)
 
 
-def _engine_risk_controls(strategy: AIStrategySpec):
+def _engine_risk_controls(strategy: AIStrategySpec, *, candidate: CodeCandidate | None = None):
+    """Risk controls for the engine, which is the only place a stop is applied.
+
+    The candidate's own stop/target win when it has them: they are part of the search
+    surface, and the action generator used to apply them itself. It no longer does -
+    it only knows the signal-day close, while the engine knows the price actually paid
+    at the next open - so the search values have to reach the engine or the search over
+    them silently stops meaning anything.
+    """
+
     raw = strategy.risk_constraints
     controls = EngineRiskControls()
+    parameters = candidate.parameters if candidate is not None else None
     stop_loss_pct = _optional_positive_float(
         raw.get("stop_loss_pct"), "stop_loss_pct", upper_bound=1.0
     )
     take_profit_pct = _optional_positive_float(raw.get("take_profit_pct"), "take_profit_pct")
+    if parameters is not None:
+        stop_loss_pct = parameters.stop_loss_pct
+        take_profit_pct = parameters.take_profit_pct
     max_position_pct = _optional_positive_float(
         raw.get("max_position_pct"), "max_position_pct", upper_bound=1.0
     )
@@ -1912,11 +2002,68 @@ def _execution_audit(engine_result: Any) -> dict[str, Any]:
     }
 
 
+def _expected_max_sharpe(candidate_count: int, observations: int) -> float:
+    """The in-sample Sharpe a skill-free search over `candidate_count` tries would give.
+
+    Picking the best of N candidates is an argmax over N noisy estimates, so the winner's
+    in-sample Sharpe is biased upward even when nothing has any edge. This is the
+    standard expected-maximum-of-N-normals approximation used for the deflated Sharpe
+    ratio, scaled by the standard error of a Sharpe estimate over `observations` bars.
+
+    Measured with candidates whose trades are random on real prices: mean return -3.7%,
+    best-of-six +16.2%. Nearly twenty points of headline out of nothing.
+    """
+
+    if candidate_count <= 1 or observations <= 1:
+        return 0.0
+    # E[max of n standard normals], Gumbel approximation - accurate to ~1% for n >= 4
+    # and conservative (too small, so it under-corrects) for the n = 2..3 the first
+    # round uses.
+    euler = 0.5772156649015329
+    n = float(candidate_count)
+    expected_max_z = (1.0 - euler) * _normal_quantile(1.0 - 1.0 / n) + euler * _normal_quantile(
+        1.0 - 1.0 / (n * math.e)
+    )
+    # Standard error of an annualised Sharpe estimate over `observations` daily bars.
+    return expected_max_z * math.sqrt(252.0 / observations)
+
+
+def _normal_quantile(p: float) -> float:
+    """Inverse standard normal CDF (Acklam's rational approximation)."""
+
+    if p <= 0.0 or p >= 1.0:
+        return 0.0
+    a = (-39.69683028665376, 220.9460984245205, -275.9285104469687,
+         138.3577518672690, -30.66479806614716, 2.506628277459239)
+    b = (-54.47609879822406, 161.5858368580409, -155.6989798598866,
+         66.80131188771972, -13.28068155288572)
+    c = (-0.007784894002430293, -0.3223964580411365, -2.400758277161838,
+         -2.549732539343734, 4.374664141464968, 2.938163982698783)
+    d = (0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416)
+    plow, phigh = 0.02425, 1.0 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2.0 * math.log(p))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+            (((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0
+        )
+    if p > phigh:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+            (((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0
+        )
+    q = p - 0.5
+    r = q * q
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (
+        ((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0
+    )
+
+
 def _metrics_from_engine_result(
     engine_result,
     *,
     price_rows: Sequence[Mapping[str, Any]] | None = None,
     benchmark_returns: Sequence[float] | None = None,
+    candidate_count: int = 1,
 ) -> BacktestMetrics:
     summary = engine_result.summary
     metric_warnings = _summary_warning_list(summary)
@@ -1938,6 +2085,9 @@ def _metrics_from_engine_result(
     split_index = max(1, int(len(daily_returns) * BACKTEST_SPLIT_FRACTION))
     in_sample_returns = daily_returns[:split_index]
     out_sample_returns = daily_returns[split_index:]
+    selection_adjusted_sharpe = in_sample_sharpe - _expected_max_sharpe(
+        candidate_count, len(in_sample_returns)
+    )
     resolved_benchmark_returns = (
         benchmark_returns
         if benchmark_returns is not None
@@ -1983,6 +2133,12 @@ def _metrics_from_engine_result(
             _max_drawdown_from_returns(in_sample_returns), METRIC_ROUND_DIGITS
         ),
         out_sample_return=round(out_sample_return, METRIC_ROUND_DIGITS),
+        out_sample_max_drawdown=round(
+            _max_drawdown_from_returns(out_sample_returns), METRIC_ROUND_DIGITS
+        ),
+        in_sample_observations=len(in_sample_returns),
+        candidates_evaluated=max(1, candidate_count),
+        selection_adjusted_sharpe=round(selection_adjusted_sharpe, METRIC_ROUND_DIGITS),
         in_sample_benchmark_return=round(in_sample_benchmark_return, METRIC_ROUND_DIGITS),
         out_sample_benchmark_return=round(out_sample_benchmark_return, METRIC_ROUND_DIGITS),
         in_sample_excess_return=round(
@@ -2252,6 +2408,12 @@ def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
         # This gate is a report/acceptance check, so it uses the untouched hold-out.
         and metrics.out_sample_sharpe >= MIN_OBJECTIVE_SHARPE
         and metrics.max_drawdown >= MAX_OBJECTIVE_DRAWDOWN
+        # A winner picked from N tries has to beat what N tries of nothing would have
+        # produced. Without this the gate passes on search width alone: six candidates
+        # trading at random cleared a +16.2% best-of-six against a -3.7% average.
+        # `candidates_evaluated` is 1 until the correction is applied, which leaves this
+        # term at in_sample_sharpe and changes no single-candidate behaviour.
+        and metrics.selection_adjusted_sharpe >= MIN_SELECTION_ADJUSTED_SHARPE
     )
     if not passes_basic_floor:
         return False

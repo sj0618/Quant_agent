@@ -182,6 +182,20 @@ class BacktestRunConfig:
     write_outputs: bool = True
     talib: TalibIndicatorConfig = field(default_factory=TalibIndicatorConfig)
     metrics_mode: Literal["selection", "full"] = "full"
+    # Trading days a held name may go without a bar before the position is written off.
+    # A position in a name that stops trading used to be carried at its last observed
+    # close for the rest of the run: never sold, never marked down, and still counted in
+    # equity. On a survivorship-free universe that is not an edge case - a quarter of the
+    # candidates ended runs with most of their final equity in names that had not traded
+    # for years. The grace period is long enough that an ordinary suspension which
+    # resumes is not caught by it.
+    delisting_grace_days: int = 20
+    # What a holder recovers when a name is written off, as a fraction of its last close.
+    # Zero is the conservative convention for survivorship-corrected backtests and is
+    # close to the Korean outcome, where 정리매매 typically clears at a small fraction of
+    # the last quoted price. It is an assumption either way, so it is a knob and it is
+    # reported in the summary rather than being buried.
+    delisting_recovery_rate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -719,6 +733,9 @@ class BacktestEngine:
         order_audit: list[OrderAuditRecord] = []
         previous_equity: float | None = None
 
+        stale_days: dict[str, int] = {}
+        forced_exits = 0
+
         for current_date in dates:
             today_bars = bars_by_date[current_date]
             cash, pending_orders, executed, execution_audit = self._execute_pending_orders(
@@ -726,6 +743,13 @@ class BacktestEngine:
             )
             trades.extend(executed)
             order_audit.extend(execution_audit)
+
+            cash, forced_trades, forced_audit, pending_orders = self._write_off_stale_positions(
+                current_date, today_bars, positions, cash, pending_orders, stale_days
+            )
+            trades.extend(forced_trades)
+            order_audit.extend(forced_audit)
+            forced_exits += len(forced_trades)
 
             generated_orders, generated_signals, generated_audit = self._generate_signals_for_date(
                 current_date, today_bars, positions, metrics_by_key, previous_metrics_by_key, pending_orders
@@ -758,6 +782,22 @@ class BacktestEngine:
 
         final_equity = equity_curve[-1].total_equity if equity_curve else cash
         summary = self._summary(cash, positions, trades, equity_curve, signals, exclusions, final_equity)
+        summary["delisting"] = {
+            "grace_days": self.config.delisting_grace_days,
+            "recovery_rate": self.config.delisting_recovery_rate,
+            "forced_exits": forced_exits,
+            # Equity still held in names that were not trading on the final date. These
+            # are marked at a stale close, so this is the part of the headline that no
+            # holder could actually have realised.
+            "unrealizable_equity": round(
+                sum(
+                    position.quantity * position.last_price
+                    for ticker, position in positions.items()
+                    if stale_days.get(ticker, 0) > 0
+                ),
+                6,
+            ),
+        }
         result = BacktestResult(
             strategy_id=self.spec.strategy_id,
             summary=summary,
@@ -899,6 +939,89 @@ class BacktestEngine:
             else:
                 included.add(ticker)
         return included, exclusions
+
+    def _write_off_stale_positions(
+        self, current_date, today_bars, positions, cash, pending_orders, stale_days
+    ):
+        """Realise positions in names that have stopped trading.
+
+        Without this a delisted or indefinitely suspended name is held forever: the
+        engine only refreshes `last_price` on days the ticker has a bar, so the position
+        keeps its final quoted value, is never sold, and keeps contributing that value to
+        every later equity point. The capital is also never returned, so the strategy
+        silently runs with fewer usable slots than `max_positions` suggests.
+
+        Names simply absent from the universe on a given day (a holiday for one listing,
+        a one-day suspension) are not delisted, which is why this waits
+        `delisting_grace_days` trading days before acting.
+        """
+
+        grace = self.config.delisting_grace_days
+        trades: list[TradeRecord] = []
+        audit: list[OrderAuditRecord] = []
+        if grace <= 0:
+            return cash, trades, audit, pending_orders
+
+        for ticker in list(positions):
+            if ticker in today_bars:
+                stale_days[ticker] = 0
+                continue
+            stale_days[ticker] = stale_days.get(ticker, 0) + 1
+            if stale_days[ticker] < grace:
+                continue
+
+            position = positions.pop(ticker)
+            exit_price = position.last_price * self.config.delisting_recovery_rate
+            gross = position.quantity * exit_price
+            exit_cost = gross * (
+                self.spec.backtest.cost_model.commission_pct
+                + self.spec.backtest.cost_model.tax_pct
+            )
+            proceeds = gross - exit_cost
+            cash += proceeds
+            invested = position.entry_notional + position.entry_cost
+            trades.append(
+                TradeRecord(
+                    ticker=ticker,
+                    entry_date=position.entry_date.isoformat(),
+                    exit_date=current_date.isoformat(),
+                    entry_price=round(position.entry_price, 6),
+                    exit_price=round(exit_price, 6),
+                    quantity=position.quantity,
+                    entry_cost=round(position.entry_cost, 6),
+                    exit_cost=round(exit_cost, 6),
+                    gross_pnl=round(gross - position.entry_notional, 6),
+                    net_pnl=round(proceeds - invested, 6),
+                    return_pct=round((proceeds - invested) / invested, 10) if invested else 0.0,
+                    reason="delisted_write_off",
+                )
+            )
+            audit.append(
+                OrderAuditRecord(
+                    date=current_date.isoformat(),
+                    ticker=ticker,
+                    side="sell",
+                    status="delisted_write_off",
+                    signal_date=current_date.isoformat(),
+                    reason="delisted_write_off",
+                    price=round(exit_price, 6),
+                    quantity=position.quantity,
+                    detail=(
+                        f"No bar for {grace} trading days; written off at "
+                        f"{self.config.delisting_recovery_rate:.0%} of the last close."
+                    ),
+                )
+            )
+            stale_days.pop(ticker, None)
+
+        # A queued order for a name that no longer trades can never fill, and leaving it
+        # pending would let it execute if the ticker ever reappeared after the write-off.
+        written_off = {record.ticker for record in trades}
+        if written_off:
+            pending_orders = [
+                order for order in pending_orders if order.ticker not in written_off
+            ]
+        return cash, trades, audit, pending_orders
 
     def _execute_pending_orders(self, current_date, today_bars, positions, cash, pending_orders):
         executable = [

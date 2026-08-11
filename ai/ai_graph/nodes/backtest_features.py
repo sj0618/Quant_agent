@@ -206,7 +206,23 @@ class PreparedFeatureStore:
             long_highs = _prior_rolling_extreme(closes, long_limit, maximum=True)
 
             local = np.arange(count, dtype=np.int64)
-            valid = local > 0
+            # A window is only itself once there are `lookback` prior bars to fill it.
+            # This was `local > 0`, so every indicator reported a shorter window under
+            # its own name: a 20-day average was the previous close on the second bar,
+            # and `high` was a single prior close, letting a breakout fire on bar two
+            # against a one-day "high". Rows inside the warm-up are left out of `target`
+            # and so stay zeroed, which keeps READY false and keeps them untradable
+            # rather than tradable on a number nobody measured.
+            #
+            # This matters most where it is least visible: a name that lists mid-backtest
+            # warms up during its post-IPO stretch, its most volatile. Enforcing it moved
+            # individual candidates by up to 16 percentage points of ten-year return on
+            # the live universe.
+            #
+            # `window` still clamps to `local` so the index arithmetic below never goes
+            # negative for the rows being skipped; the mask, not the arithmetic, is what
+            # excludes them.
+            valid = local >= lookback
             target = indices[valid]
             window = np.minimum(lookback, local)
             start = local - window
@@ -496,16 +512,16 @@ class PreparedFeatureStore:
                         buy = trend >= threshold and close >= average and close >= previous
                         sell = in_position and close < average
                     if in_position and float(state[1]) > 0.0:
-                        pnl = close / float(state[1]) - 1.0
+                        # The trailing stop is part of the profile's own rule - it tracks
+                        # the peak since entry, which the engine does not model - so it
+                        # stays here. The fixed stop-loss and take-profit do not: the
+                        # engine applies both against the price actually paid, and this
+                        # loop only knows the signal-day close. Keeping both meant one
+                        # stop evaluated twice from two entry prices a bar apart.
                         trailing_stop = float(state[3]) > 0.0 and close < float(state[3]) * (
                             1.0 - parameters.trailing_stop_pct
                         )
-                        sell = (
-                            sell
-                            or pnl <= -parameters.stop_loss_pct
-                            or pnl >= parameters.take_profit_pct
-                            or trailing_stop
-                        )
+                        sell = sell or trailing_stop
                 evaluations.append((index, ticker, close, buy, sell, score, state))
 
             open_positions = sum(1 for state in states.values() if bool(state[0]))
@@ -644,14 +660,16 @@ class PreparedFeatureStore:
                 if in_position and float(state[1]) > 0.0:
                     state[2] = int(state[2]) + 1
                     state[3] = max(float(state[3]), close)
-                    pnl = close / float(state[1]) - 1.0
-                    trailing_stop = float(state[3]) > 0.0 and close < float(state[3]) * (
+                    # Trailing stop only, for the same reason as the other two action
+                    # paths: the engine applies the fixed stop and target against the
+                    # price actually paid at the next open, while this loop only knows
+                    # the signal-day close, so keeping both evaluated one stop twice from
+                    # entry prices a bar apart. Dropping the fixed take-profit here also
+                    # matches this profile's own stated intent - the docstring above says
+                    # a fixed percentage systematically cuts the few large winners that
+                    # drive a momentum portfolio.
+                    risk_exit = float(state[3]) > 0.0 and close < float(state[3]) * (
                         1.0 - parameters.trailing_stop_pct
-                    )
-                    risk_exit = (
-                        pnl <= -parameters.stop_loss_pct
-                        or pnl >= parameters.take_profit_pct
-                        or trailing_stop
                     )
 
                 if in_position and (risk_exit or (rotation_day and ticker not in target)):
@@ -708,17 +726,18 @@ class PreparedFeatureStore:
                     exit_match = bool(exit_conditions) and all(
                         self._condition_matches(condition, index) for condition in exit_conditions
                     )
-                    entry_price = float(state[1])
-                    pnl = close / entry_price - 1.0 if entry_price else 0.0
+                    # Rule exit and the trailing stop only. The fixed stop-loss and
+                    # take-profit belong to the engine, which is the side that knows the
+                    # price actually paid: this loop records the signal-day close as the
+                    # entry, while the fill happens at the next open plus slippage.
+                    # Testing one stop against two entry prices a bar apart applied it
+                    # twice, from figures that drift by a whole bar's move plus costs.
+                    # The trailing stop stays - it tracks the peak since entry, which the
+                    # engine does not model.
                     trailing_stop = float(state[2]) > 0.0 and close < float(state[2]) * (
                         1.0 - parameters.trailing_stop_pct
                     )
-                    if (
-                        exit_match
-                        or pnl <= -parameters.stop_loss_pct
-                        or pnl >= parameters.take_profit_pct
-                        or trailing_stop
-                    ):
+                    if exit_match or trailing_stop:
                         exits.append((index, ticker))
 
             for condition in rank_conditions:
