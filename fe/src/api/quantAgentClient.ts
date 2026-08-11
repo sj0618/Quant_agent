@@ -16,6 +16,7 @@ import type {
   AIEnvelopeStatus,
   AIJobStage,
   AIJobStageStatus,
+  AITickerAction,
   AITickerActionType,
   AIReportBundle,
   AIRiskAdjustment,
@@ -667,7 +668,7 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
     status: result.status === "failed" ? "failed" : "draft",
     strategyName: result.strategy_spec?.name ?? result.user_payload.headline,
     recommendationScore: confidence === null || confidence === undefined ? formatEnvelopeStatus(result.status) : formatScoreValue(confidence),
-    signals: signalCounts(signal?.action ?? null),
+    signals: signalCounts(result.user_payload.ticker_actions),
     marketSnapshot: [
       { label: "AI 상태", value: formatEnvelopeStatus(result.status), tone: toneForStatus(result.status) },
       { label: "Trace", value: result.trace_id.slice(0, TRACE_PREVIEW_LENGTH), tone: "neutral" },
@@ -917,10 +918,20 @@ function buildAIMetricCards(selected: AIBacktestMetrics, engineSummary?: Record<
     {
       key: "sharpe",
       label: "Sharpe Ratio",
-      value: formatDecimal(selected.sharpe_ratio),
+      // The hold-out figure, because that is what the card is labelled and what the
+      // acceptance gate judges on. It used to read `sharpe_ratio`, the whole-period
+      // number, so a run whose gate said "보유 구간 외부 샤프비율 -1.2431" showed
+      // "Sharpe (홀드아웃) -0.43" directly underneath it - the same quantity, three
+      // times apart, on one screen, with the flattering one in the larger type.
+      value: formatDecimal(selected.out_sample_sharpe),
       delta: tradeCount !== null ? `거래 ${formatDecimal(tradeCount, 0)}회` : undefined,
-      tone: selected.sharpe_ratio >= 1 ? "positive" : selected.sharpe_ratio >= 0.5 ? "neutral" : "negative",
-      caption: "AI 전략 검증에서 선택된 후보 기준입니다.",
+      tone:
+        selected.out_sample_sharpe >= 1
+          ? "positive"
+          : selected.out_sample_sharpe >= 0.5
+            ? "neutral"
+            : "negative",
+      caption: "선택에 쓰지 않은 홀드아웃 구간 기준입니다.",
     },
     {
       key: "mdd",
@@ -1126,12 +1137,20 @@ function extractFinalSignal(report: AIReportBundle) {
   return null;
 }
 
-function signalCounts(signal: SignalType | null): Record<SignalType, number> {
-  return {
-    BUY: signal === "BUY" ? 1 : 0,
-    HOLD: signal === "HOLD" ? 1 : 0,
-    DROP: signal === "DROP" ? 1 : 0,
-  };
+// The per-name verdicts of this run, which is what "BUY n · HOLD n · DROP n" claims to
+// be. It used to one-hot the single strategy-level signal, so a run that told six names
+// apart reported "1건 · BUY 0 · HOLD 0 · DROP 1" beside a list showing HOLD 5 and DROP 1.
+// Same source as the candidate list now - `ticker_actions`, produced by the backtest run
+// that also produced the numbers - so the tile and the list cannot disagree.
+function signalCounts(actions: AITickerAction[] | undefined): Record<SignalType, number> {
+  const counts: Record<SignalType, number> = { BUY: 0, HOLD: 0, DROP: 0 };
+  for (const action of actions ?? []) {
+    const signal = toSignalType(action.action);
+    if (signal) {
+      counts[signal] += 1;
+    }
+  }
+  return counts;
 }
 
 function describeRiskAdjustments(adjustments: AIRiskAdjustment[]) {
