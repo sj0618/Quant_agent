@@ -1054,7 +1054,7 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
     if "roe" in lowered or "ROE" in query:
         indicator.append("roe")
 
-    if "30" in query and "rsi" in lowered:
+    if "rsi" in lowered and any(value in query for value in ("30", "70")):
         rsi_rules = rsi_trade_rules(query)
         operator = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">="}[
             rsi_rules.entry_operator

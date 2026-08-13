@@ -818,9 +818,21 @@ def test_inverse_rsi_screen_matches_overbought_entry_and_relaxes_downward() -> N
     assert matcher({"rsi": 70}) is True
     assert matcher({"rsi": 30}) is False
 
-    relaxed = _relaxed_thresholds(thresholds, 0, profile="rsi_overbought")
-    assert relaxed.rsi_min == 65
-    assert relaxed.rsi_max == thresholds.rsi_max
+    for round_index in range(4):
+        relaxed = _relaxed_thresholds(
+            thresholds, round_index, profile="rsi_overbought"
+        )
+        assert relaxed.rsi_min == 65
+        assert relaxed.rsi_max == thresholds.rsi_max
+
+    from ai_graph.data_sources import db_split
+
+    split_thresholds = db_split.ScreeningThresholds()
+    for round_index in range(4):
+        split_relaxed = db_split._relaxed_thresholds(
+            split_thresholds, round_index, profile="rsi_overbought"
+        )
+        assert split_relaxed.rsi_min == db_split.RSI_OVERBOUGHT_MIN
 
 
 def test_missing_capability_stops_before_the_screen_spends_relaxation_rounds() -> None:

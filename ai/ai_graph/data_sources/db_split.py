@@ -1365,7 +1365,7 @@ def _relaxed_thresholds(
 
     step = round_index + 1
     rsi_update = (
-        {"rsi_min": _clamped(base.rsi_min - 5.0 * step, 30.0, 95.0)}
+        {"rsi_min": _clamped(base.rsi_min - 5.0 * step, RSI_OVERBOUGHT_MIN, 95.0)}
         if profile == "rsi_overbought"
         else {"rsi_max": _clamped(base.rsi_max + 5.0 * step, 5.0, 70.0)}
     )
