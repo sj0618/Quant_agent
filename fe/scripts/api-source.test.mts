@@ -31,6 +31,15 @@ test("workspace discards a running job lost during a server restart", async () =
   assert.doesNotMatch(source, /분석 job을 서버에서 찾을 수 없습니다/);
 });
 
+test("workspace does not present a non-strategy message as a candidate-selection error", async () => {
+  const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /hasCandidateSelection/);
+  assert.match(source, /candidate_cards\.length/);
+  assert.match(source, /분석할 전략 조건을 입력해 주세요/);
+  assert.match(source, /latestPayload\?\.options\?\.length/);
+});
+
 test("report completion sends only the durable AI job id", async () => {
   const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
   const completion = source.slice(
