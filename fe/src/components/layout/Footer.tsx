@@ -8,7 +8,7 @@ export function Footer() {
           <span className="brand__mark" />
           <span>QuantAgent</span>
         </div>
-        <p>KRX LLM 퀀트 에이전트. TA-Lib 150개 지표와 10년 시계열 백테스팅을 무료로 제공합니다.</p>
+        <p>QuantAgent는 데이터 기준 시점, 산출식, 검증 범위와 한계를 확인할 수 있는 리포트 열람 경험을 제공합니다.</p>
       </div>
       <div className="site-footer__links">
         <a href={ROUTES.terms}>이용약관</a>

@@ -565,6 +565,10 @@ h6 { font-size: 0.67em; }
 @media (max-width: 820px) {
   .landing-nav { flex-wrap: wrap; height: auto; }
   .landing-nav > div:nth-child(2) { display: none; }
+  .hero { min-height: 0; padding: 56px 24px 64px; }
+  .hero h1 { margin-top: 24px; font-size: 34px; line-height: 1.18; letter-spacing: -1.1px; word-break: keep-all; }
+  .hero p { font-size: 15px; }
+  .section-head h2 { font-size: 28px; line-height: 1.28; word-break: keep-all; }
   .workspace-shell { flex-direction: column; align-items: stretch; }
   .workspace-main { min-height: auto; }
   .workspace-progress { padding: 18px; }
@@ -572,6 +576,10 @@ h6 { font-size: 0.67em; }
   .summary-grid, .metric-grid, .signal-grid, .step-grid, .principle-grid, .hero__stats, .sample-market-grid, .axis-grid, .report-metrics, .form-grid, .legal-grid, .search-form, .search-result-row { grid-template-columns: 1fr; }
   .reliability-panel__samples, .strategy-explanation__indicators, .strategy-blueprints__grid { grid-template-columns: 1fr; }
   .landing-section, .landing-cta, .site-footer { padding: 56px 24px; }
+  .site-footer { flex-direction: column; gap: 24px; }
+  .site-footer > div:first-child { max-width: none; }
+  .site-footer__links { width: 100%; flex-wrap: wrap; gap: 12px 20px; }
+  .site-footer small { align-self: flex-start; line-height: 1.5; }
   .reports-page, .report-detail-layout, .strategy-report-page, .auth-page, .legal-page, .settings-page, .search-page, .strategy-page { padding: 24px; }
   .report-row { grid-template-columns: 1fr; }
   .report-paper__section { padding: 24px; }
