@@ -1,13 +1,20 @@
+import unittest
 from datetime import date
 from decimal import Decimal
 from io import BytesIO
-import unittest
 from zipfile import ZipFile
 
 from quant_agent.data.models import RawSourcePayload
+from quant_agent.data.sources.base import SourceResponseError
 from quant_agent.data.sources.bok import normalize_bok_observations
-from quant_agent.data.sources.dart import normalize_corp_code_zip, normalize_financial_statement
-from quant_agent.data.sources.seibro import LexiconSentimentScorer, normalize_seibro_reports
+from quant_agent.data.sources.dart import (
+    normalize_corp_code_zip,
+    normalize_financial_statement,
+)
+from quant_agent.data.sources.seibro import (
+    LexiconSentimentScorer,
+    normalize_seibro_reports,
+)
 
 
 class ExternalNormalizerTests(unittest.TestCase):
@@ -131,6 +138,18 @@ class ExternalNormalizerTests(unittest.TestCase):
 
         self.assertEqual(account["amount"], Decimal("222"))
         self.assertEqual(account["raw"]["sj_div"], "CIS")
+
+    def test_normalize_dart_financials_rejects_unknown_report_code(self):
+        raw = RawSourcePayload(
+            source="DART",
+            endpoint_key="fnlttSinglAcntAll",
+            request_date=date(2026, 7, 24),
+            request={"corp_code": "00126380", "bsns_year": "2026", "reprt_code": "99999", "fs_div": "CFS"},
+            payload={"status": "000", "list": []},
+        )
+
+        with self.assertRaisesRegex(SourceResponseError, "Unsupported OpenDART report code"):
+            normalize_financial_statement(raw, symbol="005930")
 
     def test_normalize_seibro_reports_and_sentiment(self):
         reports = normalize_seibro_reports(

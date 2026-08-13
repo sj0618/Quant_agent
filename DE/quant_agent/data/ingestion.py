@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Iterable
 
-from quant_agent.data.config import KisConfig, KrxConfig, OhlcvIngestionConfig
+from quant_agent.data.config import KrxConfig, OhlcvIngestionConfig
 from quant_agent.data.models import OhlcvBar, OhlcvIngestionResult, RawSourcePayload
 from quant_agent.data.repository import DataRepository
-from quant_agent.data.sources.kis import KisOhlcvClient
 from quant_agent.data.sources.krx import KrxOhlcvClient
+
+CANONICAL_OHLCV_SOURCE = "KRX"
+KIS_ADJUSTED_INGESTION_SCRIPT = "scripts/ingest_kis_adjusted_ohlcv.py"
 
 
 @dataclass(frozen=True)
@@ -29,15 +31,20 @@ class OhlcvIngestionService:
         repository: DataRepository | None = None,
         ingestion_config: OhlcvIngestionConfig | None = None,
         krx_config: KrxConfig | None = None,
-        kis_config: KisConfig | None = None,
     ) -> None:
         self.repository = repository or DataRepository()
         self.ingestion_config = ingestion_config or OhlcvIngestionConfig.from_env()
         self.krx_client = KrxOhlcvClient(krx_config or KrxConfig.from_env())
-        self.kis_client = KisOhlcvClient(kis_config or KisConfig.from_env())
 
     def ingest_range(self, request: OhlcvIngestionRequest) -> OhlcvIngestionResult:
         source = request.source.upper()
+        if source != CANONICAL_OHLCV_SOURCE:
+            raise ValueError(
+                f"Generic OHLCV ingestion only writes the canonical {CANONICAL_OHLCV_SOURCE} dataset. "
+                f"Use {KIS_ADJUSTED_INGESTION_SCRIPT} for KIS adjusted data."
+            )
+        if request.end_date < request.start_date:
+            raise ValueError("end_date must be greater than or equal to start_date.")
         run_id = self.repository.start_ingestion_run(
             dag_id=request.dag_id,
             task_id=request.task_id,
@@ -53,8 +60,6 @@ class OhlcvIngestionService:
         total_written = 0
         total_raw_written = 0
         all_issues = []
-        if source == "KIS":
-            self.kis_client.set_request_observer(lambda event: self.repository.store_api_request_log(event, run_id))
         try:
             for chunk_start, chunk_end in chunk_date_range(
                 request.start_date,
@@ -86,9 +91,6 @@ class OhlcvIngestionService:
         except Exception as exc:
             self.repository.finish_ingestion_run(run_id, status="failed", error_message=str(exc))
             raise
-        finally:
-            if source == "KIS":
-                self.kis_client.set_request_observer(None)
 
         return OhlcvIngestionResult(
             run_id=run_id,
@@ -108,7 +110,7 @@ class OhlcvIngestionService:
         end_date: date,
         symbols: tuple[str, ...],
     ) -> tuple[list[RawSourcePayload], list[OhlcvBar]]:
-        if source == "KRX":
+        if source == CANONICAL_OHLCV_SOURCE:
             raw_payloads: list[RawSourcePayload] = []
             bars: list[OhlcvBar] = []
             for trade_date in each_date(start_date, end_date):
@@ -117,23 +119,17 @@ class OhlcvIngestionService:
                 for raw_payload in daily_payloads:
                     from quant_agent.data.sources.krx import normalize_krx_market_day
 
-                    bars.extend(normalize_krx_market_day(raw_payload.payload))
-            return raw_payloads, bars
-
-        if source == "KIS":
-            if not symbols:
-                raise ValueError("KIS ingestion requires explicit symbols because the API is symbol-scoped.")
-            raw_payloads = []
-            bars = []
-            for symbol in symbols:
-                raw_payload = self.kis_client.fetch_daily_price_payload(symbol=symbol, start_date=start_date, end_date=end_date)
-                raw_payloads.append(raw_payload)
-                from quant_agent.data.sources.kis import normalize_kis_daily_price
-
-                bars.extend(normalize_kis_daily_price(raw_payload.payload, symbol=symbol))
+                    bars.extend(self._filter_krx_bars(normalize_krx_market_day(raw_payload.payload), symbols))
             return raw_payloads, bars
 
         raise ValueError(f"Unsupported OHLCV source: {source}")
+
+    @staticmethod
+    def _filter_krx_bars(bars: list[OhlcvBar], symbols: tuple[str, ...]) -> list[OhlcvBar]:
+        requested_symbols = {symbol.strip() for symbol in symbols if symbol.strip()}
+        if not requested_symbols:
+            return bars
+        return [bar for bar in bars if bar.symbol in requested_symbols]
 
 
 def each_date(start_date: date, end_date: date) -> Iterable[date]:

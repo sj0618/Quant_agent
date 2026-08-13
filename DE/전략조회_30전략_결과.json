@@ -1,0 +1,349 @@
+{
+  "schema_version": "1.0",
+  "title": "전략 조회 성능 측정: 30전략 종합 결과",
+  "measured_on": "2026-08-11",
+  "source_document": "DE/전략조회_30전략_브리핑.md",
+  "conversion": {
+    "values_policy": "source_document_values_preserved_without_recalculation",
+    "known_rounding_discrepancy_indices": [26, 27, 28, 30]
+  },
+  "measurement": {
+    "metric": "data_load_seconds",
+    "scope": "전략 입력 후 load_pipeline_data_from_env()가 DB에서 데이터를 읽어오는 구간 전체",
+    "baseline": "ai/ai_graph/data_sources/db.py",
+    "optimized": "ai/ai_graph/data_sources/profile_aware.py -> ai/ai_graph/data_sources/db_test.py"
+  },
+  "summary": [
+    {
+      "group": "technical",
+      "strategy_count": 25,
+      "baseline_average_seconds": 151.57,
+      "optimized_average_seconds": 67.73,
+      "average_delta_seconds": 83.85,
+      "average_improvement_percent": 55.32
+    },
+    {
+      "group": "fundamental",
+      "strategy_count": 5,
+      "baseline_average_seconds": 90.33,
+      "optimized_average_seconds": 88.19,
+      "average_delta_seconds": 2.14,
+      "average_improvement_percent": 2.36
+    },
+    {
+      "group": "all",
+      "strategy_count": 30,
+      "baseline_average_seconds": 141.36,
+      "optimized_average_seconds": 71.14,
+      "average_delta_seconds": 70.23,
+      "average_improvement_percent": 49.68
+    }
+  ],
+  "strategies": [
+    {
+      "index": 1,
+      "group": "technical",
+      "strategy": "RSI 20 이하인 종목",
+      "profile": "rsi_rebound",
+      "baseline_seconds": 158.06,
+      "optimized_seconds": 49.65,
+      "delta_seconds": 108.41,
+      "improvement_percent": 68.59
+    },
+    {
+      "index": 2,
+      "group": "technical",
+      "strategy": "RSI 25 이하인 종목",
+      "profile": "rsi_rebound",
+      "baseline_seconds": 154.07,
+      "optimized_seconds": 47.76,
+      "delta_seconds": 106.31,
+      "improvement_percent": 69.0
+    },
+    {
+      "index": 3,
+      "group": "technical",
+      "strategy": "RSI 30 이하인 종목",
+      "profile": "rsi_rebound",
+      "baseline_seconds": 152.75,
+      "optimized_seconds": 45.93,
+      "delta_seconds": 106.82,
+      "improvement_percent": 69.93
+    },
+    {
+      "index": 4,
+      "group": "technical",
+      "strategy": "RSI 35 이하인 종목",
+      "profile": "rsi_rebound",
+      "baseline_seconds": 150.76,
+      "optimized_seconds": 44.5,
+      "delta_seconds": 106.26,
+      "improvement_percent": 70.48
+    },
+    {
+      "index": 5,
+      "group": "technical",
+      "strategy": "RSI 40 이하인 종목",
+      "profile": "rsi_rebound",
+      "baseline_seconds": 151.15,
+      "optimized_seconds": 45.16,
+      "delta_seconds": 105.99,
+      "improvement_percent": 70.12
+    },
+    {
+      "index": 6,
+      "group": "technical",
+      "strategy": "20일선 위에서 눌림목이 나온 종목",
+      "profile": "pullback_trend",
+      "baseline_seconds": 148.64,
+      "optimized_seconds": 75.87,
+      "delta_seconds": 72.77,
+      "improvement_percent": 48.96
+    },
+    {
+      "index": 7,
+      "group": "technical",
+      "strategy": "20일선 위에서 RSI 30 이하인 종목",
+      "profile": "rsi_rebound",
+      "baseline_seconds": 153.59,
+      "optimized_seconds": 44.5,
+      "delta_seconds": 109.09,
+      "improvement_percent": 71.03
+    },
+    {
+      "index": 8,
+      "group": "technical",
+      "strategy": "20일선 위에서 RSI 35 이하인 종목",
+      "profile": "rsi_rebound",
+      "baseline_seconds": 151.14,
+      "optimized_seconds": 45.28,
+      "delta_seconds": 105.86,
+      "improvement_percent": 70.04
+    },
+    {
+      "index": 9,
+      "group": "technical",
+      "strategy": "200일선 위에서 20일선에 가까운 종목",
+      "profile": "pullback_trend",
+      "baseline_seconds": 152.86,
+      "optimized_seconds": 76.62,
+      "delta_seconds": 76.24,
+      "improvement_percent": 49.88
+    },
+    {
+      "index": 10,
+      "group": "technical",
+      "strategy": "200일선 위에서 20일선 지지받는 종목",
+      "profile": "pullback_trend",
+      "baseline_seconds": 153.69,
+      "optimized_seconds": 77.18,
+      "delta_seconds": 76.51,
+      "improvement_percent": 49.78
+    },
+    {
+      "index": 11,
+      "group": "technical",
+      "strategy": "볼린저밴드 폭이 좁은 종목",
+      "profile": "bollinger_squeeze",
+      "baseline_seconds": 155.01,
+      "optimized_seconds": 72.84,
+      "delta_seconds": 82.17,
+      "improvement_percent": 53.01
+    },
+    {
+      "index": 12,
+      "group": "technical",
+      "strategy": "볼린저밴드 폭이 매우 좁은 종목",
+      "profile": "bollinger_squeeze",
+      "baseline_seconds": 149.4,
+      "optimized_seconds": 71.83,
+      "delta_seconds": 77.57,
+      "improvement_percent": 51.92
+    },
+    {
+      "index": 13,
+      "group": "technical",
+      "strategy": "볼린저밴드 하단 근처인 종목",
+      "profile": "bollinger_squeeze",
+      "baseline_seconds": 151.59,
+      "optimized_seconds": 75.17,
+      "delta_seconds": 76.42,
+      "improvement_percent": 50.41
+    },
+    {
+      "index": 14,
+      "group": "technical",
+      "strategy": "볼린저밴드 하단에서 벗어나기 시작한 종목",
+      "profile": "bollinger_squeeze",
+      "baseline_seconds": 148.21,
+      "optimized_seconds": 75.15,
+      "delta_seconds": 73.06,
+      "improvement_percent": 49.29
+    },
+    {
+      "index": 15,
+      "group": "technical",
+      "strategy": "볼린저밴드 상단 돌파 후보 종목",
+      "profile": "bollinger_squeeze",
+      "baseline_seconds": 147.34,
+      "optimized_seconds": 74.25,
+      "delta_seconds": 73.09,
+      "improvement_percent": 49.61
+    },
+    {
+      "index": 16,
+      "group": "technical",
+      "strategy": "상대강도가 강한 종목",
+      "profile": "relative_strength",
+      "baseline_seconds": 150.85,
+      "optimized_seconds": 68.27,
+      "delta_seconds": 82.58,
+      "improvement_percent": 54.74
+    },
+    {
+      "index": 17,
+      "group": "technical",
+      "strategy": "20일 상대강도가 강한 종목",
+      "profile": "relative_strength",
+      "baseline_seconds": 151.7,
+      "optimized_seconds": 64.59,
+      "delta_seconds": 87.11,
+      "improvement_percent": 57.42
+    },
+    {
+      "index": 18,
+      "group": "technical",
+      "strategy": "60일 상대강도가 강한 종목",
+      "profile": "relative_strength",
+      "baseline_seconds": 151.57,
+      "optimized_seconds": 64.58,
+      "delta_seconds": 86.99,
+      "improvement_percent": 57.39
+    },
+    {
+      "index": 19,
+      "group": "technical",
+      "strategy": "시장보다 상대강도가 좋은 종목",
+      "profile": "relative_strength",
+      "baseline_seconds": 151.4,
+      "optimized_seconds": 65.24,
+      "delta_seconds": 86.16,
+      "improvement_percent": 56.91
+    },
+    {
+      "index": 20,
+      "group": "technical",
+      "strategy": "주도주 후보 종목",
+      "profile": "relative_strength",
+      "baseline_seconds": 150.78,
+      "optimized_seconds": 64.84,
+      "delta_seconds": 85.94,
+      "improvement_percent": 57.0
+    },
+    {
+      "index": 21,
+      "group": "technical",
+      "strategy": "거래량이 20일 평균 이상이면서 20일선 위인 종목",
+      "profile": "breakout_volume",
+      "baseline_seconds": 151.24,
+      "optimized_seconds": 76.66,
+      "delta_seconds": 74.58,
+      "improvement_percent": 49.31
+    },
+    {
+      "index": 22,
+      "group": "technical",
+      "strategy": "거래량이 150% 이상이면서 20일선 위인 종목",
+      "profile": "breakout_volume",
+      "baseline_seconds": 150.74,
+      "optimized_seconds": 75.63,
+      "delta_seconds": 75.11,
+      "improvement_percent": 49.83
+    },
+    {
+      "index": 23,
+      "group": "technical",
+      "strategy": "최근 20일 고점 돌파하고 거래량이 150% 이상인 종목",
+      "profile": "breakout_volume",
+      "baseline_seconds": 148.28,
+      "optimized_seconds": 96.44,
+      "delta_seconds": 51.84,
+      "improvement_percent": 34.96
+    },
+    {
+      "index": 24,
+      "group": "technical",
+      "strategy": "52주 신고가 근처에서 거래량이 20일 평균 이상인 종목",
+      "profile": "breakout_volume",
+      "baseline_seconds": 157.15,
+      "optimized_seconds": 96.57,
+      "delta_seconds": 60.58,
+      "improvement_percent": 38.55
+    },
+    {
+      "index": 25,
+      "group": "technical",
+      "strategy": "신고가 돌파 후 거래량이 증가한 종목",
+      "profile": "breakout_volume",
+      "baseline_seconds": 147.33,
+      "optimized_seconds": 98.63,
+      "delta_seconds": 48.7,
+      "improvement_percent": 33.06
+    },
+    {
+      "index": 26,
+      "group": "fundamental",
+      "strategy": "저PER·고ROE·낮은 부채비율 종목",
+      "profile": "value_quality",
+      "baseline_seconds": 2.99,
+      "optimized_seconds": 1.51,
+      "delta_seconds": 1.48,
+      "improvement_percent": 49.53,
+      "note": "가치형 fast-path"
+    },
+    {
+      "index": 27,
+      "group": "fundamental",
+      "strategy": "ROE 15% 이상이면서 영업이익률과 매출성장률이 높은 종목",
+      "profile": "value_quality",
+      "baseline_seconds": 154.07,
+      "optimized_seconds": 151.87,
+      "delta_seconds": 2.21,
+      "improvement_percent": 1.43,
+      "note": "DART 읽기 유지"
+    },
+    {
+      "index": 28,
+      "group": "fundamental",
+      "strategy": "영업이익률이 높고 매출 성장률이 높은 종목",
+      "profile": "quality_growth",
+      "baseline_seconds": 146.44,
+      "optimized_seconds": 143.44,
+      "delta_seconds": 2.99,
+      "improvement_percent": 2.04,
+      "note": "퀄리티 성장형"
+    },
+    {
+      "index": 29,
+      "group": "fundamental",
+      "strategy": "매출 성장률이 높은 성장주",
+      "profile": "growth_momentum",
+      "baseline_seconds": 144.25,
+      "optimized_seconds": 142.62,
+      "delta_seconds": 1.63,
+      "improvement_percent": 1.13,
+      "note": "성장+추세형"
+    },
+    {
+      "index": 30,
+      "group": "fundamental",
+      "strategy": "ROE가 높고 부채비율이 낮은 가치주",
+      "profile": "value_quality",
+      "baseline_seconds": 3.9,
+      "optimized_seconds": 1.52,
+      "delta_seconds": 2.37,
+      "improvement_percent": 60.92,
+      "note": "가치형 fast-path"
+    }
+  ]
+}
