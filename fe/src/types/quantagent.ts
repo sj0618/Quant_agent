@@ -462,21 +462,6 @@ export interface AppOverview {
   jobStatus: AnalysisJobStatus | null;
 }
 
-export interface LandingSample {
-  heroStats: Array<{ value: string; label: string }>;
-  steps: Array<{ label: string; title: string; description: string; example: string[] }>;
-  reportPreview: {
-    title: string;
-    date: string;
-    score: string;
-    market: Array<{ label: string; value: string; tone?: Tone }>;
-    signals: Array<{ signal: SignalType; name: string; ticker: string; score: string }>;
-  };
-  comparisonRows: Array<{ item: string; traditional: string; terminal: string; quantAgent: string }>;
-  principles: Array<{ label: string; title: string; description: string }>;
-  faqs: Array<{ question: string; answer?: string }>;
-}
-
 export type ReportDeliveryStatus = "sent" | "draft" | "failed" | "resent" | "submitted" | "processing" | "delivered" | "cancelled" | "unknown";
 
 export interface ReportSummary {

@@ -1,6 +1,5 @@
 import { backendRequest } from "./backendClient";
-import { landingSample } from "../mocks/landing.mock";
-import type { LandingSample, ReportDetail, ReportSummary, Tone } from "../types/quantagent";
+import type { ReportDetail, ReportSummary, Tone } from "../types/quantagent";
 
 interface LiveReportListResponse {
   items: ReportSummary[];
@@ -9,10 +8,6 @@ interface LiveReportListResponse {
     hasMore?: boolean;
     nextCursor?: string | null;
   };
-}
-
-function clone<T>(value: T): T {
-  return structuredClone(value);
 }
 
 function normalizeReportListResponse(response: LiveReportListResponse | ReportSummary[]): ReportSummary[] {
@@ -93,11 +88,6 @@ function normalizeMarketSnapshot(snapshot: ReportSummary["marketSnapshot"] | und
       value: item.value,
       tone: item.tone,
     }));
-}
-
-/** Local-only presentation fixture; no factual performance or live-market claim. */
-export function getLandingSample(): Promise<LandingSample> {
-  return Promise.resolve(clone(landingSample));
 }
 
 /** Read-only report archive. New analysis execution is intentionally not exposed to the browser. */

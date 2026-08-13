@@ -77,6 +77,7 @@ test("public navigation contains no development preview, fake sample report link
   assert.doesNotMatch(routesSource, /emailTemplatePreview|dev\/email-template/);
   assert.doesNotMatch(landingSource, /reportDetail\("2026-04-18"\)|KRX LIVE|Sharpe 1\.42/);
   assert.match(landingSource, /새 전략 입력·분석 실행·투자 추천은 제공하지 않습니다/);
+  assert.doesNotMatch(await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"), /landing\.mock|getLandingSample|LandingSample/);
   assert.doesNotMatch(landingSource, /RELEASE VALIDATION|VALIDATION PRINCIPLES|READ-ONLY ARCHIVE|CURRENT SCOPE/);
 });
 
