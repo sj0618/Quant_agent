@@ -7,11 +7,11 @@ Credentials are read only from process environment. This script does not load
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from dataclasses import asdict
 from datetime import date
-import json
 from pathlib import Path
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -19,16 +19,25 @@ if str(ROOT) not in sys.path:
 
 from quant_agent.data.config import DatabaseConfig, OhlcvIngestionConfig  # noqa: E402
 from quant_agent.data.db import make_executor  # noqa: E402
-from quant_agent.data.ingestion import OhlcvIngestionRequest, OhlcvIngestionService  # noqa: E402
+from quant_agent.data.ingestion import (  # noqa: E402
+    KIS_ADJUSTED_INGESTION_SCRIPT,
+    OhlcvIngestionRequest,
+    OhlcvIngestionService,
+)
 from quant_agent.data.repository import DataRepository  # noqa: E402
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest OHLCV raw/core data into PostgreSQL/TimescaleDB.")
-    parser.add_argument("--source", default=None, choices=["KRX", "KIS", "krx", "kis"])
+    parser.add_argument(
+        "--source",
+        default=None,
+        choices=["KRX", "krx"],
+        help=f"Canonical raw/core ingestion source. KIS adjusted data uses {KIS_ADJUSTED_INGESTION_SCRIPT}.",
+    )
     parser.add_argument("--start-date", required=True, help="YYYY-MM-DD")
     parser.add_argument("--end-date", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--symbols", default="", help="Comma-separated symbols; required for KIS.")
+    parser.add_argument("--symbols", default="", help="Optional comma-separated symbols for KRX filtering.")
     parser.add_argument("--db-mode", choices=["psycopg", "docker"], default=None)
     parser.add_argument("--db-container", default=None)
     parser.add_argument("--dag-id", default="manual_ohlcv_ingestion")

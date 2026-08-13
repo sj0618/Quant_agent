@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
 from zipfile import BadZipFile, ZipFile
-import xml.etree.ElementTree as ET
 
 from quant_agent.data.config import DartConfig
 from quant_agent.data.models import RawSourcePayload
-from quant_agent.data.sources.base import SourceConfigurationError, SourceResponseError, retry_call
-
+from quant_agent.data.sources.base import (
+    SourceConfigurationError,
+    SourceResponseError,
+    retry_call,
+)
 
 # OpenDART reuses these account IDs across multiple statement blocks.
 # Downstream consumers expect the canonical total row, so prefer the statement
@@ -289,7 +292,9 @@ def _period_end_from_report_code(business_year: int, report_code: str) -> date:
         "11012": (6, 30),
         "11014": (9, 30),
         "11011": (12, 31),
-    }.get(report_code, (12, 31))
+    }.get(report_code)
+    if month_day is None:
+        raise SourceResponseError(f"Unsupported OpenDART report code: {report_code}")
     return date(business_year, month_day[0], month_day[1])
 
 
