@@ -1191,6 +1191,8 @@ def test_price_loader_projects_raw_notional_without_adjusted_fill() -> None:
     assert rows[0]["raw_close"] == 113.0
     assert rows[0]["raw_notional"] is None
     assert "NULL::numeric AS raw_notional" in connection.price_sql
+    assert "JOIN core.symbol_master sm" in connection.price_sql
+    assert "JOIN mart.common_stock_universe_asof" not in connection.price_sql
 
 
 def test_raw_capability_requires_every_execution_row_not_any_row() -> None:
