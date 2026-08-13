@@ -504,6 +504,7 @@ export interface ReportSummary {
 export interface PersistedReportSection {
   id?: string;
   title?: string;
+  note?: string;
   body?: string;
   entries?: PersistedReportEntry[];
 }
@@ -512,6 +513,7 @@ export interface PersistedReportEntry {
   label?: string;
   value: string;
   depth: number;
+  description?: string;
 }
 
 export interface DailyDigestHeader {

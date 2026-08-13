@@ -56,6 +56,17 @@ test("metric and strategy explanations expose cautions and source links", async 
   assert.match(performance, /indicator\.source_refs/);
 });
 
+test("archived reports render only the reader-safe metric and replay evidence contract", async () => {
+  const reportDetail = await source("../src/features/reports/ReportDetail.tsx");
+
+  assert.match(reportDetail, /readerEvidenceSections/);
+  assert.match(reportDetail, /reproduction_contract/);
+  assert.match(reportDetail, /metric_registry/);
+  assert.match(reportDetail, /검증 · 재현 계약/);
+  assert.match(reportDetail, /section\.entries/);
+  assert.doesNotMatch(reportDetail, /implementation_source|implementation_path|price_rows|raw_rows/);
+});
+
 test("generated strategies stay visible as pre-backtest blueprints with derivations", async () => {
   const performance = await source("../src/features/app/PerformanceTab.tsx");
 

@@ -10,8 +10,19 @@ interface ReportDetailProps {
 }
 
 const SIGNALS: SignalType[] = ["BUY", "HOLD", "DROP"];
+const READER_EVIDENCE_SECTION_IDS = new Set(["reproduction_contract", "metric_registry"]);
+
+function readerEvidenceSections(report: ReportDetailType) {
+  return (report.contentSections ?? []).filter((section) => (
+    typeof section.id === "string"
+    && READER_EVIDENCE_SECTION_IDS.has(section.id)
+    && Array.isArray(section.entries)
+    && section.entries.length > 0
+  ));
+}
 
 export function ReportDetail({ report }: ReportDetailProps) {
+  const evidenceSections = readerEvidenceSections(report);
   return (
     <div className="report-detail-layout">
       <aside className="report-detail-side">
@@ -25,7 +36,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
         </Card>
         <Card className="toc-card">
           <strong>목차</strong>
-          {["헤더 · 메타", "시황 근거", "수집된 뉴스", "기록된 후보 종목", "신호 근거", "정리 · 성과 지표", "면책 · 거래비용"].map((item, index) => (
+          {["헤더 · 메타", "시황 근거", "수집된 뉴스", "기록된 후보 종목", "신호 근거", "정리 · 성과 지표", "검증 · 재현 계약", "면책 · 거래비용"].map((item, index) => (
             <span className={index === 0 ? "is-active" : ""} key={item}>
               <b>{String(index + 1).padStart(2, "0")}</b> {item}
             </span>
@@ -124,8 +135,31 @@ export function ReportDetail({ report }: ReportDetailProps) {
           </div>
         </Section>
 
+        {evidenceSections.length ? (
+          <Section title="검증 · 재현 계약" index="07">
+            <p>아래 계약은 이 보관 리포트의 지표 산출과 재현성을 확인하기 위한 읽기 전용 증적입니다. 투자 권유나 새 분석 실행을 뜻하지 않습니다.</p>
+            {evidenceSections.map((section) => (
+              <Card className="risk-manager" key={section.id}>
+                <strong>{section.title}</strong>
+                {section.note ? <p>{section.note}</p> : null}
+                <dl>
+                  {section.entries?.map((entry, index) => (
+                    <div key={`${section.id}-${entry.label ?? "entry"}-${index}`}>
+                      <dt>{entry.label ?? "검증 항목"}</dt>
+                      <dd>
+                        <code>{entry.value}</code>
+                        {entry.description ? <small>{entry.description}</small> : null}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+              </Card>
+            ))}
+          </Section>
+        ) : null}
+
         <section className="report-paper__section report-paper__section--cost">
-          <h2><span>07</span> 면책 · 거래비용 안내</h2>
+          <h2><span>{evidenceSections.length ? "08" : "07"}</span> 면책 · 거래비용 안내</h2>
           <ul>
             {report.costNotes.map((note) => (
               <li key={note}>{note}</li>
