@@ -750,10 +750,10 @@ class PostgresPipelineDataSource:
                 raw.close AS raw_close, raw.volume AS raw_volume,
                 NULL::numeric AS raw_notional
             FROM {KIS_ADJUSTED_OHLCV_TABLE} p
-            JOIN {PIT_UNIVERSE_VIEW} u
-              ON u.as_of_date = p.time AND u.symbol = p.ticker
+            JOIN core.symbol_master sm
+              ON sm.symbol = p.ticker
             LEFT JOIN core.ohlcv_daily raw
-              ON raw.symbol_id = u.symbol_id AND raw.trade_date = p.time
+              ON raw.symbol_id = sm.symbol_id AND raw.trade_date = p.time
             WHERE p.ticker = ANY(%s)
               AND p.time BETWEEN %s::date AND %s::date
             ORDER BY p.ticker, p.time
