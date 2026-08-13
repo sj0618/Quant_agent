@@ -18,7 +18,7 @@ from ai_graph.api import (
 )
 from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
-from ai_graph.jobs import InMemoryAnalysisJobStore
+from ai_graph.jobs import InMemoryAnalysisJobStore, JobStoreConfigurationError
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
 
 DATA_SOURCE_ENV_KEYS = (
@@ -142,19 +142,12 @@ def test_api_status_uses_database_url_alias_for_data_source(monkeypatch) -> None
     assert "secret" not in str(data_source)
 
 
-def test_api_status_reports_persistent_job_store_fallback(monkeypatch) -> None:
+def test_api_rejects_unconfigured_persistent_job_store(monkeypatch) -> None:
     monkeypatch.setenv("AI_JOB_STORE", "persistent")
     monkeypatch.delenv("AI_DATABASE_DSN", raising=False)
-    client = TestClient(create_app())
 
-    response = client.get(API_STATUS_PATH)
-
-    assert response.status_code == 200
-    job_store = response.json()["job_store"]
-    assert job_store["requested_mode"] == "persistent"
-    assert job_store["active_mode"] == "memory"
-    assert job_store["fallback"] is True
-    assert "AI_DATABASE_DSN" in job_store["fallback_reason"]
+    with pytest.raises(JobStoreConfigurationError, match="requires a configured database DSN"):
+        create_app()
 
 
 def test_api_status_activates_postgres_job_store_when_configured(monkeypatch) -> None:

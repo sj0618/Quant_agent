@@ -25,7 +25,6 @@ DATABASE_DSN_ENV_CANDIDATES = (
     DATABASE_URL_ENV,
 )
 AI_DEFAULT_TICKER_ENV = "AI_DEFAULT_TICKER"
-AI_BACKTEST_LOOKBACK_DAYS_ENV = "AI_BACKTEST_LOOKBACK_DAYS"
 AI_L4_EVIDENCE_LIMIT_ENV = "AI_L4_EVIDENCE_LIMIT"
 AI_DB_CONNECT_TIMEOUT_SECONDS_ENV = "AI_DB_CONNECT_TIMEOUT_SECONDS"
 AI_DB_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_STATEMENT_TIMEOUT_MS"
@@ -34,43 +33,22 @@ AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
-# Ten years, which is what the warehouse holds (2016-05-20 onwards). Briefly cut to
-# five while the real cause of the statement timeout was still unknown; that was the
-# wrong trade. A five-year window starting mid-2021 excludes the COVID crash entirely -
-# the most informative stress period available - and the database was never the
-# constraint: a server-side count over the full ten-year set takes ~1.0s. The cost was
-# transferring and building rows, which is an engineering problem and is fixed as one.
-DEFAULT_BACKTEST_LOOKBACK_YEARS = 10
-DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * DEFAULT_BACKTEST_LOOKBACK_YEARS
+# Backtests always use the five calendar years ending at the most recent KRX session
+# known at the KST cutoff.  This is deliberately a calendar window, not a tunable
+# number of bars: the manifest records the resolved sessions for reproducibility.
+BACKTEST_EVALUATION_YEARS = 5
+DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * BACKTEST_EVALUATION_YEARS
+BACKTEST_WINDOW_POLICY_ID = "krx_pit_common_stock_5y_kst_session_v1"
 DEFAULT_L4_EVIDENCE_LIMIT = 5
-# Screening can match hundreds of names; every extra ticker multiplies the price rows
-# pulled for the backtest (lookback_days each), so the pool is capped rather than
-# loading the whole match set.
+# A broad screen can match many names, but recommendations never define historical
+# membership. They are presentation output only.
 DEFAULT_BACKTEST_MAX_TICKERS = 20
-# Financial metrics we track a consecutive-rise count for (for "N quarters rising"
-# strategies). Computed sequentially per filing; see _fetch_financial_timeline.
 _STREAK_METRICS = ("revenue", "operating_income", "operating_margin", "roe")
-# 조건에 일치한 종목은 점수로 다시 줄이지 않고 모두 추천 결과에 남긴다.
 DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 20
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 30_000
-# The universe backtest load (200-name KOSPI200 price/momentum/financial history) is a
-# genuinely heavy analytical scan and needs a longer budget than a quick screening SELECT.
-# Expanding the backtest universe from ~20 to 200 names is what pushed it past the 30s
-# default and started timing out; screening queries keep the tight default.
+# A PIT KOSPI/KOSDAQ universe is substantially wider than a current large-cap proxy.
 DEFAULT_DB_BACKTEST_STATEMENT_TIMEOUT_MS = 120_000
 POSTGRES_TIMEOUT_UNIT = "ms"
-# Trading days to calendar days. The real ratio is 365/246 ~ 1.5; the old value of 3
-# asked for 20.7 years of date partitions to retrieve 10 years of bars, doubling the
-# partitions locked and scanned on the heaviest query in the pipeline for nothing.
-BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 1.55
-# Backtest universe, selected as of the START of the backtest window rather than today.
-BACKTEST_UNIVERSE_SIZE = 200
-# Ranking window ending at the backtest start. Long enough that one quiet month does not
-# decide membership, short enough to stay inside a couple of Timescale chunks.
-BACKTEST_UNIVERSE_RANKING_WINDOW_DAYS = 90
-# A name has to have actually traded through the ranking window to be in the universe;
-# this rejects names that were suspended or listed days before the cut.
-BACKTEST_UNIVERSE_MIN_BARS = 30
 RSI_OVERSOLD_THRESHOLD = 30.0
 # Sentinel profile whose WHERE clause is the permissive `close > 0` baseline: screening
 # selects the whole universe once and filters it per relaxation round in-process.
@@ -96,11 +74,8 @@ TA_MOMENTUM_TICKER_TABLE = "feature.ta_momentum_ticker_daily"
 TA_TREND_TICKER_TABLE = "feature.ta_trend_ticker_daily"
 TA_VOLATILITY_TICKER_TABLE = "feature.ta_volatility_ticker_daily"
 TA_VOLUME_TICKER_TABLE = "feature.ta_volume_ticker_daily"
-UNIVERSE_VIEW = "meta.view_common_stock_universe"
-# meta.view_common_stock_universe filters on core.symbol_master.listing_status, which is
-# currently bulk-broken upstream (see _resolve_ticker/_fetch_symbol_info/_screening_sql):
-# every symbol reads as 'delisted'. Universe membership is derived from symbol_master directly
-# (scoped to KOSPI/KOSDAQ common stock) or from which tickers actually have OHLCV rows, instead.
+PIT_UNIVERSE_VIEW = "mart.common_stock_universe_asof"
+SYMBOL_LISTING_HISTORY_TABLE = "core.symbol_listing_history"
 SYMBOL_MASTER_TABLE = "core.symbol_master"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
@@ -154,7 +129,6 @@ class DataSourceConfig(BaseModel):
     database_dsn: str | None = None
     database_dsn_env: str = AI_DATABASE_DSN_ENV
     default_ticker: str = Field(default=DEFAULT_BACKTEST_TICKER, min_length=6, max_length=6)
-    backtest_lookback_days: int = Field(default=DEFAULT_BACKTEST_LOOKBACK_DAYS, gt=0)
     l4_evidence_limit: int = Field(default=DEFAULT_L4_EVIDENCE_LIMIT, gt=0)
     connect_timeout_seconds: int = Field(default=DEFAULT_DB_CONNECT_TIMEOUT_SECONDS, gt=0)
     statement_timeout_ms: int = Field(default=DEFAULT_DB_STATEMENT_TIMEOUT_MS, gt=0)
@@ -171,9 +145,6 @@ class DataSourceConfig(BaseModel):
             database_dsn=database_dsn,
             database_dsn_env=database_dsn_env,
             default_ticker=env.get(AI_DEFAULT_TICKER_ENV, DEFAULT_BACKTEST_TICKER),
-            backtest_lookback_days=_int_env(
-                env, AI_BACKTEST_LOOKBACK_DAYS_ENV, DEFAULT_BACKTEST_LOOKBACK_DAYS
-            ),
             l4_evidence_limit=_int_env(
                 env, AI_L4_EVIDENCE_LIMIT_ENV, DEFAULT_L4_EVIDENCE_LIMIT
             ),
@@ -262,10 +233,19 @@ class PostgresPipelineDataSource:
                         "capability_probe": capability_availability,
                     },
                 )
+            backtest_window = self._resolve_backtest_window(conn)
+            if backtest_window is None:
+                raise PipelineDataUnavailableError(
+                    "pit_calendar_unavailable",
+                    "KRX trading-calendar sessions are unavailable for the fixed five-year backtest window",
+                )
             indicator_families = indicator_families_for_query(query)
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
-            universe_descriptor: dict[str, Any] = {"selection": "single_ticker"}
+            universe_descriptor: dict[str, Any] = {
+                "selection": "single_ticker",
+                "source": KIS_ADJUSTED_OHLCV_TABLE,
+            }
             recommended: list[str] = []
             ticker_resolution = "screening"
             already_screened = _query_requests_screening(query)
@@ -299,36 +279,25 @@ class PostgresPipelineDataSource:
                 else:
                     ticker_resolution = "explicit_or_name_match"
             if screening_mode:
-                # The matched names are the recommendation ("buy these today"). The
-                # backtest, though, runs over a liquidity-selected universe so build_signals
-                # can enter and exit per date across many names instead of replaying the
-                # past of whichever handful is at a high right now. Recommendation and
-                # backtest universe are deliberately different things.
-                # Only the strongest matches are folded into the backtest universe. The
-                # union used to take every recommended name, which is fine for a screen
-                # that matched a handful - but a query whose wording matches no profile
-                # falls to the baseline predicate `close > 0`, so every priced name
-                # matches. That made the "KOSPI 200 plus the recommendations" universe
-                # ~2,900 tickers and the price history ~3.6M rows, far past the statement
-                # budget. This is the single cause of the reported
-                # "데이터 조회 시간이 초과되었습니다".
+                # Current recommendations are output only. PIT membership is fixed by
+                # date and cannot be widened by a present-day screen.
                 recommended = _backtest_ticker_pool(
                     screening_candidates, self.config.backtest_max_tickers
                 )
                 tickers, universe_descriptor = self._fetch_backtest_universe(
-                    conn, recommended
+                    conn, backtest_window
                 )
                 if not tickers:
-                    raise ValueError("historical backtest universe is empty")
+                    raise PipelineDataUnavailableError(
+                        "pit_universe_empty",
+                        "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
+                    )
                 ticker = recommended[0] if recommended else tickers[0]
                 symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
-                # Widen the statement timeout for the universe price/momentum/financial
-                # scan - it is far heavier than the screening SELECTs above and 30s is not
-                # enough once the backtest universe is 200 names.
                 self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, symbol_info_by_ticker, query, indicator_families
+                    conn, tickers, symbol_info_by_ticker, query, backtest_window, indicator_families
                 )
                 self._set_statement_timeout(conn)
             elif single_ticker:
@@ -336,7 +305,7 @@ class PostgresPipelineDataSource:
                 tickers = [ticker]
                 symbol_info = self._fetch_symbol_info(conn, ticker)
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, {ticker: symbol_info}, query, indicator_families
+                    conn, tickers, {ticker: symbol_info}, query, backtest_window, indicator_families
                 )
             else:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
@@ -353,6 +322,10 @@ class PostgresPipelineDataSource:
                     "no_price_rows",
                     f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}",
                 )
+            raw_price_capabilities = _raw_price_capabilities(price_rows)
+            pit_members_without_price_rows = sorted(
+                set(tickers) - {str(row.get("ticker") or "").zfill(6) for row in price_rows}
+            )
             l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
@@ -373,9 +346,7 @@ class PostgresPipelineDataSource:
                 "tickers": tickers,
                 "recommended_tickers": recommended,
                 "recommendation_ticker": recommended[0] if recommended else None,
-                "backtest_universe": (
-                    "kospi_top_200_market_cap" if screening_mode else "explicit_ticker"
-                ),
+                "backtest_universe": universe_descriptor,
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [
@@ -386,15 +357,27 @@ class PostgresPipelineDataSource:
                     self.unavailable_indicator_families
                 ),
                 "price_rows": len(price_rows),
+                "pit_member_count": len(tickers),
+                "pit_members_without_price_rows": pit_members_without_price_rows,
+                "pit_members_without_price_row_count": len(pit_members_without_price_rows),
                 "screening_candidates": len(screening_candidates),
                 "screening_relaxation": screening_relaxation,
                 "backtest_lookback_days": effective_lookback_days,
+                "backtest_window_policy_id": BACKTEST_WINDOW_POLICY_ID,
+                "backtest_start_session": backtest_window["start"].isoformat(),
+                "backtest_end_session": backtest_window["end"].isoformat(),
+                "backtest_session_count": backtest_window["session_count"],
+                "universe_provenance": SYMBOL_LISTING_HISTORY_TABLE,
+                "raw_price_provenance": {
+                    "raw_ohlcv_source": "core.ohlcv_daily",
+                    "raw_notional_source": None,
+                    "adjusted_signal_source": KIS_ADJUSTED_OHLCV_TABLE,
+                },
+                "raw_price_capabilities": raw_price_capabilities,
+                "dart_date_only_effective_policy": "next_krx_session_v1",
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_rows": len(l4_evidence),
-                # The universe is no longer symbol_master's present-day ranking; the
-                # descriptor records the as-of date it was actually rebuilt for.
-                "universe_source": universe_descriptor.get("source", SYMBOL_MASTER_TABLE),
-                "backtest_universe": universe_descriptor,
+                "universe_source": universe_descriptor["source"],
                 "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
                 "macro_status": macro_status,
@@ -402,109 +385,29 @@ class PostgresPipelineDataSource:
         )
 
     def _fetch_backtest_universe(
-        self, conn: Any, recommended: Sequence[str]
+        self, conn: Any, window: Mapping[str, Any]
     ) -> tuple[list[str], dict[str, Any]]:
-        """The universe the backtest trades over, as it stood when the backtest starts.
-
-        The screen answers "which names meet the condition today"; using that as the
-        backtest universe means trading only the two stocks that happen to be at a
-        52-week high right now, then judging the strategy on their past - which is
-        look-ahead, since being at a high today is exactly "went up in the past". The
-        generated build_signals already decides entries per date from each stock's own
-        history, so it just needs a fixed, outcome-independent market to trade in.
-
-        That market used to be "the 200 largest KOSPI names by MKTCAP on symbol_master",
-        which is today's ranking applied to a ten-year-old start date - a pure
-        survivorship filter. Measured against a universe selected as of the start, it
-        overstated the ten-year return of the same strategy by 22-44 percentage points,
-        because every name in it is, by construction, one that survived to be large
-        today. It also could not be reproduced: symbol_master is bulk-rewritten daily,
-        so the same request returned a different universe and a materially different
-        headline from one day to the next.
-
-        The ranking is rebuilt here from the price history instead, over the 90 days
-        ending at the backtest start. That keeps names that later delisted, which is the
-        whole point, and it is stable because past bars do not change. Traded value
-        stands in for market cap: MKTCAP is a single present-day scalar with no history,
-        so it cannot be evaluated as of any earlier date.
-
-        The listing metadata cannot help here. `listing_status` is 'delisted' for all
-        3,238 rows, `delisted_at` is bulk-stamped to the load date, and every
-        symbol_listing_history delisted interval carries the same load timestamp - so
-        none of the three distinguishes a live name from a dead one. A name that has
-        bars through the ranking window was trading; that is the only signal left.
-
-        The strategy's recommended names are still unioned in so a recommendation stays
-        tradable. Those come from today's screen, so they do carry the look-ahead this
-        method otherwise removes; they are reported separately in the descriptor rather
-        than being folded in silently.
-        """
-
-        lookback_days = self.config.backtest_lookback_days
-        calendar_lookback_days = int(
-            lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
-        )
-        universe, as_of, window_days = self._rank_universe_as_of(
-            conn, calendar_lookback_days
-        )
-        seen = set(universe)
-        # Recommended names first, then the ranked universe, so a recommendation is
-        # never dropped for sitting outside the cut.
-        extra = [t for t in (str(x).zfill(6) for x in recommended) if t not in seen]
-        descriptor = {
-            "selection": "traded_value_as_of_backtest_start",
-            "as_of": as_of.isoformat() if as_of else None,
-            "ranking_window_days": window_days,
-            "ranked_size": len(universe),
-            "recommended_unioned": len(extra),
-            "source": KIS_ADJUSTED_OHLCV_TABLE,
-        }
-        return [*extra, *universe], descriptor
-
-    def _rank_universe_as_of(
-        self, conn: Any, calendar_lookback_days: int
-    ) -> tuple[list[str], date | None, int]:
-        """Top names by traded value over the window ending at the backtest start.
-
-        The requested start is normally earlier than the warehouse goes: a ten-year
-        lookback resolves to 2015-11 against data that begins 2016-05. The as-of date is
-        therefore clamped forward to the first date with a full ranking window behind
-        it, so an over-long lookback yields the earliest universe that can be ranked
-        rather than an empty one. Ranking today's numbers instead is not an option -
-        that is the survivorship defect this replaces.
-        """
-
-        window_days = BACKTEST_UNIVERSE_RANKING_WINDOW_DAYS
+        """Return the lifecycle-backed common-stock universe for the fixed PIT window."""
         rows = conn.execute(
             f"""
-            WITH bounds AS (
-                SELECT GREATEST(
-                         CURRENT_DATE - make_interval(days => %s),
-                         (SELECT min(time) FROM {KIS_ADJUSTED_OHLCV_TABLE})
-                           + make_interval(days => %s)
-                       )::date AS as_of
-            )
-            SELECT split_part(o.ticker, '#', 1) AS symbol,
-                   min(b.as_of) AS as_of
-            FROM {KIS_ADJUSTED_OHLCV_TABLE} o
-            CROSS JOIN bounds b
-            WHERE o.time >= b.as_of - make_interval(days => %s)
-              AND o.time <  b.as_of
-            GROUP BY 1
-            HAVING count(*) >= %s
-            ORDER BY avg(o.adj_close * o.adj_volume) DESC NULLS LAST
-            LIMIT %s
+            SELECT DISTINCT symbol
+            FROM {PIT_UNIVERSE_VIEW}
+            WHERE as_of_date BETWEEN %s::date AND %s::date
+            ORDER BY symbol
             """,
-            [
-                calendar_lookback_days,
-                window_days,
-                window_days,
-                BACKTEST_UNIVERSE_MIN_BARS,
-                BACKTEST_UNIVERSE_SIZE,
-            ],
+            [window["start"], window["end"]],
         ).fetchall()
-        as_of = _date_value(rows[0]["as_of"]) if rows else None
-        return [str(row["symbol"]).zfill(6) for row in rows], as_of, window_days
+        universe = [str(row["symbol"]).zfill(6) for row in rows]
+        return universe, {
+            "selection": "lifecycle_pit_common_stock_window",
+            "as_of_start": window["start"].isoformat(),
+            "as_of_end": window["end"].isoformat(),
+            "session_count": window["session_count"],
+            "member_count": len(universe),
+            "source": PIT_UNIVERSE_VIEW,
+            "listing_provenance": SYMBOL_LISTING_HISTORY_TABLE,
+            "security_type": "보통주",
+        }
 
     def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
         return self._screen_with_relaxation(conn, query)[0]
@@ -512,13 +415,7 @@ class PostgresPipelineDataSource:
     def _screen_via_llm(
         self, conn: Any, query: str
     ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
-        """Let the model write the screen against the real schema.
-
-        Returns None when that path is unavailable - no live provider, or it could not
-        produce a usable query - so screening falls back to the deterministic profiles
-        rather than failing the analysis.
-        """
-
+        """Use LLM screening when available, otherwise fall back to deterministic SQL."""
         try:
             from ai_graph.data_sources.llm_screen import screen_with_llm
 
@@ -835,74 +732,35 @@ class PostgresPipelineDataSource:
         tickers: Sequence[str],
         symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
         query: str,
+        window: Mapping[str, Any],
         indicator_families: Sequence[str] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
-        lookback_days = self.config.backtest_lookback_days
-        price_rows = self._fetch_price_rows_for_lookback(
-            conn, tickers, symbol_info_by_ticker, lookback_days, indicator_families
-        )
-        if (
-            _query_requires_rsi_oversold(query)
-            and lookback_days < DEFAULT_BACKTEST_LOOKBACK_DAYS
-            and not _has_rsi_oversold_entry(price_rows)
-        ):
-            lookback_days = DEFAULT_BACKTEST_LOOKBACK_DAYS
-            price_rows = self._fetch_price_rows_for_lookback(
-                conn, tickers, symbol_info_by_ticker, lookback_days, indicator_families
-            )
-        return price_rows, lookback_days
-
-    def _fetch_price_rows_for_lookback(
-        self,
-        conn: Any,
-        tickers: Sequence[str],
-        symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
-        lookback_days: int,
-        indicator_families: Sequence[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        calendar_lookback_days = int(
-            lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
-        )
+        del query
         ticker_list = list(tickers)
-        # Every ticker shares one trading calendar, so the lookback is a date, resolved
-        # once. It used to be a per-ticker row_number() rank, which sorted all ~455k rows
-        # to apply a cap that never bound - a ten-year request against tickers that have
-        # 2499 trading days. Resolving the floor also makes it a bind parameter rather
-        # than `CURRENT_DATE - make_interval(days => %s)`, which is not a plan-time
-        # constant and so blocks partition pruning.
-        date_floor = self._resolve_backtest_date_floor(
-            conn, lookback_days, calendar_lookback_days
-        )
-        if date_floor is None:
-            return []
         rows = conn.execute(
-            """
+            f"""
             SELECT
-                time AS as_of_date,
-                ticker,
-                adj_open AS open,
-                adj_high AS high,
-                adj_low AS low,
-                adj_close AS close,
-                adj_volume AS volume
-            FROM feature.kis_adjusted_ohlcv_daily
-            WHERE ticker = ANY(%s)
-              AND time >= %s::date
-            ORDER BY ticker, time
+                p.time AS as_of_date, p.ticker,
+                p.adj_open AS open, p.adj_high AS high, p.adj_low AS low,
+                p.adj_close AS close, p.adj_volume AS volume,
+                p.adj_open AS adjusted_open, p.adj_high AS adjusted_high,
+                p.adj_low AS adjusted_low, p.adj_close AS adjusted_close,
+                p.adj_volume AS adjusted_volume,
+                raw.open AS raw_open, raw.high AS raw_high, raw.low AS raw_low,
+                raw.close AS raw_close, raw.volume AS raw_volume,
+                NULL::numeric AS raw_notional
+            FROM {KIS_ADJUSTED_OHLCV_TABLE} p
+            JOIN {PIT_UNIVERSE_VIEW} u
+              ON u.as_of_date = p.time AND u.symbol = p.ticker
+            LEFT JOIN core.ohlcv_daily raw
+              ON raw.symbol_id = u.symbol_id AND raw.trade_date = p.time
+            WHERE p.ticker = ANY(%s)
+              AND p.time BETWEEN %s::date AND %s::date
+            ORDER BY p.ticker, p.time
             """,
-            [ticker_list, date_floor],
+            [ticker_list, window["start"], window["end"]],
         ).fetchall()
-        # Indicators are only ever read for dates that have a price bar, and the price
-        # query above already capped itself at `lookback_days` rows per ticker. Asking
-        # the indicator tables for the raw calendar window instead means asking for
-        # 2520 x 3 = 7560 days - twenty years of date partitions per table - to return
-        # the same handful of years the prices actually cover. With one indicator table
-        # that was merely wasteful; with four it exceeded the statement budget outright
-        # and surfaced as "데이터 조회 시간이 초과되었습니다. 조건을 좁혀 다시 시도해
-        # 주세요", which blamed the user's conditions for our own query shape.
-        earliest_priced_date = min(
-            (_date_value(row["as_of_date"]) for row in rows), default=None
-        )
+        earliest_priced_date = min((_date_value(row["as_of_date"]) for row in rows), default=None)
         families = indicator_families or tuple(INDICATOR_TABLES)
         indicators_by_family: dict[str, dict[str, dict[date, Mapping[str, Any]]]] = {}
         unavailable_families: list[str] = []
@@ -912,16 +770,9 @@ class PostgresPipelineDataSource:
                     conn, INDICATOR_TABLES[family], ticker_list, earliest_priced_date
                 )
             except Exception:
-                # One family failing must not lose the whole analysis: the bars simply
-                # arrive without it, conditions on it do not match, and the gap is
-                # recorded rather than presented as a result. The reason is logged in
-                # full - naming a presumed cause here hid a plain SQL syntax error
-                # behind "statement budget" for as long as this handler existed.
                 _logger.exception("indicator family %s could not be loaded", family)
                 self._rollback_quietly(conn)
-                self._set_statement_timeout(
-                    conn, self.config.backtest_statement_timeout_ms
-                )
+                self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
                 unavailable_families.append(family)
         self.unavailable_indicator_families = tuple(unavailable_families)
         financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
@@ -929,19 +780,15 @@ class PostgresPipelineDataSource:
             _price_row_from_feature_frame_record(
                 _feature_frame_row_from_sources(
                     row,
-                    {
-                        family: by_ticker.get(
-                            str(row.get("ticker") or "").zfill(6), {}
-                        )
-                        for family, by_ticker in indicators_by_family.items()
-                    },
+                    {family: by_ticker.get(str(row.get("ticker") or "").zfill(6), {})
+                     for family, by_ticker in indicators_by_family.items()},
                     symbol_info_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
                 )
             )
             for row in rows
         ]
         _attach_pointintime_financials(price_rows, financials_by_ticker)
-        return price_rows
+        return price_rows, int(window["session_count"])
 
     def _fetch_financial_timeline(
         self, conn: Any, tickers: Sequence[str]
@@ -1026,26 +873,35 @@ class PostgresPipelineDataSource:
                     previous[metric] = value
         return timelines
 
-    def _resolve_backtest_date_floor(
-        self, conn: Any, lookback_days: int, calendar_lookback_days: int
-    ) -> date | None:
-        """The date `lookback_days` trading sessions back, from the calendar itself."""
-
+    def _resolve_backtest_window(self, conn: Any) -> dict[str, Any] | None:
+        """Resolve the exact five-calendar-year KST-KRX session window once."""
         row = conn.execute(
             """
-            SELECT min(time) AS date_floor
-            FROM (
-                SELECT DISTINCT time
-                FROM feature.kis_adjusted_ohlcv_daily
-                WHERE time >= CURRENT_DATE - make_interval(days => %s)
-                ORDER BY time DESC
-                LIMIT %s
-            ) sessions
-            """,
-            [calendar_lookback_days, lookback_days],
+            WITH cutoff AS (
+                SELECT max(trade_date) AS session_end
+                FROM core.trading_calendar
+                WHERE is_open
+                  AND trade_date <= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
+            ), sessions AS (
+                SELECT c.trade_date
+                FROM core.trading_calendar c
+                CROSS JOIN cutoff
+                WHERE c.is_open
+                  AND c.trade_date BETWEEN cutoff.session_end - INTERVAL '5 years' AND cutoff.session_end
+            )
+            SELECT min(trade_date) AS session_start,
+                   max(trade_date) AS session_end,
+                   count(*) AS session_count
+            FROM sessions
+            """
         ).fetchone()
-        value = row.get("date_floor") if row else None
-        return _date_value(value) if value is not None else None
+        if not row or not row.get("session_start") or not row.get("session_end"):
+            return None
+        return {
+            "start": _date_value(row["session_start"]),
+            "end": _date_value(row["session_end"]),
+            "session_count": int(row["session_count"]),
+        }
 
     def _resolve_indicator_ticker_keys(
         self, conn: Any, table: str, tickers: Sequence[str]
@@ -1287,6 +1143,7 @@ class PostgresPipelineDataSource:
         }
 
 
+
 def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -1298,20 +1155,22 @@ def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle
 
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
+    """Return an explicitly labelled local fixture; configured DB failures never use it."""
     return PipelineDataBundle(
         data_availability=_data_availability_for_query(query, source="fixture"),
         metadata={
             "source": "fixture",
             "reason": reason,
+            "production_eligible": False,
             "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),
             "available_db_objects": [
                 KIS_FEATURE_FRAME_VIEW,
                 KIS_ADJUSTED_OHLCV_TABLE,
                 TA_MOMENTUM_TICKER_TABLE,
-                UNIVERSE_VIEW,
+                PIT_UNIVERSE_VIEW,
                 ANALYST_REPORT_TABLE,
             ],
-        }
+        },
     )
 
 
@@ -2499,12 +2358,59 @@ def _attach_pointintime_financials(
         current: dict[str, float] = {}
         for row in rows:
             row_date = _date_value(row.get("date"))
-            while pointer < len(filings) and filings[pointer]["filed"] <= row_date:
+            # DART receipt numbers are date-only. EOD signals may not use a filing on
+            # the same date; it becomes eligible only on the following KRX session.
+            while pointer < len(filings) and filings[pointer]["filed"] < row_date:
                 current = filings[pointer]["ratios"]
                 pointer += 1
             for metric, value in current.items():
                 row.setdefault(metric, value)
 
+
+def _raw_price_capabilities(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    required_ohlcv = ("raw_open", "raw_high", "raw_low", "raw_close", "raw_volume")
+    missing_ohlcv_rows = [
+        {
+            "date": str(row.get("date") or ""),
+            "ticker": str(row.get("ticker") or "").zfill(6),
+            "missing_fields": [field for field in required_ohlcv if row.get(field) is None],
+        }
+        for row in rows
+        if any(row.get(field) is None for field in required_ohlcv)
+    ]
+    missing_notional_rows = [
+        {"date": str(row.get("date") or ""), "ticker": str(row.get("ticker") or "").zfill(6)}
+        for row in rows
+        if row.get("raw_notional") is None
+    ]
+    raw_ohlcv = bool(rows) and not missing_ohlcv_rows
+    raw_notional = bool(rows) and not missing_notional_rows
+    if not raw_ohlcv:
+        return {
+            "raw_ohlcv": False,
+            "raw_notional": False,
+            "reason_code": "raw_ohlcv_source_missing_or_uncovered",
+            "reason": "Required raw OHLCV coverage is incomplete; no adjusted values were substituted.",
+            "missing_raw_ohlcv_rows": missing_ohlcv_rows,
+            "missing_raw_notional_rows": missing_notional_rows,
+        }
+    if not raw_notional:
+        return {
+            "raw_ohlcv": True,
+            "raw_notional": False,
+            "reason_code": "raw_notional_source_missing_or_uncovered",
+            "reason": "Required verified raw traded-value coverage is incomplete; capacity must not be claimed.",
+            "missing_raw_ohlcv_rows": [],
+            "missing_raw_notional_rows": missing_notional_rows,
+        }
+    return {
+        "raw_ohlcv": True,
+        "raw_notional": True,
+        "reason_code": None,
+        "reason": None,
+        "missing_raw_ohlcv_rows": [],
+        "missing_raw_notional_rows": [],
+    }
 
 def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, Any]:
     trade_date = _date_value(row["as_of_date"]).isoformat()
@@ -2518,6 +2424,17 @@ def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, An
         "low": _float_value(row["low"]),
         "close": _float_value(row["close"]),
         "volume": _float_value(row["volume"]),
+        "adjusted_open": _float_value(row.get("adjusted_open", row["open"])),
+        "adjusted_high": _float_value(row.get("adjusted_high", row["high"])),
+        "adjusted_low": _float_value(row.get("adjusted_low", row["low"])),
+        "adjusted_close": _float_value(row.get("adjusted_close", row["close"])),
+        "adjusted_volume": _float_value(row.get("adjusted_volume", row["volume"])),
+        "raw_open": _optional_float_value(row.get("raw_open")),
+        "raw_high": _optional_float_value(row.get("raw_high")),
+        "raw_low": _optional_float_value(row.get("raw_low")),
+        "raw_close": _optional_float_value(row.get("raw_close")),
+        "raw_volume": _optional_float_value(row.get("raw_volume")),
+        "raw_notional": _optional_float_value(row.get("raw_notional")),
     }
     _merge_metric_values(price_row, row)
     rsi = _find_metric_value(row.get("momentum_values"), RSI_KEYS, contains="rsi")

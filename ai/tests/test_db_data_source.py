@@ -1,7 +1,7 @@
 import os
 from datetime import date
 from decimal import Decimal
-from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +16,8 @@ from ai_graph.data_sources.db import (
     QUANT_DB_DSN_ENV,
     RSI_OVERSOLD_THRESHOLD,
     ScreeningThresholds,
+    _attach_pointintime_financials,
+    _raw_price_capabilities,
     _price_row_from_feature_frame_record,
     _relaxed_thresholds,
     _mart_frame_sql,
@@ -101,6 +103,12 @@ class FakeScreeningConnection:
             return FakeResult(row={"present": not missing})
         if "DISTINCT sm.sector" in query or "DISTINCT sector" in query:
             return FakeResult(rows=[{"sector": s} for s in self.sectors])
+        if "session_start" in query and "session_count" in query:
+            return FakeResult(row={
+                "session_start": date(2021, 5, 20),
+                "session_end": AS_OF,
+                "session_count": 1_230,
+            })
         if "max(time) AS as_of_date" in query:
             return FakeResult(row={"as_of_date": AS_OF})
         if "max(time) AS previous_date" in query:
@@ -128,6 +136,8 @@ class FakeScreeningConnection:
                 }
                 for row in self.frame_rows
             ])
+        if "FROM mart.common_stock_universe_asof" in query and "SELECT DISTINCT symbol" in query:
+            return FakeResult(rows=[{"symbol": row["ticker"]} for row in self.frame_rows])
         if "mart.dart_financial_asof" in query:
             return FakeResult(rows=[])
         if "MKTCAP" in query:
@@ -194,22 +204,15 @@ def default_frame_row(**overrides):
     return row
 
 
-def test_pipeline_data_source_uses_fixture_boundary_without_dsn(monkeypatch) -> None:
+def test_pipeline_data_source_without_dsn_uses_explicit_nonproduction_fixture(monkeypatch) -> None:
     monkeypatch.delenv(AI_DATABASE_DSN_ENV, raising=False)
     monkeypatch.delenv(QUANT_DB_DSN_ENV, raising=False)
     monkeypatch.delenv(DATABASE_URL_ENV, raising=False)
 
     bundle = load_pipeline_data_from_env("RSI가 30 이하인 KOSPI200", "trace-db")
 
-    assert bundle.price_rows == []
-    assert bundle.l4_evidence == []
     assert bundle.metadata["source"] == "fixture"
-    assert bundle.metadata["dsn_env_candidates"] == [
-        AI_DATABASE_DSN_ENV,
-        QUANT_DB_DSN_ENV,
-        DATABASE_URL_ENV,
-    ]
-    assert "mart.kis_adjusted_feature_frame_asof" in bundle.metadata["available_db_objects"]
+    assert bundle.metadata["production_eligible"] is False
 
 
 def test_configured_database_failure_is_not_replaced_with_fixture(monkeypatch) -> None:
@@ -310,6 +313,12 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
 
         def execute(self, query: str, params: list[object] | None = None) -> Result:
             self.calls.append((query, params))
+            if "session_start" in query and "session_count" in query:
+                return Result(row={
+                    "session_start": date(2021, 5, 20),
+                    "session_end": AS_OF,
+                    "session_count": 1_230,
+                })
             if "AS present" in query:
                 return Result(row={"present": True})
             if "min(time) AS date_floor" in query:
@@ -382,10 +391,10 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
     price_query = next(
         query
         for query, _ in source.conn.calls
-        if "WHERE ticker = ANY(%s)" in query
+        if "WHERE p.ticker = ANY(%s)" in query
     )
-    assert "time >= %s::date" in price_query
-    assert "ORDER BY ticker, time" in price_query
+    assert "p.time BETWEEN %s::date AND %s::date" in price_query
+    assert "ORDER BY p.ticker, p.time" in price_query
 
 
 def test_postgres_data_source_broad_screening_uses_screening_candidates() -> None:
@@ -574,7 +583,7 @@ def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     assert bundle.metadata["price_source"] == "feature.kis_adjusted_ohlcv_daily"
     assert "feature.ta_momentum_ticker_daily" in bundle.metadata["indicator_sources"]
     assert bundle.metadata["l4_evidence_source"] == "raw.analyst_report_summary"
-    assert bundle.metadata["backtest_lookback_days"] >= DEFAULT_BACKTEST_LOOKBACK_DAYS
+    assert bundle.metadata["backtest_window_policy_id"] == "krx_pit_common_stock_5y_kst_session_v1"
     assert any(row.get("rsi", 100) <= RSI_OVERSOLD_THRESHOLD for row in bundle.price_rows)
 
 
@@ -620,6 +629,12 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
             # The frame loader anchors on the price table before anything else; with no
             # date it short-circuits, which would hide the duplicate-screen bug this
             # test is about.
+            if "session_start" in query and "session_count" in query:
+                return Result([{
+                    "session_start": date(2021, 7, 30),
+                    "session_end": date(2026, 7, 30),
+                    "session_count": 1_230,
+                }])
             if "max(time) AS as_of_date" in query:
                 return Result([{"as_of_date": date(2026, 7, 30)}])
             if "AS present" in query:
@@ -631,10 +646,10 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
             return connection
 
         def _fetch_backtest_universe(
-            self, _conn: object, recommended: list[str]
+            self, _conn: object, window: dict[str, object]
         ) -> tuple[list[str], dict[str, object]]:
-            assert recommended == []
-            return ["000660"], {"selection": "stub"}
+            assert window["start"] == date(2021, 7, 30)
+            return ["000660"], {"selection": "stub", "source": "mart.common_stock_universe_asof"}
 
         def _fetch_symbol_info_map(
             self, _conn: object, tickers: list[str]
@@ -647,6 +662,7 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
             tickers: list[str],
             _symbol_info: object,
             _query: str,
+            _window: object,
             _indicator_families: object | None = None,
         ) -> tuple[list[dict[str, object]], int]:
             return [
@@ -914,79 +930,62 @@ def test_backtest_universe_caps_the_recommended_names_it_folds_in() -> None:
     assert pool[0] == "002763"
 
 
-def _universe_source():
-    from ai_graph.data_sources.db import PostgresPipelineDataSource
-
-    source = PostgresPipelineDataSource.__new__(PostgresPipelineDataSource)
-    source.config = SimpleNamespace(backtest_lookback_days=2520)
-    return source
-
-
-def test_backtest_universe_is_ranked_as_of_the_start_not_today() -> None:
-    """Today's market cap ranking applied to a ten-year-old start date is survivorship.
-
-    Every name in a present-day top-200 is one that survived to be large today, so the
-    strategy is only ever tested on winners. Measured against a universe selected as of
-    the start, that overstated the same strategy's ten-year return by 22-44 percentage
-    points. The ranking has to be rebuilt from bars that existed at the start.
-    """
-
+def test_backtest_universe_is_lifecycle_pit_bounded_to_fixed_window() -> None:
     conn = FakeScreeningConnection()
+    window = {"start": date(2021, 8, 12), "end": date(2026, 8, 11), "session_count": 1_229}
 
-    universe, descriptor = _universe_source()._fetch_backtest_universe(conn, [])
+    universe, descriptor = PostgresPipelineDataSource(
+        DataSourceConfig(database_dsn="postgresql://example")
+    )._fetch_backtest_universe(conn, window)
 
     assert universe == ["000660"]
-    assert descriptor["selection"] == "traded_value_as_of_backtest_start"
-    assert descriptor["source"] == "feature.kis_adjusted_ohlcv_daily"
+    assert descriptor == {
+        "selection": "lifecycle_pit_common_stock_window",
+        "as_of_start": "2021-08-12",
+        "as_of_end": "2026-08-11",
+        "session_count": 1_229,
+        "member_count": 1,
+        "source": "mart.common_stock_universe_asof",
+        "listing_provenance": "core.symbol_listing_history",
+        "security_type": "보통주",
+    }
 
-    ranking_query = next(
-        query for query, _ in conn.calls if "WITH bounds AS" in query
+    universe_query = next(
+        query for query, _ in conn.calls if "FROM mart.common_stock_universe_asof" in query
     )
-    # symbol_master's MKTCAP is a single present-day scalar with no history, so it
-    # cannot be evaluated as of an earlier date and must not appear here.
-    assert "MKTCAP" not in ranking_query
-    assert "symbol_master" not in ranking_query
-    # The window has to end at the backtest start, not at today.
-    assert "CURRENT_DATE - make_interval(days => %s)" in ranking_query
+    assert "MKTCAP" not in universe_query
+    assert "symbol_master" not in universe_query
+    assert "kis_adjusted_feature_frame_asof" not in universe_query
 
 
-def test_backtest_universe_clamps_an_as_of_date_that_predates_the_warehouse() -> None:
-    """A ten-year lookback resolves to 2015-11 against data that starts 2016-05.
-
-    Left alone that returns nothing and the backtest silently runs on the recommended
-    names only. Falling back to today's ranking instead would reintroduce exactly the
-    bias this replaces, so the as-of date is clamped forward to the first date with a
-    full ranking window behind it.
-    """
-
+def test_backtest_universe_uses_explicit_as_of_window_not_current_date() -> None:
     conn = FakeScreeningConnection()
+    window = {"start": date(2021, 8, 12), "end": date(2026, 8, 11), "session_count": 1_229}
 
-    _universe_source()._fetch_backtest_universe(conn, [])
+    PostgresPipelineDataSource(
+        DataSourceConfig(database_dsn="postgresql://example")
+    )._fetch_backtest_universe(conn, window)
 
-    ranking_query = next(
-        query for query, _ in conn.calls if "WITH bounds AS" in query
+    query, params = next(
+        (query, params) for query, params in conn.calls
+        if "FROM mart.common_stock_universe_asof" in query
     )
-    assert "GREATEST" in ranking_query
-    assert f"SELECT min(time) FROM feature.kis_adjusted_ohlcv_daily" in ranking_query
+    assert "CURRENT_DATE" not in query
+    assert params == [window["start"], window["end"]]
 
 
-def test_backtest_universe_unions_recommendations_without_duplicating_them() -> None:
-    """A recommended name stays tradable, but never appears twice."""
+def test_backtest_universe_does_not_expand_with_current_recommendations() -> None:
+    class Connection:
+        def execute(self, _query: str, _params: object) -> FakeResult:
+            return FakeResult(rows=[{"symbol": "000660"}])
 
-    source = _universe_source()
+    window = {"start": date(2021, 8, 12), "end": date(2026, 8, 11), "session_count": 1_229}
+    universe, descriptor = PostgresPipelineDataSource(
+        DataSourceConfig(database_dsn="postgresql://example")
+    )._fetch_backtest_universe(Connection(), window)
 
-    inside, inside_descriptor = source._fetch_backtest_universe(
-        FakeScreeningConnection(), ["000660"]
-    )
-    outside, outside_descriptor = source._fetch_backtest_universe(
-        FakeScreeningConnection(), ["999999"]
-    )
-
-    assert inside == ["000660"]
-    assert inside_descriptor["recommended_unioned"] == 0
-    assert outside == ["999999", "000660"]
-    assert outside_descriptor["recommended_unioned"] == 1
-
+    assert universe == ["000660"]
+    assert descriptor["member_count"] == 1
 
 def test_screening_frame_does_not_read_the_mart_view() -> None:
     """The one-date frame must not go through mart.kis_adjusted_feature_frame_asof.
@@ -1053,3 +1052,164 @@ def test_screening_date_bound_is_a_plan_time_constant() -> None:
     assert "CURRENT_DATE" not in query
     assert "%(floor)s::date" in query
     assert isinstance(params["floor"], date)
+def test_fixed_window_uses_kst_calendar_sessions_and_manifest_values() -> None:
+    class Connection:
+        def __init__(self) -> None:
+            self.query = ""
+
+        def execute(self, query: str) -> FakeResult:
+            self.query = query
+            return FakeResult(row={
+                "session_start": date(2021, 8, 12),
+                "session_end": date(2026, 8, 11),
+                "session_count": 1_229,
+            })
+
+    connection = Connection()
+    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+    window = source._resolve_backtest_window(connection)
+
+    assert window == {"start": date(2021, 8, 12), "end": date(2026, 8, 11), "session_count": 1_229}
+    assert "Asia/Seoul" in connection.query
+    assert "INTERVAL '5 years'" in connection.query
+    assert "feature.kis_adjusted_ohlcv_daily" not in connection.query
+
+
+
+def test_future_append_cannot_expand_the_bounded_pit_universe() -> None:
+    class Connection:
+        def __init__(self) -> None:
+            self.query = ""
+            self.params: object = None
+
+        def execute(self, query: str, params: object) -> FakeResult:
+            self.query, self.params = query, params
+            return FakeResult(rows=[{"symbol": "000001"}, {"symbol": "000002"}])
+
+    connection = Connection()
+    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+    window = {"start": date(2021, 8, 12), "end": date(2026, 8, 11), "session_count": 1_229}
+
+    universe, descriptor = source._fetch_backtest_universe(connection, window)
+    assert universe == ["000001", "000002"]
+    assert descriptor["member_count"] == 2
+    assert "mart.common_stock_universe_asof" in connection.query
+    assert "MKTCAP" not in connection.query
+    assert "symbol_master" not in connection.query
+    assert "kis_adjusted_feature_frame_asof" not in connection.query
+    assert connection.params == [window["start"], window["end"]]
+
+
+def test_date_only_dart_filing_is_not_visible_until_next_session() -> None:
+    rows = [
+        {"ticker": "005930", "date": "2026-05-20"},
+        {"ticker": "005930", "date": "2026-05-21"},
+    ]
+    _attach_pointintime_financials(
+        rows,
+        {"005930": [{"filed": date(2026, 5, 20), "ratios": {"roe": 0.1}}]},
+    )
+
+    assert "roe" not in rows[0]
+    assert rows[1]["roe"] == 0.1
+
+
+def test_price_rows_separate_adjusted_and_raw_fields_when_raw_is_available() -> None:
+    row = default_frame_row(
+        as_of_date=AS_OF,
+        open=Decimal("100"), high=Decimal("105"), low=Decimal("99"),
+        close=Decimal("103"), volume=Decimal("1000"),
+        adjusted_open=Decimal("100"), adjusted_high=Decimal("105"),
+        adjusted_low=Decimal("99"), adjusted_close=Decimal("103"), adjusted_volume=Decimal("1000"),
+        raw_open=Decimal("110"), raw_high=Decimal("115"), raw_low=Decimal("109"),
+        raw_close=Decimal("113"), raw_volume=Decimal("900"), raw_notional=Decimal("101700"),
+        momentum_values={}, trend_values={}, volatility_values={}, volume_values={}, pattern_values={},
+    )
+
+    mapped = _price_row_from_feature_frame_record(row)
+    assert mapped["adjusted_close"] == 103.0
+    assert mapped["raw_close"] == 113.0
+    assert mapped["raw_volume"] == 900.0
+    assert mapped["raw_notional"] == 101700.0
+    assert _raw_price_capabilities([mapped])["raw_notional"] is True
+
+
+def test_pit_view_requires_listing_history_provenance() -> None:
+    sql = (Path(__file__).parents[2] / "DE/migrations/007_common_stock_mart_views.sql").read_text(
+        encoding="utf-8"
+    )
+    assert "JOIN core.symbol_listing_history lh" in sql
+    assert "FROM core.trading_calendar c" in sql
+    assert "c.trade_date AS as_of_date" in sql
+    assert "sm.security_type = '보통주'" in sql
+    assert "FROM mart.kis_adjusted_feature_frame_asof f" not in sql.split(
+        "CREATE OR REPLACE VIEW mart.common_stock_feature_frame_asof"
+    )[0]
+    assert "sm.listing_status" not in sql
+
+
+def test_raw_source_missing_has_reason_coded_no_fill_capability() -> None:
+    capabilities = _raw_price_capabilities([
+        {"raw_open": None, "raw_close": None, "raw_volume": None, "raw_notional": None}
+    ])
+
+    assert capabilities["raw_ohlcv"] is False
+    assert capabilities["raw_notional"] is False
+    assert capabilities["reason_code"] == "raw_ohlcv_source_missing_or_uncovered"
+
+
+def test_price_loader_projects_raw_notional_without_adjusted_fill() -> None:
+    class Connection:
+        def __init__(self) -> None:
+            self.price_sql = ""
+
+        def execute(self, query: str, _params: object = None) -> FakeResult:
+            if "AS raw_notional" in query:
+                self.price_sql = query
+                return FakeResult(rows=[{
+                    "as_of_date": AS_OF, "ticker": "000660",
+                    "open": Decimal("100"), "high": Decimal("105"), "low": Decimal("99"),
+                    "close": Decimal("103"), "volume": Decimal("1000"),
+                    "adjusted_open": Decimal("100"), "adjusted_high": Decimal("105"),
+                    "adjusted_low": Decimal("99"), "adjusted_close": Decimal("103"),
+                    "adjusted_volume": Decimal("1000"),
+                    "raw_open": Decimal("110"), "raw_high": Decimal("115"), "raw_low": Decimal("109"),
+                    "raw_close": Decimal("113"), "raw_volume": Decimal("900"), "raw_notional": None,
+                }])
+            return FakeResult(rows=[])
+
+        def rollback(self) -> None:
+            return None
+
+    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+    connection = Connection()
+    rows, _ = source._fetch_price_rows(
+        connection, ["000660"], {"000660": {}}, "RSI",
+        {"start": AS_OF, "end": AS_OF, "session_count": 1}, (),
+    )
+
+    assert rows[0]["raw_close"] == 113.0
+    assert rows[0]["raw_notional"] is None
+    assert "NULL::numeric AS raw_notional" in connection.price_sql
+
+
+def test_raw_capability_requires_every_execution_row_not_any_row() -> None:
+    capabilities = _raw_price_capabilities([
+        {
+            "date": "2026-01-02", "ticker": "000001", "raw_open": 10.0,
+            "raw_high": 11.0, "raw_low": 9.0, "raw_close": 10.0,
+            "raw_volume": 100.0, "raw_notional": 1_000.0,
+        },
+        {
+            "date": "2026-01-05", "ticker": "000001", "raw_open": None,
+            "raw_high": None, "raw_low": None, "raw_close": None,
+            "raw_volume": None, "raw_notional": None,
+        },
+    ])
+
+    assert capabilities["raw_ohlcv"] is False
+    assert capabilities["raw_notional"] is False
+    assert capabilities["missing_raw_ohlcv_rows"] == [{
+        "date": "2026-01-05", "ticker": "000001",
+        "missing_fields": ["raw_open", "raw_high", "raw_low", "raw_close", "raw_volume"],
+    }]

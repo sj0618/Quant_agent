@@ -5,6 +5,7 @@ import csv
 import gzip
 import json
 import math
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 import numpy as np
 from functools import lru_cache
 from dataclasses import dataclass, field
@@ -12,7 +13,15 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Iterable, Literal, Mapping, Sequence
 
-from .models import Condition, ConditionOperator, ExecutionTiming, MarketSnapshot, SignalAction, StrategySpec
+from .models import (
+    Condition,
+    ConditionOperator,
+    ExecutionTiming,
+    MarketSnapshot,
+    PositionSizingMethod,
+    SignalAction,
+    StrategySpec,
+)
 from .performance import calculate_quantstats_metrics
 from .strategy import METRIC_ALIASES, QuantStrategy
 
@@ -34,6 +43,7 @@ class OhlcvBar:
     low: float
     close: float
     volume: float
+    raw_notional: float | None = None
     name: str = ""
     market: str = ""
 
@@ -76,6 +86,7 @@ class PendingOrder:
     side: str
     signal_date: date
     reason: str
+    prior_raw_notional: float | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +143,19 @@ class OrderAuditRecord:
     reason: str
     price: float | None = None
     quantity: int | None = None
+    requested_quantity: int | None = None
+    filled_quantity: int | None = None
+    fill_rate: float | None = None
+    notional: float | None = None
+    cost: float | None = None
+    cost_policy_id: str | None = None
+    commission_cost: float | None = None
+    tax_cost: float | None = None
+    slippage_cost: float | None = None
+    commission_cost_text: str | None = None
+    tax_cost_text: str | None = None
+    slippage_cost_text: str | None = None
+    total_cost_text: str | None = None
     detail: str = ""
 
     def as_dict(self) -> dict[str, object]:
@@ -264,6 +288,11 @@ def load_ohlcv_csv(path: str | Path) -> list[OhlcvBar]:
                     low=_parse_float(raw["low"], field_name="low"),
                     close=_parse_float(raw["close"], field_name="close"),
                     volume=_parse_float(raw["volume"], field_name="volume"),
+                    raw_notional=(
+                        _parse_float(raw["raw_notional"], field_name="raw_notional")
+                        if raw.get("raw_notional") not in (None, "")
+                        else None
+                    ),
                 )
             )
     return rows
@@ -738,6 +767,8 @@ class BacktestEngine:
 
         for current_date in dates:
             today_bars = bars_by_date[current_date]
+            cash, corporate_audit = self._apply_corporate_actions(current_date, positions, cash)
+            order_audit.extend(corporate_audit)
             cash, pending_orders, executed, execution_audit = self._execute_pending_orders(
                 current_date, today_bars, positions, cash, pending_orders
             )
@@ -772,16 +803,25 @@ class BacktestEngine:
                     date=final_date,
                     ticker=order.ticker,
                     side=order.side,
-                    status="unfilled_end",
+                    status="expired_no_next_session",
                     signal_date=order.signal_date.isoformat(),
-                    reason=order.reason,
-                    detail="No later open was available to execute this order.",
+                    reason="next_session_unavailable",
+                    detail="No next market session was available to execute this next-open order.",
                 )
                 for order in pending_orders
             )
 
         final_equity = equity_curve[-1].total_equity if equity_curve else cash
-        summary = self._summary(cash, positions, trades, equity_curve, signals, exclusions, final_equity)
+        summary = self._summary(
+            cash,
+            positions,
+            trades,
+            equity_curve,
+            signals,
+            exclusions,
+            final_equity,
+            order_audit,
+        )
         summary["delisting"] = {
             "grace_days": self.config.delisting_grace_days,
             "recovery_rate": self.config.delisting_recovery_rate,
@@ -1023,155 +1063,220 @@ class BacktestEngine:
             ]
         return cash, trades, audit, pending_orders
 
-    def _execute_pending_orders(self, current_date, today_bars, positions, cash, pending_orders):
-        executable = [
-            order
-            for order in pending_orders
-            if order.signal_date < current_date and order.ticker in today_bars and today_bars[order.ticker].open > 0
-        ]
-        remaining = [order for order in pending_orders if order not in executable]
-        trades: list[TradeRecord] = []
+    def _apply_corporate_actions(self, current_date, positions, cash):
         audit: list[OrderAuditRecord] = []
-        for order in [item for item in executable if item.side == "sell"]:
-            position = positions.pop(order.ticker, None)
+        for event in self.spec.backtest.corporate_actions:
+            if event.effective_date != current_date:
+                continue
+            position = positions.get(event.ticker)
             if position is None:
+                continue
+            if event.event_type == "split":
+                old_quantity = position.quantity
+                new_quantity = int(old_quantity * event.split_ratio)
+                if new_quantity <= 0:
+                    raise ValueError("split ratio produced no whole shares")
+                position.quantity = new_quantity
+                position.entry_price *= old_quantity / new_quantity
+                position.entry_notional = position.quantity * position.entry_price
+                status, amount = "applied_split", None
+            elif event.event_type == "cash_dividend":
+                amount = position.quantity * event.cash_dividend_per_share
+                cash += amount
+                status = "applied_cash_dividend"
+            else:
+                amount = position.quantity * event.recovery_price
+                cash += amount
+                positions.pop(event.ticker)
+                status = "applied_delist_recovery"
+            audit.append(OrderAuditRecord(
+                date=current_date.isoformat(), ticker=event.ticker, side="corporate_action", status=status,
+                signal_date=current_date.isoformat(), reason="verified" if event.source_verified else "fixture_unverified",
+                quantity=position.quantity if event.event_type == "split" else None, notional=amount,
+                detail="Corporate action applied only on its effective session.",
+            ))
+        return cash, audit
+
+    def _execute_pending_orders(self, current_date, today_bars, positions, cash, pending_orders):
+        executable: list[PendingOrder] = []
+        audit: list[OrderAuditRecord] = []
+        for order in pending_orders:
+            if order.signal_date >= current_date:
+                continue
+            bar = today_bars.get(order.ticker)
+            if bar is None:
                 audit.append(
                     OrderAuditRecord(
-                        date=current_date.isoformat(),
-                        ticker=order.ticker,
-                        side=order.side,
-                        status="ignored_missing_position",
-                        signal_date=order.signal_date.isoformat(),
-                        reason=order.reason,
-                        detail="Sell order reached the next open without an active position.",
+                        date=current_date.isoformat(), ticker=order.ticker, side=order.side,
+                        status="expired_next_session", signal_date=order.signal_date.isoformat(),
+                        reason="next_session_missing_bar", detail="The ticker had no bar in the only eligible next session.",
                     )
                 )
+            elif not math.isfinite(bar.open) or bar.open <= 0:
+                audit.append(
+                    OrderAuditRecord(
+                        date=current_date.isoformat(), ticker=order.ticker, side=order.side,
+                        status="unfilled_invalid_open", signal_date=order.signal_date.isoformat(),
+                        reason="invalid_open", detail="The next-session open was missing, non-finite, or non-positive.",
+                    )
+                )
+            else:
+                executable.append(order)
+        trades: list[TradeRecord] = []
+        for order in [item for item in executable if item.side == "sell"]:
+            position = positions.get(order.ticker)
+            if position is None:
+                audit.append(OrderAuditRecord(
+                    date=current_date.isoformat(), ticker=order.ticker, side=order.side,
+                    status="ignored_missing_position", signal_date=order.signal_date.isoformat(), reason=order.reason,
+                    detail="Sell order reached the next open without an active position.",
+                ))
                 continue
             bar = today_bars[order.ticker]
             sell_price = bar.open * (1 - self.spec.backtest.cost_model.slippage_pct)
-            gross = position.quantity * sell_price
-            exit_cost = gross * (self.spec.backtest.cost_model.commission_pct + self.spec.backtest.cost_model.tax_pct)
+            capacity, capacity_reason = self._capacity_quantity(order, sell_price)
+            requested_quantity = position.quantity
+            if capacity_reason:
+                audit.append(OrderAuditRecord(
+                    date=current_date.isoformat(), ticker=order.ticker, side=order.side,
+                    status="unfilled_capacity", signal_date=order.signal_date.isoformat(), reason=capacity_reason,
+                    requested_quantity=position.quantity, filled_quantity=0, fill_rate=0.0,
+                    detail="No provable next-open execution capacity was available.",
+                ))
+                continue
+            quantity = min(requested_quantity, capacity)
+            if quantity <= 0:
+                audit.append(OrderAuditRecord(
+                    date=current_date.isoformat(), ticker=order.ticker, side=order.side,
+                    status="unfilled_capacity", signal_date=order.signal_date.isoformat(), reason="zero_capacity",
+                    requested_quantity=position.quantity, filled_quantity=0, fill_rate=0.0,
+                    detail="Previous raw notional allowed no whole-share fill.",
+                ))
+                continue
+            gross = quantity * sell_price
+            commission_decimal = self._cost_decimal(gross * self.spec.backtest.cost_model.commission_pct)
+            tax_decimal = self._cost_decimal(gross * self.spec.backtest.cost_model.tax_pct)
+            slippage_decimal = self._cost_decimal(quantity * (bar.open - sell_price))
+            commission_cost = float(commission_decimal)
+            tax_cost = float(tax_decimal)
+            slippage_cost = float(slippage_decimal)
+            exit_cost = commission_cost + tax_cost
             proceeds = gross - exit_cost
+            entry_notional = position.entry_notional * quantity / position.quantity
+            entry_cost = position.entry_cost * quantity / position.quantity
+            invested = entry_notional + entry_cost
             cash += proceeds
-            invested = position.entry_notional + position.entry_cost
-            gross_pnl = gross - position.entry_notional
-            net_pnl = proceeds - invested
-            trades.append(
-                TradeRecord(
-                    ticker=order.ticker,
-                    entry_date=position.entry_date.isoformat(),
-                    exit_date=current_date.isoformat(),
-                    entry_price=round(position.entry_price, 6),
-                    exit_price=round(sell_price, 6),
-                    quantity=position.quantity,
-                    entry_cost=round(position.entry_cost, 6),
-                    exit_cost=round(exit_cost, 6),
-                    gross_pnl=round(gross_pnl, 6),
-                    net_pnl=round(net_pnl, 6),
-                    return_pct=round(net_pnl / invested, 10) if invested else 0.0,
-                    reason=order.reason,
-                )
-            )
-            audit.append(
-                OrderAuditRecord(
-                    date=current_date.isoformat(),
-                    ticker=order.ticker,
-                    side=order.side,
-                    status="executed",
-                    signal_date=order.signal_date.isoformat(),
-                    reason=order.reason,
-                    price=round(sell_price, 6),
-                    quantity=position.quantity,
-                    detail="Filled at the next available open.",
-                )
-            )
-        buy_orders = [item for item in executable if item.side == "buy" and item.ticker not in positions]
-        buy_orders.sort(key=lambda order: order.ticker)
+            trades.append(TradeRecord(
+                ticker=order.ticker, entry_date=position.entry_date.isoformat(), exit_date=current_date.isoformat(),
+                entry_price=round(position.entry_price, 6), exit_price=round(sell_price, 6), quantity=quantity,
+                entry_cost=round(entry_cost, 6), exit_cost=round(exit_cost, 6),
+                gross_pnl=round(gross - entry_notional, 6), net_pnl=round(proceeds - invested, 6),
+                return_pct=round((proceeds - invested) / invested, 10) if invested else 0.0, reason=order.reason,
+            ))
+            if quantity == position.quantity:
+                positions.pop(order.ticker)
+            else:
+                position.quantity -= quantity
+                position.entry_notional -= entry_notional
+                position.entry_cost -= entry_cost
+            audit.append(OrderAuditRecord(
+                date=current_date.isoformat(), ticker=order.ticker, side=order.side, status="executed",
+                signal_date=order.signal_date.isoformat(), reason=order.reason, price=round(sell_price, 6),
+                quantity=quantity, requested_quantity=requested_quantity,
+                filled_quantity=quantity, fill_rate=round(quantity / requested_quantity, 10),
+                notional=round(gross, 6), cost=round(exit_cost, 6), cost_policy_id=self.spec.backtest.cost_model.policy_id,
+                commission_cost=commission_cost, tax_cost=tax_cost, slippage_cost=slippage_cost,
+                commission_cost_text=str(commission_decimal), tax_cost_text=str(tax_decimal),
+                slippage_cost_text=str(slippage_decimal), total_cost_text=str(commission_decimal + tax_decimal), detail="Filled at the eligible next-session open.",
+            ))
+        buy_orders = sorted((item for item in executable if item.side == "buy" and item.ticker not in positions), key=lambda order: order.ticker)
         for order in buy_orders:
-            if len(positions) >= self.spec.position_sizing.max_positions:
-                audit.append(
-                    OrderAuditRecord(
-                        date=current_date.isoformat(),
-                        ticker=order.ticker,
-                        side=order.side,
-                        status="skipped_max_positions",
-                        signal_date=order.signal_date.isoformat(),
-                        reason=order.reason,
-                        detail="Position cap was already full at the fill open.",
-                    )
-                )
+            max_positions = self.spec.position_sizing.max_positions
+            if max_positions is not None and len(positions) >= max_positions:
+                audit.append(OrderAuditRecord(
+                    date=current_date.isoformat(), ticker=order.ticker, side=order.side, status="skipped_max_positions",
+                    signal_date=order.signal_date.isoformat(), reason=order.reason, detail="Position cap was already full at the fill open.",
+                ))
                 continue
             bar = today_bars[order.ticker]
-            positions_value = sum(
-                position.quantity
-                * (today_bars[ticker].open if ticker in today_bars else position.last_price)
-                for ticker, position in positions.items()
-            )
+            buy_price = bar.open * (1 + self.spec.backtest.cost_model.slippage_pct)
+            unit_cash = buy_price * (1 + self.spec.backtest.cost_model.commission_pct)
+            if not math.isfinite(unit_cash) or unit_cash <= 0:
+                audit.append(OrderAuditRecord(date=current_date.isoformat(), ticker=order.ticker, side=order.side,
+                    status="unfilled_invalid_open", signal_date=order.signal_date.isoformat(), reason="invalid_open",
+                    detail="The next-session open could not produce a valid unit cash requirement."))
+                continue
+            positions_value = sum(position.quantity * (today_bars[ticker].open if ticker in today_bars else position.last_price) for ticker, position in positions.items())
             current_equity = cash + positions_value
-            slots_left = max(1, self.spec.position_sizing.max_positions - len(positions))
+            slots = max_positions or max(1, len(positions) + len(buy_orders))
+            sizing = self.spec.position_sizing
+            if sizing.method == PositionSizingMethod.EQUAL_WEIGHT:
+                strategy_budget = current_equity / slots
+            elif sizing.method == PositionSizingMethod.FIXED_PERCENT:
+                strategy_budget = current_equity * sizing.fixed_percent
+            elif sizing.method == PositionSizingMethod.FIXED_RISK:
+                strategy_budget = current_equity * sizing.risk_per_position / self.spec.risk_controls.stop_loss_pct
+            else:  # pragma: no cover - Pydantic enum validation prevents this path.
+                raise ValueError(f"Unsupported position sizing method: {sizing.method}")
             budget = min(
-                cash / slots_left,
-                current_equity / self.spec.position_sizing.max_positions,
+                strategy_budget,
                 current_equity * self.spec.risk_controls.max_single_position_pct,
                 max(0.0, current_equity * self.spec.risk_controls.max_gross_exposure_pct - positions_value),
             )
-            buy_price = bar.open * (1 + self.spec.backtest.cost_model.slippage_pct)
-            unit_cash = buy_price * (1 + self.spec.backtest.cost_model.commission_pct)
-            if unit_cash <= 0:
-                audit.append(
-                    OrderAuditRecord(
-                        date=current_date.isoformat(),
-                        ticker=order.ticker,
-                        side=order.side,
-                        status="skipped_invalid_unit_cash",
-                        signal_date=order.signal_date.isoformat(),
-                        reason=order.reason,
-                        detail="Unit cash was non-positive at the fill open.",
-                    )
-                )
+            requested_quantity = max(0, int(budget // unit_cash))
+            cash_quantity = max(0, int(cash // unit_cash))
+            capacity, capacity_reason = self._capacity_quantity(order, buy_price)
+            if capacity_reason:
+                audit.append(OrderAuditRecord(date=current_date.isoformat(), ticker=order.ticker, side=order.side,
+                    status="unfilled_capacity", signal_date=order.signal_date.isoformat(), reason=capacity_reason,
+                    requested_quantity=requested_quantity, filled_quantity=0, fill_rate=0.0,
+                    detail="Raw prior-session notional is required when execution capacity is enabled."))
                 continue
-            quantity = int(budget // unit_cash)
+            quantity = min(requested_quantity, cash_quantity, capacity)
             if quantity <= 0:
-                audit.append(
-                    OrderAuditRecord(
-                        date=current_date.isoformat(),
-                        ticker=order.ticker,
-                        side=order.side,
-                        status="skipped_insufficient_cash",
-                        signal_date=order.signal_date.isoformat(),
-                        reason=order.reason,
-                        price=round(buy_price, 6),
-                        detail="Budget could not buy one share at the fill open.",
-                    )
-                )
+                reason = "insufficient_cash" if cash_quantity <= 0 else "zero_capacity" if capacity <= 0 else "strategy_budget_below_one_share"
+                audit.append(OrderAuditRecord(date=current_date.isoformat(), ticker=order.ticker, side=order.side,
+                    status="unfilled", signal_date=order.signal_date.isoformat(), reason=reason, price=round(buy_price, 6),
+                    requested_quantity=requested_quantity, filled_quantity=0, fill_rate=0.0,
+                    detail="No whole share met the strategy, cash, and capacity constraints."))
                 continue
             notional = quantity * buy_price
-            entry_cost = notional * self.spec.backtest.cost_model.commission_pct
+            commission_decimal = self._cost_decimal(notional * self.spec.backtest.cost_model.commission_pct)
+            slippage_decimal = self._cost_decimal(quantity * (buy_price - bar.open))
+            commission_cost = float(commission_decimal)
+            slippage_cost = float(slippage_decimal)
+            entry_cost = commission_cost
             cash -= notional + entry_cost
-            positions[order.ticker] = Position(
-                ticker=order.ticker,
-                quantity=quantity,
-                entry_date=current_date,
-                entry_price=buy_price,
-                entry_notional=notional,
-                entry_cost=entry_cost,
-                last_price=bar.close,
-                entry_reason=order.reason,
-            )
-            audit.append(
-                OrderAuditRecord(
-                    date=current_date.isoformat(),
-                    ticker=order.ticker,
-                    side=order.side,
-                    status="executed",
-                    signal_date=order.signal_date.isoformat(),
-                    reason=order.reason,
-                    price=round(buy_price, 6),
-                    quantity=quantity,
-                    detail="Filled at the next available open.",
-                )
-            )
-        return cash, remaining, trades, audit
+            positions[order.ticker] = Position(order.ticker, quantity, current_date, buy_price, notional, entry_cost, bar.close, order.reason)
+            audit.append(OrderAuditRecord(date=current_date.isoformat(), ticker=order.ticker, side=order.side, status="executed",
+                signal_date=order.signal_date.isoformat(), reason=order.reason, price=round(buy_price, 6), quantity=quantity,
+                requested_quantity=requested_quantity, filled_quantity=quantity,
+                fill_rate=round(quantity / requested_quantity, 10) if requested_quantity else 0.0,
+                notional=round(notional, 6), cost=round(entry_cost, 6), cost_policy_id=self.spec.backtest.cost_model.policy_id,
+                commission_cost=commission_cost, tax_cost=0.0, slippage_cost=slippage_cost,
+                commission_cost_text=str(commission_decimal), tax_cost_text="0", slippage_cost_text=str(slippage_decimal),
+                total_cost_text=str(commission_decimal), detail="Filled at the eligible next-session open."))
+        return cash, [], trades, audit
+
+    def _capacity_quantity(self, order: PendingOrder, price: float) -> tuple[int, str | None]:
+        capacity_config = self.spec.backtest.execution_capacity
+        if not capacity_config.enabled:
+            return math.inf, None
+        raw_notional = order.prior_raw_notional
+        if raw_notional is None or not math.isfinite(raw_notional):
+            return 0, "raw_notional_unavailable"
+        if raw_notional <= 0:
+            return 0, "zero_raw_notional"
+        return max(0, int(raw_notional * capacity_config.max_participation_rate // price)), None
+
+    def _cost_decimal(self, value: float) -> Decimal:
+        cost_model = self.spec.backtest.cost_model
+        decimal_value = Decimal(str(value))
+        if cost_model.rounding_mode == "none":
+            return decimal_value
+        quantum = Decimal(1).scaleb(-cost_model.rounding_decimals)
+        rounding = ROUND_FLOOR if cost_model.rounding_mode == "floor" else ROUND_HALF_UP
+        return decimal_value.quantize(quantum, rounding=rounding)
 
     def _generate_signals_for_date(
         self,
@@ -1215,6 +1320,7 @@ class BacktestEngine:
                         side="buy",
                         signal_date=current_date,
                         reason=";".join(decision.reasons),
+                        prior_raw_notional=today_bars[ticker].raw_notional,
                     )
                 )
                 audit.append(
@@ -1235,6 +1341,7 @@ class BacktestEngine:
                         side="sell",
                         signal_date=current_date,
                         reason=";".join(decision.reasons),
+                        prior_raw_notional=today_bars[ticker].raw_notional,
                     )
                 )
                 audit.append(
@@ -1257,6 +1364,7 @@ class BacktestEngine:
                             side="sell",
                             signal_date=current_date,
                             reason=risk_reason,
+                            prior_raw_notional=today_bars[ticker].raw_notional,
                         )
                     )
                     signals.append(
@@ -1309,6 +1417,7 @@ class BacktestEngine:
                             side="buy",
                             signal_date=current_date,
                             reason=reason,
+                            prior_raw_notional=today_bars[ticker].raw_notional,
                         )
                     )
                     audit.append(
@@ -1333,6 +1442,7 @@ class BacktestEngine:
                             side="sell",
                             signal_date=current_date,
                             reason=reason,
+                            prior_raw_notional=today_bars[ticker].raw_notional,
                         )
                     )
                     audit.append(
@@ -1375,6 +1485,7 @@ class BacktestEngine:
                             side="sell",
                             signal_date=current_date,
                             reason=risk_reason,
+                            prior_raw_notional=today_bars[ticker].raw_notional,
                         )
                     )
                     signals.append(
@@ -1440,7 +1551,7 @@ class BacktestEngine:
             total += position.quantity * price
         return total
 
-    def _summary(self, cash, positions, trades, equity_curve, signals, exclusions, final_equity):
+    def _summary(self, cash, positions, trades, equity_curve, signals, exclusions, final_equity, order_audit):
         if self.config.metrics_mode == "selection":
             metrics = _calculate_selection_metrics(equity_curve)
         else:
@@ -1455,6 +1566,35 @@ class BacktestEngine:
         excluded_tickers = [item.as_dict() for item in exclusions]
         cost_model = self.spec.backtest.cost_model.model_dump(mode="json")
         position_sizing = self.spec.position_sizing.model_dump(mode="json")
+        buy_requested = sum(event.requested_quantity or 0 for event in order_audit if event.side == "buy")
+        buy_filled = sum(event.filled_quantity or 0 for event in order_audit if event.side == "buy")
+        turnover = sum(event.notional or 0.0 for event in order_audit if event.status == "executed")
+        commission_cost = sum(event.commission_cost or 0.0 for event in order_audit if event.status == "executed")
+        tax_cost = sum(event.tax_cost or 0.0 for event in order_audit if event.status == "executed")
+        slippage_cost = sum(event.slippage_cost or 0.0 for event in order_audit if event.status == "executed")
+        total_cost = commission_cost + tax_cost + slippage_cost
+        commission_cost_exact = sum((Decimal(event.commission_cost_text or "0") for event in order_audit if event.status == "executed"), Decimal("0"))
+        tax_cost_exact = sum((Decimal(event.tax_cost_text or "0") for event in order_audit if event.status == "executed"), Decimal("0"))
+        slippage_cost_exact = sum((Decimal(event.slippage_cost_text or "0") for event in order_audit if event.status == "executed"), Decimal("0"))
+        total_cost_exact = commission_cost_exact + tax_cost_exact + slippage_cost_exact
+        cost_policy = self.spec.backtest.cost_model
+        reliability_reasons = []
+        if any(not event.source_verified for event in self.spec.backtest.corporate_actions):
+            reliability_reasons.append("corporate_action_provenance_incomplete")
+        if not cost_policy.production_eligible:
+            reliability_reasons.append("cost_policy_provenance_incomplete")
+        if equity_curve and (
+            (cost_policy.effective_from and date.fromisoformat(equity_curve[0].date) < cost_policy.effective_from)
+            or (cost_policy.effective_to and date.fromisoformat(equity_curve[-1].date) > cost_policy.effective_to)
+        ):
+            reliability_reasons.append("cost_policy_effective_interval_not_covering_run")
+        if positions:
+            reliability_reasons.append("terminal_open_positions_without_recovery_policy")
+        data_capabilities = {
+            "cost_policy": "eligible" if cost_policy.production_eligible and "cost_policy_effective_interval_not_covering_run" not in reliability_reasons else "limited",
+            "corporate_actions": "unsupported_source_unavailable",
+            "terminal_position_recovery": "unsupported_source_unavailable" if positions else "not_required",
+        }
         return {
             "strategy_id": self.spec.strategy_id,
             "strategy_name": self.spec.strategy_name,
@@ -1551,6 +1691,24 @@ class BacktestEngine:
             "cost_model_jsonb": cost_model,
             "position_sizing": position_sizing,
             "position_sizing_jsonb": position_sizing,
+            "turnover": round(turnover, 6),
+            "total_cost": round(total_cost, 6),
+            "commission_cost_exact": str(commission_cost_exact),
+            "tax_cost_exact": str(tax_cost_exact),
+            "slippage_cost_exact": str(slippage_cost_exact),
+            "total_cost_exact": str(total_cost_exact),
+            "requested_quantity": buy_requested,
+            "filled_quantity": buy_filled,
+            "fill_rate": round(buy_filled / buy_requested, 10) if buy_requested else 0.0,
+            "cost_policy_id": cost_policy.policy_id,
+            "cost_policy_version": cost_policy.policy_version,
+            "cost_policy_production_eligible": cost_policy.production_eligible,
+            "commission_cost": round(commission_cost, 6),
+            "tax_cost": round(tax_cost, 6),
+            "slippage_cost": round(slippage_cost, 6),
+            "reliability": "limited" if reliability_reasons else "eligible",
+            "reliability_reasons": reliability_reasons,
+            "data_capabilities": data_capabilities,
             "indicator_report": self.indicator_report,
             "indicator_report_jsonb": self.indicator_report,
             "notes": [

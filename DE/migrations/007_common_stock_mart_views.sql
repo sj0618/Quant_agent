@@ -1,36 +1,40 @@
 BEGIN;
 
-  CREATE OR REPLACE VIEW mart.common_stock_feature_frame_asof AS
-  SELECT f.*
-  FROM mart.kis_adjusted_feature_frame_asof f
-  JOIN core.symbol_master sm
-    ON sm.symbol = f.symbol
-  WHERE sm.security_type = '보통주'
-    AND (sm.listed_at IS NULL OR f.as_of_date >= sm.listed_at)
-    AND (sm.delisted_at IS NULL OR f.as_of_date <= sm.delisted_at);
-
+  -- Membership starts with KRX sessions and lifecycle segments, not observed prices.
+  -- Market/lifecycle status is as-of history; common-stock classification is the
+  -- canonical security classification and never substitutes current market status.
   CREATE OR REPLACE VIEW mart.common_stock_universe_asof AS
   SELECT DISTINCT
-      f.as_of_date,
+      c.trade_date AS as_of_date,
       sm.symbol_id,
-      f.symbol,
+      sm.symbol,
       sm.name,
-      sm.market_segment,
+      lh.market AS market_segment,
       sm.security_type,
-      sm.listing_status,
-      sm.listed_at,
-      sm.delisted_at
-  FROM mart.kis_adjusted_feature_frame_asof f
+      lh.listing_status,
+      lh.valid_from AS listed_at,
+      lh.valid_to AS delisted_at
+  FROM core.trading_calendar c
+  JOIN core.symbol_listing_history lh
+    ON lh.listing_status = 'listed'
+   AND c.trade_date >= lh.valid_from
+   AND (lh.valid_to IS NULL OR c.trade_date <= lh.valid_to)
   JOIN core.symbol_master sm
-    ON sm.symbol = f.symbol
-  WHERE sm.security_type = '보통주'
-    AND (sm.listed_at IS NULL OR f.as_of_date >= sm.listed_at)
-    AND (sm.delisted_at IS NULL OR f.as_of_date <= sm.delisted_at);
+    ON sm.symbol_id = lh.symbol_id
+  WHERE c.is_open
+    AND lh.market IN ('KOSPI', 'KOSDAQ')
+    AND sm.security_type = '보통주';
+
+  CREATE OR REPLACE VIEW mart.common_stock_feature_frame_asof AS
+  SELECT f.*
+  FROM mart.common_stock_universe_asof u
+  JOIN mart.kis_adjusted_feature_frame_asof f
+    ON f.as_of_date = u.as_of_date
+   AND f.symbol = u.symbol;
 
   COMMENT ON VIEW mart.common_stock_feature_frame_asof IS
-  'MVP default backtest feature frame: KIS official adjusted OHLCV + TA, common stocks only.';
-
+  'PIT KOSPI/KOSDAQ common-stock feature rows; missing features do not remove membership.';
   COMMENT ON VIEW mart.common_stock_universe_asof IS
-  'MVP default daily universe: common stocks only, derived from KIS adjusted feature frame.';
+  'PIT KRX session x lifecycle universe. Lifecycle controls market eligibility; canonical common-stock classification controls security type.';
 
   COMMIT;

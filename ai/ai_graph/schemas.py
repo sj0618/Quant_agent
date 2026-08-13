@@ -331,44 +331,65 @@ class BacktestMetrics(BaseModel):
     win_rate: float = Field(ge=0.0, le=1.0)
     total_return: float
     in_sample_sharpe: float
-    out_sample_sharpe: float
+    out_sample_sharpe: float | None
     degradation: float
     # Selection-only statistics. Defaults preserve compatibility with historical
     # result payloads that predate the real hold-out split.
     in_sample_return: float = 0.0
     in_sample_max_drawdown: float = 0.0
     # Hold-out statistics. `sharpe_ratio`/`total_return`/`max_drawdown` above span the
-    # whole period, including the 70% that selection already read, so they are not an
-    # out-of-sample claim and must not be presented as one. These are.
-    out_sample_return: float = 0.0
-    out_sample_max_drawdown: float = 0.0
+    # whole period, including the selection history, so they are not an out-of-sample
+    # claim. Nullable values explicitly represent an unavailable walk-forward aggregate.
+    out_sample_return: float | None = None
+    out_sample_max_drawdown: float | None = None
     # Daily returns behind the in-sample statistics. Needed to deflate a Sharpe for the
     # width of the search: the public equity curve is downsampled to a dozen points, so
     # it cannot stand in for the sample size.
     in_sample_observations: int = 0
     # How many candidates the winner was chosen from. Reporting the best of N without
-    # saying what N was is what makes an argmax look like a discovery: with six
-    # candidates whose actions are pure noise, the best-of-six still returned +16.2%
-    # against a -3.7% average, so ~20 percentage points of any headline is selection
-    # luck before any skill is involved.
+    # saying what N was makes an argmax look like a discovery.
     candidates_evaluated: int = 1
-    # Sharpe after deflating for that search. Compares the in-sample Sharpe against the
-    # best-of-N a skill-free search would be expected to produce; at or below zero means
-    # the result is not distinguishable from having tried N things and kept the luckiest.
+    # Sharpe after deflating for the width of the search.
     selection_adjusted_sharpe: float = 0.0
-    in_sample_benchmark_return: float = 0.0
-    out_sample_benchmark_return: float = 0.0
-    in_sample_excess_return: float = 0.0
-    out_sample_excess_return: float = 0.0
-    benchmark_period_count: int = Field(default=0, ge=0)
-    benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    in_sample_benchmark_period_count: int = Field(default=0, ge=0)
-    in_sample_benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    in_sample_benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    out_sample_benchmark_period_count: int = Field(default=0, ge=0)
-    out_sample_benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    out_sample_benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    in_sample_benchmark_return: float | None = None
+    out_sample_benchmark_return: float | None = None
+    in_sample_excess_return: float | None = None
+    out_sample_excess_return: float | None = None
+    benchmark_period_count: int | None = Field(default=None, ge=0)
+    benchmark_period_win_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    benchmark_period_loss_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    in_sample_benchmark_period_count: int | None = Field(default=None, ge=0)
+    in_sample_benchmark_period_win_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    in_sample_benchmark_period_loss_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    out_sample_benchmark_period_count: int | None = Field(default=None, ge=0)
+    out_sample_benchmark_period_win_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    out_sample_benchmark_period_loss_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class WalkForwardFoldSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fold_index: int = Field(ge=0)
+    selection_hash: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    evaluation_sessions: list[str] = Field(default_factory=list)
+
+
+class WalkForwardPolicyResult(BaseModel):
+    """Performance belongs to the rolling selection policy, never one final candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ready", "insufficient", "unsafe_candidate"]
+    unavailable_reason: str | None = None
+    fold_selections: list[WalkForwardFoldSelection] = Field(default_factory=list)
+    unique_evaluation_session_count: int = Field(default=0, ge=0)
+    daily_returns: dict[str, float] = Field(default_factory=dict)
+    aggregate_metrics: BacktestMetrics | None = None
+    equity_curve: list[BacktestEquityPoint] = Field(default_factory=list)
+    fills: list[dict[str, Any]] = Field(default_factory=list)
+    costs: float = 0.0
+    deduped_session_count: int = Field(default=0, ge=0)
 
 
 class PublicMetricDetail(BaseModel):
@@ -573,6 +594,7 @@ class CandidateBacktestResult(BaseModel):
     fallback_reasons: list[str] = Field(default_factory=list)
     execution_stats: dict[str, Any] = Field(default_factory=dict)
     generated_strategy_blueprints: list[dict[str, Any]] = Field(default_factory=list)
+    walk_forward: WalkForwardPolicyResult | None = None
 
 
 SignalAction = Literal["BUY", "HOLD", "DROP"]

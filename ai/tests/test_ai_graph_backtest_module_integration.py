@@ -82,6 +82,64 @@ def test_backtest_node_metrics_are_computed_by_backtest_module_engine() -> None:
     assert result.engine_summary["position_sizing"]["max_positions"] == 1
 
 
+def test_adjusted_signal_rows_execute_and_capacity_check_on_verified_raw_bars() -> None:
+    strategy = make_strategy("raw-execution", "Raw execution")
+    candidate = CodeCandidate(
+        candidate_id="raw-execution-a",
+        variant="A",
+        code="""def build_signals(prices):
+    return [{"date": row["date"], "ticker": row["ticker"],
+             "action": "BUY" if row["date"] == "2026-01-02" else "HOLD",
+             "price": float(row["close"])} for row in prices]
+""",
+        validation_ok=True,
+    )
+    rows = [
+        {
+            "date": "2026-01-02", "ticker": "005930", "open": 100.0, "high": 101.0,
+            "low": 99.0, "close": 100.0, "volume": 1_000_000.0,
+            "adjusted_open": 100.0, "adjusted_high": 101.0, "adjusted_low": 99.0,
+            "adjusted_close": 100.0, "adjusted_volume": 1_000_000.0,
+            "raw_open": 90.0, "raw_high": 91.0, "raw_low": 89.0,
+            "raw_close": 90.0, "raw_volume": 1_000.0, "raw_notional": 90_000.0,
+            "rsi": 20.0,
+        },
+        {
+            "date": "2026-01-05", "ticker": "005930", "open": 110.0, "high": 111.0,
+            "low": 109.0, "close": 110.0, "volume": 1_000_000.0,
+            "adjusted_open": 110.0, "adjusted_high": 111.0, "adjusted_low": 109.0,
+            "adjusted_close": 110.0, "adjusted_volume": 1_000_000.0,
+            "raw_open": 80.0, "raw_high": 81.0, "raw_low": 79.0,
+            "raw_close": 80.0, "raw_volume": 1_000.0, "raw_notional": 80_000.0,
+            "rsi": 50.0,
+        },
+    ]
+
+    signals = backtest_node._execute_candidate_code(candidate, rows)
+    assert signals[0].price == 100.0
+    result = run_candidate_backtest(strategy, [candidate], price_rows=rows)
+    buys = [
+        event for event in result.engine_summary["execution_audit"]["recent_events"]
+        if event["side"] == "buy" and event["status"] == "executed"
+    ]
+
+    assert len(buys) == 1
+    assert buys[0]["price"] == pytest.approx(80.0 * 1.001)
+    assert buys[0]["price"] * buys[0]["quantity"] <= 100_000.0 * 0.01
+
+
+def test_declared_raw_execution_row_cannot_fall_back_to_adjusted_prices() -> None:
+    row = {
+        "date": "2026-01-02", "ticker": "005930", "open": 100.0, "high": 101.0,
+        "low": 99.0, "close": 100.0, "volume": 1_000_000.0,
+        "raw_open": 90.0, "raw_high": 91.0, "raw_low": 89.0,
+        "raw_close": None, "raw_volume": 1_000.0, "raw_notional": None,
+    }
+
+    with pytest.raises(ValueError, match="raw_execution_unavailable:2026-01-02/005930:raw_close,raw_notional"):
+        backtest_node._engine_market_rows([row])
+
+
 def test_generated_backtest_code_can_use_sorted_builtin() -> None:
     strategy_a = make_strategy("rsi_a", "RSI A")
     code = """def build_signals(prices):
@@ -180,6 +238,7 @@ def test_generated_backtest_supports_multi_ticker_portfolio_rows() -> None:
                     # A periodic surge, so volume_ratio_20 clears 1.5 the way a real
                     # breakout does instead of hovering at 1.0 forever.
                     "volume": 1_000_000 * (4 if day_index % 10 == 0 else 1),
+                    "raw_notional": close * 1_000_000 * (4 if day_index % 10 == 0 else 1),
                     "rsi": 45 + ticker_index,
                     "sma20": sum(trailing) / len(trailing),
                 }
@@ -230,6 +289,7 @@ def test_generated_backtest_preserves_requested_position_limit_with_fewer_ticker
             "low": price,
             "close": price,
             "volume": 1_000_000,
+            "raw_notional": price * 1_000_000,
             "rsi": 20 if row_date == "2026-01-02" else 50,
         }
         for row_date in ("2026-01-02", "2026-01-05")
@@ -247,7 +307,16 @@ def test_generated_backtest_preserves_requested_position_limit_with_fewer_ticker
     assert result.engine_summary["ai_backtest_context"]["requested_max_positions"] == 10
     assert result.engine_summary["ai_backtest_context"]["applied_max_positions"] == 3
     assert len(buys) == 3
-    assert all(event["price"] * event["quantity"] <= 100_000 for event in buys)
+    raw_notional_by_ticker = {
+        "000001": 10 * 1_000_000,
+        "000002": 20 * 1_000_000,
+        "000003": 30 * 1_000_000,
+    }
+    assert all(
+        event["price"] * event["quantity"]
+        <= raw_notional_by_ticker[event["ticker"]] * 0.01
+        for event in buys
+    )
 
 
 def test_candidate_backtest_handles_single_price_row_without_metric_crash() -> None:
@@ -460,7 +529,6 @@ def test_ticker_actions_agree_with_the_position_book_of_the_same_run() -> None:
     beside, so this checks the two against each other: the names the engine still holds
     are exactly the names told to HOLD or SELL, and a held name is never a BUY.
     """
-
     strategy = make_strategy("ticker-actions", "Ticker Actions")
     candidates = generate_loop3_candidates(
         Loop3Request(strategy=strategy, variant="A", trace_id="trace-ticker-actions")
@@ -503,3 +571,27 @@ def test_ticker_actions_agree_with_the_position_book_of_the_same_run() -> None:
     assert {a.source_candidate_id for a in actions} <= {
         result.selected_candidate.candidate_id
     }
+
+
+def test_primary_benchmark_is_explicitly_unavailable_without_official_tr_inputs() -> None:
+    price_rows = [
+        {
+            "date": row_date,
+            "ticker": ticker,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1_000_000.0,
+            "raw_notional": close * 1_000_000.0,
+        }
+        for row_date, close in (("2026-01-02", 100.0), ("2026-01-03", 101.0))
+        for ticker in ("000001", "000002")
+    ]
+    context = backtest_node._build_benchmark_context(price_rows)
+    provenance = backtest_node._benchmark_provenance(context)
+
+    assert provenance["primary"]["available"] is False
+    assert provenance["primary"]["return"] is None
+    assert provenance["primary"]["unavailable_reason"]
+    assert provenance["auxiliary"]["label"] == backtest_node.AUXILIARY_BENCHMARK_LABEL
