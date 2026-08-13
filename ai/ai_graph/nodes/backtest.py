@@ -25,15 +25,16 @@ from ai_graph.schemas import (
     BacktestMetrics,
     CandidateBacktestResult,
     CodeCandidate,
+    WalkForwardFoldSelection,
+    WalkForwardPolicyResult,
 )
 from ai_graph.schemas import StrategySpec as AIStrategySpec
 from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
 from ai_graph.nodes.backtest_features import FEATURE_DEFINITION_VERSION, PreparedFeatureStore
 from ai_graph.progress import report_activity
 from ai_graph.nodes.position_sizing import (
-    applied_max_positions as _shared_applied_max_positions,
     available_ticker_count as _shared_available_ticker_count,
-    requested_max_positions as _shared_requested_max_positions,
+    required_max_position_pct,
 )
 from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
 from ai_graph.security.ast_validator import validate_backtest_code
@@ -44,17 +45,37 @@ DEFAULT_FIXTURE_TICKER = "005930"
 DEFAULT_FIXTURE_MARKET = "KRX"
 DEFAULT_FIXTURE_VOLUME = 1_000_000.0
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
+CANONICAL_ANALYSIS_INITIAL_CAPITAL = 100_000_000.0
 METRIC_ROUND_DIGITS = 6
 MIN_RETURNS_FOR_SPLIT = 4
-BENCHMARK_LABEL = "동일가중 매수-보유 프록시"
-BENCHMARK_METHOD = "fixed_universe_equal_weight_buy_and_hold"
-BENCHMARK_WARNING = (
-    "이 벤치마크는 분석 대상 유니버스의 초기 구성으로 고정해 계산합니다. "
-    "구성 종목의 상폐/신규 편입 반영이 늦어져 생존편향 경고가 남습니다."
+PRIMARY_BENCHMARK_LABEL = "공식 KOSPI/KOSDAQ TR"
+PRIMARY_BENCHMARK_METHOD = "official_kospi_kosdaq_total_return"
+AUXILIARY_BENCHMARK_LABEL = "동일가중 매수-보유 보조 프록시"
+AUXILIARY_BENCHMARK_METHOD = "fixed_universe_equal_weight_buy_and_hold"
+AUXILIARY_BENCHMARK_WARNING = (
+    "공식 KOSPI/KOSDAQ 총수익률(TR) 시계열과 월초 목표 비중이 입력되지 않아 "
+    "동일가중 보조 프록시만 계산했습니다. 공식 벤치마크로 해석할 수 없습니다."
 )
-# Candidates are selected using only the first 70% of the history.  The final 30%
-# is deliberately kept untouched until after selection, so it is a real hold-out.
+# Legacy graph exports now describe the authoritative primary benchmark contract.
+BENCHMARK_LABEL = PRIMARY_BENCHMARK_LABEL
+BENCHMARK_METHOD = PRIMARY_BENCHMARK_METHOD
+BENCHMARK_WARNING = AUXILIARY_BENCHMARK_WARNING
+# Candidates are selected using only the first 70% of the history. The final 30%
+# is a hold-out, not a rolling walk-forward validation.
 BACKTEST_SPLIT_FRACTION = 0.7
+WALK_FORWARD_WARMUP_MONTHS = 1
+WALK_FORWARD_TRAIN_MONTHS = 12
+WALK_FORWARD_VALIDATION_MONTHS = 3
+WALK_FORWARD_EVALUATION_MONTHS = 1
+WALK_FORWARD_ROLL_MONTHS = 1
+WALK_FORWARD_MIN_VALID_FOLDS = 24
+WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS = 24
+WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS = 480
+# Kept as an internal spelling for callers that imported the old constant.
+WALK_FORWARD_MIN_SESSIONS = WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS
+INSUFFICIENT_WALK_FORWARD_SAMPLE = "INSUFFICIENT_WALK_FORWARD_SAMPLE"
+READY_WALK_FORWARD = "READY_WALK_FORWARD"
+UNSAFE_WALK_FORWARD_CANDIDATE = "UNSAFE_WALK_FORWARD_CANDIDATE"
 # A quarter is short enough to expose regime-specific wins/losses instead of letting a
 # ten-year total hide them. A strategy may win by a lot in some blocks, but losing at
 # least half of these fixed, non-overlapping blocks is still an automatic failure.
@@ -65,13 +86,8 @@ MIN_OBJECTIVE_TRADES = 5
 # Below this many matched names, a backtest describes the names, not the strategy, and
 # tuning dozens of rule variants against them is fitting noise. Warn rather than pretend.
 MIN_RELIABLE_TICKERS = 5
-# A long-only equity portfolio held through a decade of Korean market drawdowns does
-# not keep Sharpe above 1.0 or cap losses at 10% - those are hedge-fund thresholds, and
-# requiring them meant every run "missed the objective" and paid for two self-improvement
-# rounds no matter how well it did. A run returning 72% cumulative still scored negative.
-# These are floors for "worth showing", not for "excellent".
-# TEMPORARY TEST-ONLY: 샤프와 MDD 커트라인을 결과 노출 검증용으로 느슨하게
-# 잡았다. 테스트가 끝나면 운영 기준을 다시 정하고 이 두 값을 함께 교체할 것.
+# Performance thresholds remain selection policy only; data reliability is reported
+# independently through coverage and walk-forward metadata.
 MIN_OBJECTIVE_SHARPE = 0.0
 MAX_OBJECTIVE_DRAWDOWN = -0.50
 # The winner's in-sample Sharpe, less what an argmax over the same number of skill-free
@@ -109,17 +125,32 @@ DEFAULT_WALL_BUDGET_SECONDS = 540.0
 # neighbourhood while the hold-out remains unavailable to selection.
 MAX_SELF_IMPROVEMENT_ROUNDS = 2
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
-BACKTEST_ENGINE_VERSION = "candidate-engine.v2"
-# v3 adds ticker_actions; a v2 entry has none, and reusing it would drop the per-stock
-# recommendation while still serving the performance numbers.
-BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v3"
+BACKTEST_ENGINE_VERSION = "candidate-engine.v3"
+# v4 persists the full execution ledger, including the per-stock ticker actions.
+BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v4"
 BACKTEST_CACHE_DIR_ENV = "AI_BACKTEST_CACHE_DIR"
 BACKTEST_CACHE_TTL_ENV = "AI_BACKTEST_CACHE_TTL_SECONDS"
 BACKTEST_CACHE_MAX_BYTES_ENV = "AI_BACKTEST_CACHE_MAX_BYTES"
 DEFAULT_CACHE_TTL_SECONDS = 86_400
 DEFAULT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
 PRICE_FIELD_NAMES = frozenset(
-    {"date", "ticker", "name", "market", "open", "high", "low", "close", "volume"}
+    {
+        "date",
+        "ticker",
+        "name",
+        "market",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "raw_open",
+        "raw_high",
+        "raw_low",
+        "raw_close",
+        "raw_volume",
+        "raw_notional",
+    }
 )
 ALLOWED_RUNTIME_IMPORTS = frozenset({"datetime", "math", "statistics"})
 DEFAULT_BACKTEST_PRICE_ROWS: tuple[dict[str, object], ...] = (
@@ -131,6 +162,7 @@ DEFAULT_BACKTEST_PRICE_ROWS: tuple[dict[str, object], ...] = (
         "low": 99.0,
         "close": 100.0,
         "volume": DEFAULT_FIXTURE_VOLUME,
+        "raw_notional": DEFAULT_FIXTURE_VOLUME * 100.0,
         "rsi": 25.0,
     },
     {
@@ -141,6 +173,7 @@ DEFAULT_BACKTEST_PRICE_ROWS: tuple[dict[str, object], ...] = (
         "low": 101.0,
         "close": 102.0,
         "volume": DEFAULT_FIXTURE_VOLUME * 1.6,
+        "raw_notional": DEFAULT_FIXTURE_VOLUME * 1.6 * 102.0,
         "rsi": 50.0,
     },
     {
@@ -151,6 +184,7 @@ DEFAULT_BACKTEST_PRICE_ROWS: tuple[dict[str, object], ...] = (
         "low": 100.0,
         "close": 101.0,
         "volume": DEFAULT_FIXTURE_VOLUME,
+        "raw_notional": DEFAULT_FIXTURE_VOLUME * 101.0,
         "rsi": 75.0,
     },
     {
@@ -161,6 +195,7 @@ DEFAULT_BACKTEST_PRICE_ROWS: tuple[dict[str, object], ...] = (
         "low": 104.0,
         "close": 105.0,
         "volume": DEFAULT_FIXTURE_VOLUME,
+        "raw_notional": DEFAULT_FIXTURE_VOLUME * 105.0,
         "rsi": 50.0,
     },
 )
@@ -190,6 +225,7 @@ VERBOSE_ENGINE_SUMMARY_KEYS = frozenset(
         "excluded_ticker_jsonb",
         "indicator_report",
         "indicator_report_jsonb",
+        "_storage_execution_ledger",
     }
 )
 
@@ -455,7 +491,39 @@ class _BenchmarkContext:
     daily_returns: tuple[float, ...]
     selection_days: int
     selection_return: float
-    total_return: float
+    total_return: float | None
+    primary_available: bool
+    primary_unavailable_reason: str | None
+    auxiliary_label: str
+
+
+@dataclass(frozen=True)
+class _WalkForwardFold:
+    fold_index: int
+    warmup_sessions: tuple[str, ...]
+    train_sessions: tuple[str, ...]
+    validation_sessions: tuple[str, ...]
+    evaluation_sessions: tuple[str, ...]
+
+    @property
+    def evaluation_month(self) -> str:
+        return self.evaluation_sessions[0][:7]
+
+
+@dataclass(frozen=True)
+class _SplitPolicy:
+    warmup_sessions: tuple[str, ...]
+    folds: tuple[_WalkForwardFold, ...]
+    final_lockbox_sessions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _WalkForwardSample:
+    session_count: int
+    valid_fold_count: int
+    unique_evaluation_month_count: int
+    unique_evaluation_session_count: int
+    status: str
 
 
 @dataclass(frozen=True)
@@ -709,7 +777,7 @@ class _CandidateBacktestSession:
                 available_ticker_count=_available_ticker_count(self.price_rows),
             )
             engine_config = EngineBacktestRunConfig(
-                initial_capital=DEFAULT_INITIAL_CAPITAL,
+                initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL,
                 write_outputs=False,
                 talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
                 metrics_mode="selection",
@@ -1354,21 +1422,63 @@ def _evaluate_candidate_task(
         engine_result,
         benchmark_returns=benchmark_context.daily_returns,
     )
+    metrics = _mask_unavailable_walk_forward_metrics(
+        metrics, _walk_forward_sample(rows).status
+    )
     enriched_candidate = candidate.model_copy(update={"metrics": metrics})
     engine_summary = dict(engine_result.summary)
     engine_summary["buy_signal_count"] = _signal_action_count(engine_result, "BUY")
     engine_summary["sell_signal_count"] = _signal_action_count(engine_result, "SELL")
     execution_audit = _execution_audit(engine_result)
     engine_summary["execution_audit"] = execution_audit
+    engine_summary["_storage_execution_ledger"] = _storage_execution_ledger(engine_result)
     available_ticker_count = _available_ticker_count(rows)
     requested_max_positions = _requested_max_positions(strategy_a)
     applied_max_positions = _applied_max_positions(strategy_a, available_ticker_count)
     engine_summary["ai_backtest_context"] = {
+        "analysis_initial_capital_krw": CANONICAL_ANALYSIS_INITIAL_CAPITAL,
+        "initial_capital_contract": "canonical_analysis_job_sealed_primary_contract",
         "available_ticker_count": available_ticker_count,
         "requested_max_positions": requested_max_positions,
         "applied_max_positions": applied_max_positions,
+        "max_position_pct": _strategy_max_position_pct(strategy_a),
+        "sizing_contract": "strategy_risk_constraints.max_position_pct",
+        "gross_exposure_limit": 1.0,
+        "cash_floor": 0.0,
+        "leverage_allowed": False,
         "exposure_normalized": applied_max_positions != requested_max_positions,
     }
+    split_policy = _walk_forward_split_policy(rows)
+    walk_forward = _walk_forward_sample(rows)
+    engine_summary["walk_forward_sample"] = _walk_forward_metadata(
+        walk_forward, split_policy
+    )
+    engine_summary["benchmark_provenance"] = _benchmark_provenance(benchmark_context)
+    public_metric_availability = _undefined_metric_availability(
+        _summary_warning_list(engine_summary)
+    )
+    if walk_forward.status in {
+        INSUFFICIENT_WALK_FORWARD_SAMPLE,
+        UNSAFE_WALK_FORWARD_CANDIDATE,
+    }:
+        public_metric_availability.update(
+            {
+                "out_sample_return": {
+                    "value": None,
+                    "unavailable_reason": walk_forward.status,
+                },
+                "out_sample_sharpe": {
+                    "value": None,
+                    "unavailable_reason": walk_forward.status,
+                },
+                "benchmark_comparison": {
+                    "value": None,
+                    "unavailable_reason": walk_forward.status,
+                },
+            }
+        )
+    if public_metric_availability:
+        engine_summary["public_metric_availability"] = public_metric_availability
     engine_summary["effective_trade_count"] = max(
         _summary_float_default(engine_summary, "trade_count", 0.0),
         float(execution_audit["executed_buy_count"]),
@@ -1422,11 +1532,17 @@ def run_candidate_backtest(
     feature_coverage: Mapping[str, Any] | None = None,
     fallback_reasons: Sequence[str] | None = None,
     _session: _CandidateBacktestSession | None = None,
+    _walk_forward_enabled: bool = True,
 ) -> CandidateBacktestResult:
     if not candidates:
         raise ValueError("at least one candidate is required")
 
     rows = _session.price_rows if _session is not None else _price_rows(price_rows)
+    sample = _walk_forward_sample(rows)
+    if _walk_forward_enabled and sample.status == READY_WALK_FORWARD:
+        return _run_walk_forward_candidate_backtest(
+            strategy_a, candidates, rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons
+        )
     owns_session = _session is None
     session = _session or _CandidateBacktestSession(strategy_a, rows)
     enriched_candidates: list[CodeCandidate] = []
@@ -1541,7 +1657,7 @@ def run_candidate_backtest(
             backtest_payload=_backtest_payload(
                 strategy_a,
                 rows,
-                benchmark_return=session.benchmark_context.total_return,
+                benchmark_context=session.benchmark_context,
             ),
             feature_coverage=dict(feature_coverage or {}),
             fallback_reasons=list(fallback_reasons or ()),
@@ -1553,6 +1669,204 @@ def run_candidate_backtest(
     finally:
         if owns_session:
             session.close()
+
+
+def _rows_for_sessions(
+    rows: Sequence[Mapping[str, Any]], sessions: Sequence[str]
+) -> list[Mapping[str, Any]]:
+    allowed = set(sessions)
+    return sorted(
+        (row for row in rows if str(row.get("date")) in allowed),
+        key=lambda row: (str(row.get("date")), str(row.get("ticker", ""))),
+    )
+
+
+def _fold_engine(
+    strategy: AIStrategySpec,
+    candidate: CodeCandidate,
+    context_rows: Sequence[Mapping[str, Any]],
+    engine_rows: Sequence[Mapping[str, Any]],
+    tradable_sessions: set[str],
+):
+    store = PreparedFeatureStore(context_rows, rows_are_sorted=True)
+    action_map = {
+        (str(row.get("date")), str(row.get("ticker", "")).zfill(6)): action
+        for row, action in zip(
+            store.rows,
+            store.build_actions(candidate.strategy_ir, candidate.parameters),
+            strict=True,
+        )
+    }
+    ohlcv_rows, metric_rows = _engine_market_rows(engine_rows)
+    spec = _engine_strategy_spec(
+        strategy, candidate, available_ticker_count=_available_ticker_count(engine_rows)
+    )
+    prepared = prepare_engine_market_data(
+        spec, ohlcv_rows=ohlcv_rows, metric_rows=metric_rows,
+        config=EngineBacktestRunConfig(initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL, write_outputs=False, talib=EngineTalibIndicatorConfig(enabled=False, mode="none"), metrics_mode="selection"),
+        inputs_normalized=True,
+    )
+    actions = [
+        action_map.get((str(row.date), str(row.ticker).zfill(6)), HOLD_SIGNAL_VALUE)
+        if str(row.date) in tradable_sessions else HOLD_SIGNAL_VALUE
+        for row in prepared.ohlcv_rows
+    ]
+    return _run_candidate_backtest(strategy, candidate, engine_rows, prepared_market=prepared, generated_actions=actions, metrics_mode="selection")
+
+
+def _complete_target_returns(
+    engine_result: Any, targets: set[str]
+) -> dict[str, float] | None:
+    """Read every engine equity point; public curve sampling must never gate execution."""
+    returns: dict[str, float] = {}
+    for point in getattr(engine_result, "equity_curve", ()):
+        point_date = str(getattr(point, "date", ""))
+        if point_date in targets:
+            returns[point_date] = _finite_float(
+                getattr(point, "daily_return", None),
+                f"walk_forward_daily_return[{point_date}]",
+            )
+    return returns if set(returns) == targets else None
+
+
+def _full_target_fills(engine_result: Any, targets: set[str]) -> list[dict[str, Any]]:
+    return [
+        payload
+        for event in getattr(engine_result, "order_audit", ())
+        if (payload := event.as_dict()).get("status") == "executed"
+        and str(payload.get("date", payload.get("session", ""))) in targets
+    ]
+
+
+def _walk_forward_aggregate_metrics(returns: Sequence[float]) -> BacktestMetrics:
+    total_return = _compound_returns(returns)
+    sharpe = _native_sharpe_like(list(returns))
+    return BacktestMetrics(
+        sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
+        max_drawdown=round(_max_drawdown_from_returns(returns), METRIC_ROUND_DIGITS),
+        win_rate=(sum(value > 0.0 for value in returns) / len(returns) if returns else 0.0),
+        total_return=round(total_return, METRIC_ROUND_DIGITS),
+        in_sample_sharpe=0.0,
+        out_sample_sharpe=round(sharpe, METRIC_ROUND_DIGITS),
+        degradation=0.0,
+        out_sample_return=round(total_return, METRIC_ROUND_DIGITS),
+    )
+
+def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: list[CodeCandidate], rows: Sequence[Mapping[str, Any]], *, feature_coverage: Mapping[str, Any] | None, fallback_reasons: Sequence[str] | None) -> CandidateBacktestResult:
+    if any(candidate.representation != "structured" for candidate in candidates):
+        result = run_candidate_backtest(strategy, candidates, price_rows=rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons, _walk_forward_enabled=False)
+        masked = result.selected_candidate.model_copy(update={"metrics": _mask_unavailable_walk_forward_metrics(result.selected_candidate.metrics, UNSAFE_WALK_FORWARD_CANDIDATE)})
+        return result.model_copy(update={"selected_candidate": masked, "walk_forward": WalkForwardPolicyResult(status="unsafe_candidate", unavailable_reason=UNSAFE_WALK_FORWARD_CANDIDATE)})
+
+    claimed: set[str] = set()
+    returns_by_session: dict[str, float] = {}
+    selections: list[WalkForwardFoldSelection] = []
+    fills: list[dict[str, Any]] = []
+    evaluation_ledgers: list[dict[str, Any]] = []
+    deduped = 0
+    selected: CodeCandidate | None = None
+    policy = _walk_forward_split_policy(rows)
+    for fold in policy.folds:
+        selection_sessions = (*fold.warmup_sessions, *fold.train_sessions, *fold.validation_sessions)
+        selection_rows = _rows_for_sessions(rows, selection_sessions)
+        # Selection engine sees warmup for features, but warmup orders are HOLD.
+        eligible: list[CodeCandidate] = []
+        for proposed in candidates:
+            if not proposed.validation_ok:
+                continue
+            selection_engine = _fold_engine(
+                strategy,
+                proposed,
+                selection_rows,
+                selection_rows,
+                set((*fold.train_sessions, *fold.validation_sessions)),
+            )
+            if not getattr(selection_engine, "equity_curve", None):
+                continue
+            metrics = _metrics_from_engine_result(selection_engine)
+            eligible.append(proposed.model_copy(update={"metrics": metrics}))
+        if not eligible:
+            continue
+        own = [candidate for candidate in eligible if _is_user_rule(candidate)]
+        candidate = max(own or eligible, key=_candidate_rank)
+
+        targets = tuple(session for session in fold.evaluation_sessions if session not in claimed)
+        deduped += len(fold.evaluation_sessions) - len(targets)
+        if not targets:
+            continue
+        target_set = set(targets)
+        context_rows = _rows_for_sessions(rows, (*selection_sessions, *targets))
+        # Fresh engine gets bridge + target only; actions retain all causal feature history.
+        engine_rows = _rows_for_sessions(rows, (*fold.validation_sessions[-1:], *targets))
+        evaluation_engine = _fold_engine(strategy, candidate, context_rows, engine_rows, target_set)
+        target_returns = _complete_target_returns(evaluation_engine, target_set)
+        if target_returns is None:
+            continue
+        claimed.update(target_set)
+        returns_by_session.update(target_returns)
+        fills.extend(_full_target_fills(evaluation_engine, target_set))
+        evaluation_ledgers.append(_storage_execution_ledger(evaluation_engine))
+        selected = candidate
+        digest = sha256(json.dumps({"fold": fold.fold_index, "candidate": _candidate_identity(candidate), "train": fold.train_sessions, "validation": fold.validation_sessions}, sort_keys=True).encode()).hexdigest()
+        selections.append(WalkForwardFoldSelection(fold_index=fold.fold_index, selection_hash=digest, candidate_id=candidate.candidate_id, evaluation_sessions=list(targets)))
+
+    months = {session[:7] for session in returns_by_session}
+    ready = len(selections) >= WALK_FORWARD_MIN_VALID_FOLDS and len(months) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS and len(returns_by_session) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS and len(returns_by_session) == len(claimed)
+    ordered_sessions = sorted(returns_by_session) if ready else []
+    daily_returns = {session: returns_by_session[session] for session in ordered_sessions}
+    equity = 1.0
+    curve: list[BacktestEquityPoint] = []
+    for session in ordered_sessions:
+        equity *= 1.0 + daily_returns[session]
+        curve.append(BacktestEquityPoint(date=session, cumulative_return=round(equity - 1.0, METRIC_ROUND_DIGITS)))
+    if selected is None:
+        raise ValueError("walk-forward produced no complete evaluation fold")
+    costs = sum(
+        sum(
+            float(fill.get(key, 0.0) or 0.0)
+            for key in ("commission_cost", "tax_cost", "slippage_cost")
+        )
+        for fill in fills
+    )
+    engine_summary = {
+        "walk_forward_sample": _walk_forward_metadata(_walk_forward_sample(rows), policy),
+        "walk_forward_policy": "rolling_selection_policy",
+        "_storage_execution_ledger": _merge_storage_execution_ledgers(evaluation_ledgers),
+    }
+    return CandidateBacktestResult(
+        strategy_a=strategy,
+        candidates=candidates,
+        selected_candidate=selected,
+        equity_curve=curve,
+        engine_summary=engine_summary,
+        backtest_payload=_backtest_payload(
+            strategy,
+            rows,
+            benchmark_context=_build_benchmark_context(rows),
+        ),
+        feature_coverage=dict(feature_coverage or {}),
+        fallback_reasons=list(fallback_reasons or ()),
+        execution_stats={
+            "walk_forward": True,
+            "evaluation_sessions": len(claimed),
+        },
+        walk_forward=WalkForwardPolicyResult(
+            status="ready" if ready else "insufficient",
+            unavailable_reason=None if ready else INSUFFICIENT_WALK_FORWARD_SAMPLE,
+            fold_selections=selections,
+            unique_evaluation_session_count=len(daily_returns),
+            daily_returns=daily_returns,
+            aggregate_metrics=(
+                _walk_forward_aggregate_metrics(list(daily_returns.values()))
+                if ready
+                else None
+            ),
+            equity_curve=curve,
+            fills=fills if ready else [],
+            costs=costs if ready else 0.0,
+            deduped_session_count=deduped,
+        ),
+    )
 
 
 def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -1603,23 +1917,15 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         all_candidates = candidates
         seen_candidates = {_candidate_identity(candidate) for candidate in all_candidates}
         fallback_reasons = list(state.get("backtest_code", {}).get("fallback_reasons", []))
-        # Automatic mode used to get zero rounds: refining thresholds after seeing the
-        # objective miss would fit the training history. That was a fair objection to the
-        # loop as written, but it was aimed at the wrong part of it. The search accepts a
-        # candidate on `_selected_objective_score`, which is selection-split only; the one
-        # thing that read the hold-out was the stop condition below, which broke as soon
-        # as `_passes_objective_floor` went true. So the leak is removed rather than the
-        # search, and every mode now gets the same budget.
-        #
-        # Automatic was the mode that had to clear the benchmark-relative gate on top of
-        # the basic floor, and it was also the only one given no attempts to clear it -
-        # three pre-registered families, evaluated once, against a bar that asks a
-        # strategy to beat buy-and-hold on total return, hold-out excess return, and the
-        # 63-day period win rate both overall and in the hold-out. In practice it never
-        # passed. Widening the search is priced in rather than hidden: the winner is
-        # argmax over everything tried, and `_apply_selection_correction` below discounts
-        # its Sharpe by exactly that N.
-        self_improvement_rounds = MAX_SELF_IMPROVEMENT_ROUNDS
+        # Refinement operates only on the selection data. Once real walk-forward
+        # evaluation is available, changing candidates after that evaluation would
+        # leak evaluation evidence into the search. Otherwise retain the automatic
+        # mode's established refinement budget.
+        self_improvement_rounds = (
+            0
+            if _walk_forward_sample(rows).status == READY_WALK_FORWARD
+            else MAX_SELF_IMPROVEMENT_ROUNDS
+        )
         for iteration in range(1, self_improvement_rounds + 1):
             if time.perf_counter() - node_started >= _wall_budget_seconds():
                 fallback_reasons.append(
@@ -1778,7 +2084,7 @@ def _run_candidate_backtest(
     return run_engine_backtest(
         engine_spec,
         config=EngineBacktestRunConfig(
-            initial_capital=DEFAULT_INITIAL_CAPITAL,
+            initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL,
             write_outputs=False,
             talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
             metrics_mode=metrics_mode,
@@ -1831,6 +2137,53 @@ def _execute_candidate_code(
     return [_generated_signal_from_raw(signal) for signal in raw_signals]
 
 
+def _storage_execution_ledger(engine_result: Any) -> dict[str, Any]:
+    signals = [signal.as_dict() for signal in getattr(engine_result, "signals", [])]
+    order_audit = [event.as_dict() for event in getattr(engine_result, "order_audit", [])]
+    fills = [event for event in order_audit if event.get("status") == "executed"]
+    trades = [trade.as_dict() for trade in getattr(engine_result, "trades", [])]
+    positions: list[dict[str, Any]] = []
+    quantities: dict[str, float] = defaultdict(float)
+    for fill in fills:
+        ticker = str(fill.get("ticker") or "")
+        quantity = float(fill.get("filled_quantity") or 0)
+        quantities[ticker] += quantity if fill.get("side") == "buy" else -quantity
+        positions.append({"date": fill.get("date"), "ticker": ticker, "quantity": quantities[ticker], "fill_quantity": quantity, "side": fill.get("side"), "reason": fill.get("reason")})
+    equity = [point.as_dict() for point in getattr(engine_result, "equity_curve", [])]
+    ledger = {"signals": signals, "order_audit": order_audit, "fills": fills, "positions": positions, "trades": trades, "equity": equity}
+    ledger["source_event_count"] = sum(len(value) for value in ledger.values() if isinstance(value, list))
+    ledger["source_event_hash"] = sha256(
+        json.dumps(
+            {key: ledger[key] for key in ("signals", "order_audit", "fills", "positions", "trades", "equity")},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return ledger
+
+
+def _merge_storage_execution_ledgers(
+    ledgers: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    keys = ("signals", "order_audit", "fills", "positions", "trades", "equity")
+    merged: dict[str, Any] = {key: [] for key in keys}
+    for ledger in ledgers:
+        for key in keys:
+            records = ledger.get(key, [])
+            if isinstance(records, list):
+                merged[key].extend(records)
+    merged["source_event_count"] = sum(len(merged[key]) for key in keys)
+    merged["source_event_hash"] = sha256(
+        json.dumps(
+            {key: merged[key] for key in keys},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return merged
+
 def _generated_signal_from_raw(signal: object) -> GeneratedSignal:
     if isinstance(signal, Mapping):
         normalized = dict(signal)
@@ -1850,16 +2203,40 @@ def _engine_market_rows(
     ohlcv_rows: list[Any] = []
     metric_rows: dict[tuple[date, str], dict[str, float]] = {}
 
+    raw_execution_declared = any(
+        any(field in row for field in ("raw_open", "raw_high", "raw_low", "raw_close", "raw_volume"))
+        for row in price_rows
+    )
     for raw in price_rows:
         if "date" not in raw or "close" not in raw:
-            raise ValueError("price rows must include date and close")
+            raise ValueError("price rows must include date and adjusted close for signal generation")
         row_date = date.fromisoformat(str(raw["date"]))
         ticker = str(raw.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
-        close = _finite_float(raw["close"], "close")
-        open_price = _finite_float(raw.get("open", close), "open")
-        high = _finite_float(raw.get("high", max(open_price, close)), "high")
-        low = _finite_float(raw.get("low", min(open_price, close)), "low")
-        volume = _finite_float(raw.get("volume", DEFAULT_FIXTURE_VOLUME), "volume")
+        if raw_execution_declared:
+            required_raw_fields = ("raw_open", "raw_high", "raw_low", "raw_close", "raw_volume", "raw_notional")
+            missing = [field for field in required_raw_fields if raw.get(field) in (None, "")]
+            if missing:
+                raise ValueError(
+                    f"raw_execution_unavailable:{row_date.isoformat()}/{ticker}:{','.join(missing)}"
+                )
+            open_price = _finite_float(raw["raw_open"], "raw_open")
+            high = _finite_float(raw["raw_high"], "raw_high")
+            low = _finite_float(raw["raw_low"], "raw_low")
+            close = _finite_float(raw["raw_close"], "raw_close")
+            volume = _finite_float(raw["raw_volume"], "raw_volume")
+            parsed_raw_notional = _finite_float(raw["raw_notional"], "raw_notional")
+        else:
+            # Synthetic callers that predate the raw loader retain one self-consistent
+            # series. Warehouse rows declare raw fields and therefore never reach here.
+            close = _finite_float(raw["close"], "close")
+            open_price = _finite_float(raw.get("open", close), "open")
+            high = _finite_float(raw.get("high", max(open_price, close)), "high")
+            low = _finite_float(raw.get("low", min(open_price, close)), "low")
+            volume = _finite_float(raw.get("volume", DEFAULT_FIXTURE_VOLUME), "volume")
+            raw_notional = raw.get("raw_notional")
+            parsed_raw_notional = (
+                None if raw_notional in (None, "") else _finite_float(raw_notional, "raw_notional")
+            )
         ohlcv_rows.append(
             EngineOhlcvBar(
                 date=row_date,
@@ -1871,6 +2248,7 @@ def _engine_market_rows(
                 low=low,
                 close=close,
                 volume=volume,
+                raw_notional=parsed_raw_notional,
             )
         )
         metric_row: dict[str, float] = {}
@@ -1991,23 +2369,20 @@ def _engine_risk_controls(strategy: AIStrategySpec, *, candidate: CodeCandidate 
 
 
 def _requested_max_positions(strategy: AIStrategySpec) -> int:
-    max_position_pct = _optional_positive_float(
-        strategy.risk_constraints.get("max_position_pct"),
-        "max_position_pct",
-        upper_bound=1.0,
-    )
-    return _shared_requested_max_positions(max_position_pct)
+    return max(1, math.ceil(1.0 / _strategy_max_position_pct(strategy)))
 
 
 def _applied_max_positions(
     strategy: AIStrategySpec, available_ticker_count: int | None = None
 ) -> int:
-    max_position_pct = _optional_positive_float(
-        strategy.risk_constraints.get("max_position_pct"),
-        "max_position_pct",
-        upper_bound=1.0,
-    )
-    return _shared_applied_max_positions(max_position_pct, available_ticker_count)
+    requested = _requested_max_positions(strategy)
+    if available_ticker_count is None or available_ticker_count <= 0:
+        return requested
+    return min(requested, available_ticker_count)
+
+
+def _strategy_max_position_pct(strategy: AIStrategySpec) -> float:
+    return required_max_position_pct(strategy.risk_constraints)
 
 
 def _available_ticker_count(price_rows: Sequence[Mapping[str, Any]]) -> int:
@@ -2356,6 +2731,94 @@ def _compound_returns(daily_returns: Sequence[float]) -> float:
     return equity - 1.0
 
 
+def _walk_forward_split_policy(price_rows: Sequence[Mapping[str, Any]]) -> _SplitPolicy:
+    sessions_by_month: dict[str, list[str]] = defaultdict(list)
+    for session in sorted(
+        {str(row.get("date")) for row in price_rows if row.get("date") is not None}
+    ):
+        sessions_by_month[session[:7]].append(session)
+    months = tuple(sorted(sessions_by_month))
+    warmup_sessions = tuple(
+        session
+        for month in months[:WALK_FORWARD_WARMUP_MONTHS]
+        for session in sessions_by_month[month]
+    )
+    folds: list[_WalkForwardFold] = []
+    span = (
+        WALK_FORWARD_TRAIN_MONTHS
+        + WALK_FORWARD_VALIDATION_MONTHS
+        + WALK_FORWARD_EVALUATION_MONTHS
+    )
+    for start in range(0, len(months) - (span + WALK_FORWARD_WARMUP_MONTHS) + 1, WALK_FORWARD_ROLL_MONTHS):
+        warmup_months = months[start : start + WALK_FORWARD_WARMUP_MONTHS]
+        train_start = start + WALK_FORWARD_WARMUP_MONTHS
+        train_months = months[train_start : train_start + WALK_FORWARD_TRAIN_MONTHS]
+        validation_start = train_start + WALK_FORWARD_TRAIN_MONTHS
+        validation_months = months[validation_start : validation_start + WALK_FORWARD_VALIDATION_MONTHS]
+        evaluation_months = months[validation_start + WALK_FORWARD_VALIDATION_MONTHS : validation_start + WALK_FORWARD_VALIDATION_MONTHS + WALK_FORWARD_EVALUATION_MONTHS]
+        fold = _WalkForwardFold(
+            fold_index=len(folds),
+            warmup_sessions=tuple(session for month in warmup_months for session in sessions_by_month[month]),
+            train_sessions=tuple(session for month in train_months for session in sessions_by_month[month]),
+            validation_sessions=tuple(session for month in validation_months for session in sessions_by_month[month]),
+            evaluation_sessions=tuple(session for month in evaluation_months for session in sessions_by_month[month]),
+        )
+        if fold.warmup_sessions and fold.train_sessions and fold.validation_sessions and fold.evaluation_sessions:
+            folds.append(fold)
+    final_lockbox_sessions = folds[-1].evaluation_sessions if folds else ()
+    return _SplitPolicy(
+        warmup_sessions=warmup_sessions,
+        folds=tuple(folds),
+        final_lockbox_sessions=final_lockbox_sessions,
+    )
+
+
+def _walk_forward_sample(price_rows: Sequence[Mapping[str, Any]]) -> _WalkForwardSample:
+    sessions = {str(row.get("date")) for row in price_rows if row.get("date") is not None}
+    policy = _walk_forward_split_policy(price_rows)
+    evaluation_sessions = [session for fold in policy.folds for session in fold.evaluation_sessions]
+    unique_evaluation_sessions = set(evaluation_sessions)
+    evaluation_months = {session[:7] for session in unique_evaluation_sessions}
+    meets_minimum = (
+        len(policy.folds) >= WALK_FORWARD_MIN_VALID_FOLDS
+        and len(evaluation_months) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS
+        and len(unique_evaluation_sessions) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS
+    )
+    return _WalkForwardSample(
+        session_count=len(sessions),
+        valid_fold_count=len(policy.folds),
+        unique_evaluation_month_count=len(evaluation_months),
+        unique_evaluation_session_count=len(unique_evaluation_sessions),
+        status=READY_WALK_FORWARD if meets_minimum else INSUFFICIENT_WALK_FORWARD_SAMPLE,
+    )
+
+
+def _walk_forward_metadata(
+    sample: _WalkForwardSample, policy: _SplitPolicy | None = None
+) -> dict[str, Any]:
+    return {
+        "policy": "warmup_1m_train_12m_validation_3m_evaluation_1m_roll_1m",
+        "session_count": sample.session_count,
+        "valid_fold_count": sample.valid_fold_count,
+        "unique_evaluation_month_count": sample.unique_evaluation_month_count,
+        "unique_evaluation_session_count": sample.unique_evaluation_session_count,
+        "minimums": {
+            "unique_evaluation_sessions": WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
+            "valid_folds": WALK_FORWARD_MIN_VALID_FOLDS,
+            "unique_evaluation_months": WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS,
+        },
+        "status": sample.status,
+        "aggregate_oos_available": sample.status == READY_WALK_FORWARD,
+        "benchmark_comparison_available": False,
+        "selection_scope": "train_validation_only",
+        "final_lockbox_excluded_from_selection": True,
+        "unavailable_reason": None if sample.status == READY_WALK_FORWARD else sample.status,
+        "fold_evaluation_months": [
+            fold.evaluation_month for fold in (policy.folds if policy else ())
+        ],
+        "final_lockbox_sessions": list(policy.final_lockbox_sessions) if policy else [],
+    }
+
 def _benchmark_daily_returns(
     price_rows: Sequence[Mapping[str, Any]],
 ) -> list[float]:
@@ -2382,21 +2845,111 @@ def _daily_returns_from_benchmark_curve(
 def _build_benchmark_context(
     price_rows: Sequence[Mapping[str, Any]],
 ) -> _BenchmarkContext:
-    curve, total_return = _equal_weight_benchmark_curve(price_rows)
+    auxiliary_curve, _ = _equal_weight_benchmark_curve(price_rows)
     selection_days = max(
         1,
         int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION),
     )
-    selection_index = min(max(0, selection_days - 1), len(curve) - 1)
+    selection_index = min(max(0, selection_days - 1), len(auxiliary_curve) - 1)
     selection_return = (
-        float(curve[selection_index].cumulative_return) if curve else 0.0
+        float(auxiliary_curve[selection_index].cumulative_return) if auxiliary_curve else 0.0
     )
     return _BenchmarkContext(
-        daily_returns=tuple(_daily_returns_from_benchmark_curve(curve)),
+        daily_returns=tuple(_daily_returns_from_benchmark_curve(auxiliary_curve)),
         selection_days=selection_days,
         selection_return=selection_return,
-        total_return=float(total_return or 0.0),
+        total_return=None,
+        primary_available=False,
+        primary_unavailable_reason=(
+            "official KOSPI and KOSDAQ total-return series with target weights were not supplied"
+        ),
+        auxiliary_label=AUXILIARY_BENCHMARK_LABEL,
     )
+
+
+def _benchmark_provenance(context: _BenchmarkContext) -> dict[str, Any]:
+    return {
+        "primary": {
+            "label": PRIMARY_BENCHMARK_LABEL,
+            "method": PRIMARY_BENCHMARK_METHOD,
+            "available": context.primary_available,
+            "official_series_and_lagged_weights": context.primary_available,
+            "return": context.total_return if context.primary_available else None,
+            "unavailable_reason": context.primary_unavailable_reason,
+        },
+        "auxiliary": {
+            "label": context.auxiliary_label,
+            "method": AUXILIARY_BENCHMARK_METHOD,
+            "warning": AUXILIARY_BENCHMARK_WARNING,
+        },
+    }
+
+
+def _official_krx_tr_benchmark_curve(
+    kospi_tr: Mapping[str, float],
+    kosdaq_tr: Mapping[str, float],
+    lagged_target_weights: Mapping[str, tuple[float, float]],
+) -> tuple[list[BacktestEquityPoint], float | None]:
+    """Monthly-rebalanced KOSPI/KOSDAQ TR benchmark with fixed intra-month units.
+
+    Each month's units are set from that month's first available TR observations and the
+    target weights lagged from the prior month. Units then remain fixed until the next
+    month, so daily weights drift with relative performance rather than being silently
+    reset every session.
+    """
+    dates = sorted(set(kospi_tr) & set(kosdaq_tr))
+    if not dates:
+        return [], None
+    units: tuple[float, float] | None = None
+    active_month: str | None = None
+    curve: list[BacktestEquityPoint] = []
+    base_value: float | None = None
+    # Missing monthly weights are a data-contract failure, never a 50/50 fallback.
+    for current_date in dates:
+        month = current_date[:7]
+        if month != active_month:
+            if month not in lagged_target_weights:
+                raise ValueError(f"missing lagged official benchmark weights for {month}")
+            weights = lagged_target_weights[month]
+            kospi_weight, kosdaq_weight = (float(weights[0]), float(weights[1]))
+            if (
+                not math.isfinite(kospi_weight)
+                or not math.isfinite(kosdaq_weight)
+                or kospi_weight < 0.0
+                or kosdaq_weight < 0.0
+                or not math.isclose(kospi_weight + kosdaq_weight, 1.0, abs_tol=1e-9)
+            ):
+                raise ValueError(
+                    "official benchmark target weights must be finite, non-negative, and sum to 1"
+                )
+            kospi_level = _finite_float(kospi_tr[current_date], "kospi_tr")
+            kosdaq_level = _finite_float(kosdaq_tr[current_date], "kosdaq_tr")
+            if kospi_level <= 0.0 or kosdaq_level <= 0.0:
+                raise ValueError("official benchmark TR levels must be positive")
+            portfolio_value = (
+                1.0
+                if units is None
+                else units[0] * kospi_level + units[1] * kosdaq_level
+            )
+            units = (
+                portfolio_value * kospi_weight / kospi_level,
+                portfolio_value * kosdaq_weight / kosdaq_level,
+            )
+            active_month = month
+        assert units is not None
+        value = (
+            units[0] * _finite_float(kospi_tr[current_date], "kospi_tr")
+            + units[1] * _finite_float(kosdaq_tr[current_date], "kosdaq_tr")
+        )
+        if base_value is None:
+            base_value = value
+        curve.append(
+            BacktestEquityPoint(
+                date=current_date,
+                cumulative_return=round(value / base_value - 1.0, METRIC_ROUND_DIGITS),
+            )
+        )
+    return curve, curve[-1].cumulative_return
 
 
 def _benchmark_period_stats(
@@ -2467,13 +3020,46 @@ def _native_sharpe_like(
     metric_name: str = "sharpe",
     metric_warnings: list[dict[str, str]] | None = None,
 ) -> float:
-    del metric_name, metric_warnings
     if len(daily_returns) < 2:
+        if metric_warnings is not None:
+            metric_warnings.append({"metric": metric_name, "reason": "fewer than two returns"})
         return 0.0
     mean_return = sum(daily_returns) / len(daily_returns)
     variance = sum((value - mean_return) ** 2 for value in daily_returns) / (len(daily_returns) - 1)
-    return mean_return / math.sqrt(variance) * math.sqrt(252.0) if variance > 0.0 else 0.0
+    if variance <= 0.0:
+        if metric_warnings is not None:
+            metric_warnings.append({"metric": metric_name, "reason": "zero return variance"})
+        return 0.0
+    return mean_return / math.sqrt(variance) * math.sqrt(252.0)
 
+
+def _mask_unavailable_walk_forward_metrics(
+    metrics: BacktestMetrics, reason: str
+) -> BacktestMetrics:
+    if reason not in {
+        INSUFFICIENT_WALK_FORWARD_SAMPLE,
+        UNSAFE_WALK_FORWARD_CANDIDATE,
+    }:
+        return metrics
+    return metrics.model_copy(
+        update={
+            "out_sample_sharpe": None,
+            "out_sample_return": None,
+            "in_sample_benchmark_return": None,
+            "out_sample_benchmark_return": None,
+            "in_sample_excess_return": None,
+            "out_sample_excess_return": None,
+            "benchmark_period_count": None,
+            "benchmark_period_win_rate": None,
+            "benchmark_period_loss_rate": None,
+            "in_sample_benchmark_period_count": None,
+            "in_sample_benchmark_period_win_rate": None,
+            "in_sample_benchmark_period_loss_rate": None,
+            "out_sample_benchmark_period_count": None,
+            "out_sample_benchmark_period_win_rate": None,
+            "out_sample_benchmark_period_loss_rate": None,
+        }
+    )
 
 def _degradation(in_sample_sharpe: float, out_sample_sharpe: float) -> float:
     if in_sample_sharpe == 0:
@@ -2526,6 +3112,7 @@ def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
     passes_basic_floor = (
         trade_count >= MIN_OBJECTIVE_TRADES
         # This gate is a report/acceptance check, so it uses the untouched hold-out.
+        and metrics.out_sample_sharpe is not None
         and metrics.out_sample_sharpe >= MIN_OBJECTIVE_SHARPE
         and metrics.max_drawdown >= MAX_OBJECTIVE_DRAWDOWN
         # A winner picked from N tries has to beat what N tries of nothing would have
@@ -2540,39 +3127,64 @@ def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
     strategy = getattr(result, "strategy_a", None)
     if getattr(strategy, "selection_mode", "standard") != "automatic":
         return True
-    return not _benchmark_objective_reasons(metrics)
+    payload = getattr(result, "backtest_payload", {}) or {}
+    benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
+    primary = benchmark.get("primary") if isinstance(benchmark, Mapping) else None
+    if not isinstance(primary, Mapping) or not primary.get("available"):
+        return False
+    return not _benchmark_objective_reasons(metrics, benchmark_return=primary.get("return"))
 
 
-def _benchmark_objective_reasons(metrics: BacktestMetrics) -> list[str]:
+
+def _benchmark_objective_reasons(
+    metrics: BacktestMetrics, *, benchmark_return: float | None = None
+) -> list[str]:
     """Why an automatic strategy failed the benchmark-relative acceptance rule.
 
-    Both checks are measured on the hold-out, for the same reason the basic floor reads
-    `out_sample_sharpe` rather than `sharpe_ratio`: this is an acceptance test, and the
-    selection split is the data the winning candidate was chosen on.
-
-    There used to be four checks. The other two - the 63-day loss rate over the whole
-    history, and total return against the whole-period benchmark - spanned the selection
-    split as well, so a candidate was partly being judged on the sample it won. They also
-    could not fail alone: each restated its hold-out counterpart over a longer window, so
-    the pair below is what actually decided every outcome while the report listed four
-    reasons and read as four independent findings. Removing them relaxes nothing that was
-    load-bearing - the run that prompted this still fails both survivors, at a 63.6%
-    hold-out loss rate and -118.75% hold-out excess return.
+    The final lockbox checks preserve the hold-out acceptance contract. Aggregate
+    walk-forward and official-primary checks are required as well; unavailable nullable
+    values fail closed instead of being mistaken for neutral performance.
     """
 
     reasons: list[str] = []
-    if metrics.out_sample_benchmark_period_count <= 0:
+    if metrics.benchmark_period_count is None:
+        reasons.append("walk-forward benchmark aggregate is unavailable")
+    elif metrics.benchmark_period_count <= 0:
+        reasons.append(
+            f"{BENCHMARK_EVALUATION_PERIOD_DAYS}거래일 벤치마크 비교 구간이 없습니다"
+        )
+    if metrics.out_sample_benchmark_period_count is None:
+        reasons.append("walk-forward final lockbox benchmark aggregate is unavailable")
+    elif metrics.out_sample_benchmark_period_count <= 0:
         reasons.append(
             f"최종 미사용 구간에 {BENCHMARK_EVALUATION_PERIOD_DAYS}거래일 벤치마크 비교 구간이 없습니다"
         )
-    elif metrics.out_sample_benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:
+    elif (
+        metrics.out_sample_benchmark_period_loss_rate is not None
+        and metrics.out_sample_benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE
+    ):
         reasons.append(
             "최종 미사용 구간의 벤치마크 패배 비율 "
             f"{metrics.out_sample_benchmark_period_loss_rate:.1%} >= "
             f"{MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:.0%}"
         )
-    if metrics.out_sample_excess_return <= 0.0:
+    if metrics.out_sample_excess_return is None:
+        reasons.append("walk-forward final lockbox excess return is unavailable")
+    elif metrics.out_sample_excess_return <= 0.0:
         reasons.append(f"최종 미사용 구간 초과수익률 {metrics.out_sample_excess_return:.2%} <= 0%")
+    parsed_benchmark = float(benchmark_return) if _is_numeric_metric(benchmark_return) else None
+    if (
+        parsed_benchmark is None
+        and metrics.in_sample_benchmark_return is not None
+        and metrics.out_sample_benchmark_return is not None
+    ):
+        parsed_benchmark = (1.0 + metrics.in_sample_benchmark_return) * (
+            1.0 + metrics.out_sample_benchmark_return
+        ) - 1.0
+    if parsed_benchmark is None:
+        reasons.append("official benchmark aggregate is unavailable")
+    elif metrics.total_return <= parsed_benchmark:
+        reasons.append(f"전체 수익률 {metrics.total_return:.2%} <= 벤치마크 {parsed_benchmark:.2%}")
     return reasons
 
 
@@ -2613,7 +3225,8 @@ def _objective_score(
     )
     annual_excess_return = annual_return - annual_benchmark_return
     benchmark_consistency = (
-        metrics.in_sample_benchmark_period_win_rate - metrics.in_sample_benchmark_period_loss_rate
+        float(metrics.in_sample_benchmark_period_win_rate or 0.0)
+        - float(metrics.in_sample_benchmark_period_loss_rate or 0.0)
     )
     trading_days = selection_days
     annual_turnover = trade_count * 252.0 / trading_days
@@ -2641,7 +3254,9 @@ def _objective_score(
     if annual_excess_return <= 0.0:
         score -= 0.35 + abs(annual_excess_return)
     if (
-        metrics.in_sample_benchmark_period_count > 0
+        metrics.in_sample_benchmark_period_count is not None
+        and metrics.in_sample_benchmark_period_count > 0
+        and metrics.in_sample_benchmark_period_loss_rate is not None
         and metrics.in_sample_benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE
     ):
         score -= 0.25 + metrics.in_sample_benchmark_period_loss_rate
@@ -2845,9 +3460,10 @@ def _backtest_payload(
     strategy: AIStrategySpec,
     rows: Sequence[Mapping[str, Any]],
     *,
-    benchmark_return: float | None = None,
+    benchmark_context: _BenchmarkContext,
 ) -> dict[str, Any]:
     tickers = sorted({str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6) for row in rows})
+    walk_forward = _walk_forward_sample(rows)
     payload = {
         "strategy_id": strategy.strategy_id,
         "market": strategy.market,
@@ -2855,12 +3471,12 @@ def _backtest_payload(
         "price_rows": len(rows),
         "first_date": str(rows[0].get("date")) if rows else None,
         "last_date": str(rows[-1].get("date")) if rows else None,
-        "benchmark_return": round(
-            _benchmark_return(rows) if benchmark_return is None else benchmark_return,
-            METRIC_ROUND_DIGITS,
+        "analysis_initial_capital_krw": CANONICAL_ANALYSIS_INITIAL_CAPITAL,
+        "initial_capital_contract": "canonical_analysis_job_sealed_primary_contract",
+        "benchmark": _benchmark_provenance(benchmark_context),
+        "walk_forward_sample": _walk_forward_metadata(
+            walk_forward, _walk_forward_split_policy(rows)
         ),
-        "benchmark_method": BENCHMARK_METHOD,
-        "benchmark_warning": BENCHMARK_WARNING,
     }
     fingerprint = repr(sorted(payload.items())).encode("utf-8")
     return {**payload, "payload_hash": sha256(fingerprint).hexdigest()[:16]}
@@ -2935,6 +3551,17 @@ def _summary_float(summary: Mapping[str, Any], key: str) -> float:
         raise ValueError(f"engine summary missing {key}")
     return _finite_float(summary[key], key)
 
+
+def _undefined_metric_availability(
+    metric_warnings: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, None | str]]:
+    unavailable: dict[str, dict[str, None | str]] = {}
+    for warning in metric_warnings:
+        metric = warning.get("metric")
+        reason = warning.get("reason")
+        if isinstance(metric, str) and isinstance(reason, str):
+            unavailable[metric] = {"value": None, "unavailable_reason": reason}
+    return unavailable
 
 def _summary_float_default(summary: Mapping[str, Any], key: str, default: float) -> float:
     if key not in summary:

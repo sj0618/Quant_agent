@@ -276,9 +276,8 @@ def test_public_performance_reliability_marks_multi_ticker_postgres_as_sufficien
     assert not performance.reliability.warnings
 
 
-def test_public_performance_benchmark_and_excess_return_are_visible() -> None:
+def test_public_performance_does_not_promote_equal_weight_proxy_to_primary() -> None:
     benchmark_rows = _trend_rows(datetime(2026, 1, 1), 252, ticker_count=5, start_price=100.0)
-    expected_benchmark_return = 0.01
     performance = build_public_backtest_performance(
         _performance_payload(
             BacktestMetrics(
@@ -298,18 +297,19 @@ def test_public_performance_benchmark_and_excess_return_are_visible() -> None:
 
     assert performance is not None
     assert performance.benchmark is not None
-    assert performance.benchmark.is_available is True
+    assert performance.benchmark.is_available is False
     assert performance.benchmark.method == BENCHMARK_METHOD
     assert BENCHMARK_WARNING in performance.benchmark.warning
-    assert performance.benchmark.total_return == pytest.approx(expected_benchmark_return)
+    assert performance.benchmark.total_return is None
     benchmark_metric = next(
         metric for metric in performance.metric_details if metric.key == "benchmark_return"
     )
     excess_metric = next(
         metric for metric in performance.metric_details if metric.key == "excess_return"
     )
-    assert benchmark_metric.value == pytest.approx(expected_benchmark_return)
-    assert excess_metric.value == pytest.approx(0.05 - expected_benchmark_return)
+    assert benchmark_metric.value is None
+    assert benchmark_metric.unavailable_reason
+    assert excess_metric.value is None
 
 
 def test_public_performance_metric_details_have_explanations_and_flags() -> None:

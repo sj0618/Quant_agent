@@ -3227,7 +3227,9 @@ def _objective_gate_reasons(
         reasons.append(
             f"거래 횟수 {trade_count:.0f}회로 MIN_OBJECTIVE_TRADES={MIN_OBJECTIVE_TRADES} 조건 미달"
         )
-    if metrics.out_sample_sharpe < MIN_OBJECTIVE_SHARPE:
+    if metrics.out_sample_sharpe is None:
+        reasons.append("워크포워드 외부 샤프비율을 신뢰성 있게 계산할 수 없음")
+    elif metrics.out_sample_sharpe < MIN_OBJECTIVE_SHARPE:
         reasons.append(
             f"보유 구간 외부 샤프비율 {metrics.out_sample_sharpe:.4f} < {MIN_OBJECTIVE_SHARPE:.2f}"
         )

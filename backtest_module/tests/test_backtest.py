@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pytest
@@ -12,6 +12,7 @@ from backtest_module import (
     RiskControls,
     StrategySpec,
 )
+from backtest_module.models import CorporateActionEvent
 from backtest_module.backtest import (
     BacktestRunConfig,
     EquityPoint,
@@ -47,7 +48,10 @@ def rsi_spec() -> StrategySpec:
             stop_loss_pct=0.5,
             take_profit_pct=None,
         ),
-        backtest={"cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump()},
+        backtest={
+            "cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump(),
+            "execution_capacity": {"enabled": False},
+        },
     )
 
 
@@ -111,7 +115,10 @@ def test_multi_ticker_buys_respect_single_and_gross_exposure_limits():
                 max_single_position_pct=0.2,
                 stop_loss_pct=0.5,
             ),
-            backtest={"cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump()},
+            backtest={
+                "cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump(),
+                "execution_capacity": {"enabled": False},
+            },
         ),
         ohlcv_rows=[
             OhlcvBar(date=day, ticker=ticker, open=10, high=10, low=10, close=10, volume=1000)
@@ -157,7 +164,10 @@ def test_all_2000_krx_tickers_run_without_score_filtering():
                 max_single_position_pct=1 / len(tickers),
                 stop_loss_pct=0.5,
             ),
-            backtest={"cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump()},
+            backtest={
+                "cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump(),
+                "execution_capacity": {"enabled": False},
+            },
         ),
         ohlcv_rows=[
             OhlcvBar(date=day, ticker=ticker, open=100, high=100, low=100, close=100, volume=1000)
@@ -529,7 +539,12 @@ def _delisting_scenario(*, grace_days, recovery_rate, survivor_days=40, doomed_d
             risk_controls=RiskControls(
                 max_gross_exposure_pct=1.0, max_single_position_pct=0.5, stop_loss_pct=0.9
             ),
-            backtest={"cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump()},
+            backtest={
+                "cost_model": CostModel(
+                    commission_pct=0, tax_pct=0, slippage_pct=0
+                ).model_dump(),
+                "execution_capacity": {"enabled": False},
+            },
         ),
         ohlcv_rows=rows,
         metric_rows=metrics,
@@ -608,3 +623,153 @@ def test_selection_metrics_vectorized_formula_matches_reference():
     assert metrics["max_drawdown"] == pytest.approx(round(expected_max_drawdown, 10), rel=1e-10)
     assert metrics["win_rate"] == pytest.approx(2.0 / 3.0, rel=1e-10)
     assert metrics["profit_factor"] == pytest.approx(0.04 / 0.01, rel=1e-10)
+
+
+def test_next_session_expiry_and_raw_capacity_are_fail_transparent():
+    spec = rsi_spec()
+    spec.backtest.execution_capacity.enabled = True
+    result = run_backtest(
+        spec,
+        ohlcv_rows=[
+            OhlcvBar(date=date(2026, 1, 2), ticker="000001", open=10, high=10, low=10, close=10, volume=1, raw_notional=100),
+            OhlcvBar(date=date(2026, 1, 5), ticker="000002", open=10, high=10, low=10, close=10, volume=999999),
+        ],
+        metric_rows=[{"date": "2026-01-02", "ticker": "000001", "rsi_14": 20}, {"date": "2026-01-05", "ticker": "000002", "rsi_14": 50}],
+        config=BacktestRunConfig(initial_capital=1000, write_outputs=False, talib=TalibIndicatorConfig(enabled=False, mode="none")),
+    )
+    expired = [event for event in result.order_audit if event.ticker == "000001" and event.status == "expired_next_session"]
+    assert expired and expired[0].reason == "next_session_missing_bar"
+
+
+def test_raw_prior_notional_limits_partial_fill_and_never_uses_fill_day_volume():
+    spec = rsi_spec()
+    spec.backtest.execution_capacity.enabled = True
+    result = run_backtest(
+        spec,
+        ohlcv_rows=[
+            OhlcvBar(date=date(2026, 1, 2), ticker="005930", open=10, high=10, low=10, close=10, volume=1, raw_notional=10_000),
+            OhlcvBar(date=date(2026, 1, 5), ticker="005930", open=10, high=10, low=10, close=10, volume=999999, raw_notional=0),
+        ],
+        metric_rows=[{"date": "2026-01-02", "ticker": "005930", "rsi_14": 20}, {"date": "2026-01-05", "ticker": "005930", "rsi_14": 50}],
+        config=BacktestRunConfig(initial_capital=1000, write_outputs=False, talib=TalibIndicatorConfig(enabled=False, mode="none")),
+    )
+    buy = next(event for event in result.order_audit if event.status == "executed" and event.side == "buy")
+    assert (buy.requested_quantity, buy.filled_quantity, buy.fill_rate) == (100, 10, 0.1)
+
+
+def test_unbounded_positions_and_fixed_risk_validation():
+    tickers = [f"{number:06d}" for number in range(11)]
+    spec = StrategySpec(
+        strategy_id="unbounded", strategy_name="Unbounded",
+        entry_rules=[Condition(left="rsi_14", operator=ConditionOperator.LTE, right=30)],
+        position_sizing=PositionSizing(max_positions=None),
+        risk_controls=RiskControls(max_single_position_pct=0.2),
+        backtest={"execution_capacity": {"enabled": False}},
+    )
+    result = run_backtest(
+        spec,
+        ohlcv_rows=[OhlcvBar(date=day, ticker=ticker, open=10, high=10, low=10, close=10, volume=1) for day in (date(2026, 1, 2), date(2026, 1, 5)) for ticker in tickers],
+        metric_rows=[{"date": day.isoformat(), "ticker": ticker, "rsi_14": 20 if day == date(2026, 1, 2) else 50} for day in (date(2026, 1, 2), date(2026, 1, 5)) for ticker in tickers],
+        config=BacktestRunConfig(initial_capital=1_100, write_outputs=False, talib=TalibIndicatorConfig(enabled=False, mode="none")),
+    )
+    assert result.summary["open_positions"] == 11
+    with pytest.raises(ValueError, match="stop_loss_pct"):
+        StrategySpec(
+            strategy_id="invalid_risk", strategy_name="Invalid Risk",
+            entry_rules=[Condition(left="rsi_14", operator=ConditionOperator.LTE, right=30)],
+            position_sizing=PositionSizing(method="fixed_risk", risk_per_position=0.01),
+            risk_controls=RiskControls(stop_loss_pct=None),
+        )
+
+
+
+def test_cost_cash_reconciliation_preserves_actual_costs():
+    spec = rsi_spec()
+    spec.backtest.cost_model = CostModel(commission_pct=0.01, tax_pct=0.02, slippage_pct=0)
+    result = run_backtest(
+        spec,
+        ohlcv_rows=[
+            OhlcvBar(date=date(2026, 1, 2), ticker="005930", open=100, high=100, low=100, close=100, volume=1),
+            OhlcvBar(date=date(2026, 1, 5), ticker="005930", open=100, high=100, low=100, close=100, volume=1),
+            OhlcvBar(date=date(2026, 1, 6), ticker="005930", open=110, high=110, low=110, close=110, volume=1),
+            OhlcvBar(date=date(2026, 1, 7), ticker="005930", open=110, high=110, low=110, close=110, volume=1),
+        ],
+        metric_rows=[{"date": day, "ticker": "005930", "rsi_14": value} for day, value in [("2026-01-02", 20), ("2026-01-05", 50), ("2026-01-06", 80), ("2026-01-07", 80)]],
+        config=BacktestRunConfig(initial_capital=1_000, write_outputs=False, talib=TalibIndicatorConfig(enabled=False, mode="none")),
+    )
+    assert result.summary["final_equity"] == pytest.approx(1_051.3)
+    assert result.summary["total_cost"] == pytest.approx(38.7)
+
+
+def test_cost_policy_provenance_interval_components_and_limited_reliability():
+    with pytest.raises(ValueError, match="effective_from"):
+        CostModel(effective_from=date(2026, 1, 2), effective_to=date(2026, 1, 1))
+    spec = rsi_spec()
+    spec.backtest.cost_model = CostModel(
+        commission_pct=0.01, tax_pct=0.02, slippage_pct=0.01,
+        policy_id="krx-retail", policy_version="2026.1", applicable_market="KRX", applicable_account="cash",
+        applicable_channel="online", applicable_tier="standard",
+        effective_from=date(2026, 1, 1), effective_to=date(2026, 12, 31), source_urls=["https://example.test/fees"],
+        document_hash="sha256:fixture", verified_at=datetime(2026, 1, 1), rounding_mode="floor", rounding_decimals=2,
+    )
+    result = run_backtest(
+        spec,
+        ohlcv_rows=bars(), metric_rows=rsi_metrics(),
+        config=BacktestRunConfig(initial_capital=1_000, write_outputs=False, talib=TalibIndicatorConfig(enabled=False, mode="none")),
+    )
+    executed = [event for event in result.order_audit if event.status == "executed"]
+    assert all(event.cost_policy_id == "krx-retail" for event in executed)
+    assert result.summary["commission_cost"] > 0
+    assert result.summary["tax_cost"] > 0
+    assert result.summary["slippage_cost"] > 0
+    assert result.summary["total_cost"] == pytest.approx(
+        result.summary["commission_cost"] + result.summary["tax_cost"] + result.summary["slippage_cost"]
+    )
+    spec.backtest.cost_model.effective_from = date(2026, 1, 6)
+    outside_interval = run_backtest(
+        spec, ohlcv_rows=bars(), metric_rows=rsi_metrics(),
+        config=BacktestRunConfig(initial_capital=1_000, write_outputs=False, talib=TalibIndicatorConfig(enabled=False, mode="none")),
+    )
+    assert "cost_policy_effective_interval_not_covering_run" in outside_interval.summary["reliability_reasons"]
+
+
+def test_terminal_open_position_marks_recovery_capability_limited():
+    spec = rsi_spec()
+    result = run_backtest(
+        spec,
+        ohlcv_rows=bars()[:2],
+        metric_rows=rsi_metrics()[:2],
+        config=BacktestRunConfig(initial_capital=1_000, write_outputs=False, talib=TalibIndicatorConfig(enabled=False, mode="none")),
+    )
+    assert "terminal_open_positions_without_recovery_policy" in result.summary["reliability_reasons"]
+    assert result.summary["data_capabilities"]["corporate_actions"] == "unsupported_source_unavailable"
+    assert result.summary["cost_policy_production_eligible"] is False
+
+
+def test_corporate_actions_apply_only_on_effective_session_and_recover_delist():
+    spec = rsi_spec()
+    spec.backtest.corporate_actions = [
+        CorporateActionEvent(event_type="split", ticker="005930", effective_date=date(2026, 1, 6), split_ratio=2),
+        CorporateActionEvent(event_type="cash_dividend", ticker="005930", effective_date=date(2026, 1, 6), cash_dividend_per_share=1),
+        CorporateActionEvent(event_type="delist", ticker="005930", effective_date=date(2026, 1, 7), recovery_price=5),
+    ]
+    result = run_backtest(
+        spec, ohlcv_rows=bars(), metric_rows=rsi_metrics(),
+        config=BacktestRunConfig(initial_capital=1_000, write_outputs=False, talib=TalibIndicatorConfig(enabled=False, mode="none")),
+    )
+    statuses = [event.status for event in result.order_audit if event.side == "corporate_action"]
+    assert statuses == ["applied_split", "applied_cash_dividend", "applied_delist_recovery"]
+    assert result.summary["open_positions"] == 0
+    assert "corporate_action_provenance_incomplete" in result.summary["reliability_reasons"]
+
+
+def test_cost_half_up_uses_decimal_at_half_boundary():
+    spec = rsi_spec()
+    spec.backtest.cost_model = CostModel(commission_pct=0.005, tax_pct=0, slippage_pct=0, rounding_mode="half_up", rounding_decimals=0)
+    result = run_backtest(
+        spec, ohlcv_rows=bars()[:2], metric_rows=rsi_metrics()[:2],
+        config=BacktestRunConfig(initial_capital=1_000, write_outputs=False, talib=TalibIndicatorConfig(enabled=False, mode="none")),
+    )
+    buy = next(event for event in result.order_audit if event.side == "buy" and event.status == "executed")
+    assert buy.commission_cost_text == "5"
+    assert result.summary["commission_cost_exact"] == "5"

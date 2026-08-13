@@ -530,7 +530,9 @@ def test_automatic_benchmark_gate_treats_exactly_half_losing_periods_as_defeat()
         strategy_a=SimpleNamespace(selection_mode="automatic"),
         selected_candidate=SimpleNamespace(candidate_id="benchmark-winner", metrics=metrics),
         engine_summary={"effective_trade_count": 20},
-        backtest_payload={"benchmark_return": 0.32},
+        backtest_payload={
+            "benchmark": {"primary": {"available": True, "return": 0.32}}
+        },
     )
 
     assert backtest_node._passes_objective_floor(result)
@@ -604,7 +606,6 @@ def test_expected_max_sharpe_grows_with_the_number_of_candidates():
     trials producing a "profitable" winner out of pure noise. A headline that does not
     subtract this reports the width of the search as if it were skill.
     """
-
     observations = 1764  # ~7y of daily bars, the in-sample side of a 10y run
 
     one = backtest_node._expected_max_sharpe(1, observations)
@@ -701,7 +702,6 @@ def test_indicator_windows_wait_for_a_full_lookback():
     a shorter one under its own name and `high` could be a single prior close - letting a
     breakout fire on bar two. The rows inside the warm-up now stay unready.
     """
-
     store, ticker_count = _warmup_store()
     lookback = 60
 
@@ -753,7 +753,6 @@ def test_candidate_stop_and_target_reach_the_engine():
     open. Removing the first copy is only correct if the candidate's own stop/target
     still reach the second - otherwise the search over them quietly stops mattering.
     """
-
     strategy = StrategySpec(
         strategy_id="stops",
         name="Stops",
@@ -791,7 +790,6 @@ def test_candidate_stop_and_target_reach_the_engine():
 
 def test_action_generator_no_longer_emits_its_own_stop_loss_exits():
     """Only rule exits and the profile's trailing stop come from the generator."""
-
     import inspect
 
     from ai_graph.nodes import backtest_features
@@ -801,3 +799,122 @@ def test_action_generator_no_longer_emits_its_own_stop_loss_exits():
     assert "parameters.take_profit_pct" not in source
     # The trailing stop is the profile's own rule and the engine does not model it.
     assert "trailing_stop" in source
+
+
+def test_canonical_analysis_contract_seals_one_hundred_million_krw() -> None:
+    assert backtest_node.CANONICAL_ANALYSIS_INITIAL_CAPITAL == 100_000_000.0
+    assert backtest_node.DEFAULT_INITIAL_CAPITAL == 1_000_000.0
+
+
+def test_missing_strategy_sizing_is_fail_closed_not_default_ten() -> None:
+    strategy = _strategy().model_copy(update={"risk_constraints": {}})
+
+    with pytest.raises(ValueError, match="max_position_pct"):
+        backtest_node._requested_max_positions(strategy)
+
+
+def test_short_history_hides_aggregate_oos_and_benchmark_claims() -> None:
+    metadata = backtest_node._walk_forward_metadata(backtest_node._walk_forward_sample(_rows(days=79)))
+
+    assert metadata["status"] == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
+    assert metadata["aggregate_oos_available"] is False
+    assert metadata["benchmark_comparison_available"] is False
+
+
+def test_official_tr_benchmark_keeps_units_fixed_between_monthly_rebalances() -> None:
+    curve, total_return = backtest_node._official_krx_tr_benchmark_curve(
+        {
+            "2024-01-02": 100.0,
+            "2024-01-31": 110.0,
+            "2024-02-01": 110.0,
+            "2024-02-29": 121.0,
+        },
+        {
+            "2024-01-02": 100.0,
+            "2024-01-31": 100.0,
+            "2024-02-01": 100.0,
+            "2024-02-29": 100.0,
+        },
+        {"2024-01": (0.5, 0.5), "2024-02": (1.0, 0.0)},
+    )
+
+    assert [point.cumulative_return for point in curve] == pytest.approx(
+        [0.0, 0.05, 0.05, 0.155]
+    )
+    assert total_return == pytest.approx(0.155)
+
+
+def test_undefined_metric_is_published_as_null_with_a_reason() -> None:
+    availability = backtest_node._undefined_metric_availability(
+        [{"metric": "out_sample_sharpe", "reason": "zero return variance"}]
+    )
+
+    assert availability["out_sample_sharpe"] == {
+        "value": None,
+        "unavailable_reason": "zero return variance",
+    }
+
+
+def _monthly_sessions(month_count: int, sessions_per_month: int = 12) -> list[dict[str, str]]:
+    return [
+        {"date": date(2020 + month_index // 12, month_index % 12 + 1, day).isoformat()}
+        for month_index in range(month_count)
+        for day in range(1, sessions_per_month + 1)
+    ]
+
+
+def test_walk_forward_policy_uses_disjoint_monthly_evaluation_folds() -> None:
+    rows = _monthly_sessions(40, sessions_per_month=20)
+    policy = backtest_node._walk_forward_split_policy(rows)
+    sample = backtest_node._walk_forward_sample(rows)
+
+    assert len(policy.warmup_sessions) == 20
+    assert len(policy.folds) == 24
+    assert policy.folds[0].train_sessions[0].startswith("2020-02")
+    assert len({session for fold in policy.folds for session in fold.evaluation_sessions}) == 480
+    assert sample.valid_fold_count == 24
+    assert sample.unique_evaluation_session_count == 480
+    assert sample.status == backtest_node.READY_WALK_FORWARD
+
+
+def test_walk_forward_completeness_uses_full_engine_curve_not_public_sample() -> None:
+    targets = {
+        date(2024, 1, day).isoformat()
+        for day in range(1, 21)
+    }
+    engine_result = SimpleNamespace(
+        equity_curve=[
+            SimpleNamespace(date=session, daily_return=index / 10_000)
+            for index, session in enumerate(sorted(targets), start=1)
+        ]
+    )
+
+    returns = backtest_node._complete_target_returns(engine_result, targets)
+
+    assert returns is not None
+    assert len(returns) == 20
+    assert set(returns) == targets
+
+
+def test_walk_forward_policy_fails_closed_at_23_folds_and_479_sessions() -> None:
+    twenty_three_folds = _monthly_sessions(39, sessions_per_month=20)
+    four_seventy_nine_sessions = _monthly_sessions(40, sessions_per_month=20)[:-1]
+
+    assert backtest_node._walk_forward_sample(twenty_three_folds).valid_fold_count == 23
+    assert (
+        backtest_node._walk_forward_sample(twenty_three_folds).status
+        == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
+    )
+    assert (
+        backtest_node._walk_forward_sample(four_seventy_nine_sessions).status
+        == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
+    )
+
+
+def test_official_tr_benchmark_rejects_missing_monthly_lagged_weight() -> None:
+    with pytest.raises(ValueError, match="missing lagged official benchmark weights"):
+        backtest_node._official_krx_tr_benchmark_curve(
+            {"2024-01-02": 100.0, "2024-02-01": 101.0},
+            {"2024-01-02": 100.0, "2024-02-01": 101.0},
+            {"2024-01": (0.5, 0.5)},
+        )

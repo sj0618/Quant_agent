@@ -99,7 +99,7 @@ def test_public_metrics_use_engine_summary_scalars_not_sampled_rows() -> None:
     assert values["sharpe_ratio"] == 0.1
     assert values["win_rate"] == 0.05
     assert values["in_sample_sharpe"] == 0.2
-    assert values["out_sample_sharpe"] == 0.3
+    assert values["out_sample_sharpe"] is None
     assert values["degradation"] == 0.01
     assert values["cagr"] == 0.4
     assert values["annualized_volatility"] == 0.11
@@ -133,7 +133,83 @@ def test_public_metrics_missing_engine_scalars_become_none() -> None:
     assert values["sortino_ratio"] is None
     assert values["calmar_ratio"] is None
     assert values["profit_factor"] is None
-    assert values["benchmark_return"] is not None
+    assert values["benchmark_return"] is None
+
+
+def test_public_metrics_consume_fail_closed_walk_forward_availability() -> None:
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.2,
+            max_drawdown=-0.1,
+            win_rate=0.5,
+            total_return=0.08,
+            in_sample_sharpe=0.1,
+            out_sample_sharpe=0.2,
+            degradation=0.0,
+            out_sample_excess_return=0.03,
+        ),
+        engine_summary={
+            "effective_trade_count": 8,
+            "public_metric_availability": {
+                "out_sample_sharpe": {
+                    "value": None,
+                    "unavailable_reason": "NOT_IMPLEMENTED_WALK_FORWARD",
+                },
+                "benchmark_comparison": {
+                    "value": None,
+                    "unavailable_reason": "NOT_IMPLEMENTED_WALK_FORWARD",
+                },
+            },
+        },
+    )
+    performance = build_public_backtest_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    details = {item.key: item for item in performance.metric_details}
+    assert details["out_sample_sharpe"].value is None
+    assert details["out_sample_sharpe"].unavailable_reason == "NOT_IMPLEMENTED_WALK_FORWARD"
+    assert details["benchmark_return"].value is None
+    assert details["benchmark_return"].unavailable_reason == "NOT_IMPLEMENTED_WALK_FORWARD"
+    assert performance.metrics.out_sample_sharpe is None
+    assert performance.metrics.out_sample_excess_return is None
+
+
+def test_primary_benchmark_requires_official_series_and_lagged_weight_provenance() -> None:
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.2,
+            max_drawdown=-0.1,
+            win_rate=0.5,
+            total_return=0.08,
+            in_sample_sharpe=0.1,
+            out_sample_sharpe=0.2,
+            degradation=0.0,
+        )
+    )
+    payload["backtest_payload"] = {
+        "benchmark": {
+            "primary": {
+                "official_series_and_lagged_weights": True,
+                "return": 0.12,
+                "unavailable_reason": None,
+            }
+        }
+    }
+
+    performance = build_public_backtest_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    assert performance.benchmark is not None
+    assert performance.benchmark.is_available is True
+    assert performance.benchmark.total_return == 0.12
 
 
 def test_public_performance_source_refs_are_propagated_from_explanations() -> None:
