@@ -88,7 +88,10 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
               : totalReturnMetric?.caption ?? (benchmarkReturn === undefined ? "실제 수익률 곡선 기준" : `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`),
           },
           {
-            label: "Sharpe (Walk-forward)",
+            // The engine runs a single 70/30 split, not a walk-forward: the
+            // walk_forward config exists on the spec but nothing ever reads it. Labelling
+            // this "Walk-forward" claimed a validation that was never performed.
+            label: "Sharpe (홀드아웃)",
             value: insufficient ? "표본 부족" : sharpeMetric?.value ?? "—",
             delta: sharpeMetric?.delta,
             caption: sharpeMetric?.caption ?? "AI 전략 검증 결과",

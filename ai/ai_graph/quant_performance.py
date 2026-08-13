@@ -4,13 +4,13 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 from ai_graph.nodes.backtest import (
+    INSUFFICIENT_WALK_FORWARD_SAMPLE,
     BENCHMARK_LABEL,
     BENCHMARK_METHOD,
     BENCHMARK_WARNING,
     MIN_OBJECTIVE_TRADES,
     MIN_RELIABLE_TICKERS,
     METRIC_ROUND_DIGITS,
-    _equal_weight_benchmark_curve,
     _is_numeric_metric,
     _price_rows,
     _public_engine_summary,
@@ -64,18 +64,29 @@ def build_public_backtest_performance(
         return None
 
     result = CandidateBacktestResult.model_validate(backtest)
-    if result.selected_candidate.metrics is None:
+    walk_forward = result.walk_forward
+    metrics = (
+        walk_forward.aggregate_metrics
+        if walk_forward is not None and walk_forward.status == "ready"
+        else result.selected_candidate.metrics
+    )
+    if metrics is None:
         return None
 
     normalized_rows = _price_rows(price_rows)
     source = _pipeline_source(pipeline_data_source)
     reliability = _build_backtest_reliability(result, normalized_rows, source=source)
-    benchmark = _build_public_benchmark(normalized_rows, reliability=reliability)
+    benchmark = _build_public_benchmark(result, reliability=reliability)
     selected_parameters = result.selected_candidate.parameters
+    public_metrics = _public_metrics(metrics, result.engine_summary)
     return BacktestPerformance(
-        selected_candidate_id=result.selected_candidate.candidate_id,
-        metrics=result.selected_candidate.metrics,
-        equity_curve=result.equity_curve,
+        selected_candidate_id=(
+            "walk-forward-selection-policy"
+            if walk_forward is not None and walk_forward.status == "ready"
+            else result.selected_candidate.candidate_id
+        ),
+        metrics=public_metrics,
+        equity_curve=(walk_forward.equity_curve if walk_forward is not None and walk_forward.status == "ready" else result.equity_curve),
         engine_summary=_public_engine_summary(result.engine_summary),
         reliability=reliability,
         data_quality=_build_data_quality(reliability),
@@ -195,11 +206,27 @@ def _build_data_quality(reliability: BacktestReliability) -> list[str]:
 
 
 def _build_public_benchmark(
-    price_rows: Sequence[Mapping[str, Any]],
+    result: CandidateBacktestResult,
     *,
     reliability: BacktestReliability,
 ) -> BacktestBenchmark:
-    if reliability.status == "insufficient":
+    payload = result.backtest_payload if isinstance(result.backtest_payload, Mapping) else {}
+    benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
+    primary = benchmark.get("primary") if isinstance(benchmark, Mapping) else None
+    reason = (
+        primary.get("unavailable_reason")
+        if isinstance(primary, Mapping)
+        else "official KOSPI/KOSDAQ TR provenance is missing"
+    )
+    has_official_inputs = isinstance(primary, Mapping) and primary.get(
+        "official_series_and_lagged_weights"
+    ) is True
+    total_return = primary.get("return") if isinstance(primary, Mapping) else None
+    if (
+        reliability.status == "insufficient"
+        or not has_official_inputs
+        or not _is_numeric_metric(total_return)
+    ):
         return BacktestBenchmark(
             label=BENCHMARK_LABEL,
             method=BENCHMARK_METHOD,
@@ -207,31 +234,49 @@ def _build_public_benchmark(
             total_return=None,
             cumulative_curve=[],
             is_available=False,
-            unavailable_reason=_BENCHMARK_UNAVAILABLE_REASON,
+            unavailable_reason=(
+                _BENCHMARK_UNAVAILABLE_REASON
+                if reliability.status == "insufficient"
+                else str(reason or "official KOSPI/KOSDAQ TR provenance is incomplete")
+            ),
         )
-
-    cumulative_curve, total_return = _equal_weight_benchmark_curve(price_rows)
-    if not cumulative_curve:
-        return BacktestBenchmark(
-            label=BENCHMARK_LABEL,
-            method=BENCHMARK_METHOD,
-            warning=BENCHMARK_WARNING,
-            total_return=None,
-            cumulative_curve=[],
-            is_available=False,
-            unavailable_reason=_BENCHMARK_UNAVAILABLE_REASON,
-        )
-
     return BacktestBenchmark(
         label=BENCHMARK_LABEL,
         method=BENCHMARK_METHOD,
-        warning=BENCHMARK_WARNING,
-        total_return=total_return,
-        cumulative_curve=cumulative_curve,
+        warning=None,
+        total_return=float(total_return),
+        cumulative_curve=[],
         is_available=True,
         unavailable_reason=None,
     )
 
+
+def _public_metrics(metrics, engine_summary: Mapping[str, Any]):
+    availability = engine_summary.get("public_metric_availability")
+    if not isinstance(availability, Mapping):
+        return metrics
+    updates = {
+        key: None
+        for key in (
+            "out_sample_sharpe",
+            "out_sample_return",
+            "out_sample_excess_return",
+            "in_sample_benchmark_return",
+            "out_sample_benchmark_return",
+            "in_sample_excess_return",
+            "benchmark_period_count",
+            "benchmark_period_win_rate",
+            "benchmark_period_loss_rate",
+            "in_sample_benchmark_period_count",
+            "in_sample_benchmark_period_win_rate",
+            "in_sample_benchmark_period_loss_rate",
+            "out_sample_benchmark_period_count",
+            "out_sample_benchmark_period_win_rate",
+            "out_sample_benchmark_period_loss_rate",
+        )
+        if key in availability or "benchmark_comparison" in availability
+    }
+    return metrics.model_copy(update=updates) if updates else metrics
 
 def _build_public_metric_details(
     result: CandidateBacktestResult,
@@ -265,12 +310,15 @@ def _build_public_metric_details(
         ),
     }
 
+    public_availability = summary.get("public_metric_availability")
+    availability = public_availability if isinstance(public_availability, Mapping) else {}
     if reliability.status == "insufficient":
         unavailable_reason = _UNAVAILABLE_METRIC_REASON
         for key in list(values):
             values[key] = None
         values["benchmark_return"] = None
         values["excess_return"] = None
+        reasons = {key: unavailable_reason for key in _METRIC_DETAIL_KEYS}
     else:
         unavailable_reason = None
         values["benchmark_return"] = benchmark.total_return if benchmark.is_available else None
@@ -282,12 +330,49 @@ def _build_public_metric_details(
             )
         else:
             values["excess_return"] = None
-
+        reasons: dict[str, str] = {}
+        for key, detail in availability.items():
+            if isinstance(detail, Mapping) and isinstance(detail.get("unavailable_reason"), str):
+                reasons[str(key)] = str(detail["unavailable_reason"])
+        benchmark_reason = reasons.get("benchmark_comparison")
+        if "out_sample_sharpe" not in reasons:
+            reasons["out_sample_sharpe"] = INSUFFICIENT_WALK_FORWARD_SAMPLE
+        if "out_sample_excess_return" not in reasons:
+            reasons["out_sample_excess_return"] = INSUFFICIENT_WALK_FORWARD_SAMPLE
+        if not benchmark.is_available:
+            benchmark_reason = (
+                benchmark_reason
+                or benchmark.unavailable_reason
+                or INSUFFICIENT_WALK_FORWARD_SAMPLE
+            )
+            for key in (
+                "benchmark_return",
+                "excess_return",
+                "benchmark_period_win_rate",
+                "benchmark_period_loss_rate",
+                "out_sample_benchmark_period_loss_rate",
+            ):
+                values[key] = None
+                reasons[key] = benchmark_reason
+        if benchmark_reason:
+            for key in (
+                "benchmark_return",
+                "excess_return",
+                "out_sample_excess_return",
+                "benchmark_period_win_rate",
+                "benchmark_period_loss_rate",
+                "out_sample_benchmark_period_loss_rate",
+            ):
+                values[key] = None
+                reasons[key] = benchmark_reason
+        for key in reasons:
+            if key in values:
+                values[key] = None
     return [
         _metric_detail(
             key=key,
             value=values.get(key),
-            unavailable_reason=unavailable_reason,
+            unavailable_reason=reasons.get(key, unavailable_reason),
         )
         for key in _METRIC_DETAIL_KEYS
     ]

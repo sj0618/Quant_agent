@@ -425,11 +425,22 @@ class AOAIResponsesClient:
         Headers alone do not satisfy the response-start deadline. Until the first
         non-empty text delta arrives, both the short socket read timeout and the
         wall-clock check below remain active. The normal timeout applies afterwards.
+
+        The deadline is silence, not elapsed time. It used to run from the start of the
+        attempt to the first text delta, which is not a liveness signal at all on a
+        reasoning deployment: the model emits `response.created`, `response.in_progress`
+        and `web_search_call` events while it thinks and searches, and only then starts
+        writing. Anything that thought for longer than the deadline was killed as a dead
+        stream and retried into the same wall. Measured over 14 days of production, that
+        was every `strategy_intent` call ever made - 13 of 13, each dying at 33-40s after
+        its retries - while `backtest_code_generation` calls that began writing early
+        went on to succeed at 38.8s. The budget was never the problem; what it timed was.
         """
 
         final_payload: dict[str, Any] | None = None
         terminal_type: str | None = None
         first_text_seconds: float | None = None
+        last_event_at = attempt_started
         for line in response.iter_lines():
             if not line.startswith("data:"):
                 continue
@@ -442,6 +453,9 @@ class AOAIResponsesClient:
                 continue
             if not isinstance(event, dict):
                 continue
+            # Any well-formed event proves the deployment is still working on this
+            # request, which is the only thing the start deadline is entitled to check.
+            last_event_at = time.perf_counter()
             event_type = event.get("type")
             if event_type == "response.output_text.delta":
                 delta = event.get("delta")
@@ -458,11 +472,11 @@ class AOAIResponsesClient:
                     ] = self.timeout_seconds
             if (
                 first_text_seconds is None
-                and time.perf_counter() - attempt_started
+                and time.perf_counter() - last_event_at
                 > self.response_start_timeout_seconds
             ):
                 raise httpx.ReadTimeout(
-                    "AOAI produced no meaningful text before the response-start deadline",
+                    "AOAI stream went silent before the response-start deadline",
                     request=response.request,
                 )
             if event_type in TERMINAL_STREAM_EVENTS:

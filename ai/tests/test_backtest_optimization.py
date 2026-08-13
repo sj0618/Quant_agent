@@ -530,20 +530,27 @@ def test_automatic_benchmark_gate_treats_exactly_half_losing_periods_as_defeat()
         strategy_a=SimpleNamespace(selection_mode="automatic"),
         selected_candidate=SimpleNamespace(candidate_id="benchmark-winner", metrics=metrics),
         engine_summary={"effective_trade_count": 20},
-        backtest_payload={"benchmark_return": 0.32},
+        backtest_payload={
+            "benchmark": {"primary": {"available": True, "return": 0.32}}
+        },
     )
 
     assert backtest_node._passes_objective_floor(result)
 
-    result.selected_candidate.metrics = metrics.model_copy(
-        update={"benchmark_period_loss_rate": 0.50}
-    )
-    assert not backtest_node._passes_objective_floor(result)
-
+    # Exactly half is a defeat, not a draw: the rate is compared with >=.
     result.selected_candidate.metrics = metrics.model_copy(
         update={"out_sample_benchmark_period_loss_rate": 0.50}
     )
     assert not backtest_node._passes_objective_floor(result)
+
+    # The whole-history loss rate is deliberately not a gate any more. It spans the
+    # selection split, so it judged the winner partly on the sample it was chosen from,
+    # and it could not fail without the hold-out rate above failing too. A candidate that
+    # clears the hold-out passes even when its full-history rate is at the old boundary.
+    result.selected_candidate.metrics = metrics.model_copy(
+        update={"benchmark_period_loss_rate": 0.50}
+    )
+    assert backtest_node._passes_objective_floor(result)
 
 
 def test_repeated_round_submits_no_completed_candidate(monkeypatch, tmp_path) -> None:
@@ -589,3 +596,325 @@ def test_python_fallback_timeout_terminates_worker(monkeypatch, tmp_path) -> Non
         assert not evaluation.candidate.validation_ok
         assert any("timeout" in item for item in evaluation.candidate.violations)
         assert session._executor is None
+
+
+def test_expected_max_sharpe_grows_with_the_number_of_candidates():
+    """Picking the best of N noisy estimates is biased upward by construction.
+
+    Measured with candidates whose trades were random on real prices: the average
+    candidate returned -3.7% and the best-of-six returned +16.2%, with nine of twelve
+    trials producing a "profitable" winner out of pure noise. A headline that does not
+    subtract this reports the width of the search as if it were skill.
+    """
+    observations = 1764  # ~7y of daily bars, the in-sample side of a 10y run
+
+    one = backtest_node._expected_max_sharpe(1, observations)
+    six = backtest_node._expected_max_sharpe(6, observations)
+    fifteen = backtest_node._expected_max_sharpe(15, observations)
+
+    assert one == 0.0
+    assert 0.0 < six < fifteen
+    # A shorter sample makes the same search more dangerous, not less.
+    assert backtest_node._expected_max_sharpe(6, 252) > six
+
+
+def test_selection_correction_records_the_search_width_without_changing_the_winner():
+    metrics = BacktestMetrics(
+        sharpe_ratio=0.9,
+        max_drawdown=-0.2,
+        win_rate=0.5,
+        total_return=0.4,
+        in_sample_sharpe=0.9,
+        out_sample_sharpe=0.1,
+        degradation=0.9,
+        in_sample_observations=1764,
+    )
+    candidate = CodeCandidate(
+        candidate_id="A1", variant="A", code="def build_signals(p):\n    return []\n",
+        validation_ok=True, metrics=metrics,
+    )
+    result = SimpleNamespace(
+        selected_candidate=candidate,
+        model_copy=lambda update: SimpleNamespace(**{**result.__dict__, **update}),
+    )
+
+    corrected = backtest_node._apply_selection_correction(result, 15)
+
+    assert corrected.selected_candidate.candidate_id == "A1"
+    assert corrected.selected_candidate.metrics.candidates_evaluated == 15
+    assert corrected.selected_candidate.metrics.selection_adjusted_sharpe < 0.9
+    # The uncorrected figures are untouched - the correction adds context, it does not
+    # rewrite what the run measured.
+    assert corrected.selected_candidate.metrics.in_sample_sharpe == 0.9
+
+
+def test_headline_reports_the_hold_out_not_the_period_selection_optimised_against():
+    headline = backtest_node._headline_metrics(
+        {
+            "total_return": 0.42,
+            "sharpe_ratio": 0.9,
+            "max_drawdown": -0.2,
+            "in_sample_return": 0.60,
+            "in_sample_sharpe": 1.3,
+            "in_sample_max_drawdown": -0.15,
+            "out_sample_return": -0.08,
+            "out_sample_sharpe": -0.25,
+            "out_sample_max_drawdown": -0.3,
+            "candidates_evaluated": 15,
+            "selection_adjusted_sharpe": -0.1,
+        }
+    )
+
+    assert headline["basis"] == "hold_out"
+    assert headline["total_return"] == -0.08
+    assert headline["sharpe_ratio"] == -0.25
+    assert headline["candidates_evaluated"] == 15
+    # Both other bases stay reachable, explicitly labelled.
+    assert headline["in_sample"]["sharpe_ratio"] == 1.3
+    assert headline["full_period"]["sharpe_ratio"] == 0.9
+
+
+def _warmup_store(bars=400, tickers=("000001", "000002")):
+    rows = []
+    for ticker in tickers:
+        price = 10_000.0
+        for index in range(bars):
+            price *= 1.004 if index % 3 else 0.997
+            rows.append(
+                {
+                    "date": (date(2016, 1, 1) + timedelta(days=index)).isoformat(),
+                    "ticker": ticker,
+                    "open": price,
+                    "high": price * 1.01,
+                    "low": price * 0.99,
+                    "close": price,
+                    "volume": 1_000_000.0,
+                    "rsi": 40.0,
+                }
+            )
+    return PreparedFeatureStore(rows), len(tickers)
+
+
+def test_indicator_windows_wait_for_a_full_lookback():
+    """A 20-day average must not be the previous close on the second bar.
+
+    features() computed every window as min(lookback, index), so each indicator reported
+    a shorter one under its own name and `high` could be a single prior close - letting a
+    breakout fire on bar two. The rows inside the warm-up now stay unready.
+    """
+    store, ticker_count = _warmup_store()
+    lookback = 60
+
+    matrix = store.features(lookback)
+    not_ready = int((matrix[:, 0] == 0).sum())
+
+    # Exactly the warm-up rows of each ticker, not just each ticker's first bar.
+    assert not_ready == lookback * ticker_count
+
+    closes = store.close[store.indices_by_ticker["000001"]]
+    first_ready = store.indices_by_ticker["000001"][lookback]
+    # The reported average is the real lookback-bar mean, not a truncated one.
+    assert matrix[first_ready][1] == pytest.approx(closes[0:lookback].mean())
+
+
+def test_no_action_fires_before_its_lookback_has_elapsed():
+    store, _ = _warmup_store()
+    parameters = CandidateParameters(
+        profile="long_regime_momentum",
+        lookback=60,
+        threshold=0.05,
+        stop_loss_pct=0.08,
+        take_profit_pct=0.25,
+        max_positions=5,
+    )
+    ir = StrategyIR(
+        strategy_id="warmup",
+        entry_feature="close",
+        exit_feature="close",
+        proxy_feature="close",
+    )
+
+    actions = list(store.build_actions(ir, parameters))
+
+    ordinal = {}
+    for indices in store.indices_by_ticker.values():
+        for position, index in enumerate(indices):
+            ordinal[index] = position
+    fired = [ordinal[i] for i, a in enumerate(actions) if a != 0]
+    assert fired, "the fixture should still produce signals after the warm-up"
+    assert min(fired) >= parameters.lookback
+
+
+def test_candidate_stop_and_target_reach_the_engine():
+    """The engine is the only place a stop is applied, so the search values must get there.
+
+    Stop-loss used to be evaluated twice: once by the action generator against the
+    signal-day close, once by the engine against the price actually paid at the next
+    open. Removing the first copy is only correct if the candidate's own stop/target
+    still reach the second - otherwise the search over them quietly stops mattering.
+    """
+    strategy = StrategySpec(
+        strategy_id="stops",
+        name="Stops",
+        market="KOSPI",
+        timeframe="1d",
+        entry_conditions=[Condition(left="rsi", operator=ConditionOperator.LT, right=30.0)],
+        risk_constraints={"stop_loss_pct": 0.08, "take_profit_pct": 0.2},
+        confidence=0.5,
+    )
+    parameters = CandidateParameters(
+        profile="long_regime_momentum",
+        lookback=60,
+        threshold=0.05,
+        stop_loss_pct=0.03,
+        take_profit_pct=0.45,
+        max_positions=5,
+    )
+    ir = StrategyIR(
+        strategy_id="stops", entry_feature="close", exit_feature="close", proxy_feature="close"
+    )
+    candidate = CodeCandidate(
+        candidate_id="A1", variant="A", code="def build_signals(p):\n    return []\n",
+        validation_ok=True, representation="structured", strategy_ir=ir, parameters=parameters,
+    )
+
+    controls = backtest_node._engine_risk_controls(strategy, candidate=candidate)
+
+    assert controls.stop_loss_pct == 0.03
+    assert controls.take_profit_pct == 0.45
+    # With no candidate the strategy's own constraints still apply.
+    plain = backtest_node._engine_risk_controls(strategy)
+    assert plain.stop_loss_pct == 0.08
+    assert plain.take_profit_pct == 0.2
+
+
+def test_action_generator_no_longer_emits_its_own_stop_loss_exits():
+    """Only rule exits and the profile's trailing stop come from the generator."""
+    import inspect
+
+    from ai_graph.nodes import backtest_features
+
+    source = inspect.getsource(backtest_features.PreparedFeatureStore)
+    assert "parameters.stop_loss_pct" not in source
+    assert "parameters.take_profit_pct" not in source
+    # The trailing stop is the profile's own rule and the engine does not model it.
+    assert "trailing_stop" in source
+
+
+def test_canonical_analysis_contract_seals_one_hundred_million_krw() -> None:
+    assert backtest_node.CANONICAL_ANALYSIS_INITIAL_CAPITAL == 100_000_000.0
+    assert backtest_node.DEFAULT_INITIAL_CAPITAL == 1_000_000.0
+
+
+def test_missing_strategy_sizing_is_fail_closed_not_default_ten() -> None:
+    strategy = _strategy().model_copy(update={"risk_constraints": {}})
+
+    with pytest.raises(ValueError, match="max_position_pct"):
+        backtest_node._requested_max_positions(strategy)
+
+
+def test_short_history_hides_aggregate_oos_and_benchmark_claims() -> None:
+    metadata = backtest_node._walk_forward_metadata(backtest_node._walk_forward_sample(_rows(days=79)))
+
+    assert metadata["status"] == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
+    assert metadata["aggregate_oos_available"] is False
+    assert metadata["benchmark_comparison_available"] is False
+
+
+def test_official_tr_benchmark_keeps_units_fixed_between_monthly_rebalances() -> None:
+    curve, total_return = backtest_node._official_krx_tr_benchmark_curve(
+        {
+            "2024-01-02": 100.0,
+            "2024-01-31": 110.0,
+            "2024-02-01": 110.0,
+            "2024-02-29": 121.0,
+        },
+        {
+            "2024-01-02": 100.0,
+            "2024-01-31": 100.0,
+            "2024-02-01": 100.0,
+            "2024-02-29": 100.0,
+        },
+        {"2024-01": (0.5, 0.5), "2024-02": (1.0, 0.0)},
+    )
+
+    assert [point.cumulative_return for point in curve] == pytest.approx(
+        [0.0, 0.05, 0.05, 0.155]
+    )
+    assert total_return == pytest.approx(0.155)
+
+
+def test_undefined_metric_is_published_as_null_with_a_reason() -> None:
+    availability = backtest_node._undefined_metric_availability(
+        [{"metric": "out_sample_sharpe", "reason": "zero return variance"}]
+    )
+
+    assert availability["out_sample_sharpe"] == {
+        "value": None,
+        "unavailable_reason": "zero return variance",
+    }
+
+
+def _monthly_sessions(month_count: int, sessions_per_month: int = 12) -> list[dict[str, str]]:
+    return [
+        {"date": date(2020 + month_index // 12, month_index % 12 + 1, day).isoformat()}
+        for month_index in range(month_count)
+        for day in range(1, sessions_per_month + 1)
+    ]
+
+
+def test_walk_forward_policy_uses_disjoint_monthly_evaluation_folds() -> None:
+    rows = _monthly_sessions(40, sessions_per_month=20)
+    policy = backtest_node._walk_forward_split_policy(rows)
+    sample = backtest_node._walk_forward_sample(rows)
+
+    assert len(policy.warmup_sessions) == 20
+    assert len(policy.folds) == 24
+    assert policy.folds[0].train_sessions[0].startswith("2020-02")
+    assert len({session for fold in policy.folds for session in fold.evaluation_sessions}) == 480
+    assert sample.valid_fold_count == 24
+    assert sample.unique_evaluation_session_count == 480
+    assert sample.status == backtest_node.READY_WALK_FORWARD
+
+
+def test_walk_forward_completeness_uses_full_engine_curve_not_public_sample() -> None:
+    targets = {
+        date(2024, 1, day).isoformat()
+        for day in range(1, 21)
+    }
+    engine_result = SimpleNamespace(
+        equity_curve=[
+            SimpleNamespace(date=session, daily_return=index / 10_000)
+            for index, session in enumerate(sorted(targets), start=1)
+        ]
+    )
+
+    returns = backtest_node._complete_target_returns(engine_result, targets)
+
+    assert returns is not None
+    assert len(returns) == 20
+    assert set(returns) == targets
+
+
+def test_walk_forward_policy_fails_closed_at_23_folds_and_479_sessions() -> None:
+    twenty_three_folds = _monthly_sessions(39, sessions_per_month=20)
+    four_seventy_nine_sessions = _monthly_sessions(40, sessions_per_month=20)[:-1]
+
+    assert backtest_node._walk_forward_sample(twenty_three_folds).valid_fold_count == 23
+    assert (
+        backtest_node._walk_forward_sample(twenty_three_folds).status
+        == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
+    )
+    assert (
+        backtest_node._walk_forward_sample(four_seventy_nine_sessions).status
+        == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
+    )
+
+
+def test_official_tr_benchmark_rejects_missing_monthly_lagged_weight() -> None:
+    with pytest.raises(ValueError, match="missing lagged official benchmark weights"):
+        backtest_node._official_krx_tr_benchmark_curve(
+            {"2024-01-02": 100.0, "2024-02-01": 101.0},
+            {"2024-01-02": 100.0, "2024-02-01": 101.0},
+            {"2024-01": (0.5, 0.5)},
+        )

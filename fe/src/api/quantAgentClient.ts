@@ -16,6 +16,8 @@ import type {
   AIEnvelopeStatus,
   AIJobStage,
   AIJobStageStatus,
+  AITickerAction,
+  AITickerActionType,
   AIReportBundle,
   AIRiskAdjustment,
   AIStrategySpec,
@@ -666,7 +668,7 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
     status: result.status === "failed" ? "failed" : "draft",
     strategyName: result.strategy_spec?.name ?? result.user_payload.headline,
     recommendationScore: confidence === null || confidence === undefined ? formatEnvelopeStatus(result.status) : formatScoreValue(confidence),
-    signals: signalCounts(signal?.action ?? null),
+    signals: signalCounts(result.user_payload.ticker_actions),
     marketSnapshot: [
       { label: "AI 상태", value: formatEnvelopeStatus(result.status), tone: toneForStatus(result.status) },
       { label: "Trace", value: result.trace_id.slice(0, TRACE_PREVIEW_LENGTH), tone: "neutral" },
@@ -737,19 +739,26 @@ function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandida
   if (!result) {
     return [];
   }
-  // These names came out of a DB screen, so what is known about each one is which rules it
-  // matched. The strategy's single action and the candidate card's confidence describe the
-  // strategy, not any one name, and stamping them onto each row read as a per-name verdict.
-  // The strategy-level signal is still shown once, in the overview counters.
+  // A screening match on its own says which rules a name passed, not what to do about it -
+  // stamping the strategy's single action onto every row used to invent a per-name verdict.
+  // ticker_actions is that verdict, and it is computed by the same backtest run the
+  // performance numbers come from: the final bar's signals against the final position book.
+  // Rows the backtest has no opinion on stay undefined rather than defaulting to HOLD.
+  const actionByTicker = new Map(
+    (result.user_payload.ticker_actions ?? []).map((action) => [action.ticker, action]),
+  );
   const candidates = result.user_payload.candidate_cards.flatMap((card) =>
     (card.matches ?? []).map((match) => {
       const matchedRules = match.matched_rules ?? [];
-      const rationale = matchedRules.length ? matchedRules.join(" · ") : card.reason ?? card.summary;
+      const action = actionByTicker.get(match.ticker);
+      const rationale = action?.reason
+        ?? (matchedRules.length ? matchedRules.join(" · ") : card.reason ?? card.summary);
       return {
         id: match.ticker,
         ticker: match.ticker,
         name: match.name,
         sector: match.sector ?? card.sector ?? match.market,
+        signal: toSignalType(action?.action),
         price: match.close == null ? "—" : `${new Intl.NumberFormat(APP_LOCALE).format(match.close)}원`,
         rationale,
         evidence: [
@@ -764,9 +773,54 @@ function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandida
       } satisfies TradingCandidate;
     }),
   );
-  return candidates.filter(
+  const unique = candidates.filter(
     (candidate, index, all) => all.findIndex((item) => item.ticker === candidate.ticker) === index,
   );
+  // A name the strategy is holding or exiting today need not be in today's screen - the
+  // screen answers "what qualifies now", not "what are we in". Dropping those rows would
+  // silently hide every SELL, which is the one verdict a user cannot afford to miss.
+  const screened = new Set(unique.map((candidate) => candidate.ticker));
+  const heldOnly = [...actionByTicker.values()]
+    .filter((action) => !screened.has(action.ticker) && action.action !== "WATCH")
+    .map(
+      (action) =>
+        ({
+          id: action.ticker,
+          ticker: action.ticker,
+          name: action.name,
+          sector: "보유 종목",
+          signal: toSignalType(action.action),
+          price:
+            action.close == null
+              ? "—"
+              : `${new Intl.NumberFormat(APP_LOCALE).format(action.close)}원`,
+          rationale: action.reason,
+          evidence: [
+            {
+              provider: "QuantAgent 백테스트",
+              title: `${action.source_candidate_id ?? "선택 후보"} 최종 봉 판정`,
+              date: action.as_of_date,
+              summary: action.reason,
+            },
+          ],
+          riskReasons: [],
+        }) satisfies TradingCandidate,
+    );
+  return [...unique, ...heldOnly];
+}
+
+/** WATCH is the absence of a verdict, so it stays undefined instead of becoming HOLD. */
+function toSignalType(action: AITickerActionType | undefined): SignalType | undefined {
+  if (action === "BUY") {
+    return "BUY";
+  }
+  if (action === "HOLD") {
+    return "HOLD";
+  }
+  if (action === "SELL") {
+    return "DROP";
+  }
+  return undefined;
 }
 
 function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: PerformanceSummary): PerformanceSummary {
@@ -864,10 +918,20 @@ function buildAIMetricCards(selected: AIBacktestMetrics, engineSummary?: Record<
     {
       key: "sharpe",
       label: "Sharpe Ratio",
-      value: formatDecimal(selected.sharpe_ratio),
+      // The hold-out figure, because that is what the card is labelled and what the
+      // acceptance gate judges on. It used to read `sharpe_ratio`, the whole-period
+      // number, so a run whose gate said "보유 구간 외부 샤프비율 -1.2431" showed
+      // "Sharpe (홀드아웃) -0.43" directly underneath it - the same quantity, three
+      // times apart, on one screen, with the flattering one in the larger type.
+      value: formatDecimal(selected.out_sample_sharpe),
       delta: tradeCount !== null ? `거래 ${formatDecimal(tradeCount, 0)}회` : undefined,
-      tone: selected.sharpe_ratio >= 1 ? "positive" : selected.sharpe_ratio >= 0.5 ? "neutral" : "negative",
-      caption: "AI 전략 검증에서 선택된 후보 기준입니다.",
+      tone:
+        selected.out_sample_sharpe >= 1
+          ? "positive"
+          : selected.out_sample_sharpe >= 0.5
+            ? "neutral"
+            : "negative",
+      caption: "선택에 쓰지 않은 홀드아웃 구간 기준입니다.",
     },
     {
       key: "mdd",
@@ -1073,12 +1137,20 @@ function extractFinalSignal(report: AIReportBundle) {
   return null;
 }
 
-function signalCounts(signal: SignalType | null): Record<SignalType, number> {
-  return {
-    BUY: signal === "BUY" ? 1 : 0,
-    HOLD: signal === "HOLD" ? 1 : 0,
-    DROP: signal === "DROP" ? 1 : 0,
-  };
+// The per-name verdicts of this run, which is what "BUY n · HOLD n · DROP n" claims to
+// be. It used to one-hot the single strategy-level signal, so a run that told six names
+// apart reported "1건 · BUY 0 · HOLD 0 · DROP 1" beside a list showing HOLD 5 and DROP 1.
+// Same source as the candidate list now - `ticker_actions`, produced by the backtest run
+// that also produced the numbers - so the tile and the list cannot disagree.
+function signalCounts(actions: AITickerAction[] | undefined): Record<SignalType, number> {
+  const counts: Record<SignalType, number> = { BUY: 0, HOLD: 0, DROP: 0 };
+  for (const action of actions ?? []) {
+    const signal = toSignalType(action.action);
+    if (signal) {
+      counts[signal] += 1;
+    }
+  }
+  return counts;
 }
 
 function describeRiskAdjustments(adjustments: AIRiskAdjustment[]) {

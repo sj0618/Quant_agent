@@ -43,7 +43,9 @@ const MAX_POLL_FAILURES = 3;
 // recorded) returns clean 200s with result:null and would otherwise spin the progress bar
 // indefinitely. Past this age we surface a timeout instead of leaving the user watching
 // forever. Generous on purpose - a 200-name universe backtest legitimately takes minutes.
-const MAX_ANALYSIS_DURATION_MS = 10 * 60_000;
+// There is deliberately no client-side deadline for a running analysis. See the polling
+// effect for why: neither total runtime nor time-since-progress is evidence the client
+// can convict on, and a wrong verdict discards a finished analysis.
 const PROGRESS_TICK_INTERVAL_MS = 250;
 const CLIENT_PROGRESS_DURATION_MS = 90_000;
 const CLIENT_PROGRESS_START_PERCENT = 6;
@@ -93,6 +95,14 @@ interface JobFailure {
   owner?: string;
   retryable?: boolean;
   debugRef?: string;
+}
+
+// Categories the client assigns to itself when it cannot see the server, as opposed to a
+// failure_cause the server actually returned. Only the latter ends a job.
+const CLIENT_SIDE_FAILURE_CATEGORIES = new Set(["client_timeout", "fe_polling"]);
+
+function isServerReportedFailure(failure: JobFailure | undefined): boolean {
+  return failure !== undefined && !CLIENT_SIDE_FAILURE_CATEGORIES.has(failure.category ?? "");
 }
 
 function getInitialTab(): WorkspaceTab {
@@ -159,10 +169,12 @@ function conversationPreview(conversation: WorkspaceConversation, template: AppO
 
 function WorkspaceEmptyState({
   hasConversation,
+  hasCandidateSelection,
   progress,
   activity,
 }: {
   hasConversation: boolean;
+  hasCandidateSelection: boolean;
   progress?: WorkspaceProgress | null;
   activity?: ActivityState;
 }) {
@@ -240,11 +252,19 @@ function WorkspaceEmptyState({
 
   return (
     <section className="workspace-empty">
-      <strong>{hasConversation ? "전략 후보를 선택해 주세요" : "전략 채팅으로 시작해 주세요"}</strong>
+      <strong>
+        {hasCandidateSelection
+          ? "전략 후보를 선택해 주세요"
+          : hasConversation
+            ? "분석할 전략 조건을 입력해 주세요"
+            : "전략 채팅으로 시작해 주세요"}
+      </strong>
       <p>
-        {hasConversation
+        {hasCandidateSelection
           ? "AI가 후보 카드를 준비했습니다. 왼쪽 채팅에서 카드를 선택하면 전략과 리포트 워크스페이스가 채워집니다."
-          : "왼쪽 전략 채팅에 원하는 조건을 한 문장으로 입력하면 AI가 전략 필드, 검증 결과, 리포트 초안을 자동으로 구성합니다."}
+          : hasConversation
+            ? "이 대화는 전략 분석 요청으로 처리되지 않았습니다. 왼쪽 채팅에 매수·매도 조건 또는 분석할 투자 전략을 입력해 주세요."
+            : "왼쪽 전략 채팅에 원하는 조건을 한 문장으로 입력하면 AI가 전략 필드, 검증 결과, 리포트 초안을 자동으로 구성합니다."}
       </p>
     </section>
   );
@@ -310,8 +330,15 @@ export function AppPage() {
   }, [analysisJobs, inertJobIds, pendingAnalysis]);
 
   useEffect(() => {
+    // A client-side conclusion is a guess about the server, so it must not be the thing
+    // that stops us asking the server. Give-ups from `fe_polling` and `client_timeout`
+    // keep polling and clear themselves the moment a result appears; only a verdict the
+    // server actually reported is terminal.
     const pollingJobs = analysisJobs.filter(
-      (job) => !job.result && !jobErrors[job.job_id] && !inertJobIds.includes(job.job_id),
+      (job) =>
+        !job.result &&
+        !inertJobIds.includes(job.job_id) &&
+        !isServerReportedFailure(jobErrors[job.job_id]),
     );
     if (!pollingJobs.length) {
       return undefined;
@@ -320,6 +347,7 @@ export function AppPage() {
     let cancelled = false;
     const timeoutId = window.setTimeout(async () => {
       const failures: Record<string, JobFailure> = {};
+      const recovered = new Set<string>();
       const missingJobIds = new Set<string>();
       const refreshedJobs = await Promise.all(
         pollingJobs.map(async (job) => {
@@ -377,24 +405,41 @@ export function AppPage() {
             debugRef: job.result?.debug_ref ?? undefined,
           };
         }
-        // A job the server keeps reporting as still-running past the wall-clock cap is
-        // treated as stuck: successful polls alone would never end the loading state.
-        if (!job.result && !failures[job.job_id]) {
-          const startedAt = Date.parse(job.created_at);
-          if (Number.isFinite(startedAt) && Date.now() - startedAt > MAX_ANALYSIS_DURATION_MS) {
-            failures[job.job_id] = {
-              message: "분석이 시간 내에 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.",
-              category: "client_timeout",
-              // polling_stage is excluded from the public job model, so name the stage
-              // from the progress the client can actually see.
-              stage: job.stages.find((step) => step.status === "running")?.stage,
-              retryable: true,
-            };
-          }
+        // A finished job is the server's verdict, and it voids whatever the client
+        // concluded while waiting. The failure_cause recorded just above survives - the
+        // deletions this drives are applied before this round's findings, not after.
+        if (job.result) {
+          recovered.add(job.job_id);
         }
+        // Nothing else is decided here. The client used to convict a running job on its
+        // own clock, first at ten minutes of total runtime and then at eight minutes
+        // without a progress update, and both were wrong for the same reason: neither is
+        // evidence about the server.
+        //
+        // Runtime is not, because a healthy analysis takes 457-498s and is getting
+        // slower. Silence is not either, because progress reporting is explicitly
+        // best-effort - report_node_stage logs and swallows a failed status write, so the
+        // analysis carries on while `updated_at` stops moving, which is indistinguishable
+        // from a hang no matter how the budget is tuned.
+        //
+        // What the client can actually observe is whether the server answers. A poll that
+        // succeeds and says "running" is proof of life; polls that keep failing are
+        // already handled above as `fe_polling`. Between those two there is nothing left
+        // for a timer to add, and getting it wrong throws away a completed analysis and
+        // the report the backend has already stored. The user has a stop button for the
+        // case where they simply do not want to wait any longer.
       }
-      if (Object.keys(failures).length) {
-        setJobErrors((current) => ({ ...current, ...failures }));
+      if (Object.keys(failures).length || recovered.size) {
+        setJobErrors((current) => {
+          const next = { ...current };
+          // Clear first, then apply: a job that finished drops the guess the client was
+          // holding, but a failure_cause the server returned in this same round has to
+          // land on top of that and stay.
+          for (const jobId of recovered) {
+            delete next[jobId];
+          }
+          return { ...next, ...failures };
+        });
       }
 
       setAnalysisJobs((jobs) =>
@@ -485,6 +530,9 @@ export function AppPage() {
   // backtest. When it did not, the picks still render but under an explicit not-validated
   // banner so they read as reference, not a buy list.
   const latestPayload = latestJob?.result?.user_payload;
+  const hasCandidateSelection = Boolean(
+    latestJob?.result?.status === "need_clarification" && latestPayload?.candidate_cards.length,
+  );
   const recommendationGate =
     latestPayload && "recommendation_gate" in latestPayload ? latestPayload.recommendation_gate ?? null : null;
   const showGateWarning = canRenderWorkspace && recommendationGate !== null && !recommendationGate.validated;
@@ -593,7 +641,10 @@ export function AppPage() {
           onAnalyze={async (query) => {
             // A brand-new strategy starts a brand-new conversation; answering a
             // clarification or picking a candidate card continues the current one.
-            const awaitingUserInput = latestJob?.result?.status === "need_clarification";
+            const awaitingUserInput = Boolean(
+              latestJob?.result?.status === "need_clarification" &&
+                (latestPayload?.candidate_cards.length || latestPayload?.options?.length),
+            );
             const previousJobs = awaitingUserInput ? analysisJobs : [];
             if (!awaitingUserInput) {
               archiveCurrentConversation();
@@ -645,7 +696,12 @@ export function AppPage() {
               {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
             </>
           ) : (
-            <WorkspaceEmptyState activity={analysisActivity} hasConversation={hasCurrentConversation} progress={workspaceProgress} />
+            <WorkspaceEmptyState
+              activity={analysisActivity}
+              hasCandidateSelection={hasCandidateSelection}
+              hasConversation={hasCurrentConversation}
+              progress={workspaceProgress}
+            />
           )}
         </main>
       </div>

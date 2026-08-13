@@ -13,6 +13,7 @@ on:
           - live-aoai
           - live-full-analysis
           - live-audit
+          - trace-diagnostic
 
 permissions:
   contents: read
@@ -345,6 +346,89 @@ jobs:
               or errors != 0
           ):
               raise RuntimeError("production AOAI audit round trip failed")
+          PY
+          REMOTE
+
+      - name: Diagnose recent deployed analysis failures
+        if: ${{ inputs.mode == 'trace-diagnostic' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="$1"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          test -s "$PID_FILE"
+          PID="$(cat "$PID_FILE")"
+          [[ "$PID" =~ ^[1-9][0-9]*$ ]]
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) export "$entry" ;;
+            esac
+          done < "/proc/$PID/environ"
+          cd "$APP_DIR/ai"
+          "$APP_DIR/ai/.venv/bin/python" -u <<'PY'
+          import json
+          import os
+          import re
+          import psycopg
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is not configured")
+          with psycopg.connect(dsn) as conn:
+              errors = conn.execute(
+                  """
+                  SELECT t.metadata_jsonb->>'public_trace_id', t.status,
+                         e.error_type, e.error_message, e.stack_trace,
+                         e.context_jsonb, e.created_at
+                  FROM app.ai_error_log AS e
+                  JOIN app.ai_trace AS t USING (trace_id)
+                  WHERE e.created_at >= now() - interval '45 minutes'
+                  ORDER BY e.created_at DESC
+                  LIMIT 20
+                  """
+              ).fetchall()
+              jobs = conn.execute(
+                  """
+                  SELECT job_id, job_jsonb->>'trace_id', job_jsonb->>'error_message',
+                         job_jsonb->'fallback_reasons', updated_at
+                  FROM app.ai_analysis_job
+                  WHERE job_jsonb->>'status' = 'failed'
+                    AND updated_at >= now() - interval '45 minutes'
+                  ORDER BY updated_at DESC
+                  LIMIT 20
+                  """
+              ).fetchall()
+          redact = lambda value: re.sub(
+              r"(?i)(postgres(?:ql)?://)[^\s'\"]+", r"\1[redacted]", str(value)
+          )
+          print(json.dumps({
+              "errors": [
+                  {
+                      "public_trace_id": row[0], "trace_status": row[1],
+                      "error_type": row[2], "error_message": redact(row[3]),
+                      "stack_trace": redact(row[4])[-4000:],
+                      "context": row[5], "created_at": row[6].isoformat(),
+                  }
+                  for row in errors
+              ],
+              "failed_jobs": [
+                  {
+                      "job_id": str(row[0]), "trace_id": row[1],
+                      "error_message": redact(row[2]), "fallback_reasons": row[3],
+                      "updated_at": row[4].isoformat(),
+                  }
+                  for row in jobs
+              ],
+          }, ensure_ascii=False, sort_keys=True))
           PY
           REMOTE
 

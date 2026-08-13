@@ -107,7 +107,7 @@ class PositionSizing(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     method: PositionSizingMethod = PositionSizingMethod.EQUAL_WEIGHT
-    max_positions: int = Field(default=10, ge=1)
+    max_positions: Union[int, None] = Field(default=10, ge=1)
     fixed_percent: Union[float, None] = Field(default=None, gt=0.0, le=1.0)
     risk_per_position: Union[float, None] = Field(default=None, gt=0.0, le=1.0)
 
@@ -120,11 +120,18 @@ class PositionSizing(BaseModel):
         return self
 
 
+class ExecutionCapacityConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    max_participation_rate: float = Field(default=0.01, gt=0.0, le=1.0)
+
+
 class RiskControls(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_gross_exposure_pct: float = Field(default=1.0, gt=0.0, le=1.0)
-    stop_loss_pct: float = Field(default=0.08, gt=0.0, le=1.0)
+    stop_loss_pct: Union[float, None] = Field(default=0.08, gt=0.0, le=1.0)
     take_profit_pct: Union[float, None] = Field(default=None, gt=0.0)
     max_single_position_pct: float = Field(default=0.2, gt=0.0, le=1.0)
     max_sector_weight_pct: float = Field(default=0.4, gt=0.0, le=1.0)
@@ -145,6 +152,62 @@ class CostModel(BaseModel):
     commission_pct: float = Field(default=0.00015, ge=0.0)
     tax_pct: float = Field(default=0.0023, ge=0.0)
     slippage_pct: float = Field(default=0.001, ge=0.0)
+    policy_id: Union[str, None] = None
+    policy_version: Union[str, None] = None
+    applicable_market: Union[str, None] = None
+    applicable_account: Union[str, None] = None
+    applicable_channel: Union[str, None] = None
+    applicable_tier: Union[str, None] = None
+    effective_from: Union[date, None] = None
+    effective_to: Union[date, None] = None
+    source_urls: list[str] = Field(default_factory=list)
+    document_hash: Union[str, None] = None
+    verified_at: Union[datetime, None] = None
+    rounding_mode: Literal["none", "floor", "half_up"] = "none"
+    rounding_decimals: int = Field(default=6, ge=0, le=10)
+
+    @model_validator(mode="after")
+    def validate_cost_policy(self) -> "CostModel":
+        if self.effective_from and self.effective_to and self.effective_from > self.effective_to:
+            raise ValueError("cost policy effective_from must not be after effective_to")
+        return self
+
+    @property
+    def production_eligible(self) -> bool:
+        return bool(
+            self.policy_id and self.policy_version and self.applicable_market and self.applicable_account
+            and self.applicable_channel and self.applicable_tier and self.effective_from and self.effective_to
+            and self.source_urls and self.document_hash and self.verified_at
+        )
+
+
+class CorporateActionEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: Literal["split", "cash_dividend", "delist"]
+    ticker: str
+    effective_date: date
+    split_ratio: Union[float, None] = Field(default=None, gt=0.0)
+    cash_dividend_per_share: Union[float, None] = Field(default=None, ge=0.0)
+    recovery_price: Union[float, None] = Field(default=None, ge=0.0)
+    recovery_verified: bool = False
+    source_urls: list[str] = Field(default_factory=list)
+    document_hash: Union[str, None] = None
+    verified_at: Union[datetime, None] = None
+
+    @model_validator(mode="after")
+    def validate_event(self) -> "CorporateActionEvent":
+        if self.event_type == "split" and self.split_ratio is None:
+            raise ValueError("split event requires split_ratio")
+        if self.event_type == "cash_dividend" and self.cash_dividend_per_share is None:
+            raise ValueError("cash_dividend event requires cash_dividend_per_share")
+        if self.event_type == "delist" and self.recovery_price is None:
+            raise ValueError("delist event requires recovery_price; use zero for explicit zero recovery")
+        return self
+
+    @property
+    def source_verified(self) -> bool:
+        return bool(self.source_urls and self.document_hash and self.verified_at)
 
 
 class BacktestConfig(BaseModel):
@@ -154,6 +217,8 @@ class BacktestConfig(BaseModel):
     use_adjusted_price: bool = True
     walk_forward: WalkForwardConfig = Field(default_factory=WalkForwardConfig)
     cost_model: CostModel = Field(default_factory=CostModel)
+    execution_capacity: ExecutionCapacityConfig = Field(default_factory=ExecutionCapacityConfig)
+    corporate_actions: list[CorporateActionEvent] = Field(default_factory=list)
 
 
 class ReportingConfig(BaseModel):
@@ -196,6 +261,8 @@ class StrategySpec(BaseModel):
     def validate_strategy_spec(self) -> "StrategySpec":
         if not self.entry_rules:
             raise ValueError("entry_rules는 최소 1개 이상 필요합니다.")
+        if self.position_sizing.method == PositionSizingMethod.FIXED_RISK and self.risk_controls.stop_loss_pct is None:
+            raise ValueError("fixed_risk 방식은 stop_loss_pct가 필요합니다.")
         return self
 
 

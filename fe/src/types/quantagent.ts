@@ -287,6 +287,19 @@ export interface AIRecommendationGate {
   reason: string;
 }
 
+export type AITickerActionType = 'BUY' | 'SELL' | 'HOLD' | 'WATCH';
+
+/** Today's verdict for one stock, produced by the same backtest run as `performance`. */
+export interface AITickerAction {
+  ticker: string;
+  name: string;
+  action: AITickerActionType;
+  reason: string;
+  as_of_date: string;
+  close?: number | null;
+  source_candidate_id?: string | null;
+}
+
 export interface AIUserPayload {
   headline: string;
   message: string;
@@ -295,6 +308,7 @@ export interface AIUserPayload {
   report: AIReportBundle | null;
   performance?: AIBacktestPerformance | null;
   recommendation_gate?: AIRecommendationGate | null;
+  ticker_actions?: AITickerAction[];
   question?: string | null;
   options?: AIClarificationOption[];
   recommended?: number | null;

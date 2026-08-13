@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # pyright: reportUnannotatedClassAttribute=false
 
+import json
 import logging
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -11,7 +12,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha256
 from os import environ
-from typing import ClassVar, Protocol
+from typing import Any, ClassVar, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -52,6 +53,77 @@ class StageProgress(BaseModel):
     message: str | None = None
 
 
+MANIFEST_SCHEMA_VERSION = "1"
+MANIFEST_CONTRACT_HASH = "3bb9a4727895b08f6d7a396e9179c2f7263bbea5d7a1d5130c7a079b9e808e0f"
+
+
+class ExecutionRunIdentity(BaseModel):
+    """Identifiers needed to join one execution ledger to its analysis request."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    trace_id: str = Field(min_length=1)
+    strategy_id: str | None = None
+    run_id: str | None = None
+
+
+class ExecutionSession(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    requested_at: datetime
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
+class ExecutionCapabilities(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    terminal_event_documents: bool = False
+    corporate_action_events: bool = False
+
+
+class ExecutionEvent(BaseModel):
+    """One ledger event; cost and quantity fields permit deterministic reconstruction."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    event_id: str = Field(min_length=1)
+    occurred_at: datetime
+    requested_qty: float = Field(ge=0)
+    filled_qty: float = Field(ge=0)
+    reason: str = Field(min_length=1)
+    component_costs: dict[str, float] = Field(default_factory=dict)
+    document: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
+
+class ExecutionEvents(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    signals: list[ExecutionEvent] = Field(default_factory=list)
+    orders: list[ExecutionEvent] = Field(default_factory=list)
+    fills: list[ExecutionEvent] = Field(default_factory=list)
+    positions: list[ExecutionEvent] = Field(default_factory=list)
+    trades: list[ExecutionEvent] = Field(default_factory=list)
+    equity: list[ExecutionEvent] = Field(default_factory=list)
+
+
+class ExecutionManifest(BaseModel):
+    """Versioned, secret-free execution ledger persisted inside canonical job JSONB."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1"] = MANIFEST_SCHEMA_VERSION
+    contract_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    run_identity: ExecutionRunIdentity
+    policy_hashes: dict[str, str] = Field(min_length=1)
+    session: ExecutionSession
+    capabilities: ExecutionCapabilities = Field(default_factory=ExecutionCapabilities)
+    events: ExecutionEvents = Field(default_factory=ExecutionEvents)
+    ledger_event_count: int = Field(default=0, ge=0)
+    ledger_event_hash: str = Field(default_factory=lambda: _stable_hash({}), pattern=r"^[0-9a-f]{64}$")
+
+
 class AnalysisJob(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
@@ -73,6 +145,9 @@ class AnalysisJob(BaseModel):
     debug_ref: str | None = Field(default=None, exclude=True)
     fallback_reasons: list[str] = Field(default_factory=list, exclude=True)
     error_message: str | None = Field(default=None, exclude=True)
+    # Canonical writer persists this versioned ledger in job_jsonb; it deliberately has
+    # no DSN, credential, or arbitrary provider payload fields.
+    execution_manifest: ExecutionManifest = Field(exclude=True)
 
 
 class AnalysisJobStore(Protocol):
@@ -162,9 +237,10 @@ class InMemoryAnalysisJobStore:
         fallback_reasons: Sequence[str] | None = None,
     ) -> AnalysisJob:
         now = datetime.now(UTC)
+        job_id = f"job_{uuid4().hex[:12]}"
         trace_id = sha256(f"{request_text}:{now.isoformat()}".encode("utf-8")).hexdigest()[:16]
         job = AnalysisJob(
-            job_id=f"job_{uuid4().hex[:12]}",
+            job_id=job_id,
             trace_id=trace_id,
             query=request_text,
             user_id=user_id,
@@ -176,6 +252,17 @@ class InMemoryAnalysisJobStore:
             updated_at=now,
             stages=_stage_progresses(Stage.INTERPRETING, AnalysisJobStatus.QUEUED, now),
             fallback_reasons=list(fallback_reasons or ()),
+            execution_manifest=ExecutionManifest(
+                contract_hash=MANIFEST_CONTRACT_HASH,
+                run_identity=ExecutionRunIdentity(
+                    job_id=job_id,
+                    trace_id=trace_id,
+                    strategy_id=strategy_id,
+                    run_id=run_id,
+                ),
+                policy_hashes={"execution_contract": MANIFEST_CONTRACT_HASH},
+                session=ExecutionSession(requested_at=now),
+            ),
         )
         self.jobs[job.job_id] = job
         return job
@@ -206,6 +293,9 @@ class InMemoryAnalysisJobStore:
                 normalized_status,
                 now,
                 message=message,
+            ),
+            "execution_manifest": _manifest_with_session_update(
+                job.execution_manifest, normalized_status, now
             ),
         }
         if fallback_reasons is not None:
@@ -249,6 +339,12 @@ class InMemoryAnalysisJobStore:
                 "debug_ref": result_envelope.debug_ref,
                 "fallback_reasons": reasons,
                 "error_message": None,
+                "execution_manifest": _manifest_from_completion(
+                    job.execution_manifest,
+                    result_envelope,
+                    completed_at,
+                    strategy_id=strategy_id,
+                ),
             }
         )
         self.jobs[job_id] = job
@@ -283,6 +379,9 @@ class InMemoryAnalysisJobStore:
                 "debug_ref": result.debug_ref,
                 "fallback_reasons": reasons,
                 "error_message": error_message,
+                "execution_manifest": _manifest_with_session_update(
+                    job.execution_manifest, AnalysisJobStatus.FAILED, failed_at
+                ),
             }
         )
         self.jobs[job_id] = job
@@ -386,7 +485,12 @@ def run_job_sync(
             ),
         )
     except Exception as exc:
-        diagnostic = classify_failure(exc, stage=Stage.FINALIZING.value)
+        # The stage the graph had actually reached, not FINALIZING. `job` was read before
+        # the run and never advances, so reporting its stage said every failure happened
+        # while finalizing - including ones that died in the Data node minutes earlier,
+        # which sent anyone reading the envelope to the wrong end of the pipeline.
+        failed_job = store.get_job(job_id) or job
+        diagnostic = classify_failure(exc, stage=failed_job.polling_stage.value)
         # The public envelope deliberately hides the original error behind debug_ref,
         # so this is the only place it is ever recorded. Without it a failure is
         # untraceable - doubly so now that jobs run as a background task, where the
@@ -438,31 +542,23 @@ def create_analysis_job_store_from_env(
         )
     if requested_mode == PERSISTENT_JOB_STORE_MODE:
         if repository is None:
-            reason = (
-                "AI_JOB_STORE=persistent requires the DB-team repository adapter; "
-                "falling back to in-memory job store."
-            )
             if not dsn_configured:
-                reason = (
-                    "database DSN is not set in any of "
-                    "AI_DATABASE_DSN/QUANT_DB_DSN/DATABASE_URL for AI_JOB_STORE=persistent; "
-                    "falling back to in-memory job store."
+                raise JobStoreConfigurationError(
+                    "AI_JOB_STORE=persistent requires a configured database DSN in "
+                    "AI_DATABASE_DSN/QUANT_DB_DSN/DATABASE_URL and a repository adapter."
                 )
-            store = InMemoryAnalysisJobStore()
-            return JobStoreRuntime(
-                store=store,
-                requested_mode=requested_mode,
-                active_mode=store.store_mode,
-                fallback=True,
-                fallback_reason=reason,
-                dsn_configured=dsn_configured,
-                dsn_env=dsn_env,
+            raise JobStoreConfigurationError(
+                "AI_JOB_STORE=persistent requires the DB-team repository adapter."
             )
         if persistent_store_factory is None:
             raise JobStoreConfigurationError(
                 "persistent_store_factory is required when a persistent repository is provided."
             )
         store = persistent_store_factory(repository)
+        if store.store_mode != PERSISTENT_JOB_STORE_MODE:
+            raise JobStoreConfigurationError(
+                "AI_JOB_STORE=persistent requires a persistent store; memory fallback is forbidden."
+            )
         return JobStoreRuntime(
             store=store,
             requested_mode=requested_mode,
@@ -478,6 +574,162 @@ def create_analysis_job_store_from_env(
     )
     raise JobStoreConfigurationError(message)
 
+
+def _manifest_with_session_update(
+    manifest: ExecutionManifest,
+    status: AnalysisJobStatus,
+    timestamp: datetime,
+    *,
+    strategy_id: str | None = None,
+) -> ExecutionManifest:
+    session = manifest.session
+    if status == AnalysisJobStatus.RUNNING and session.started_at is None:
+        session = session.model_copy(update={"started_at": timestamp})
+    elif status in {AnalysisJobStatus.COMPLETED, AnalysisJobStatus.FAILED}:
+        session = session.model_copy(update={"ended_at": timestamp})
+    identity = manifest.run_identity
+    if strategy_id is not None and identity.strategy_id != strategy_id:
+        identity = identity.model_copy(update={"strategy_id": strategy_id})
+    return manifest.model_copy(update={"session": session, "run_identity": identity})
+
+
+def _manifest_from_completion(manifest: ExecutionManifest, result_envelope: APIEnvelope, completed_at: datetime, *, strategy_id: str | None) -> ExecutionManifest:
+    manifest = _manifest_with_session_update(manifest, AnalysisJobStatus.COMPLETED, completed_at, strategy_id=strategy_id)
+    performance = result_envelope.user_payload.performance
+    if performance is None:
+        return manifest
+    ledger = _storage_ledger(result_envelope)
+    if ledger is None:
+        if performance.engine_summary.get("execution_audit"):
+            raise JobStoreConfigurationError("completed backtest is missing its storage execution ledger.")
+        return manifest
+    events = _events_from_storage_ledger(ledger, completed_at)
+    source_count = int(ledger.get("source_event_count", -1))
+    source_hash = str(ledger.get("source_event_hash", ""))
+    if source_count != _event_count(events) or source_hash != _stable_hash(_ledger_source(ledger)):
+        raise JobStoreConfigurationError("storage execution ledger count/hash reconciliation failed.")
+    return manifest.model_copy(update={"events": events, "ledger_event_count": source_count, "ledger_event_hash": source_hash, "policy_hashes": _policy_hashes(result_envelope, performance.engine_summary, ledger.get("order_audit", []), strategy_id=manifest.run_identity.strategy_id)})
+
+
+def _storage_ledger(result_envelope: APIEnvelope) -> Mapping[str, Any] | None:
+    performance = result_envelope.user_payload.performance
+    if performance is not None:
+        ledger = performance.engine_summary.get("_storage_execution_ledger")
+        if isinstance(ledger, Mapping):
+            return ledger
+    try:
+        from ai_graph.graph import DEBUG_STORE
+
+        payload = DEBUG_STORE.get(result_envelope.debug_ref)
+    except (ImportError, AttributeError):
+        payload = None
+    ledger = payload.backtest_artifacts.get("engine_summary", {}).get("_storage_execution_ledger") if payload else None
+    return ledger if isinstance(ledger, Mapping) else None
+
+
+def _events_from_storage_ledger(ledger: Mapping[str, Any], occurred_at: datetime) -> ExecutionEvents:
+    def records(name: str) -> list[Mapping[str, Any]]:
+        value = ledger.get(name, [])
+        return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+    def mapped(name: str, prefix: str) -> list[ExecutionEvent]:
+        return [_audit_execution_event(event, f"{prefix}:{index}", _event_timestamp(event.get("exit_date", event.get("date")), occurred_at)) for index, event in enumerate(records(name))]
+
+    return ExecutionEvents(signals=mapped("signals", "signal"), orders=mapped("order_audit", "order"), fills=mapped("fills", "fill"), positions=mapped("positions", "position"), trades=mapped("trades", "trade"), equity=mapped("equity", "equity"))
+
+
+def _event_count(events: ExecutionEvents) -> int:
+    return sum(len(getattr(events, name)) for name in ("signals", "orders", "fills", "positions", "trades", "equity"))
+
+
+def _ledger_source(ledger: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: ledger.get(key, []) for key in ("signals", "order_audit", "fills", "positions", "trades", "equity")}
+
+def _execution_events_from_backtest(audit_events: Sequence[Mapping[str, Any]], equity_curve: Sequence[Any], occurred_at: datetime) -> ExecutionEvents:
+    signals: list[ExecutionEvent] = []
+    orders: list[ExecutionEvent] = []
+    fills: list[ExecutionEvent] = []
+    positions: list[ExecutionEvent] = []
+    trades: list[ExecutionEvent] = []
+    for index, event in enumerate(audit_events):
+        status = str(event.get("status") or "unknown")
+        execution_event = _audit_execution_event(event, f"audit:{index}", _event_timestamp(event.get("date"), occurred_at))
+        if status == "submitted":
+            signals.append(execution_event)
+            orders.append(execution_event)
+        if status == "executed":
+            fills.append(execution_event)
+            positions.append(execution_event)
+            trades.append(execution_event)
+    equity = [
+        ExecutionEvent(event_id=f"equity:{index}", occurred_at=_event_timestamp(getattr(point, "date", None), occurred_at), requested_qty=0, filled_qty=0, reason="equity_mark", document=_safe_document(point.model_dump(mode="json") if hasattr(point, "model_dump") else {}))
+        for index, point in enumerate(equity_curve)
+    ]
+    return ExecutionEvents(signals=signals, orders=orders, fills=fills, positions=positions, trades=trades, equity=equity)
+
+
+def _audit_execution_event(event: Mapping[str, Any], event_id: str, occurred_at: datetime) -> ExecutionEvent:
+    requested = _nonnegative_float(event.get("requested_quantity", event.get("quantity")))
+    filled = _nonnegative_float(event.get("filled_quantity"))
+    if str(event.get("status")) == "executed" and filled == 0:
+        filled = requested
+    costs = {name: _nonnegative_float(event.get(name)) for name in ("commission_cost", "tax_cost", "slippage_cost") if event.get(name) is not None}
+    return ExecutionEvent(event_id=event_id, occurred_at=occurred_at, requested_qty=requested, filled_qty=filled, reason=str(event.get("reason") or event.get("status") or "engine_execution"), component_costs=costs, document=_safe_document(event))
+
+
+
+def _policy_hashes(
+    result_envelope: APIEnvelope,
+    engine_summary: Mapping[str, Any],
+    audit_events: Sequence[Mapping[str, Any]],
+    *,
+    strategy_id: str | None,
+) -> dict[str, str]:
+    strategy = (
+        result_envelope.strategy_spec.model_dump(mode="json")
+        if result_envelope.strategy_spec
+        else {"strategy_id": strategy_id}
+    )
+    performance = result_envelope.user_payload.performance
+    return {
+        "execution_contract": MANIFEST_CONTRACT_HASH,
+        "strategy": _stable_hash(strategy),
+        "data": _stable_hash({"reliability": performance.reliability.model_dump(mode="json") if performance and performance.reliability else None}),
+        "cost": _stable_hash({"cost_policy_ids": sorted(str(event["cost_policy_id"]) for event in audit_events if event.get("cost_policy_id")), "cost_components": [_safe_document(event) for event in audit_events if event.get("cost") is not None]}),
+        "sizing": _stable_hash(engine_summary.get("ai_backtest_context", {})),
+        "benchmark": _stable_hash({"benchmark": performance.benchmark.model_dump(mode="json") if performance and performance.benchmark else None, "provenance": engine_summary.get("benchmark_provenance", {})}),
+    }
+
+
+def _stable_hash(value: object) -> str:
+    return sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _safe_document(value: Mapping[str, Any]) -> dict[str, str | int | float | bool | None]:
+    allowed = {"date", "exit_date", "signal_date", "ticker", "side", "status", "reason", "price", "quantity", "fill_quantity", "requested_quantity", "filled_quantity", "fill_rate", "notional", "cost", "cost_policy_id", "commission_cost", "tax_cost", "slippage_cost", "cash", "positions_value", "total_equity", "daily_return", "cumulative_return", "gross_pnl", "net_pnl", "return_pct", "entry_cost", "exit_cost"}
+    return {key: normalized for key, raw in value.items() if key in allowed and (normalized := _scalar_document_value(raw)) is not None}
+
+
+def _scalar_document_value(value: Any) -> str | int | float | bool | None:
+    return value if isinstance(value, (str, int, float, bool)) or value is None else str(value)
+
+
+def _nonnegative_float(value: Any) -> float:
+    try:
+        return max(0.0, float(value or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _event_timestamp(value: Any, default: datetime) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value).replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return default
 
 def _requested_job_store_mode(env: Mapping[str, str]) -> str:
     raw_mode = env.get(AI_JOB_STORE_ENV) or env.get(BE_JOB_STORE_MODE_ENV) or MEMORY_JOB_STORE_MODE
@@ -543,6 +795,44 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             retryable=True,
             safe_message="현재 AI 분석 요청이 몰려 대기 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:aoai_capacity_exhausted"],
+        )
+    # The provider accepted the request and then stopped producing, so retries burned the
+    # budget without a usable answer. Its message says "Model request timed out after
+    # retry attempts", which contains none of the substrings the heuristics below look for
+    # - they are all about the warehouse - so a run killed by a slow deployment was
+    # reported as "분류되지 않은 오류" and read as a bug in the analysis rather than a
+    # provider that needed more time.
+    if type(exc).__name__ in {"LLMClientError", "LLMTimeoutError"} and "timed out" in str(exc).lower():
+        return FailureDiagnostic(
+            category="infrastructure_failure",
+            subcause="aoai_response_timeout",
+            failure_stage=stage,
+            owner="ai_graph",
+            retryable=True,
+            safe_message=(
+                "AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요."
+            ),
+            evidence_refs=["failure:aoai_response_timeout"],
+        )
+    # psycopg raises OutOfMemory for the server's "out of shared memory", which here has
+    # only ever meant the lock table filled up: a query touched more partitions than
+    # max_locks_per_transaction x max_connections leaves room for. Matched by type name
+    # rather than message because the message heuristics below never caught it - it
+    # contains none of "timeout", "validation" or "schema", so a run that died this way
+    # was reported as "분류되지 않은 오류", which told the user nothing and hid a
+    # warehouse-side cause behind a message that reads like an AI bug.
+    if type(exc).__name__ == "OutOfMemory" or "out of shared memory" in str(exc).lower():
+        return FailureDiagnostic(
+            category="infrastructure_failure",
+            subcause="db_lock_capacity_exhausted",
+            failure_stage=stage,
+            owner="data_source_config",
+            retryable=True,
+            safe_message=(
+                "데이터 조회가 서버 자원 한도에 걸려 중단했습니다. "
+                "일시적인 부하일 수 있으니 잠시 후 다시 시도해 주세요."
+            ),
+            evidence_refs=["failure:db_lock_capacity_exhausted"],
         )
     # The warehouse answered, it just had nothing to run this strategy on. That is an
     # answer for the user, not a crash: sorted into unknown_failure it produced "분류되지

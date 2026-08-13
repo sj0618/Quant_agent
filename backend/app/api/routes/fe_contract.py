@@ -130,6 +130,8 @@ async def _completed_analysis_payload(request: Request, *, user_id: str, ai_job_
             "summary": projection["summary"],
             "sections": projection.get("sections") or [],
             "recommendationGate": user_payload.get("recommendation_gate"),
+            # Per-stock BUY/SELL/HOLD/WATCH from the run that produced the numbers above.
+            "tickerActions": user_payload.get("ticker_actions") or [],
             "performance": user_payload.get("performance"),
             "strategySpec": result.get("strategy_spec"),
             "aiJobId": ai_job_id,

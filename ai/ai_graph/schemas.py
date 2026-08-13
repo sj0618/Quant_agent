@@ -25,6 +25,10 @@ FailureCategory = Literal[
 FailureSubcause = Literal[
     "db_connect_timeout",
     "db_statement_timeout",
+    # The warehouse ran out of lock-table slots ("out of shared memory"), which a query
+    # touching many hypertable chunks can do on its own. Distinct from the timeouts
+    # above: nothing was slow, the statement was refused before it read a row.
+    "db_lock_capacity_exhausted",
     "semantic_drift",
     "missing_data_policy_gap",
     "clarification_quality_gap",
@@ -39,6 +43,9 @@ FailureSubcause = Literal[
     "freshness_gap",
     "external_source_rate_limited",
     "aoai_capacity_exhausted",
+    # The provider took the request and then did not answer within the client's budget,
+    # as opposed to refusing it for capacity (aoai_capacity_exhausted above).
+    "aoai_response_timeout",
     "parser_low_confidence",
     "source_conflict",
     "data_required",
@@ -324,26 +331,65 @@ class BacktestMetrics(BaseModel):
     win_rate: float = Field(ge=0.0, le=1.0)
     total_return: float
     in_sample_sharpe: float
-    out_sample_sharpe: float
+    out_sample_sharpe: float | None
     degradation: float
     # Selection-only statistics. Defaults preserve compatibility with historical
     # result payloads that predate the real hold-out split.
     in_sample_return: float = 0.0
     in_sample_max_drawdown: float = 0.0
-    out_sample_return: float = 0.0
-    in_sample_benchmark_return: float = 0.0
-    out_sample_benchmark_return: float = 0.0
-    in_sample_excess_return: float = 0.0
-    out_sample_excess_return: float = 0.0
-    benchmark_period_count: int = Field(default=0, ge=0)
-    benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    in_sample_benchmark_period_count: int = Field(default=0, ge=0)
-    in_sample_benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    in_sample_benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    out_sample_benchmark_period_count: int = Field(default=0, ge=0)
-    out_sample_benchmark_period_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    out_sample_benchmark_period_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Hold-out statistics. `sharpe_ratio`/`total_return`/`max_drawdown` above span the
+    # whole period, including the selection history, so they are not an out-of-sample
+    # claim. Nullable values explicitly represent an unavailable walk-forward aggregate.
+    out_sample_return: float | None = None
+    out_sample_max_drawdown: float | None = None
+    # Daily returns behind the in-sample statistics. Needed to deflate a Sharpe for the
+    # width of the search: the public equity curve is downsampled to a dozen points, so
+    # it cannot stand in for the sample size.
+    in_sample_observations: int = 0
+    # How many candidates the winner was chosen from. Reporting the best of N without
+    # saying what N was makes an argmax look like a discovery.
+    candidates_evaluated: int = 1
+    # Sharpe after deflating for the width of the search.
+    selection_adjusted_sharpe: float = 0.0
+    in_sample_benchmark_return: float | None = None
+    out_sample_benchmark_return: float | None = None
+    in_sample_excess_return: float | None = None
+    out_sample_excess_return: float | None = None
+    benchmark_period_count: int | None = Field(default=None, ge=0)
+    benchmark_period_win_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    benchmark_period_loss_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    in_sample_benchmark_period_count: int | None = Field(default=None, ge=0)
+    in_sample_benchmark_period_win_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    in_sample_benchmark_period_loss_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    out_sample_benchmark_period_count: int | None = Field(default=None, ge=0)
+    out_sample_benchmark_period_win_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    out_sample_benchmark_period_loss_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class WalkForwardFoldSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fold_index: int = Field(ge=0)
+    selection_hash: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    evaluation_sessions: list[str] = Field(default_factory=list)
+
+
+class WalkForwardPolicyResult(BaseModel):
+    """Performance belongs to the rolling selection policy, never one final candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ready", "insufficient", "unsafe_candidate"]
+    unavailable_reason: str | None = None
+    fold_selections: list[WalkForwardFoldSelection] = Field(default_factory=list)
+    unique_evaluation_session_count: int = Field(default=0, ge=0)
+    daily_returns: dict[str, float] = Field(default_factory=dict)
+    aggregate_metrics: BacktestMetrics | None = None
+    equity_curve: list[BacktestEquityPoint] = Field(default_factory=list)
+    fills: list[dict[str, Any]] = Field(default_factory=list)
+    costs: float = 0.0
+    deduped_session_count: int = Field(default=0, ge=0)
 
 
 class PublicMetricDetail(BaseModel):
@@ -506,6 +552,31 @@ class CodeCandidate(BaseModel):
         return self
 
 
+TickerActionType = Literal["BUY", "SELL", "HOLD", "WATCH"]
+
+
+class TickerAction(BaseModel):
+    """What to do with one stock today, according to the strategy that was validated.
+
+    The backtest ends on the most recent bar, so it already knows both halves of this:
+    what the rule signals now, and what the book is holding now. Emitting the verdict
+    from that same run is the only way the recommendation and the performance figure can
+    be guaranteed to describe the same strategy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    action: TickerActionType
+    reason: str = Field(min_length=1)
+    as_of_date: str = Field(min_length=1)
+    close: float | None = None
+    # Which candidate produced it, so a recommendation can be traced to the run that
+    # was measured rather than to "the strategy" in general.
+    source_candidate_id: str | None = None
+
+
 class CandidateBacktestResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -513,6 +584,8 @@ class CandidateBacktestResult(BaseModel):
     candidates: list[CodeCandidate] = Field(min_length=1)
     selected_candidate: CodeCandidate
     equity_curve: list[BacktestEquityPoint]
+    # Per-stock BUY/SELL/HOLD for the final bar of the selected candidate's run.
+    ticker_actions: list[TickerAction] = Field(default_factory=list)
     engine_summary: dict[str, Any] = Field(default_factory=dict)
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = Field(default_factory=dict)
     objective_scores_by_candidate: dict[str, float] = Field(default_factory=dict)
@@ -521,6 +594,7 @@ class CandidateBacktestResult(BaseModel):
     fallback_reasons: list[str] = Field(default_factory=list)
     execution_stats: dict[str, Any] = Field(default_factory=dict)
     generated_strategy_blueprints: list[dict[str, Any]] = Field(default_factory=list)
+    walk_forward: WalkForwardPolicyResult | None = None
 
 
 SignalAction = Literal["BUY", "HOLD", "DROP"]
@@ -666,6 +740,7 @@ class UserPayload(BaseModel):
     report: ReportBundle | None = None
     performance: BacktestPerformance | None = None
     recommendation_gate: RecommendationGate | None = None
+    ticker_actions: list[TickerAction] = Field(default_factory=list)
     question: str | None = None
     options: list[ClarificationOption] = Field(default_factory=list, max_length=3)
     recommended: int | None = Field(default=None, ge=0, le=2)

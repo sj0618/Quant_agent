@@ -336,9 +336,18 @@ class CompiledConditions:
         judged against the whole day's universe, applied by build_signals separately.
     """
 
-    def __init__(self, per_stock: str, rank_filters: list[tuple[str, float, bool]]):
+    def __init__(
+        self,
+        per_stock: str,
+        rank_filters: list[tuple[str, float, bool]],
+        warmup_bars: int = 1,
+    ):
         self.per_stock = per_stock
         self.rank_filters = rank_filters
+        # Bars of history the widest condition needs before it means what it says. A
+        # 52-week-high rule evaluated on a stock's third bar compares against a
+        # three-day high; the generated build_signals waits this many bars instead.
+        self.warmup_bars = warmup_bars
 
 
 def compile_conditions(conditions: Sequence[Condition]) -> CompiledConditions | None:
@@ -353,7 +362,12 @@ def compile_conditions(conditions: Sequence[Condition]) -> CompiledConditions | 
         return None
     parts: list[str] = []
     rank_filters: list[tuple[str, float, bool]] = []
+    warmup_bars = 1
     for condition in conditions:
+        # `consecutive` needs that many evaluated bars; `window` needs a full window.
+        warmup_bars = max(
+            warmup_bars, int(condition.window or 1), int(condition.consecutive or 1)
+        )
         rank = _rank_filter(condition)
         if rank is not None:
             rank_filters.append(rank)
@@ -365,7 +379,7 @@ def compile_conditions(conditions: Sequence[Condition]) -> CompiledConditions | 
     # A rule made only of rank cuts still needs a per-stock expression; "True" lets the
     # ranking do the selecting.
     per_stock = " and ".join(parts) if parts else "True"
-    return CompiledConditions(per_stock, rank_filters)
+    return CompiledConditions(per_stock, rank_filters, warmup_bars)
 
 
 def _rank_filter(condition: Condition) -> tuple[str, float, bool] | None:

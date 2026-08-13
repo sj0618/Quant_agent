@@ -1052,6 +1052,8 @@ def _render_condition_signal_code(
     entry_expr = compiled.per_stock
     # (metric, pct, top) triples, evaluated against the day's universe below.
     rank_filters = list(compiled.rank_filters)
+    # Bars the widest condition needs before it evaluates to what it claims.
+    warmup_bars = max(1, int(getattr(compiled, "warmup_bars", 1)))
     # Generated from the compiler's own vocabulary so an expression can never name a
     # variable the template forgot to bind.
     indicator_bindings = "\n            ".join(
@@ -1077,6 +1079,7 @@ def _render_condition_signal_code(
             return float("nan")
         return float(value)
     rank_filters = {rank_filters!r}
+    warmup_bars = {int(warmup_bars)}
     signals = []
     rows_by_date = {{}}
     for row in sorted(prices, key=lambda item: (item["date"], item.get("ticker", "000000"))):
@@ -1109,8 +1112,11 @@ def _render_condition_signal_code(
             lows = hist["lows"]
             closes = hist["closes"]
             volumes = hist["volumes"]
-            # Enough history for the longest window before the rule can be judged.
-            ready = len(closes) >= 1
+            # Enough history for the longest window before the rule can be judged. This
+            # said `>= 1`, which is what the comment always claimed but the code never
+            # did: a 52-week-high condition was evaluated on a stock's second bar
+            # against a one-day high, and matched.
+            ready = len(closes) >= warmup_bars
             entry_ok = False
             if ready:
                 try:
@@ -1308,11 +1314,14 @@ def _render_adaptive_signal_code(
             )
             closes = history["closes"]
             volumes = history["volumes"]
-            window = min(lookback, len(closes))
+            # The window has to be full before it is the window the profile names.
+            # `min(lookback, len(closes))` made a 120-day average mean a 2-day average on
+            # the second bar, which is where the profile's first entries came from.
+            window = lookback
             buy = False
             sell = False
             score = -999.0
-            if window:
+            if len(closes) >= lookback:
                 recent = closes[-window:]
                 average = sum(recent) / window
                 short_window = min(max(3, window // 4), len(closes))

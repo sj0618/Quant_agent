@@ -44,6 +44,7 @@ USER_PAYLOAD_FIELDS = {
     "report",
     "performance",
     "recommendation_gate",
+    "ticker_actions",
     "question",
     "options",
     "recommended",
