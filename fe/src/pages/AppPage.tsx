@@ -169,10 +169,12 @@ function conversationPreview(conversation: WorkspaceConversation, template: AppO
 
 function WorkspaceEmptyState({
   hasConversation,
+  hasCandidateSelection,
   progress,
   activity,
 }: {
   hasConversation: boolean;
+  hasCandidateSelection: boolean;
   progress?: WorkspaceProgress | null;
   activity?: ActivityState;
 }) {
@@ -250,11 +252,19 @@ function WorkspaceEmptyState({
 
   return (
     <section className="workspace-empty">
-      <strong>{hasConversation ? "전략 후보를 선택해 주세요" : "전략 채팅으로 시작해 주세요"}</strong>
+      <strong>
+        {hasCandidateSelection
+          ? "전략 후보를 선택해 주세요"
+          : hasConversation
+            ? "분석할 전략 조건을 입력해 주세요"
+            : "전략 채팅으로 시작해 주세요"}
+      </strong>
       <p>
-        {hasConversation
+        {hasCandidateSelection
           ? "AI가 후보 카드를 준비했습니다. 왼쪽 채팅에서 카드를 선택하면 전략과 리포트 워크스페이스가 채워집니다."
-          : "왼쪽 전략 채팅에 원하는 조건을 한 문장으로 입력하면 AI가 전략 필드, 검증 결과, 리포트 초안을 자동으로 구성합니다."}
+          : hasConversation
+            ? "이 대화는 전략 분석 요청으로 처리되지 않았습니다. 왼쪽 채팅에 매수·매도 조건 또는 분석할 투자 전략을 입력해 주세요."
+            : "왼쪽 전략 채팅에 원하는 조건을 한 문장으로 입력하면 AI가 전략 필드, 검증 결과, 리포트 초안을 자동으로 구성합니다."}
       </p>
     </section>
   );
@@ -520,6 +530,9 @@ export function AppPage() {
   // backtest. When it did not, the picks still render but under an explicit not-validated
   // banner so they read as reference, not a buy list.
   const latestPayload = latestJob?.result?.user_payload;
+  const hasCandidateSelection = Boolean(
+    latestJob?.result?.status === "need_clarification" && latestPayload?.candidate_cards.length,
+  );
   const recommendationGate =
     latestPayload && "recommendation_gate" in latestPayload ? latestPayload.recommendation_gate ?? null : null;
   const showGateWarning = canRenderWorkspace && recommendationGate !== null && !recommendationGate.validated;
@@ -628,7 +641,10 @@ export function AppPage() {
           onAnalyze={async (query) => {
             // A brand-new strategy starts a brand-new conversation; answering a
             // clarification or picking a candidate card continues the current one.
-            const awaitingUserInput = latestJob?.result?.status === "need_clarification";
+            const awaitingUserInput = Boolean(
+              latestJob?.result?.status === "need_clarification" &&
+                (latestPayload?.candidate_cards.length || latestPayload?.options?.length),
+            );
             const previousJobs = awaitingUserInput ? analysisJobs : [];
             if (!awaitingUserInput) {
               archiveCurrentConversation();
@@ -680,7 +696,12 @@ export function AppPage() {
               {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
             </>
           ) : (
-            <WorkspaceEmptyState activity={analysisActivity} hasConversation={hasCurrentConversation} progress={workspaceProgress} />
+            <WorkspaceEmptyState
+              activity={analysisActivity}
+              hasCandidateSelection={hasCandidateSelection}
+              hasConversation={hasCurrentConversation}
+              progress={workspaceProgress}
+            />
           )}
         </main>
       </div>
