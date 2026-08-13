@@ -418,7 +418,7 @@ explicitly as close to the original as you can. Never tighten a threshold.
 Every value must stay inside these inclusive ranges:
   high_252_ratio 0.50..1.0, volume_ratio_min 0.5..10.0,
   relative_strength_20d_min -1.0..1.0, relative_strength_60d_min -1.0..1.0,
-  rsi_max 5.0..70.0, rsi_cross_floor 5.0..70.0, sma20_band 0.005..0.50,
+  rsi_max 5.0..70.0, rsi_cross_floor 5.0..70.0, rsi_min 30.0..95.0, sma20_band 0.005..0.50,
   bb_width_max 0.02..1.0, bb_upper_ratio 0.50..1.0.
 require_close_above_sma20 is a boolean; set it false to drop the trend filter.
 """
@@ -437,6 +437,7 @@ class _LiveScreeningThresholds(BaseModel):
     relative_strength_60d_min: float
     rsi_max: float
     rsi_cross_floor: float
+    rsi_min: float
     sma20_band: float
     bb_width_max: float
     bb_upper_ratio: float

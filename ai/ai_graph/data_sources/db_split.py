@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -9,7 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-import logging
+from ai_graph.quant_strategy import rsi_trade_rules
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -107,6 +108,7 @@ RSI_KEYS = ("rsi", "RSI", "rsi_14", "RSI_14", "talib_rsi_14", "TA_RSI_14")
 # match can carry RSI 33 while the strategy card reads "RSI <= 30", so the label prints the
 # actual reading - "RSI 과매도권" alone let a 33 pass for a 30.
 RSI_OVERSOLD_MAX = 35
+RSI_OVERBOUGHT_MIN = 65
 MARKET_SCOPE_TERMS = (
     "KOSPI200",
     "KOSPI 200",
@@ -1340,6 +1342,7 @@ class ScreeningThresholds(BaseModel):
     relative_strength_60d_min: float = Field(default=0.0, ge=-1.0, le=1.0)
     rsi_max: float = Field(default=35.0, ge=5.0, le=70.0)
     rsi_cross_floor: float = Field(default=30.0, ge=5.0, le=70.0)
+    rsi_min: float = Field(default=70.0, ge=30.0, le=95.0)
     sma20_band: float = Field(default=0.04, ge=0.005, le=0.50)
     bb_width_max: float = Field(default=0.18, ge=0.02, le=1.0)
     bb_upper_ratio: float = Field(default=0.995, ge=0.50, le=1.0)
@@ -1354,11 +1357,18 @@ def _clamped(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> ScreeningThresholds:
+def _relaxed_thresholds(
+    base: ScreeningThresholds, round_index: int, *, profile: str = "rsi_rebound"
+) -> ScreeningThresholds:
     """Deterministic widening ladder, used when no live LLM is configured and as the
     fallback whenever an LLM relaxation proposal is unusable."""
 
     step = round_index + 1
+    rsi_update = (
+        {"rsi_min": _clamped(base.rsi_min - 5.0 * step, RSI_OVERBOUGHT_MIN, 95.0)}
+        if profile == "rsi_overbought"
+        else {"rsi_max": _clamped(base.rsi_max + 5.0 * step, 5.0, 70.0)}
+    )
     return base.model_copy(
         update={
             "high_252_ratio": _clamped(base.high_252_ratio - 0.02 * step, 0.50, 1.0),
@@ -1372,7 +1382,6 @@ def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> Screenin
             "relative_strength_60d_min": _clamped(
                 base.relative_strength_60d_min - 0.05 * step, -1.0, 1.0
             ),
-            "rsi_max": _clamped(base.rsi_max + 5.0 * step, 5.0, 70.0),
             "sma20_band": _clamped(base.sma20_band + 0.02 * step, 0.005, 0.50),
             "bb_width_max": _clamped(base.bb_width_max + 0.06 * step, 0.02, 1.0),
             "bb_upper_ratio": _clamped(base.bb_upper_ratio - 0.02 * step, 0.50, 1.0),
@@ -1382,6 +1391,7 @@ def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> Screenin
                 base.operating_margin_min - 0.02 * step, -1.0, 1.0
             ),
             "revenue_growth_min": _clamped(base.revenue_growth_min - 0.03 * step, -1.0, 10.0),
+            **rsi_update,
         }
     )
 
@@ -1438,6 +1448,10 @@ def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
         previous = _numeric(row.get("prev_rsi"))
         return previous is not None and previous < thresholds.rsi_cross_floor <= rsi
 
+    def rsi_overbought(row: Mapping[str, Any]) -> bool:
+        rsi = _numeric(row.get("rsi"))
+        return rsi is not None and rsi >= thresholds.rsi_min
+
     def pullback_trend(row: Mapping[str, Any]) -> bool:
         close = _numeric(row.get("close"))
         sma20 = _numeric(row.get("sma20"))
@@ -1480,6 +1494,7 @@ def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
     return {
         "breakout_volume": breakout_volume,
         "rsi_rebound": rsi_rebound,
+        "rsi_overbought": rsi_overbought,
         "pullback_trend": pullback_trend,
         "bollinger_squeeze": bollinger_squeeze,
         "relative_strength": relative_strength,
@@ -1585,7 +1600,7 @@ def _propose_relaxed_thresholds(
 ) -> ScreeningThresholds:
     """Ask the LLM to loosen the screen, falling back to the deterministic ladder."""
 
-    deterministic = _relaxed_thresholds(thresholds, round_index)
+    deterministic = _relaxed_thresholds(thresholds, round_index, profile=profile)
     try:
         # Imported lazily: ai_graph.llm pulls in the provider stack, which must stay
         # optional for fixture-only runs of this module.
@@ -1626,7 +1641,11 @@ def _screening_profile(query: str) -> str:
     if _mentions_fundamentals(query, ("매출 성장", "매출성장", "성장률", "성장주")):
         return "growth_momentum"
     if "rsi" in lowered or "과매도" in query or "반등" in query:
-        return "rsi_rebound"
+        return (
+            "rsi_overbought"
+            if rsi_trade_rules(query).entry_side == "overbought"
+            else "rsi_rebound"
+        )
     if "볼린저" in query or "밴드" in query or "변동성" in query:
         return "bollinger_squeeze"
     if "200일" in query or "눌림목" in query or "20일선" in query:
@@ -1657,6 +1676,7 @@ _PROFILE_DATA_FAMILIES: dict[str, tuple[str, ...]] = {
     "quality_growth": ("ohlcv_ta", "fundamentals"),
     "growth_momentum": ("ohlcv_ta", "fundamentals"),
     "rsi_rebound": ("ohlcv_ta",),
+    "rsi_overbought": ("ohlcv_ta",),
     "bollinger_squeeze": ("ohlcv_ta",),
     "pullback_trend": ("ohlcv_ta",),
     "relative_strength": ("ohlcv_ta",),
@@ -1769,6 +1789,7 @@ PATH_RETURNS = "returns"
 _PROFILE_PATH_NEEDS: dict[str, frozenset[str]] = {
     "breakout_volume": frozenset({PATH_HIGH_252, PATH_VOLUME_RATIO, PATH_RETURNS}),
     "rsi_rebound": frozenset(),
+    "rsi_overbought": frozenset(),
     "pullback_trend": frozenset(),
     "bollinger_squeeze": frozenset(),
     "relative_strength": frozenset({PATH_RETURNS}),
@@ -1887,6 +1908,7 @@ _FAMILY_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
 _PROFILE_INDICATOR_METRICS: dict[str, tuple[str, ...]] = {
     "breakout_volume": ("sma20",),
     "rsi_rebound": ("rsi",),
+    "rsi_overbought": ("rsi",),
     "pullback_trend": ("sma20", "sma200"),
     "bollinger_squeeze": ("bb_upper", "bb_width"),
     "relative_strength": (),
@@ -2170,9 +2192,16 @@ def _matched_screening_rules(row: Mapping[str, Any], profile: str) -> list[str]:
         rules.append("20일 상대강도 양호")
     rsi = _optional_float_value(row.get("rsi"))
     prev_rsi = _optional_float_value(row.get("prev_rsi"))
-    if rsi is not None and rsi <= RSI_OVERSOLD_MAX:
+    if profile == "rsi_overbought" and rsi is not None and rsi >= RSI_OVERBOUGHT_MIN:
+        rules.append(f"RSI {rsi:.0f} 과매수권")
+    elif rsi is not None and rsi <= RSI_OVERSOLD_MAX:
         rules.append(f"RSI {rsi:.0f} 과매도권")
-    if prev_rsi is not None and rsi is not None and prev_rsi < 30 <= rsi:
+    if (
+        profile == "rsi_rebound"
+        and prev_rsi is not None
+        and rsi is not None
+        and prev_rsi < 30 <= rsi
+    ):
         rules.append("RSI 30 상향 돌파")
     if profile == "bollinger_squeeze" and _compare(row.get("bb_upper"), close):
         rules.append("볼린저 상단 근접/돌파")
@@ -2548,7 +2577,11 @@ def _find_metric_value(
 
 def _query_requires_rsi_oversold(query: str) -> bool:
     lowered = query.lower()
-    return "rsi" in lowered and ("30" in lowered or "과매도" in query)
+    return (
+        "rsi" in lowered
+        and ("30" in lowered or "과매도" in query)
+        and rsi_trade_rules(query).entry_side == "oversold"
+    )
 
 
 def _has_rsi_oversold_entry(price_rows: list[dict[str, Any]]) -> bool:

@@ -55,6 +55,7 @@ from ai_graph.quant_strategy import (
     classify_strategy_request,
     infer_automatic_strategy_preferences,
     robust_strategy_source_refs,
+    rsi_trade_rules,
 )
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
@@ -1053,8 +1054,12 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
     if "roe" in lowered or "ROE" in query:
         indicator.append("roe")
 
-    if "30" in query and "rsi" in lowered:
-        threshold.append("rsi <= 30")
+    if "rsi" in lowered and any(value in query for value in ("30", "70")):
+        rsi_rules = rsi_trade_rules(query)
+        operator = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">="}[
+            rsi_rules.entry_operator
+        ]
+        threshold.append(f"rsi {operator} {int(rsi_rules.entry_threshold)}")
     if "40" in query and "rsi" in lowered:
         threshold.append("rsi <= 40")
     if "150" in query and "거래량" in query:
@@ -1896,6 +1901,17 @@ def _strategy_profile_base(
     lowered = query.lower()
     slot_indicator = set(semantic_slots.get("indicator", [])) if semantic_slots else set()
     slot_event = set(semantic_slots.get("event", [])) if semantic_slots else set()
+    rsi_rules = rsi_trade_rules(query)
+    rsi_operator_symbols = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
+    rsi_is_overbought = rsi_rules.entry_side == "overbought"
+    rsi_entry_description = (
+        f"RSI {rsi_operator_symbols[rsi_rules.entry_operator]} {int(rsi_rules.entry_threshold)}"
+    )
+    if not rsi_is_overbought and rsi_rules.entry_operator == "lte":
+        rsi_entry_description += " 또는 30 상향 회복"
+    rsi_exit_description = (
+        f"RSI {rsi_operator_symbols[rsi_rules.exit_operator]} {int(rsi_rules.exit_threshold)}"
+    )
     if (selection_mode or classify_strategy_request(query)) == "automatic":
         return {
             "strategy_id": "automatic_performance_momentum",
@@ -2821,17 +2837,29 @@ def _strategy_profile_base(
     if "rsi" in lowered or "rsi" in slot_indicator or "과매도" in query or "반등" in query:
         return {
             "strategy_id": "rsi_rebound",
-            "name": "RSI 과매도 반등",
+            "name": "RSI 과매수 모멘텀" if rsi_is_overbought else "RSI 과매도 반등",
             "entry_conditions": [
                 Condition(
-                    left="rsi", operator="lte", right=30, description="RSI <= 30 또는 30 상향 회복"
+                    left="rsi",
+                    operator=rsi_rules.entry_operator,
+                    right=rsi_rules.entry_threshold,
+                    description=rsi_entry_description,
                 )
             ],
             "exit_conditions": [
-                Condition(left="rsi", operator="gte", right=70, description="RSI >= 70")
+                Condition(
+                    left="rsi",
+                    operator=rsi_rules.exit_operator,
+                    right=rsi_rules.exit_threshold,
+                    description=rsi_exit_description,
+                )
             ],
             "indicators": ["RSI"],
-            "assumptions": ["RSI 30 회복 조건은 L2에서 과매도 반등 proxy로 해석"],
+            "assumptions": [
+                "RSI 70 이상 매수·30 미만 매도 조건을 그대로 적용"
+                if rsi_is_overbought
+                else "RSI 30 회복 조건은 L2에서 과매도 반등 proxy로 해석"
+            ],
             "confidence": 0.84,
         }
     if any(term in query for term in ("52주", "120일", "신고가", "거래량", "돌파", "갭")):
@@ -2962,15 +2990,29 @@ def _strategy_profile_base(
         }
     return {
         "strategy_id": "rsi_rebound",
-        "name": "RSI 과매도 반등",
+        "name": "RSI 과매수 모멘텀" if rsi_is_overbought else "RSI 과매도 반등",
         "entry_conditions": [
-            Condition(left="rsi", operator="lte", right=30, description="RSI <= 30")
+            Condition(
+                left="rsi",
+                operator=rsi_rules.entry_operator,
+                right=rsi_rules.entry_threshold,
+                description=rsi_entry_description,
+            )
         ],
         "exit_conditions": [
-            Condition(left="rsi", operator="gte", right=70, description="RSI >= 70")
+            Condition(
+                left="rsi",
+                operator=rsi_rules.exit_operator,
+                right=rsi_rules.exit_threshold,
+                description=rsi_exit_description,
+            )
         ],
         "indicators": ["RSI"],
-        "assumptions": ["명확한 기술 조건이 없으면 RSI 평균회귀 후보를 기본 제안"],
+        "assumptions": [
+            "RSI 70 이상 매수·30 미만 매도 조건을 그대로 적용"
+            if rsi_is_overbought
+            else "명확한 기술 조건이 없으면 RSI 평균회귀 후보를 기본 제안"
+        ],
         "confidence": 0.68,
     }
 
