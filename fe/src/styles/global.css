@@ -82,6 +82,7 @@ h6 { font-size: 0.67em; }
    overflow and push the page into a scroll it does not need. */
 .app-shell .async-state { min-height: calc(100dvh - 56px); }
 .async-state strong { display: block; color: var(--ink); }
+.async-state h1 { display: block; margin: 0; color: var(--ink); font-size: 18px; line-height: 1.4; }
 .async-state p { margin-top: 4px; font-size: 13px; }
 .async-state__action { display: inline-block; margin-top: 16px; }
 .async-state__dot { width: 10px; height: 10px; border-radius: 999px; background: var(--blue); }
