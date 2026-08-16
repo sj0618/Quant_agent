@@ -260,6 +260,10 @@ def test_unsubscribe_token_round_trip_invalid_and_expired():
     claims = email_unsubscribe.verify_unsubscribe_token(settings, token, now=issued_at + timedelta(minutes=1))
     assert claims.user_id == "7"
 
+    with pytest.raises(AppError) as not_active:
+        email_unsubscribe.verify_unsubscribe_token(settings, token, now=issued_at - timedelta(minutes=1))
+    assert not_active.value.code == "unsubscribe_token_invalid"
+
     with pytest.raises(AppError) as invalid:
         email_unsubscribe.verify_unsubscribe_token(settings, token + "x", now=issued_at + timedelta(minutes=1))
     assert invalid.value.code == "unsubscribe_token_invalid"

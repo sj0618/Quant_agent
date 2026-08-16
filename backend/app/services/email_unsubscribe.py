@@ -200,6 +200,8 @@ def verify_unsubscribe_token(
     issued_at = _parse_timestamp(payload.get("issued_at"), field_name="issued_at")
     expires_at = _parse_timestamp(payload.get("expires_at"), field_name="expires_at")
     current_time = now or datetime.now(UTC)
+    if issued_at.astimezone(UTC) > current_time.astimezone(UTC):
+        raise _invalid_token_error(UNSUBSCRIBE_TOKEN_INVALID_CODE, "Unsubscribe token is not active yet")
     if expires_at <= current_time.astimezone(UTC):
         raise _invalid_token_error(UNSUBSCRIBE_TOKEN_EXPIRED_CODE, "Unsubscribe token has expired", status_code=410)
 
