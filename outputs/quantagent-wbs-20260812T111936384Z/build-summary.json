@@ -1,0 +1,12 @@
+{
+  "outputPath": "/Users/6kiity/Documents/quant-dev/outputs/quantagent-wbs-20260812T111936384Z/QuantAgent_WBS.xlsx",
+  "sheets": [
+    "WBS",
+    "Milestones",
+    "Risks",
+    "README"
+  ],
+  "taskRows": 17,
+  "milestoneRows": 7,
+  "riskRows": 6
+}

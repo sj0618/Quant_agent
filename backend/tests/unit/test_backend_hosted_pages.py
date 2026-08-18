@@ -59,18 +59,34 @@ def test_app_page_requires_valid_session_then_serves_shell(frontend_dist: Path, 
     assert response.text == "<!doctype html><html><body>FE SPA</body></html>"
 
 
-def test_frontend_routes_use_spa_fallback(frontend_dist: Path, monkeypatch: pytest.MonkeyPatch):
+def test_known_frontend_routes_use_spa_fallback(frontend_dist: Path, monkeypatch: pytest.MonkeyPatch):
     client, _app = make_client(frontend_dist, monkeypatch)
     search = client.get("/search")
+    report_detail = client.get("/reports/report-123")
     root = client.get("/")
     asset = client.get("/assets/app.js")
 
     assert search.status_code == 200
+    assert report_detail.status_code == 200
     assert root.status_code == 200
     assert asset.status_code == 200
     assert search.text == "<!doctype html><html><body>FE SPA</body></html>"
+    assert report_detail.text == "<!doctype html><html><body>FE SPA</body></html>"
     assert root.text == "<!doctype html><html><body>FE SPA</body></html>"
     assert asset.text == "console.log('FE SPA asset');"
+
+
+def test_unknown_frontend_routes_keep_the_not_found_shell_but_return_http_404(
+    frontend_dist: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client, _app = make_client(frontend_dist, monkeypatch)
+
+    response = client.get("/dev/email-template")
+
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.text == "<!doctype html><html><body>FE SPA</body></html>"
 
 
 def test_static_auth_js_uses_same_origin_auth_urls_and_no_browser_storage():

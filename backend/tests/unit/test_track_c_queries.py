@@ -221,6 +221,41 @@ async def test_track_c_get_report_parses_persisted_projection_and_scopes_to_owne
             ],
             "performance_jsonb": {},
             "cost_notes": ["거래비용 반영: 수수료 0.015%, 거래세 0.23%, 슬리피지 0.1%."],
+            "content_html": {
+                "sections": [
+                    {
+                        "id": "reproduction_contract",
+                        "title": "untrusted title",
+                        "items": {
+                            "contract_version": "quantagent-backtest-replay.v1",
+                            "input_hash": "a" * 64,
+                            "output_hash": "b" * 64,
+                            "price_rows": [{"must": "not be exposed"}],
+                        },
+                    },
+                    {
+                        "id": "metric_registry",
+                        "items": {
+                            "formula_version": "quant-metric-registry.v2",
+                            "metrics": [
+                                {
+                                    "label": "Sharpe Ratio",
+                                    "formula": "(R_p - R_f) / sigma_p",
+                                    "inputs": ["period_return", "risk_free_rate"],
+                                    "input_window": "daily returns",
+                                    "as_of_policy": "latest common date",
+                                    "null_policy": "unavailable when input is missing",
+                                    "implementation_ref": "metric_registry.v2",
+                                    "implementation_hash": "c" * 64,
+                                    "implementation_source": "must not be exposed",
+                                    "implementation_path": "/secret/path",
+                                }
+                            ],
+                        },
+                    },
+                    {"id": "risk", "items": {"reasoning": "must not be exposed"}},
+                ]
+            },
             "run_id": "run-1",
             "run_strategy_id": "strategy-1",
             "run_config_jsonb": {"strategyName": "Track C Strategy", "ticker": "005930"},
@@ -294,6 +329,30 @@ async def test_track_c_get_report_parses_persisted_projection_and_scopes_to_owne
     assert result["costNotes"] == ["거래비용 반영: 수수료 0.015%, 거래세 0.23%, 슬리피지 0.1%."]
     assert {metric["key"] for metric in result["performance"]["metrics"]} == {"sharpe", "mdd", "winRate", "totalReturn"}
     assert result["performance"]["disclaimer"] == ""
+    assert result["contentSections"] == [
+        {
+            "id": "reproduction_contract",
+            "title": "검증 재현 계약",
+            "entries": [
+                {"label": "재현 계약 버전", "value": "quantagent-backtest-replay.v1", "depth": 1},
+                {"label": "입력 해시", "value": "a" * 64, "depth": 1},
+                {"label": "출력 해시", "value": "b" * 64, "depth": 1},
+            ],
+        },
+        {
+            "id": "metric_registry",
+            "title": "퀀트 지표 산출 계약",
+            "entries": [
+                {
+                    "label": "Sharpe Ratio",
+                    "value": "(R_p - R_f) / sigma_p",
+                    "depth": 1,
+                    "description": "입력: period_return, risk_free_rate · 관찰 구간: daily returns · 기준 시점: latest common date · 결측 처리: unavailable when input is missing · 구현 기준: metric_registry.v2 · 구현 해시: " + "c" * 64,
+                }
+            ],
+            "note": "수식 레지스트리 버전: quant-metric-registry.v2",
+        },
+    ]
 
 
 @pytest.mark.asyncio

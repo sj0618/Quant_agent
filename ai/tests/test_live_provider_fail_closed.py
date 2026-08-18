@@ -118,6 +118,55 @@ def test_aoai_role_call_failure_is_not_replaced_with_fallback(monkeypatch) -> No
         )
 
 
+@pytest.mark.parametrize(
+    "live_call",
+    [
+        lambda: role_calls.generate_relaxed_screening_thresholds(
+            query="005930 RSI",
+            profile="balanced",
+            current={},
+            fallback={"rsi_min": 30},
+            round_index=0,
+            universe_rows=100,
+        ),
+        lambda: role_calls.review_strategy_spec(query="005930 RSI", strategy={}, screening={}),
+        lambda: role_calls.research_screening_terms(query="005930 RSI"),
+        lambda: role_calls.resolve_strategy_intent(query="005930 RSI", capabilities=[]),
+        lambda: role_calls.generate_screening_sql(
+            query="005930 RSI",
+            schema_context="",
+            schema_notes="",
+            output_contract="",
+        ),
+        lambda: role_calls.revise_strategy_conditions(
+            query="005930 RSI",
+            strategy={},
+            judge={},
+            fallback=role_calls.StrategyConditionsPayload(),
+        ),
+        lambda: role_calls.generate_report_writeup(
+            context={},
+            fallback=RoleDebatePayload(role="REPORT_WRITER", summary="fallback"),
+        ),
+    ],
+    ids=(
+        "screening-relaxation",
+        "strategy-review",
+        "screening-research",
+        "strategy-intent",
+        "screening-sql",
+        "strategy-revision",
+        "report-writeup",
+    ),
+)
+def test_aoai_auxiliary_role_failure_is_not_replaced_with_fallback(monkeypatch, live_call) -> None:
+    monkeypatch.setenv("AI_LLM_PROVIDER", "aoai")
+    monkeypatch.setattr(role_calls, "create_llm_client", lambda *, role: FailingLLMClient())
+
+    with pytest.raises(LLMClientError, match="provider unavailable"):
+        live_call()
+
+
 def test_aoai_role_call_requires_the_complete_output_contract(monkeypatch) -> None:
     monkeypatch.setenv("AI_LLM_PROVIDER", "aoai")
     monkeypatch.setattr(role_calls, "create_llm_client", lambda *, role: IncompleteRoleLLMClient())
@@ -304,6 +353,31 @@ def test_analysis_api_returns_failed_job_when_configured_database_is_down(monkey
 
     assert response.status_code == 201
     # POST queues the analysis; the failed envelope surfaces through polling.
+    polled = client.get(f"/analysis-jobs/{response.json()['job_id']}")
+    assert polled.status_code == 200
+    payload = polled.json()
+    assert payload["result"]["status"] == "failed"
+    assert payload["result"]["failure_cause"] is not None
+    assert payload["result"]["user_payload"]["performance"] is None
+    assert payload["result"]["user_payload"]["report"] is None
+
+
+def test_analysis_api_returns_failed_job_when_live_provider_is_down(monkeypatch) -> None:
+    """A live-provider outage must fail the job instead of publishing fallback output."""
+    monkeypatch.setenv("AUTH_ENABLED", "0")
+    monkeypatch.setenv("AI_LLM_PROVIDER", "aoai")
+    monkeypatch.delenv("AI_DATABASE_DSN", raising=False)
+    monkeypatch.delenv("QUANT_DB_DSN", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(role_calls, "create_llm_client", lambda *, role: FailingLLMClient())
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    response = client.post(
+        "/analysis-jobs",
+        json={"query": "005930 RSI가 30 이하이면 매수하고 70 이상이면 매도"},
+    )
+
+    assert response.status_code == 201
     polled = client.get(f"/analysis-jobs/{response.json()['job_id']}")
     assert polled.status_code == 200
     payload = polled.json()

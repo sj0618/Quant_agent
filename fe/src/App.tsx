@@ -1,5 +1,4 @@
-import { Suspense, lazy, useEffect, useState } from "react";
-import { AsyncState } from "./components/common/AsyncState";
+import { useEffect, useState } from "react";
 import { AppPage } from "./pages/AppPage";
 import { AuthCallbackPage } from "./pages/AuthCallbackPage";
 import { AuthRequiredPage } from "./pages/AuthRequiredPage";
@@ -14,12 +13,6 @@ import { UnsubscribePage } from "./pages/UnsubscribePage";
 import { getCurrentSession, isSessionRecentlyValidated, validateCurrentSession } from "./api/authClient";
 import { ROUTES, getCurrentPathWithSearch, parseReportDetailId, sanitizeReturnTo } from "./config/routes";
 import type { AuthSession } from "./types/auth";
-
-// 이 페이지만 react-dom/server 를 끌어오기 때문에(발송용 HTML 문자열 렌더) 별도 chunk 로 떼어낸다.
-// 정적 import 로 두면 실사용자 메인 번들이 190kB 커진다.
-const EmailTemplatePreviewPage = lazy(() =>
-  import("./pages/EmailTemplatePreviewPage").then((module) => ({ default: module.EmailTemplatePreviewPage })),
-);
 
 function normalizePath(pathname: string) {
   return pathname.replace(/\/+$/, "") || "/";
@@ -100,14 +93,6 @@ function AppRoutes() {
     return <UnsubscribePage />;
   }
 
-  if (path === ROUTES.emailTemplatePreview) {
-    return (
-      <Suspense fallback={<AsyncState title="이메일 템플릿을 불러오는 중입니다" tone="loading" />}>
-        <EmailTemplatePreviewPage />
-      </Suspense>
-    );
-  }
-
   if (protectedRoute && !session) {
     return <AuthRequiredPage returnTo={getCurrentPathWithSearch()} />;
   }
@@ -140,7 +125,7 @@ function AppRoutes() {
   return (
     <main className="not-found">
       <h1>페이지를 찾을 수 없습니다</h1>
-      <p>Figma HI-FI 구현 대상 route가 아닙니다.</p>
+      <p>주소를 다시 확인하거나 홈에서 이용 가능한 기능을 선택해 주세요.</p>
       <a href={ROUTES.home}>홈으로 가기</a>
     </main>
   );
