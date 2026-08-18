@@ -1,7 +1,12 @@
 import json
+import os
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import pytest
+
+if TYPE_CHECKING:
+    from offline_test_environment import OfflineTestEnvironment
 
 from ai_graph.audit import RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
@@ -14,6 +19,30 @@ from ai_graph.graph import (
 )
 from ai_graph.jobs import InMemoryAnalysisJobStore
 from ai_graph.schemas import AmbiguityCode, EnvelopeStatus
+
+pytest_plugins = ("offline_test_environment",)
+pytestmark = pytest.mark.usefixtures("offline_test_environment")
+
+
+def test_offline_environment_rebinds_imported_consumers_and_tripwires_boundaries(
+    offline_test_environment: "OfflineTestEnvironment",
+) -> None:
+    isolated = offline_test_environment
+
+    assert os.environ["AI_LLM_PROVIDER"] == "mock"
+    assert os.environ["AI_AUDIT_SINK"] == "noop"
+    assert all(name not in os.environ for name in isolated.database_env_names)
+    assert all(name not in os.environ for name in isolated.provider_credential_names)
+    assert isolated.graph_module.load_pipeline_data_from_env is isolated.offline_loader
+    assert (
+        isolated.api_module.create_app.__kwdefaults__["analysis_runner"]
+        is isolated.graph_module.run_analysis
+    )
+
+    with pytest.raises(AssertionError, match="database boundary reached"):
+        isolated.data_source_module.PostgresPipelineDataSource.load(object(), "query", "trace")
+    with pytest.raises(AssertionError, match="provider boundary reached"):
+        isolated.aoai_module.AOAIResponsesClient.generate_json(object(), object())
 
 
 def test_rsi_strategy_runs_ready_e2e_without_external_keys() -> None:
@@ -35,6 +64,7 @@ def test_rsi_strategy_runs_ready_e2e_without_external_keys() -> None:
     internal = DEBUG_STORE.get(envelope.debug_ref)
     assert internal is not None
     assert internal.validation["node_sequence"] == list(NODE_SEQUENCE)
+    assert internal.validation["pipeline_data_source"]["source"] == "fixture"
     assert set(internal.model_dump()) == {
         "trace_id",
         "node_outputs",
@@ -317,7 +347,7 @@ def test_work_agent_failure_stops_downstream_and_keeps_one_correlated_error(monk
 def test_analysis_job_polling_contract_runs_sync() -> None:
     store = InMemoryAnalysisJobStore()
     job = store.create("RSI가 30 이하인 KOSPI200")
-    assert [stage.status for stage in job.stages][0] == "queued"
+    assert next(stage.status for stage in job.stages) == "queued"
 
     completed = store.run_sync(job.job_id, lambda query, trace_id: run_analysis(query, trace_id))
 
