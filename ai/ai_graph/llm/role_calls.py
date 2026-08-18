@@ -457,9 +457,8 @@ def generate_relaxed_screening_thresholds(
 
     Returns a plain mapping rather than the caller's model so ai_graph.data_sources
     stays importable without the LLM stack; the caller re-validates and clamps it.
-    Unlike the other role calls this never raises on a live provider - screening has
-    a deterministic ladder to fall back on, and failing the whole analysis because a
-    relaxation hint was unavailable would be worse than widening the screen blindly.
+    In a live-provider run, an unavailable provider stops the analysis instead of
+    silently widening the screen with deterministic thresholds.
     """
 
     expected_json_schema = _LiveScreeningThresholds.model_json_schema()
@@ -486,6 +485,8 @@ def generate_relaxed_screening_thresholds(
         payload = create_llm_client(role="SCREENING_RELAXATION").generate_json(request)
         parsed = _LiveScreeningThresholds.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return dict(fallback)
     return parsed.model_dump(exclude={"rationale"})
 
@@ -572,6 +573,8 @@ def review_strategy_spec(
             payload = create_llm_client(role="STRATEGY_REVIEW").generate_json(request)
         parsed = _LiveStrategyReview.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
     with activity_role("RESEARCH_JUDGE"):
         report_activity(
@@ -653,6 +656,8 @@ def research_screening_terms(*, query: str) -> dict[str, Any] | None:
         payload = create_llm_client(role="SCREENING_RESEARCH").generate_json(request)
         return _LiveScreeningResearch.model_validate(payload).model_dump()
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
 
 
@@ -759,6 +764,8 @@ def resolve_strategy_intent(
         payload = create_llm_client(role="STRATEGY_INTENT").generate_json(request)
         resolved = _LiveStrategyIntent.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
     if resolved.scope == "supported" and not resolved.resolved_query.strip():
         # An empty resolution would silently hand the raw vague query back to the
@@ -883,6 +890,8 @@ def generate_screening_sql(
         payload = create_llm_client(role="SCREENING_SQL").generate_json(request)
         parsed = _LiveScreeningSQL.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
     result = parsed.model_dump()
     # Validate the structured conditions against the real Condition (dropping the AOAI
@@ -969,6 +978,8 @@ def revise_strategy_conditions(
         payload = create_llm_client(role="STRATEGY_REVISION").generate_json(request)
         parsed = _LiveStrategyRevision.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
     if not parsed.changed or not parsed.entry_conditions:
         return None
@@ -1052,10 +1063,8 @@ def generate_report_writeup(
             )
         return written
     except (LLMClientError, ValidationError, ValueError, TypeError) as exc:
-        # Unlike the debates, this never re-raises on a live provider. By the time the
-        # report is written the screen, backtest and risk decision are all done; losing
-        # the entire analysis because the write-up failed its schema check throws away
-        # everything that did work. The fallback still carries the real decision.
+        if is_live_llm_provider():
+            raise
         _logger.warning("report write-up failed; using deterministic fallback: %s", exc)
         reasons = [*fallback.fallback_reasons, f"{type(exc).__name__}: {exc}"]
         return fallback.model_copy(update={"fallback_reasons": reasons})

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
 
@@ -66,11 +66,12 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   assert.doesNotMatch(authSource, /AUTH_ENDPOINTS\.testLogin/);
 });
 
-test("public navigation contains no development preview, fake sample report link, or internal 404 copy", async () => {
-  const [appSource, routesSource, landingSource] = await Promise.all([
+test("public navigation and bundle sources contain no development preview, fake sample report link, or internal 404 copy", async () => {
+  const [appSource, routesSource, landingSource, globalStyles] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/config/routes.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/pages/LandingPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/styles/global.css", import.meta.url), "utf8"),
   ]);
 
   assert.doesNotMatch(appSource, /EmailTemplatePreviewPage|Figma HI-FI/);
@@ -79,6 +80,8 @@ test("public navigation contains no development preview, fake sample report link
   assert.match(landingSource, /새 전략 입력·분석 실행·투자 추천은 제공하지 않습니다/);
   assert.doesNotMatch(await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"), /landing\.mock|getLandingSample|LandingSample/);
   assert.doesNotMatch(landingSource, /RELEASE VALIDATION|VALIDATION PRINCIPLES|READ-ONLY ARCHIVE|CURRENT SCOPE/);
+  assert.doesNotMatch(globalStyles, /email-template/);
+  await assert.rejects(access(new URL("../src/pages/EmailTemplatePreviewPage.tsx", import.meta.url)));
 });
 
 test("Google callback reuses its one-time exchange under React StrictMode", async () => {
