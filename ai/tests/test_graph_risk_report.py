@@ -238,6 +238,9 @@ def test_public_performance_reliability_marks_fixture_4row_single_ticker_as_insu
     assert performance.reliability.ticker_count == 1
     assert performance.reliability.trading_days == 4
     assert any("fixture" in reason for reason in performance.reliability.reasons)
+    assert performance.is_available is False
+    assert performance.metrics is None
+    assert performance.equity_curve == []
     assert performance.benchmark is not None
     assert performance.benchmark.is_available is False
     assert performance.benchmark.total_return is None

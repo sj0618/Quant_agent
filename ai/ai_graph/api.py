@@ -52,6 +52,7 @@ from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
 from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.llm.role_calls import generate_strategy_description
 from ai_graph.nodes.daily_digest import MAX_DIGEST_STRATEGIES, build_daily_digest
+from ai_graph.quant_performance import sanitize_public_backtest_performance
 from ai_graph.schemas import SCHEMA_VERSION
 from ai_graph.schemas import APIEnvelope, DailyDigestReport, DailyDigestStrategyInput, EnvelopeStatus, UserPayload
 
@@ -549,7 +550,10 @@ def create_app(
         user_id: str = Depends(require_user),
     ) -> list[AnalysisJob]:
         owned_jobs = (job for job in store.list_jobs(limit=100) if job.user_id == user_id)
-        return sorted(owned_jobs, key=lambda job: job.updated_at, reverse=True)[:limit]
+        return [
+            _public_job(job)
+            for job in sorted(owned_jobs, key=lambda job: job.updated_at, reverse=True)[:limit]
+        ]
 
     @app.post(
         SPEC_STRATEGY_PARSE_PATH,
@@ -567,7 +571,7 @@ def create_app(
             strategy_id=request.strategy_id,
             run_id=request.client_request_id,
         )
-        return run_job_sync(
+        return _public_job(run_job_sync(
             store,
             job.job_id,
             _build_analysis_runner_with_audit(
@@ -580,7 +584,7 @@ def create_app(
                 client_request_id=request.client_request_id,
                 user_id=user_id,
             ),
-        )
+        ))
 
     @app.post(
         STRATEGY_DESCRIPTIONS_PATH,
@@ -656,7 +660,7 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="analysis job not found",
             )
-        return job
+        return _public_job(job)
 
     @app.get(
         SPEC_ANALYSIS_JOB_DETAIL_PATH,
@@ -673,8 +677,9 @@ def create_app(
     )
     def get_backtest(strategy_id: str, user_id: str = Depends(require_user)) -> APIEnvelope:
         job = _find_job_by_strategy(store, strategy_id, user_id)
-        if job and job.result and job.result.user_payload.performance is not None:
-            return job.result
+        result = _public_envelope(job.result) if job and job.result else None
+        if result and result.user_payload.performance is not None:
+            return result
         return _not_found_envelope(
             resource_type="backtest",
             resource_id=strategy_id,
@@ -692,11 +697,12 @@ def create_app(
             or _find_job_by_report_id(store, report_id, user_id)
             or _find_job_by_trace_or_debug_ref(store, report_id, user_id)
         )
-        if job and job.result and job.result.user_payload.report is not None:
-            return job.result
+        result = _public_envelope(job.result) if job and job.result else None
+        if result and result.user_payload.report is not None:
+            return result
         resolver = app.state.report_resolver
         if resolver is not None:
-            resolved = resolver(report_id)
+            resolved = _public_envelope(resolver(report_id))
             if resolved is not None and resolved.user_payload.report is not None:
                 return resolved
         return _not_found_envelope(
@@ -885,6 +891,30 @@ def _job_store_status(runtime: JobStoreRuntime) -> JobStoreStatus:
 def _owned_job(store: AnalysisJobStore, job_id: str, user_id: str) -> AnalysisJob | None:
     job = store.get_job(job_id)
     return job if job is not None and job.user_id == user_id else None
+
+
+def _public_envelope(envelope: APIEnvelope | None) -> APIEnvelope | None:
+    """Apply the public performance contract to an already stored envelope."""
+
+    if envelope is None:
+        return None
+    performance = envelope.user_payload.performance
+    public_performance = sanitize_public_backtest_performance(performance)
+    if public_performance is performance:
+        return envelope
+    payload = envelope.user_payload.model_copy(
+        update={"performance": public_performance}
+    )
+    return envelope.model_copy(update={"user_payload": payload})
+
+
+def _public_job(job: AnalysisJob) -> AnalysisJob:
+    """Return a response-safe copy without mutating the stored execution result."""
+
+    result = _public_envelope(job.result)
+    if result is job.result:
+        return job
+    return job.model_copy(update={"result": result})
 
 
 def _find_job_by_strategy(store: AnalysisJobStore, strategy_id: str, user_id: str) -> AnalysisJob | None:

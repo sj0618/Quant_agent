@@ -43,7 +43,7 @@ def main() -> int:
         ),
         "metrics": (
             performance.metrics.model_dump(mode="json")
-            if performance is not None
+            if performance is not None and performance.metrics is not None
             else None
         ),
         "trade_count": (

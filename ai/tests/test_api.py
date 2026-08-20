@@ -19,7 +19,19 @@ from ai_graph.api import (
 from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import InMemoryAnalysisJobStore, JobStoreConfigurationError
-from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
+from ai_graph.schemas import (
+    APIEnvelope,
+    BacktestBenchmark,
+    BacktestEquityPoint,
+    BacktestMetrics,
+    BacktestPerformance,
+    BacktestReliability,
+    Condition,
+    EnvelopeStatus,
+    PublicMetricDetail,
+    StrategySpec,
+    UserPayload,
+)
 
 DATA_SOURCE_ENV_KEYS = (
     "AI_DATABASE_DSN",
@@ -206,8 +218,10 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert performance["selected_candidate_id"]
     assert "metrics_by_variant" not in performance
     assert "selected_variant" not in performance
-    assert performance["metrics"]["total_return"] > 0
-    assert performance["equity_curve"][-1]["cumulative_return"] > 0
+    assert performance["is_available"] is False
+    assert performance["metrics"] is None
+    assert performance["equity_curve"] == []
+    assert all(detail["is_available"] is False for detail in performance["metric_details"])
 
 
 def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> None:
@@ -313,8 +327,10 @@ def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monk
     assert performance["selected_candidate_id"]
     assert "metrics_by_variant" not in performance
     assert "selected_variant" not in performance
-    assert performance["metrics"]["total_return"] > 0
-    assert performance["equity_curve"][-1]["cumulative_return"] > 0
+    assert performance["is_available"] is False
+    assert performance["metrics"] is None
+    assert performance["equity_curve"] == []
+    assert all(detail["is_available"] is False for detail in performance["metric_details"])
 
     poll_response = client.get(f"{ANALYSIS_JOBS_PATH}/{created_job['job_id']}")
     assert poll_response.status_code == 200
@@ -394,6 +410,101 @@ def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adap
     assert len(session.model_calls) == len(session.prompt_logs)
     assert "strategy_conditions" in {call.task_type for call in session.model_calls}
     assert all(call.execution_id is not None for call in session.model_calls)
+
+
+def test_backtest_api_redacts_legacy_insufficient_performance_before_serialization() -> None:
+    strategy = StrategySpec(
+        strategy_id="legacy-warmup",
+        name="legacy warm-up fixture",
+        market="KRX",
+        timeframe="daily",
+        entry_conditions=[Condition(left="rsi", operator="lte", right=30)],
+        confidence=0.8,
+    )
+    detail = PublicMetricDetail(
+        key="total_return",
+        label="Total return",
+        value=0.12,
+        unit="percent",
+        is_available=True,
+        plain_explanation="fixture metric",
+        why_used="fixture check",
+        caution="not for trading",
+    )
+    performance = BacktestPerformance(
+        selected_candidate_id="fixture-candidate",
+        metrics=BacktestMetrics(
+            sharpe_ratio=0.3,
+            max_drawdown=-0.1,
+            win_rate=0.5,
+            total_return=0.12,
+            in_sample_sharpe=0.3,
+            out_sample_sharpe=None,
+            degradation=0.0,
+        ),
+        equity_curve=[BacktestEquityPoint(date="2026-01-01", cumulative_return=0.12)],
+        engine_summary={
+            "effective_trade_count": 7,
+            "total_return": 0.12,
+            "sharpe_ratio": 0.3,
+        },
+        reliability=BacktestReliability(
+            source="fixture",
+            status="insufficient",
+            row_count=4,
+            ticker_count=1,
+            trading_days=4,
+            trade_count=7,
+            reasons=["warm-up history is insufficient"],
+        ),
+        benchmark=BacktestBenchmark(
+            label="fixture benchmark",
+            method="fixture",
+            total_return=0.04,
+            cumulative_curve=[
+                BacktestEquityPoint(date="2026-01-01", cumulative_return=0.04)
+            ],
+            is_available=True,
+        ),
+        metric_details=[detail],
+    )
+    envelope = APIEnvelope(
+        status=EnvelopeStatus.READY,
+        trace_id="legacy-warmup-trace",
+        user_payload=UserPayload(
+            headline="ready",
+            message="analysis completed",
+            next_actions=[],
+            performance=performance,
+        ),
+        strategy_spec=strategy,
+        debug_ref="debug:legacy-warmup",
+        retryable=False,
+    )
+    client = TestClient(
+        create_app(
+            InMemoryAnalysisJobStore(),
+            analysis_runner=lambda _query, _trace_id: envelope,
+        )
+    )
+
+    response = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": "legacy warm-up", "strategy_id": "legacy-warmup"},
+    )
+    assert response.status_code == 201
+
+    backtest_response = client.get("/api/backtests/legacy-warmup")
+    assert backtest_response.status_code == 200
+    public_performance = backtest_response.json()["user_payload"]["performance"]
+    assert public_performance["is_available"] is False
+    assert public_performance["metrics"] is None
+    assert public_performance["equity_curve"] == []
+    assert public_performance["engine_summary"] == {"effective_trade_count": 7}
+    assert public_performance["benchmark"]["is_available"] is False
+    assert public_performance["benchmark"]["total_return"] is None
+    assert public_performance["benchmark"]["cumulative_curve"] == []
+    assert all(detail["is_available"] is False for detail in public_performance["metric_details"])
 
 
 def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:

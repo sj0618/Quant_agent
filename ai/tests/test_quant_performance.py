@@ -350,6 +350,11 @@ def test_public_performance_reliability_boundary_cases() -> None:
     assert fixture is not None
     assert fixture.reliability is not None
     assert fixture.reliability.status == "insufficient"
+    assert fixture.is_available is False
+    assert fixture.unavailable_reason
+    assert fixture.metrics is None
+    assert fixture.equity_curve == []
+    assert all(item.is_available is False for item in fixture.metric_details)
 
     no_rows = build_public_backtest_performance(
         _build_payload(
@@ -370,6 +375,9 @@ def test_public_performance_reliability_boundary_cases() -> None:
     assert no_rows is not None
     assert no_rows.reliability is not None
     assert no_rows.reliability.status == "insufficient"
+    assert no_rows.is_available is False
+    assert no_rows.metrics is None
+    assert no_rows.equity_curve == []
     assert all(item.is_available is False for item in no_rows.metric_details)
 
     short = build_public_backtest_performance(

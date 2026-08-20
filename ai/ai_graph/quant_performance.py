@@ -52,6 +52,7 @@ _RELIABILITY_MIN_DAYS = 252
 
 _UNAVAILABLE_METRIC_REASON = "신뢰도 부족으로 공개 지표를 계산할 수 없습니다."
 _BENCHMARK_UNAVAILABLE_REASON = "신뢰도 부족으로 벤치마크를 표시하지 않습니다."
+_UNAVAILABLE_ENGINE_SUMMARY_KEYS = frozenset({"effective_trade_count"})
 
 
 def build_public_backtest_performance(
@@ -79,15 +80,28 @@ def build_public_backtest_performance(
     benchmark = _build_public_benchmark(result, reliability=reliability)
     selected_parameters = result.selected_candidate.parameters
     public_metrics = _public_metrics(metrics, result.engine_summary)
-    return BacktestPerformance(
+    unavailable = reliability.status == "insufficient"
+    performance = BacktestPerformance(
         selected_candidate_id=(
             "walk-forward-selection-policy"
             if walk_forward is not None and walk_forward.status == "ready"
             else result.selected_candidate.candidate_id
         ),
-        metrics=public_metrics,
-        equity_curve=(walk_forward.equity_curve if walk_forward is not None and walk_forward.status == "ready" else result.equity_curve),
-        engine_summary=_public_engine_summary(result.engine_summary),
+        metrics=None if unavailable else public_metrics,
+        equity_curve=(
+            []
+            if unavailable
+            else (
+                walk_forward.equity_curve
+                if walk_forward is not None and walk_forward.status == "ready"
+                else result.equity_curve
+            )
+        ),
+        engine_summary=(
+            _unavailable_engine_summary(result.engine_summary)
+            if unavailable
+            else _public_engine_summary(result.engine_summary)
+        ),
         reliability=reliability,
         data_quality=_build_data_quality(reliability),
         benchmark=benchmark,
@@ -104,7 +118,71 @@ def build_public_backtest_performance(
             selected_parameters=selected_parameters,
             generated_strategies=result.generated_strategy_blueprints,
         ),
+        is_available=not unavailable,
+        unavailable_reason=_UNAVAILABLE_METRIC_REASON if unavailable else None,
     )
+    return sanitize_public_backtest_performance(performance)
+
+
+def sanitize_public_backtest_performance(
+    performance: BacktestPerformance | None,
+) -> BacktestPerformance | None:
+    """Fail closed for stored results that predate the unavailable projection.
+
+    New results are projected safely above, but persisted envelopes and QA fixtures can
+    still contain an older performance object with positive metrics.  Keeping this
+    helper idempotent lets every API response boundary enforce the same contract.
+    """
+
+    if performance is None:
+        return None
+    reliability = performance.reliability
+    if reliability is None or reliability.status != "insufficient":
+        return performance
+
+    reason = performance.unavailable_reason or _UNAVAILABLE_METRIC_REASON
+    benchmark = performance.benchmark
+    if benchmark is not None:
+        benchmark = benchmark.model_copy(
+            update={
+                "total_return": None,
+                "cumulative_curve": [],
+                "is_available": False,
+                "unavailable_reason": benchmark.unavailable_reason
+                or _BENCHMARK_UNAVAILABLE_REASON,
+            }
+        )
+    metric_details = [
+        detail.model_copy(
+            update={
+                "value": None,
+                "is_available": False,
+                "unavailable_reason": detail.unavailable_reason or reason,
+            }
+        )
+        for detail in performance.metric_details
+    ]
+    return performance.model_copy(
+        update={
+            "metrics": None,
+            "equity_curve": [],
+            "engine_summary": _unavailable_engine_summary(performance.engine_summary),
+            "benchmark": benchmark,
+            "metric_details": metric_details,
+            "is_available": False,
+            "unavailable_reason": reason,
+        }
+    )
+
+
+def _unavailable_engine_summary(engine_summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only the count needed to explain reliability, never result scalars."""
+
+    return {
+        key: value
+        for key, value in engine_summary.items()
+        if key in _UNAVAILABLE_ENGINE_SUMMARY_KEYS
+    }
 
 
 def _pipeline_source(
