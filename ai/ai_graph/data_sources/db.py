@@ -301,8 +301,11 @@ class PostgresPipelineDataSource:
                 excluded_screening_candidate_count = sum(
                     1 for item in recommended if item not in pit_set
                 )
+                # Current candidates are context only. The traded ticker comes from
+                # the historical PIT universe, never from today's screen, so past
+                # performance can never be attributed to a current pick.
                 recommended = [item for item in recommended if item in pit_set]
-                ticker = recommended[0] if recommended else tickers[0]
+                ticker = tickers[0]
                 universe_descriptor["excluded_screening_candidate_count"] = (
                     excluded_screening_candidate_count
                 )

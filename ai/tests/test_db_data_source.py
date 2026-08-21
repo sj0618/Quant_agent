@@ -1057,6 +1057,90 @@ def test_backtest_universe_excludes_current_screening_candidates() -> None:
     assert excluded == 1
     assert kept == ["000660"]
 
+
+def test_load_never_trades_a_current_screening_candidate() -> None:
+    """End-to-end: the traded ticker comes from the PIT universe, not today's screen.
+
+    A current candidate that is not in the PIT universe must be excluded from the
+    recommendation, counted in the descriptor, and the traded ticker must fall back
+    to the historical universe's first member with recommendation_ticker=None.
+    """
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows or []
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def rollback(self):
+            return None
+
+        def execute(self, query, params=None):
+            if "session_start" in query and "session_count" in query:
+                return Result([{
+                    "session_start": date(2021, 7, 30),
+                    "session_end": date(2026, 7, 30),
+                    "session_count": 1_230,
+                }])
+            if "max(time) AS as_of_date" in query:
+                return Result([{"as_of_date": date(2026, 7, 30)}])
+            if "AS present" in query:
+                return Result([{"present": True}])
+            return Result([])
+
+    class CandidateOutsideUniverseSource(PostgresPipelineDataSource):
+        def _connect(self):
+            return Connection()
+
+        def _screen_with_relaxation(self, _conn, _query):
+            candidate = {
+                "ticker": "999999",
+                "relative_strength_20d": 0.5,
+                "matched_rules": ["test"],
+            }
+            return [candidate], {"relaxation_rounds": 0, "relaxed": False}
+
+        def _fetch_backtest_universe(self, _conn, _window):
+            return ["000660"], {
+                "selection": "lifecycle_pit_common_stock_window",
+                "source": "mart.common_stock_universe_asof",
+            }
+
+        def _fetch_symbol_info_map(self, _conn, tickers):
+            return {t: {"ticker": t, "included": True} for t in tickers}
+
+        def _fetch_price_rows(self, _conn, tickers, _info, _q, _w, _f=None):
+            return [{
+                "date": "2026-05-20", "ticker": tickers[0],
+                "open": 100, "high": 101, "low": 99, "close": 100,
+                "volume": 1_000,
+            }], 1_230
+
+        def _fetch_macro_status(self, _conn):
+            return {}
+
+    bundle = CandidateOutsideUniverseSource(
+        DataSourceConfig(database_dsn="postgresql://fake/fake")
+    ).load("RSI가 30 이하로 떨어진 KOSPI200", "trace-lookahead")
+
+    assert bundle.metadata["recommendation_ticker"] is None
+    assert bundle.metadata["recommended_tickers"] == []
+    assert bundle.metadata["ticker"] == "000660"
+    assert bundle.price_rows[0]["ticker"] == "000660"
+    assert bundle.metadata["backtest_universe"]["excluded_screening_candidate_count"] == 1
+
+
 def test_screening_frame_does_not_read_the_mart_view() -> None:
     """The one-date frame must not go through mart.kis_adjusted_feature_frame_asof.
 
