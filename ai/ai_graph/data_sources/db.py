@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.quant_strategy import rsi_trade_rules
+from ai_graph.source_manifest import build_source_manifest
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -333,6 +334,18 @@ class PostgresPipelineDataSource:
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
             # Capabilities were probed up front; nothing since then can change them.
 
+        source_manifest = build_source_manifest(
+            source="postgres",
+            as_of=backtest_window["end"],
+            freshness="unknown",
+            lineage_refs=[
+                KIS_ADJUSTED_OHLCV_TABLE,
+                PIT_UNIVERSE_VIEW,
+                SYMBOL_LISTING_HISTORY_TABLE,
+                *[INDICATOR_TABLES[family] for family in indicator_families],
+            ],
+            source_version=BACKTEST_WINDOW_POLICY_ID,
+        )
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
@@ -343,6 +356,7 @@ class PostgresPipelineDataSource:
             ),
             metadata={
                 "source": "postgres",
+                "source_manifest": source_manifest.model_dump(mode="json"),
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
@@ -1162,6 +1176,13 @@ def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
         data_availability=_data_availability_for_query(query, source="fixture"),
         metadata={
             "source": "fixture",
+            "source_manifest": build_source_manifest(
+                source="fixture",
+                as_of=datetime.now(UTC).date(),
+                freshness="unknown",
+                lineage_refs=[reason, query],
+                source_version="local-fixture",
+            ).model_dump(mode="json"),
             "reason": reason,
             "production_eligible": False,
             "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),

@@ -19,7 +19,11 @@ from ai_graph.audit import (
     report_audit_failure,
 )
 from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_sink
-from ai_graph.data_sources import load_pipeline_data_from_env, screening_data_families
+from ai_graph.data_sources import (
+    PipelineDataUnavailableError,
+    load_pipeline_data_from_env,
+    screening_data_families,
+)
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from pydantic import ValidationError
 
@@ -85,6 +89,7 @@ from ai_graph.schemas import (
     TickerAction,
     StrategySpec,
 )
+from ai_graph.source_manifest import is_release_profile, validate_release_metadata
 from ai_graph.state import QuantAgentState
 
 
@@ -623,6 +628,13 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         detail=f"조회할 데이터 항목 {len(data_requirements)}종을 확정했습니다.",
     )
     pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
+    if is_release_profile():
+        manifest_errors = validate_release_metadata(pipeline_data.metadata)
+        if manifest_errors:
+            raise PipelineDataUnavailableError(
+                "release_source_manifest_invalid",
+                "release source manifest is invalid: " + "; ".join(manifest_errors),
+            )
     source_usage = build_source_usage(
         query,
         data_requirements,
