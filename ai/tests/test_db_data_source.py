@@ -1015,6 +1015,48 @@ def test_backtest_universe_does_not_expand_with_current_recommendations() -> Non
     assert universe == ["000660"]
     assert descriptor["member_count"] == 1
 
+def test_current_screening_candidate_pool_is_capped() -> None:
+    """The current candidate pool is capped before it can reach the backtest pool."""
+    from ai_graph.data_sources.db import _backtest_ticker_pool
+
+    candidates = [
+        {"ticker": f"{i:06d}", "relative_strength_20d": i / 1000.0}
+        for i in range(50)
+    ]
+    pool = _backtest_ticker_pool(candidates, 20)
+    assert len(pool) == 20
+    assert pool[0] == "000049"
+
+def test_backtest_universe_excludes_current_screening_candidates() -> None:
+    """A current candidate outside the PIT universe must not become the traded ticker.
+
+    The screen runs today but the backtest window started five years ago, so a name
+    absent from historical membership must be excluded and counted as such.
+    """
+    class Connection:
+        def execute(self, _query: str, _params: object) -> FakeResult:
+            return FakeResult(rows=[{"symbol": "000660"}])
+
+    universe, descriptor = PostgresPipelineDataSource(
+        DataSourceConfig(database_dsn="postgresql://example")
+    )._fetch_backtest_universe(
+        Connection(),
+        {"start": date(2021, 8, 12), "end": date(2026, 8, 11), "session_count": 1_229},
+    )
+    assert universe == ["000660"]
+    assert descriptor["selection"] == "lifecycle_pit_common_stock_window"
+
+    from ai_graph.data_sources.db import _backtest_ticker_pool
+
+    recommended = _backtest_ticker_pool(
+        [{"ticker": "000660"}, {"ticker": "999999"}], 20
+    )
+    pit_set = set(universe)
+    excluded = sum(1 for item in recommended if item not in pit_set)
+    kept = [item for item in recommended if item in pit_set]
+    assert excluded == 1
+    assert kept == ["000660"]
+
 def test_screening_frame_does_not_read_the_mart_view() -> None:
     """The one-date frame must not go through mart.kis_adjusted_feature_frame_asof.
 
