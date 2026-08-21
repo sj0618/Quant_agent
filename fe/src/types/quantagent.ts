@@ -46,6 +46,14 @@ export interface AISourceUsage {
   evidence_refs: string[];
 }
 
+export interface AIFreshnessEvidence {
+  status: AIFreshnessStatus;
+  as_of?: string | null;
+  reason: string;
+  source: string;
+  no_recommendation: boolean;
+}
+
 export interface AIFailureDiagnostic {
   category: string;
   subcause: string;
@@ -97,6 +105,7 @@ export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec
   data_requirements?: AIDataRequirement[];
   source_usage?: AISourceUsage[];
   freshness_status?: AIFreshnessStatus | null;
+  freshness_evidence?: AIFreshnessEvidence | null;
   proxy_disclosure?: Record<string, string> | null;
   failure_cause?: AIFailureDiagnostic | null;
   evidence_refs?: AIEvidenceRef[];

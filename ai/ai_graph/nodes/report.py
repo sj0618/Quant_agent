@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ai_graph.freshness import build_freshness_evidence
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_report_writeup
 from ai_graph.nodes.backtest import summarize_backtest
 from ai_graph.schemas import ReportBundle, ReportProjection, RiskDecision, StrategySpec
@@ -32,6 +33,7 @@ def build_report_bundle(
     if citations:
         sections.append({"id": "citations", "title": "출처", "items": citations})
     if data:
+        freshness_evidence = build_freshness_evidence(data.get("pipeline_data_source"))
         sections.insert(
             3,
             {
@@ -46,6 +48,14 @@ def build_report_bundle(
                 "id": "data_availability",
                 "title": "데이터 가용성",
                 "items": data.get("data_availability", {}),
+            },
+        )
+        sections.insert(
+            5,
+            {
+                "id": "freshness",
+                "title": "데이터 freshness",
+                "items": freshness_evidence.model_dump(mode="json"),
             },
         )
     if backtest:
@@ -64,14 +74,25 @@ def build_report_bundle(
         summary=f"{signal.action} / confidence {signal.confidence:.2f}. {risk_text}",
         sections=sections,
     )
+    email_sections: list[dict[str, Any]] = [
+        {"id": "summary", "title": "요약", "items": {"confidence": signal.confidence}},
+        {"id": "assumptions", "title": "검증 가정", "items": strategy.assumptions},
+        {"id": "risk", "title": "리스크 변경", "items": [item.model_dump() for item in risk.adjustments]},
+    ]
+    if data:
+        email_sections.append(
+            {
+                "id": "freshness",
+                "title": "데이터 freshness",
+                "items": build_freshness_evidence(
+                    data.get("pipeline_data_source")
+                ).model_dump(mode="json"),
+            }
+        )
     email = ReportProjection(
         title=f"[QuantAgent] {strategy.name}: {signal.action}",
         summary=f"{strategy.timeframe} 전략 신호는 {signal.action}입니다.",
-        sections=[
-            {"id": "summary", "title": "요약", "items": {"confidence": signal.confidence}},
-            {"id": "assumptions", "title": "검증 가정", "items": strategy.assumptions},
-            {"id": "risk", "title": "리스크 변경", "items": [item.model_dump() for item in risk.adjustments]},
-        ],
+        sections=email_sections,
     )
     return ReportBundle(
         web_projection=web,

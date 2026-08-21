@@ -18,6 +18,7 @@ class QuantAgentState(TypedDict, total=False):
     data_requirements: list[dict[str, Any]]
     source_usage: list[dict[str, Any]]
     freshness_status: str
+    freshness_evidence: dict[str, Any]
     proxy_disclosure: dict[str, str] | None
     failure_cause: dict[str, Any]
     evidence_refs: list[dict[str, Any]]

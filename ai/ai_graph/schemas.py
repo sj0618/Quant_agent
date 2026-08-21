@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
 
 SCHEMA_VERSION = "ai-mvp.v1"
 
@@ -138,6 +137,18 @@ class SourceUsage(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     fallback_used: bool = False
     evidence_refs: list[str] = Field(default_factory=list)
+
+
+class FreshnessEvidence(BaseModel):
+    """The freshness decision shared by the API envelope and report projections."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: FreshnessStatus
+    as_of: date | None = None
+    reason: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    no_recommendation: bool
 
 
 class FailureDiagnostic(BaseModel):
@@ -842,6 +853,7 @@ class APIEnvelope(BaseModel):
     data_requirements: list[DataRequirement] = Field(default_factory=list)
     source_usage: list[SourceUsage] = Field(default_factory=list)
     freshness_status: FreshnessStatus | None = None
+    freshness_evidence: FreshnessEvidence | None = None
     proxy_disclosure: dict[str, str] | None = None
     failure_cause: FailureDiagnostic | None = None
     evidence_refs: list[EvidenceRef] = Field(default_factory=list)
