@@ -286,6 +286,9 @@ class PostgresPipelineDataSource:
                 recommended = _backtest_ticker_pool(
                     screening_candidates, self.config.backtest_max_tickers
                 )
+                # Current candidates are context only: the backtest trades its own
+                # PIT universe, so a candidate outside it must not become the traded
+                # ticker either. Record how many were excluded for report disclosure.
                 tickers, universe_descriptor = self._fetch_backtest_universe(
                     conn, backtest_window
                 )
@@ -294,7 +297,18 @@ class PostgresPipelineDataSource:
                         "pit_universe_empty",
                         "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
                     )
-                ticker = recommended[0] if recommended else tickers[0]
+                pit_set = set(tickers)
+                excluded_screening_candidate_count = sum(
+                    1 for item in recommended if item not in pit_set
+                )
+                # Current candidates are context only. The traded ticker comes from
+                # the historical PIT universe, never from today's screen, so past
+                # performance can never be attributed to a current pick.
+                recommended = [item for item in recommended if item in pit_set]
+                ticker = tickers[0]
+                universe_descriptor["excluded_screening_candidate_count"] = (
+                    excluded_screening_candidate_count
+                )
                 symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
                 self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
