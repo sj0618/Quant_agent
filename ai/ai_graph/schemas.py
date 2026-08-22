@@ -6,7 +6,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 SCHEMA_VERSION = "ai-mvp.v1"
 
 
@@ -46,6 +45,13 @@ FailureSubcause = Literal[
     # The provider took the request and then did not answer within the client's budget,
     # as opposed to refusing it for capacity (aoai_capacity_exhausted above).
     "aoai_response_timeout",
+    # Provider failures are kept separate from warehouse connection failures so the
+    # operator can distinguish an AOAI incident from a database incident without
+    # exposing provider response bodies to API consumers.
+    "aoai_connection_error",
+    "aoai_http_4xx",
+    "aoai_http_5xx",
+    "aoai_http_error",
     "parser_low_confidence",
     "source_conflict",
     "data_required",

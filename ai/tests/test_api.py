@@ -1,7 +1,11 @@
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+
+if TYPE_CHECKING:
+    from offline_test_environment import OfflineTestEnvironment
 
 from ai_graph.api import (
     AI_CORS_ALLOW_ORIGINS_ENV,
@@ -12,14 +16,19 @@ from ai_graph.api import (
     DOCS_URL,
     HEALTH_PATH,
     OPENAPI_URL,
+    READINESS_PATH,
     SPEC_STRATEGY_PARSE_PATH,
     STRATEGY_DESCRIPTIONS_PATH,
     create_app,
 )
 from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
-from ai_graph.jobs import InMemoryAnalysisJobStore, JobStoreConfigurationError
+from ai_graph.jobs import InMemoryAnalysisJobStore, JobStoreConfigurationError, JobStoreRuntime
+from ai_graph.research_contract import RuleDraftSigner
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
+
+pytest_plugins = ("offline_test_environment",)
+pytestmark = pytest.mark.usefixtures("offline_test_environment")
 
 DATA_SOURCE_ENV_KEYS = (
     "AI_DATABASE_DSN",
@@ -64,31 +73,6 @@ def _ready_envelope(trace_id: str) -> APIEnvelope:
         retryable=False,
     )
 
-def _daily_digest_strategy_payload(
-    strategy_id: str,
-    name: str,
-    signal: str,
-) -> dict[str, object]:
-    return {
-        "strategy_id": strategy_id,
-        "name": name,
-        "timeframe": "1d",
-        "today_signal": signal,
-        "targets": ["삼성전자"],
-        "metrics": {
-            "sharpe_ratio": 1.12,
-            "max_drawdown": -0.06,
-            "win_rate": 0.58,
-            "total_return": 0.14,
-            "in_sample_sharpe": 1.12,
-            "out_sample_sharpe": 1.12,
-            "degradation": 0.0,
-        },
-        "win_rate": 0.583,
-        "trade_count": 24,
-    }
-
-
 def test_swagger_openapi_lists_current_api_surface() -> None:
     client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
@@ -101,6 +85,7 @@ def test_swagger_openapi_lists_current_api_surface() -> None:
     paths = schema_response.json()["paths"]
 
     assert HEALTH_PATH in paths
+    assert READINESS_PATH in paths
     assert API_STATUS_PATH in paths
     assert ANALYSIS_JOBS_PATH in paths
     assert ANALYSIS_JOB_DETAIL_PATH in paths
@@ -110,6 +95,89 @@ def test_swagger_openapi_lists_current_api_surface() -> None:
     assert "/api/analysis-jobs/{job_id}" in paths
     assert "/api/backtests/{strategy_id}" in paths
     assert "/api/reports/{report_id}" in paths
+
+
+def _persistent_job_store_runtime() -> JobStoreRuntime:
+    return JobStoreRuntime(
+        store=InMemoryAnalysisJobStore(),
+        requested_mode="persistent",
+        active_mode="persistent",
+        fallback=False,
+        fallback_reason=None,
+        dsn_configured=True,
+    )
+
+
+def test_release_readiness_requires_durable_job_store_before_other_dependencies() -> None:
+    migration_calls = 0
+
+    def migration_probe() -> bool:
+        nonlocal migration_calls
+        migration_calls += 1
+        return True
+
+    response = TestClient(
+        create_app(InMemoryAnalysisJobStore(), readiness_migration_probe=migration_probe)
+    ).get(READINESS_PATH)
+
+    assert response.status_code == 503
+    checks = {check["name"]: check for check in response.json()["checks"]}
+    assert checks["durable_job_store"] == {
+        "name": "durable_job_store",
+        "ready": False,
+        "reason": "durable_job_store_required",
+    }
+    assert checks["migration_revision"]["reason"] == "migration_revision_required"
+    assert migration_calls == 0
+
+
+def test_release_readiness_rejects_missing_migration_and_contract_drift(monkeypatch) -> None:
+    missing_migration = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: False,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    ).get(READINESS_PATH)
+    assert missing_migration.status_code == 503
+    checks = {check["name"]: check for check in missing_migration.json()["checks"]}
+    assert checks["migration_revision"]["reason"] == "migration_revision_required"
+
+    ready_client = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    )
+    assert ready_client.get(READINESS_PATH).status_code == 200
+
+    monkeypatch.setattr("ai_graph.api.SCHEMA_VERSION", "ai-mvp.v0")
+    drifted = ready_client.get(READINESS_PATH)
+    assert drifted.status_code == 503
+    checks = {check["name"]: check for check in drifted.json()["checks"]}
+    assert checks["ai_contract_version"] == {
+        "name": "ai_contract_version",
+        "ready": False,
+        "reason": "ai_contract_version_mismatch",
+    }
+
+
+def test_release_readiness_requires_a_rule_draft_signer() -> None:
+    response = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+        )
+    ).get(READINESS_PATH)
+
+    assert response.status_code == 503
+    checks = {check["name"]: check for check in response.json()["checks"]}
+    assert checks["rule_draft_signer"] == {
+        "name": "rule_draft_signer",
+        "ready": False,
+        "reason": "rule_draft_signer_required",
+    }
 
 
 def test_api_status_exposes_data_source_without_dsn_value(monkeypatch) -> None:
@@ -327,36 +395,30 @@ def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monk
     assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in create_response.text
     assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in poll_response.text
 
-    # An asset class outside KRX cash equities is the one input that still comes back
-    # without a result; an underspecified stock request no longer does.
+    # Out-of-scope assets are rejected before a job, audit, provider, or data-source
+    # path can start.  The former queued "rejected" job retained prohibited input.
     rejected_response = client.post(ANALYSIS_JOBS_PATH, json={"query": "옵션 양매도 전략 만들어줘"})
-    assert rejected_response.status_code == 201
-    rejected_job = _poll_job(client, rejected_response.json()["job_id"])
-    rejected_result = rejected_job["result"]
-    rejected_payload = rejected_result["user_payload"]
-
-    assert rejected_result["status"] == "rejected"
-    assert rejected_payload["question"]
-    assert len(rejected_payload["candidate_cards"]) == 3
-    assert len(rejected_payload["options"]) == 3
-    assert rejected_payload["report"] is None
-    assert rejected_payload["performance"] is None
-
-    rejected_poll = client.get(f"{ANALYSIS_JOBS_PATH}/{rejected_job['job_id']}")
-    assert rejected_poll.status_code == 200
-    rejected_polled = rejected_poll.json()
-    assert rejected_polled["job_id"] == rejected_job["job_id"]
-    assert rejected_polled["trace_id"] == rejected_job["trace_id"]
-    assert rejected_polled["result"] == rejected_result
-    assert rejected_polled["result"]["status"] == "rejected"
+    assert rejected_response.status_code == 422
+    rejected_payload = rejected_response.json()
+    assert rejected_payload["kind"] == "unsupported_scope"
+    assert rejected_payload["reason_code"] == "unsupported_asset_family"
+    assert "job_id" not in rejected_payload
+    assert "trace_id" not in rejected_payload
 
     assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in rejected_response.text
-    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in rejected_poll.text
 
-def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adapters() -> None:
+def test_spec_strategy_parse_returns_a_signed_rule_review_without_creating_a_job(
+    offline_test_environment: "OfflineTestEnvironment",
+) -> None:
     store = InMemoryAnalysisJobStore()
     sink = RecordingAuditSink()
-    client = TestClient(create_app(store, audit_sink=_create_test_audit_sink(sink)))
+    client = TestClient(
+        create_app(
+            store,
+            audit_sink=_create_test_audit_sink(sink),
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    )
 
     create_response = client.post(
         SPEC_STRATEGY_PARSE_PATH,
@@ -367,33 +429,14 @@ def test_spec_strategy_parse_accepts_natural_language_and_supports_resource_adap
         },
     )
 
-    assert create_response.status_code == 201
-    created_job = create_response.json()
-    assert created_job["result"]["status"] == "ready"
-
-    poll_response = client.get(f"/api/analysis-jobs/{created_job['job_id']}")
-    assert poll_response.status_code == 200
-    assert poll_response.json()["job_id"] == created_job["job_id"]
-
-    backtest_response = client.get("/api/backtests/breakout_volume_momentum")
-    assert backtest_response.status_code == 200
-    assert backtest_response.json()["status"] == "ready"
-    assert backtest_response.json()["user_payload"]["performance"]["selected_candidate_id"]
-
-    stored_job = store.get_job(created_job["job_id"])
-    assert stored_job is not None
-    assert stored_job.report_id is not None
-
-    report_response = client.get(f"/api/reports/{stored_job.report_id}")
-    assert report_response.status_code == 200
-    assert report_response.json()["status"] == "ready"
-    assert report_response.json()["user_payload"]["report"]["web_projection"]["sections"]
-
-    assert len(sink.sessions) == 1
-    session = sink.sessions[0]
-    assert len(session.model_calls) == len(session.prompt_logs)
-    assert "strategy_conditions" in {call.task_type for call in session.model_calls}
-    assert all(call.execution_id is not None for call in session.model_calls)
+    assert create_response.status_code == 200
+    review = create_response.json()
+    assert review["kind"] == "rule_draft"
+    assert review["is_executable"] is False
+    assert len(review["clarifications"]) <= 3
+    assert "최근 52주 신고가" not in create_response.text
+    assert store.jobs == {}
+    assert sink.sessions == ()
 
 
 def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:
@@ -512,107 +555,47 @@ def test_strategy_descriptions_route_records_sanitized_error_audit_events(monkey
     assert error_event.error_type == "RuntimeError"
     assert "raw request details" not in error_event.message
     assert session.buffered_events[-1].status == "failed"
-def test_daily_digest_route_records_success_audit_steps() -> None:
+def test_retired_daily_digest_returns_gone_without_audit_or_llm(monkeypatch) -> None:
     sink = RecordingAuditSink()
+
+    def llm_path_must_not_run(*_args, **_kwargs) -> None:
+        raise AssertionError("retired daily digest route invoked the LLM path")
+
+    monkeypatch.setattr(
+        "ai_graph.nodes.daily_digest.generate_daily_digest_overall_comment",
+        llm_path_must_not_run,
+    )
     client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
 
-    response = client.post(
-        DAILY_DIGEST_PATH,
-        json={
-            "user_name": "홍길동",
-            "report_date": "2026-06-29",
-            "strategies": [
-                _daily_digest_strategy_payload("rsi", "RSI 전략", "BUY"),
-                _daily_digest_strategy_payload("macd", "MACD 전략", "HOLD"),
-            ],
-        },
-    )
+    response = client.post(DAILY_DIGEST_PATH, json={"legacy": "payload"})
 
-    assert response.status_code == 201
-    payload = response.json()
-    assert payload["header"]["strategy_count"] == 2
-    assert len(sink.sessions) == 1
-    session = sink.sessions[0]
-    assert isinstance(session.correlation.db_trace_id, UUID)
-    assert session.correlation.trace_id is None
-    assert session.correlation.entrypoint == "api.daily_digest"
-    assert session.correlation.feature == "daily_digest"
-    assert [event.kind for event in session.buffered_events] == ["step", "step", "step", "step", "finalization"]
-    assert [event.step for event in session.buffered_events if event.kind == "step"] == [
-        "daily_digest_started",
-        "daily_digest_card_ready",
-        "daily_digest_card_ready",
-        "daily_digest_market_brief",
-    ]
-    assert "strategy_id=rsi" in session.buffered_events[1].message
-    assert "strategy_id=macd" in session.buffered_events[2].message
-    assert session.buffered_events[-1].status == "completed"
-    assert len(session.model_calls) == len(session.prompt_logs) == 4
-    assert all(call.execution_id is None for call in session.model_calls)
+    assert response.status_code == 410
+    assert response.json()["detail"] == {
+        "code": "daily_digest_retired",
+        "message": "정기 다이제스트 생성은 현재 제공하지 않습니다.",
+    }
+    assert sink.sessions == ()
 
 
-def test_report_route_uses_injected_report_resolver_for_real_report_ids() -> None:
-    resolved_ids: list[str] = []
-
-    def report_resolver(report_id: str) -> APIEnvelope | None:
-        resolved_ids.append(report_id)
-        return APIEnvelope(
-            status=EnvelopeStatus.READY,
-            trace_id="trace-report-resolver",
-            user_payload=UserPayload(
-                headline="ready",
-                message="report resolved",
-                next_actions=[],
-                report={
-                    "web_projection": {"title": "웹", "summary": "요약", "sections": []},
-                    "email_projection": {"title": "메일", "summary": "요약", "sections": []},
-                    "risk_adjustments": [],
-                },
-            ),
-            strategy_spec=None,
-            debug_ref="debug:trace-report-resolver",
-            retryable=False,
-        )
-
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), report_resolver=report_resolver))
+def test_mutable_ai_report_route_is_retired() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
     response = client.get("/api/reports/backend-report-1")
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "ready"
-    assert response.json()["user_payload"]["report"]["web_projection"]["title"] == "웹"
-    assert resolved_ids == ["backend-report-1"]
-def test_daily_digest_route_records_sanitized_error_audit_events(monkeypatch) -> None:
-    sink = RecordingAuditSink()
+    assert response.status_code == 410
+    assert response.json()["detail"] == {
+        "code": "mutable_ai_report_projection_retired",
+        "message": "요청형 리포트는 보관된 읽기 전용 스냅샷에서만 제공합니다.",
+        "read_only_alternative": "/api/v1/reports",
+    }
 
-    def failing_build_daily_digest(*args, **kwargs):
-        raise ValueError("daily digest exploded with raw request details")
 
-    monkeypatch.setattr("ai_graph.api.build_daily_digest", failing_build_daily_digest)
-    client = TestClient(create_app(InMemoryAnalysisJobStore(), audit_sink=_create_test_audit_sink(sink)))
+def test_api_status_marks_retired_report_and_digest_endpoints() -> None:
+    status_response = TestClient(create_app(InMemoryAnalysisJobStore())).get(API_STATUS_PATH)
 
-    response = client.post(
-        DAILY_DIGEST_PATH,
-        json={
-            "user_name": "홍길동",
-            "report_date": "2026-06-29",
-            "strategies": [_daily_digest_strategy_payload("rsi", "RSI 전략", "BUY")],
-        },
-    )
-
-    assert response.status_code == 422
-    assert response.json()["detail"] == "daily digest exploded with raw request details"
-    assert len(sink.sessions) == 1
-    session = sink.sessions[0]
-    assert [event.kind for event in session.buffered_events] == ["step", "error", "finalization"]
-    assert [event.step for event in session.buffered_events if event.kind in {"step", "error"}] == [
-        "daily_digest_started",
-        "daily_digest_validation",
-    ]
-    error_event = session.buffered_events[-2]
-    assert error_event.error_type == "ValueError"
-    assert "raw request details" not in error_event.message
-    assert session.buffered_events[-1].status == "failed"
+    endpoints = {(entry["method"], entry["path"]): entry for entry in status_response.json()["endpoints"]}
+    assert endpoints[("GET", "/api/reports/{report_id}")]["state"] == "retired"
+    assert endpoints[("POST", DAILY_DIGEST_PATH)]["state"] == "retired"
 def test_spec_resource_adapters_return_failed_envelope_instead_of_404() -> None:
     client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
@@ -621,8 +604,8 @@ def test_spec_resource_adapters_return_failed_envelope_instead_of_404() -> None:
 
     assert backtest_response.status_code == 200
     assert backtest_response.json()["status"] == "failed"
-    assert report_response.status_code == 200
-    assert report_response.json()["status"] == "failed"
+    assert report_response.status_code == 410
+    assert report_response.json()["detail"]["code"] == "mutable_ai_report_projection_retired"
 
 
 def test_analysis_job_route_uses_injected_store_and_preserves_polling_contract() -> None:
@@ -707,7 +690,10 @@ def test_analysis_audit_session_opens_only_after_job_runner_entry(monkeypatch) -
     assert sink.sessions == ()
 
 
-def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys) -> None:
+def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(
+    capsys,
+    offline_test_environment: "OfflineTestEnvironment",
+) -> None:
     class FailingOpenAuditSink:
 
         def open_session(self, correlation):
@@ -719,6 +705,7 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
                 InMemoryAnalysisJobStore(),
                 analysis_runner=lambda query, trace_id: _ready_envelope(trace_id),
                 audit_sink=audit_sink,
+                rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
             )
         )
 
@@ -727,8 +714,7 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
 
     def stable_job_payload(client, response):
         body = response.json()
-        # /analysis-jobs queues the run and answers before a result exists; the spec
-        # parse adapter still resolves synchronously.
+        # /analysis-jobs queues the run and answers before a result exists.
         if body["result"] is None:
             body = _poll_job(client, body["job_id"])
         result = dict(body["result"])
@@ -736,17 +722,7 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
         result.pop("debug_ref")
         return result, [(stage["stage"], stage["status"]) for stage in body["stages"]]
 
-    job_payloads = [
-        (ANALYSIS_JOBS_PATH, {"query": "RSI strategy"}),
-        (
-            SPEC_STRATEGY_PARSE_PATH,
-            {
-                "natural_language": "RSI strategy",
-                "strategy_id": "rsi",
-                "client_request_id": "request-1",
-            },
-        ),
-    ]
+    job_payloads = [(ANALYSIS_JOBS_PATH, {"query": "RSI strategy"})]
     for path, payload in job_payloads:
         normal_response = normal.post(path, json=payload)
         broken_response = broken.post(path, json=payload)
@@ -754,6 +730,12 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
         assert stable_job_payload(broken, broken_response) == stable_job_payload(
             normal, normal_response
         )
+
+    parse_payload = {"natural_language": "RSI 30 이하, RSI 70 이상"}
+    normal_parse = normal.post(SPEC_STRATEGY_PARSE_PATH, json=parse_payload)
+    broken_parse = broken.post(SPEC_STRATEGY_PARSE_PATH, json=parse_payload)
+    assert normal_parse.status_code == broken_parse.status_code == 200
+    assert normal_parse.json()["kind"] == broken_parse.json()["kind"] == "rule_draft"
 
     descriptions_payload = {
         "strategies": [
@@ -773,23 +755,18 @@ def test_all_ai_entrypoints_keep_business_responses_when_audit_open_fails(capsys
     assert broken_response.status_code == normal_response.status_code
     assert broken_response.json() == normal_response.json()
 
-    digest_payload = {
-        "user_name": "홍길동",
-        "report_date": "2026-07-13",
-        "strategies": [_daily_digest_strategy_payload("rsi", "RSI", "BUY")],
-    }
-    normal_response = normal.post(DAILY_DIGEST_PATH, json=digest_payload)
-    broken_response = broken.post(DAILY_DIGEST_PATH, json=digest_payload)
-    assert broken_response.status_code == normal_response.status_code
+    normal_response = normal.post(DAILY_DIGEST_PATH, json={})
+    broken_response = broken.post(DAILY_DIGEST_PATH, json={})
+    assert broken_response.status_code == normal_response.status_code == 410
     assert broken_response.json() == normal_response.json()
 
     stderr = capsys.readouterr().err
-    assert stderr.count("ai_audit_failure") == 4
+    assert stderr.count("ai_audit_failure") == 2
     assert "postgresql://" not in stderr
     assert "secret" not in stderr
 
 
-def test_parse_strategy_route_records_failure_audit_events_with_request_metadata() -> None:
+def test_parse_strategy_route_does_not_open_an_audit_or_run_analysis() -> None:
     sink = RecordingAuditSink()
 
     def failing_runner(query: str, trace_id: str) -> APIEnvelope:
@@ -800,6 +777,7 @@ def test_parse_strategy_route_records_failure_audit_events_with_request_metadata
             InMemoryAnalysisJobStore(),
             analysis_runner=failing_runner,
             audit_sink=_create_test_audit_sink(sink),
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
         )
     )
 
@@ -812,28 +790,11 @@ def test_parse_strategy_route_records_failure_audit_events_with_request_metadata
         },
     )
 
-    assert response.status_code == 201
-    failed_job = response.json()
-    assert failed_job["result"]["status"] == "failed"
-    assert failed_job["result"]["debug_ref"].startswith("job-error:")
-    assert len(sink.sessions) == 1
-    session = sink.sessions[0]
-    assert isinstance(session.correlation.db_trace_id, UUID)
-    assert session.correlation.trace_id == failed_job["trace_id"]
-    assert session.correlation.entrypoint == "api.strategy_parse"
-    assert session.correlation.feature == "strategy_parse"
-    assert session.correlation.strategy_id == "breakout_volume_momentum"
-    assert session.correlation.client_request_id == "client-parse-1"
-    assert [event.kind for event in session.buffered_events] == ["step", "step", "error", "finalization"]
-    assert [event.step for event in session.buffered_events if event.kind in {"step", "error"}] == [
-        "job_dispatched",
-        "analysis_started",
-        "analysis_execution",
-    ]
-    error_event = session.buffered_events[-2]
-    assert error_event.error_type == "RuntimeError"
-    assert "runner failed" not in error_event.message
-    assert session.buffered_events[-1].status == "failed"
+    assert response.status_code == 200
+    assert response.json()["kind"] == "rule_draft"
+    assert sink.sessions == ()
+
+
 def test_failed_analysis_job_returns_error_contract() -> None:
     def failing_runner(query: str, trace_id: str) -> APIEnvelope:
         raise RuntimeError(f"runner failed for {query} with {trace_id}")
