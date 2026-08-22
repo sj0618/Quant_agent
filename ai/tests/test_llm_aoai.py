@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from ai_graph.audit import RecordingAuditSink, bind_audit_context, create_audit_correlation
+from ai_graph.jobs import classify_failure
 from ai_graph.llm import aoai as aoai_module
 from ai_graph.llm.aoai import AOAIResponsesClient
 from ai_graph.llm.base import (
@@ -542,6 +543,57 @@ def test_aoai_audit_transport_failure_has_null_response() -> None:
     assert session.buffered_events[0].call_id == session.model_calls[0].call_id
     assert session.buffered_events[0].execution_id == execution_id
     assert session.agent_executions[0].status == "succeeded"
+
+
+@pytest.mark.parametrize(
+    ("handler", "expected_subcause", "retryable"),
+    [
+        (
+            lambda request: (_ for _ in ()).throw(
+                httpx.ConnectTimeout("provider-secret-timeout", request=request)
+            ),
+            "aoai_response_timeout",
+            True,
+        ),
+        (
+            lambda request: (_ for _ in ()).throw(
+                httpx.ConnectError("provider-secret-connect", request=request)
+            ),
+            "aoai_connection_error",
+            True,
+        ),
+        (
+            lambda _request: httpx.Response(503, text="provider-secret-http"),
+            "aoai_http_5xx",
+            True,
+        ),
+    ],
+    ids=("timeout", "connection", "http-503"),
+)
+def test_aoai_provider_failures_keep_their_cause_for_job_classification(
+    handler, expected_subcause: str, retryable: bool
+) -> None:
+    """An AOAI wrapper must preserve causes for the job's public-safe failure code."""
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/responses",
+        api_key="provider-secret-key",
+        model="test-model",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(LLMClientError) as raised:
+        client.generate_json(make_request())
+
+    diagnostic = classify_failure(raised.value, stage="researching")
+
+    assert diagnostic.category == "infrastructure_failure"
+    assert diagnostic.subcause == expected_subcause
+    assert diagnostic.retryable is retryable
+    public = diagnostic.model_dump_json()
+    assert "provider-secret" not in public
+    assert "provider-secret-key" not in public
 
 
 def test_aoai_retry_is_one_logical_call() -> None:

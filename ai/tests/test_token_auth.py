@@ -176,6 +176,64 @@ def test_requests_over_the_token_quota_are_rejected_with_429() -> None:
     assert third.headers["Retry-After"] == "60"
 
 
+@pytest.mark.parametrize(
+    ("path", "body", "expected_kind", "expected_reason", "private_fragment"),
+    (
+        (
+            ANALYSIS_JOBS_PATH,
+            {"query": "내 보유 종목을 지금 팔아줘"},
+            "scope_refusal",
+            "personalized_investment_request",
+            "내 보유",
+        ),
+        (
+            "/api/strategies/parse",
+            {"natural_language": "내 계좌에 맞는 종목을 골라줘"},
+            "scope_refusal",
+            "personalized_investment_request",
+            "내 계좌",
+        ),
+        (
+            ANALYSIS_JOBS_PATH,
+            {"query": "비트코인 가격으로 전략을 만들어 주세요."},
+            "unsupported_scope",
+            "unsupported_asset_family",
+            "비트코인",
+        ),
+    ),
+)
+def test_preflight_rejection_is_returned_before_token_quota_or_job_creation(
+    path: str,
+    body: dict,
+    expected_kind: str,
+    expected_reason: str,
+    private_fragment: str,
+) -> None:
+    redis_client = FakeRedis()
+    token_resolver = StubAccountTokenResolver({"secret-token": _token()})
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(
+        create_app(
+            store,
+            analysis_runner=lambda *_args: pytest.fail("refused request must not run analysis"),
+            session_resolver=StubSessionResolver({}),
+            account_token_resolver=token_resolver,
+            account_token_quota=AccountTokenQuota(redis_client),
+        )
+    )
+
+    response = client.post(path, json=body, headers={"Authorization": "Bearer secret-token"})
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["kind"] == expected_kind
+    assert payload["reason_code"] == expected_reason
+    assert private_fragment not in response.text
+    assert redis_client.counters == {}
+    assert store.jobs == {}
+    assert token_resolver.calls == 1
+
+
 def test_the_quota_window_is_given_an_expiry_so_the_counter_resets() -> None:
     redis_client = FakeRedis()
     client = _client(

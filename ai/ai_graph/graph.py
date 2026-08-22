@@ -24,8 +24,6 @@ from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_s
 from pydantic import ValidationError
 
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
-from ai_graph.memory import AnalysisMemory
-from ai_graph.progress import raise_if_cancelled, report_activity, report_node_stage
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
     generate_strategy_conditions,
@@ -50,6 +48,8 @@ from ai_graph.nodes.backtest import (
     _summary_float_default,
     backtest_node,
 )
+from ai_graph.memory import AnalysisMemory
+from ai_graph.progress import raise_if_cancelled, report_activity, report_node_stage
 from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_strategy import (
     classify_strategy_request,
@@ -61,6 +61,7 @@ from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
+from ai_graph.preflight import classify_research_request
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
@@ -70,13 +71,13 @@ from ai_graph.schemas import (
     BacktestEquityPoint,
     CandidateBacktestResult,
     BacktestMetrics,
-    PublicMetricDetail,
     ClarificationOption,
     Condition,
     DataRequirement,
     EnvelopeStatus,
     EvidenceRef,
     InternalPayload,
+    PublicMetricDetail,
     ScreeningMatch,
     SemanticSlots,
     SourceUsage,
@@ -84,9 +85,9 @@ from ai_graph.schemas import (
     StrategyCandidateCard,
     TickerAction,
     StrategySpec,
+    UserPayload,
 )
 from ai_graph.state import QuantAgentState
-
 
 _logger = logging.getLogger(__name__)
 
@@ -221,6 +222,13 @@ def run_analysis(
 ) -> APIEnvelope:
     query = _normalize_user_query(user_query)
     resolved_trace_id = trace_id or (_trace_id(query) if query else None)
+    scope_decision = classify_research_request(query)
+    if not scope_decision.allowed:
+        # This guard intentionally precedes audit-session construction and graph setup.
+        # A refused personalized request must not persist a job/audit record, consume a
+        # provider slot, or invoke a data source merely because another entrypoint
+        # bypassed the HTTP preflight adapter.
+        return _scope_refusal_envelope(query, resolved_trace_id or _trace_id(query))
     if audit_session is not None and not is_authorized_audit_session(audit_session):
         report_audit_failure("unapproved_audit_session")
         audit_session = None
@@ -275,6 +283,29 @@ def run_analysis(
         metadata_jsonb={"debug_ref": envelope.debug_ref, "public_trace_id": envelope.trace_id},
     )
     return envelope
+
+
+def _scope_refusal_envelope(query: str, trace_id: str) -> APIEnvelope:
+    decision = classify_research_request(query)
+    if decision.allowed:
+        raise ValueError("scope refusal envelope requires a refused request")
+    headline = (
+        "현재 지원 범위 밖의 요청입니다."
+        if decision.kind == "unsupported_scope"
+        else "개인화된 투자 요청은 분석하지 않습니다."
+    )
+    return APIEnvelope(
+        status=EnvelopeStatus.REJECTED,
+        trace_id=trace_id,
+        user_payload=UserPayload(
+            headline=headline,
+            message=decision.public_message,
+            next_actions=[decision.public_guidance],
+        ),
+        strategy_spec=None,
+        debug_ref=f"scope-refusal:{_trace_id(query)}",
+        retryable=False,
+    )
 
 
 def instrument_node(

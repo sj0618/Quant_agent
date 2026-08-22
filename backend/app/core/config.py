@@ -186,6 +186,7 @@ class Settings(BaseSettings):
     auth_allowed_hosts: str = Field(default="localhost,127.0.0.1", alias="AUTH_ALLOWED_HOSTS")
     auth_allowed_origins: str = Field(default="", alias="AUTH_ALLOWED_ORIGINS")
     auth_trusted_proxy_headers: bool = Field(default=False, alias="AUTH_TRUSTED_PROXY_HEADERS")
+    auth_trusted_proxy_hosts: str = Field(default="", alias="AUTH_TRUSTED_PROXY_HOSTS")
 
     auth_session_cookie_name: str = Field(default="qa_session", alias="AUTH_SESSION_COOKIE_NAME")
     auth_cookie_secure: bool = Field(default=True, alias="AUTH_COOKIE_SECURE")
@@ -210,6 +211,18 @@ class Settings(BaseSettings):
         default=60,
         alias="AUTH_SESSION_TOUCH_INTERVAL_SECONDS",
         ge=1,
+    )
+    auth_login_rate_limit_max_attempts: int = Field(
+        default=20,
+        alias="AUTH_LOGIN_RATE_LIMIT_MAX_ATTEMPTS",
+        ge=1,
+        le=1_000,
+    )
+    auth_login_rate_limit_window_seconds: int = Field(
+        default=300,
+        alias="AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS",
+        ge=10,
+        le=3_600,
     )
     auth_csrf_ttl_seconds: int = Field(default=3600, alias="AUTH_CSRF_TTL_SECONDS", ge=300)
     auth_csrf_required: bool = Field(default=False, alias="AUTH_CSRF_REQUIRED")
@@ -731,6 +744,11 @@ class Settings(BaseSettings):
                     "AUTH_SESSION_TOUCH_INTERVAL_SECONDS must not exceed "
                     "AUTH_SESSION_IDLE_TTL_SECONDS"
                 )
+            if self.auth_trusted_proxy_headers and not self.trusted_proxy_hosts:
+                raise ValueError(
+                    "AUTH_TRUSTED_PROXY_HOSTS is required when "
+                    "AUTH_TRUSTED_PROXY_HEADERS is enabled"
+                )
             if self.ai_backtest_scope_hmac_primary is None:
                 missing.append("AI_BACKTEST_SCOPE_HMAC_PRIMARY")
             if not self.ai_backtest_scope_hmac_primary_version:
@@ -867,6 +885,10 @@ class Settings(BaseSettings):
         return _split_csv(self.auth_allowed_hosts)
 
     @property
+    def trusted_proxy_hosts(self) -> list[str]:
+        return _split_csv(self.auth_trusted_proxy_hosts)
+
+    @property
     def pdf_temp_allowed_hosts(self) -> list[str]:
         return _split_csv(self.pdf_temp_url_allowed_hosts)
 
@@ -963,6 +985,7 @@ class Settings(BaseSettings):
             "auth_allowed_hosts": self.allowed_hosts,
             "auth_allowed_origins": self.allowed_origins,
             "auth_trusted_proxy_headers": self.auth_trusted_proxy_headers,
+            "auth_trusted_proxy_hosts": self.trusted_proxy_hosts,
             "auth_session_cookie_name": self.auth_session_cookie_name,
             "auth_cookie_secure": self.auth_cookie_secure,
             "auth_cookie_samesite": self.auth_cookie_samesite,
@@ -971,6 +994,8 @@ class Settings(BaseSettings):
             "auth_session_idle_ttl_seconds": self.auth_session_idle_ttl_seconds,
             "auth_session_absolute_ttl_seconds": self.auth_session_absolute_ttl_seconds,
             "auth_session_touch_interval_seconds": self.auth_session_touch_interval_seconds,
+            "auth_login_rate_limit_max_attempts": self.auth_login_rate_limit_max_attempts,
+            "auth_login_rate_limit_window_seconds": self.auth_login_rate_limit_window_seconds,
             "auth_csrf_required": self.auth_csrf_required,
             "ai_backtest_scope_hmac_primary": "<configured>" if self.ai_backtest_scope_hmac_primary else None,
             "ai_backtest_scope_hmac_primary_version": self.ai_backtest_scope_hmac_primary_version,

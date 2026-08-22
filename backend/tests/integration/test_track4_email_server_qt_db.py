@@ -369,9 +369,8 @@ async def test_track4_email_report_server_qt_db() -> None:
                 headers=intruder_headers,
                 json={"strategyId": first_strategy_id},
             )
-            assert subscribed.status_code == duplicate_subscription.status_code == 200
-            assert subscribed.json()["subscriptionCount"] == duplicate_subscription.json()["subscriptionCount"] == 1
-            assert intruder_subscription.status_code == 404
+            assert subscribed.status_code == duplicate_subscription.status_code == intruder_subscription.status_code == 410
+            assert subscribed.json()["error"]["code"] == "daily_digest_subscriptions_retired"
 
             completion = _completion_payload(token=context["token"])
             completed = await client.post(
@@ -709,22 +708,17 @@ async def test_track4_email_report_server_qt_db() -> None:
                 headers=owner_headers,
                 json={"strategyId": rollback_ids[1]},
             )
-            assert daily_subscription.status_code == second_subscription.status_code == 200
-            assert second_subscription.json()["subscriptionCount"] == 3
-            assert over_limit_subscription.status_code == 409
+            assert daily_subscription.status_code == second_subscription.status_code == over_limit_subscription.status_code == 410
+            assert daily_subscription.json()["error"]["code"] == "daily_digest_subscriptions_retired"
 
-            for strategy_id, expected_count in (
-                (first_strategy_id, 2),
-                (daily_disabled_ids[1], 1),
-                (second_ids[1], 0),
-            ):
+            for strategy_id in (first_strategy_id, daily_disabled_ids[1], second_ids[1]):
                 deleted_subscription = await client.delete(
                     f"/api/v1/me/email-strategy-subscriptions/{strategy_id}",
                     cookies=owner_cookie,
                     headers=owner_headers,
                 )
-                assert deleted_subscription.status_code == 200
-                assert deleted_subscription.json()["subscriptionCount"] == expected_count
+                assert deleted_subscription.status_code == 410
+                assert deleted_subscription.json()["error"]["code"] == "daily_digest_subscriptions_retired"
     finally:
         if owner_session_id is not None:
             await context["store"].revoke_session(owner_session_id)

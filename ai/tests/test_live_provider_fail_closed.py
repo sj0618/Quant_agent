@@ -1,3 +1,4 @@
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -385,3 +386,62 @@ def test_analysis_api_returns_failed_job_when_live_provider_is_down(monkeypatch)
     assert payload["result"]["failure_cause"] is not None
     assert payload["result"]["user_payload"]["performance"] is None
     assert payload["result"]["user_payload"]["report"] is None
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected_subcause"),
+    (
+        (
+            httpx.ConnectTimeout(
+                "provider-secret-timeout",
+                request=httpx.Request("POST", "https://provider.test/responses"),
+            ),
+            "aoai_response_timeout",
+        ),
+        (
+            httpx.ConnectError(
+                "provider-secret-connect",
+                request=httpx.Request("POST", "https://provider.test/responses"),
+            ),
+            "aoai_connection_error",
+        ),
+        (
+            httpx.HTTPStatusError(
+                "provider-secret-http",
+                request=httpx.Request("POST", "https://provider.test/responses"),
+                response=httpx.Response(503),
+            ),
+            "aoai_http_5xx",
+        ),
+    ),
+    ids=("timeout", "connection", "http-503"),
+)
+def test_analysis_job_provider_failures_are_classified_without_publishing_cards(
+    monkeypatch, cause: Exception, expected_subcause: str
+) -> None:
+    monkeypatch.setenv("AUTH_ENABLED", "0")
+
+    def failing_runner(_query: str, _trace_id: str) -> None:
+        raise LLMClientError("AOAI Responses request failed") from cause
+
+    client = TestClient(
+        create_app(InMemoryAnalysisJobStore(), analysis_runner=failing_runner)
+    )
+    response = client.post(
+        "/analysis-jobs",
+        json={"query": "RSI 30 이하와 거래량 조건을 검토해 주세요."},
+    )
+
+    assert response.status_code == 201
+    payload = client.get(f"/analysis-jobs/{response.json()['job_id']}").json()
+    result = payload["result"]
+    public = repr(result)
+    assert result["status"] == "failed"
+    assert result["failure_cause"]["subcause"] == expected_subcause
+    assert result["strategy_spec"] is None
+    assert result["user_payload"]["candidate_cards"] == []
+    assert result["user_payload"]["performance"] is None
+    assert result["user_payload"]["report"] is None
+    assert result["user_payload"]["ticker_actions"] == []
+    assert result["user_payload"]["recommendation_gate"] is None
+    assert "provider-secret" not in public

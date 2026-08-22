@@ -3,7 +3,7 @@ import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
 
-test("browser exposes a read-only report archive rather than an on-demand analysis client", async () => {
+test("browser exposes rule-reviewed research without reviving the legacy analysis client", async () => {
   const [clientSource, appSource, activitySource] = await Promise.all([
     readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8"),
@@ -16,8 +16,8 @@ test("browser exposes a read-only report archive rather than an on-demand analys
   assert.match(clientSource, /export async function getReportById/);
   assert.doesNotMatch(clientSource, /createAnalysisJob|cancelAnalysisJob|createAnalysisRun|completeAnalysisRun/);
   assert.doesNotMatch(clientSource, /analysis-jobs|strategyDescriptions|fetchAI/);
-  assert.match(appSource, /읽기 전용 보관함/);
-  assert.match(appSource, /새 전략 분석과 추천 생성은 현재 제공하지 않습니다/);
+  assert.match(appSource, /ResearchWorkspace/);
+  assert.doesNotMatch(appSource, /매수|매도|보유|추천|BUY|SELL|HOLD/);
   assert.doesNotMatch(appSource, /StrategyInputPanel|useAnalysisActivity|analysis-jobs/);
   assert.match(activitySource, /analysisJobEvents/);
 });
@@ -77,7 +77,8 @@ test("public navigation and bundle sources contain no development preview, fake 
   assert.doesNotMatch(appSource, /EmailTemplatePreviewPage|Figma HI-FI/);
   assert.doesNotMatch(routesSource, /emailTemplatePreview|dev\/email-template/);
   assert.doesNotMatch(landingSource, /reportDetail\("2026-04-18"\)|KRX LIVE|Sharpe 1\.42/);
-  assert.match(landingSource, /새 전략 입력·분석 실행·투자 추천은 제공하지 않습니다/);
+  assert.match(landingSource, /현재는 보관된 검증 리포트 열람만 지원합니다/);
+  assert.doesNotMatch(landingSource, /매수|매도|보유|추천|BUY|SELL|HOLD/);
   assert.doesNotMatch(await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"), /landing\.mock|getLandingSample|LandingSample/);
   assert.doesNotMatch(landingSource, /RELEASE VALIDATION|VALIDATION PRINCIPLES|READ-ONLY ARCHIVE|CURRENT SCOPE/);
   assert.doesNotMatch(globalStyles, /email-template/);
