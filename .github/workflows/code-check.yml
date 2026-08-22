@@ -73,7 +73,12 @@ jobs:
           python -m pytest -q
           backend/tests/unit/test_main_smoke.py
           backend/tests/unit/test_auth_config.py
+          backend/tests/unit/test_auth_core.py
+          backend/tests/unit/test_auth_routes.py
           backend/tests/unit/test_fe_contract_routes.py
+          backend/tests/unit/test_track_c_store.py
+          backend/tests/unit/test_runtime_perf.py
+          backend/tests/unit/test_deploy_workflow_contract.py
           backend/tests/unit/test_ai_account_token_routes.py
 
       - name: Run database contract tests
@@ -106,3 +111,43 @@ jobs:
       - name: Typecheck and production build
         working-directory: fe
         run: npm run test
+
+  release-trust:
+    name: Offline release-trust gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            ai/pyproject.toml
+            backtest_module/pyproject.toml
+            backend/pyproject.toml
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+          cache: npm
+          cache-dependency-path: fe/package-lock.json
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./backtest_module -e ./ai -e "./backend[test]" pytest
+
+      - name: Install frontend dependencies
+        working-directory: fe
+        run: npm ci
+
+      - name: Verify release-trust contracts
+        run: |
+          node --test scripts/evaluate-release-trust.test.mjs
+          node scripts/evaluate-release-trust.mjs

@@ -86,8 +86,9 @@ def bearer_token_from_request(request: Request) -> str | None:
 class PostgresAccountTokenResolver:
     """Looks a token up by digest, rejecting anything not currently active."""
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, *, record_usage: bool = True) -> None:
         self._dsn = dsn
+        self._record_usage = record_usage
 
     async def resolve(self, raw_token: str) -> ResolvedAccountToken | None:
         import psycopg
@@ -109,16 +110,17 @@ class PostgresAccountTokenResolver:
             ).fetchone()
             if row is None:
                 return None
-            # Only written on a cache miss, so a hot token costs one write per cache TTL
-            # rather than one per request. Best effort: a token that authenticated should
-            # not be rejected because bookkeeping failed.
-            try:
-                await conn.execute(
-                    "UPDATE app.ai_account_token SET last_used_at = now() WHERE token_id = %s",
-                    (row["token_id"],),
-                )
-            except Exception:
-                _logger.warning("failed to record account token usage", exc_info=True)
+            if self._record_usage:
+                # Only written on a cache miss, so a hot token costs one write per cache
+                # TTL rather than one per request. The preflight resolver below disables
+                # this bookkeeping so a refused request remains mutation-free.
+                try:
+                    await conn.execute(
+                        "UPDATE app.ai_account_token SET last_used_at = now() WHERE token_id = %s",
+                        (row["token_id"],),
+                    )
+                except Exception:
+                    _logger.warning("failed to record account token usage", exc_info=True)
         return ResolvedAccountToken(
             token_id=str(row["token_id"]),
             user_id=str(row["user_id"]),
@@ -330,6 +332,68 @@ class RequireUserIdentityWithinQuota:
         return cached
 
 
+class RequirePreflightIdentityReadOnly:
+    """Authenticate a request without token-usage, cache, or quota mutation.
+
+    The protected analysis routes call :meth:`consume_quota_after_preflight` only after
+    the deterministic scope check accepts the request. A refusal therefore cannot spend
+    an account token allowance or trigger the normal token resolver's bookkeeping.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_requirement: RequireAuthenticatedUser,
+        token_resolver: AccountTokenResolver | None = None,
+        quota: AccountTokenQuota | None = None,
+    ) -> None:
+        self._session_requirement = session_requirement
+        self._token_resolver = token_resolver
+        self._quota = quota
+
+    async def __call__(self, request: Request) -> str:
+        raw_token = bearer_token_from_request(request)
+        if raw_token is None:
+            return await self._session_requirement(request)
+        resolver = self._resolve_resolver(request)
+        resolved = None if resolver is None else await resolver.resolve(raw_token)
+        if resolved is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or revoked API token",
+            )
+        # Request-local state is not persisted and lets the route charge only accepted
+        # bearer requests after the policy boundary.
+        request.state.preflight_account_token = resolved
+        return resolved.user_id
+
+    async def consume_quota_after_preflight(self, request: Request) -> None:
+        token = getattr(request.state, "preflight_account_token", None)
+        if not isinstance(token, ResolvedAccountToken):
+            return
+        quota = self._resolve_quota(request)
+        if quota is not None:
+            await quota.check_and_consume(token)
+
+    def _resolve_resolver(self, request: Request) -> AccountTokenResolver | None:
+        if self._token_resolver is not None:
+            return self._token_resolver
+        cached = getattr(request.app.state, "preflight_account_token_resolver", None)
+        if cached is None:
+            cached = build_read_only_account_token_resolver_from_env()
+            request.app.state.preflight_account_token_resolver = cached
+        return cached
+
+    def _resolve_quota(self, request: Request) -> AccountTokenQuota | None:
+        if self._quota is not None:
+            return self._quota
+        cached = getattr(request.app.state, "account_token_quota", None)
+        if cached is None:
+            cached = build_account_token_quota_from_env()
+            request.app.state.account_token_quota = cached
+        return cached
+
+
 def _redis_client_from_env(env: Mapping[str, str] | None = None) -> Any | None:
     source = environ if env is None else env
     redis_url = (source.get(REDIS_URL_ENV) or "").strip()
@@ -363,6 +427,22 @@ def build_account_token_resolver_from_env(
     if redis_client is not None:
         resolver = CachedAccountTokenResolver(resolver, redis_client)
     return resolver
+
+
+def build_read_only_account_token_resolver_from_env(
+    env: Mapping[str, str] | None = None,
+) -> AccountTokenResolver | None:
+    """Build the preflight token resolver without cache or token-usage writes."""
+
+    source = environ if env is None else env
+    if not auth_enabled(source):
+        return None
+    from ai_graph.data_sources.db import resolve_database_dsn_from_env
+
+    dsn, _ = resolve_database_dsn_from_env(source)
+    if not dsn:
+        return None
+    return PostgresAccountTokenResolver(dsn, record_usage=False)
 
 
 def build_account_token_quota_from_env(

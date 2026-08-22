@@ -126,7 +126,6 @@ def test_email_routes_require_authentication_and_csrf_before_database_access():
 
     for path in (
         "/api/v1/me/notifications",
-        "/api/v1/me/email-strategy-subscriptions",
         "/api/v1/me/email-deliveries",
     ):
         response = client.get(path)
@@ -137,13 +136,34 @@ def test_email_routes_require_authentication_and_csrf_before_database_access():
     cookie = {app.state.settings.auth_session_cookie_name: session_id}
     for method, path, payload in (
         ("PATCH", "/api/v1/me/notifications", {"dailyReportEmail": True}),
-        ("POST", "/api/v1/me/email-strategy-subscriptions", {"strategyId": "strategy-1"}),
-        ("DELETE", "/api/v1/me/email-strategy-subscriptions/strategy-1", None),
         ("POST", "/api/v1/reports/report-1/resend", None),
     ):
         response = client.request(method, path, cookies=cookie, headers={"Origin": API_ORIGIN}, json=payload)
         assert response.status_code == 403
         assert response.json()["error"]["code"] == "csrf_invalid"
+
+
+def test_daily_digest_subscription_routes_are_retired_before_auth_or_database_access(monkeypatch):
+    client, _app = make_client()
+
+    def database_access_must_not_happen(_request):
+        raise AssertionError("retired daily-digest subscription route reached the database")
+
+    monkeypatch.setattr(fe_contract.email_reports, "get_db_engine", database_access_must_not_happen)
+
+    for method, path in (
+        ("GET", "/api/v1/me/email-strategy-subscriptions"),
+        ("POST", "/api/v1/me/email-strategy-subscriptions"),
+        ("DELETE", "/api/v1/me/email-strategy-subscriptions/strategy-1"),
+    ):
+        response = client.request(method, path, json={"strategyId": "strategy-1"})
+        assert response.status_code == 410
+        assert response.json()["error"] == {
+            "component": "email_reports",
+            "code": "daily_digest_subscriptions_retired",
+            "message": "정기 다이제스트 구독은 현재 제공하지 않습니다.",
+            "details": {},
+        }
 
 
 def test_unsubscribe_route_is_public_but_fail_closed_when_disabled():

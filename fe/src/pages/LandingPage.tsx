@@ -36,7 +36,7 @@ export function LandingPage() {
           <a className="button button--primary" href={reportsHref}>리포트 보관함 보기 →</a>
           <a className="button button--ghost" href="#limits">현재 이용 범위</a>
         </div>
-        <small>새 전략 입력·분석 실행·투자 추천은 제공하지 않습니다.</small>
+        <small>현재는 보관된 검증 리포트 열람만 지원합니다.</small>
       </section>
 
       <section className="landing-section" id="principles">
@@ -45,7 +45,7 @@ export function LandingPage() {
           <Card>
             <Badge variant="soft">출처</Badge>
             <h3>근거와 기준 시점</h3>
-            <p>데이터 출처, 관측 시점, 사용 범위가 확인되지 않으면 수치와 추천을 신뢰 가능한 결과로 표시하지 않습니다.</p>
+            <p>데이터 출처, 관측 시점, 사용 범위가 확인되지 않으면 수치와 종목 선정을 신뢰 가능한 결과로 표시하지 않습니다.</p>
           </Card>
           <Card>
             <Badge variant="soft">산출식</Badge>
@@ -70,7 +70,7 @@ export function LandingPage() {
             </div>
           </div>
           <h3>새 분석을 시작하지 않는 리포트 경험</h3>
-          <p>보관 리포트는 과거 기록을 확인하기 위한 화면입니다. 검증 상태가 불충분하거나 출처가 확인되지 않는 기록은 추천 행동으로 연결하지 않습니다.</p>
+          <p>보관 리포트는 과거 기록을 확인하기 위한 화면입니다. 검증 상태가 불충분하거나 출처가 확인되지 않는 기록은 투자 판단으로 연결하지 않습니다.</p>
           <a href={reportsHref}>로그인 후 리포트 보관함 열기 →</a>
         </Card>
       </section>
@@ -80,7 +80,7 @@ export function LandingPage() {
         <Card>
           <ul>
             <li>자연어 전략 입력을 통한 신규 분석과 백테스트 실행</li>
-            <li>개인별 투자 추천 또는 자동 주문을 유도하는 기능</li>
+            <li>개인별 자문이나 자동 주문을 유도하는 기능</li>
             <li>검증 근거가 없는 예시 성과를 실제 성과처럼 제시하는 화면</li>
           </ul>
           <p>이 제한은 부족한 결과를 정상 결과처럼 보이지 않게 하기 위한 릴리스 안전장치입니다.</p>

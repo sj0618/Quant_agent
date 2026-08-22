@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -17,17 +17,6 @@ PROVIDER_CREDENTIAL_ENV_NAMES = (
     "AZURE_OPENAI_ENDPOINT",
     "OPENAI_API_KEY",
 )
-_ROLE_CREDENTIAL_SUFFIXES = ("_RESPONSES_URL", "_API_KEY", "_MODEL")
-
-
-def _provider_credential_names() -> set[str]:
-    names = set(PROVIDER_CREDENTIAL_ENV_NAMES)
-    names.update(
-        name
-        for name in os.environ
-        if name.startswith("AI_LLM_") and name.endswith(_ROLE_CREDENTIAL_SUFFIXES)
-    )
-    return names
 
 
 def _database_boundary_reached(*_args: Any, **_kwargs: Any) -> None:
@@ -47,11 +36,13 @@ class OfflineTestEnvironment:
     offline_loader: Callable[[str, str], Any]
     database_env_names: tuple[str, ...]
     provider_credential_names: frozenset[str]
+    cache_dir: Path
 
 
 @pytest.fixture
 def offline_test_environment(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> OfflineTestEnvironment:
     """Opt these tests into fixture data, mock LLMs, and no-op auditing.
 
@@ -60,14 +51,18 @@ def offline_test_environment(
     contract, not an incidental cleanup of the process environment.
     """
 
-    provider_credential_names = _provider_credential_names()
     for name in DATABASE_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
-    for name in provider_credential_names:
+    for name in PROVIDER_CREDENTIAL_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
+    # Each fixture invocation owns an empty temporary cache.  A shared system cache can
+    # retain a historic dependency-failure evaluation and make a healthy test process
+    # fail before it evaluates any current code.
+    cache_dir = tmp_path / "backtest-cache"
     monkeypatch.setenv("AI_DATA_SOURCE_VARIANT", "db")
     monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
     monkeypatch.setenv("AI_AUDIT_SINK", "noop")
+    monkeypatch.setenv("AI_BACKTEST_CACHE_DIR", str(cache_dir))
 
     import ai_graph.api as api_module
     import ai_graph.data_sources.db as data_source_module
@@ -99,7 +94,8 @@ def offline_test_environment(
             aoai_module=aoai_module,
             offline_loader=offline_loader,
             database_env_names=DATABASE_ENV_NAMES,
-            provider_credential_names=frozenset(provider_credential_names),
+            provider_credential_names=frozenset(PROVIDER_CREDENTIAL_ENV_NAMES),
+            cache_dir=cache_dir,
         )
     finally:
         graph_module.DEBUG_STORE._records.clear()
