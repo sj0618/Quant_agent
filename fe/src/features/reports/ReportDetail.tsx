@@ -1,6 +1,8 @@
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
+import { PublicClaimDisclosure } from "../../components/common/PublicClaimDisclosure";
 import { ResultTrustLinks } from "../../components/common/ResultTrustLinks";
+import { ROUTES } from "../../config/routes";
 import type { ArchivedReportDetail, PersistedReportSection } from "../../types/quantagent";
 
 interface ReportDetailProps {
@@ -67,17 +69,29 @@ export function ReportDetail({ report }: ReportDetailProps) {
           </dl>
         </section>
 
+        <section className="report-paper__section" aria-labelledby="archived-snapshot-state-title">
+          <h2 id="archived-snapshot-state-title"><span>02</span> 보관 시점과 현재 검증 한계</h2>
+          <p>이 리포트는 과거 보관 기록입니다. 현재 시장 상태나 현재 성과를 확인하는 실행 결과가 아니므로, 현재 검증할 수 없음으로 표시합니다.</p>
+          <dl className="strategy-mini">
+            <div><dt>현재 검증 상태</dt><dd>현재 검증할 수 없음</dd></div>
+            <div><dt>보관 기준일</dt><dd>{report.date || "기준일 미확인"}</dd></div>
+            <div><dt>표시 출처</dt><dd>보관된 검증 재현·지표 계약</dd></div>
+            <div><dt>다음 행동</dt><dd><a href={ROUTES.reports}>보관 리포트 목록으로 돌아가기</a></dd></div>
+          </dl>
+          <PublicClaimDisclosure claimKey="archivedSnapshot" asOf={report.date || undefined} />
+        </section>
+
         {evidenceSections.length ? evidenceSections.map((section, index) => (
-          <EvidenceSection index={String(index + 2).padStart(2, "0")} key={section.id} section={section} />
+          <EvidenceSection index={String(index + 3).padStart(2, "0")} key={section.id} section={section} />
         )) : (
           <section className="report-paper__section">
-            <h2><span>02</span> 검증 재현 계약</h2>
+            <h2><span>03</span> 검증 재현 계약</h2>
             <p>이 보관 기록에는 공개 열람 가능한 검증 계약이 없습니다. 근거가 없는 수치나 요약은 표시하지 않습니다.</p>
           </section>
         )}
 
         <section className="report-paper__section report-paper__section--cost">
-          <h2><span>{String(evidenceSections.length + 2).padStart(2, "0")}</span> 한계와 문제 기록</h2>
+          <h2><span>{String(evidenceSections.length + 3).padStart(2, "0")}</span> 한계와 문제 기록</h2>
           <p>과거 기록은 미래 결과를 보장하지 않습니다. 결과에 문제가 있으면 결과 ID와 버전을 함께 기록해 주세요.</p>
           <ResultTrustLinks resultId={report.id} version={version} />
         </section>

@@ -1,5 +1,6 @@
 import { Badge } from "../components/common/Badge";
 import { Card } from "../components/common/Card";
+import { PublicClaimDisclosure } from "../components/common/PublicClaimDisclosure";
 import { Footer } from "../components/layout/Footer";
 import { ROUTES, withReturnTo } from "../config/routes";
 
@@ -84,6 +85,15 @@ export function LandingPage() {
             <li>검증 근거가 없는 예시 성과를 실제 성과처럼 제시하는 화면</li>
           </ul>
           <p>이 제한은 부족한 결과를 정상 결과처럼 보이지 않게 하기 위한 릴리스 안전장치입니다.</p>
+        </Card>
+      </section>
+      <section aria-labelledby="public-claim-title" className="landing-section landing-section--soft">
+        <SectionHead eyebrow="공개 문구 기준" title="성과 수치가 아닌, 열람 범위를 공개합니다" />
+        <Card>
+          <h3 id="public-claim-title">보관 리포트의 공개 범위</h3>
+          <p>랜딩에는 sample이나 live 성과 수치를 표시하지 않습니다. 각 보관 리포트에서 기준일과 검증 계약을 확인해 주세요.</p>
+          <PublicClaimDisclosure claimKey="landingArchiveScope" />
+          <a href={ROUTES.trust}>신뢰센터에서 데이터·표시 원칙 확인 →</a>
         </Card>
       </section>
       <Footer />

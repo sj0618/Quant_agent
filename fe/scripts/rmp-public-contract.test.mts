@@ -46,4 +46,12 @@ test("every public research result and archived result links to a result-bound t
   assert.match(app, /ROUTES\.trust/);
   assert.match(legal, /결과 문제 기록/);
   assert.match(legal, /feedbackResultId/);
+
+  for (const status of ["ready", "need_clarification", "no_match", "unavailable", "failed", "dev_preview"]) {
+    const statusBody = renderer.match(new RegExp(`case "${status}":[\\s\\S]*?(?=case |$)`))?.[0] ?? "";
+    assert.match(statusBody, /ResearchResultDisclosure/);
+    assert.match(statusBody, /ResultTrustLinks/);
+  }
+  assert.match(renderer, /연구 전용 결과입니다/);
+  assert.match(renderer, /AI가 만든 설명은 운영 데이터의 출처·기준일·검증 계약을 대신하지 않으며/);
 });
