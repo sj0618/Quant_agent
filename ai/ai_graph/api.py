@@ -45,6 +45,7 @@ from ai_graph.jobs import (
     run_job_sync,
 )
 from ai_graph.llm.role_calls import generate_strategy_description
+from ai_graph.llm.factory import live_provider_configuration_ready
 from ai_graph.preflight import (
     SCOPE_REFUSAL_REASON,
     UNSUPPORTED_SCOPE_REASON,
@@ -260,6 +261,7 @@ class ReadinessCheck(BaseModel):
         "migration_revision",
         "ai_contract_version",
         "rule_draft_signer",
+        "provider_config",
     ]
     ready: bool
     reason: str | None = None
@@ -1053,6 +1055,7 @@ def _release_readiness(
             migration_ready = False
     contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
     rule_draft_signer_ready = rule_draft_signer is not None
+    provider_config_ready, provider_reason = live_provider_configuration_ready(environ)
     checks = [
         ReadinessCheck(
             name="durable_job_store",
@@ -1073,6 +1076,11 @@ def _release_readiness(
             name="rule_draft_signer",
             ready=rule_draft_signer_ready,
             reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
+        ),
+        ReadinessCheck(
+            name="provider_config",
+            ready=provider_config_ready,
+            reason=provider_reason,
         ),
     ]
     return ReadinessResponse(

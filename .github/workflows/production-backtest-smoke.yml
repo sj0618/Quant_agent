@@ -455,12 +455,13 @@ jobs:
           PY
           REMOTE
 
-      - name: Verify public AI health
+      - name: Verify public AI readiness
         if: ${{ inputs.mode == 'live-audit' }}
         run: |
           curl --fail --silent --show-error \
             --connect-timeout 10 --max-time 30 \
-            https://qt-agent.kro.kr/ai-api/health
+            https://qt-agent.kro.kr/ai-api/readiness \
+            | python -c 'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert all(check["ready"] for check in payload["checks"])'
 
       - name: Benchmark internal backtest on two CPU cores
         if: ${{ inputs.mode == 'deployed-backtest' }}

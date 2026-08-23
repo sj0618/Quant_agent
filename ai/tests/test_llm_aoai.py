@@ -16,7 +16,7 @@ from ai_graph.llm.base import (
     LLMProviderConfigError,
     LLMResponseParseError,
 )
-from ai_graph.llm.factory import create_llm_client
+from ai_graph.llm.factory import create_llm_client, live_provider_configuration_ready
 from ai_graph.llm.mock import MockLLMClient
 
 
@@ -786,6 +786,56 @@ def test_llm_factory_falls_back_to_global_model_without_role_override() -> None:
 def test_llm_factory_requires_all_aoai_env_values() -> None:
     with pytest.raises(LLMProviderConfigError):
         create_llm_client({"AI_LLM_PROVIDER": "aoai"})
+
+
+def test_live_provider_configuration_rejects_mock_provider() -> None:
+    ready, reason = live_provider_configuration_ready({"AI_LLM_PROVIDER": "mock"})
+
+    assert ready is False
+    assert reason == "live_provider_required"
+
+
+def test_live_provider_configuration_requires_valid_aoai_configuration() -> None:
+    ready, reason = live_provider_configuration_ready(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": "not-a-url",
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "test-model",
+        }
+    )
+
+    assert ready is False
+    assert reason == "provider_config_invalid"
+
+
+def test_live_provider_configuration_accepts_valid_aoai_configuration() -> None:
+    ready, reason = live_provider_configuration_ready(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": "https://example.test/openai/responses?api-version=2025-04-01-preview",
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "test-model",
+        }
+    )
+
+    assert ready is True
+    assert reason is None
+
+
+def test_live_provider_configuration_rejects_invalid_role_specific_override() -> None:
+    ready, reason = live_provider_configuration_ready(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": "https://example.test/openai/responses?api-version=2025-04-01-preview",
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "test-model",
+            "AI_LLM_REPORT_WRITER_RESPONSES_URL": "not-a-url",
+        }
+    )
+
+    assert ready is False
+    assert reason == "provider_config_invalid"
 
 
 def test_response_start_deadline_measures_silence_not_thinking_time(monkeypatch) -> None:

@@ -14,6 +14,7 @@ from app.api.routes import (
     auth,
     fe_contract,
     health,
+    readiness,
     pages,
     reports_pdf_temp,
 )
@@ -131,6 +132,7 @@ def create_app() -> FastAPI:
 
     app.openapi = custom_openapi
     app.include_router(health.router)
+    app.include_router(readiness.router)
 
     # Canonical API paths used by the latest FE and deployed environments.
     app.include_router(auth.router, prefix="/api/v1")
