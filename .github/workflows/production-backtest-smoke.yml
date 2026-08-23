@@ -13,6 +13,7 @@ on:
           - live-aoai
           - live-full-analysis
           - live-audit
+          - server-diagnostics
           - trace-diagnostic
 
 permissions:
@@ -48,7 +49,12 @@ jobs:
           install -d -m 700 "$HOME/.ssh"
           printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
           chmod 600 "$HOME/.ssh/id_ed25519"
-          ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts"
+          for attempt in 1 2 3; do
+            ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts" \
+              && break
+            test "$attempt" = 3 && exit 1
+            sleep 2
+          done
           chmod 644 "$HOME/.ssh/known_hosts"
 
       - name: Stage branch benchmark without deploying
@@ -62,6 +68,23 @@ jobs:
             -P "$SERVER_PORT" \
             branch-source.tgz \
             "$SERVER_USER@$SERVER_HOST:$AOAI_RUN_ROOT.tgz"
+
+      - name: Read server resource state
+        if: ${{ inputs.mode == 'server-diagnostics' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" <<'REMOTE'
+          set -Eeuo pipefail
+          uptime
+          nproc
+          free -h
+          df -h /tmp
+          ps -eo pid,ppid,etime,pcpu,pmem,rss,stat,comm,args --sort=-pcpu | sed -n '1,30p'
+          REMOTE
 
       - name: Run live AOAI and branch backtest benchmarks
         if: ${{ inputs.mode == 'live-aoai' }}

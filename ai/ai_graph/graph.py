@@ -409,6 +409,15 @@ def _safe_state_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
         candidate = value.get(key)
         if isinstance(candidate, (str, int, float, bool)):
             metadata[key] = str(candidate)[:128]
+    data = value.get("data")
+    pipeline = data.get("pipeline_data_source") if isinstance(data, Mapping) else None
+    timings = pipeline.get("timings") if isinstance(pipeline, Mapping) else None
+    if isinstance(timings, Mapping):
+        metadata["timings"] = {
+            str(key): seconds
+            for key, seconds in timings.items()
+            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+        }
     return metadata
 
 

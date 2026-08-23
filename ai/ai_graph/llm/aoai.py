@@ -422,9 +422,10 @@ class AOAIResponsesClient:
         carries a usable answer: an incomplete or failed run still repeats the response
         object, but without the message the caller is trying to parse.
 
-        Headers alone do not satisfy the response-start deadline. Until the first
-        non-empty text delta arrives, both the short socket read timeout and the
-        wall-clock check below remain active. The normal timeout applies afterwards.
+        Headers alone do not satisfy the response-start deadline. Until the response
+        actually starts - a `web_search_call.searching` event or the first non-empty
+        text delta - both the short socket read timeout and the wall-clock check below
+        remain active. The normal timeout applies afterwards.
 
         The deadline is silence, not elapsed time. It used to run from the start of the
         attempt to the first text delta, which is not a liveness signal at all on a
@@ -440,6 +441,7 @@ class AOAIResponsesClient:
         final_payload: dict[str, Any] | None = None
         terminal_type: str | None = None
         first_text_seconds: float | None = None
+        response_started = False
         last_event_at = attempt_started
         for line in response.iter_lines():
             if not line.startswith("data:"):
@@ -457,6 +459,9 @@ class AOAIResponsesClient:
             # request, which is the only thing the start deadline is entitled to check.
             last_event_at = time.perf_counter()
             event_type = event.get("type")
+            if event_type == "response.web_search_call.searching":
+                response_started = True
+                response.request.extensions["timeout"]["read"] = self.timeout_seconds
             if event_type == "response.output_text.delta":
                 delta = event.get("delta")
                 if (
@@ -467,11 +472,12 @@ class AOAIResponsesClient:
                     first_text_seconds = round(
                         time.perf_counter() - attempt_started, 6
                     )
+                    response_started = True
                     response.request.extensions["timeout"][
                         "read"
                     ] = self.timeout_seconds
             if (
-                first_text_seconds is None
+                not response_started
                 and time.perf_counter() - last_event_at
                 > self.response_start_timeout_seconds
             ):

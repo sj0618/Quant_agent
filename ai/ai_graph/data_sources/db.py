@@ -3,9 +3,11 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from time import perf_counter
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -211,7 +213,14 @@ class PostgresPipelineDataSource:
         self.unavailable_indicator_families: tuple[str, ...] = ()
 
     def load(self, query: str, trace_id: str) -> PipelineDataBundle:
+        # Wall-clock per phase. A slow load used to surface as one opaque number, which
+        # named neither the read that spent the time nor whether it was the connection,
+        # the screen or the price scan.
+        timings: dict[str, float] = {}
+        load_started = perf_counter()
+        connect_started = perf_counter()
         with self._connect() as conn:
+            timings["connect_seconds"] = perf_counter() - connect_started
             self._set_statement_timeout(conn)
             # Ask what the warehouse can actually serve before spending anything on the
             # query. This used to run last, after screening, so a strategy whose data is
@@ -221,7 +230,9 @@ class PostgresPipelineDataSource:
             # mart.dart_financial_asof empty, every fundamental strategy took that path
             # and surfaced as "데이터 조회 시간이 초과되었습니다", which named neither the
             # missing data nor the fact that waiting longer could not help.
-            capability_availability = measure_capabilities(conn)
+            capability_availability = self._timed(
+                timings, "capability_seconds", measure_capabilities, conn
+            )
             unsupported = unsupported_capabilities(query, capability_availability)
             if unsupported:
                 return PipelineDataBundle(
@@ -234,9 +245,12 @@ class PostgresPipelineDataSource:
                         "stopped_before_screening": True,
                         "unsupported_capabilities": unsupported,
                         "capability_probe": capability_availability,
+                        "timings": _rounded_timings(timings, load_started),
                     },
                 )
-            backtest_window = self._resolve_backtest_window(conn)
+            backtest_window = self._timed(
+                timings, "backtest_window_seconds", self._resolve_backtest_window, conn
+            )
             if backtest_window is None:
                 raise PipelineDataUnavailableError(
                     "pit_calendar_unavailable",
@@ -253,11 +267,37 @@ class PostgresPipelineDataSource:
             ticker_resolution = "screening"
             already_screened = _query_requests_screening(query)
             screening_mode = already_screened
+            pit_market: tuple[
+                list[str],
+                dict[str, Any],
+                Mapping[str, Mapping[str, Any]],
+                list[dict[str, Any]],
+                int,
+            ] | None = None
+            parallel_screening_backtest = False
             if already_screened:
-                screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
+                # The screen and the PIT market read nothing from each other: membership
+                # is fixed by date, and today's picks are filtered against it afterwards
+                # either way. So they run at the same time, on separate connections. The
+                # capability and calendar gates above still run first, so a query the
+                # warehouse cannot serve never pays for either read.
+                parallel_screening_backtest = True
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    screening = executor.submit(self._screen_on_its_own_connection, query)
+                    pit_market = self._load_pit_market(
+                        conn, backtest_window, query, indicator_families, timings
+                    )
+                    (
+                        screening_candidates,
+                        screening_relaxation,
+                        screening_timings,
+                    ) = screening.result()
+                timings.update(screening_timings)
             single_ticker: str | None = None
             if not screening_candidates:
-                single_ticker = self._resolve_ticker(conn, query)
+                single_ticker = self._timed(
+                    timings, "ticker_resolution_seconds", self._resolve_ticker, conn, query
+                )
                 if single_ticker is None:
                     screening_mode = True
                     # Ambiguous query (no explicit ticker, no name match): screen as a
@@ -271,8 +311,8 @@ class PostgresPipelineDataSource:
                     # for a screen that legitimately matched nothing today it doubled the
                     # cost of the request and pushed it into a statement timeout.
                     if not already_screened:
-                        screening_candidates, screening_relaxation = self._screen_with_relaxation(
-                            conn, query
+                        screening_candidates, screening_relaxation = self._timed(
+                            timings, "screening_seconds", self._screen_with_relaxation, conn, query
                         )
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
@@ -282,6 +322,17 @@ class PostgresPipelineDataSource:
                 else:
                     ticker_resolution = "explicit_or_name_match"
             if screening_mode:
+                if pit_market is None:
+                    pit_market = self._load_pit_market(
+                        conn, backtest_window, query, indicator_families, timings
+                    )
+                (
+                    tickers,
+                    universe_descriptor,
+                    symbol_info_by_ticker,
+                    price_rows,
+                    effective_lookback_days,
+                ) = pit_market
                 # Current recommendations are output only. PIT membership is fixed by
                 # date and cannot be widened by a present-day screen.
                 recommended = _backtest_ticker_pool(
@@ -290,14 +341,6 @@ class PostgresPipelineDataSource:
                 # Current candidates are context only: the backtest trades its own
                 # PIT universe, so a candidate outside it must not become the traded
                 # ticker either. Record how many were excluded for report disclosure.
-                tickers, universe_descriptor = self._fetch_backtest_universe(
-                    conn, backtest_window
-                )
-                if not tickers:
-                    raise PipelineDataUnavailableError(
-                        "pit_universe_empty",
-                        "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
-                    )
                 pit_set = set(tickers)
                 excluded_screening_candidate_count = sum(
                     1 for item in recommended if item not in pit_set
@@ -310,19 +353,24 @@ class PostgresPipelineDataSource:
                 universe_descriptor["excluded_screening_candidate_count"] = (
                     excluded_screening_candidate_count
                 )
-                symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
-                self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
-                price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, symbol_info_by_ticker, query, backtest_window, indicator_families
-                )
-                self._set_statement_timeout(conn)
             elif single_ticker:
                 ticker = single_ticker
                 tickers = [ticker]
-                symbol_info = self._fetch_symbol_info(conn, ticker)
-                price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, {ticker: symbol_info}, query, backtest_window, indicator_families
+                symbol_info = self._timed(
+                    timings, "symbol_info_seconds", self._fetch_symbol_info, conn, ticker
+                )
+                price_rows, effective_lookback_days = self._timed(
+                    timings,
+                    "price_rows_seconds",
+                    self._fetch_price_rows,
+                    conn,
+                    tickers,
+                    {ticker: symbol_info},
+                    query,
+                    backtest_window,
+                    indicator_families,
+                    timings=timings,
                 )
             else:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
@@ -343,9 +391,15 @@ class PostgresPipelineDataSource:
             pit_members_without_price_rows = sorted(
                 set(tickers) - {str(row.get("ticker") or "").zfill(6) for row in price_rows}
             )
-            l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
-            macro_status = self._fetch_macro_status(conn)
-            macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
+            l4_evidence = self._timed(
+                timings, "l4_evidence_seconds", self._fetch_l4_evidence, conn, ticker, trace_id
+            )
+            macro_status = self._timed(
+                timings, "macro_status_seconds", self._fetch_macro_status, conn
+            )
+            macro_snapshot = self._timed(
+                timings, "macro_snapshot_seconds", self._fetch_macro_snapshot, conn, price_rows
+            )
             # Capabilities were probed up front; nothing since then can change them.
 
         source_manifest = build_source_manifest(
@@ -377,6 +431,7 @@ class PostgresPipelineDataSource:
                 "recommended_tickers": recommended,
                 "recommendation_ticker": recommended[0] if recommended else None,
                 "backtest_universe": universe_descriptor,
+                "parallel_screening_backtest": parallel_screening_backtest,
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [
@@ -411,7 +466,102 @@ class PostgresPipelineDataSource:
                 "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
                 "macro_status": macro_status,
+                "timings": _rounded_timings(timings, load_started),
             },
+        )
+
+    @staticmethod
+    def _timed(
+        timings: dict[str, float],
+        name: str,
+        call: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run `call`, accumulating its wall-clock under `name`."""
+
+        started = perf_counter()
+        try:
+            return call(*args, **kwargs)
+        finally:
+            timings[name] = timings.get(name, 0.0) + perf_counter() - started
+
+    def _screen_on_its_own_connection(
+        self, query: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, float]]:
+        """Screen on a second connection so it can overlap the PIT market load.
+
+        Its timings come back with the result rather than being written into the
+        caller's dict, which the calling thread is still updating.
+        """
+
+        connect_started = perf_counter()
+        with self._connect() as conn:
+            connect_seconds = perf_counter() - connect_started
+            self._set_statement_timeout(conn)
+            screening_started = perf_counter()
+            candidates, relaxation = self._screen_with_relaxation(conn, query)
+            screening_seconds = perf_counter() - screening_started
+        return (
+            candidates,
+            relaxation,
+            {
+                "screening_connect_seconds": connect_seconds,
+                "screening_seconds": screening_seconds,
+            },
+        )
+
+    def _load_pit_market(
+        self,
+        conn: Any,
+        window: Mapping[str, Any],
+        query: str,
+        indicator_families: Sequence[str],
+        timings: dict[str, float],
+    ) -> tuple[
+        list[str],
+        dict[str, Any],
+        Mapping[str, Mapping[str, Any]],
+        list[dict[str, Any]],
+        int,
+    ]:
+        """The PIT universe and its price rows - reads nothing from today's screen."""
+
+        tickers, universe_descriptor = self._timed(
+            timings, "universe_seconds", self._fetch_backtest_universe, conn, window
+        )
+        if not tickers:
+            raise PipelineDataUnavailableError(
+                "pit_universe_empty",
+                "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
+            )
+        symbol_info_by_ticker = self._timed(
+            timings, "symbol_info_seconds", self._fetch_symbol_info_map, conn, tickers
+        )
+        # Widen the statement timeout for the universe price/indicator/financial scan -
+        # it is far heavier than the screening SELECTs and the tight default is not
+        # enough once the universe is the whole PIT membership.
+        self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
+        price_rows, effective_lookback_days = self._timed(
+            timings,
+            "price_rows_seconds",
+            self._fetch_price_rows,
+            conn,
+            tickers,
+            symbol_info_by_ticker,
+            query,
+            window,
+            indicator_families,
+            timings=timings,
+        )
+        self._set_statement_timeout(conn)
+        return (
+            tickers,
+            universe_descriptor,
+            symbol_info_by_ticker,
+            price_rows,
+            effective_lookback_days,
         )
 
     def _fetch_backtest_universe(
@@ -764,9 +914,13 @@ class PostgresPipelineDataSource:
         query: str,
         window: Mapping[str, Any],
         indicator_families: Sequence[str] | None = None,
+        *,
+        timings: dict[str, float] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         del query
+        timings = {} if timings is None else timings
         ticker_list = list(tickers)
+        ohlcv_started = perf_counter()
         rows = conn.execute(
             f"""
             SELECT
@@ -790,10 +944,12 @@ class PostgresPipelineDataSource:
             """,
             [ticker_list, window["start"], window["end"]],
         ).fetchall()
+        timings["price_ohlcv_query_seconds"] = perf_counter() - ohlcv_started
         earliest_priced_date = min((_date_value(row["as_of_date"]) for row in rows), default=None)
         families = indicator_families or tuple(INDICATOR_TABLES)
         indicators_by_family: dict[str, dict[str, dict[date, Mapping[str, Any]]]] = {}
         unavailable_families: list[str] = []
+        indicators_started = perf_counter()
         for family in families:
             try:
                 indicators_by_family[family] = self._fetch_indicator_values_by_date(
@@ -805,7 +961,11 @@ class PostgresPipelineDataSource:
                 self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
                 unavailable_families.append(family)
         self.unavailable_indicator_families = tuple(unavailable_families)
+        timings["price_indicator_seconds"] = perf_counter() - indicators_started
+        financials_started = perf_counter()
         financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
+        timings["price_financial_seconds"] = perf_counter() - financials_started
+        conversion_started = perf_counter()
         price_rows = [
             _price_row_from_feature_frame_record(
                 _feature_frame_row_from_sources(
@@ -817,7 +977,10 @@ class PostgresPipelineDataSource:
             )
             for row in rows
         ]
+        timings["price_row_conversion_seconds"] = perf_counter() - conversion_started
+        attach_started = perf_counter()
         _attach_pointintime_financials(price_rows, financials_by_ticker)
+        timings["price_financial_attach_seconds"] = perf_counter() - attach_started
         return price_rows, int(window["session_count"])
 
     def _fetch_financial_timeline(
@@ -1172,6 +1335,15 @@ class PostgresPipelineDataSource:
             "reason": "BOK macro mart is pilot-only and does not cover KOSPI/FX/VKOSPI rules.",
         }
 
+
+
+def _rounded_timings(timings: Mapping[str, float], load_started: float) -> dict[str, float]:
+    """Phase timings plus the elapsed total, rounded for the report payload."""
+
+    return {
+        **{name: round(seconds, 6) for name, seconds in timings.items()},
+        "total_seconds": round(perf_counter() - load_started, 6),
+    }
 
 
 def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle:
