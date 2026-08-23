@@ -1,10 +1,47 @@
 from __future__ import annotations
 
+from hashlib import sha256
+from pathlib import Path
 from typing import Any
-
 
 _SHARPE_SOURCE = "https://web.stanford.edu/~wfsharpe/art/sr/SR.htm"
 _QUANTSTATS_SOURCE = "https://github.com/ranaroussi/quantstats"
+METRIC_REGISTRY_VERSION = "quant-metric-registry.v3"
+
+# This is deliberately independent of the engine's much larger debug summary.  A new
+# engine scalar must be registered here before it can become a public performance fact.
+PUBLIC_METRIC_KEYS = (
+    "total_return",
+    "cagr",
+    "annualized_volatility",
+    "sharpe_ratio",
+    "sortino_ratio",
+    "max_drawdown",
+    "calmar_ratio",
+    "win_rate",
+    "profit_factor",
+    "benchmark_return",
+    "excess_return",
+    "out_sample_excess_return",
+    "benchmark_period_win_rate",
+    "benchmark_period_loss_rate",
+    "out_sample_benchmark_period_loss_rate",
+    "in_sample_sharpe",
+    "out_sample_sharpe",
+    "degradation",
+)
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_IMPLEMENTATION_SOURCES = {
+    "engine": "backtest_module/backtest_module/performance.py",
+    "analysis": "ai/ai_graph/nodes/backtest.py",
+    "projection": "ai/ai_graph/quant_performance.py",
+}
+_DEFAULT_AS_OF_POLICY = "입력 가격열의 마지막 거래일을 기준 시각으로 기록합니다."
+_DEFAULT_NULL_POLICY = (
+    "값이 없거나 비유한값이면 0으로 대체하지 않고 value=null, is_available=false로 "
+    "표시합니다. 신뢰도 부족이면 공개 지표 전체를 숨깁니다."
+)
 
 
 _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
@@ -75,9 +112,15 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     "profit_factor": {
         "label": "수익팩터",
         "unit": "ratio",
-        "plain_explanation": "총이익을 총손실로 나눈 값입니다. 수익분포 기반 period-return 값이며, 거래 수량 근사값이 아닙니다.",
+        "plain_explanation": (
+            "백테스트 일별 기간수익률(period-return)의 양수 합계를 음수 합계의 절대값으로 "
+            "나눈 값입니다. 승률이나 거래 수량의 근사값이 아닙니다."
+        ),
         "why_used": "이익 기여 구간과 손실 구간의 상대 비율을 보조적으로 보여줍니다.",
-        "caution": "거래 수가 적으면 과도하게 변동할 수 있습니다.",
+        "caution": (
+            "손실 기간이 없어 분모가 0이면 유한한 비율이 아니므로 값을 임의 상한이나 1로 "
+            "바꾸지 않고 검증 불가로 표시합니다."
+        ),
         "source_refs": [_QUANTSTATS_SOURCE],
     },
     "benchmark_return": {
@@ -155,15 +198,219 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
 }
 
 
+def _contract(
+    formula: str,
+    *,
+    inputs: list[str],
+    input_window: str,
+    implementation_source: str,
+    implementation_ref: str,
+    denominator: str = "해당 없음",
+    clip_policy: str = "유한한 엔진 값을 임의로 상한/하한 처리하지 않습니다.",
+    null_policy: str = _DEFAULT_NULL_POLICY,
+    as_of_policy: str = _DEFAULT_AS_OF_POLICY,
+) -> dict[str, Any]:
+    return {
+        "formula": formula,
+        "inputs": inputs,
+        "input_window": input_window,
+        "denominator": denominator,
+        "clip_policy": clip_policy,
+        "null_policy": null_policy,
+        "as_of_policy": as_of_policy,
+        "implementation_source": implementation_source,
+        "implementation_ref": implementation_ref,
+    }
+
+
+_METRIC_CONTRACTS: dict[str, dict[str, Any]] = {
+    "total_return": _contract(
+        "R_total = V_T / V_0 - 1",
+        inputs=["초기 총자산 V_0", "최종 총자산 V_T"],
+        input_window="전체 백테스트 기간",
+        implementation_source="engine",
+        implementation_ref="backtest_module.performance.calculate_quantstats_metrics → quantstats.stats.comp",
+    ),
+    "cagr": _contract(
+        "CAGR = (V_T / V_0)^(1 / years) - 1",
+        inputs=["초기·최종 총자산", "기간의 달력일/연수"],
+        input_window="전체 백테스트 기간",
+        implementation_source="engine",
+        implementation_ref="backtest_module.performance.calculate_quantstats_metrics → quantstats.stats.cagr",
+    ),
+    "annualized_volatility": _contract(
+        "σ_ann = std(R_t) × √252",
+        inputs=["일별 기간수익률 R_t", "연환산 거래일 252"],
+        input_window="전체 백테스트 기간의 일별 수익률",
+        implementation_source="engine",
+        implementation_ref="backtest_module.performance.calculate_quantstats_metrics → quantstats.stats.volatility",
+    ),
+    "sharpe_ratio": _contract(
+        "Sharpe = mean(R_t - R_f) / std(R_t - R_f) × √252",
+        inputs=["일별 기간수익률 R_t", "QuantStats 무위험수익률 R_f"],
+        input_window="전체 백테스트 기간의 일별 수익률",
+        implementation_source="engine",
+        implementation_ref="backtest_module.performance.calculate_quantstats_metrics → quantstats.stats.sharpe",
+    ),
+    "sortino_ratio": _contract(
+        "Sortino = mean(R_t - target) / downside_deviation(R_t) × √252",
+        inputs=["일별 기간수익률 R_t", "목표수익률", "하방 수익률"],
+        input_window="전체 백테스트 기간의 일별 수익률",
+        implementation_source="engine",
+        implementation_ref="backtest_module.performance.calculate_quantstats_metrics → quantstats.stats.sortino",
+    ),
+    "max_drawdown": _contract(
+        "MDD = min_t(V_t / max_{u≤t}(V_u) - 1)",
+        inputs=["일별 총자산 V_t"],
+        input_window="전체 백테스트 기간의 자산곡선",
+        implementation_source="engine",
+        implementation_ref="backtest_module.performance.calculate_quantstats_metrics → quantstats.stats.max_drawdown",
+    ),
+    "calmar_ratio": _contract(
+        "Calmar = CAGR / |MDD|",
+        inputs=["연환산수익률 CAGR", "최대낙폭 MDD"],
+        input_window="전체 백테스트 기간",
+        implementation_source="engine",
+        implementation_ref="backtest_module.performance.calculate_quantstats_metrics → quantstats.stats.calmar",
+        denominator="|MDD|",
+    ),
+    "win_rate": _contract(
+        "trade_win_rate = count(net_pnl > 0) / count(completed_trades)",
+        inputs=["완결 거래별 순손익 net_pnl"],
+        input_window="전체 백테스트 기간의 완료 거래",
+        implementation_source="analysis",
+        implementation_ref="ai_graph.nodes.backtest._metrics_from_engine_result ← engine trade_win_rate",
+        denominator="완료 거래 수",
+    ),
+    "profit_factor": _contract(
+        "PF = Σ max(R_t, 0) / |Σ min(R_t, 0)|",
+        inputs=["백테스트 자산곡선에서 계산한 일별 기간수익률 R_t"],
+        input_window="전체 백테스트 기간의 일별 수익률(첫 기준점 제외)",
+        implementation_source="analysis",
+        implementation_ref=(
+            "backtest_module.performance.calculate_quantstats_metrics → "
+            "quantstats.stats.profit_factor; ai_graph.nodes.backtest._profit_factor"
+        ),
+        denominator="|Σ min(R_t, 0)| (음수 기간수익률의 절대 합)",
+        clip_policy="상한/하한을 적용하지 않습니다. 승률 기반 프록시·0~3 clip을 사용하지 않습니다.",
+        null_policy=(
+            "분모가 0이어서 엔진 값이 non-finite이거나, 값이 없거나 defaulted 경고가 있으면 "
+            "value=null, is_available=false로 표시합니다."
+        ),
+    ),
+    "benchmark_return": _contract(
+        "R_benchmark = V_b,T / V_b,0 - 1",
+        inputs=["고정 유니버스 종목별 종가"],
+        input_window="전략과 동일한 전체 백테스트 기간",
+        implementation_source="analysis",
+        implementation_ref="ai_graph.nodes.backtest._equal_weight_benchmark_curve",
+    ),
+    "excess_return": _contract(
+        "R_excess = R_strategy - R_benchmark",
+        inputs=["전략 누적수익률", "동일 기간 벤치마크 수익률"],
+        input_window="전략과 동일한 전체 백테스트 기간",
+        implementation_source="projection",
+        implementation_ref="ai_graph.quant_performance._build_public_metric_details",
+    ),
+    "out_sample_excess_return": _contract(
+        "R_OOS,excess = Π(1 + R_strategy,t) - Π(1 + R_benchmark,t)",
+        inputs=["홀드아웃 전략·벤치마크 일별 수익률"],
+        input_window="후보 선택에 사용하지 않은 마지막 30% hold-out",
+        implementation_source="analysis",
+        implementation_ref="ai_graph.nodes.backtest._metrics_from_engine_result",
+    ),
+    "benchmark_period_win_rate": _contract(
+        "win_rate = count(R_strategy,block > R_benchmark,block) / count(complete_blocks)",
+        inputs=["전략·벤치마크 일별 수익률", "63거래일 고정 블록"],
+        input_window="전체 기간의 완료된 63거래일 블록",
+        implementation_source="analysis",
+        implementation_ref="ai_graph.nodes.backtest._benchmark_period_stats",
+        denominator="완료된 63거래일 블록 수",
+    ),
+    "benchmark_period_loss_rate": _contract(
+        "loss_rate = count(R_strategy,block < R_benchmark,block) / count(complete_blocks)",
+        inputs=["전략·벤치마크 일별 수익률", "63거래일 고정 블록"],
+        input_window="전체 기간의 완료된 63거래일 블록",
+        implementation_source="analysis",
+        implementation_ref="ai_graph.nodes.backtest._benchmark_period_stats",
+        denominator="완료된 63거래일 블록 수",
+    ),
+    "out_sample_benchmark_period_loss_rate": _contract(
+        "OOS loss_rate = count(R_strategy,block < R_benchmark,block) / count(complete_blocks)",
+        inputs=["홀드아웃 전략·벤치마크 일별 수익률", "63거래일 고정 블록"],
+        input_window="마지막 30% hold-out의 완료된 63거래일 블록",
+        implementation_source="analysis",
+        implementation_ref="ai_graph.nodes.backtest._benchmark_period_stats",
+        denominator="hold-out 완료 블록 수",
+    ),
+    "in_sample_sharpe": _contract(
+        "Sharpe_train = mean(R_t - R_f) / std(R_t - R_f) × √252",
+        inputs=["학습구간 일별 기간수익률", "무위험수익률"],
+        input_window="후보 선택에 쓴 최초 70% 학습구간",
+        implementation_source="analysis",
+        implementation_ref="ai_graph.nodes.backtest._split_sharpes",
+    ),
+    "out_sample_sharpe": _contract(
+        "Sharpe_holdout = mean(R_t - R_f) / std(R_t - R_f) × √252",
+        inputs=["홀드아웃 일별 기간수익률", "무위험수익률"],
+        input_window="후보 선택에 쓰지 않은 마지막 30% hold-out",
+        implementation_source="analysis",
+        implementation_ref="ai_graph.nodes.backtest._split_sharpes",
+    ),
+    "degradation": _contract(
+        "degradation = max(0, (Sharpe_train - Sharpe_holdout) / |Sharpe_train|)",
+        inputs=["학습구간 샤프비율", "홀드아웃 샤프비율"],
+        input_window="70% 학습구간과 30% hold-out",
+        implementation_source="analysis",
+        implementation_ref="ai_graph.nodes.backtest._degradation",
+        denominator="|Sharpe_train|; Sharpe_train=0이면 구현 정책값 0",
+    ),
+}
+
+
+def _implementation_hash(source_key: str) -> str:
+    relative_path = _IMPLEMENTATION_SOURCES[source_key]
+    try:
+        source = (_REPOSITORY_ROOT / relative_path).read_bytes()
+    except OSError as error:
+        raise RuntimeError(
+            f"metric implementation source is unavailable: {relative_path}"
+        ) from error
+    return sha256(source).hexdigest()
+
+
+def metric_registry_entry(key: str) -> dict[str, Any]:
+    """Return the canonical contract for a public quantitative metric."""
+
+    explanation = _METRIC_EXPLANATIONS.get(key)
+    contract = _METRIC_CONTRACTS.get(key)
+    if explanation is None or contract is None:
+        raise KeyError(f"metric is not registered for public output: {key}")
+    source_key = contract["implementation_source"]
+    return {
+        "key": key,
+        **explanation,
+        **contract,
+        "formula_version": METRIC_REGISTRY_VERSION,
+        "implementation_path": _IMPLEMENTATION_SOURCES[source_key],
+        "implementation_hash": _implementation_hash(source_key),
+    }
+
+
+def public_metric_registry() -> list[dict[str, Any]]:
+    """Ordered whitelist and semantic registry for all public metric cards."""
+
+    return [metric_registry_entry(key) for key in PUBLIC_METRIC_KEYS]
+
+
 def metric_explanation(key: str) -> dict[str, Any]:
-    return _METRIC_EXPLANATIONS.get(
-        key,
-        {
-            "label": key,
-            "unit": "ratio",
-            "plain_explanation": f"{key}는 백테스트 성능 지표입니다.",
-            "why_used": "성능의 보조 판별값으로 사용됩니다.",
-            "caution": "지표 정의가 제한되어 있어 보조적으로 해석합니다.",
-            "source_refs": [],
-        },
-    )
+    if key in _METRIC_EXPLANATIONS:
+        return metric_registry_entry(key)
+    return {
+        "label": key,
+        "unit": "ratio",
+        "plain_explanation": f"{key}는 백테스트 성능 지표입니다.",
+        "why_used": "성능의 보조 판별값으로 사용됩니다.",
+        "caution": "지표 정의가 제한되어 있어 보조적으로 해석합니다.",
+        "source_refs": [],
+    }

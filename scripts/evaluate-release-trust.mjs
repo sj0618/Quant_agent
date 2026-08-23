@@ -124,6 +124,7 @@ export function buildReleaseTrustChecks({
         "pytest",
         "-q",
         "ai/tests/test_research_eligibility.py::test_ineligible_reasons_have_fixed_precedence",
+        "ai/tests/test_source_manifest.py::test_release_profile_fails_before_fixture_analysis_can_return_a_result",
         "ai/tests/test_db_data_source.py::test_runtime_facts_classify_database_failure_without_error_details",
         "ai/tests/test_db_data_source.py::test_configured_database_failure_is_not_replaced_with_fixture",
         "ai/tests/test_llm_aoai.py::test_aoai_provider_failures_keep_their_cause_for_job_classification[timeout]",

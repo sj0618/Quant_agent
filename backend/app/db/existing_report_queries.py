@@ -681,6 +681,143 @@ def _report_summary_item(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _reader_report_summary_item(row: dict[str, Any]) -> dict[str, Any]:
+    """Map the browser archive list to its explicit, narrow allowlist.
+
+    Do not reuse ``_report_summary_item`` here.  That mapper intentionally
+    serves legacy/internal callers and includes analytical narrative and action
+    fields that must never be sent to the browser archive reader.
+    """
+
+    sort_at = _first_non_empty(row.get("sort_at"), row.get("sent_at"), row.get("created_at"))
+    report_date = _first_non_empty(row.get("report_date"), sort_at)
+    item = {
+        "id": _text(row.get("report_id")),
+        "runId": _optional_text(row.get("backtest_run_id")),
+        "date": _report_date_text(report_date),
+        "weekday": _report_weekday_text(row.get("weekday"), report_date),
+        "sentAt": _report_sent_at_text(_first_non_empty(row.get("sent_at"), row.get("created_at"))),
+        "status": _normalize_status(row.get("status")),
+        "createdAt": _as_iso(row.get("created_at")),
+        "updatedAt": _as_iso(row.get("updated_at")),
+        "publishedAt": _as_iso(sort_at),
+        "_sortAt": _as_iso(sort_at),
+    }
+    return item
+
+
+async def list_reader_reports(
+    engine: AsyncEngine,
+    *,
+    limit: int = REPORT_LIST_DEFAULT_LIMIT,
+    cursor: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    """List the reader-safe archive projection for one authenticated owner.
+
+    The archive reader is intentionally searchable only by immutable report ID,
+    lifecycle status, and archive date.  Legacy generated narrative, strategy,
+    candidate, market, and score fields stay server-side for internal callers.
+    """
+
+    sanitized_limit = _coerce_limit(limit)
+    cursor_payload = _decode_cursor(cursor)
+    normalized_user_id = _coerce_bigint_user_id(user_id or "")
+    filters: list[str] = ["run.user_id = CAST(:user_id AS bigint)"]
+    params: dict[str, Any] = {"limit_plus_one": sanitized_limit + 1, "user_id": str(normalized_user_id)}
+    if status is not None and str(status).strip():
+        filters.append("report.status = :status")
+        params["status"] = str(status).strip()
+    search_pattern = _normalize_search_pattern(q)
+    if search_pattern is not None:
+        filters.append(
+            "(report.report_id::text ILIKE :q "
+            "OR COALESCE(report.status, '') ILIKE :q "
+            "OR COALESCE(report.report_date::text, '') ILIKE :q)"
+        )
+        params["q"] = search_pattern
+    if cursor_payload is not None:
+        filters.append(
+            "(COALESCE(report.sent_at, report.created_at), report.report_id) "
+            "< (CAST(:cursor_sort_at AS timestamptz), :cursor_id)"
+        )
+        params["cursor_sort_at"] = cursor_payload[0]
+        params["cursor_id"] = cursor_payload[1]
+
+    sql = f"""
+        SELECT
+            report.report_id::text AS report_id,
+            report.backtest_run_id,
+            report.report_date,
+            report.weekday,
+            report.sent_at,
+            report.status,
+            report.created_at,
+            report.updated_at,
+            COALESCE(report.sent_at, report.created_at) AS sort_at
+        FROM app.strategy_email_report AS report
+        INNER JOIN app.backtest_run AS run
+          ON run.run_id = report.backtest_run_id
+        WHERE {' AND '.join(filters)}
+        ORDER BY COALESCE(report.sent_at, report.created_at) DESC, report.report_id DESC
+        LIMIT :limit_plus_one
+    """
+    rows = await fetch_all(engine, sql, params)
+    with measure_span("mapping"):
+        items = [_reader_report_summary_item(row) for row in rows[:sanitized_limit]]
+        has_more = len(rows) > sanitized_limit
+        next_cursor = _cursor_payload(items[-1]["_sortAt"], items[-1]["id"]) if has_more and items else None
+        for item in items:
+            item.pop("_sortAt", None)
+    return {"items": items, "meta": {"limit": sanitized_limit, "hasMore": has_more, "nextCursor": next_cursor}}
+
+
+async def get_reader_report(engine: AsyncEngine, report_id: str, *, user_id: str | None = None) -> dict[str, Any] | None:
+    """Return the archive reader's allowlisted detail projection.
+
+    This deliberately avoids the full ``get_report`` join graph (news,
+    candidates, performance, narrative, action signals).  Keep that internal
+    function unchanged for persistence and operator workflows.
+    """
+
+    filters = ["report.report_id = :report_id"]
+    params: dict[str, Any] = {"report_id": report_id}
+    if user_id is not None and str(user_id).strip():
+        normalized_user_id = _coerce_bigint_user_id(user_id)
+        filters.append("run.user_id = CAST(:user_id AS bigint)")
+        params["user_id"] = str(normalized_user_id)
+    row = await fetch_one(
+        engine,
+        f"""
+        SELECT
+            report.report_id::text AS report_id,
+            report.backtest_run_id,
+            report.report_date,
+            report.weekday,
+            report.sent_at,
+            report.status,
+            report.created_at,
+            report.updated_at,
+            report.content_html,
+            COALESCE(report.sent_at, report.created_at) AS sort_at
+        FROM app.strategy_email_report AS report
+        INNER JOIN app.backtest_run AS run
+          ON run.run_id = report.backtest_run_id
+        WHERE {' AND '.join(filters)}
+        LIMIT 1
+        """,
+        params,
+    )
+    if row is None:
+        return None
+    item = _reader_report_summary_item(row)
+    item.pop("_sortAt", None)
+    item["contentSections"] = _reader_evidence_sections(row.get("content_html"))
+    return item
+
+
 async def list_reports(
     engine: AsyncEngine,
     *,

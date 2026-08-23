@@ -1,4 +1,5 @@
 import type { ResearchResultV1 } from "@/types/researchContract";
+import { ResultTrustLinks } from "@/components/common/ResultTrustLinks";
 
 interface ResearchResultRendererProps {
   result: ResearchResultV1;
@@ -24,6 +25,7 @@ export function ResearchResultRenderer({ result }: ResearchResultRendererProps) 
               </li>
             ))}
           </ul>
+          <ResultTrustLinks resultId={result.result_id} version={result.rule_version} />
         </section>
       );
     case "need_clarification":
@@ -38,6 +40,7 @@ export function ResearchResultRenderer({ result }: ResearchResultRendererProps) 
               </li>
             ))}
           </ul>
+          <ResultTrustLinks resultId={result.result_id} version={result.rule_version} />
         </section>
       );
     case "no_match":
@@ -46,6 +49,7 @@ export function ResearchResultRenderer({ result }: ResearchResultRendererProps) 
           <h2 id="research-result-title">조건 일치 항목이 없습니다</h2>
           <p>{result.explanation}</p>
           <p>출처 PostgreSQL · 기준일 {result.provenance.as_of}의 조건 일치 수는 0개입니다.</p>
+          <ResultTrustLinks resultId={result.result_id} version={result.rule_version} />
         </section>
       );
     case "unavailable":
@@ -54,6 +58,7 @@ export function ResearchResultRenderer({ result }: ResearchResultRendererProps) 
           <h2 id="research-result-title">결과를 표시할 수 없습니다</h2>
           <p>{result.explanation}</p>
           <p>{result.retryable ? "운영 데이터 상태가 확인된 뒤 다시 시도할 수 있습니다." : "현재는 다시 시도할 수 없습니다."}</p>
+          <ResultTrustLinks resultId={result.result_id} version={result.rule_version} />
         </section>
       );
     case "failed":
@@ -62,6 +67,7 @@ export function ResearchResultRenderer({ result }: ResearchResultRendererProps) 
           <h2 id="research-result-title">처리에 실패했습니다</h2>
           <p>{result.explanation}</p>
           <p>문의 시 참조 번호: {result.support_reference}</p>
+          <ResultTrustLinks resultId={result.result_id} version={result.rule_version} />
         </section>
       );
     case "dev_preview":
@@ -70,6 +76,7 @@ export function ResearchResultRenderer({ result }: ResearchResultRendererProps) 
           <h2 id="research-result-title">개발 검증 미리보기</h2>
           <p>{result.explanation}</p>
           <p>이 상태는 운영 데이터 결과가 아니며 공개 화면에서 사용하지 않습니다.</p>
+          <ResultTrustLinks resultId={result.result_id} version={result.rule_version} />
         </section>
       );
   }

@@ -17,8 +17,10 @@ from ai_graph.nodes.backtest import (
     _price_rows,
     _public_engine_summary,
     _summary_float_default,
+    _summary_warning_list,
+    _undefined_metric_availability,
 )
-from ai_graph.quant_explanations import metric_explanation
+from ai_graph.quant_explanations import PUBLIC_METRIC_KEYS, metric_explanation
 from ai_graph.quant_strategy import build_strategy_explanation
 from ai_graph.research_eligibility import (
     PerformanceAvailable,
@@ -32,27 +34,6 @@ from ai_graph.schemas import (
     BacktestReliability,
     CandidateBacktestResult,
     PublicMetricDetail,
-)
-
-_METRIC_DETAIL_KEYS = (
-    "total_return",
-    "cagr",
-    "annualized_volatility",
-    "sharpe_ratio",
-    "sortino_ratio",
-    "max_drawdown",
-    "calmar_ratio",
-    "win_rate",
-    "profit_factor",
-    "benchmark_return",
-    "excess_return",
-    "out_sample_excess_return",
-    "benchmark_period_win_rate",
-    "benchmark_period_loss_rate",
-    "out_sample_benchmark_period_loss_rate",
-    "in_sample_sharpe",
-    "out_sample_sharpe",
-    "degradation",
 )
 
 _RELIABILITY_SHORT_TERM_DAYS = 30
@@ -404,14 +385,17 @@ def _build_public_metric_details(
     }
 
     public_availability = summary.get("public_metric_availability")
-    availability = public_availability if isinstance(public_availability, Mapping) else {}
+    availability = {
+        **_undefined_metric_availability(_summary_warning_list(summary)),
+        **(public_availability if isinstance(public_availability, Mapping) else {}),
+    }
     if reliability.status == "insufficient":
         unavailable_reason = _UNAVAILABLE_METRIC_REASON
         for key in list(values):
             values[key] = None
         values["benchmark_return"] = None
         values["excess_return"] = None
-        reasons = {key: unavailable_reason for key in _METRIC_DETAIL_KEYS}
+        reasons = {key: unavailable_reason for key in PUBLIC_METRIC_KEYS}
     else:
         unavailable_reason = None
         values["benchmark_return"] = benchmark.total_return if benchmark.is_available else None
@@ -467,7 +451,7 @@ def _build_public_metric_details(
             value=values.get(key),
             unavailable_reason=reasons.get(key, unavailable_reason),
         )
-        for key in _METRIC_DETAIL_KEYS
+        for key in PUBLIC_METRIC_KEYS
     ]
 
 

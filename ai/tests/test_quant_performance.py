@@ -139,6 +139,42 @@ def test_public_metrics_missing_engine_scalars_become_none() -> None:
     assert values["benchmark_return"] is None
 
 
+def test_public_profit_factor_rejects_an_engine_default_even_without_a_saved_availability_map() -> None:
+    performance = build_public_backtest_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.1,
+                max_drawdown=-0.1,
+                win_rate=0.5,
+                total_return=0.08,
+                in_sample_sharpe=0.11,
+                out_sample_sharpe=0.09,
+                degradation=0.02,
+            ),
+            engine_summary={
+                "effective_trade_count": 8,
+                "profit_factor": 0.0,
+                "metric_warnings": [
+                    {
+                        "metric": "profit_factor",
+                        "warning": "profit_factor was unavailable and defaulted to 0.0",
+                    }
+                ],
+            },
+        ),
+        price_rows=_rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    profit_factor = next(
+        detail for detail in performance.metric_details if detail.key == "profit_factor"
+    )
+    assert profit_factor.value is None
+    assert profit_factor.is_available is False
+    assert profit_factor.unavailable_reason == "profit_factor was unavailable and defaulted to 0.0"
+
+
 def test_public_metrics_consume_fail_closed_walk_forward_availability() -> None:
     payload = _build_payload(
         BacktestMetrics(

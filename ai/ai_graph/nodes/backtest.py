@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import math
 import json
+import math
 import os
 import pickle
 import sys
+import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
@@ -15,11 +16,20 @@ from multiprocessing import get_all_start_methods, get_context
 from pathlib import Path
 from tempfile import gettempdir
 from threading import Lock
-import time
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
+from ai_graph.nodes.backtest_features import FEATURE_DEFINITION_VERSION, PreparedFeatureStore
+from ai_graph.nodes.position_sizing import (
+    available_ticker_count as _shared_available_ticker_count,
+)
+from ai_graph.nodes.position_sizing import (
+    required_max_position_pct,
+)
+from ai_graph.progress import report_activity
+from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
 from ai_graph.schemas import (
     BacktestEquityPoint,
     BacktestMetrics,
@@ -29,16 +39,7 @@ from ai_graph.schemas import (
     WalkForwardPolicyResult,
 )
 from ai_graph.schemas import StrategySpec as AIStrategySpec
-from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
-from ai_graph.nodes.backtest_features import FEATURE_DEFINITION_VERSION, PreparedFeatureStore
-from ai_graph.progress import report_activity
-from ai_graph.nodes.position_sizing import (
-    available_ticker_count as _shared_available_ticker_count,
-    required_max_position_pct,
-)
-from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
 from ai_graph.security.ast_validator import validate_backtest_code
-
 
 BACKTEST_MODULE_SOURCE_ROOT = Path(__file__).resolve().parents[3] / "backtest_module"
 DEFAULT_FIXTURE_TICKER = "005930"
@@ -126,8 +127,9 @@ DEFAULT_WALL_BUDGET_SECONDS = 540.0
 MAX_SELF_IMPROVEMENT_ROUNDS = 2
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
 BACKTEST_ENGINE_VERSION = "candidate-engine.v3"
-# v4 persists the full execution ledger, including the per-stock ticker actions.
-BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v4"
+# v5 prevents cached summaries created before the metric availability contract from
+# re-exposing an engine-defaulted public metric as a measured zero.
+BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v5"
 BACKTEST_CACHE_DIR_ENV = "AI_BACKTEST_CACHE_DIR"
 BACKTEST_CACHE_TTL_ENV = "AI_BACKTEST_CACHE_TTL_SECONDS"
 BACKTEST_CACHE_MAX_BYTES_ENV = "AI_BACKTEST_CACHE_MAX_BYTES"
@@ -474,17 +476,35 @@ def _ensure_backtest_module_source_path() -> None:
 try:
     from backtest_module import (
         Condition as EngineCondition,
+    )
+    from backtest_module import (
         ConditionOperator as EngineConditionOperator,
+    )
+    from backtest_module import (
         PositionSizing as EnginePositionSizing,
+    )
+    from backtest_module import (
         RiskControls as EngineRiskControls,
+    )
+    from backtest_module import (
         StrategySpec as EngineStrategySpec,
     )
     from backtest_module.backtest import (
         BacktestRunConfig as EngineBacktestRunConfig,
+    )
+    from backtest_module.backtest import (
         OhlcvBar as EngineOhlcvBar,
+    )
+    from backtest_module.backtest import (
         PreparedMarketData as EnginePreparedMarketData,
+    )
+    from backtest_module.backtest import (
         TalibIndicatorConfig as EngineTalibIndicatorConfig,
+    )
+    from backtest_module.backtest import (
         prepare_market_data as prepare_engine_market_data,
+    )
+    from backtest_module.backtest import (
         run_backtest as run_engine_backtest,
     )
     from backtest_module.performance import (
@@ -499,17 +519,35 @@ except ImportError:
             sys.modules.pop(module_name, None)
     from backtest_module import (
         Condition as EngineCondition,
+    )
+    from backtest_module import (
         ConditionOperator as EngineConditionOperator,
+    )
+    from backtest_module import (
         PositionSizing as EnginePositionSizing,
+    )
+    from backtest_module import (
         RiskControls as EngineRiskControls,
+    )
+    from backtest_module import (
         StrategySpec as EngineStrategySpec,
     )
     from backtest_module.backtest import (
         BacktestRunConfig as EngineBacktestRunConfig,
+    )
+    from backtest_module.backtest import (
         OhlcvBar as EngineOhlcvBar,
+    )
+    from backtest_module.backtest import (
         PreparedMarketData as EnginePreparedMarketData,
+    )
+    from backtest_module.backtest import (
         TalibIndicatorConfig as EngineTalibIndicatorConfig,
+    )
+    from backtest_module.backtest import (
         prepare_market_data as prepare_engine_market_data,
+    )
+    from backtest_module.backtest import (
         run_backtest as run_engine_backtest,
     )
     from backtest_module.performance import (
@@ -544,6 +582,26 @@ class _CandidateEvaluation:
     quantstats_dependency_error: bool = False
     diagnostics: dict[str, Any] | None = None
     ticker_actions: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _is_cacheable_evaluation(evaluation: _CandidateEvaluation) -> bool:
+    """Keep only complete, dependency-independent candidate results on disk.
+
+    A missing optional dependency is an observation about the process that created the
+    evaluation, not about the strategy, rows, or candidate fingerprint.  Persisting it
+    made a repaired environment keep raising the old ``quantstats`` failure through the
+    isolated Python-fallback path.  Incomplete/failed evaluations likewise cannot be a
+    deterministic reusable result.
+    """
+
+    return bool(
+        not evaluation.quantstats_dependency_error
+        and evaluation.candidate.validation_ok
+        and evaluation.candidate.metrics is not None
+        and evaluation.engine_summary is not None
+        and evaluation.equity_curve is not None
+        and evaluation.objective_score is not None
+    )
 
 
 @dataclass(frozen=True)
@@ -721,7 +779,7 @@ class _DiskEvaluationCache:
             diagnostics = dict(payload.get("diagnostics") or {})
             diagnostics["cache_hit"] = True
             diagnostics["cache_level"] = "disk"
-            return _CandidateEvaluation(
+            evaluation = _CandidateEvaluation(
                 candidate=rebound,
                 engine_summary=payload.get("engine_summary"),
                 equity_curve=[
@@ -734,11 +792,17 @@ class _DiskEvaluationCache:
                 diagnostics=diagnostics,
                 ticker_actions=list(payload.get("ticker_actions") or []),
             )
+            if not _is_cacheable_evaluation(evaluation):
+                path.unlink(missing_ok=True)
+                return None
+            return evaluation
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             path.unlink(missing_ok=True)
             return None
 
     def store(self, key: str, evaluation: _CandidateEvaluation) -> int:
+        if not _is_cacheable_evaluation(evaluation):
+            return 0
         path = self.root / f"{key}.json"
         temporary = self.root / f".{key}.{os.getpid()}.tmp"
         payload = {
@@ -3458,17 +3522,23 @@ def _annualized_return(
     return (1.0 + total_return) ** (252.0 / effective_days) - 1.0
 
 
-def _profit_factor(engine_summary: Mapping[str, Any]) -> float:
-    win_rate = _summary_float_default(
-        engine_summary,
-        "trade_win_rate",
-        _summary_float_default(engine_summary, "win_rate", 0.0),
-    )
-    if win_rate <= 0:
-        return 0.0
-    if win_rate >= 1:
-        return 2.0
-    return min(3.0, win_rate / max(1.0 - win_rate, 0.01))
+def _profit_factor(engine_summary: Mapping[str, Any]) -> float | None:
+    """Return the engine's period-return profit factor without a win-rate proxy.
+
+    Profit factor is the sum of positive period returns divided by the absolute sum of
+    negative period returns.  A trade win rate is neither term of that ratio.  Preserve
+    the engine's finite result without clipping it, and fail closed when the engine had
+    no finite denominator/value or defaulted the metric after an error.
+    """
+
+    if any(
+        warning.get("metric") == "profit_factor"
+        and isinstance(warning.get("reason") or warning.get("warning"), str)
+        for warning in _summary_warning_list(engine_summary)
+    ):
+        return None
+    value = engine_summary.get("profit_factor")
+    return float(value) if _is_numeric_metric(value) else None
 
 
 def _equal_weight_benchmark_curve(
@@ -3638,7 +3708,9 @@ def _undefined_metric_availability(
     unavailable: dict[str, dict[str, None | str]] = {}
     for warning in metric_warnings:
         metric = warning.get("metric")
-        reason = warning.get("reason")
+        # The native selection implementation writes ``reason`` while QuantStats
+        # writes ``warning``. Both mean that the advertised scalar is not measured.
+        reason = warning.get("reason") or warning.get("warning")
         if isinstance(metric, str) and isinstance(reason, str):
             unavailable[metric] = {"value": None, "unavailable_reason": reason}
     return unavailable

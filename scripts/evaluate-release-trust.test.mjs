@@ -94,6 +94,11 @@ test("release trust includes API, screen, metric, and backend contract gates", (
   );
   assert.ok(
     checks[2].args.includes(
+      "ai/tests/test_source_manifest.py::test_release_profile_fails_before_fixture_analysis_can_return_a_result"
+    )
+  );
+  assert.ok(
+    checks[2].args.includes(
       "ai/tests/test_api.py::test_release_readiness_requires_durable_job_store_before_other_dependencies"
     )
   );

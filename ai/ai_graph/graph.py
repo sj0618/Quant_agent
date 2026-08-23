@@ -19,7 +19,11 @@ from ai_graph.audit import (
     report_audit_failure,
 )
 from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_sink
-from ai_graph.data_sources import load_pipeline_data_from_env, screening_data_families
+from ai_graph.data_sources import (
+    PipelineDataUnavailableError,
+    load_pipeline_data_from_env,
+    screening_data_families,
+)
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from pydantic import ValidationError
 
@@ -63,6 +67,11 @@ from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
 from ai_graph.preflight import classify_research_request
 from ai_graph.research_eligibility import PerformanceAvailable
+from ai_graph.source_manifest import (
+    build_pipeline_extract_snapshot,
+    is_release_profile,
+    validate_release_metadata,
+)
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
@@ -655,6 +664,29 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         detail=f"조회할 데이터 항목 {len(data_requirements)}종을 확정했습니다.",
     )
     pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
+    if is_release_profile():
+        raw_required_tickers = pipeline_data.metadata.get("tickers", ())
+        required_tickers = (
+            raw_required_tickers
+            if isinstance(raw_required_tickers, Sequence) and not isinstance(raw_required_tickers, str)
+            else ()
+        )
+        manifest_errors = validate_release_metadata(
+            pipeline_data.metadata,
+            extract_snapshot=build_pipeline_extract_snapshot(
+                price_rows=pipeline_data.price_rows,
+                screening_candidates=pipeline_data.screening_candidates,
+                l4_evidence=pipeline_data.l4_evidence,
+                macro_snapshot=pipeline_data.macro_snapshot,
+                data_availability=pipeline_data.data_availability,
+                required_tickers=required_tickers,
+            ),
+        )
+        if manifest_errors:
+            raise PipelineDataUnavailableError(
+                "release_source_manifest_invalid",
+                "release source manifest is invalid: " + "; ".join(manifest_errors),
+            )
     source_usage = build_source_usage(
         query,
         data_requirements,

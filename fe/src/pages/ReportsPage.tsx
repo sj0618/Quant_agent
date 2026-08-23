@@ -63,8 +63,8 @@ export function ReportsPage() {
       <main className="reports-page">
         <div className="reports-page__head">
           <div>
-            <h1>리포트</h1>
-            <p>매일 오전 8시 발송된 일일 분석 리포트를 모두 확인할 수 있습니다.</p>
+            <h1>결과 보관함</h1>
+            <p>당시의 읽기 전용 결과 스냅샷과 검증 재현 계약을 확인할 수 있습니다.</p>
           </div>
           <div>
             <button onClick={handlePrintPdf} type="button">전체 PDF 다운로드</button>
@@ -73,7 +73,6 @@ export function ReportsPage() {
         </div>
         {actionStatus ? <div className="action-feedback">{actionStatus}</div> : null}
         <ReportList
-          allReports={reports}
           filters={filters}
           onApplyFilters={handleApplyFilters}
           onResetFilters={handleResetFilters}

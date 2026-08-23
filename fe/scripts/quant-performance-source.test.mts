@@ -4,17 +4,18 @@ import test from "node:test";
 
 const source = (path: string) => readFile(new URL(path, import.meta.url), "utf8");
 
-test("read-only reports never fall back to demo performance numbers", async () => {
+test("read-only reports never fall back to demo numbers or expose legacy performance fields", async () => {
   const [adapter, reportDetail] = await Promise.all([
     source("../src/api/quantAgentClient.ts"),
     source("../src/features/reports/ReportDetail.tsx"),
   ]);
 
   assert.match(adapter, /backendRequest/);
-  assert.match(reportDetail, /report\.performance\.metrics\.map/);
+  assert.match(reportDetail, /READER_EVIDENCE_SECTION_IDS/);
   assert.doesNotMatch(adapter, /BASELINE_RETURN_PERCENT/);
   assert.doesNotMatch(adapter, /\+92\.4/);
   assert.doesNotMatch(reportDetail, /\+92\.4|Sharpe 1\.42/);
+  assert.doesNotMatch(reportDetail, /report\.performance|recommendationScore|report\.signals|report\.candidates/);
 });
 
 test("benchmark series requires an available real curve and never a zero placeholder", async () => {
@@ -62,7 +63,7 @@ test("archived reports render only the reader-safe metric and replay evidence co
   assert.match(reportDetail, /readerEvidenceSections/);
   assert.match(reportDetail, /reproduction_contract/);
   assert.match(reportDetail, /metric_registry/);
-  assert.match(reportDetail, /검증 · 재현 계약/);
+  assert.match(reportDetail, /검증 재현 계약/);
   assert.match(reportDetail, /section\.entries/);
   assert.doesNotMatch(reportDetail, /implementation_source|implementation_path|price_rows|raw_rows/);
 });

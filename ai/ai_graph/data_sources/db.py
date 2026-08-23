@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ai_graph.quant_strategy import rsi_trade_rules
 from ai_graph.research_eligibility import ResearchRuntimeFacts
+from ai_graph.source_manifest import build_pipeline_extract_snapshot, build_source_manifest
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -408,17 +409,44 @@ class PostgresPipelineDataSource:
             and tickers
             and required_families.issubset(available_families)
         )
+        source_freshness = "eod_current" if price_covers_session else "stale"
+        data_availability = _data_availability_for_query(
+            query, source="postgres", available=capability_availability
+        )
+        extract_snapshot = build_pipeline_extract_snapshot(
+            price_rows=price_rows,
+            screening_candidates=screening_candidates,
+            l4_evidence=l4_evidence,
+            macro_snapshot=macro_snapshot,
+            data_availability=data_availability,
+            required_tickers=tickers,
+        )
+        source_manifest = build_source_manifest(
+            source="postgres",
+            as_of=research_as_of,
+            freshness=source_freshness,
+            lineage_refs=[
+                KIS_ADJUSTED_OHLCV_TABLE,
+                PIT_UNIVERSE_VIEW,
+                SYMBOL_LISTING_HISTORY_TABLE,
+                *[INDICATOR_TABLES[family] for family in indicator_families],
+            ],
+            source_version=BACKTEST_WINDOW_POLICY_ID,
+            extract_snapshot=extract_snapshot,
+        )
 
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
             macro_snapshot=macro_snapshot,
-            data_availability=_data_availability_for_query(
-                query, source="postgres", available=capability_availability
-            ),
+            data_availability=data_availability,
             metadata={
                 "source": "postgres",
+                "source_manifest": source_manifest.model_dump(mode="json"),
+                "source_snapshot_as_of": research_as_of,
+                "source_snapshot_freshness": source_freshness,
+                "source_snapshot_version": BACKTEST_WINDOW_POLICY_ID,
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
@@ -464,7 +492,7 @@ class PostgresPipelineDataSource:
                 # candidates, or exception details.
                 "research_as_of": research_as_of,
                 "research_session_state": "krx_completed_session",
-                "research_freshness": "eod_current" if price_covers_session else "stale",
+                "research_freshness": source_freshness,
                 "research_required_families": sorted(required_families),
                 "research_available_families": sorted(available_families),
                 "research_snapshot_id": trace_id,
@@ -1273,10 +1301,30 @@ def measure_research_runtime_facts_from_env(
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
     """Return an explicitly labelled local fixture; configured DB failures never use it."""
+    fixture_as_of = datetime.now(UTC).date()
+    data_availability = _data_availability_for_query(query, source="fixture")
+    extract_snapshot = build_pipeline_extract_snapshot(
+        price_rows=[],
+        screening_candidates=[],
+        l4_evidence=[],
+        macro_snapshot=None,
+        data_availability=data_availability,
+    )
     return PipelineDataBundle(
-        data_availability=_data_availability_for_query(query, source="fixture"),
+        data_availability=data_availability,
         metadata={
             "source": "fixture",
+            "source_manifest": build_source_manifest(
+                source="fixture",
+                as_of=fixture_as_of,
+                freshness="unknown",
+                lineage_refs=[reason, query],
+                source_version="local-fixture",
+                extract_snapshot=extract_snapshot,
+            ).model_dump(mode="json"),
+            "source_snapshot_as_of": fixture_as_of.isoformat(),
+            "source_snapshot_freshness": "unknown",
+            "source_snapshot_version": "local-fixture",
             "reason": reason,
             "production_eligible": False,
             "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),

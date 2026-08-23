@@ -75,6 +75,142 @@ async def test_track_c_list_reports_clamps_limit_and_scopes_to_owner(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_reader_archive_list_query_and_payload_exclude_legacy_report_fields(monkeypatch):
+    recorded: dict[str, object] = {}
+
+    async def fake_fetch_all(engine, sql, params=None):
+        recorded["engine"] = engine
+        recorded["sql"] = sql
+        recorded["params"] = params or {}
+        return [
+            {
+                "report_id": "report-1",
+                "backtest_run_id": "run-1",
+                "report_date": "2026-07-20",
+                "weekday": "Monday",
+                "sent_at": "2026-07-20T10:10:00Z",
+                "status": "sent",
+                "created_at": "2026-07-20T10:00:00Z",
+                "updated_at": "2026-07-20T10:05:00Z",
+                "sort_at": "2026-07-20T10:10:00Z",
+                # A row can contain these in a test double; the reader mapper
+                # must still make the emitted allowlist exact.
+                "title": "Do not expose",
+                "summary": "Do not expose",
+                "recommendation_score": 9.9,
+                "buy_count": 4,
+                "market_snapshot": [{"label": "KOSPI", "value": "secret"}],
+            }
+        ]
+
+    monkeypatch.setattr(existing_report_queries, "fetch_all", fake_fetch_all)
+
+    result = await existing_report_queries.list_reader_reports(FakeEngine(), user_id="42", q="report-1")
+
+    sql = str(recorded["sql"])
+    assert "report.report_id::text ILIKE :q" in sql
+    assert "report.title" not in sql
+    assert "report.summary" not in sql
+    assert "recommendation_score" not in sql
+    assert "buy_count" not in sql
+    assert "market_snapshot" not in sql
+    assert "strategy_email_report_candidate" not in sql
+    assert recorded["params"] == {"limit_plus_one": 21, "user_id": "42", "q": "%report-1%"}
+    assert set(result["items"][0]) == {
+        "id",
+        "runId",
+        "date",
+        "weekday",
+        "sentAt",
+        "status",
+        "createdAt",
+        "updatedAt",
+        "publishedAt",
+    }
+    assert result["items"][0]["id"] == "report-1"
+    assert result["items"][0]["date"] == "2026.07.20"
+
+
+@pytest.mark.asyncio
+async def test_reader_archive_detail_uses_allowlisted_evidence_without_legacy_queries(monkeypatch):
+    recorded: dict[str, object] = {}
+
+    async def fake_fetch_one(engine, sql, params=None):
+        recorded["engine"] = engine
+        recorded["sql"] = sql
+        recorded["params"] = params or {}
+        return {
+            "report_id": "report-1",
+            "backtest_run_id": "run-1",
+            "report_date": "2026-07-20",
+            "weekday": "Monday",
+            "sent_at": "2026-07-20T10:10:00Z",
+            "status": "sent",
+            "created_at": "2026-07-20T10:00:00Z",
+            "updated_at": "2026-07-20T10:05:00Z",
+            "sort_at": "2026-07-20T10:10:00Z",
+            "content_html": {
+                "sections": [
+                    {
+                        "id": "reproduction_contract",
+                        "items": {
+                            "contract_version": "quantagent-backtest-replay.v1",
+                            "input_hash": "a" * 64,
+                            "output_hash": "b" * 64,
+                        },
+                    },
+                    {
+                        "id": "execution_snapshot",
+                        "items": {"generated_narrative": "Do not expose", "secret": "Do not expose"},
+                    },
+                ]
+            },
+            "title": "Do not expose",
+            "summary": "Do not expose",
+            "recommendation_score": 9.9,
+            "buy_count": 4,
+            "market_snapshot": [{"label": "KOSPI", "value": "secret"}],
+        }
+
+    async def fake_fetch_all(*_args, **_kwargs):
+        raise AssertionError("Reader detail must not fetch news, candidates, or performance rows")
+
+    monkeypatch.setattr(existing_report_queries, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(existing_report_queries, "fetch_all", fake_fetch_all)
+
+    result = await existing_report_queries.get_reader_report(FakeEngine(), "report-1", user_id="42")
+
+    assert result is not None
+    sql = str(recorded["sql"])
+    for forbidden in ("report.title", "report.summary", "recommendation_score", "buy_count", "market_snapshot", "candidate", "news", "performance"):
+        assert forbidden not in sql
+    assert recorded["params"] == {"report_id": "report-1", "user_id": "42"}
+    assert set(result) == {
+        "id",
+        "runId",
+        "date",
+        "weekday",
+        "sentAt",
+        "status",
+        "createdAt",
+        "updatedAt",
+        "publishedAt",
+        "contentSections",
+    }
+    assert result["contentSections"] == [
+        {
+            "id": "reproduction_contract",
+            "title": "검증 재현 계약",
+            "entries": [
+                {"label": "재현 계약 버전", "value": "quantagent-backtest-replay.v1", "depth": 1},
+                {"label": "입력 해시", "value": "a" * 64, "depth": 1},
+                {"label": "출력 해시", "value": "b" * 64, "depth": 1},
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_track_c_list_reports_applies_report_strategy_candidate_search(monkeypatch):
     recorded: dict[str, object] = {}
 

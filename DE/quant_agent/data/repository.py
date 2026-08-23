@@ -252,6 +252,7 @@ class DataRepository:
 
         symbol_rows = []
         lifecycle_rows = []
+        security_type_history_rows = []
         name_history_rows = []
         calendar_dates: set[date] = set()
         ohlcv_rows = []
@@ -260,11 +261,12 @@ class DataRepository:
 
         for bar in symbol_by_code.values():
             market_segment = _infer_market_segment(bar.raw)
+            security_type = _infer_security_type(bar.raw)
             symbol_rows.append(
                 "("
                 f"{sql_literal(bar.symbol)}, {sql_literal(bar.name or bar.symbol)}, "
                 f"{sql_literal(market_segment)}, {sql_literal(market_segment)}, "
-                f"{sql_literal(_infer_security_type(bar.raw))}, {sql_literal('listed')}, "
+                f"{sql_literal(security_type)}, {sql_literal('listed')}, "
                 f"{sql_literal(bar.trade_date)}, NULL, {jsonb_literal(_symbol_metadata(bar.raw))}"
                 ")"
             )
@@ -281,7 +283,6 @@ class DataRepository:
                 f"{sql_literal(source_id)}, {sql_literal(run_id)}, {jsonb_literal(_symbol_metadata(bar.raw))}"
                 ")"
             )
-
         for bar in deduped_bars:
             calendar_dates.add(bar.trade_date)
             flags = ohlcv_quality_flags(bar)
@@ -318,6 +319,19 @@ class DataRepository:
                 ")"
             )
 
+        for bar in sorted(deduped_bars, key=lambda candidate: (candidate.symbol, candidate.trade_date)):
+            security_type = _infer_security_type(bar.raw)
+            security_type_metadata = _security_type_history_metadata(bar.raw)
+            if security_type is not None and security_type_metadata is not None:
+                security_type_history_rows.append(
+                    "("
+                    f"{sql_literal(bar.symbol)}, {sql_literal(bar.trade_date)}, "
+                    f"{sql_literal(security_type)}, {sql_literal(source_id)}, "
+                    f"{sql_literal(run_id)}, {sql_literal('security-type-source-payload-v1')}, "
+                    f"{jsonb_literal(security_type_metadata)}"
+                    ")"
+                )
+
         calendar_rows = [
             "("
             f"{sql_literal('KRX')}, {sql_literal(trade_date)}, TRUE, "
@@ -347,6 +361,7 @@ class DataRepository:
               updated_at = now();
             """,
             _symbol_lifecycle_sql(lifecycle_rows),
+            _symbol_security_type_history_sql(security_type_history_rows),
             _symbol_name_history_sql(name_history_rows),
             f"""
             INSERT INTO core.trading_calendar (market, trade_date, is_open, source_id, run_id)
@@ -1220,6 +1235,83 @@ def _symbol_lifecycle_sql(rows: list[str]) -> str:
         """
 
 
+def _symbol_security_type_history_sql(rows: list[str]) -> str:
+    """Persist every source-backed symbol/date classification as a non-overlapping interval."""
+
+    if not rows:
+        return ""
+    return f"""
+        WITH incoming(symbol, valid_from, security_type, source_id, run_id, source_version, metadata_jsonb) AS (
+            VALUES {", ".join(rows)}
+        ),
+        resolved AS (
+            SELECT sm.symbol_id,
+                   i.valid_from::date AS valid_from,
+                   i.security_type,
+                   i.source_id,
+                   i.run_id::uuid AS run_id,
+                   i.source_version,
+                   i.metadata_jsonb::jsonb AS metadata_jsonb
+              FROM incoming i
+              JOIN core.symbol_master sm ON sm.symbol = i.symbol
+        ),
+        existing AS (
+            SELECT h.symbol_id,
+                   h.valid_from,
+                   h.security_type,
+                   h.source_id,
+                   h.run_id,
+                   h.source_version,
+                   h.metadata_jsonb,
+                   0 AS source_priority
+              FROM core.symbol_security_type_history h
+             WHERE h.symbol_id IN (SELECT DISTINCT symbol_id FROM resolved)
+        ),
+        timeline AS (
+            SELECT symbol_id, valid_from, security_type, source_id, run_id,
+                   source_version, metadata_jsonb, 1 AS source_priority
+              FROM resolved
+            UNION ALL
+            SELECT symbol_id, valid_from, security_type, source_id, run_id,
+                   source_version, metadata_jsonb, source_priority
+              FROM existing
+        ),
+        deduplicated AS (
+            SELECT DISTINCT ON (symbol_id, valid_from)
+                   symbol_id, valid_from, security_type, source_id, run_id,
+                   source_version, metadata_jsonb
+              FROM timeline
+             ORDER BY symbol_id, valid_from, source_priority DESC
+        ),
+        intervals AS (
+            SELECT symbol_id,
+                   valid_from,
+                   LEAD(valid_from) OVER (
+                       PARTITION BY symbol_id
+                       ORDER BY valid_from
+                   ) - 1 AS valid_to,
+                   security_type,
+                   source_id,
+                   run_id,
+                   source_version,
+                   metadata_jsonb
+              FROM deduplicated
+        )
+        INSERT INTO core.symbol_security_type_history
+          (symbol_id, valid_from, valid_to, security_type, source_id, run_id, source_version, metadata_jsonb)
+        SELECT symbol_id, valid_from, valid_to, security_type, source_id, run_id,
+               source_version, metadata_jsonb
+          FROM intervals
+        ON CONFLICT (symbol_id, valid_from) DO UPDATE SET
+          valid_to = EXCLUDED.valid_to,
+          security_type = EXCLUDED.security_type,
+          source_id = EXCLUDED.source_id,
+          run_id = EXCLUDED.run_id,
+          source_version = EXCLUDED.source_version,
+          metadata_jsonb = core.symbol_security_type_history.metadata_jsonb || EXCLUDED.metadata_jsonb;
+        """
+
+
 def _symbol_name_history_sql(rows: list[str]) -> str:
     if not rows:
         return ""
@@ -1362,6 +1454,33 @@ def _infer_security_type(raw: dict[str, Any]) -> str | None:
         name=name,
         market_segment=_infer_market_segment(raw),
     )
+
+
+def _security_type_history_metadata(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Return explicit source fields that justify a historical classification.
+
+    A name or current market can classify the master record, but cannot prove an
+    older security type. Only an observed classification field can open or update a
+    point-in-time classification interval.
+    """
+
+    evidence_keys = (
+        "security_type",
+        "SECUGRP_NM",
+        "secugrp_nm",
+        "SECT_TP_NM",
+        "sect_tp_nm",
+        "MKT_TP_NM",
+        "mkt_tp_nm",
+    )
+    evidence = {
+        key: raw[key]
+        for key in evidence_keys
+        if raw.get(key) not in (None, "")
+    }
+    if not evidence:
+        return None
+    return {"classification_evidence": evidence}
 
 
 def _symbol_metadata(raw: dict[str, Any]) -> dict[str, Any]:

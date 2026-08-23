@@ -268,7 +268,7 @@ TRACK_C_CONTRACT_POLICY: tuple[EndpointContract, ...] = (
         fe_live_allowed=True,
         auth_required=True,
         csrf_required_for_unsafe=False,
-        summary="List Track C reports for the current owner.",
+        summary="List reader-safe archived-result metadata for the current owner.",
         required_dependency="trading-data DB engine",
     ),
     contract(
@@ -280,7 +280,7 @@ TRACK_C_CONTRACT_POLICY: tuple[EndpointContract, ...] = (
         fe_live_allowed=True,
         auth_required=True,
         csrf_required_for_unsafe=False,
-        summary="Read a Track C report for the current owner.",
+        summary="Read immutable identifiers and allow-listed verification evidence for the current owner.",
         required_dependency="trading-data DB engine",
     ),
 )

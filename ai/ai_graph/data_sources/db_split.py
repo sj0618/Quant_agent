@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any, Literal
@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.quant_strategy import rsi_trade_rules
+from ai_graph.source_manifest import build_pipeline_extract_snapshot, build_source_manifest
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -215,6 +216,106 @@ class PipelineDataBundle(BaseModel):
     macro_snapshot: dict[str, Any] | None = None
     data_availability: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+def _latest_loaded_price_date(price_rows: Sequence[Mapping[str, Any]]) -> date:
+    """Return the newest concrete price date; never manufacture one from wall-clock time."""
+
+    dates: list[date] = []
+    for row in price_rows:
+        row_date = _loaded_price_row_date(row)
+        if row_date is not None:
+            dates.append(row_date)
+    if not dates:
+        raise PipelineDataUnavailableError(
+            "source_snapshot_date_missing",
+            "loaded price rows did not contain a usable source snapshot date",
+        )
+    return max(dates)
+
+
+def _loaded_price_row_date(row: Mapping[str, Any]) -> date | None:
+    raw = row.get("date") or row.get("time") or row.get("as_of_date")
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if raw is None:
+        return None
+    try:
+        return date.fromisoformat(str(raw))
+    except ValueError:
+        return None
+
+
+def _source_snapshot_freshness(
+    *,
+    source_snapshot_as_of: date,
+    latest_available_session: date | None,
+    price_rows: Sequence[Mapping[str, Any]],
+    required_tickers: Collection[str],
+) -> str:
+    """Classify freshness from warehouse metadata and every required ticker's coverage."""
+
+    if latest_available_session is None or not required_tickers:
+        return "unknown"
+    if source_snapshot_as_of != latest_available_session:
+        return "stale"
+    latest_by_ticker: dict[str, date] = {}
+    for row in price_rows:
+        ticker = str(row.get("ticker") or "").zfill(6)
+        row_date = _loaded_price_row_date(row)
+        if ticker and row_date is not None:
+            latest_by_ticker[ticker] = max(latest_by_ticker.get(ticker, row_date), row_date)
+    normalized_required = {str(ticker).zfill(6) for ticker in required_tickers}
+    return (
+        "eod_current"
+        if all(latest_by_ticker.get(ticker) == latest_available_session for ticker in normalized_required)
+        else "stale"
+    )
+
+
+def _build_backtest_source_manifest(
+    *,
+    price_rows: Sequence[Mapping[str, Any]],
+    screening_candidates: Sequence[Mapping[str, Any]],
+    l4_evidence: Sequence[Mapping[str, Any]],
+    macro_snapshot: Mapping[str, Any] | None,
+    data_availability: Mapping[str, Any],
+    indicator_families: Collection[str],
+    required_tickers: Collection[str],
+    latest_available_session: date | None,
+):
+    """Bind the split adapter's concrete extract to its warehouse freshness facts."""
+
+    source_snapshot_as_of = _latest_loaded_price_date(price_rows)
+    source_freshness = _source_snapshot_freshness(
+        source_snapshot_as_of=source_snapshot_as_of,
+        latest_available_session=latest_available_session,
+        price_rows=price_rows,
+        required_tickers=required_tickers,
+    )
+    extract_snapshot = build_pipeline_extract_snapshot(
+        price_rows=price_rows,
+        screening_candidates=screening_candidates,
+        l4_evidence=l4_evidence,
+        macro_snapshot=macro_snapshot,
+        data_availability=data_availability,
+        required_tickers=required_tickers,
+    )
+    manifest = build_source_manifest(
+        source="postgres",
+        as_of=source_snapshot_as_of,
+        freshness=source_freshness,
+        lineage_refs=[
+            KIS_ADJUSTED_OHLCV_TABLE,
+            UNIVERSE_VIEW,
+            *[INDICATOR_TABLES[family] for family in indicator_families],
+        ],
+        source_version="split-pipeline-v1",
+        extract_snapshot=extract_snapshot,
+    )
+    return manifest, source_snapshot_as_of, source_freshness
 
 
 class PostgresPipelineDataSource:
@@ -441,21 +542,40 @@ class PostgresPipelineDataSource:
                     "no_price_rows",
                     f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}",
                 )
+            # This is intentionally queried after the extract has been read from the
+            # same connection.  The manifest can call the extract current only when
+            # its newest concrete bar reaches the warehouse's measured latest session.
+            latest_available_session = self._resolve_screening_date(conn)
             l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
             # Capabilities were probed up front; nothing since then can change them.
 
+        data_availability = _data_availability_for_query(
+            query, source="postgres", available=capability_availability
+        )
+        source_manifest, source_manifest_as_of, source_freshness = _build_backtest_source_manifest(
+            price_rows=price_rows,
+            screening_candidates=screening_candidates,
+            l4_evidence=l4_evidence,
+            macro_snapshot=macro_snapshot,
+            data_availability=data_availability,
+            indicator_families=indicator_families,
+            required_tickers=tickers,
+            latest_available_session=latest_available_session,
+        )
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
             macro_snapshot=macro_snapshot,
-            data_availability=_data_availability_for_query(
-                query, source="postgres", available=capability_availability
-            ),
+            data_availability=data_availability,
             metadata={
                 "source": "postgres",
+                "source_manifest": source_manifest.model_dump(mode="json"),
+                "source_snapshot_as_of": source_manifest_as_of.isoformat(),
+                "source_snapshot_freshness": source_freshness,
+                "source_snapshot_version": "split-pipeline-v1",
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
@@ -1296,10 +1416,30 @@ def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle
 
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
+    fixture_as_of = datetime.now(UTC).date()
+    data_availability = _data_availability_for_query(query, source="fixture")
+    extract_snapshot = build_pipeline_extract_snapshot(
+        price_rows=[],
+        screening_candidates=[],
+        l4_evidence=[],
+        macro_snapshot=None,
+        data_availability=data_availability,
+    )
     return PipelineDataBundle(
-        data_availability=_data_availability_for_query(query, source="fixture"),
+        data_availability=data_availability,
         metadata={
             "source": "fixture",
+            "source_manifest": build_source_manifest(
+                source="fixture",
+                as_of=fixture_as_of,
+                freshness="unknown",
+                lineage_refs=[reason, query],
+                source_version="local-fixture",
+                extract_snapshot=extract_snapshot,
+            ).model_dump(mode="json"),
+            "source_snapshot_as_of": fixture_as_of.isoformat(),
+            "source_snapshot_freshness": "unknown",
+            "source_snapshot_version": "local-fixture",
             "reason": reason,
             "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),
             "available_db_objects": [

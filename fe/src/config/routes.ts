@@ -10,9 +10,18 @@ export const ROUTES = {
   terms: "/terms",
   privacy: "/privacy",
   disclaimer: "/disclaimer",
+  trust: "/trust",
   unsubscribe: "/unsubscribe",
   reportDetail: (id: string) => `/reports/${encodeURIComponent(id)}`,
 } as const;
+
+export function trustFeedback(resultId: string, version?: string | null) {
+  const params = new URLSearchParams({ result_id: resultId });
+  if (version?.trim()) {
+    params.set("version", version.trim());
+  }
+  return `${ROUTES.trust}?${params.toString()}#feedback`;
+}
 
 const RETIRED_REPORT_ROUTE_SEGMENTS = new Set(["history", "strategies"]);
 

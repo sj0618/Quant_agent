@@ -108,6 +108,13 @@ def _persistent_job_store_runtime() -> JobStoreRuntime:
     )
 
 
+def _configure_live_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AI_LLM_PROVIDER", "aoai")
+    monkeypatch.setenv("AI_AOAI_RESPONSES_URL", "https://example.test/openai/v1/responses")
+    monkeypatch.setenv("AI_AOAI_API_KEY", "test-readiness-key")
+    monkeypatch.setenv("AI_AOAI_MODEL", "test-readiness-model")
+
+
 def test_release_readiness_requires_durable_job_store_before_other_dependencies() -> None:
     migration_calls = 0
 
@@ -132,6 +139,7 @@ def test_release_readiness_requires_durable_job_store_before_other_dependencies(
 
 
 def test_release_readiness_rejects_missing_migration_and_contract_drift(monkeypatch) -> None:
+    _configure_live_provider(monkeypatch)
     missing_migration = TestClient(
         create_app(
             job_store_runtime=_persistent_job_store_runtime(),
@@ -178,6 +186,38 @@ def test_release_readiness_requires_a_rule_draft_signer() -> None:
         "ready": False,
         "reason": "rule_draft_signer_required",
     }
+
+
+def test_release_readiness_requires_live_aoai_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
+    client = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    )
+
+    mock_provider = client.get(READINESS_PATH)
+    assert mock_provider.status_code == 503
+    checks = {check["name"]: check for check in mock_provider.json()["checks"]}
+    assert checks["live_provider_configuration"] == {
+        "name": "live_provider_configuration",
+        "ready": False,
+        "reason": "live_provider_configuration_required",
+    }
+
+    monkeypatch.setenv("AI_LLM_PROVIDER", "aoai")
+    monkeypatch.setenv("AI_AOAI_RESPONSES_URL", "https://example.test/openai/v1/responses")
+    monkeypatch.setenv("AI_AOAI_API_KEY", "test-readiness-key")
+    monkeypatch.delenv("AI_AOAI_MODEL", raising=False)
+    incomplete_provider = client.get(READINESS_PATH)
+    assert incomplete_provider.status_code == 503
+    checks = {check["name"]: check for check in incomplete_provider.json()["checks"]}
+    assert checks["live_provider_configuration"]["reason"] == "live_provider_configuration_required"
+
+    _configure_live_provider(monkeypatch)
+    assert client.get(READINESS_PATH).status_code == 200
 
 
 def test_api_status_exposes_data_source_without_dsn_value(monkeypatch) -> None:

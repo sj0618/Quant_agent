@@ -196,7 +196,14 @@ def test_track_c_run_and_report_routes_enforce_owner_scope(monkeypatch):
     ):
         if user_id == "user-1":
             return {
-                "items": [{"id": "report-1", "runId": "run-1", "title": "Report", "summary": "Summary", "status": "sent"}],
+                "items": [{
+                    "id": "report-1",
+                    "runId": "run-1",
+                    "date": "2026.07.20",
+                    "weekday": "월요일",
+                    "sentAt": "오전 10:10 발송",
+                    "status": "sent",
+                }],
                 "meta": {"limit": limit, "hasMore": False, "nextCursor": None},
             }
         return {"items": [], "meta": {"limit": limit, "hasMore": False, "nextCursor": None}}
@@ -206,16 +213,17 @@ def test_track_c_run_and_report_routes_enforce_owner_scope(monkeypatch):
             return {
                 "id": report_id,
                 "runId": "run-1",
-                "title": "Report",
-                "summary": "Summary",
+                "date": "2026.07.20",
+                "weekday": "월요일",
+                "sentAt": "오전 10:10 발송",
                 "status": "sent",
-                "marketBrief": "Summary",
+                "contentSections": [],
             }
         return None
 
     monkeypatch.setattr(fe_contract.fe_contract_store, "get_analysis_run_from_db", fake_get_run)
-    monkeypatch.setattr(fe_contract.fe_contract_store, "list_reports_from_db", fake_list_reports)
-    monkeypatch.setattr(fe_contract.fe_contract_store, "get_report_from_db", fake_get_report)
+    monkeypatch.setattr(fe_contract.fe_contract_store, "list_reader_reports_from_db", fake_list_reports)
+    monkeypatch.setattr(fe_contract.fe_contract_store, "get_reader_report_from_db", fake_get_report)
 
     owner_run = client.get("/api/v1/runs/run-1", cookies={app.state.settings.auth_session_cookie_name: owner_session_id})
     intruder_run = client.get("/api/v1/runs/run-1", cookies={app.state.settings.auth_session_cookie_name: intruder_session_id})
@@ -230,10 +238,24 @@ def test_track_c_run_and_report_routes_enforce_owner_scope(monkeypatch):
     assert intruder_run.json()["error"]["code"] == "run_not_found"
     assert owner_reports.status_code == 200
     assert owner_reports.json()["items"][0]["id"] == "report-1"
+    assert set(owner_reports.json()["items"][0]) == {"id", "runId", "date", "weekday", "sentAt", "status"}
     assert intruder_reports.status_code == 200
     assert intruder_reports.json()["items"] == []
     assert owner_report.status_code == 200
     assert owner_report.json()["id"] == "report-1"
+    assert set(owner_report.json()) == {"id", "runId", "date", "weekday", "sentAt", "status", "contentSections"}
+    forbidden_reader_fields = {
+        "title",
+        "summary",
+        "recommendationScore",
+        "signals",
+        "marketSnapshot",
+        "news",
+        "candidates",
+        "performance",
+    }
+    assert forbidden_reader_fields.isdisjoint(owner_reports.json()["items"][0])
+    assert forbidden_reader_fields.isdisjoint(owner_report.json())
     assert intruder_report.status_code == 404
     assert intruder_report.json()["error"]["code"] == "report_not_found"
 
@@ -273,7 +295,7 @@ def test_track_c_complete_and_report_list_routes_forward_filters(monkeypatch):
         return {"items": [], "meta": {"limit": limit, "hasMore": False, "nextCursor": None}}
 
     monkeypatch.setattr(fe_contract.fe_contract_store, "complete_analysis_run_from_db", fake_complete)
-    monkeypatch.setattr(fe_contract.fe_contract_store, "list_reports_from_db", fake_list_reports)
+    monkeypatch.setattr(fe_contract.fe_contract_store, "list_reader_reports_from_db", fake_list_reports)
 
     class StoredResult:
         def model_dump(self, *, mode: str):
@@ -344,11 +366,18 @@ def test_report_diagnostics_preserve_contract_and_record_safe_metadata(monkeypat
 
     async def fake_list_reports(_engine, **_kwargs):
         return {
-            "items": [{"id": "report-1", "runId": "run-1", "title": "Report", "summary": "Summary", "status": "sent"}],
+            "items": [{
+                "id": "report-1",
+                "runId": "run-1",
+                "date": "2026.07.20",
+                "weekday": "월요일",
+                "sentAt": "오전 10:10 발송",
+                "status": "sent",
+            }],
             "meta": {"limit": 20, "hasMore": False, "nextCursor": None},
         }
 
-    monkeypatch.setattr(fe_contract.fe_contract_store, "list_reports_from_db", fake_list_reports)
+    monkeypatch.setattr(fe_contract.fe_contract_store, "list_reader_reports_from_db", fake_list_reports)
     caplog.set_level("INFO", logger="uvicorn.error.runtime_perf")
 
     response = client.get(

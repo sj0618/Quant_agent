@@ -122,6 +122,10 @@ DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
 READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
 REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
 ANALYSIS_JOBS_MIGRATION_REVISION = "021_ai_analysis_jobs"
+AI_LLM_PROVIDER_ENV = "AI_LLM_PROVIDER"
+AI_AOAI_RESPONSES_URL_ENV = "AI_AOAI_RESPONSES_URL"
+AI_AOAI_API_KEY_ENV = "AI_AOAI_API_KEY"
+AI_AOAI_MODEL_ENV = "AI_AOAI_MODEL"
 
 
 class CreateAnalysisJobRequest(BaseModel):
@@ -280,6 +284,7 @@ class ReadinessCheck(BaseModel):
     name: Literal[
         "durable_job_store",
         "migration_revision",
+        "live_provider_configuration",
         "ai_contract_version",
         "rule_draft_signer",
     ]
@@ -587,6 +592,7 @@ def create_app(
             runtime,
             migration_probe=migration_probe,
             rule_draft_signer=app.state.rule_draft_signer,
+            provider_ready=_live_provider_configuration_is_ready(),
         )
         if result.status == "unavailable":
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -1094,6 +1100,7 @@ def _release_readiness(
     *,
     migration_probe: Callable[[], bool],
     rule_draft_signer: RuleDraftSigner | None,
+    provider_ready: bool,
 ) -> ReadinessResponse:
     durable_store_ready = (
         runtime.requested_mode == PERSISTENT_JOB_STORE_MODE
@@ -1121,6 +1128,11 @@ def _release_readiness(
             reason=None if migration_ready else "migration_revision_required",
         ),
         ReadinessCheck(
+            name="live_provider_configuration",
+            ready=provider_ready,
+            reason=None if provider_ready else "live_provider_configuration_required",
+        ),
+        ReadinessCheck(
             name="ai_contract_version",
             ready=contract_ready,
             reason=None if contract_ready else "ai_contract_version_mismatch",
@@ -1135,6 +1147,28 @@ def _release_readiness(
         status="ready" if all(check.ready for check in checks) else "unavailable",
         ai_contract_version=SCHEMA_VERSION,
         checks=checks,
+    )
+
+
+def _live_provider_configuration_is_ready() -> bool:
+    """Check only the presence of the production AOAI configuration.
+
+    Readiness must not instantiate an HTTP client or expose a credential.  The graph's
+    live provider factory requires this global fallback trio whenever a role does not
+    have a dedicated override, so requiring all three protects every role from silently
+    falling back to the local mock provider in a release profile.
+    """
+
+    provider = (environ.get(AI_LLM_PROVIDER_ENV) or "mock").strip().lower()
+    if provider != "aoai":
+        return False
+    return all(
+        bool((environ.get(key) or "").strip())
+        for key in (
+            AI_AOAI_RESPONSES_URL_ENV,
+            AI_AOAI_API_KEY_ENV,
+            AI_AOAI_MODEL_ENV,
+        )
     )
 
 

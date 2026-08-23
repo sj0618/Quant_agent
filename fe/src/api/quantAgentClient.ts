@@ -1,8 +1,8 @@
 import { backendRequest } from "./backendClient";
-import type { ReportDetail, ReportSummary, Tone } from "../types/quantagent";
+import type { ArchivedReportDetail, ArchivedReportSummary, PersistedReportSection } from "../types/quantagent";
 
 interface LiveReportListResponse {
-  items: ReportSummary[];
+  items: ArchivedReportSummary[];
   meta?: {
     limit?: number;
     hasMore?: boolean;
@@ -10,94 +10,60 @@ interface LiveReportListResponse {
   };
 }
 
-function normalizeReportListResponse(response: LiveReportListResponse | ReportSummary[]): ReportSummary[] {
+function normalizeReportListResponse(response: LiveReportListResponse | ArchivedReportSummary[]): ArchivedReportSummary[] {
   const items = Array.isArray(response) ? response : response.items;
-  return items.map(normalizeReportSummary);
+  return items.map(normalizeArchivedReportSummary);
 }
 
-function normalizeReportSummary(report: Partial<ReportSummary>): ReportSummary {
+function normalizeArchivedReportSummary(report: Partial<ArchivedReportSummary>): ArchivedReportSummary {
   return {
     id: report.id ?? "",
     runId: report.runId,
-    strategyId: report.strategyId,
-    instrumentId: report.instrumentId,
-    instrumentName: report.instrumentName,
-    ticker: report.ticker,
     createdAt: report.createdAt,
     updatedAt: report.updatedAt,
     publishedAt: report.publishedAt,
     date: report.date ?? "",
     weekday: report.weekday ?? "",
     sentAt: report.sentAt ?? "",
-    title: report.title ?? "",
-    summary: report.summary ?? "",
     status: report.status ?? "unknown",
-    strategyName: report.strategyName ?? "",
-    recommendationScore: report.recommendationScore ?? "—",
-    signals: {
-      BUY: report.signals?.BUY ?? 0,
-      HOLD: report.signals?.HOLD ?? 0,
-      DROP: report.signals?.DROP ?? 0,
-    },
-    marketSnapshot: normalizeMarketSnapshot(report.marketSnapshot),
   };
 }
 
-function normalizeNullableText(value: string | null | undefined): string | null {
-  const text = value?.trim();
-  return text ? text : null;
+function normalizePersistedReportSection(value: PersistedReportSection): PersistedReportSection {
+  return {
+    id: value.id,
+    title: value.title,
+    note: value.note,
+    body: value.body,
+    entries: Array.isArray(value.entries) ? value.entries.map((entry) => ({
+      label: entry.label,
+      value: entry.value,
+      depth: entry.depth,
+      description: entry.description,
+    })) : [],
+  };
 }
 
-function normalizeText(value: string | null | undefined, fallback = ""): string {
-  const text = value?.trim();
-  return text ? text : fallback;
-}
-
-function normalizeReportDetail(report: ReportDetail | null): ReportDetail | null {
+function normalizeReportDetail(report: ArchivedReportDetail | null): ArchivedReportDetail | null {
   if (!report) {
     return null;
   }
   return {
-    ...normalizeReportSummary(report),
-    recipient: normalizeNullableText(report.recipient),
-    marketBrief: normalizeText(report.marketBrief, normalizeText(report.summary)),
-    marketContext: normalizeNullableText(report.marketContext),
-    contentSections: report.contentSections,
-    news: Array.isArray(report.news) ? report.news : [],
-    candidates: Array.isArray(report.candidates) ? report.candidates : [],
-    signalAxes: Array.isArray(report.signalAxes) ? report.signalAxes : [],
-    riskManagerOverride: normalizeText(report.riskManagerOverride),
-    conclusion: normalizeText(report.conclusion, normalizeText(report.summary)),
-    warningNote: normalizeNullableText(report.warningNote),
-    performance: {
-      metrics: Array.isArray(report.performance?.metrics) ? report.performance.metrics : [],
-      disclaimer: normalizeText(report.performance?.disclaimer),
-    },
-    costNotes: Array.isArray(report.costNotes) ? report.costNotes.filter((note) => typeof note === "string" && note.trim()) : [],
+    ...normalizeArchivedReportSummary(report),
+    contentSections: Array.isArray(report.contentSections)
+      ? report.contentSections.map(normalizePersistedReportSection)
+      : [],
   };
 }
 
-function normalizeMarketSnapshot(snapshot: ReportSummary["marketSnapshot"] | undefined): ReportSummary["marketSnapshot"] {
-  if (!Array.isArray(snapshot)) {
-    return [];
-  }
-  return snapshot
-    .filter((item): item is { label: string; value: string; tone?: Tone } => Boolean(item && typeof item.label === "string" && typeof item.value === "string"))
-    .map((item) => ({
-      label: item.label,
-      value: item.value,
-      tone: item.tone,
-    }));
-}
-
 /** Read-only report archive. New analysis execution is intentionally not exposed to the browser. */
-export async function getReports(q?: string): Promise<ReportSummary[]> {
+export async function getReports(q?: string): Promise<ArchivedReportSummary[]> {
   const normalizedQuery = q?.trim();
   const path = normalizedQuery ? `/reports?${new URLSearchParams({ q: normalizedQuery }).toString()}` : "/reports";
-  const response = await backendRequest<LiveReportListResponse | ReportSummary[]>(path);
+  const response = await backendRequest<LiveReportListResponse | ArchivedReportSummary[]>(path);
   return normalizeReportListResponse(response);
 }
 
-export async function getReportById(id: string): Promise<ReportDetail | null> {
-  return normalizeReportDetail(await backendRequest<ReportDetail | null>(`/reports/${encodeURIComponent(id)}`));
+export async function getReportById(id: string): Promise<ArchivedReportDetail | null> {
+  return normalizeReportDetail(await backendRequest<ArchivedReportDetail | null>(`/reports/${encodeURIComponent(id)}`));
 }

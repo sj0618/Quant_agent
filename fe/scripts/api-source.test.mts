@@ -39,7 +39,7 @@ test("canonical product surface excludes retired history and strategy routes", a
   assert.match(searchSource, /getReports\(normalizedQuery\)/);
   assert.match(searchSource, /ROUTES\.reportDetail/);
   assert.match(searchSource, /Badge variant="info">report<\/Badge>/);
-  assert.match(searchSource, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
+  assert.match(searchSource, /placeholder="결과 ID 또는 보관 기준일"/);
   assert.doesNotMatch(searchSource, /getAppOverview/);
   assert.doesNotMatch(searchSource, /getWorkspaceTemplate/);
   assert.doesNotMatch(searchSource, /refreshLatestAnalysisJob/);
