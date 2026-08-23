@@ -838,6 +838,22 @@ def test_live_provider_configuration_rejects_invalid_role_specific_override() ->
     assert reason == "provider_config_invalid"
 
 
+def test_live_provider_configuration_returns_a_reason_for_targeted_role() -> None:
+    ready, reason = live_provider_configuration_ready(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": "https://example.test/openai/responses?api-version=2025-04-01-preview",
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "test-model",
+            "AI_LLM_REPORT_WRITER_RESPONSES_URL": "not-a-url",
+        },
+        role="report writer",
+    )
+
+    assert ready is False
+    assert reason == "provider_config_invalid"
+
+
 def test_response_start_deadline_measures_silence_not_thinking_time(monkeypatch) -> None:
     """A reasoning deployment that emits progress events must not be cut off.
 

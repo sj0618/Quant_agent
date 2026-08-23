@@ -17,7 +17,6 @@ from ai_graph.llm.aoai import (
 from ai_graph.llm.base import LLMClient, LLMProviderConfigError
 from ai_graph.llm.mock import MockLLMClient
 
-
 AI_LLM_PROVIDER_ENV = "AI_LLM_PROVIDER"
 AI_AOAI_RESPONSES_URL_ENV = "AI_AOAI_RESPONSES_URL"
 AI_AOAI_API_KEY_ENV = "AI_AOAI_API_KEY"
@@ -101,7 +100,8 @@ def live_provider_configuration_ready(
     if not _live_provider_configuration_ready_for_role(env, role=None):
         return False, "provider_config_invalid"
     if role is not None:
-        return _live_provider_configuration_ready_for_role(env, role)
+        role_ready = _live_provider_configuration_ready_for_role(env, role)
+        return role_ready, None if role_ready else "provider_config_invalid"
 
     for configured_role in _configured_aoai_roles(env):
         if not _live_provider_configuration_ready_for_role(env, configured_role):
