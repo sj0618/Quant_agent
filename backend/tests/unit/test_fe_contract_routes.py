@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -124,7 +126,6 @@ def test_email_routes_require_authentication_and_csrf_before_database_access():
 
     for path in (
         "/api/v1/me/notifications",
-        "/api/v1/me/email-strategy-subscriptions",
         "/api/v1/me/email-deliveries",
     ):
         response = client.get(path)
@@ -135,13 +136,34 @@ def test_email_routes_require_authentication_and_csrf_before_database_access():
     cookie = {app.state.settings.auth_session_cookie_name: session_id}
     for method, path, payload in (
         ("PATCH", "/api/v1/me/notifications", {"dailyReportEmail": True}),
-        ("POST", "/api/v1/me/email-strategy-subscriptions", {"strategyId": "strategy-1"}),
-        ("DELETE", "/api/v1/me/email-strategy-subscriptions/strategy-1", None),
         ("POST", "/api/v1/reports/report-1/resend", None),
     ):
         response = client.request(method, path, cookies=cookie, headers={"Origin": API_ORIGIN}, json=payload)
         assert response.status_code == 403
         assert response.json()["error"]["code"] == "csrf_invalid"
+
+
+def test_daily_digest_subscription_routes_are_retired_before_auth_or_database_access(monkeypatch):
+    client, _app = make_client()
+
+    def database_access_must_not_happen(_request):
+        raise AssertionError("retired daily-digest subscription route reached the database")
+
+    monkeypatch.setattr(fe_contract.email_reports, "get_db_engine", database_access_must_not_happen)
+
+    for method, path in (
+        ("GET", "/api/v1/me/email-strategy-subscriptions"),
+        ("POST", "/api/v1/me/email-strategy-subscriptions"),
+        ("DELETE", "/api/v1/me/email-strategy-subscriptions/strategy-1"),
+    ):
+        response = client.request(method, path, json={"strategyId": "strategy-1"})
+        assert response.status_code == 410
+        assert response.json()["error"] == {
+            "component": "email_reports",
+            "code": "daily_digest_subscriptions_retired",
+            "message": "정기 다이제스트 구독은 현재 제공하지 않습니다.",
+            "details": {},
+        }
 
 
 def test_unsubscribe_route_is_public_but_fail_closed_when_disabled():
@@ -253,11 +275,43 @@ def test_track_c_complete_and_report_list_routes_forward_filters(monkeypatch):
     monkeypatch.setattr(fe_contract.fe_contract_store, "complete_analysis_run_from_db", fake_complete)
     monkeypatch.setattr(fe_contract.fe_contract_store, "list_reports_from_db", fake_list_reports)
 
+    class StoredResult:
+        def model_dump(self, *, mode: str):
+            assert mode == "json"
+            return {
+                "status": "ready",
+                "strategy_spec": {"strategy_id": "strategy-1"},
+                "user_payload": {
+                    "recommendation_gate": {"validated": True},
+                    "performance": {"sharpe_ratio": 0.28},
+                    "report": {
+                        "web_projection": {
+                            "title": "Stored report",
+                            "summary": "Stored summary",
+                            "sections": [{"title": "Section", "summary": "Body"}],
+                        }
+                    },
+                },
+            }
+
+    app.state.analysis_job_store = SimpleNamespace(
+        get_job=lambda job_id: SimpleNamespace(
+            job_id=job_id,
+            user_id="user-1",
+            status="completed",
+            result=StoredResult(),
+            completed_at=datetime(2026, 8, 3, tzinfo=UTC),
+        )
+    )
+
     completion = client.post(
         "/api/v1/runs/run-1/complete",
         cookies={app.state.settings.auth_session_cookie_name: session_id},
         headers={"Origin": API_ORIGIN, "X-CSRF-Token": csrf_token},
-        json={"status": "completed", "result": {"title": "Report", "summary": "Summary"}},
+        json={
+            "aiJobId": "job-1",
+            "result": {"title": "Forged browser report", "summary": "Forged browser summary"},
+        },
     )
     reports = client.get(
         "/api/v1/reports",
@@ -272,7 +326,9 @@ def test_track_c_complete_and_report_list_routes_forward_filters(monkeypatch):
     assert observed["user_id"] == "user-1"
     assert observed["run_id"] == "run-1"
     assert observed["payload"]["status"] == "completed"
-    assert observed["payload"]["result"]["title"] == "Report"
+    assert observed["payload"]["aiJobId"] == "job-1"
+    assert observed["payload"]["result"]["title"] == "Stored report"
+    assert observed["payload"]["result"]["summary"] == "Stored summary"
     assert reports.status_code == 200
     assert observed["list_filters"] == {"user_id": "user-1", "limit": 5, "cursor": "cursor-value", "status": "sent", "q": "삼성전자"}
 

@@ -28,11 +28,17 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
   const maxDrawdownMetric = metricByKey(overview, "mdd");
   const chartPoints = overview.performance.equityCurve.slice(-5);
   const latestPoint = chartPoints[chartPoints.length - 1];
-  const strategyReturn = latestPoint?.strategy ?? 0;
-  const benchmarkReturn = latestPoint?.benchmark ?? 0;
-  const currentAsset = CHART_INITIAL_ASSET * (1 + strategyReturn / PERCENT_SCALE);
-  const benchmarkLabel = overview.performance.benchmarkLabel ?? "KOSPI200";
-  const hasBenchmarkSeries = chartPoints.some((point) => point.benchmark !== 0);
+  const strategyReturn = latestPoint?.strategy;
+  const benchmarkReturn = latestPoint?.benchmark;
+  const currentAsset = strategyReturn === undefined
+    ? null
+    : CHART_INITIAL_ASSET * (1 + strategyReturn / PERCENT_SCALE);
+  const benchmarkLabel = overview.performance.benchmark?.label
+    || overview.performance.benchmarkLabel
+    || "벤치마크";
+  const hasBenchmarkSeries = overview.performance.benchmark?.is_available === true
+    && chartPoints.some((point) => Number.isFinite(point.benchmark));
+  const insufficient = overview.performance.reliability?.status === "insufficient";
   const candidateCounts = countScoredSignals(overview.candidates);
 
   return (
@@ -57,6 +63,16 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
         </dl>
       </Card>
 
+      {overview.performance.reliability ? (
+        <Card className={`overview-reliability overview-reliability--${overview.performance.reliability.status}`}>
+          <div>
+            <strong>성과 신뢰도: {overview.performance.reliability.status === "sufficient" ? "충분" : overview.performance.reliability.status === "limited" ? "제한적" : "부족"}</strong>
+            <span>{overview.performance.reliability.trading_days}거래일 · {overview.performance.reliability.ticker_count}종목 · 거래 {overview.performance.reliability.trade_count}회</span>
+          </div>
+          {overview.performance.reliability.reasons.length ? <p>{overview.performance.reliability.reasons.join(" · ")}</p> : null}
+        </Card>
+      ) : null}
+
       <section className="summary-grid">
         {[
           validated
@@ -65,13 +81,18 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
           { label: "활성 신호", value: `${overview.passCount}건`, delta: undefined, caption: `BUY ${overview.buyCount} · HOLD ${overview.holdCount} · DROP ${overview.dropCount}` },
           {
             label: "검증 누적 수익률",
-            value: totalReturnMetric?.value ?? formatPercentValue(strategyReturn),
+            value: insufficient ? "표본 부족" : totalReturnMetric?.value ?? (strategyReturn === undefined ? "—" : formatPercentValue(strategyReturn)),
             delta: totalReturnMetric?.delta,
-            caption: totalReturnMetric?.caption ?? `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`,
+            caption: insufficient
+              ? "신뢰도 기준 미달로 숫자를 표시하지 않습니다."
+              : totalReturnMetric?.caption ?? (benchmarkReturn === undefined ? "실제 수익률 곡선 기준" : `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`),
           },
           {
-            label: "Sharpe (Walk-forward)",
-            value: sharpeMetric?.value ?? "-",
+            // The engine runs a single 70/30 split, not a walk-forward: the
+            // walk_forward config exists on the spec but nothing ever reads it. Labelling
+            // this "Walk-forward" claimed a validation that was never performed.
+            label: "Sharpe (홀드아웃)",
+            value: insufficient ? "표본 부족" : sharpeMetric?.value ?? "—",
             delta: sharpeMetric?.delta,
             caption: sharpeMetric?.caption ?? "AI 전략 검증 결과",
           },
@@ -145,7 +166,7 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
         </Card>
       </div>
 
-      <Card className="chart-card" padded={false}>
+      {chartPoints.length >= 2 && strategyReturn !== undefined ? <Card className="chart-card" padded={false}>
         <div className="card-head">
           <div>
             <strong>누적 수익률</strong>
@@ -160,15 +181,20 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
         <div className="chart-card__numbers">
           <div>
             <span>현재 자산</span>
-            <strong>{formatCurrency(currentAsset)}</strong>
+            <strong>{currentAsset === null ? "—" : formatCurrency(currentAsset)}</strong>
             <em>{formatPercentValue(strategyReturn)}</em>
           </div>
           <div><span>초기 자산</span><strong>{formatCurrency(CHART_INITIAL_ASSET)}</strong></div>
-          {hasBenchmarkSeries ? <div><span>{benchmarkLabel} 대비</span><strong>{formatPercentPoint(strategyReturn - benchmarkReturn)}</strong></div> : null}
+          {hasBenchmarkSeries && benchmarkReturn !== undefined ? <div><span>{benchmarkLabel} 대비</span><strong>{formatPercentPoint(strategyReturn - benchmarkReturn)}</strong></div> : null}
           <div><span>최대 낙폭</span><strong>{maxDrawdownMetric?.value ?? "-"}</strong></div>
         </div>
         <PerformanceChart points={chartPoints} series={hasBenchmarkSeries ? ["benchmark", "strategy"] : ["strategy"]} />
-      </Card>
+      </Card> : (
+        <Card className="performance-empty">
+          <strong>누적 수익률을 표시할 수 없습니다</strong>
+          <p>{insufficient ? "표본이 부족해 숫자와 곡선을 숨겼습니다." : "실제 백테스트 시계열이 없습니다."}</p>
+        </Card>
+      )}
     </div>
   );
 }

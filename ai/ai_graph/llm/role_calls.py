@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.llm import LLMClientError, LLMJsonRequest, create_llm_client, is_live_llm_provider
+from ai_graph.nodes.condition_compiler import supported_metrics
 from ai_graph.progress import activity_role, report_activity
 from ai_graph.schemas import (
     Condition,
@@ -309,27 +310,49 @@ def generate_strategy_description(
     )
 
 
-STRATEGY_CONDITIONS_SYSTEM_PROMPT = (
-    "You are a QuantAgent strategy analyst. Convert the user's Korean natural-language "
-    "trading strategy into structured JSON that matches EXPECTED_JSON_SCHEMA exactly: "
-    '"entry_conditions" and "exit_conditions" (each a non-empty array of objects with '
-    "left, operator, right, description — operator one of lt/lte/gt/gte/eq/ne/between/"
-    'cross_above/cross_below), "indicators" (array of indicator names referenced), and '
-    '"confidence" (0-1). Use the web search tool to confirm current market-standard '
-    "definitions and thresholds for any named indicator or strategy pattern when the query "
-    "alone is insufficient. Return JSON only, no prose.\n\n"
-    "Condition value format (required, no exceptions):\n"
-    "- lt/lte/gt/gte/eq/ne: `right` MUST be a number (int or float). Never a ticker, "
-    "company name, or any other non-numeric string.\n"
-    "- between: `right` MUST be a 2-item [low, high] number array.\n"
-    "- cross_above/cross_below: `right` MUST be a string naming the other metric/line "
-    "being crossed (e.g. \"sma_20\"), not a company or ticker.\n"
-    "Entry/exit conditions describe technical trading logic only (price, indicators, "
-    "volume, moving averages, etc.) — never instrument selection. If the user names a "
-    "specific stock or ticker (e.g. 삼성전자, 005930), do not emit a condition for it; "
-    "stock/universe selection is resolved separately by the data layer, outside this call. "
-    "Only describe the trading logic that applies once a stock is already selected."
-)
+def _strategy_conditions_prompt() -> str:
+    """Built at import from the compiler's own vocabulary.
+
+    The prompt used to constrain the shape of a condition but not its `left`, and
+    offered "sma_20" as an example of a metric name - which the compiler did not
+    recognise. Conditions therefore came back well-formed and untranslatable: six of
+    the seven built-in strategy profiles compiled to nothing, and the backtest quietly
+    validated a generic template instead of the user's rule while the UI reported
+    "매수 조건 N개 생성 완료". Listing the vocabulary here, from the module that
+    consumes it, is what stops the two drifting again.
+    """
+
+    vocabulary = ", ".join(supported_metrics())
+    return (
+        "You are a QuantAgent strategy analyst. Convert the user's Korean natural-language "
+        "trading strategy into structured JSON that matches EXPECTED_JSON_SCHEMA exactly: "
+        '"entry_conditions" and "exit_conditions" (each a non-empty array of objects with '
+        "left, operator, right, description — operator one of lt/lte/gt/gte/eq/ne/between/"
+        'cross_above/cross_below), "indicators" (array of indicator names referenced), and '
+        '"confidence" (0-1). Use the web search tool to confirm current market-standard '
+        "definitions and thresholds for any named indicator or strategy pattern when the query "
+        "alone is insufficient. Return JSON only, no prose.\n\n"
+        "Metric names (required):\n"
+        f"- `left`, and `right` when it names a metric, MUST come from this list: {vocabulary}\n"
+        "- A metric outside the list cannot be backtested. If the strategy genuinely needs "
+        "one, express the closest rule you can with the listed metrics and say what you "
+        "substituted in that condition's `description`. Do not invent a metric name.\n\n"
+        "Condition value format (required, no exceptions):\n"
+        "- lt/lte/gt/gte/eq/ne: `right` MUST be a number (int or float). Never a ticker, "
+        "company name, or any other non-numeric string.\n"
+        "- between: `right` MUST be a 2-item [low, high] number array.\n"
+        "- cross_above/cross_below: `right` MUST be a string naming the other metric/line "
+        'being crossed (e.g. "sma20"), not a company or ticker.\n'
+        "Entry/exit conditions describe technical trading logic only (price, indicators, "
+        "volume, moving averages, etc.) — never instrument selection. If the user names a "
+        "specific stock or ticker (e.g. 삼성전자, 005930), do not emit a condition for it; "
+        "stock/universe selection is resolved separately by the data layer, outside this call. "
+        "Only describe the trading logic that applies once a stock is already selected."
+    )
+
+
+STRATEGY_CONDITIONS_SYSTEM_PROMPT = _strategy_conditions_prompt()
+
 
 
 def generate_strategy_conditions(
@@ -395,7 +418,7 @@ explicitly as close to the original as you can. Never tighten a threshold.
 Every value must stay inside these inclusive ranges:
   high_252_ratio 0.50..1.0, volume_ratio_min 0.5..10.0,
   relative_strength_20d_min -1.0..1.0, relative_strength_60d_min -1.0..1.0,
-  rsi_max 5.0..70.0, rsi_cross_floor 5.0..70.0, sma20_band 0.005..0.50,
+  rsi_max 5.0..70.0, rsi_cross_floor 5.0..70.0, rsi_min 30.0..95.0, sma20_band 0.005..0.50,
   bb_width_max 0.02..1.0, bb_upper_ratio 0.50..1.0.
 require_close_above_sma20 is a boolean; set it false to drop the trend filter.
 """
@@ -414,6 +437,7 @@ class _LiveScreeningThresholds(BaseModel):
     relative_strength_60d_min: float
     rsi_max: float
     rsi_cross_floor: float
+    rsi_min: float
     sma20_band: float
     bb_width_max: float
     bb_upper_ratio: float
@@ -433,9 +457,8 @@ def generate_relaxed_screening_thresholds(
 
     Returns a plain mapping rather than the caller's model so ai_graph.data_sources
     stays importable without the LLM stack; the caller re-validates and clamps it.
-    Unlike the other role calls this never raises on a live provider - screening has
-    a deterministic ladder to fall back on, and failing the whole analysis because a
-    relaxation hint was unavailable would be worse than widening the screen blindly.
+    In a live-provider run, an unavailable provider stops the analysis instead of
+    silently widening the screen with deterministic thresholds.
     """
 
     expected_json_schema = _LiveScreeningThresholds.model_json_schema()
@@ -462,6 +485,8 @@ def generate_relaxed_screening_thresholds(
         payload = create_llm_client(role="SCREENING_RELAXATION").generate_json(request)
         parsed = _LiveScreeningThresholds.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return dict(fallback)
     return parsed.model_dump(exclude={"rationale"})
 
@@ -548,6 +573,8 @@ def review_strategy_spec(
             payload = create_llm_client(role="STRATEGY_REVIEW").generate_json(request)
         parsed = _LiveStrategyReview.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
     with activity_role("RESEARCH_JUDGE"):
         report_activity(
@@ -629,6 +656,8 @@ def research_screening_terms(*, query: str) -> dict[str, Any] | None:
         payload = create_llm_client(role="SCREENING_RESEARCH").generate_json(request)
         return _LiveScreeningResearch.model_validate(payload).model_dump()
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
 
 
@@ -735,6 +764,8 @@ def resolve_strategy_intent(
         payload = create_llm_client(role="STRATEGY_INTENT").generate_json(request)
         resolved = _LiveStrategyIntent.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
     if resolved.scope == "supported" and not resolved.resolved_query.strip():
         # An empty resolution would silently hand the raw vague query back to the
@@ -859,6 +890,8 @@ def generate_screening_sql(
         payload = create_llm_client(role="SCREENING_SQL").generate_json(request)
         parsed = _LiveScreeningSQL.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
     result = parsed.model_dump()
     # Validate the structured conditions against the real Condition (dropping the AOAI
@@ -945,6 +978,8 @@ def revise_strategy_conditions(
         payload = create_llm_client(role="STRATEGY_REVISION").generate_json(request)
         parsed = _LiveStrategyRevision.model_validate(payload)
     except (LLMClientError, ValidationError, ValueError, TypeError):
+        if is_live_llm_provider():
+            raise
         return None
     if not parsed.changed or not parsed.entry_conditions:
         return None
@@ -1028,10 +1063,8 @@ def generate_report_writeup(
             )
         return written
     except (LLMClientError, ValidationError, ValueError, TypeError) as exc:
-        # Unlike the debates, this never re-raises on a live provider. By the time the
-        # report is written the screen, backtest and risk decision are all done; losing
-        # the entire analysis because the write-up failed its schema check throws away
-        # everything that did work. The fallback still carries the real decision.
+        if is_live_llm_provider():
+            raise
         _logger.warning("report write-up failed; using deterministic fallback: %s", exc)
         reasons = [*fallback.fallback_reasons, f"{type(exc).__name__}: {exc}"]
         return fallback.model_copy(update={"fallback_reasons": reasons})

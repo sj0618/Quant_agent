@@ -1,7 +1,11 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from ai_graph.api import ANALYSIS_JOBS_PATH, create_app
 from ai_graph.jobs import InMemoryAnalysisJobStore
+
+pytest_plugins = ("offline_test_environment",)
+pytestmark = pytest.mark.usefixtures("offline_test_environment")
 
 
 QUERY = "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어"
@@ -31,6 +35,10 @@ API_ENVELOPE_FIELDS = {
     "proxy_disclosure",
     "failure_cause",
     "evidence_refs",
+    # Added deliberately: the backtest's own statement of which rule it traded. Without
+    # it a report where the user's conditions were silently replaced by a generic
+    # template is byte-identical to one where they were actually tested.
+    "rule_provenance",
 }
 USER_PAYLOAD_FIELDS = {
     "headline",
@@ -40,6 +48,7 @@ USER_PAYLOAD_FIELDS = {
     "report",
     "performance",
     "recommendation_gate",
+    "ticker_actions",
     "question",
     "options",
     "recommended",
@@ -73,6 +82,7 @@ def test_analysis_job_and_api_envelope_public_fields_are_frozen() -> None:
     assert result["semantic_slots"]["indicator"]
     assert result["data_requirements"]
     assert result["source_usage"]
+    assert all(source["fallback_used"] for source in result["source_usage"])
     assert result["evidence_refs"]
     assert set(user_payload) == USER_PAYLOAD_FIELDS
     assert user_payload["performance"]["selected_candidate_id"]

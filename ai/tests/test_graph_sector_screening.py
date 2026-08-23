@@ -24,6 +24,15 @@ def test_parse_semantic_slots_sector_is_none_when_absent() -> None:
     assert "universe" not in slots.model_dump()
 
 
+def test_parse_semantic_slots_extracts_rsi_threshold_without_mentioning_30() -> None:
+    slots = parse_semantic_slots(
+        "RSI 70 이상이면 사고 싶어", trace_id="trace-slot-rsi-70-only"
+    )
+
+    assert "rsi" in slots.indicator
+    assert "rsi >= 70" in slots.threshold
+
+
 def test_build_strategy_spec_propagates_sector() -> None:
     query = "반도체 섹터에서 RSI 30 이하로 과매도된 종목 찾아줘"
     slots = parse_semantic_slots(query, trace_id="trace-spec-sector")

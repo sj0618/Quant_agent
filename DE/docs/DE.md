@@ -195,7 +195,7 @@ meta        위 전체 흐름의 실행 이력, API 로그, 품질 이슈, linea
 
 | 항목 | 내용 |
 |---|---|
-| 목적 | KRX 또는 KIS OHLCV를 지정 기간 기준으로 수집해 raw/core 계층에 적재. 10년 KRX 기본 OHLCV backfill과 daily update에 사용. |
+| 목적 | KRX OHLCV를 지정 기간 기준으로 수집해 raw/core 계층에 적재. KIS 공식 수정주가는 별도 feature 파이프라인으로 분리한다. |
 | 입력 | `--source`, `--start-date`, `--end-date`, `--symbols`, `--db-mode`, `--db-container`, `--output`. |
 | 핵심 클래스 | `OhlcvIngestionService`. |
 | 저장 대상 | `raw.ohlcv_response`, `core.symbol_master`, `core.symbol_listing_history`, `core.symbol_name_history`, `core.trading_calendar`, `core.ohlcv_daily`, `meta.lineage_event`, `meta.data_quality_issue`, `meta.ingestion_cursor`. |
@@ -207,7 +207,7 @@ meta        위 전체 흐름의 실행 이력, API 로그, 품질 이슈, linea
 | 실행 run 생성 | `meta.ingestion_run`에 source, 기간, symbol 파라미터 저장. |
 | 기간 분할 | `OhlcvIngestionConfig.batch_days` 기준으로 날짜 범위 chunk 분할. 기본값 1일. |
 | KRX 수집 | 날짜별로 KRX KOSPI/KOSDAQ 일별 endpoint 호출. 응답 payload를 보존하고 `normalize_krx_market_day()`로 OHLCV row 변환. |
-| KIS 수집 | symbol-scoped API 구조라 명시 symbol 목록이 있을 때만 수집. `normalize_kis_daily_price()`로 변환. |
+| KIS 수집 | 이 명령은 KIS 데이터를 `core.ohlcv_daily`에 적재하지 않는다. KIS 공식 수정주가는 `scripts/ingest_kis_adjusted_ohlcv.py`로 `feature.kis_adjusted_ohlcv_daily`에 적재한다. |
 | raw 저장 | `request_hash`, `payload_hash` 기준 `raw.ohlcv_response`에 `ON CONFLICT DO NOTHING` 저장. |
 | core upsert | 중복 symbol/date는 마지막 row 기준 dedupe. 종목 마스터, 상장 이력, 종목명 이력, 거래일, OHLCV를 한 transaction으로 upsert. |
 | 품질 flags | OHLCV 가격/거래량 이상, 중복 row 등 즉시 탐지한 품질 이슈를 `meta.data_quality_issue`에 기록. |

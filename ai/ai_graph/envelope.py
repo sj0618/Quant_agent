@@ -34,6 +34,7 @@ def build_envelope(
     proxy_disclosure: dict[str, str] | None = None,
     failure_cause: dict[str, Any] | None = None,
     evidence_refs: list[dict[str, Any]] | None = None,
+    rule_provenance: dict[str, Any] | None = None,
 ) -> APIEnvelope:
     payload = (
         user_payload
@@ -54,4 +55,5 @@ def build_envelope(
         proxy_disclosure=proxy_disclosure,
         failure_cause=failure_cause,
         evidence_refs=evidence_refs or [],
+        rule_provenance=rule_provenance,
     )

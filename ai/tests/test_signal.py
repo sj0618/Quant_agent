@@ -85,13 +85,16 @@ def test_backtest_summary_excludes_generated_candidate_payloads():
         }
     )
 
-    assert summary == {
-        "selected_candidate_id": "candidate-a",
-        "metrics": {"sharpe_ratio": 1.4},
-        "engine_summary": {"trades": 7},
-        "objective_score": 0.81,
-    }
+    assert summary["selected_candidate_id"] == "candidate-a"
+    assert summary["metrics"] == {"sharpe_ratio": 1.4}
+    assert summary["engine_summary"] == {"trades": 7}
+    assert summary["objective_score"] == 0.81
     assert "candidates" not in summary
+    # The headline reports the hold-out, and says so; the full-period figure the
+    # selection already optimised against stays available but is not the headline.
+    assert summary["headline"]["basis"] == "hold_out"
+    assert summary["headline"]["full_period"]["sharpe_ratio"] == 1.4
+    assert summary["headline"]["sharpe_ratio"] is None
 
 
 def test_signal_condition_validates_between_shape():

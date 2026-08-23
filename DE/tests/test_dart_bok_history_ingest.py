@@ -6,9 +6,12 @@ import unittest
 
 from scripts.ingest_dart_bok_history import (
     DartReportPeriod,
+    DartUniverseEntry,
     SchemaMappingError,
     TableColumn,
     TableSchema,
+    SourceStats,
+    iter_resumable_dart_jobs,
     format_bok_period,
     load_bok_series_configs,
     parse_args,
@@ -63,6 +66,58 @@ class DartBokHistoryIngestTests(unittest.TestCase):
 
         self.assertEqual(len(periods), 4)
         self.assertEqual({period.report_code for period in periods}, {"11013", "11012", "11014", "11011"})
+
+    def test_parse_args_enables_dart_skip_existing_flag(self):
+        args = parse_args(
+            [
+                "--scope",
+                "custom",
+                "--sources",
+                "dart",
+                "--start-date",
+                "2016-01-01",
+                "--end-date",
+                "2016-12-31",
+                "--dart-skip-existing",
+            ]
+        )
+
+        self.assertTrue(args.dart_skip_existing)
+
+    def test_resumable_dart_jobs_skip_existing_feature_keys(self):
+        universe = [
+            DartUniverseEntry(symbol="005930", corp_code="00126380", symbol_id=1),
+            DartUniverseEntry(symbol="000660", corp_code="00164742", symbol_id=2),
+        ]
+        periods = [
+            DartReportPeriod(2026, "11013", date(2026, 3, 31)),
+            DartReportPeriod(2026, "11011", date(2026, 12, 31)),
+        ]
+        existing_keys = {
+            (1, date(2026, 3, 31), "11013", "CFS"),
+            (2, date(2026, 12, 31), "11011", "CFS"),
+        }
+        stats = SourceStats()
+
+        jobs = list(
+            iter_resumable_dart_jobs(
+                universe,
+                periods,
+                "CFS",
+                existing_keys,
+                skip_existing=True,
+                stats=stats,
+            )
+        )
+
+        self.assertEqual(
+            jobs,
+            [
+                (universe[0], periods[1]),
+                (universe[1], periods[0]),
+            ],
+        )
+        self.assertEqual(stats.rows_skipped, 2)
 
     def test_schema_validation_rejects_missing_non_nullable_column(self):
         table_schema = TableSchema(

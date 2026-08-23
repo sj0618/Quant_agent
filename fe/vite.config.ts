@@ -6,6 +6,7 @@ import tailwindcss from "@tailwindcss/vite";
 type ProxyTarget = {
   target: string;
   changeOrigin: boolean;
+  xfwd: boolean;
   rewrite?: (path: string) => string;
 };
 
@@ -29,10 +30,12 @@ export function createBackendProxyConfig(env: Record<string, string | undefined>
         "/api/v1": {
           target: combinedTarget,
           changeOrigin: true,
+          xfwd: true,
         },
         "/ai-api": {
           target: combinedTarget,
           changeOrigin: true,
+          xfwd: true,
         },
       },
     };
@@ -41,12 +44,14 @@ export function createBackendProxyConfig(env: Record<string, string | undefined>
     mode: "split",
     proxy: {
       "/api/v1": {
-        target: backendTarget,
-        changeOrigin: true,
+          target: backendTarget,
+          changeOrigin: true,
+          xfwd: true,
       },
       "/ai-api": {
-        target: aiTarget,
-        changeOrigin: true,
+          target: aiTarget,
+          changeOrigin: true,
+          xfwd: true,
         rewrite: (path: string) => path.replace(/^\/ai-api/, ""),
       },
     },

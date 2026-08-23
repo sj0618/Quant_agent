@@ -1,34 +1,25 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
 
-test("report surfaces keep the restored live report source", async () => {
-  const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+test("browser exposes rule-reviewed research without reviving the legacy analysis client", async () => {
+  const [clientSource, appSource, activitySource] = await Promise.all([
+    readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/api/analysisActivity.ts", import.meta.url), "utf8"),
+  ]);
 
-  assert.match(source, /mocks\/(?:app|reports)\.mock/);
-  assert.match(source, /backendRequest/);
-  assert.match(source, /export async function getReports\(q\?: string\)/);
-  assert.match(source, /new URLSearchParams\(\{ q: normalizedQuery \}\)/);
-  assert.match(source, /export async function getReportById/);
-  assert.doesNotMatch(source, /export async function searchInstruments/);
-  assert.match(source, /AI_REPORT_ID_PREFIX/);
-  assert.doesNotMatch(source, /reportClient|reportAdapter/);
-});
-
-test("workspace restores the latest server analysis on a fresh browser", async () => {
-  const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
-
-  assert.match(source, /refreshLatestAnalysisJob\(\)/);
-  assert.match(source, /setAnalysisJobs\(\(jobs\) => \(jobs\.length \? jobs : \[latestJob\]\)\)/);
-});
-
-test("workspace discards a running job lost during a server restart", async () => {
-  const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
-
-  assert.match(source, /missingJobIds\.add\(job\.job_id\)/);
-  assert.match(source, /\.filter\(\(job\) => !missingJobIds\.has\(job\.job_id\)\)/);
-  assert.doesNotMatch(source, /분석 job을 서버에서 찾을 수 없습니다/);
+  assert.match(clientSource, /backendRequest/);
+  assert.match(clientSource, /export async function getReports\(q\?: string\)/);
+  assert.match(clientSource, /new URLSearchParams\(\{ q: normalizedQuery \}\)/);
+  assert.match(clientSource, /export async function getReportById/);
+  assert.doesNotMatch(clientSource, /createAnalysisJob|cancelAnalysisJob|createAnalysisRun|completeAnalysisRun/);
+  assert.doesNotMatch(clientSource, /analysis-jobs|strategyDescriptions|fetchAI/);
+  assert.match(appSource, /ResearchWorkspace/);
+  assert.doesNotMatch(appSource, /매수|매도|보유|추천|BUY|SELL|HOLD/);
+  assert.doesNotMatch(appSource, /StrategyInputPanel|useAnalysisActivity|analysis-jobs/);
+  assert.match(activitySource, /analysisJobEvents/);
 });
 
 test("canonical product surface excludes retired history and strategy routes", async () => {
@@ -41,9 +32,6 @@ test("canonical product surface excludes retired history and strategy routes", a
 
   assert.doesNotMatch(routesSource, /reportsHistory|reportStrategies|strategyReportDetail/);
   assert.doesNotMatch(appSource, /ReportsHistoryPage|StrategyReportsPage|StrategyReportDetailPage/);
-  // The retired *route* stays retired; the send-history timeline itself lives on /me now.
-  // It was deleted along with that route in 6dadc69 while its backend endpoint stayed live,
-  // so it is asserted present rather than absent.
   assert.doesNotMatch(profileSource, /reportsHistory/);
   assert.match(profileSource, /EmailHistoryTimeline/);
   assert.match(profileSource, /getEmailDeliveries/);
@@ -61,7 +49,7 @@ test("canonical product surface excludes retired history and strategy routes", a
 
 test("authentication boundaries do not leak cached analysis between users", async () => {
   const authSource = await readFile(new URL("../src/api/authClient.ts", import.meta.url), "utf8");
-  const aiSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+  const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
   const profileSource = await readFile(new URL("../src/pages/ProfilePage.tsx", import.meta.url), "utf8");
 
@@ -69,14 +57,32 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   assert.match(authSource, /AUTH_ENDPOINTS\.me/);
   assert.match(authSource, /finally \{\s+clearCurrentSession\(\)/);
   assert.match(appSource, /validateCurrentSession\(\)/);
-  assert.match(aiSource, /\[401, 403\]\.includes\(error\.status\)/);
-  assert.match(aiSource, /error\.status === 404/);
+  assert.doesNotMatch(clientSource, /localStorage|analysis-jobs|fetchAI/);
   assert.match(profileSource, /window\.location\.assign\(ROUTES\.home\)/);
   assert.doesNotMatch(authSource, /TEST_AUTH_SESSION/);
   assert.doesNotMatch(authSource, /saveTestSession/);
   assert.doesNotMatch(authSource, /provider:\s*"test"/);
   assert.doesNotMatch(authSource, /completeTestLogin/);
   assert.doesNotMatch(authSource, /AUTH_ENDPOINTS\.testLogin/);
+});
+
+test("public navigation and bundle sources contain no development preview, fake sample report link, or internal 404 copy", async () => {
+  const [appSource, routesSource, landingSource, globalStyles] = await Promise.all([
+    readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/config/routes.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/pages/LandingPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/styles/global.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.doesNotMatch(appSource, /EmailTemplatePreviewPage|Figma HI-FI/);
+  assert.doesNotMatch(routesSource, /emailTemplatePreview|dev\/email-template/);
+  assert.doesNotMatch(landingSource, /reportDetail\("2026-04-18"\)|KRX LIVE|Sharpe 1\.42/);
+  assert.match(landingSource, /현재는 보관된 검증 리포트 열람만 지원합니다/);
+  assert.doesNotMatch(landingSource, /매수|매도|보유|추천|BUY|SELL|HOLD/);
+  assert.doesNotMatch(await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"), /landing\.mock|getLandingSample|LandingSample/);
+  assert.doesNotMatch(landingSource, /RELEASE VALIDATION|VALIDATION PRINCIPLES|READ-ONLY ARCHIVE|CURRENT SCOPE/);
+  assert.doesNotMatch(globalStyles, /email-template/);
+  await assert.rejects(access(new URL("../src/pages/EmailTemplatePreviewPage.tsx", import.meta.url)));
 });
 
 test("Google callback reuses its one-time exchange under React StrictMode", async () => {

@@ -39,6 +39,25 @@ def get_session_cookie(request: Request) -> str | None:
     return request.cookies.get(settings.auth_session_cookie_name)
 
 
+def _oauth_client_identifier(request: Request, settings) -> str:  # noqa: ANN001
+    """Use a proxy-appended peer only when the direct peer is explicitly trusted."""
+
+    connected_peer = request.client.host if request.client is not None else "unknown"
+    if (
+        not settings.auth_trusted_proxy_headers
+        or connected_peer not in settings.trusted_proxy_hosts
+    ):
+        return connected_peer
+
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if not forwarded_for:
+        return connected_peer
+
+    # Vite's x-forward mode appends the direct peer. Choosing the final value
+    # prevents an incoming client from selecting an earlier spoofed value.
+    return forwarded_for.rsplit(",", maxsplit=1)[-1].strip() or connected_peer
+
+
 @router.get("/google/start")
 async def google_start(
     request: Request,
@@ -48,6 +67,7 @@ async def google_start(
 ) -> Response:
     settings = get_runtime_settings(request)
     store = get_session_store(request)
+    await store.enforce_login_rate_limit(_oauth_client_identifier(request, settings))
     safe_return_to = sanitize_return_to(return_to)
     state = generate_token_urlsafe(32)
     nonce = generate_token_urlsafe(32)
@@ -86,7 +106,10 @@ async def _complete_google_callback(request: Request, *, code: str, oauth_state:
         expected_nonce=str(oauth_state["nonce"]),
     )
     user = await upsert_google_user(get_db_engine(request), identity)
-    session_id, _csrf_token = await store.create_session(user_id=str(user["id"]))
+    session_id, _csrf_token = await store.rotate_session(
+        user_id=str(user["id"]),
+        previous_session_id=get_session_cookie(request),
+    )
     return user, session_id
 
 

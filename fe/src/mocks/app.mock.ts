@@ -35,7 +35,7 @@ export const analysisJobStatus: AnalysisJobStatus = {
     { stage: "strategy_parse", status: "done", label: "전략 정형화", updated_at: "2026-04-18T07:12:00+09:00" },
     { stage: "data_collect", status: "done", label: "KIS·DART·뉴스 수집", updated_at: "2026-04-18T07:29:00+09:00" },
     { stage: "signal_judge", status: "done", label: "신호 판정", updated_at: "2026-04-18T07:44:00+09:00" },
-    { stage: "backtest", status: "done", label: "Walk-forward 백테스트", updated_at: "2026-04-18T07:52:00+09:00" },
+    { stage: "backtest", status: "done", label: "홀드아웃 백테스트", updated_at: "2026-04-18T07:52:00+09:00" },
     { stage: "risk_review", status: "done", label: "Risk Manager 검토", updated_at: "2026-04-18T07:57:00+09:00" },
     { stage: "report_ready", status: "done", label: "리포트 준비 완료", updated_at: "2026-04-18T08:00:00+09:00" },
   ],
@@ -208,9 +208,12 @@ export const tradingCandidates: TradingCandidate[] = [
 
 export const performanceSummary: PerformanceSummary = {
   headline: "백테스트 결과",
-  period: "Walk-forward · IS 18M / OOS 3M · 2016.01 ~ 2026.03",
+  // The engine splits the history once, 70/30, and selects on the first part. It does
+  // not roll windows: the spec carries a walk_forward config that nothing reads. This
+  // copy described a validation the backtest has never performed.
+  period: "단일 홀드아웃 · 선택 70% / 검증 30% · 2016.01 ~ 2026.03",
   metrics: [
-    { key: "sharpe", label: "Sharpe Ratio", value: "1.42", delta: "기준선 1.11", tone: "positive", caption: "Walk-forward 평균. 1.5 이상이 우수." },
+    { key: "sharpe", label: "Sharpe Ratio", value: "1.42", delta: "기준선 1.11", tone: "positive", caption: "홀드아웃 구간 기준. 1.5 이상이 우수." },
     { key: "mdd", label: "Max Drawdown", value: "-9.4%", delta: "기준선 -12.1%", tone: "negative", caption: "감내 가능한 수준. 시장 평균 -15% 대비 양호." },
     { key: "winRate", label: "Win Rate", value: "58.2%", delta: "+3.4pp", tone: "positive", caption: "수익 거래 비율. 10년 누적 1,247 거래." },
     { key: "totalReturn", label: "Total Return (10y)", value: "+92.4%", delta: "CAGR 6.8%", tone: "positive", caption: "거래비용 반영. KOSPI200 동기간 +54.3%." },
@@ -239,7 +242,7 @@ export const performanceSummary: PerformanceSummary = {
     { date: "25.04", label: "美 상호관세 발표", impact: "-α", tone: "negative" },
   ],
   disclaimer:
-    "Walk-forward 6개 윈도우 평균. OOS 구간 신뢰구간 ±2.1%pp. 미래 수익률을 보장하지 않으며, 거래비용은 수수료 0.015% · 거래세 0.23% · 슬리피지 0.1% 반영.",
+    "단일 홀드아웃 구간(마지막 30%) 기준. 여러 후보 중 선택 구간 성과가 가장 좋은 하나를 고른 결과이므로 탐색 폭만큼 상향 편향이 있습니다. 미래 수익률을 보장하지 않으며, 거래비용은 수수료 0.015% · 거래세 0.23% · 슬리피지 0.1% 반영.",
 };
 
 export const appOverview: AppOverview = {

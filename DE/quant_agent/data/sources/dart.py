@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
-from zipfile import ZipFile
-import xml.etree.ElementTree as ET
+from zipfile import BadZipFile, ZipFile
 
 from quant_agent.data.config import DartConfig
 from quant_agent.data.models import RawSourcePayload
-from quant_agent.data.sources.base import SourceConfigurationError, SourceResponseError, retry_call
-
+from quant_agent.data.sources.base import (
+    SourceConfigurationError,
+    SourceResponseError,
+    retry_call,
+)
 
 # OpenDART reuses these account IDs across multiple statement blocks.
 # Downstream consumers expect the canonical total row, so prefer the statement
@@ -25,6 +29,43 @@ DART_ACCOUNT_STATEMENT_PREFERENCES: dict[str, tuple[str, ...]] = {
     "dart_OperatingIncomeLoss": ("IS", "CIS"),
     "ifrs-full_BasicEarningsLossPerShare": ("IS", "CIS"),
 }
+DART_QUOTA_STATUS_CODES = frozenset({"020"})
+DART_QUOTA_MESSAGE_HINTS = ("사용한도", "quota", "usage limit", "too many requests")
+
+
+@dataclass
+class DartApiKeyPool:
+    keys: tuple[str, ...]
+    cursor: int = 0
+    disabled_keys: set[str] = field(default_factory=set)
+
+    @property
+    def size(self) -> int:
+        return len(self.keys)
+
+    @property
+    def active_size(self) -> int:
+        return sum(1 for key in self.keys if key not in self.disabled_keys)
+
+    def next(self) -> str:
+        if not self.keys:
+            raise SourceConfigurationError(
+                "DART_API_KEY, OPENDART_API_KEY, FSS_API_KEY, FSS_API_KEY_2, or FSS_API_KEY_3 is required for OpenDART ingestion."
+            )
+        if self.active_size == 0:
+            raise SourceResponseError("OpenDART API keys are exhausted for this run.")
+
+        attempts = 0
+        while attempts < len(self.keys):
+            key = self.keys[self.cursor]
+            self.cursor = (self.cursor + 1) % len(self.keys)
+            attempts += 1
+            if key not in self.disabled_keys:
+                return key
+        raise SourceResponseError("OpenDART API keys are exhausted for this run.")
+
+    def disable(self, key: str) -> None:
+        self.disabled_keys.add(key)
 
 
 class OpenDartClient:
@@ -32,23 +73,37 @@ class OpenDartClient:
 
     def __init__(self, config: DartConfig) -> None:
         self.config = config
+        self._api_key_pool = DartApiKeyPool(config.api_keys)
 
     def fetch_corp_codes(self) -> bytes:
         if not self.config.is_configured:
-            raise SourceConfigurationError("DART_API_KEY, OPENDART_API_KEY, or FSS_API_KEY is required for OpenDART ingestion.")
-
-        def request_bytes() -> bytes:
-            import requests
-
-            response = requests.get(
-                f"{self.config.base_url}/corpCode.xml",
-                params={"crtfc_key": self.config.api_key},
-                timeout=self.config.request_timeout_seconds,
+            raise SourceConfigurationError(
+                "DART_API_KEY, OPENDART_API_KEY, FSS_API_KEY, FSS_API_KEY_2, or FSS_API_KEY_3 is required for OpenDART ingestion."
             )
-            response.raise_for_status()
-            return response.content
 
-        return retry_call(request_bytes, self.config.retry)
+        last_error: Exception | None = None
+        while self._api_key_pool.active_size > 0:
+            api_key = self._api_key_pool.next()
+            archive_bytes = b""
+            try:
+                archive_bytes = retry_call(
+                    lambda: self._fetch_corp_codes_once(api_key),
+                    self.config.retry,
+                )
+                normalize_corp_code_zip(archive_bytes)
+            except (BadZipFile, SourceResponseError) as exc:
+                last_error = exc
+                if self._is_quota_text(archive_bytes.decode("utf-8", errors="ignore")):
+                    self._api_key_pool.disable(api_key)
+                continue
+            except Exception as exc:  # noqa: BLE001 - preserve underlying source failure
+                last_error = exc
+                continue
+            return archive_bytes
+
+        if last_error is not None:
+            raise last_error
+        raise SourceResponseError("OpenDART corpCode request failed for all configured API keys.")
 
     def fetch_financial_statement(
         self,
@@ -59,38 +114,106 @@ class OpenDartClient:
         fs_div: str = "CFS",
     ) -> RawSourcePayload:
         if not self.config.is_configured:
-            raise SourceConfigurationError("DART_API_KEY, OPENDART_API_KEY, or FSS_API_KEY is required for OpenDART ingestion.")
+            raise SourceConfigurationError(
+                "DART_API_KEY, OPENDART_API_KEY, FSS_API_KEY, FSS_API_KEY_2, or FSS_API_KEY_3 is required for OpenDART ingestion."
+            )
+
+        last_error: Exception | None = None
+        while self._api_key_pool.active_size > 0:
+            api_key = self._api_key_pool.next()
+            try:
+                payload = retry_call(
+                    lambda: self._fetch_financial_payload_once(
+                        api_key=api_key,
+                        corp_code=corp_code,
+                        business_year=business_year,
+                        report_code=report_code,
+                        fs_div=fs_div,
+                    ),
+                    self.config.retry,
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve underlying source failure
+                last_error = exc
+                continue
+
+            status = str(payload.get("status", "")).strip()
+            message = str(payload.get("message", "")).strip()
+            if self._is_quota_payload(status, message):
+                self._api_key_pool.disable(api_key)
+                last_error = SourceResponseError(
+                    f"OpenDART financial response status={status}: {message or 'API quota exhausted'}"
+                )
+                continue
+
+            safe_request = {
+                "corp_code": corp_code,
+                "bsns_year": str(business_year),
+                "reprt_code": report_code,
+                "fs_div": fs_div,
+            }
+            return RawSourcePayload(
+                source=self.source_name,
+                endpoint_key="fnlttSinglAcntAll",
+                request_date=date.today(),
+                request=safe_request,
+                payload=payload,
+            )
+
+        if last_error is not None:
+            raise last_error
+        raise SourceResponseError("OpenDART financial request failed for all configured API keys.")
+
+    def _fetch_corp_codes_once(self, api_key: str) -> bytes:
+        import requests
+
+        response = requests.get(
+            f"{self.config.base_url}/corpCode.xml",
+            params={"crtfc_key": api_key},
+            timeout=self.config.request_timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.content
+
+    def _fetch_financial_payload_once(
+        self,
+        *,
+        api_key: str,
+        corp_code: str,
+        business_year: int,
+        report_code: str,
+        fs_div: str,
+    ) -> dict[str, Any]:
+        import requests
+
         params = {
-            "crtfc_key": self.config.api_key,
+            "crtfc_key": api_key,
             "corp_code": corp_code,
             "bsns_year": str(business_year),
             "reprt_code": report_code,
             "fs_div": fs_div,
         }
-
-        def request_payload() -> dict[str, Any]:
-            import requests
-
-            response = requests.get(
-                f"{self.config.base_url}/fnlttSinglAcntAll.json",
-                params=params,
-                timeout=self.config.request_timeout_seconds,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise SourceResponseError("OpenDART financial response is not a JSON object.")
-            return payload
-
-        payload = retry_call(request_payload, self.config.retry)
-        safe_request = {key: value for key, value in params.items() if key != "crtfc_key"}
-        return RawSourcePayload(
-            source=self.source_name,
-            endpoint_key="fnlttSinglAcntAll",
-            request_date=date.today(),
-            request=safe_request,
-            payload=payload,
+        response = requests.get(
+            f"{self.config.base_url}/fnlttSinglAcntAll.json",
+            params=params,
+            timeout=self.config.request_timeout_seconds,
         )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise SourceResponseError("OpenDART financial response is not a JSON object.")
+        return payload
+
+    @staticmethod
+    def _is_quota_payload(status: str, message: str) -> bool:
+        if status in DART_QUOTA_STATUS_CODES:
+            return True
+        normalized_message = message.casefold()
+        return any(hint in normalized_message for hint in DART_QUOTA_MESSAGE_HINTS)
+
+    @staticmethod
+    def _is_quota_text(text: str) -> bool:
+        normalized_text = text.casefold()
+        return any(hint in normalized_text for hint in DART_QUOTA_MESSAGE_HINTS)
 
 
 def normalize_corp_code_zip(zip_bytes: bytes) -> list[dict[str, str]]:
@@ -169,7 +292,9 @@ def _period_end_from_report_code(business_year: int, report_code: str) -> date:
         "11012": (6, 30),
         "11014": (9, 30),
         "11011": (12, 31),
-    }.get(report_code, (12, 31))
+    }.get(report_code)
+    if month_day is None:
+        raise SourceResponseError(f"Unsupported OpenDART report code: {report_code}")
     return date(business_year, month_day[0], month_day[1])
 
 

@@ -50,7 +50,7 @@
 
 | 구분 | 변수 |
 |---|---|
-| DART | `DART_API_KEY` 권장. 기존 `.env` 호환을 위해 `OPENDART_API_KEY`, `FSS_API_KEY`도 인식한다. |
+| DART | `FSS_API_KEY`, `FSS_API_KEY_2`, `FSS_API_KEY_3` 권장. 기존 `.env` 호환을 위해 `DART_API_KEY`, `OPENDART_API_KEY`도 인식한다. |
 | BOK | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON` |
 | WICS | `WICS_COMPANY_INFO_URL`, 선택: `WICS_REQUEST_WORKERS` |
 | DB | 권장: `QUANT_DB_DSN` 또는 `DATABASE_URL`; 또는 `QUANT_DB_HOST`, `QUANT_DB_PORT`, `QUANT_DB_NAME`, `QUANT_DB_USER`, `QUANT_DB_PASSWORD` |
@@ -119,7 +119,7 @@
 | 연결 symbol 수 | 2,506개 |
 | period_end 범위 | `2016-03-31 ~ 2026-03-31` |
 
-DART 수집은 연도 단위로 나눠 재개했고, `feature.dart_financial_quarterly` 기본키 `(symbol_id, period_end, report_code, fs_div)` 기준 `ON CONFLICT DO NOTHING`으로 재실행 중복을 방지한다. 완료 후 검증에서 중복 PK 그룹, 빈 `accounts_jsonb`, feature/mart row delta, corp-map 미연결 row가 모두 0건이었다. 검증 산출물은 `.omx/logs/dart-validation-20260604-095618.md`와 `.omx/logs/dart-validation-20260604-095618.json`에 저장했다.
+DART 수집은 연도 단위로 나눠 재개했고, `feature.dart_financial_quarterly` 기본키 `(symbol_id, period_end, report_code, fs_div)` 기준 `ON CONFLICT DO NOTHING`으로 재실행 중복을 방지한다. 현재 스크립트는 `--dart-skip-existing`를 켜면 `feature.dart_financial_quarterly`에 이미 존재하는 `(symbol_id, period_end, report_code, fs_div)` 조합을 API 호출 전에 건너뛴다. 또한 `FSS_API_KEY` 계열 키를 순환 사용하고, 사용한도 응답을 반환한 키는 같은 실행에서 비활성화해 나머지 키로 계속 진행한다. 완료 후 검증에서 중복 PK 그룹, 빈 `accounts_jsonb`, feature/mart row delta, corp-map 미연결 row가 모두 0건이었다. 검증 산출물은 `.omx/logs/dart-validation-20260604-095618.md`와 `.omx/logs/dart-validation-20260604-095618.json`에 저장했다.
 
 ## 2. `DE/airflow/dags/quant_agent_data_engineering.py`
 
@@ -166,5 +166,5 @@ ingest_ohlcv_daily
 | DART 1달 테스트의 의미 | 재무제표는 일봉이 아니므로 `test-1m`/`daily`는 `filing-window` 모드로 최근 공시 예상 윈도우에 해당하는 보고서 코드를 가져온다. |
 | BOK 수집 대상 | Airflow 기본값은 `rate-fx` 12개 금리/환율 series에 월별 유가(WTI/Dubai/Brent) 3개 series를 더한 구성이다. `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON`이 있으면 해당 값으로 오버라이드한다. |
 | DART 완료 후 남은 운영 작업 | 2016~2026 CFS 재무제표 백필은 완료. 이후에는 신규 분기/사업보고서 증분 수집, 초반 timeout/network 실패 run의 상태 분리, 서버 DB 이관 후 동일 검증 자동화가 남는다. |
-| 서버 이전 시 필요한 것 | 서버의 Airflow 환경 또는 Secret Backend에 `DART_API_KEY`, `BOK_API_KEY`, `QUANT_DB_DSN`(권장) 또는 host/user/password, BOK series JSON을 주입한다. 공용 DB 적재까지 자동화하려면 `QUANT_DB_EXECUTION_MODE=psycopg`를 함께 두는 편이 명시적이다. |
+| 서버 이전 시 필요한 것 | 서버의 Airflow 환경 또는 Secret Backend에 `FSS_API_KEY`, `FSS_API_KEY_2`, `FSS_API_KEY_3`, `BOK_API_KEY`, `QUANT_DB_DSN`(권장) 또는 host/user/password, BOK series JSON을 주입한다. 공용 DB 적재까지 자동화하려면 `QUANT_DB_EXECUTION_MODE=psycopg`를 함께 두는 편이 명시적이다. |
 | 실패 시 확인 순서 | DB 자격증명 → 대상 테이블 스키마 → BOK series JSON → DART/BOK API 키 → API rate limit/응답 status 순서로 확인한다. |

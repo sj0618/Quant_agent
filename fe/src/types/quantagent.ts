@@ -131,6 +131,7 @@ export interface AIStrategySpec {
   risk_constraints: Record<string, number | string | boolean>;
   assumptions: string[];
   source_refs: string[];
+  selection_mode?: "standard" | "automatic" | "user_defined";
   confidence: number;
 }
 
@@ -194,16 +195,109 @@ export interface AIBacktestEquityPoint {
   cumulative_return: number;
 }
 
+export interface AIBacktestReliability {
+  source: "fixture" | "postgres" | "unknown";
+  status: "sufficient" | "limited" | "insufficient";
+  row_count: number;
+  ticker_count: number;
+  trading_days: number;
+  history_start: string | null;
+  history_end: string | null;
+  trade_count: number;
+  reasons: string[];
+  warnings: string[];
+}
+
+export interface AIBacktestBenchmark {
+  label: string;
+  method: string;
+  warning: string | null;
+  total_return: number | null;
+  cumulative_curve: AIBacktestEquityPoint[];
+  is_available: boolean;
+  unavailable_reason: string | null;
+}
+
+export interface AIBacktestMetricDetail {
+  key: string;
+  label: string;
+  value: number | null;
+  unit: "percent" | "ratio" | string;
+  is_available: boolean;
+  unavailable_reason: string | null;
+  plain_explanation: string;
+  why_used: string;
+  caution: string;
+  source_refs: string[];
+}
+
+export interface AIIndicatorExplanation {
+  key: string;
+  label: string;
+  plain_explanation: string;
+  why_used: string;
+  formula?: string | null;
+  derivation?: string | null;
+  customization?: string | null;
+  caution: string;
+  source_refs: string[];
+}
+
+export interface AIGeneratedStrategyBlueprint {
+  blueprint_id: string;
+  profile: string;
+  title: string;
+  formula: string;
+  derivation: string;
+  why_generated: string;
+  lookback: number;
+  max_positions: number;
+  rebalance_interval_days: number;
+  stop_loss_pct: number;
+  trailing_stop_pct: number;
+  source_refs: string[];
+}
+
+export interface AIStrategyExplanation {
+  selection_mode: "standard" | "automatic" | "user_defined";
+  title: string;
+  summary: string;
+  why_selected: string;
+  rebalance_explanation: string | null;
+  caution: string;
+  indicators: AIIndicatorExplanation[];
+  generated_strategies?: AIGeneratedStrategyBlueprint[];
+  source_refs: string[];
+}
+
 export interface AIBacktestPerformance {
   selected_candidate_id: string;
   metrics: AIBacktestMetrics;
   equity_curve: AIBacktestEquityPoint[];
   engine_summary?: Record<string, unknown>;
+  reliability?: AIBacktestReliability | null;
+  data_quality?: string[];
+  benchmark?: AIBacktestBenchmark | null;
+  metric_details?: AIBacktestMetricDetail[];
+  strategy_explanation?: AIStrategyExplanation | null;
 }
 
 export interface AIRecommendationGate {
   validated: boolean;
   reason: string;
+}
+
+export type AITickerActionType = 'BUY' | 'SELL' | 'HOLD' | 'WATCH';
+
+/** Today's verdict for one stock, produced by the same backtest run as `performance`. */
+export interface AITickerAction {
+  ticker: string;
+  name: string;
+  action: AITickerActionType;
+  reason: string;
+  as_of_date: string;
+  close?: number | null;
+  source_candidate_id?: string | null;
 }
 
 export interface AIUserPayload {
@@ -214,6 +308,7 @@ export interface AIUserPayload {
   report: AIReportBundle | null;
   performance?: AIBacktestPerformance | null;
   recommendation_gate?: AIRecommendationGate | null;
+  ticker_actions?: AITickerAction[];
   question?: string | null;
   options?: AIClarificationOption[];
   recommended?: number | null;
@@ -281,13 +376,17 @@ export interface BacktestMetric {
   delta?: string;
   tone: Tone;
   caption: string;
+  plainExplanation?: string;
+  whyUsed?: string;
+  caution?: string;
+  sourceRefs?: string[];
 }
 
 export interface EquityPoint {
   date: string;
   strategy: number;
-  original: number;
-  benchmark: number;
+  original?: number;
+  benchmark?: number;
 }
 
 export interface PerformanceComparisonRow {
@@ -314,6 +413,11 @@ export interface PerformanceSummary {
   equityCurve: EquityPoint[];
   comparison: PerformanceComparisonRow[];
   macroEvents: MacroEvent[];
+  reliability?: AIBacktestReliability | null;
+  dataQuality?: string[];
+  benchmark?: AIBacktestBenchmark;
+  metricDetails?: AIBacktestMetricDetail[];
+  strategyExplanation?: AIStrategyExplanation | null;
   disclaimer: string;
 }
 
@@ -358,21 +462,6 @@ export interface AppOverview {
   jobStatus: AnalysisJobStatus | null;
 }
 
-export interface LandingSample {
-  heroStats: Array<{ value: string; label: string }>;
-  steps: Array<{ label: string; title: string; description: string; example: string[] }>;
-  reportPreview: {
-    title: string;
-    date: string;
-    score: string;
-    market: Array<{ label: string; value: string; tone?: Tone }>;
-    signals: Array<{ signal: SignalType; name: string; ticker: string; score: string }>;
-  };
-  comparisonRows: Array<{ item: string; traditional: string; terminal: string; quantAgent: string }>;
-  principles: Array<{ label: string; title: string; description: string }>;
-  faqs: Array<{ question: string; answer?: string }>;
-}
-
 export type ReportDeliveryStatus = "sent" | "draft" | "failed" | "resent" | "submitted" | "processing" | "delivered" | "cancelled" | "unknown";
 
 export interface ReportSummary {
@@ -400,6 +489,7 @@ export interface ReportSummary {
 export interface PersistedReportSection {
   id?: string;
   title?: string;
+  note?: string;
   body?: string;
   entries?: PersistedReportEntry[];
 }
@@ -408,6 +498,7 @@ export interface PersistedReportEntry {
   label?: string;
   value: string;
   depth: number;
+  description?: string;
 }
 
 export interface DailyDigestHeader {

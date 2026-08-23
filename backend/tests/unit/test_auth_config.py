@@ -76,6 +76,13 @@ def test_authenticated_sender_mailbox_is_accepted_and_domain_is_normalized():
     )
 
 
+def test_trusted_proxy_headers_require_explicit_proxy_hosts():
+    with pytest.raises(ValidationError) as rejected:
+        valid_settings(AUTH_TRUSTED_PROXY_HEADERS=True)
+
+    assert "AUTH_TRUSTED_PROXY_HOSTS is required" in str(rejected.value)
+
+
 @pytest.mark.parametrize(
     "sender",
     [

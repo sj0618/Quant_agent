@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import UTC, date, datetime, time
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from time import perf_counter
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-import logging
+from ai_graph.quant_strategy import rsi_trade_rules
+from ai_graph.source_manifest import build_source_manifest
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -27,7 +29,6 @@ DATABASE_DSN_ENV_CANDIDATES = (
     DATABASE_URL_ENV,
 )
 AI_DEFAULT_TICKER_ENV = "AI_DEFAULT_TICKER"
-AI_BACKTEST_LOOKBACK_DAYS_ENV = "AI_BACKTEST_LOOKBACK_DAYS"
 AI_L4_EVIDENCE_LIMIT_ENV = "AI_L4_EVIDENCE_LIMIT"
 AI_DB_CONNECT_TIMEOUT_SECONDS_ENV = "AI_DB_CONNECT_TIMEOUT_SECONDS"
 AI_DB_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_STATEMENT_TIMEOUT_MS"
@@ -36,46 +37,55 @@ AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
-DEFAULT_BACKTEST_LOOKBACK_YEARS = 10
-DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * DEFAULT_BACKTEST_LOOKBACK_YEARS
+# Backtests always use the five calendar years ending at the most recent KRX session
+# known at the KST cutoff.  This is deliberately a calendar window, not a tunable
+# number of bars: the manifest records the resolved sessions for reproducibility.
+BACKTEST_EVALUATION_YEARS = 5
+DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * BACKTEST_EVALUATION_YEARS
+BACKTEST_WINDOW_POLICY_ID = "krx_pit_common_stock_5y_kst_session_v1"
 DEFAULT_L4_EVIDENCE_LIMIT = 5
-# Screening can match hundreds of names; every extra ticker multiplies the price rows
-# pulled for the backtest (lookback_days each), so the pool is capped rather than
-# loading the whole match set.
+# A broad screen can match many names, but recommendations never define historical
+# membership. They are presentation output only.
 DEFAULT_BACKTEST_MAX_TICKERS = 20
-# Financial metrics we track a consecutive-rise count for (for "N quarters rising"
-# strategies). Computed sequentially per filing; see _fetch_financial_timeline.
 _STREAK_METRICS = ("revenue", "operating_income", "operating_margin", "roe")
-# 조건에 일치한 종목은 점수로 다시 줄이지 않고 모두 추천 결과에 남긴다.
 DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 20
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 30_000
-# The universe backtest load (200-name KOSPI200 price/momentum/financial history) is a
-# genuinely heavy analytical scan and needs a longer budget than a quick screening SELECT.
-# Expanding the backtest universe from ~20 to 200 names is what pushed it past the 30s
-# default and started timing out; screening queries keep the tight default.
+# A PIT KOSPI/KOSDAQ universe is substantially wider than a current large-cap proxy.
 DEFAULT_DB_BACKTEST_STATEMENT_TIMEOUT_MS = 120_000
 POSTGRES_TIMEOUT_UNIT = "ms"
-BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER = 3
 RSI_OVERSOLD_THRESHOLD = 30.0
 # Sentinel profile whose WHERE clause is the permissive `close > 0` baseline: screening
 # selects the whole universe once and filters it per relaxation round in-process.
 SCREENING_BASELINE_PROFILE = "__baseline__"
 MAX_SCREENING_RELAXATION_ROUNDS = 3
+# How far back the screen looks for the latest trading date. Wide enough to survive a
+# long market closure or a stalled ingestion, narrow enough that chunk pruning keeps the
+# lock footprint small - see _resolve_screening_date.
+SCREENING_DATE_LOOKBACK_DAYS = 90
 
 KIS_FEATURE_FRAME_VIEW = "mart.kis_adjusted_feature_frame_asof"
 KIS_ADJUSTED_OHLCV_TABLE = "feature.kis_adjusted_ohlcv_daily"
+# The base table mart.symbol_feature_frame_asof (and so KIS_FEATURE_FRAME_VIEW) is built
+# from, together with the quality flag that view selects on. Read directly by
+# _feature_frame_sql - see the comment there for why the view itself cannot be.
+ADJUSTED_OHLCV_TABLE = "feature.adjusted_ohlcv_daily"
+KIS_ADJUSTED_PRICE_METHOD = "kis_official_adjusted"
+# Carried by the frame statement so log readers and tests can recognise it. The tables it
+# reads are each read by other statements too, so matching on a table name would not
+# identify this one.
+FEATURE_FRAME_MARKER = "-- feature-frame:one-date"
 TA_MOMENTUM_TICKER_TABLE = "feature.ta_momentum_ticker_daily"
 TA_TREND_TICKER_TABLE = "feature.ta_trend_ticker_daily"
 TA_VOLATILITY_TICKER_TABLE = "feature.ta_volatility_ticker_daily"
 TA_VOLUME_TICKER_TABLE = "feature.ta_volume_ticker_daily"
-UNIVERSE_VIEW = "meta.view_common_stock_universe"
-# meta.view_common_stock_universe filters on core.symbol_master.listing_status, which is
-# currently bulk-broken upstream (see _resolve_ticker/_fetch_symbol_info/_screening_sql):
-# every symbol reads as 'delisted'. Universe membership is derived from symbol_master directly
-# (scoped to KOSPI/KOSDAQ common stock) or from which tickers actually have OHLCV rows, instead.
+PIT_UNIVERSE_VIEW = "mart.common_stock_universe_asof"
+SYMBOL_LISTING_HISTORY_TABLE = "core.symbol_listing_history"
 SYMBOL_MASTER_TABLE = "core.symbol_master"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
+# BOK ECOS daily 원/달러 rate. The only macro series the risk rules can be fed from
+# directly; there is no equity index and no volatility index in this warehouse.
+USD_KRW_SERIES_ID = "731Y003:0000003"
 DART_FINANCIAL_TABLE = "mart.dart_financial_asof"
 # DART accounts are stored as objects, with the figure under "amount" and the prior
 # period under raw.frmtrm_amount. Values are text and not always numeric.
@@ -95,6 +105,7 @@ RSI_KEYS = ("rsi", "RSI", "rsi_14", "RSI_14", "talib_rsi_14", "TA_RSI_14")
 # match can carry RSI 33 while the strategy card reads "RSI <= 30", so the label prints the
 # actual reading - "RSI 과매도권" alone let a 33 pass for a 30.
 RSI_OVERSOLD_MAX = 35
+RSI_OVERBOUGHT_MIN = 65
 MARKET_SCOPE_TERMS = (
     "KOSPI200",
     "KOSPI 200",
@@ -105,7 +116,6 @@ MARKET_SCOPE_TERMS = (
     "코스닥150",
     "코스닥 150",
 )
-KOSPI_200_TERMS = MARKET_SCOPE_TERMS[:4]
 BROAD_SCREENING_TERMS = (
     "종목을 찾아",
     "종목 찾아",
@@ -124,7 +134,6 @@ class DataSourceConfig(BaseModel):
     database_dsn: str | None = None
     database_dsn_env: str = AI_DATABASE_DSN_ENV
     default_ticker: str = Field(default=DEFAULT_BACKTEST_TICKER, min_length=6, max_length=6)
-    backtest_lookback_days: int = Field(default=DEFAULT_BACKTEST_LOOKBACK_DAYS, gt=0)
     l4_evidence_limit: int = Field(default=DEFAULT_L4_EVIDENCE_LIMIT, gt=0)
     connect_timeout_seconds: int = Field(default=DEFAULT_DB_CONNECT_TIMEOUT_SECONDS, gt=0)
     statement_timeout_ms: int = Field(default=DEFAULT_DB_STATEMENT_TIMEOUT_MS, gt=0)
@@ -141,9 +150,6 @@ class DataSourceConfig(BaseModel):
             database_dsn=database_dsn,
             database_dsn_env=database_dsn_env,
             default_ticker=env.get(AI_DEFAULT_TICKER_ENV, DEFAULT_BACKTEST_TICKER),
-            backtest_lookback_days=_int_env(
-                env, AI_BACKTEST_LOOKBACK_DAYS_ENV, DEFAULT_BACKTEST_LOOKBACK_DAYS
-            ),
             l4_evidence_limit=_int_env(
                 env, AI_L4_EVIDENCE_LIMIT_ENV, DEFAULT_L4_EVIDENCE_LIMIT
             ),
@@ -164,13 +170,35 @@ class DataSourceConfig(BaseModel):
         )
 
 
+class PipelineDataUnavailableError(ValueError):
+    """The warehouse is healthy but has nothing to run this strategy on.
+
+    Subclasses ValueError because that is what these two conditions were raised as
+    before, so anything already catching them keeps working - the point of the class is
+    the `reason` code, not a new place in the hierarchy.
+
+    Distinct from an infrastructure error on purpose. Both used to be raised as bare
+    ValueErrors, so `classify_failure` sorted "no stock matches your condition today"
+    into `unknown_failure` - a message that tells the user nothing and reads as a
+    crash, which is what left runs looking like they had stalled until the client's
+    wall-clock timeout gave up on them. Carrying the reason as a code lets the job
+    layer turn it into an answer ("조건에 맞는 종목이 없습니다") instead.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class PipelineDataBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     price_rows: list[dict[str, Any]] = Field(default_factory=list)
     screening_candidates: list[dict[str, Any]] = Field(default_factory=list)
     l4_evidence: list[dict[str, Any]] = Field(default_factory=list)
-    macro_snapshot: dict[str, float] | None = None
+    # Carries the measured values plus the label saying what the equity leg was
+    # measured against, so a report can never call a universe proxy "the KOSPI".
+    macro_snapshot: dict[str, Any] | None = None
     data_availability: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -180,97 +208,96 @@ class PostgresPipelineDataSource:
         if not config.database_dsn:
             raise ValueError(f"{AI_DATABASE_DSN_ENV} is required for PostgreSQL data source")
         self.config = config
+        # Indicator families the warehouse could not serve within the statement budget
+        # for this load, so the report can say so instead of silently not matching.
+        self.unavailable_indicator_families: tuple[str, ...] = ()
 
     def load(self, query: str, trace_id: str) -> PipelineDataBundle:
-        if _query_requests_screening(query) and _has_kospi200_reference(query):
-            # The recommendation is guaranteed to be a subset of this fixed universe,
-            # so neither read needs the other's result.
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                screening_future = executor.submit(
-                    self._screen_with_separate_connection, query
-                )
-                return self._load(query, trace_id, screening_future)
-        return self._load(query, trace_id)
-
-    def _load(
-        self,
-        query: str,
-        trace_id: str,
-        screening_future: Future[
-            tuple[list[dict[str, Any]], dict[str, Any], dict[str, float]]
-        ]
-        | None = None,
-    ) -> PipelineDataBundle:
+        # Wall-clock per phase. A slow load used to surface as one opaque number, which
+        # named neither the read that spent the time nor whether it was the connection,
+        # the screen or the price scan.
+        timings: dict[str, float] = {}
         load_started = perf_counter()
-        timings = {
-            name: 0.0
-            for name in (
-                "connect_seconds",
-                "screening_connect_seconds",
-                "screening_seconds",
-                "ticker_resolution_seconds",
-                "universe_seconds",
-                "symbol_info_seconds",
-                "price_rows_seconds",
-                "price_ohlcv_query_seconds",
-                "price_momentum_query_seconds",
-                "price_momentum_decode_seconds",
-                "price_financial_query_seconds",
-                "price_financial_decode_seconds",
-                "price_row_conversion_seconds",
-                "price_financial_attach_seconds",
-                "l4_evidence_seconds",
-                "macro_seconds",
-                "capability_seconds",
-            )
-        }
         connect_started = perf_counter()
         with self._connect() as conn:
             timings["connect_seconds"] = perf_counter() - connect_started
             self._set_statement_timeout(conn)
+            # Ask what the warehouse can actually serve before spending anything on the
+            # query. This used to run last, after screening, so a strategy whose data is
+            # not loaded at all still paid for the full screen plus three LLM relaxation
+            # rounds - each widening a threshold against columns that were NULL for every
+            # row and could never match - and then failed with a generic message. With
+            # mart.dart_financial_asof empty, every fundamental strategy took that path
+            # and surfaced as "데이터 조회 시간이 초과되었습니다", which named neither the
+            # missing data nor the fact that waiting longer could not help.
+            capability_availability = self._timed(
+                timings, "capability_seconds", measure_capabilities, conn
+            )
+            unsupported = unsupported_capabilities(query, capability_availability)
+            if unsupported:
+                return PipelineDataBundle(
+                    data_availability=_data_availability_for_query(
+                        query, source="postgres", available=capability_availability
+                    ),
+                    metadata={
+                        "source": "postgres",
+                        "dsn_env": self.config.database_dsn_env,
+                        "stopped_before_screening": True,
+                        "unsupported_capabilities": unsupported,
+                        "capability_probe": capability_availability,
+                        "timings": _rounded_timings(timings, load_started),
+                    },
+                )
+            backtest_window = self._timed(
+                timings, "backtest_window_seconds", self._resolve_backtest_window, conn
+            )
+            if backtest_window is None:
+                raise PipelineDataUnavailableError(
+                    "pit_calendar_unavailable",
+                    "KRX trading-calendar sessions are unavailable for the fixed five-year backtest window",
+                )
+            indicator_families = indicator_families_for_query(query)
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
+            universe_descriptor: dict[str, Any] = {
+                "selection": "single_ticker",
+                "source": KIS_ADJUSTED_OHLCV_TABLE,
+            }
             recommended: list[str] = []
             ticker_resolution = "screening"
             already_screened = _query_requests_screening(query)
             screening_mode = already_screened
-            single_ticker: str | None = None
-            if screening_future is not None:
-                phase_started = perf_counter()
-                tickers = self._fetch_backtest_universe(conn, [])
-                timings["universe_seconds"] = perf_counter() - phase_started
-                if not tickers:
-                    raise ValueError("historical backtest universe is empty")
-                phase_started = perf_counter()
-                symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
-                timings["symbol_info_seconds"] = perf_counter() - phase_started
-                self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
-                phase_started = perf_counter()
-                price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, symbol_info_by_ticker, query, timings
-                )
-                timings["price_rows_seconds"] = perf_counter() - phase_started
-                self._set_statement_timeout(conn)
-
-                screening_candidates, screening_relaxation, screening_timings = (
-                    screening_future.result()
-                )
+            pit_market: tuple[
+                list[str],
+                dict[str, Any],
+                Mapping[str, Mapping[str, Any]],
+                list[dict[str, Any]],
+                int,
+            ] | None = None
+            parallel_screening_backtest = False
+            if already_screened:
+                # The screen and the PIT market read nothing from each other: membership
+                # is fixed by date, and today's picks are filtered against it afterwards
+                # either way. So they run at the same time, on separate connections. The
+                # capability and calendar gates above still run first, so a query the
+                # warehouse cannot serve never pays for either read.
+                parallel_screening_backtest = True
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    screening = executor.submit(self._screen_on_its_own_connection, query)
+                    pit_market = self._load_pit_market(
+                        conn, backtest_window, query, indicator_families, timings
+                    )
+                    (
+                        screening_candidates,
+                        screening_relaxation,
+                        screening_timings,
+                    ) = screening.result()
                 timings.update(screening_timings)
-                recommended = [
-                    str(item["ticker"]).zfill(6) for item in screening_candidates
-                ]
-                ticker = recommended[0] if recommended else tickers[0]
-                symbol_info = symbol_info_by_ticker.get(
-                    ticker, {"ticker": ticker, "included": False}
+            single_ticker: str | None = None
+            if not screening_candidates:
+                single_ticker = self._timed(
+                    timings, "ticker_resolution_seconds", self._resolve_ticker, conn, query
                 )
-            elif already_screened:
-                phase_started = perf_counter()
-                screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
-                timings["screening_seconds"] += perf_counter() - phase_started
-            if screening_future is None and not screening_candidates:
-                phase_started = perf_counter()
-                single_ticker = self._resolve_ticker(conn, query)
-                timings["ticker_resolution_seconds"] += perf_counter() - phase_started
                 if single_ticker is None:
                     screening_mode = True
                     # Ambiguous query (no explicit ticker, no name match): screen as a
@@ -284,11 +311,9 @@ class PostgresPipelineDataSource:
                     # for a screen that legitimately matched nothing today it doubled the
                     # cost of the request and pushed it into a statement timeout.
                     if not already_screened:
-                        phase_started = perf_counter()
-                        screening_candidates, screening_relaxation = self._screen_with_relaxation(
-                            conn, query
+                        screening_candidates, screening_relaxation = self._timed(
+                            timings, "screening_seconds", self._screen_with_relaxation, conn, query
                         )
-                        timings["screening_seconds"] += perf_counter() - phase_started
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
                         if screening_candidates
@@ -296,116 +321,181 @@ class PostgresPipelineDataSource:
                     )
                 else:
                     ticker_resolution = "explicit_or_name_match"
-            if screening_future is None and screening_mode:
-                # The matched names are the recommendation ("buy these today"). The
-                # backtest, though, runs over a liquidity-selected universe so build_signals
-                # can enter and exit per date across many names instead of replaying the
-                # past of whichever handful is at a high right now. Recommendation and
-                # backtest universe are deliberately different things.
-                recommended = [str(item["ticker"]).zfill(6) for item in screening_candidates]
-                phase_started = perf_counter()
-                tickers = self._fetch_backtest_universe(conn, recommended)
-                timings["universe_seconds"] = perf_counter() - phase_started
-                if not tickers:
-                    raise ValueError("historical backtest universe is empty")
-                ticker = recommended[0] if recommended else tickers[0]
-                phase_started = perf_counter()
-                symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
-                timings["symbol_info_seconds"] = perf_counter() - phase_started
-                symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
-                # Widen the statement timeout for the universe price/momentum/financial
-                # scan - it is far heavier than the screening SELECTs above and 30s is not
-                # enough once the backtest universe is 200 names.
-                self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
-                phase_started = perf_counter()
-                price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, symbol_info_by_ticker, query, timings
+            if screening_mode:
+                if pit_market is None:
+                    pit_market = self._load_pit_market(
+                        conn, backtest_window, query, indicator_families, timings
+                    )
+                (
+                    tickers,
+                    universe_descriptor,
+                    symbol_info_by_ticker,
+                    price_rows,
+                    effective_lookback_days,
+                ) = pit_market
+                # Current recommendations are output only. PIT membership is fixed by
+                # date and cannot be widened by a present-day screen.
+                recommended = _backtest_ticker_pool(
+                    screening_candidates, self.config.backtest_max_tickers
                 )
-                timings["price_rows_seconds"] = perf_counter() - phase_started
-                self._set_statement_timeout(conn)
-            elif screening_future is None and single_ticker:
+                # Current candidates are context only: the backtest trades its own
+                # PIT universe, so a candidate outside it must not become the traded
+                # ticker either. Record how many were excluded for report disclosure.
+                pit_set = set(tickers)
+                excluded_screening_candidate_count = sum(
+                    1 for item in recommended if item not in pit_set
+                )
+                # Current candidates are context only. The traded ticker comes from
+                # the historical PIT universe, never from today's screen, so past
+                # performance can never be attributed to a current pick.
+                recommended = [item for item in recommended if item in pit_set]
+                ticker = tickers[0]
+                universe_descriptor["excluded_screening_candidate_count"] = (
+                    excluded_screening_candidate_count
+                )
+                symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
+            elif single_ticker:
                 ticker = single_ticker
                 tickers = [ticker]
-                phase_started = perf_counter()
-                symbol_info = self._fetch_symbol_info(conn, ticker)
-                timings["symbol_info_seconds"] = perf_counter() - phase_started
-                phase_started = perf_counter()
-                price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, {ticker: symbol_info}, query, timings
+                symbol_info = self._timed(
+                    timings, "symbol_info_seconds", self._fetch_symbol_info, conn, ticker
                 )
-                timings["price_rows_seconds"] = perf_counter() - phase_started
-            elif screening_future is None:
+                price_rows, effective_lookback_days = self._timed(
+                    timings,
+                    "price_rows_seconds",
+                    self._fetch_price_rows,
+                    conn,
+                    tickers,
+                    {ticker: symbol_info},
+                    query,
+                    backtest_window,
+                    indicator_families,
+                    timings=timings,
+                )
+            else:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
                 # silently substitute config.default_ticker, since that produces a
                 # report that looks real but always trades the same hardcoded stock.
-                raise ValueError(
+                raise PipelineDataUnavailableError(
+                    "no_screening_matches",
                     "no screening candidates or resolvable ticker found in the database "
                     f"for this query after {screening_relaxation.get('relaxation_rounds', 0)} "
-                    "relaxation round(s); refusing to fall back to a hardcoded default ticker"
+                    "relaxation round(s); refusing to fall back to a hardcoded default ticker",
                 )
             if not price_rows:
-                raise ValueError(f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}")
-            phase_started = perf_counter()
-            l4_evidence = (
-                self._fetch_l4_evidence(conn, ticker, trace_id)
-                if recommended or single_ticker
-                else []
+                raise PipelineDataUnavailableError(
+                    "no_price_rows",
+                    f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}",
+                )
+            raw_price_capabilities = _raw_price_capabilities(price_rows)
+            pit_members_without_price_rows = sorted(
+                set(tickers) - {str(row.get("ticker") or "").zfill(6) for row in price_rows}
             )
-            timings["l4_evidence_seconds"] = perf_counter() - phase_started
-            phase_started = perf_counter()
-            macro_status = self._fetch_macro_status(conn)
-            timings["macro_seconds"] = perf_counter() - phase_started
-            phase_started = perf_counter()
-            capability_availability = measure_capabilities(conn)
-            timings["capability_seconds"] = perf_counter() - phase_started
+            l4_evidence = self._timed(
+                timings, "l4_evidence_seconds", self._fetch_l4_evidence, conn, ticker, trace_id
+            )
+            macro_status = self._timed(
+                timings, "macro_status_seconds", self._fetch_macro_status, conn
+            )
+            macro_snapshot = self._timed(
+                timings, "macro_snapshot_seconds", self._fetch_macro_snapshot, conn, price_rows
+            )
+            # Capabilities were probed up front; nothing since then can change them.
 
-        timings["total_seconds"] = perf_counter() - load_started
-
+        source_manifest = build_source_manifest(
+            source="postgres",
+            as_of=backtest_window["end"],
+            freshness="unknown",
+            lineage_refs=[
+                KIS_ADJUSTED_OHLCV_TABLE,
+                PIT_UNIVERSE_VIEW,
+                SYMBOL_LISTING_HISTORY_TABLE,
+                *[INDICATOR_TABLES[family] for family in indicator_families],
+            ],
+            source_version=BACKTEST_WINDOW_POLICY_ID,
+        )
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
+            macro_snapshot=macro_snapshot,
             data_availability=_data_availability_for_query(
                 query, source="postgres", available=capability_availability
             ),
             metadata={
                 "source": "postgres",
+                "source_manifest": source_manifest.model_dump(mode="json"),
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
                 "recommended_tickers": recommended,
                 "recommendation_ticker": recommended[0] if recommended else None,
-                "backtest_universe": (
-                    "kospi_top_200_market_cap" if screening_mode else "explicit_ticker"
-                ),
-                "parallel_screening_backtest": screening_future is not None,
+                "backtest_universe": universe_descriptor,
+                "parallel_screening_backtest": parallel_screening_backtest,
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [
-                    TA_MOMENTUM_TICKER_TABLE,
-                    TA_TREND_TICKER_TABLE,
-                    TA_VOLATILITY_TICKER_TABLE,
-                    TA_VOLUME_TICKER_TABLE,
+                    INDICATOR_TABLES[family] for family in indicator_families
                 ],
+                "indicator_families": list(indicator_families),
+                "unavailable_indicator_families": list(
+                    self.unavailable_indicator_families
+                ),
                 "price_rows": len(price_rows),
+                "pit_member_count": len(tickers),
+                "pit_members_without_price_rows": pit_members_without_price_rows,
+                "pit_members_without_price_row_count": len(pit_members_without_price_rows),
                 "screening_candidates": len(screening_candidates),
                 "screening_relaxation": screening_relaxation,
                 "backtest_lookback_days": effective_lookback_days,
+                "backtest_window_policy_id": BACKTEST_WINDOW_POLICY_ID,
+                "backtest_start_session": backtest_window["start"].isoformat(),
+                "backtest_end_session": backtest_window["end"].isoformat(),
+                "backtest_session_count": backtest_window["session_count"],
+                "universe_provenance": SYMBOL_LISTING_HISTORY_TABLE,
+                "raw_price_provenance": {
+                    "raw_ohlcv_source": "core.ohlcv_daily",
+                    "raw_notional_source": None,
+                    "adjusted_signal_source": KIS_ADJUSTED_OHLCV_TABLE,
+                },
+                "raw_price_capabilities": raw_price_capabilities,
+                "dart_date_only_effective_policy": "next_krx_session_v1",
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_rows": len(l4_evidence),
-                "universe_source": SYMBOL_MASTER_TABLE,
+                "universe_source": universe_descriptor["source"],
                 "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
                 "macro_status": macro_status,
-                "timings": {
-                    name: round(seconds, 6) for name, seconds in timings.items()
-                },
+                "timings": _rounded_timings(timings, load_started),
             },
         )
 
-    def _screen_with_separate_connection(
+    @staticmethod
+    def _timed(
+        timings: dict[str, float],
+        name: str,
+        call: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run `call`, accumulating its wall-clock under `name`."""
+
+        started = perf_counter()
+        try:
+            return call(*args, **kwargs)
+        finally:
+            timings[name] = timings.get(name, 0.0) + perf_counter() - started
+
+    def _screen_on_its_own_connection(
         self, query: str
     ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, float]]:
+        """Screen on a second connection so it can overlap the PIT market load.
+
+        Its timings come back with the result rather than being written into the
+        caller's dict, which the calling thread is still updating.
+        """
+
         connect_started = perf_counter()
         with self._connect() as conn:
             connect_seconds = perf_counter() - connect_started
@@ -413,43 +503,91 @@ class PostgresPipelineDataSource:
             screening_started = perf_counter()
             candidates, relaxation = self._screen_with_relaxation(conn, query)
             screening_seconds = perf_counter() - screening_started
-        return candidates, relaxation, {
-            "screening_connect_seconds": connect_seconds,
-            "screening_seconds": screening_seconds,
-        }
+        return (
+            candidates,
+            relaxation,
+            {
+                "screening_connect_seconds": connect_seconds,
+                "screening_seconds": screening_seconds,
+            },
+        )
 
-    def _fetch_backtest_universe(self, conn: Any, recommended: Sequence[str]) -> list[str]:
-        """The universe the backtest actually trades over: KOSPI 200.
+    def _load_pit_market(
+        self,
+        conn: Any,
+        window: Mapping[str, Any],
+        query: str,
+        indicator_families: Sequence[str],
+        timings: dict[str, float],
+    ) -> tuple[
+        list[str],
+        dict[str, Any],
+        Mapping[str, Mapping[str, Any]],
+        list[dict[str, Any]],
+        int,
+    ]:
+        """The PIT universe and its price rows - reads nothing from today's screen."""
 
-        The screen answers "which names meet the condition today"; using that as the
-        backtest universe means trading only the two stocks that happen to be at a
-        52-week high right now, then judging the strategy on their past - which is
-        look-ahead, since being at a high today is exactly "went up in the past". The
-        generated build_signals already decides entries per date from each stock's own
-        history, so it just needs a fixed, outcome-independent market to trade in.
+        tickers, universe_descriptor = self._timed(
+            timings, "universe_seconds", self._fetch_backtest_universe, conn, window
+        )
+        if not tickers:
+            raise PipelineDataUnavailableError(
+                "pit_universe_empty",
+                "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
+            )
+        symbol_info_by_ticker = self._timed(
+            timings, "symbol_info_seconds", self._fetch_symbol_info_map, conn, tickers
+        )
+        # Widen the statement timeout for the universe price/indicator/financial scan -
+        # it is far heavier than the screening SELECTs and the tight default is not
+        # enough once the universe is the whole PIT membership.
+        self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
+        price_rows, effective_lookback_days = self._timed(
+            timings,
+            "price_rows_seconds",
+            self._fetch_price_rows,
+            conn,
+            tickers,
+            symbol_info_by_ticker,
+            query,
+            window,
+            indicator_families,
+            timings=timings,
+        )
+        self._set_statement_timeout(conn)
+        return (
+            tickers,
+            universe_descriptor,
+            symbol_info_by_ticker,
+            price_rows,
+            effective_lookback_days,
+        )
 
-        KOSPI 200 is that market. There is no index-membership table, so it is
-        approximated the standard way - the 200 largest KOSPI common stocks by market
-        cap (MKTCAP on symbol_master). The strategy's recommended names are unioned in so
-        they remain tradable even if one sits just outside the top 200.
-        """
-
+    def _fetch_backtest_universe(
+        self, conn: Any, window: Mapping[str, Any]
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Return the lifecycle-backed common-stock universe for the fixed PIT window."""
         rows = conn.execute(
-            """
-            SELECT symbol
-            FROM core.symbol_master
-            WHERE market = 'KOSPI'
-              AND security_type = '보통주'
-              AND metadata_jsonb->>'MKTCAP' ~ '^[0-9]+$'
-            ORDER BY (metadata_jsonb->>'MKTCAP')::numeric DESC
-            LIMIT 200
-            """
+            f"""
+            SELECT DISTINCT symbol
+            FROM {PIT_UNIVERSE_VIEW}
+            WHERE as_of_date BETWEEN %s::date AND %s::date
+            ORDER BY symbol
+            """,
+            [window["start"], window["end"]],
         ).fetchall()
         universe = [str(row["symbol"]).zfill(6) for row in rows]
-        seen = set(universe)
-        # Recommended names first, then KOSPI 200, so a recommendation is never dropped.
-        extra = [t for t in (str(x).zfill(6) for x in recommended) if t not in seen]
-        return [*extra, *universe]
+        return universe, {
+            "selection": "lifecycle_pit_common_stock_window",
+            "as_of_start": window["start"].isoformat(),
+            "as_of_end": window["end"].isoformat(),
+            "session_count": window["session_count"],
+            "member_count": len(universe),
+            "source": PIT_UNIVERSE_VIEW,
+            "listing_provenance": SYMBOL_LISTING_HISTORY_TABLE,
+            "security_type": "보통주",
+        }
 
     def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
         return self._screen_with_relaxation(conn, query)[0]
@@ -457,13 +595,7 @@ class PostgresPipelineDataSource:
     def _screen_via_llm(
         self, conn: Any, query: str
     ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
-        """Let the model write the screen against the real schema.
-
-        Returns None when that path is unavailable - no live provider, or it could not
-        produce a usable query - so screening falls back to the deterministic profiles
-        rather than failing the analysis.
-        """
-
+        """Use LLM screening when available, otherwise fall back to deterministic SQL."""
         try:
             from ai_graph.data_sources.llm_screen import screen_with_llm
 
@@ -531,29 +663,10 @@ class PostgresPipelineDataSource:
         # before the baseline query.
         self._rollback_quietly(conn)
         sector = extract_sector_from_query(query, known_sectors)
-        screening_tickers = (
-            self._fetch_backtest_universe(conn, [])
-            if _has_kospi200_reference(query)
-            else []
-        )
-        params: list[Any] = [screening_tickers] if screening_tickers else []
-        if sector:
-            params.append(sector)
-        # The window-function CTE is the expensive part, so it runs once and every
-        # relaxation round re-filters these rows in-process. It scans every ticker in
-        # feature.kis_adjusted_ohlcv_daily (no pre-filtered candidate view narrows it
-        # anymore - see SYMBOL_MASTER_TABLE comment above), so it needs the same wider
-        # budget as the backtest universe fetch rather than the tight default, which
-        # was sized for the old, much smaller pre-filtered scan.
+        # Fetched once and re-filtered in-process for every relaxation round, so a wider
+        # screen costs nothing at the database.
         self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
-        rows = conn.execute(
-            _screening_sql(
-                SCREENING_BASELINE_PROFILE,
-                sector=sector,
-                restrict_tickers=bool(screening_tickers),
-            ),
-            params,
-        ).fetchall()
+        rows, frame_trace = self._load_screening_frame(conn, sector=sector, profile=profile)
         self._set_statement_timeout(conn)
 
         thresholds = ScreeningThresholds()
@@ -573,7 +686,9 @@ class PostgresPipelineDataSource:
                 candidates = [
                     _screening_candidate_from_row(row, profile, sector=sector) for row in matched
                 ]
-                return candidates, _relaxation_trace(profile, rounds, len(rows))
+                return candidates, _relaxation_trace(
+                    profile, rounds, len(rows), frame=frame_trace
+                )
             if round_index == MAX_SCREENING_RELAXATION_ROUNDS:
                 break
             thresholds = _propose_relaxed_thresholds(
@@ -583,7 +698,153 @@ class PostgresPipelineDataSource:
                 round_index=round_index,
                 universe_rows=len(rows),
             )
-        return [], _relaxation_trace(profile, rounds, len(rows))
+        return [], _relaxation_trace(profile, rounds, len(rows), frame=frame_trace)
+
+    def _load_screening_frame(
+        self, conn: Any, *, sector: str | None, profile: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """One screening date's rows: warehouse indicators plus the few path features.
+
+        Four small statements instead of one large one, because the anchor date has to
+        reach each of them as a bind parameter rather than as a subquery, which is not a
+        plan-time constant and so blocks partition pruning.
+
+        That alone was not enough to stop the "out of shared memory /
+        max_locks_per_transaction" failures, because the frame read went through
+        KIS_FEATURE_FRAME_VIEW, where the date can only ever restrict the price side of
+        five outer joins. Bind parameter or literal made no difference there - measured
+        10,718 lock entries either way. See _feature_frame_sql, which reads the same
+        tables with a date restriction on each one.
+
+        Moving averages, Bollinger bands and RSI are no longer recomputed here. The
+        warehouse already stores them per ticker per date, and recomputing meant the
+        screen and the backtest each had their own definition of the same indicator.
+        """
+
+        as_of = self._resolve_screening_date(conn)
+        if as_of is None:
+            return [], {"as_of_date": None, "reason": "no recent rows in the price table"}
+
+        frame_rows = conn.execute(
+            _mart_frame_sql(sector=bool(sector)),
+            {"as_of": as_of, "sector": sector},
+        ).fetchall()
+
+        needs = (
+            _ALL_PATH_NEEDS
+            if profile == SCREENING_BASELINE_PROFILE
+            else _PROFILE_PATH_NEEDS.get(profile, _ALL_PATH_NEEDS)
+        )
+        # Relative strength is measured against the whole priced universe, so the path
+        # read is never sector-scoped even when the frame is.
+        needs = needs | {PATH_RETURNS}
+        path_sql, lookback_days = _path_features_sql(needs)
+        path_rows = conn.execute(path_sql, {"as_of": as_of}).fetchall()
+
+        prev_date = self._resolve_previous_trading_date(conn, as_of)
+        prev_rsi_by_ticker: dict[str, Any] = {}
+        if prev_date is not None:
+            prev_rsi_by_ticker = {
+                str(row["ticker"]).zfill(6): row.get("prev_rsi")
+                for row in conn.execute(_prev_rsi_sql(), {"prev": prev_date}).fetchall()
+            }
+
+        financials_by_symbol = {
+            str(row["symbol"]).zfill(6): row
+            for row in conn.execute(_financial_sql(), {"as_of": as_of}).fetchall()
+        }
+
+        strength, benchmark = _relative_strength(path_rows)
+        path_by_ticker = {str(row["ticker"]).zfill(6): row for row in path_rows}
+
+        rows: list[dict[str, Any]] = []
+        for frame_row in frame_rows:
+            ticker = str(frame_row.get("ticker") or "").zfill(6)
+            row = dict(frame_row)
+            row["ticker"] = ticker
+            path = path_by_ticker.get(ticker) or {}
+            row["high_252"] = path.get("high_252")
+            avg_volume_20 = _optional_float_value(path.get("avg_volume_20"))
+            volume = _optional_float_value(frame_row.get("volume"))
+            row["volume_ratio_20"] = (
+                volume / avg_volume_20
+                if volume is not None and avg_volume_20 and avg_volume_20 > 0
+                else None
+            )
+            excess = strength.get(ticker) or {}
+            row["relative_strength_20d"] = excess.get("20d")
+            row["relative_strength_60d"] = excess.get("60d")
+            row["prev_rsi"] = prev_rsi_by_ticker.get(ticker)
+            financial = financials_by_symbol.get(ticker)
+            if financial is not None:
+                row["financial_period_end"] = financial.get("financial_period_end")
+                for field in (
+                    "roe",
+                    "debt_to_equity",
+                    "operating_margin",
+                    "revenue_growth_yoy",
+                ):
+                    row[field] = financial.get(field)
+                eps = _optional_float_value(financial.get("eps"))
+                close = _optional_float_value(frame_row.get("close"))
+                row["per"] = close / eps if eps and eps > 0 and close is not None else None
+            rows.append(row)
+
+        trace = {
+            "as_of_date": as_of.isoformat(),
+            "previous_trading_date": prev_date.isoformat() if prev_date else None,
+            # The frame's own tables, not KIS_FEATURE_FRAME_VIEW - the view cannot be
+            # read for a single date without locking every chunk behind it. Same rows,
+            # same columns; see _feature_frame_sql.
+            "indicator_source": ADJUSTED_OHLCV_TABLE,
+            "indicators_read": list(INDICATOR_FIELDS),
+            "path_features_computed": sorted(needs),
+            "path_lookback_days": lookback_days,
+            "frame_rows": len(frame_rows),
+            "relative_strength_benchmark": benchmark,
+        }
+        return rows, trace
+
+    def _resolve_screening_date(self, conn: Any, ) -> date | None:
+        """The latest trading date, read from the price table rather than the mart view.
+
+        Bounded to 90 days because an unbounded max() over a 534-chunk hypertable locks
+        every chunk and exhausts max_locks_per_transaction. Anchoring on the base table
+        also keeps this cheap (~80ms) - the same max() over the feature-frame view costs
+        ~25s because the view's own predicates block pruning.
+
+        The bound is computed here and bound as a parameter rather than written as
+        `CURRENT_DATE - INTERVAL '90 days'`. CURRENT_DATE is STABLE, not a plan-time
+        constant, so chunks are excluded only at execution: the scan reads the same 28
+        chunks either way, but the planner has already locked all 534. Measured, that is
+        2,142 lock entries against 62 - a third of the cluster's whole lock table spent
+        before the screen has read a row.
+        """
+
+        floor = date.today() - timedelta(days=SCREENING_DATE_LOOKBACK_DAYS)
+        row = conn.execute(
+            f"""
+            SELECT max(time) AS as_of_date
+            FROM {KIS_ADJUSTED_OHLCV_TABLE}
+            WHERE time >= %(floor)s::date
+            """,
+            {"floor": floor},
+        ).fetchone()
+        value = row.get("as_of_date") if row else None
+        return _date_value(value) if value is not None else None
+
+    def _resolve_previous_trading_date(self, conn: Any, as_of: date) -> date | None:
+        row = conn.execute(
+            f"""
+            SELECT max(time) AS previous_date
+            FROM {KIS_ADJUSTED_OHLCV_TABLE}
+            WHERE time < %(as_of)s::date
+              AND time >= %(as_of)s::date - 10
+            """,
+            {"as_of": as_of},
+        ).fetchone()
+        value = row.get("previous_date") if row else None
+        return _date_value(value) if value is not None else None
 
     def _connect(self) -> Any:
         import psycopg
@@ -651,91 +912,79 @@ class PostgresPipelineDataSource:
         tickers: Sequence[str],
         symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
         query: str,
+        window: Mapping[str, Any],
+        indicator_families: Sequence[str] | None = None,
+        *,
         timings: dict[str, float] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
-        timings = timings if timings is not None else {}
-        lookback_days = self.config.backtest_lookback_days
-        price_rows = self._fetch_price_rows_for_lookback(
-            conn, tickers, symbol_info_by_ticker, lookback_days, timings
-        )
-        if (
-            _query_requires_rsi_oversold(query)
-            and lookback_days < DEFAULT_BACKTEST_LOOKBACK_DAYS
-            and not _has_rsi_oversold_entry(price_rows)
-        ):
-            lookback_days = DEFAULT_BACKTEST_LOOKBACK_DAYS
-            price_rows = self._fetch_price_rows_for_lookback(
-                conn, tickers, symbol_info_by_ticker, lookback_days, timings
-            )
-        return price_rows, lookback_days
-
-    def _fetch_price_rows_for_lookback(
-        self,
-        conn: Any,
-        tickers: Sequence[str],
-        symbol_info_by_ticker: Mapping[str, Mapping[str, Any]],
-        lookback_days: int,
-        timings: dict[str, float],
-    ) -> list[dict[str, Any]]:
-        calendar_lookback_days = (
-            lookback_days * BACKTEST_LOOKBACK_CALENDAR_DAY_MULTIPLIER
-        )
+        del query
+        timings = {} if timings is None else timings
         ticker_list = list(tickers)
-        # row_number keeps the lookback per ticker: a plain LIMIT would spend the whole
-        # budget on whichever ticker sorted first and starve the rest.
-        phase_started = perf_counter()
+        ohlcv_started = perf_counter()
         rows = conn.execute(
-            """
-            SELECT as_of_date, ticker, open, high, low, close, volume
-            FROM (
-                SELECT
-                    time AS as_of_date,
-                    ticker,
-                    adj_open::double precision AS open,
-                    adj_high::double precision AS high,
-                    adj_low::double precision AS low,
-                    adj_close::double precision AS close,
-                    adj_volume::double precision AS volume,
-                    row_number() OVER (PARTITION BY ticker ORDER BY time DESC) AS ticker_rank
-                FROM feature.kis_adjusted_ohlcv_daily
-                WHERE ticker = ANY(%s)
-                  AND time >= CURRENT_DATE - make_interval(days => %s)
-            ) ranked
-            WHERE ticker_rank <= %s
-            ORDER BY as_of_date, ticker
+            f"""
+            SELECT
+                p.time AS as_of_date, p.ticker,
+                p.adj_open AS open, p.adj_high AS high, p.adj_low AS low,
+                p.adj_close AS close, p.adj_volume AS volume,
+                p.adj_open AS adjusted_open, p.adj_high AS adjusted_high,
+                p.adj_low AS adjusted_low, p.adj_close AS adjusted_close,
+                p.adj_volume AS adjusted_volume,
+                raw.open AS raw_open, raw.high AS raw_high, raw.low AS raw_low,
+                raw.close AS raw_close, raw.volume AS raw_volume,
+                NULL::numeric AS raw_notional
+            FROM {KIS_ADJUSTED_OHLCV_TABLE} p
+            JOIN core.symbol_master sm
+              ON sm.symbol = p.ticker
+            LEFT JOIN core.ohlcv_daily raw
+              ON raw.symbol_id = sm.symbol_id AND raw.trade_date = p.time
+            WHERE p.ticker = ANY(%s)
+              AND p.time BETWEEN %s::date AND %s::date
+            ORDER BY p.ticker, p.time
             """,
-            [ticker_list, calendar_lookback_days, lookback_days],
+            [ticker_list, window["start"], window["end"]],
         ).fetchall()
-        timings["price_ohlcv_query_seconds"] = (
-            timings.get("price_ohlcv_query_seconds", 0.0) + perf_counter() - phase_started
-        )
-        momentum_by_ticker = self._fetch_momentum_values_by_date(
-            conn, ticker_list, calendar_lookback_days, lookback_days, timings
-        )
-        financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list, timings)
-        phase_started = perf_counter()
+        timings["price_ohlcv_query_seconds"] = perf_counter() - ohlcv_started
+        earliest_priced_date = min((_date_value(row["as_of_date"]) for row in rows), default=None)
+        families = indicator_families or tuple(INDICATOR_TABLES)
+        indicators_by_family: dict[str, dict[str, dict[date, Mapping[str, Any]]]] = {}
+        unavailable_families: list[str] = []
+        indicators_started = perf_counter()
+        for family in families:
+            try:
+                indicators_by_family[family] = self._fetch_indicator_values_by_date(
+                    conn, INDICATOR_TABLES[family], ticker_list, earliest_priced_date
+                )
+            except Exception:
+                _logger.exception("indicator family %s could not be loaded", family)
+                self._rollback_quietly(conn)
+                self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
+                unavailable_families.append(family)
+        self.unavailable_indicator_families = tuple(unavailable_families)
+        timings["price_indicator_seconds"] = perf_counter() - indicators_started
+        financials_started = perf_counter()
+        financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
+        timings["price_financial_seconds"] = perf_counter() - financials_started
+        conversion_started = perf_counter()
         price_rows = [
             _price_row_from_feature_frame_record(
                 _feature_frame_row_from_sources(
                     row,
-                    momentum_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
+                    {family: by_ticker.get(str(row.get("ticker") or "").zfill(6), {})
+                     for family, by_ticker in indicators_by_family.items()},
                     symbol_info_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
                 )
             )
             for row in rows
         ]
-        timings["price_row_conversion_seconds"] = (
-            timings.get("price_row_conversion_seconds", 0.0) + perf_counter() - phase_started
-        )
-        phase_started = perf_counter()
+        timings["price_row_conversion_seconds"] = perf_counter() - conversion_started
+        attach_started = perf_counter()
         _attach_pointintime_financials(price_rows, financials_by_ticker)
-        timings["price_financial_attach_seconds"] = (
-            timings.get("price_financial_attach_seconds", 0.0) + perf_counter() - phase_started
-        )
-        return price_rows
+        timings["price_financial_attach_seconds"] = perf_counter() - attach_started
+        return price_rows, int(window["session_count"])
 
     def _fetch_financial_timeline(
-        self, conn: Any, tickers: Sequence[str], timings: dict[str, float]
+        self, conn: Any, tickers: Sequence[str]
     ) -> dict[str, list[dict[str, Any]]]:
         """Each ticker's filings as a time-ordered list of (filed_date, ratios).
 
@@ -748,7 +997,6 @@ class PostgresPipelineDataSource:
         look-ahead or empty.
         """
 
-        phase_started = perf_counter()
         rows = conn.execute(
             f"""
             WITH filings AS (
@@ -772,11 +1020,7 @@ class PostgresPipelineDataSource:
             """,
             [list(tickers)],
         ).fetchall()
-        timings["price_financial_query_seconds"] = (
-            timings.get("price_financial_query_seconds", 0.0) + perf_counter() - phase_started
-        )
 
-        phase_started = perf_counter()
         timelines: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             ticker = str(row.get("symbol") or "").zfill(6)
@@ -820,50 +1064,140 @@ class PostgresPipelineDataSource:
                         streaks[metric] = streaks.get(metric, 0) + 1 if value > prior else 0
                     ratios[f"{metric}_up_streak"] = streaks.get(metric, 0)
                     previous[metric] = value
-        timings["price_financial_decode_seconds"] = (
-            timings.get("price_financial_decode_seconds", 0.0) + perf_counter() - phase_started
-        )
         return timelines
 
-    def _fetch_momentum_values_by_date(
-        self,
-        conn: Any,
-        tickers: Sequence[str],
-        calendar_lookback_days: int,
-        lookback_days: int,
-        timings: dict[str, float],
-    ) -> dict[str, dict[date, Mapping[str, Any]]]:
-        phase_started = perf_counter()
-        rows = conn.execute(
+    def _resolve_backtest_window(self, conn: Any) -> dict[str, Any] | None:
+        """Resolve the exact five-calendar-year KST-KRX session window once."""
+        row = conn.execute(
             """
-            SELECT base_ticker, time, values_jsonb
-            FROM (
-                SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
-                    split_part(ticker, '#', 1) AS base_ticker,
-                    time,
-                    values_jsonb
-                FROM feature.ta_momentum_ticker_daily
-                WHERE split_part(ticker, '#', 1) = ANY(%s)
-                  AND time >= CURRENT_DATE - make_interval(days => %s)
-                ORDER BY split_part(ticker, '#', 1), time, ticker
-            ) deduped
+            WITH cutoff AS (
+                SELECT max(trade_date) AS session_end
+                FROM core.trading_calendar
+                WHERE is_open
+                  AND trade_date <= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
+            ), sessions AS (
+                SELECT c.trade_date
+                FROM core.trading_calendar c
+                CROSS JOIN cutoff
+                WHERE c.is_open
+                  AND c.trade_date BETWEEN cutoff.session_end - INTERVAL '5 years' AND cutoff.session_end
+            )
+            SELECT min(trade_date) AS session_start,
+                   max(trade_date) AS session_end,
+                   count(*) AS session_count
+            FROM sessions
+            """
+        ).fetchone()
+        if not row or not row.get("session_start") or not row.get("session_end"):
+            return None
+        return {
+            "start": _date_value(row["session_start"]),
+            "end": _date_value(row["session_end"]),
+            "session_count": int(row["session_count"]),
+        }
+
+    def _resolve_indicator_ticker_keys(
+        self, conn: Any, table: str, tickers: Sequence[str]
+    ) -> list[str]:
+        """The suffixed keys ('000020#S05') this table uses for these 6-digit codes.
+
+        Read from the table's most recent partition only, so the expensive `split_part`
+        predicate is paid once over one day instead of over every partition in the
+        backtest window.
+        """
+
+        rows = conn.execute(
+            f"""
+            WITH latest AS (
+                SELECT max(time) AS time
+                FROM {table}
+                WHERE time >= CURRENT_DATE - INTERVAL '30 days'
+            )
+            SELECT DISTINCT t.ticker
+            FROM {table} t, latest
+            WHERE t.time = latest.time
+              AND split_part(t.ticker, '#', 1) = ANY(%s)
             """,
-            [list(tickers), calendar_lookback_days],
+            [list(tickers)],
         ).fetchall()
-        timings["price_momentum_query_seconds"] = (
-            timings.get("price_momentum_query_seconds", 0.0) + perf_counter() - phase_started
+        # Both spellings, because the key format changed over the history: rows from
+        # 2026 are keyed '005930#S07', rows from 2024 and earlier plain '005930'.
+        # Matching only what the latest partition uses left ten-year reads at 0.2%
+        # coverage. Both are equality on the indexed column, so the read stays an index
+        # scan rather than reverting to split_part().
+        keys = {str(row["ticker"]) for row in rows if row.get("ticker")}
+        keys.update(str(ticker) for ticker in tickers)
+        return sorted(keys)
+
+    def _fetch_indicator_values_by_date(
+        self, conn: Any, table: str, tickers: Sequence[str], since: date | None
+    ) -> dict[str, dict[date, Mapping[str, Any]]]:
+        """One ta_* table's values per ticker per date, from `since` onwards.
+
+        Same shape for every family, so trend/volatility/volume reach the backtest the
+        way momentum always has. They did not before: the frame builder hardcoded them
+        to `{}`, which is why a compiled condition could only ever reference OHLCV and
+        RSI - and why the backtest and the screen disagreed about every other indicator.
+
+        Only the keys this module maps are projected, rather than hauling every
+        indicator document into Python and discarding most of it - measured 1.87x on a
+        205-name, 360-day read of all four tables (24.6s -> 13.2s).
+        """
+
+        if since is None:
+            return {}
+        keys = sorted(
+            {
+                spelling
+                for source in _FAMILY_SOURCE_KEYS.get(table, ())
+                for spelling in _key_spellings(source)
+            }
         )
-        phase_started = perf_counter()
+        if not keys:
+            return {}
+        # Aliases are quoted: indicator names carry dots (CCI_20_0.015, BBU_20_2.0), and
+        # an unquoted `AS cci_20_0.015` is a syntax error - which is exactly how this
+        # read was failing, in 188ms, while the handler below reported it as a statement
+        # budget overrun.
+        projection = ", ".join(
+            f'(values_jsonb->>\'{key}\')::numeric AS "{_metric_key(key)}"' for key in keys
+        )
+        alias_by_column = {_metric_key(key): key for key in keys}
+        # `split_part(ticker, '#', 1) = ANY(...)` cannot use the ticker index, so the
+        # range read degenerated into a full scan of every partition in the window and
+        # blew the statement budget. Resolve the suffixed keys ('000020#S05') from a
+        # single recent partition first - one cheap lookup - then match them directly so
+        # the multi-year read is an index scan.
+        ticker_keys = self._resolve_indicator_ticker_keys(conn, table, tickers)
+        if not ticker_keys:
+            return {}
+        # No DISTINCT ON: de-duplicating in SQL meant sorting every matched row by a
+        # computed expression, which is most of what made this read unaffordable. The
+        # keys are already known, so the collision (several security types sharing one
+        # 6-digit code) is resolved here instead - first key wins, matching the previous
+        # `ORDER BY ..., ticker` tie-break.
+        rows = conn.execute(
+            f"""
+            SELECT ticker, time, {projection}
+            FROM {table}
+            WHERE ticker = ANY(%s)
+              AND time >= %s::date
+            ORDER BY ticker, time
+            """,
+            [ticker_keys, since],
+        ).fetchall()
         values_by_ticker: dict[str, dict[date, Mapping[str, Any]]] = {}
         for row in rows:
-            values = row.get("values_jsonb")
-            ticker_key = str(row.get("base_ticker") or "").zfill(6)
-            values_by_ticker.setdefault(ticker_key, {})[_date_value(row["time"])] = (
-                values if isinstance(values, Mapping) else {}
-            )
-        timings["price_momentum_decode_seconds"] = (
-            timings.get("price_momentum_decode_seconds", 0.0) + perf_counter() - phase_started
-        )
+            ticker_key = str(row.get("ticker") or "").split("#", 1)[0].zfill(6)
+            by_date = values_by_ticker.setdefault(ticker_key, {})
+            trade_date = _date_value(row["time"])
+            if trade_date in by_date:
+                continue
+            by_date[trade_date] = {
+                source: row[column]
+                for column, source in alias_by_column.items()
+                if row.get(column) is not None
+            }
         return values_by_ticker
 
     def _fetch_l4_evidence(self, conn: Any, ticker: str, trace_id: str) -> list[dict[str, Any]]:
@@ -942,6 +1276,49 @@ class PostgresPipelineDataSource:
             for ticker in tickers
         }
 
+    def _fetch_macro_snapshot(
+        self, conn: Any, price_rows: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any] | None:
+        """The macro inputs the risk rules read, from the series the warehouse has.
+
+        FX is real: BOK series 731Y003:0000003 is the daily 원/달러 rate, so its
+        day-over-day change feeds FX_DAILY_MOVE_2PCT_CAP directly. There is no index
+        series, so the equity leg is the loaded universe's mean daily return - a proxy,
+        labelled as one in `kospi_source` so a report never calls it the KOSPI. There is
+        no volatility series at all, so vkospi stays None and its rule skips rather than
+        assuming a calm market.
+        """
+
+        snapshot: dict[str, Any] = {}
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT value
+                FROM {BOK_MACRO_VIEW}
+                WHERE series_id = %(series)s
+                  AND effective_date >= CURRENT_DATE - 30
+                ORDER BY effective_date DESC
+                LIMIT 2
+                """,
+                {"series": USD_KRW_SERIES_ID},
+            ).fetchall()
+        except Exception:
+            _logger.warning("BOK macro read failed; FX risk rule will not be evaluated")
+            rows = []
+        if len(rows) == 2:
+            latest = _optional_float_value(rows[0].get("value"))
+            prior = _optional_float_value(rows[1].get("value"))
+            if latest is not None and prior and prior > 0:
+                snapshot["fx_daily_change_pct"] = latest / prior - 1.0
+
+        market_return = _latest_universe_return(price_rows)
+        if market_return is not None:
+            snapshot["kospi_close_change_pct"] = market_return
+            snapshot["kospi_source"] = (
+                "loaded universe mean daily return (no index series in the warehouse)"
+            )
+        return snapshot or None
+
     def _fetch_macro_status(self, conn: Any) -> dict[str, Any]:
         row = conn.execute(
             """
@@ -959,6 +1336,16 @@ class PostgresPipelineDataSource:
         }
 
 
+
+def _rounded_timings(timings: Mapping[str, float], load_started: float) -> dict[str, float]:
+    """Phase timings plus the elapsed total, rounded for the report payload."""
+
+    return {
+        **{name: round(seconds, 6) for name, seconds in timings.items()},
+        "total_seconds": round(perf_counter() - load_started, 6),
+    }
+
+
 def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -970,20 +1357,29 @@ def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle
 
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
+    """Return an explicitly labelled local fixture; configured DB failures never use it."""
     return PipelineDataBundle(
         data_availability=_data_availability_for_query(query, source="fixture"),
         metadata={
             "source": "fixture",
+            "source_manifest": build_source_manifest(
+                source="fixture",
+                as_of=datetime.now(UTC).date(),
+                freshness="unknown",
+                lineage_refs=[reason, query],
+                source_version="local-fixture",
+            ).model_dump(mode="json"),
             "reason": reason,
+            "production_eligible": False,
             "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),
             "available_db_objects": [
                 KIS_FEATURE_FRAME_VIEW,
                 KIS_ADJUSTED_OHLCV_TABLE,
                 TA_MOMENTUM_TICKER_TABLE,
-                UNIVERSE_VIEW,
+                PIT_UNIVERSE_VIEW,
                 ANALYST_REPORT_TABLE,
             ],
-        }
+        },
     )
 
 
@@ -1016,6 +1412,7 @@ class ScreeningThresholds(BaseModel):
     relative_strength_60d_min: float = Field(default=0.0, ge=-1.0, le=1.0)
     rsi_max: float = Field(default=35.0, ge=5.0, le=70.0)
     rsi_cross_floor: float = Field(default=30.0, ge=5.0, le=70.0)
+    rsi_min: float = Field(default=70.0, ge=30.0, le=95.0)
     sma20_band: float = Field(default=0.04, ge=0.005, le=0.50)
     bb_width_max: float = Field(default=0.18, ge=0.02, le=1.0)
     bb_upper_ratio: float = Field(default=0.995, ge=0.50, le=1.0)
@@ -1030,11 +1427,18 @@ def _clamped(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> ScreeningThresholds:
+def _relaxed_thresholds(
+    base: ScreeningThresholds, round_index: int, *, profile: str = "rsi_rebound"
+) -> ScreeningThresholds:
     """Deterministic widening ladder, used when no live LLM is configured and as the
     fallback whenever an LLM relaxation proposal is unusable."""
 
     step = round_index + 1
+    rsi_update = (
+        {"rsi_min": _clamped(base.rsi_min - 5.0 * step, RSI_OVERBOUGHT_MIN, 95.0)}
+        if profile == "rsi_overbought"
+        else {"rsi_max": _clamped(base.rsi_max + 5.0 * step, 5.0, 70.0)}
+    )
     return base.model_copy(
         update={
             "high_252_ratio": _clamped(base.high_252_ratio - 0.02 * step, 0.50, 1.0),
@@ -1048,7 +1452,6 @@ def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> Screenin
             "relative_strength_60d_min": _clamped(
                 base.relative_strength_60d_min - 0.05 * step, -1.0, 1.0
             ),
-            "rsi_max": _clamped(base.rsi_max + 5.0 * step, 5.0, 70.0),
             "sma20_band": _clamped(base.sma20_band + 0.02 * step, 0.005, 0.50),
             "bb_width_max": _clamped(base.bb_width_max + 0.06 * step, 0.02, 1.0),
             "bb_upper_ratio": _clamped(base.bb_upper_ratio - 0.02 * step, 0.50, 1.0),
@@ -1058,6 +1461,7 @@ def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> Screenin
                 base.operating_margin_min - 0.02 * step, -1.0, 1.0
             ),
             "revenue_growth_min": _clamped(base.revenue_growth_min - 0.03 * step, -1.0, 10.0),
+            **rsi_update,
         }
     )
 
@@ -1114,6 +1518,10 @@ def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
         previous = _numeric(row.get("prev_rsi"))
         return previous is not None and previous < thresholds.rsi_cross_floor <= rsi
 
+    def rsi_overbought(row: Mapping[str, Any]) -> bool:
+        rsi = _numeric(row.get("rsi"))
+        return rsi is not None and rsi >= thresholds.rsi_min
+
     def pullback_trend(row: Mapping[str, Any]) -> bool:
         close = _numeric(row.get("close"))
         sma20 = _numeric(row.get("sma20"))
@@ -1156,6 +1564,7 @@ def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
     return {
         "breakout_volume": breakout_volume,
         "rsi_rebound": rsi_rebound,
+        "rsi_overbought": rsi_overbought,
         "pullback_trend": pullback_trend,
         "bollinger_squeeze": bollinger_squeeze,
         "relative_strength": relative_strength,
@@ -1230,7 +1639,11 @@ def _backtest_ticker_pool(
 
 
 def _relaxation_trace(
-    profile: str, rounds: list[dict[str, Any]], universe_rows: int
+    profile: str,
+    rounds: list[dict[str, Any]],
+    universe_rows: int,
+    *,
+    frame: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     final = rounds[-1] if rounds else {}
     return {
@@ -1240,6 +1653,10 @@ def _relaxation_trace(
         "relaxation_rounds": max(len(rounds) - 1, 0),
         "relaxed": bool(final.get("relaxed")) and bool(final.get("matched_count")),
         "matched_count": int(final.get("matched_count") or 0),
+        # Which date was screened, where the indicators came from, and what the
+        # relative-strength benchmark was measured against - all three used to be
+        # invisible in the report.
+        "frame": dict(frame or {}),
     }
 
 
@@ -1253,7 +1670,7 @@ def _propose_relaxed_thresholds(
 ) -> ScreeningThresholds:
     """Ask the LLM to loosen the screen, falling back to the deterministic ladder."""
 
-    deterministic = _relaxed_thresholds(thresholds, round_index)
+    deterministic = _relaxed_thresholds(thresholds, round_index, profile=profile)
     try:
         # Imported lazily: ai_graph.llm pulls in the provider stack, which must stay
         # optional for fixture-only runs of this module.
@@ -1294,7 +1711,11 @@ def _screening_profile(query: str) -> str:
     if _mentions_fundamentals(query, ("매출 성장", "매출성장", "성장률", "성장주")):
         return "growth_momentum"
     if "rsi" in lowered or "과매도" in query or "반등" in query:
-        return "rsi_rebound"
+        return (
+            "rsi_overbought"
+            if rsi_trade_rules(query).entry_side == "overbought"
+            else "rsi_rebound"
+        )
     if "볼린저" in query or "밴드" in query or "변동성" in query:
         return "bollinger_squeeze"
     if "200일" in query or "눌림목" in query or "20일선" in query:
@@ -1304,6 +1725,40 @@ def _screening_profile(query: str) -> str:
     if "신고가" in query or "거래량" in query or "돌파" in query or "모멘텀" in query:
         return "breakout_volume"
     return "technical_proxy"
+
+
+def screening_profile(query: str) -> str:
+    """The profile the loader will actually screen this query with.
+
+    Public so the requirement planner can be grounded in the same decision the loader
+    makes, rather than deriving "what data does this need" from its own keyword table
+    that had already drifted out of agreement with this one.
+    """
+
+    return _screening_profile(query)
+
+
+# Which data families each screening profile reads. Every profile's WHERE clause is
+# built on price/TA columns, so ohlcv_ta is unconditional; the fundamental profiles
+# additionally join the DART financials CTE.
+_PROFILE_DATA_FAMILIES: dict[str, tuple[str, ...]] = {
+    "value_quality": ("ohlcv_ta", "fundamentals"),
+    "quality_growth": ("ohlcv_ta", "fundamentals"),
+    "growth_momentum": ("ohlcv_ta", "fundamentals"),
+    "rsi_rebound": ("ohlcv_ta",),
+    "rsi_overbought": ("ohlcv_ta",),
+    "bollinger_squeeze": ("ohlcv_ta",),
+    "pullback_trend": ("ohlcv_ta",),
+    "relative_strength": ("ohlcv_ta",),
+    "breakout_volume": ("ohlcv_ta",),
+    "technical_proxy": ("ohlcv_ta",),
+}
+
+
+def screening_data_families(query: str) -> tuple[str, ...]:
+    """Data families the screen for this query will read from the warehouse."""
+
+    return _PROFILE_DATA_FAMILIES.get(screening_profile(query), ("ohlcv_ta",))
 
 
 def _dart_amount(field: str, *, prior: bool = False) -> str:
@@ -1318,21 +1773,22 @@ def _dart_amount(field: str, *, prior: bool = False) -> str:
     return f"CASE WHEN {path} ~ '^-?[0-9]+$' THEN ({path})::numeric END"
 
 
-def _financial_cte(*, restrict_tickers: bool = False) -> str:
-    """Latest DART filing per symbol, as ratios, joined into screening.
+def _financial_sql() -> str:
+    """Latest DART filing per symbol, as ratios, for one screening date.
 
     Filings are selected on available_from - the date the statement became public -
     rather than period_end, so a screen never sees numbers that were not yet filed.
     Revenue growth compares against the same report_code roughly a year earlier;
     raw.frmtrm_amount is present too rarely (4% of symbols) to rely on.
+
+    Takes the anchor date as a bind parameter rather than reading it from a CTE. The
+    date has to be a plan-time constant for PostgreSQL to prune partitions; supplied as
+    a subquery it cannot, and the screen then takes a lock on every partition of every
+    daily table it touches and dies with "out of shared memory".
     """
 
-    ticker_predicate = (
-        "\n              AND symbol IN (SELECT ticker FROM requested_tickers)"
-        if restrict_tickers
-        else ""
-    )
-    return f"""financial_raw AS (
+    return f"""
+        WITH financial_raw AS (
             SELECT
                 symbol,
                 period_end,
@@ -1347,8 +1803,8 @@ def _financial_cte(*, restrict_tickers: bool = False) -> str:
             FROM {DART_FINANCIAL_TABLE}
             -- Only the newest filing per symbol is used, and a year-ago comparison for
             -- growth, so there is no reason to scan back to 2016.
-            WHERE available_from <= (SELECT as_of_date FROM latest_date)
-              AND available_from >= (SELECT as_of_date FROM latest_date) - INTERVAL '3 years'{ticker_predicate}
+            WHERE available_from <= %(as_of)s::date
+              AND available_from >= %(as_of)s::date - INTERVAL '3 years'
         ),
         financial_latest AS (
             SELECT DISTINCT ON (symbol) *
@@ -1382,201 +1838,464 @@ def _financial_cte(*, restrict_tickers: bool = False) -> str:
              AND prior_filing.report_code = current_filing.report_code
              AND prior_filing.period_end BETWEEN current_filing.period_end - INTERVAL '400 days'
                                              AND current_filing.period_end - INTERVAL '330 days'
-        )"""
-
-
-def _screening_sql(
-    profile: str, *, sector: str | None = None, restrict_tickers: bool = False
-) -> str:
-    where_clause = {
-        "breakout_volume": (
-            "close >= high_252 * 0.995 AND volume_ratio_20 >= 1.5 "
-            "AND close > sma20 AND relative_strength_20d >= 0"
-        ),
-        "rsi_rebound": f"(rsi <= {RSI_OVERSOLD_MAX} OR (prev_rsi < 30 AND rsi >= 30))",
-        "pullback_trend": (
-            "close > sma200 AND sma20 > 0 AND abs(close / sma20 - 1) <= 0.04"
-        ),
-        "bollinger_squeeze": (
-            "bb_width > 0 AND bb_width <= 0.18 AND close >= bb_upper * 0.995"
-        ),
-        "relative_strength": "relative_strength_20d >= 0 AND relative_strength_60d >= 0",
-    }.get(profile, "close > 0")
-    requested_tickers_cte = (
-        "requested_tickers AS (SELECT unnest(%s::text[]) AS ticker),\n        "
-        if restrict_tickers
-        else ""
-    )
-    ticker_predicate = (
-        "\n              AND p.ticker IN (SELECT ticker FROM requested_tickers)"
-        if restrict_tickers
-        else ""
-    )
-    momentum_ticker_predicate = (
-        "\n              AND base_ticker IN (SELECT ticker FROM requested_tickers)"
-        if restrict_tickers
-        else ""
-    )
-    sector_predicate = "\n              AND sm.sector = %s" if sector else ""
-    # The default universe comes from recent OHLCV presence; KOSPI200 requests pass the
-    # caller's 200-name market-cap universe through restrict_tickers.
-    # core.symbol_master is still joined (LEFT, so a missing row can't drop a ticker) purely
-    # for display fields (name/market/sector), never as a membership filter.
-    return f"""
-        WITH {requested_tickers_cte}latest_date AS (
-            -- The window is what makes this affordable: the table has 531 date
-            -- partitions and an unbounded max() locks every one of them. With
-            -- max_locks_per_transaction at 64 the whole statement then dies with
-            -- "out of shared memory" before it reads a single row.
-            SELECT max(time) AS as_of_date
-            FROM feature.kis_adjusted_ohlcv_daily
-            WHERE time >= CURRENT_DATE - INTERVAL '90 days'
-        ),
-        prices AS (
-            SELECT
-                p.time,
-                p.ticker,
-                sm.name,
-                sm.market,
-                sm.market_segment,
-                sm.sector,
-                p.adj_open AS open,
-                p.adj_high AS high,
-                p.adj_low AS low,
-                p.adj_close AS close,
-                p.adj_volume AS volume
-            FROM feature.kis_adjusted_ohlcv_daily p
-            LEFT JOIN core.symbol_master sm
-              ON sm.symbol = p.ticker
-            WHERE p.time >= (SELECT as_of_date FROM latest_date) - INTERVAL '420 days'{ticker_predicate}{sector_predicate}
-        ),
-        features AS (
-            SELECT
-                prices.*,
-                avg(close) OVER w20 AS sma20,
-                avg(close) OVER w50 AS sma50,
-                avg(close) OVER w200 AS sma200,
-                max(high) OVER w20 AS high_20,
-                max(high) OVER w120 AS high_120,
-                max(high) OVER w252 AS high_252,
-                avg(volume) OVER w20 AS avg_volume_20,
-                stddev_samp(close) OVER w20 AS std20,
-                lag(close, 20) OVER wt AS close_20d_ago,
-                lag(close, 60) OVER wt AS close_60d_ago,
-                lag(close, 120) OVER wt AS close_120d_ago
-            FROM prices
-            WINDOW
-                wt AS (PARTITION BY ticker ORDER BY time),
-                w20 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW),
-                w50 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 49 PRECEDING AND CURRENT ROW),
-                w120 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 119 PRECEDING AND CURRENT ROW),
-                w200 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 199 PRECEDING AND CURRENT ROW),
-                w252 AS (PARTITION BY ticker ORDER BY time ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)
-        ),
-        {_financial_cte(restrict_tickers=restrict_tickers)},
-        momentum_raw AS (
-            -- ta_momentum_ticker_daily keys tickers as '000020#S05' (6-digit code plus a
-            -- security-type suffix) while kis_adjusted_ohlcv_daily keys them as '000020',
-            -- so joining the raw columns matches nothing and every rsi comes back NULL.
-            -- Strip the suffix here; DISTINCT ON keeps one row per (ticker, time) when
-            -- several security types collapse onto the same 6-digit code.
-            SELECT DISTINCT ON (split_part(ticker, '#', 1), time)
-                time,
-                split_part(ticker, '#', 1) AS ticker,
-                COALESCE(
-                    values_jsonb->>'RSI_14',
-                    values_jsonb->>'rsi_14',
-                    values_jsonb->>'RSI',
-                    values_jsonb->>'rsi'
-                ) AS rsi_text
-            FROM feature.ta_momentum_ticker_daily
-            WHERE time >= (SELECT as_of_date FROM latest_date) - INTERVAL '90 days'{momentum_ticker_predicate}
-            ORDER BY split_part(ticker, '#', 1), time, ticker
-        ),
-        momentum AS (
-            SELECT
-                time,
-                ticker,
-                CASE
-                    WHEN rsi_text ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN rsi_text::numeric
-                    ELSE NULL
-                END AS rsi
-            FROM momentum_raw
-        ),
-        momentum_with_prev AS (
-            SELECT
-                time,
-                ticker,
-                rsi,
-                lag(rsi) OVER (PARTITION BY ticker ORDER BY time) AS prev_rsi
-            FROM momentum
-        ),
-        -- as_of_date comes from kis_adjusted_ohlcv_daily, but RSI lives in
-        -- ta_momentum_ticker_daily, which a different DE task populates. Requiring
-        -- momentum on exactly that date meant one late TA run made every rsi NULL, and
-        -- an all-NULL rsi is the one screen no relaxation round can rescue: the
-        -- rsi_rebound predicate rejects a NULL row whatever rsi_max is widened to, so
-        -- all four rounds match nothing and the analysis dies with "no screening
-        -- candidates". Take each ticker's most recent momentum row at or before the
-        -- price date instead, bounded so a genuinely stale feed still screens as
-        -- missing rather than silently trading a month-old RSI.
-        momentum_as_of AS (
-            SELECT DISTINCT ON (ticker)
-                ticker,
-                time AS momentum_time,
-                rsi,
-                prev_rsi
-            FROM momentum_with_prev
-            WHERE time <= (SELECT as_of_date FROM latest_date)
-              AND time >= (SELECT as_of_date FROM latest_date) - INTERVAL '7 days'
-            ORDER BY ticker, time DESC
-        ),
-        latest_rows AS (
-            SELECT
-                f.*,
-                mwp.rsi,
-                mwp.prev_rsi,
-                CASE WHEN avg_volume_20 > 0 THEN volume / avg_volume_20 ELSE NULL END AS volume_ratio_20,
-                CASE WHEN close_20d_ago > 0 THEN close / close_20d_ago - 1 ELSE NULL END AS return_20d,
-                CASE WHEN close_60d_ago > 0 THEN close / close_60d_ago - 1 ELSE NULL END AS return_60d,
-                CASE WHEN close_120d_ago > 0 THEN close / close_120d_ago - 1 ELSE NULL END AS return_120d,
-                (sma20 + 2 * COALESCE(std20, 0)) AS bb_upper,
-                CASE WHEN sma20 > 0 THEN (4 * COALESCE(std20, 0)) / sma20 ELSE NULL END AS bb_width,
-                close * volume AS turnover,
-                fin.roe,
-                fin.debt_to_equity,
-                fin.operating_margin,
-                fin.revenue_growth_yoy,
-                -- PER needs no share count: DART reports basic EPS directly.
-                CASE WHEN fin.eps > 0 THEN close / fin.eps END AS per,
-                fin.financial_period_end
-            FROM features f
-            LEFT JOIN momentum_as_of mwp
-              ON mwp.ticker = f.ticker
-            -- LEFT so a ticker without filings still screens on price alone; the
-            -- fundamental predicates simply will not match it.
-            LEFT JOIN financials fin ON fin.symbol = f.ticker
-            WHERE f.time = (SELECT as_of_date FROM latest_date)
-        ),
-        market AS (
-            SELECT
-                avg(return_20d) AS market_return_20d,
-                avg(return_60d) AS market_return_60d
-            FROM latest_rows
-        ),
-        matched AS (
-            SELECT
-                latest_rows.*,
-                COALESCE(return_20d, 0) - COALESCE(market.market_return_20d, 0) AS relative_strength_20d,
-                COALESCE(return_60d, 0) - COALESCE(market.market_return_60d, 0) AS relative_strength_60d
-            FROM latest_rows
-            CROSS JOIN market
         )
-        SELECT *
-        FROM matched
-        WHERE {where_clause}
-        ORDER BY ticker
+        SELECT symbol, financial_period_end, roe, debt_to_equity, operating_margin,
+               revenue_growth_yoy, eps
+        FROM financials"""
+
+
+# What each profile's predicate reads from the price path. Everything else it needs -
+# moving averages, Bollinger bands, RSI - the warehouse has already computed, so the
+# only reason to walk price history at all is the handful of things it has not.
+#
+# Scoping matters: a 252-row rolling max over 420 days of the whole universe is by far
+# the most expensive thing the screen does (~3.0s), while the 20/60-day lags need only
+# ~130 days (~0.5s). A relative-strength screen paying the 52-week-high cost it never
+# reads was most of the query's runtime.
+PATH_HIGH_252 = "high_252"
+PATH_VOLUME_RATIO = "volume_ratio_20"
+PATH_RETURNS = "returns"
+
+_PROFILE_PATH_NEEDS: dict[str, frozenset[str]] = {
+    "breakout_volume": frozenset({PATH_HIGH_252, PATH_VOLUME_RATIO, PATH_RETURNS}),
+    "rsi_rebound": frozenset(),
+    "rsi_overbought": frozenset(),
+    "pullback_trend": frozenset(),
+    "bollinger_squeeze": frozenset(),
+    "relative_strength": frozenset({PATH_RETURNS}),
+    "value_quality": frozenset({PATH_RETURNS}),
+    "quality_growth": frozenset(),
+    "growth_momentum": frozenset(),
+}
+# The baseline screen is re-filtered in-process for every relaxation round and for
+# whichever profile is active, and _matched_screening_rules explains a candidate using
+# all of them, so the baseline reads the full set.
+_ALL_PATH_NEEDS = frozenset({PATH_HIGH_252, PATH_VOLUME_RATIO, PATH_RETURNS})
+
+# Calendar days of price history each path feature needs, with slack for holidays.
+_PATH_LOOKBACK_DAYS: dict[str, int] = {
+    PATH_HIGH_252: 420,
+    PATH_RETURNS: 130,
+    PATH_VOLUME_RATIO: 40,
+}
+
+# Indicator keys inside the mart feature frame's JSONB columns, mapped to the names the
+# screening predicates and candidate cards use. The warehouse computes these with
+# pandas-ta on the adjusted series; reading them here is what makes the screen and the
+# backtest share one definition instead of each deriving its own.
+_TREND_KEYS: dict[str, str] = {
+    "sma20": "SMA_20",
+    "sma50": "SMA_50",
+    "sma200": "SMA_200",
+    "ema20": "EMA_20",
+    "ema50": "EMA_50",
+    "ema200": "EMA_200",
+    "macd": "MACD_12_26_9",
+    "macd_signal": "MACDs_12_26_9",
+    "macd_hist": "MACDh_12_26_9",
+    "adx": "ADX_14",
+}
+_VOLATILITY_KEYS: dict[str, str] = {
+    "bb_upper": "BBU_20_2.0",
+    "bb_lower": "BBL_20_2.0",
+    "bb_middle": "BBM_20_2.0",
+    "bb_pct": "BBP_20_2.0",
+    "atr": "ATRr_14",
+    "natr": "NATR_14",
+}
+# The Bollinger keys were renamed mid-pipeline: bars up to 2026-07-10 are keyed
+# `BBU_20_2.0_2.0`, bars from 2025-08-28 `BBU_20_2.0`, and the two overlap. Reading only
+# the current spelling left Bollinger populated on 13.5% of backtest bars while every
+# other indicator sat at 99.9% - a strategy would quietly stop matching on older
+# history. Each key falls back to its older spelling until the data team normalises it.
+_LEGACY_KEY_SUFFIX = "_2.0"
+_LEGACY_KEYED = frozenset(
+    {"BBU_20_2.0", "BBL_20_2.0", "BBM_20_2.0", "BBP_20_2.0", "BBB_20_2.0"}
+)
+
+
+def _key_spellings(source: str) -> tuple[str, ...]:
+    """Every warehouse spelling of one indicator key, most current first."""
+
+    if source in _LEGACY_KEYED:
+        return (source, f"{source}{_LEGACY_KEY_SUFFIX}")
+    return (source,)
+_MOMENTUM_KEYS: dict[str, str] = {
+    "rsi": "RSI_14",
+    "mfi": "MFI_14",
+    "cci": "CCI_20_0.015",
+    "willr": "WILLR_14",
+    "roc": "ROC_10",
+    "stoch_k": "STOCHk_14_3_3",
+    "stoch_d": "STOCHd_14_3_3",
+}
+_VOLUME_KEYS: dict[str, str] = {
+    "obv": "OBV",
+    "cmf": "CMF_20",
+    "ad": "AD",
+    "adosc": "ADOSC_3_10",
+}
+# Bollinger bandwidth: pandas-ta reports BBB as a percentage of the middle band,
+# (upper - lower) / middle * 100. The screen's thresholds are fractions, so it is
+# divided here rather than every predicate being rewritten around a percentage.
+_BB_BANDWIDTH_KEY = "BBB_20_2.0"
+_BB_BANDWIDTH_SCALE = 100.0
+
+# The per-ticker indicator tables behind the mart feature frame, read directly for the
+# backtest window (the frame view is anchored to a single date).
+INDICATOR_TABLES: dict[str, str] = {
+    "trend": TA_TREND_TICKER_TABLE,
+    "momentum": TA_MOMENTUM_TICKER_TABLE,
+    "volatility": TA_VOLATILITY_TICKER_TABLE,
+    "volume": TA_VOLUME_TICKER_TABLE,
+}
+
+# Which family each condition metric lives in, so the backtest reads only the tables its
+# strategy actually references. Reading all four over a 200-name universe cost ~37s;
+# most strategies touch one or two.
+INDICATOR_FAMILY_BY_METRIC: dict[str, str] = {
+    **{alias: "trend" for alias in _TREND_KEYS},
+    **{alias: "momentum" for alias in _MOMENTUM_KEYS},
+    **{alias: "volatility" for alias in _VOLATILITY_KEYS},
+    **{alias: "volume" for alias in _VOLUME_KEYS},
+    "bb_width": "volatility",
+}
+# Momentum carries RSI, which the report and several fallbacks read whether or not the
+# strategy names it, so it is never skipped.
+ALWAYS_LOADED_FAMILIES = frozenset({"momentum"})
+
+# Which warehouse keys each ta_* table is read for, so the query projects those columns
+# instead of returning whole indicator documents.
+_FAMILY_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
+    TA_TREND_TICKER_TABLE: tuple(_TREND_KEYS.values()),
+    TA_MOMENTUM_TICKER_TABLE: tuple(_MOMENTUM_KEYS.values()),
+    TA_VOLATILITY_TICKER_TABLE: (*_VOLATILITY_KEYS.values(), _BB_BANDWIDTH_KEY),
+    TA_VOLUME_TICKER_TABLE: tuple(_VOLUME_KEYS.values()),
+}
+
+# Indicators each screening profile's predicate reads off the bar (path features like
+# high_252 are computed separately and are not in any ta_* family).
+_PROFILE_INDICATOR_METRICS: dict[str, tuple[str, ...]] = {
+    "breakout_volume": ("sma20",),
+    "rsi_rebound": ("rsi",),
+    "rsi_overbought": ("rsi",),
+    "pullback_trend": ("sma20", "sma200"),
+    "bollinger_squeeze": ("bb_upper", "bb_width"),
+    "relative_strength": (),
+    "value_quality": (),
+    "quality_growth": (),
+    "growth_momentum": ("sma50",),
+}
+
+
+def indicator_families_for_query(query: str) -> tuple[str, ...]:
+    """The ta_* families a run of this query needs on every backtest bar.
+
+    All four, which is what a compiled condition on `sma200` or `bb_lower` needs. This
+    was briefly cut to momentum while the four-family read looked like it could not be
+    served; it turned out not to be a cost problem at all - the projected query carried
+    an unquoted column alias for indicators whose names contain dots (CCI_20_0.015), so
+    every family failed on a syntax error in under 200ms and was reported as a budget
+    overrun. With the alias quoted and the ticker keys resolved up front, a ten-year
+    momentum read is ~2.8s.
     """
+
+    _ = _PROFILE_INDICATOR_METRICS.get(_screening_profile(query), ())
+    return tuple(INDICATOR_TABLES)
+
+
+def indicator_families_for_metrics(metrics: Sequence[str]) -> tuple[str, ...]:
+    """The ta_* families needed to evaluate these condition metrics."""
+
+    families = set(ALWAYS_LOADED_FAMILIES)
+    for metric in metrics:
+        family = INDICATOR_FAMILY_BY_METRIC.get(str(metric).strip().lower())
+        if family is not None:
+            families.add(family)
+    return tuple(family for family in INDICATOR_TABLES if family in families)
+
+# Warehouse indicator key -> the name a condition uses, applied to every backtest bar
+# so `sma20` on a bar means exactly what `sma20` meant in the screen.
+BACKTEST_INDICATOR_ALIASES: dict[str, str] = {
+    spelling: alias
+    for alias, source in {
+        **_TREND_KEYS,
+        **_VOLATILITY_KEYS,
+        **_MOMENTUM_KEYS,
+        **_VOLUME_KEYS,
+    }.items()
+    for spelling in _key_spellings(source)
+}
+
+INDICATOR_FIELDS: tuple[str, ...] = (
+    *_TREND_KEYS,
+    *_VOLATILITY_KEYS,
+    *_MOMENTUM_KEYS,
+    *_VOLUME_KEYS,
+    "bb_width",
+)
+
+
+def _jsonb_projection(column: str, keys: Mapping[str, str]) -> str:
+    projections = []
+    for alias, source in keys.items():
+        spellings = _key_spellings(source)
+        if len(spellings) == 1:
+            expression = f"({column}->>'{spellings[0]}')::numeric"
+        else:
+            reads = ", ".join(f"{column}->>'{name}'" for name in spellings)
+            expression = f"(COALESCE({reads}))::numeric"
+        projections.append(f"{expression} AS {alias}")
+    return ",\n            ".join(projections)
+
+
+def _feature_frame_sql(date_param: str) -> str:
+    """The mart feature frame for one trading date, without reading the mart view.
+
+    KIS_FEATURE_FRAME_VIEW resolves to a join of six hypertables, the five indicator
+    tables hanging off the price table by `ta.time = a.time` in a LEFT JOIN. Restricting
+    the view to one date only restricts the price side: PostgreSQL will not propagate
+    `a.time = <date>` across an outer join to the nullable side, so each ta_* table
+    reaches the planner with no date qualification and every one of its 534 chunks is
+    locked. Measured against production, one screening read of the view took 10,718 lock
+    entries - the cluster's whole lock table is 6,400 (max_locks_per_transaction 64 x
+    max_connections 100). That is the `out of shared memory` that has been failing
+    analyses, and it is why the run this was traced from died in the Data node.
+
+    Reading the same tables here lets each one carry its own date restriction, which the
+    planner can prune on before taking locks. MATERIALIZED is load-bearing: an ordinary
+    subquery is pulled up into the outer join and its WHERE degrades back into a join
+    qual that prunes nothing - measured 2,150 lock entries per table pulled up, against
+    18 when the pull-up is blocked.
+
+    Only the four families the projection below reads are joined. The view also carries
+    `pattern_values`, which nothing here selects; including it would cost another
+    hypertable's worth of locks for a column that is discarded.
+    """
+
+    return f"""
+        {FEATURE_FRAME_MARKER}
+        WITH bars AS MATERIALIZED (
+            SELECT time, ticker, base_ticker, adj_open, adj_high, adj_low,
+                   adj_close, adj_volume, quality_flags
+            FROM {ADJUSTED_OHLCV_TABLE}
+            WHERE time = %({date_param})s::date
+        ),
+        trend_frame AS MATERIALIZED (
+            SELECT ticker, time, values_jsonb FROM {TA_TREND_TICKER_TABLE}
+            WHERE time = %({date_param})s::date
+        ),
+        momentum_frame AS MATERIALIZED (
+            SELECT ticker, time, values_jsonb FROM {TA_MOMENTUM_TICKER_TABLE}
+            WHERE time = %({date_param})s::date
+        ),
+        volatility_frame AS MATERIALIZED (
+            SELECT ticker, time, values_jsonb FROM {TA_VOLATILITY_TICKER_TABLE}
+            WHERE time = %({date_param})s::date
+        ),
+        volume_frame AS MATERIALIZED (
+            SELECT ticker, time, values_jsonb FROM {TA_VOLUME_TICKER_TABLE}
+            WHERE time = %({date_param})s::date
+        )
+        SELECT
+            bars.time AS as_of_date,
+            bars.ticker,
+            bars.base_ticker,
+            sm.name,
+            sm.market_segment,
+            sm.sector,
+            bars.adj_open AS open,
+            bars.adj_high AS high,
+            bars.adj_low AS low,
+            bars.adj_close AS close,
+            bars.adj_volume AS volume,
+            trend_frame.values_jsonb AS trend_values,
+            momentum_frame.values_jsonb AS momentum_values,
+            volatility_frame.values_jsonb AS volatility_values,
+            volume_frame.values_jsonb AS volume_values
+        FROM bars
+        JOIN {SYMBOL_MASTER_TABLE} sm ON sm.symbol = bars.base_ticker
+        LEFT JOIN trend_frame
+          ON trend_frame.ticker = bars.ticker AND trend_frame.time = bars.time
+        LEFT JOIN momentum_frame
+          ON momentum_frame.ticker = bars.ticker AND momentum_frame.time = bars.time
+        LEFT JOIN volatility_frame
+          ON volatility_frame.ticker = bars.ticker AND volatility_frame.time = bars.time
+        LEFT JOIN volume_frame
+          ON volume_frame.ticker = bars.ticker AND volume_frame.time = bars.time
+        WHERE (bars.quality_flags->>'adjusted_price_method') = '{KIS_ADJUSTED_PRICE_METHOD}'
+    """
+
+
+def _mart_frame_sql(*, sector: bool) -> str:
+    """Every indicator the warehouse already has, for one trading date.
+
+    DISTINCT ON collapses the security-type variants that share a 6-digit code; the
+    feature frame keys rows as '000020#S05' in `ticker` and the bare code in
+    `base_ticker`, and on some dates both variants are present.
+    """
+
+    sector_predicate = "\n          AND sector = %(sector)s" if sector else ""
+    return f"""
+        SELECT DISTINCT ON (base_ticker)
+            base_ticker AS ticker,
+            name,
+            market_segment,
+            market_segment AS market,
+            sector,
+            as_of_date AS time,
+            open, high, low, close, volume,
+            {_jsonb_projection("trend_values", _TREND_KEYS)},
+            {_jsonb_projection("volatility_values", _VOLATILITY_KEYS)},
+            {_jsonb_projection("momentum_values", _MOMENTUM_KEYS)},
+            {_jsonb_projection("volume_values", _VOLUME_KEYS)},
+            (COALESCE(
+                {", ".join(
+                    f"volatility_values->>'{name}'"
+                    for name in _key_spellings(_BB_BANDWIDTH_KEY)
+                )}
+            ))::numeric / {_BB_BANDWIDTH_SCALE} AS bb_width
+        FROM ({_feature_frame_sql("as_of")}) frame
+        WHERE TRUE{sector_predicate}
+        ORDER BY base_ticker, ticker
+    """
+
+
+def _prev_rsi_sql() -> str:
+    return f"""
+        SELECT DISTINCT ON (base_ticker)
+            base_ticker AS ticker,
+            (momentum_values->>'{_MOMENTUM_KEYS["rsi"]}')::numeric AS prev_rsi
+        FROM ({_feature_frame_sql("prev")}) frame
+        ORDER BY base_ticker, ticker
+    """
+
+
+def _path_features_sql(needs: frozenset[str]) -> tuple[str, int]:
+    """Only the price-path features the warehouse does not precompute.
+
+    Returns the statement and the calendar-day window it needs, so a screen that never
+    reads a 52-week high does not pay to compute one.
+    """
+
+    lookback = max(
+        (_PATH_LOOKBACK_DAYS[need] for need in needs if need in _PATH_LOOKBACK_DAYS),
+        default=40,
+    )
+    # The close comes from here, not from the (possibly sector-scoped) feature frame,
+    # so the relative-strength benchmark can be the whole priced universe.
+    selected = ["ticker", "time", "adj_close AS close"]
+    windows = ["wt AS (PARTITION BY ticker ORDER BY time)"]
+    if PATH_HIGH_252 in needs:
+        selected.append("max(adj_high) OVER w252 AS high_252")
+        windows.append(
+            "w252 AS (PARTITION BY ticker ORDER BY time "
+            "ROWS BETWEEN 251 PRECEDING AND CURRENT ROW)"
+        )
+    if PATH_VOLUME_RATIO in needs:
+        selected.append("avg(adj_volume) OVER w20 AS avg_volume_20")
+        windows.append(
+            "w20 AS (PARTITION BY ticker ORDER BY time "
+            "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)"
+        )
+    if PATH_RETURNS in needs:
+        selected.append("lag(adj_close, 20) OVER wt AS close_20d_ago")
+        selected.append("lag(adj_close, 60) OVER wt AS close_60d_ago")
+    projection = ",\n                ".join(selected)
+    return (
+        f"""
+        WITH path AS (
+            SELECT
+                {projection}
+            FROM {KIS_ADJUSTED_OHLCV_TABLE}
+            WHERE time > %(as_of)s::date - {lookback}
+              AND time <= %(as_of)s::date
+            WINDOW {", ".join(windows)}
+        )
+        SELECT * FROM path WHERE time = %(as_of)s::date
+        """,
+        lookback,
+    )
+
+
+def _latest_universe_return(rows: Sequence[Mapping[str, Any]]) -> float | None:
+    """Mean one-day return across the loaded universe on its most recent date."""
+
+    by_ticker: dict[str, list[tuple[str, float]]] = {}
+    for row in rows:
+        close = _optional_float_value(row.get("close"))
+        date_value = str(row.get("date") or "")
+        if close is None or not date_value:
+            continue
+        by_ticker.setdefault(str(row.get("ticker") or ""), []).append((date_value, close))
+    returns: list[float] = []
+    for series in by_ticker.values():
+        if len(series) < 2:
+            continue
+        series.sort(key=lambda item: item[0])
+        prior, latest = series[-2][1], series[-1][1]
+        if prior > 0:
+            returns.append(latest / prior - 1.0)
+    return sum(returns) / len(returns) if returns else None
+
+
+def _relative_strength(
+    path_rows: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, dict[str, float | None]], dict[str, Any]]:
+    """Each stock's excess return over the market, and what "the market" was.
+
+    The benchmark is the mean return of the whole priced universe, computed before any
+    sector filter is applied. It used to be the mean of whatever set the screen had
+    already narrowed to, so asking for "반도체 섹터 주도주 중 상대강도 강한 종목"
+    measured each chip stock against the chip sector's own average - a sector that fell
+    20% while the market rose still produced "leaders", because half of any set is
+    above its own mean by construction. Relative strength now means the same thing
+    whatever the query filtered on, and the population is reported alongside it.
+
+    Both the close and its lagged values come from `path_rows`, which is never
+    sector-scoped. Taking the close from the feature frame instead silently put the
+    filter back: tickers outside the sector had no close to pair with their return and
+    dropped out of the mean.
+    """
+
+    returns: dict[str, dict[str, float | None]] = {}
+    for row in path_rows:
+        ticker = str(row.get("ticker") or "").zfill(6)
+        close = _optional_float_value(row.get("close"))
+        if close is None:
+            continue
+        entry: dict[str, float | None] = {}
+        for horizon, column in (("20d", "close_20d_ago"), ("60d", "close_60d_ago")):
+            prior = _optional_float_value(row.get(column))
+            entry[horizon] = close / prior - 1.0 if prior and prior > 0 else None
+        returns[ticker] = entry
+
+    benchmark: dict[str, Any] = {
+        "population": "priced_universe_before_sector_filter",
+        "constituents": len(returns),
+    }
+    market: dict[str, float | None] = {}
+    for horizon in ("20d", "60d"):
+        values = [
+            entry[horizon] for entry in returns.values() if entry.get(horizon) is not None
+        ]
+        market[horizon] = sum(values) / len(values) if values else None
+        benchmark[f"market_return_{horizon}"] = market[horizon]
+        benchmark[f"observations_{horizon}"] = len(values)
+
+    strength: dict[str, dict[str, float | None]] = {}
+    for ticker, entry in returns.items():
+        strength[ticker] = {}
+        for horizon in ("20d", "60d"):
+            own, mkt = entry.get(horizon), market.get(horizon)
+            # A stock without enough history has no excess return. It used to be
+            # COALESCE(return, 0) - market, which handed every newly listed name the
+            # negative of the market as its "relative strength" and let it screen in
+            # whenever the market fell.
+            strength[ticker][horizon] = (
+                own - mkt if own is not None and mkt is not None else None
+            )
+    return strength, benchmark
 
 
 def _screening_candidate_from_row(
@@ -1620,9 +2339,16 @@ def _matched_screening_rules(row: Mapping[str, Any], profile: str) -> list[str]:
         rules.append("20일 상대강도 양호")
     rsi = _optional_float_value(row.get("rsi"))
     prev_rsi = _optional_float_value(row.get("prev_rsi"))
-    if rsi is not None and rsi <= RSI_OVERSOLD_MAX:
+    if profile == "rsi_overbought" and rsi is not None and rsi >= RSI_OVERBOUGHT_MIN:
+        rules.append(f"RSI {rsi:.0f} 과매수권")
+    elif rsi is not None and rsi <= RSI_OVERSOLD_MAX:
         rules.append(f"RSI {rsi:.0f} 과매도권")
-    if prev_rsi is not None and rsi is not None and prev_rsi < 30 <= rsi:
+    if (
+        profile == "rsi_rebound"
+        and prev_rsi is not None
+        and rsi is not None
+        and prev_rsi < 30 <= rsi
+    ):
         rules.append("RSI 30 상향 돌파")
     if profile == "bollinger_squeeze" and _compare(row.get("bb_upper"), close):
         rules.append("볼린저 상단 근접/돌파")
@@ -1821,11 +2547,6 @@ def _has_market_scope_reference(query: str) -> bool:
     return any(term.upper() in normalized_query for term in MARKET_SCOPE_TERMS)
 
 
-def _has_kospi200_reference(query: str) -> bool:
-    normalized_query = query.upper()
-    return any(term.upper() in normalized_query for term in KOSPI_200_TERMS)
-
-
 def _has_broad_screening_reference(query: str) -> bool:
     return any(term in query for term in BROAD_SCREENING_TERMS)
 
@@ -1873,12 +2594,59 @@ def _attach_pointintime_financials(
         current: dict[str, float] = {}
         for row in rows:
             row_date = _date_value(row.get("date"))
-            while pointer < len(filings) and filings[pointer]["filed"] <= row_date:
+            # DART receipt numbers are date-only. EOD signals may not use a filing on
+            # the same date; it becomes eligible only on the following KRX session.
+            while pointer < len(filings) and filings[pointer]["filed"] < row_date:
                 current = filings[pointer]["ratios"]
                 pointer += 1
             for metric, value in current.items():
                 row.setdefault(metric, value)
 
+
+def _raw_price_capabilities(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    required_ohlcv = ("raw_open", "raw_high", "raw_low", "raw_close", "raw_volume")
+    missing_ohlcv_rows = [
+        {
+            "date": str(row.get("date") or ""),
+            "ticker": str(row.get("ticker") or "").zfill(6),
+            "missing_fields": [field for field in required_ohlcv if row.get(field) is None],
+        }
+        for row in rows
+        if any(row.get(field) is None for field in required_ohlcv)
+    ]
+    missing_notional_rows = [
+        {"date": str(row.get("date") or ""), "ticker": str(row.get("ticker") or "").zfill(6)}
+        for row in rows
+        if row.get("raw_notional") is None
+    ]
+    raw_ohlcv = bool(rows) and not missing_ohlcv_rows
+    raw_notional = bool(rows) and not missing_notional_rows
+    if not raw_ohlcv:
+        return {
+            "raw_ohlcv": False,
+            "raw_notional": False,
+            "reason_code": "raw_ohlcv_source_missing_or_uncovered",
+            "reason": "Required raw OHLCV coverage is incomplete; no adjusted values were substituted.",
+            "missing_raw_ohlcv_rows": missing_ohlcv_rows,
+            "missing_raw_notional_rows": missing_notional_rows,
+        }
+    if not raw_notional:
+        return {
+            "raw_ohlcv": True,
+            "raw_notional": False,
+            "reason_code": "raw_notional_source_missing_or_uncovered",
+            "reason": "Required verified raw traded-value coverage is incomplete; capacity must not be claimed.",
+            "missing_raw_ohlcv_rows": [],
+            "missing_raw_notional_rows": missing_notional_rows,
+        }
+    return {
+        "raw_ohlcv": True,
+        "raw_notional": True,
+        "reason_code": None,
+        "reason": None,
+        "missing_raw_ohlcv_rows": [],
+        "missing_raw_notional_rows": [],
+    }
 
 def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, Any]:
     trade_date = _date_value(row["as_of_date"]).isoformat()
@@ -1892,6 +2660,17 @@ def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, An
         "low": _float_value(row["low"]),
         "close": _float_value(row["close"]),
         "volume": _float_value(row["volume"]),
+        "adjusted_open": _float_value(row.get("adjusted_open", row["open"])),
+        "adjusted_high": _float_value(row.get("adjusted_high", row["high"])),
+        "adjusted_low": _float_value(row.get("adjusted_low", row["low"])),
+        "adjusted_close": _float_value(row.get("adjusted_close", row["close"])),
+        "adjusted_volume": _float_value(row.get("adjusted_volume", row["volume"])),
+        "raw_open": _optional_float_value(row.get("raw_open")),
+        "raw_high": _optional_float_value(row.get("raw_high")),
+        "raw_low": _optional_float_value(row.get("raw_low")),
+        "raw_close": _optional_float_value(row.get("raw_close")),
+        "raw_volume": _optional_float_value(row.get("raw_volume")),
+        "raw_notional": _optional_float_value(row.get("raw_notional")),
     }
     _merge_metric_values(price_row, row)
     rsi = _find_metric_value(row.get("momentum_values"), RSI_KEYS, contains="rsi")
@@ -1902,20 +2681,27 @@ def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, An
 
 def _feature_frame_row_from_sources(
     row: Mapping[str, Any],
-    momentum_by_date: Mapping[date, Mapping[str, Any]],
+    indicators_by_family: Mapping[str, Mapping[date, Mapping[str, Any]]],
     symbol_info: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """One backtest bar: prices plus every indicator family for that date.
+
+    All four non-momentum families used to be hardcoded to `{}` here, so the backtest
+    saw OHLCV and RSI and nothing else - while the screen that picked the stock had
+    moving averages, bands and the rest. Filling them is what lets a compiled condition
+    mean the same thing on both sides.
+    """
+
     trade_date = _date_value(row["as_of_date"])
     return {
         **dict(row),
         "as_of_date": trade_date,
         "name": symbol_info.get("name") or "",
         "market_segment": symbol_info.get("market_segment") or "KRX",
-        "trend_values": {},
-        "momentum_values": momentum_by_date.get(trade_date, {}),
-        "volatility_values": {},
-        "volume_values": {},
-        "pattern_values": {},
+        **{
+            f"{family}_values": indicators_by_family.get(family, {}).get(trade_date, {})
+            for family in INDICATOR_TABLES
+        },
     }
 
 
@@ -1944,6 +2730,15 @@ def _l4_evidence_from_report(row: Mapping[str, Any], trace_id: str) -> dict[str,
 
 
 def _merge_metric_values(target: dict[str, Any], row: Mapping[str, Any]) -> None:
+    """Flatten the indicator JSONB onto the bar, under the condition vocabulary's names.
+
+    Both spellings are kept: the warehouse key (`SMA_20`) so nothing that already reads
+    it breaks, and the canonical alias (`sma20`) that compiled conditions and the screen
+    both use. Bollinger bandwidth is rescaled from pandas-ta's percentage to the
+    fraction the thresholds are written in - the same conversion the screen applies, so
+    `bb_width` cannot mean 16.35 on one side and 0.1635 on the other.
+    """
+
     for field_name in (
         "trend_values",
         "momentum_values",
@@ -1958,7 +2753,13 @@ def _merge_metric_values(target: dict[str, Any], row: Mapping[str, Any]) -> None
             parsed = _optional_float_value(value)
             if parsed is None:
                 continue
-            target.setdefault(_metric_key(str(key)), parsed)
+            source_key = str(key)
+            target.setdefault(_metric_key(source_key), parsed)
+            alias = BACKTEST_INDICATOR_ALIASES.get(source_key)
+            if alias is not None:
+                target.setdefault(alias, parsed)
+            if source_key in _key_spellings(_BB_BANDWIDTH_KEY):
+                target.setdefault("bb_width", parsed / _BB_BANDWIDTH_SCALE)
 
 
 def _find_metric_value(
@@ -1981,7 +2782,11 @@ def _find_metric_value(
 
 def _query_requires_rsi_oversold(query: str) -> bool:
     lowered = query.lower()
-    return "rsi" in lowered and ("30" in lowered or "과매도" in query)
+    return (
+        "rsi" in lowered
+        and ("30" in lowered or "과매도" in query)
+        and rsi_trade_rules(query).entry_side == "oversold"
+    )
 
 
 def _has_rsi_oversold_entry(price_rows: list[dict[str, Any]]) -> bool:

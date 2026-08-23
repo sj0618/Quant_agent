@@ -17,17 +17,35 @@ MAX_CONCENTRATION_HAIRCUT = 0.33
 
 
 class MacroSnapshot(BaseModel):
+    """Market conditions the risk rules downgrade a BUY on.
+
+    Every field used to default to a value that no rule could fire on (0.0 / 0.0 / 20.0
+    against thresholds of -5% / 2% / 30) and nothing ever assigned the snapshot, so all
+    three rules were dead while looking implemented. Two are now fed from
+    mart.bok_macro_asof; the third is None because the warehouse has no volatility index
+    at all, and a rule with no input must read as "not evaluated" rather than "passed".
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    kospi_close_change_pct: float = 0.0
-    fx_daily_change_pct: float = 0.0
-    vkospi: float = 20.0
+    kospi_close_change_pct: float | None = None
+    fx_daily_change_pct: float | None = None
+    # No VKOSPI series exists in the warehouse. Kept on the model so a future feed can
+    # populate it, but the rule below skips rather than assuming a calm market.
+    vkospi: float | None = None
+    # What the equity leg was measured against, since it is a universe-average proxy
+    # rather than the KOSPI index - the warehouse carries no index series.
+    kospi_source: str | None = None
 
 
 def apply_risk_rules(signal: SignalDecision, macro: MacroSnapshot) -> RiskDecision:
     adjusted = signal.model_copy(deep=True)
     adjustments: list[RiskAdjustment] = []
-    if adjusted.action == "BUY" and macro.kospi_close_change_pct <= -0.05:
+    if (
+        adjusted.action == "BUY"
+        and macro.kospi_close_change_pct is not None
+        and macro.kospi_close_change_pct <= -0.05
+    ):
         adjustments.append(
             RiskAdjustment(
                 before="BUY",
@@ -37,7 +55,11 @@ def apply_risk_rules(signal: SignalDecision, macro: MacroSnapshot) -> RiskDecisi
             )
         )
         adjusted = adjusted.model_copy(update={"action": "HOLD", "confidence": min(adjusted.confidence, 0.7)})
-    if adjusted.action == "BUY" and abs(macro.fx_daily_change_pct) > 0.02:
+    if (
+        adjusted.action == "BUY"
+        and macro.fx_daily_change_pct is not None
+        and abs(macro.fx_daily_change_pct) > 0.02
+    ):
         if adjusted.confidence > 0.7:
             adjustments.append(
                 RiskAdjustment(
@@ -48,7 +70,7 @@ def apply_risk_rules(signal: SignalDecision, macro: MacroSnapshot) -> RiskDecisi
                 )
             )
         adjusted = adjusted.model_copy(update={"confidence": min(adjusted.confidence, 0.7)})
-    if adjusted.action == "BUY" and macro.vkospi > 30:
+    if adjusted.action == "BUY" and macro.vkospi is not None and macro.vkospi > 30:
         if adjusted.confidence > 0.6:
             adjustments.append(
                 RiskAdjustment(

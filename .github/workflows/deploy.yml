@@ -11,7 +11,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-trust:
+    name: Offline release-trust gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            ai/pyproject.toml
+            backtest_module/pyproject.toml
+            backend/pyproject.toml
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+          cache: npm
+          cache-dependency-path: fe/package-lock.json
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./backtest_module -e ./ai -e "./backend[test]" pytest
+
+      - name: Install frontend dependencies
+        working-directory: fe
+        run: npm ci
+
+      - name: Verify offline release trust
+        env:
+          RELEASE_TRUST_PYTHON: python
+        run: node scripts/evaluate-release-trust.mjs
+
   deploy:
+    needs: release-trust
     runs-on: ubuntu-latest
 
     steps:
@@ -85,6 +126,8 @@ jobs:
             printf '%s\n' 'AUTH_PUBLIC_BACKEND_ORIGIN=https://qt-agent.kro.kr'
             printf '%s\n' 'AUTH_ALLOWED_ORIGINS=https://qt-agent.kro.kr'
             printf '%s\n' 'AUTH_ALLOWED_HOSTS=qt-agent.kro.kr,localhost,127.0.0.1'
+            printf '%s\n' 'AUTH_TRUSTED_PROXY_HEADERS=true'
+            printf '%s\n' 'AUTH_TRUSTED_PROXY_HOSTS=127.0.0.1,::1'
             printf '%s\n' 'AUTH_COOKIE_SECURE=true'
             printf '%s\n' 'AUTH_COOKIE_SAMESITE=lax'
           } > "$auth_env_file"
@@ -104,7 +147,7 @@ jobs:
               backup_file="$APP_DIR/.env.backup.$(date -u +%Y%m%dT%H%M%SZ)"
               cp -p "$env_file" "$backup_file"
               chmod 600 "$backup_file"
-              grep -Ev '^(APP_ENV|AUTH_ENABLED|GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|GOOGLE_REDIRECT_URI|AUTH_PUBLIC_BACKEND_ORIGIN|AUTH_ALLOWED_ORIGINS|AUTH_ALLOWED_HOSTS|AUTH_COOKIE_SECURE|AUTH_COOKIE_SAMESITE)=' \
+              grep -Ev '^(APP_ENV|AUTH_ENABLED|GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|GOOGLE_REDIRECT_URI|AUTH_PUBLIC_BACKEND_ORIGIN|AUTH_ALLOWED_ORIGINS|AUTH_ALLOWED_HOSTS|AUTH_TRUSTED_PROXY_HEADERS|AUTH_TRUSTED_PROXY_HOSTS|AUTH_COOKIE_SECURE|AUTH_COOKIE_SAMESITE)=' \
                 "$env_file" > "$next_file" || true
             fi
             cat "$incoming" >> "$next_file"
@@ -130,6 +173,9 @@ jobs:
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
             mkdir -p "$RUN_DIR"
+            SECRET_DIR="$HOME/.config/quantagent"
+            mkdir -p "$SECRET_DIR"
+            chmod 700 "$SECRET_DIR"
 
             for auth_var in \
               AUTH_ENABLED \
@@ -139,6 +185,8 @@ jobs:
               AUTH_PUBLIC_BACKEND_ORIGIN \
               AUTH_ALLOWED_ORIGINS \
               AUTH_ALLOWED_HOSTS \
+              AUTH_TRUSTED_PROXY_HEADERS \
+              AUTH_TRUSTED_PROXY_HOSTS \
               AUTH_COOKIE_SECURE \
               AUTH_COOKIE_SAMESITE
             do
@@ -148,11 +196,16 @@ jobs:
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
-            "$APP_DIR/ai/.venv/bin/python" -m pip install -e "$APP_DIR/backend" -e "$APP_DIR/ai"
+            "$APP_DIR/ai/.venv/bin/python" -m pip install \
+              -e "$APP_DIR/backtest_module" \
+              -e "$APP_DIR/backend" \
+              -e "$APP_DIR/ai"
+            "$APP_DIR/ai/.venv/bin/python" -c \
+              'import backtest_module, quantstats; print("backtest dependencies ready")'
             (
               cd "$APP_DIR"
               "$APP_DIR/ai/.venv/bin/python" -c \
-                'from app.core.config import load_settings; settings = load_settings(); assert settings.is_production, "APP_ENV must be production"; assert settings.auth_enabled, "AUTH_ENABLED must be true"; assert settings.auth_cookie_secure, "AUTH_COOKIE_SECURE must be true"; assert settings.google_redirect_uri == "https://qt-agent.kro.kr/auth/google/callback", "GOOGLE_REDIRECT_URI mismatch"; assert "https://qt-agent.kro.kr" in settings.allowed_origins, "AUTH_ALLOWED_ORIGINS mismatch"'
+                'from app.core.config import load_settings; settings = load_settings(); assert settings.is_production, "APP_ENV must be production"; assert settings.auth_enabled, "AUTH_ENABLED must be true"; assert settings.auth_cookie_secure, "AUTH_COOKIE_SECURE must be true"; assert settings.google_redirect_uri == "https://qt-agent.kro.kr/auth/google/callback", "GOOGLE_REDIRECT_URI mismatch"; assert "https://qt-agent.kro.kr" in settings.allowed_origins, "AUTH_ALLOWED_ORIGINS mismatch"; assert settings.auth_trusted_proxy_headers, "AUTH_TRUSTED_PROXY_HEADERS must be true"; assert set(settings.trusted_proxy_hosts) == {"127.0.0.1", "::1"}, "AUTH_TRUSTED_PROXY_HOSTS mismatch"'
             )
 
             "$APP_DIR/ai/.venv/bin/python" - "$APP_DIR" <<'PY'
@@ -174,6 +227,7 @@ jobs:
                   "013_ai_runtime_logging.sql",
                   "019_ai_prompt_response_summary.sql",
                   "020_ai_account_tokens.sql",
+                  "021_ai_analysis_jobs.sql",
               ):
                   conn.execute(
                       (app_dir / "service_db" / "migrations" / name).read_text(
@@ -190,6 +244,7 @@ jobs:
             fi
             chmod 600 "$AUDIT_SECRET_FILE"
             export APP_ENV=production
+            export AI_JOB_STORE=persistent
             export AI_AUDIT_PRODUCTION_ENABLED=1
             export AI_AUDIT_SINK=postgres
             export AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET
@@ -199,6 +254,14 @@ jobs:
             export AI_AUDIT_GATE_B_EVIDENCE_ID=production-deployment
             export AI_AUDIT_GATE_B_DEPLOYMENT_REVISION="$DEPLOYMENT_REVISION"
             export AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE=active
+            RULE_DRAFT_SECRET_FILE="$SECRET_DIR/ai-rule-draft-hmac.secret"
+            if [ ! -s "$RULE_DRAFT_SECRET_FILE" ]; then
+              openssl rand -hex 32 > "$RULE_DRAFT_SECRET_FILE"
+            fi
+            chmod 600 "$RULE_DRAFT_SECRET_FILE"
+            export AI_RULE_DRAFT_HMAC_SECRET
+            AI_RULE_DRAFT_HMAC_SECRET="$(tr -d '\r\n' < "$RULE_DRAFT_SECRET_FILE")"
+            export AI_RULE_DRAFT_HMAC_KEY_VERSION=server-v1
             export AI_AUDIT_GATE_B_ADMISSION_TOKEN
             AI_AUDIT_GATE_B_ADMISSION_TOKEN="$("$APP_DIR/ai/.venv/bin/python" - <<'PY'
           import base64
@@ -339,6 +402,12 @@ jobs:
             wait_for_url "Combined backend" "http://127.0.0.1:18001/combined-health" "$RUN_DIR/combined.log"
             wait_for_url "General backend" "http://127.0.0.1:18001/health" "$RUN_DIR/combined.log"
             wait_for_url "AI API" "http://127.0.0.1:18001/ai-api/health" "$RUN_DIR/combined.log"
+            curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
+              | "$APP_DIR/ai/.venv/bin/python" -c \
+                'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
+            curl -fsS 'http://127.0.0.1:18001/ai-api/readiness' \
+              | "$APP_DIR/ai/.venv/bin/python" -c \
+                'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert payload["migration_revision"] == "021_ai_analysis_jobs"; assert payload["ai_contract_version"] == "ai-mvp.v1"; assert all(check["ready"] for check in payload["checks"])'
             wait_for_url "FE dev server" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
 
             auth_headers="$(mktemp "$RUN_DIR/google-auth-smoke.headers.XXXXXX")"

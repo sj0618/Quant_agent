@@ -60,3 +60,21 @@ def max_position_pct_from_risk_constraints(risk_constraints: Mapping[str, Any]) 
     if not math.isfinite(parsed) or parsed <= 0 or parsed > 1.0:
         return None
     return parsed
+
+
+def required_max_position_pct(risk_constraints: Mapping[str, Any]) -> float:
+    """Resolve the canonical backtest sizing contract without a portfolio default."""
+    if "max_position_pct" not in risk_constraints:
+        raise ValueError(
+            "canonical analysis backtest requires strategy risk_constraints.max_position_pct"
+        )
+    value = risk_constraints["max_position_pct"]
+    if isinstance(value, bool):
+        raise ValueError("max_position_pct must be numeric")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_position_pct must be numeric") from exc
+    if not math.isfinite(parsed) or parsed <= 0.0 or parsed > 1.0:
+        raise ValueError("max_position_pct must be finite and in (0, 1]")
+    return parsed
