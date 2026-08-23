@@ -8,9 +8,10 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
 from ai_graph.quant_strategy import rsi_trade_rules
+from ai_graph.research_eligibility import ResearchRuntimeFacts
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -200,6 +201,63 @@ class PipelineDataBundle(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+def research_runtime_facts_from_bundle(
+    bundle: PipelineDataBundle,
+    *,
+    dsn_configured: bool,
+    trace_id: str,
+    retrieved_at: datetime | None = None,
+) -> ResearchRuntimeFacts:
+    """Derive secret-free eligibility facts from a loader-produced bundle.
+
+    This is deliberately an adapter measurement, not a caller-controlled public
+    assertion: the only PostgreSQL path that calls it is ``PostgresPipelineDataSource``.
+    Contract fixtures may exercise it locally, but cannot constitute server evidence.
+    """
+
+    metadata = bundle.metadata
+    source = metadata.get("source")
+    as_of = metadata.get("research_as_of")
+    session_state = metadata.get("research_session_state")
+    freshness = metadata.get("research_freshness")
+    required = frozenset(metadata.get("research_required_families", ()))
+    available = frozenset(metadata.get("research_available_families", ()))
+    snapshot_id = metadata.get("research_snapshot_id")
+    return ResearchRuntimeFacts(
+        dsn_configured=dsn_configured,
+        source=source if isinstance(source, str) else None,
+        # A source label alone is never enough: this flag only becomes true after the
+        # live adapter measured all session/family/count fields below.
+        production_eligible=bool(metadata.get("research_measurement_complete")),
+        as_of=as_of if isinstance(as_of, str) else None,
+        retrieved_at=retrieved_at or datetime.now(UTC),
+        session_state=session_state if isinstance(session_state, str) else None,
+        freshness=freshness if isinstance(freshness, str) else None,
+        required_families=required,
+        available_families=available,
+        row_count=len(bundle.price_rows),
+        universe_count=_safe_int(metadata.get("pit_member_count")),
+        candidate_count=len(bundle.screening_candidates),
+        candidate_items_count=len(bundle.screening_candidates),
+        snapshot_or_result_id=snapshot_id if isinstance(snapshot_id, str) else trace_id,
+    )
+
+
+def classify_research_runtime_failure(*, dsn_configured: bool) -> ResearchRuntimeFacts:
+    """Classify a configured adapter failure without exposing DSN/SQL/error text."""
+
+    return ResearchRuntimeFacts(
+        dsn_configured=dsn_configured,
+        load_state="database_error",
+        source=None,
+        production_eligible=False,
+    )
+
+
+def _safe_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 class PostgresPipelineDataSource:
     def __init__(self, config: DataSourceConfig) -> None:
         if not config.database_dsn:
@@ -333,6 +391,24 @@ class PostgresPipelineDataSource:
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
             # Capabilities were probed up front; nothing since then can change them.
 
+        research_as_of = backtest_window["end"].isoformat()
+        required_families = {"price_ta", "pit_universe", *indicator_families}
+        available_families = set(required_families)
+        if self.unavailable_indicator_families:
+            available_families.difference_update(self.unavailable_indicator_families)
+        price_dates = {
+            str(row.get("date") or row.get("time") or row.get("as_of_date") or "")
+            for row in price_rows
+        }
+        # The end session comes from core.trading_calendar inside this same connection;
+        # data is current only when the returned price rows actually cover that session.
+        price_covers_session = research_as_of in price_dates
+        research_measurement_complete = bool(
+            price_covers_session
+            and tickers
+            and required_families.issubset(available_families)
+        )
+
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
@@ -383,6 +459,16 @@ class PostgresPipelineDataSource:
                 "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
                 "macro_status": macro_status,
+                # Eligibility measurement is intentionally separate from the public
+                # source label. It is safe to expose but cannot reveal DSNs, SQL, rows,
+                # candidates, or exception details.
+                "research_as_of": research_as_of,
+                "research_session_state": "krx_completed_session",
+                "research_freshness": "eod_current" if price_covers_session else "stale",
+                "research_required_families": sorted(required_families),
+                "research_available_families": sorted(available_families),
+                "research_snapshot_id": trace_id,
+                "research_measurement_complete": research_measurement_complete,
             },
         )
 
@@ -1111,7 +1197,7 @@ class PostgresPipelineDataSource:
                 """,
                 {"series": USD_KRW_SERIES_ID},
             ).fetchall()
-        except Exception:
+        except Exception:  # noqa: BLE001 - macro capability failure must not abort screening.
             _logger.warning("BOK macro read failed; FX risk rule will not be evaluated")
             rows = []
         if len(rows) == 2:
@@ -1154,6 +1240,35 @@ def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle
             query=query,
         )
     return PostgresPipelineDataSource(config).load(query, trace_id)
+
+
+def measure_research_runtime_facts_from_env(
+    query: str,
+    trace_id: str,
+) -> ResearchRuntimeFacts:
+    """Run the configured read-only adapter and return only sanitized measurements.
+
+    This deliberately does not fall back to fixtures when a configured PostgreSQL
+    adapter fails. Callers can pass the result to the central policy and safely attest
+    a failure as ``database_error`` without leaking operational details.
+    """
+
+    config = DataSourceConfig.from_env()
+    if not config.database_dsn:
+        return research_runtime_facts_from_bundle(
+            _fixture_bundle("database DSN is not configured", query=query),
+            dsn_configured=False,
+            trace_id=trace_id,
+        )
+    try:
+        bundle = PostgresPipelineDataSource(config).load(query, trace_id)
+    except Exception:  # noqa: BLE001 - must fail closed without exposing driver detail.
+        return classify_research_runtime_failure(dsn_configured=True)
+    return research_runtime_facts_from_bundle(
+        bundle,
+        dsn_configured=True,
+        trace_id=trace_id,
+    )
 
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
@@ -1461,29 +1576,15 @@ def _propose_relaxed_thresholds(
     round_index: int,
     universe_rows: int,
 ) -> ScreeningThresholds:
-    """Ask the LLM to loosen the screen, falling back to the deterministic ladder."""
+    """Return the audited relaxation ladder without invoking any provider.
 
-    deterministic = _relaxed_thresholds(thresholds, round_index, profile=profile)
-    try:
-        # Imported lazily: ai_graph.llm pulls in the provider stack, which must stay
-        # optional for fixture-only runs of this module.
-        from ai_graph.llm.role_calls import generate_relaxed_screening_thresholds
-    except ImportError:
-        return deterministic
+    An empty screen is a normal market outcome. It must be reproducible and must not
+    trigger an auxiliary LLM request (or an accidental network call) merely to widen
+    thresholds. The parameters are retained for the trace-compatible call boundary.
+    """
 
-    proposal = generate_relaxed_screening_thresholds(
-        query=query,
-        profile=profile,
-        current=thresholds.model_dump(),
-        fallback=deterministic.model_dump(),
-        round_index=round_index,
-        universe_rows=universe_rows,
-    )
-    known = {key: value for key, value in proposal.items() if key in ScreeningThresholds.model_fields}
-    try:
-        return ScreeningThresholds.model_validate(known)
-    except ValidationError:
-        return deterministic
+    del query, universe_rows
+    return _relaxed_thresholds(thresholds, round_index, profile=profile)
 
 
 def _mentions_fundamentals(query: str, terms: Sequence[str]) -> bool:
@@ -2258,7 +2359,7 @@ def measure_capabilities(conn: Any) -> dict[str, bool]:
         try:
             row = conn.execute(f"SELECT EXISTS (SELECT 1 FROM {probe} LIMIT 1) AS present").fetchone()
             available[name] = bool(row and row.get("present"))
-        except Exception:
+        except Exception:  # noqa: BLE001 - unreadable optional capability is unavailable.
             # A missing or unreadable table is simply an unavailable capability.
             available[name] = False
     return available

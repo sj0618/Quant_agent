@@ -423,11 +423,16 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
 }
 
 function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, baseline: PerformanceSummary): PerformanceSummary {
-  const aiPerformance = job.result?.user_payload.performance;
-  const selectedMetrics = aiPerformance?.metrics ?? null;
-  if (!aiPerformance || !selectedMetrics) {
+  const projection = job.result?.user_payload.performance;
+  if (!projection) {
     return baseline;
   }
+  if (projection.availability !== "available") {
+    return unavailablePerformanceSummary(baseline, projection.reason_code);
+  }
+
+  const aiPerformance = projection.performance;
+  const selectedMetrics = aiPerformance.metrics;
 
   const equityCurve = buildAIEquityCurve(aiPerformance);
   const comparison = buildAIComparisonRows(selectedMetrics, aiPerformance.engine_summary);
@@ -442,7 +447,21 @@ function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, baseline: Perf
     comparison: comparison.length ? comparison : baseline.comparison,
     disclaimer:
       `AI 백테스트 엔진이 후보 코드 중 ${aiPerformance.selected_candidate_id}를 선택했습니다. ` +
-      "벤치마크 데이터가 없는 검증 응답은 0% 기준선과 함께 표시합니다.",
+      projection.limitations.join(" "),
+  };
+}
+
+function unavailablePerformanceSummary(baseline: PerformanceSummary, reasonCode: string): PerformanceSummary {
+  return {
+    ...baseline,
+    headline: "성과 수치를 표시할 수 없습니다",
+    period: "검증 근거 불충분",
+    benchmarkLabel: undefined,
+    metrics: [],
+    equityCurve: [],
+    comparison: [],
+    macroEvents: [],
+    disclaimer: `성능 데이터는 공개 계약을 충족하지 못해 숨김 처리되었습니다. (${reasonCode})`,
   };
 }
 

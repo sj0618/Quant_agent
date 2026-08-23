@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ai_graph.research_eligibility import PublicPerformance
+
 SCHEMA_VERSION = "ai-mvp.v1"
 
 
@@ -744,7 +746,10 @@ class UserPayload(BaseModel):
     next_actions: list[str] = Field(default_factory=list)
     candidate_cards: list[StrategyCandidateCard] = Field(default_factory=list)
     report: ReportBundle | None = None
-    performance: BacktestPerformance | None = None
+    # Internal backtest objects retain their richer audit fields.  The HTTP/job
+    # envelope deliberately exposes only the discriminated projection so consumers
+    # cannot mistake a partial calculation for a publishable performance result.
+    performance: PublicPerformance | None = None
     recommendation_gate: RecommendationGate | None = None
     ticker_actions: list[TickerAction] = Field(default_factory=list)
     question: str | None = None

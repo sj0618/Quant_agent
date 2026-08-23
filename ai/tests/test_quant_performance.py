@@ -1,9 +1,12 @@
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
-from ai_graph import graph
-from ai_graph import quant_performance
+from ai_graph import graph, quant_performance
 from ai_graph.quant_explanations import metric_explanation
-from ai_graph.quant_performance import build_public_backtest_performance
+from ai_graph.quant_performance import (
+    build_public_backtest_performance,
+    project_public_performance,
+)
+from ai_graph.research_eligibility import PerformanceAvailable, PerformanceUnavailable
 from ai_graph.schemas import (
     BacktestMetrics,
     CandidateParameters,
@@ -511,3 +514,63 @@ def test_graph_public_performance_alias_points_to_quant_module() -> None:
         graph.build_public_backtest_performance
         is quant_performance.build_public_backtest_performance
     )
+
+
+def test_public_projection_removes_every_metric_and_chart_for_insufficient_data() -> None:
+    projection = project_public_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.2, max_drawdown=-0.1, win_rate=0.5,
+                total_return=0.08, in_sample_sharpe=0.1,
+                out_sample_sharpe=None, degradation=0.0,
+            )
+        ),
+        price_rows=_rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=5),
+        pipeline_data_source={"source": "fixture"},
+    )
+
+    assert isinstance(projection, PerformanceUnavailable)
+    public = projection.model_dump(mode="json")
+    forbidden = {"metrics", "equity_curve", "benchmark", "total_return", "sharpe_ratio", "max_drawdown"}
+
+    def walk(value):
+        if isinstance(value, dict):
+            assert not forbidden.intersection(value)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(public)
+
+
+def test_public_projection_requires_engine_manifest_before_exposing_complete_values() -> None:
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.2, max_drawdown=-0.1, win_rate=0.5,
+            total_return=0.08, in_sample_sharpe=0.1,
+            out_sample_sharpe=None, degradation=0.0,
+        ),
+        engine_summary={
+            "effective_trade_count": 8,
+            "performance_method_manifest": {
+                "evaluated_rule": "rsi", "rule_version": "v1", "substituted": False,
+                "market": "KRX", "universe": "test", "start_date": "2024-01-01",
+                "end_date": "2024-12-31", "eod_basis": "ohlcv_eod", "initial_capital": 1000000,
+                "rebalance_timing": "weekly", "fill_timing": "next_open",
+                "corporate_action_method": "engine", "cost_tax_slippage_liquidity": "configured",
+                "observations": 252, "trades": 8, "data_version": "test", "result_version": "test",
+                "execution_version": "test", "historical_simulation_warning": "not predictive",
+            },
+        },
+    )
+    projection = project_public_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert isinstance(projection, PerformanceAvailable)
+    assert projection.performance["metrics"]["total_return"] == 0.08
+    assert "engine_summary" not in projection.performance

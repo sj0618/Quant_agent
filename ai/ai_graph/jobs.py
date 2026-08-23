@@ -25,6 +25,7 @@ from ai_graph.progress import (
     cancellation_check,
     stage_reporter,
 )
+from ai_graph.research_eligibility import PerformanceAvailable
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
 
 _logger = logging.getLogger(__name__)
@@ -595,27 +596,23 @@ def _manifest_with_session_update(
 def _manifest_from_completion(manifest: ExecutionManifest, result_envelope: APIEnvelope, completed_at: datetime, *, strategy_id: str | None) -> ExecutionManifest:
     manifest = _manifest_with_session_update(manifest, AnalysisJobStatus.COMPLETED, completed_at, strategy_id=strategy_id)
     performance = result_envelope.user_payload.performance
-    if performance is None:
+    if not isinstance(performance, PerformanceAvailable):
         return manifest
     ledger = _storage_ledger(result_envelope)
     if ledger is None:
-        if performance.engine_summary.get("execution_audit"):
-            raise JobStoreConfigurationError("completed backtest is missing its storage execution ledger.")
+        # The public projection intentionally omits engine_summary.  A ledger may be
+        # recovered from the internal debug store, but a missing one must not make the
+        # public serializer reach back into its hidden metrics payload.
         return manifest
     events = _events_from_storage_ledger(ledger, completed_at)
     source_count = int(ledger.get("source_event_count", -1))
     source_hash = str(ledger.get("source_event_hash", ""))
     if source_count != _event_count(events) or source_hash != _stable_hash(_ledger_source(ledger)):
         raise JobStoreConfigurationError("storage execution ledger count/hash reconciliation failed.")
-    return manifest.model_copy(update={"events": events, "ledger_event_count": source_count, "ledger_event_hash": source_hash, "policy_hashes": _policy_hashes(result_envelope, performance.engine_summary, ledger.get("order_audit", []), strategy_id=manifest.run_identity.strategy_id)})
+    return manifest.model_copy(update={"events": events, "ledger_event_count": source_count, "ledger_event_hash": source_hash, "policy_hashes": _policy_hashes(result_envelope, {}, ledger.get("order_audit", []), strategy_id=manifest.run_identity.strategy_id)})
 
 
 def _storage_ledger(result_envelope: APIEnvelope) -> Mapping[str, Any] | None:
-    performance = result_envelope.user_payload.performance
-    if performance is not None:
-        ledger = performance.engine_summary.get("_storage_execution_ledger")
-        if isinstance(ledger, Mapping):
-            return ledger
     try:
         from ai_graph.graph import DEBUG_STORE
 
@@ -693,10 +690,10 @@ def _policy_hashes(
     return {
         "execution_contract": MANIFEST_CONTRACT_HASH,
         "strategy": _stable_hash(strategy),
-        "data": _stable_hash({"reliability": performance.reliability.model_dump(mode="json") if performance and performance.reliability else None}),
+        "data": _stable_hash({"method_manifest": performance.method_manifest.model_dump(mode="json") if isinstance(performance, PerformanceAvailable) else None}),
         "cost": _stable_hash({"cost_policy_ids": sorted(str(event["cost_policy_id"]) for event in audit_events if event.get("cost_policy_id")), "cost_components": [_safe_document(event) for event in audit_events if event.get("cost") is not None]}),
         "sizing": _stable_hash(engine_summary.get("ai_backtest_context", {})),
-        "benchmark": _stable_hash({"benchmark": performance.benchmark.model_dump(mode="json") if performance and performance.benchmark else None, "provenance": engine_summary.get("benchmark_provenance", {})}),
+        "benchmark": _stable_hash({"benchmark_method": performance.method_manifest.benchmark_method if isinstance(performance, PerformanceAvailable) else None, "provenance": engine_summary.get("benchmark_provenance", {})}),
     }
 
 

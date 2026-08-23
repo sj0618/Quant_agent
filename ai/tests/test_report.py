@@ -2,7 +2,7 @@ import json
 
 from nodes.backtest import BacktestMetrics, BacktestResult, TradeSignal
 from report import ReportRequest, build_report
-from risk_manager import RiskDecision, RiskCheck
+from risk_manager import RiskCheck, RiskDecision
 
 
 def test_report_keeps_internal_payload_out_of_public_dump() -> None:
@@ -51,5 +51,8 @@ def test_report_keeps_internal_payload_out_of_public_dump() -> None:
     assert public_payload["trace_id"] == "trace-1"
     assert public_payload["debug_ref"] == "dbg-1"
     assert public_payload["recommendation"] == "APPROVE"
+    assert public_payload["performance_availability"] == "unavailable"
+    assert "metrics" not in public_payload
+    assert "total_return_pct" not in json.loads(public_json)
     assert "internal_payload" not in public_payload
     assert "raw_llm" not in json.loads(public_json)

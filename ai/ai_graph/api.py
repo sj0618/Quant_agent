@@ -3,6 +3,8 @@ from __future__ import annotations
 # pyright: reportUnannotatedClassAttribute=false, reportUnusedFunction=false
 import asyncio
 import json
+import secrets
+import uuid
 from collections.abc import AsyncIterator, Callable
 from os import environ
 from typing import ClassVar, Literal
@@ -27,6 +29,7 @@ from ai_graph.data_sources.db import (
     BOK_MACRO_VIEW,
     KIS_ADJUSTED_OHLCV_TABLE,
     SYMBOL_MASTER_TABLE,
+    measure_research_runtime_facts_from_env,
     resolve_database_dsn_from_env,
 )
 from ai_graph.graph import run_analysis
@@ -65,6 +68,11 @@ from ai_graph.research_contract import (
     build_rule_draft,
     canonical_rule_execution_query,
     unavailable_result_for_unverified_job,
+)
+from ai_graph.research_eligibility import (
+    EligiblePostgresEod,
+    ResearchRuntimeFacts,
+    evaluate_research_eligibility,
 )
 from ai_graph.schemas import (
     SCHEMA_VERSION,
@@ -108,6 +116,9 @@ AI_CORS_ALLOW_ORIGINS_ENV = "AI_CORS_ALLOW_ORIGINS"
 CORS_ALLOW_METHODS = ["GET", "POST", "OPTIONS"]
 CORS_ALLOW_HEADERS = ["Authorization", "Content-Type"]
 RESEARCH_EXECUTION_ENABLED_ENV = "AI_RESEARCH_EXECUTION_ENABLED"
+DATA_EVIDENCE_PROBE_TOKEN_ENV = "AI_DATA_EVIDENCE_PROBE_TOKEN"
+DATA_EVIDENCE_PROBE_PATH = "/_operator/research-data-evidence"
+DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
 READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
 REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
 ANALYSIS_JOBS_MIGRATION_REVISION = "021_ai_analysis_jobs"
@@ -160,6 +171,17 @@ class ParseStrategyRequest(BaseModel):
     @property
     def request_text(self) -> str:
         return (self.natural_language or self.query or "").strip()
+
+
+class DataEvidenceProbeResponse(BaseModel):
+    """Non-public, secret-free read-only measurement response for release evidence."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    decision: Literal["eligible", "ineligible"]
+    reason_code: str | None = None
+    facts: ResearchRuntimeFacts
+    deployment_revision: str | None = None
 
 
 PreflightRejectionResponse = ScopeRefusalV1 | UnsupportedScopeV1
@@ -515,6 +537,40 @@ def create_app(
         else _research_execution_enabled()
     )
     migration_probe = readiness_migration_probe or _analysis_jobs_migration_is_current
+
+    probe_token = (environ.get(DATA_EVIDENCE_PROBE_TOKEN_ENV) or "").strip()
+    if probe_token:
+        @app.get(
+            DATA_EVIDENCE_PROBE_PATH,
+            response_model=DataEvidenceProbeResponse,
+            include_in_schema=False,
+        )
+        def research_data_evidence_probe(
+            x_ai_evidence_probe: str | None = Header(default=None),
+        ) -> DataEvidenceProbeResponse:
+            """Execute only the bounded DB adapter and policy; never create a job.
+
+            The route is absent unless a separate operator secret is configured. It
+            deliberately bypasses normal token/session resolvers because those can
+            update usage/cache state; the probe must remain read-only end-to-end.
+            """
+
+            if not x_ai_evidence_probe or not secrets.compare_digest(
+                x_ai_evidence_probe, probe_token
+            ):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            trace_id = f"evidence-{uuid.uuid4()}"
+            facts = measure_research_runtime_facts_from_env(
+                "KRX 상장 종목의 RSI 조건을 검토",
+                trace_id,
+            )
+            decision = evaluate_research_eligibility(facts)
+            return DataEvidenceProbeResponse(
+                decision=decision.kind,
+                reason_code=None if isinstance(decision, EligiblePostgresEod) else decision.reason_code,
+                facts=facts,
+                deployment_revision=(environ.get(DEPLOYMENT_REVISION_ENV) or "").strip() or None,
+            )
 
     @app.get(HEALTH_PATH, response_model=HealthResponse, tags=["System"])
     def health() -> HealthResponse:

@@ -3,14 +3,16 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
+from pydantic import ValidationError
+
 from ai_graph.nodes.backtest import (
-    INSUFFICIENT_WALK_FORWARD_SAMPLE,
     BENCHMARK_LABEL,
     BENCHMARK_METHOD,
     BENCHMARK_WARNING,
+    INSUFFICIENT_WALK_FORWARD_SAMPLE,
+    METRIC_ROUND_DIGITS,
     MIN_OBJECTIVE_TRADES,
     MIN_RELIABLE_TICKERS,
-    METRIC_ROUND_DIGITS,
     _is_numeric_metric,
     _price_rows,
     _public_engine_summary,
@@ -18,6 +20,12 @@ from ai_graph.nodes.backtest import (
 )
 from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_strategy import build_strategy_explanation
+from ai_graph.research_eligibility import (
+    PerformanceAvailable,
+    PerformanceMethodManifest,
+    PerformanceUnavailable,
+    PublicPerformance,
+)
 from ai_graph.schemas import (
     BacktestBenchmark,
     BacktestPerformance,
@@ -52,6 +60,91 @@ _RELIABILITY_MIN_DAYS = 252
 
 _UNAVAILABLE_METRIC_REASON = "신뢰도 부족으로 공개 지표를 계산할 수 없습니다."
 _BENCHMARK_UNAVAILABLE_REASON = "신뢰도 부족으로 벤치마크를 표시하지 않습니다."
+
+
+def project_public_performance(
+    backtest: Mapping[str, Any] | None,
+    *,
+    price_rows: Sequence[Mapping[str, Any]] | None = None,
+    pipeline_data_source: Mapping[str, Any] | None = None,
+) -> PublicPerformance | None:
+    """Project an internal backtest onto the sole public performance contract.
+
+    ``BacktestPerformance`` intentionally remains an internal calculation/audit
+    object.  In particular, an insufficient run or a run without an engine-produced
+    method manifest never reaches an HTTP, job, report, or export consumer with a
+    partially masked metrics object.
+    """
+
+    internal = build_public_backtest_performance(
+        backtest,
+        price_rows=price_rows,
+        pipeline_data_source=pipeline_data_source,
+    )
+    if internal is None:
+        return None
+
+    reliability = internal.reliability
+    safe_facts = _safe_performance_facts(reliability, pipeline_data_source)
+    if reliability is None or reliability.status == "insufficient":
+        return PerformanceUnavailable(
+            reason_code="insufficient_reliability",
+            safe_facts=safe_facts,
+        )
+
+    manifest = _performance_method_manifest(backtest)
+    if manifest is None:
+        return PerformanceUnavailable(
+            reason_code="incomplete_method_manifest",
+            safe_facts=safe_facts,
+        )
+
+    # Do not serialize engine_summary: it is useful for local audit/persistence but
+    # is not a stable public performance schema and can carry nested raw metrics.
+    public_payload = internal.model_dump(exclude={"engine_summary"}, mode="json")
+    limitations = list(reliability.warnings)
+    if reliability.status == "limited":
+        limitations.insert(0, "Performance evidence is limited; review provenance before relying on values.")
+    return PerformanceAvailable(
+        performance=public_payload,
+        method_manifest=manifest,
+        limitations=limitations,
+    )
+
+
+def _performance_method_manifest(
+    backtest: Mapping[str, Any] | None,
+) -> PerformanceMethodManifest | None:
+    if not isinstance(backtest, Mapping):
+        return None
+    summary = backtest.get("engine_summary")
+    raw = summary.get("performance_method_manifest") if isinstance(summary, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return PerformanceMethodManifest.model_validate(raw)
+    except ValidationError:
+        # Manifest validation is intentionally fail-closed at the public boundary.
+        return None
+
+
+def _safe_performance_facts(
+    reliability: BacktestReliability | None,
+    pipeline_data_source: Mapping[str, Any] | None,
+) -> dict[str, str | int | bool | None]:
+    source = _pipeline_source(pipeline_data_source)
+    if reliability is None:
+        return {"source": source}
+    return {
+        "source": reliability.source,
+        "reliability": reliability.status,
+        "row_count": reliability.row_count,
+        "ticker_count": reliability.ticker_count,
+        "trading_days": reliability.trading_days,
+        "trade_count": reliability.trade_count,
+        "history_start": reliability.history_start,
+        "history_end": reliability.history_end,
+    }
 
 
 def build_public_backtest_performance(
@@ -410,7 +503,7 @@ def _metric_summary(summary: Mapping[str, Any], keys: tuple[str, ...]) -> float 
     return None
 
 
-def _safe_metric(value: float | int | None) -> float | None:
+def _safe_metric(value: float | None) -> float | None:
     if _is_numeric_metric(value):
         return float(value)
     return None

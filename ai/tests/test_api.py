@@ -271,11 +271,11 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert [stage["stage"] for stage in polled_job["stages"]] == MOCK_PROVIDER_STAGES
     assert all(stage["status"] == "succeeded" for stage in polled_job["stages"])
     performance = polled_job["result"]["user_payload"]["performance"]
-    assert performance["selected_candidate_id"]
-    assert "metrics_by_variant" not in performance
-    assert "selected_variant" not in performance
-    assert performance["metrics"]["total_return"] > 0
-    assert performance["equity_curve"][-1]["cumulative_return"] > 0
+    assert performance["availability"] == "unavailable"
+    assert performance["reason_code"] == "insufficient_reliability"
+    assert "performance" not in performance
+    assert "metrics" not in performance
+    assert "equity_curve" not in performance
 
 
 def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> None:
@@ -295,9 +295,10 @@ def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> Non
         "automatic_performance_momentum"
     )
     assert result["rule_provenance"]["substituted"] is False
-    explanation = result["user_payload"]["performance"]["strategy_explanation"]
-    assert explanation["selection_mode"] == "automatic"
-    assert explanation["source_refs"]
+    projection = result["user_payload"]["performance"]
+    assert projection["availability"] == "unavailable"
+    assert projection["reason_code"] == "insufficient_reliability"
+    assert "performance" not in projection
 
 
 def test_analysis_job_api_lists_only_authenticated_users_jobs_newest_first() -> None:
@@ -378,11 +379,11 @@ def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monk
     assert report["web_projection"]
     assert report["email_projection"]
     performance = created_result["user_payload"]["performance"]
-    assert performance["selected_candidate_id"]
-    assert "metrics_by_variant" not in performance
-    assert "selected_variant" not in performance
-    assert performance["metrics"]["total_return"] > 0
-    assert performance["equity_curve"][-1]["cumulative_return"] > 0
+    assert performance["availability"] == "unavailable"
+    assert performance["reason_code"] == "insufficient_reliability"
+    assert "performance" not in performance
+    assert "metrics" not in performance
+    assert "equity_curve" not in performance
 
     poll_response = client.get(f"{ANALYSIS_JOBS_PATH}/{created_job['job_id']}")
     assert poll_response.status_code == 200

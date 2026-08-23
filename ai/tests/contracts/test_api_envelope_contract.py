@@ -85,10 +85,21 @@ def test_analysis_job_and_api_envelope_public_fields_are_frozen() -> None:
     assert all(source["fallback_used"] for source in result["source_usage"])
     assert result["evidence_refs"]
     assert set(user_payload) == USER_PAYLOAD_FIELDS
-    assert user_payload["performance"]["selected_candidate_id"]
-    assert "metrics" in user_payload["performance"]
-    assert "equity_curve" in user_payload["performance"]
-    assert "metrics_by_variant" not in user_payload["performance"]
+    performance = user_payload["performance"]
+    assert performance["availability"] in {"available", "unavailable"}
+    if performance["availability"] == "available":
+        public = performance["performance"]
+        assert public["selected_candidate_id"]
+        assert "metrics" in public
+        assert "equity_curve" in public
+        assert "engine_summary" not in public
+        assert "metrics_by_variant" not in public
+        assert performance["method_manifest"]["evaluated_rule"]
+    else:
+        assert "performance" not in performance
+        assert "metrics" not in performance
+        assert "equity_curve" not in performance
+        assert performance["reason_code"]
     assert set(report) == REPORT_FIELDS
     assert set(report["web_projection"]) == PROJECTION_FIELDS
     assert set(report["email_projection"]) == PROJECTION_FIELDS

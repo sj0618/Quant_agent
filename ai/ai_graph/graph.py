@@ -62,6 +62,7 @@ from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
 from ai_graph.preflight import classify_research_request
+from ai_graph.research_eligibility import PerformanceAvailable
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
@@ -841,7 +842,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             ],
             "candidate_cards": cards,
             "report": report,
-            "performance": build_public_backtest_performance(
+            "performance": project_public_performance(
                 state.get("backtest"),
                 price_rows=state.get("price_rows"),
                 pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
@@ -937,16 +938,14 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
     relaxation = pipeline.get("screening_relaxation") or {}
     availability = data.get("data_availability") or {}
     performance = (
-        build_public_backtest_performance(
+        project_public_performance(
             state.get("backtest"),
             price_rows=state.get("price_rows"),
             pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
         )
         or {}
     )
-    payload = (
-        performance.model_dump() if isinstance(performance, BacktestPerformance) else performance
-    )
+    payload = performance.performance if isinstance(performance, PerformanceAvailable) else None
     metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
 
     try:
@@ -3331,16 +3330,14 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
     relaxation = pipeline.get("screening_relaxation") or {}
     availability = data.get("data_availability") or {}
     performance = (
-        build_public_backtest_performance(
+        project_public_performance(
             state.get("backtest"),
             price_rows=state.get("price_rows"),
             pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
         )
         or {}
     )
-    payload = (
-        performance.model_dump() if isinstance(performance, BacktestPerformance) else performance
-    )
+    payload = performance.performance if isinstance(performance, PerformanceAvailable) else None
     metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
 
     try:
@@ -3554,4 +3551,7 @@ def _sortino_ratio(total_return: float, returns: Sequence[float]) -> float | Non
 
 
 # Public performance helpers are sourced from quant_performance for a stable behavior contract.
-from ai_graph.quant_performance import build_public_backtest_performance  # noqa: E402, F811
+from ai_graph.quant_performance import (  # noqa: E402, F401, F811
+    build_public_backtest_performance,
+    project_public_performance,
+)
