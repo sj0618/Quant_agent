@@ -478,3 +478,151 @@ def test_recommendation_gate_accepts_valid_objective() -> None:
     assert gate is not None
     assert gate.validated is True
     assert "objective gate를 모두 통과" in gate.reason
+
+
+def _automatic_strategy() -> StrategySpec:
+    return make_strategy().model_copy(update={"selection_mode": "automatic"})
+
+
+def _gate_state(
+    metrics: BacktestMetrics,
+    *,
+    strategy: StrategySpec,
+    engine_summary: dict,
+    benchmark_primary: dict | None = None,
+) -> dict:
+    candidate = CodeCandidate(
+        candidate_id="A2",
+        variant="A",
+        code="pass",
+        validation_ok=True,
+        metrics=metrics,
+    )
+    backtest = {
+        "strategy_a": strategy.model_dump(),
+        "candidates": [candidate.model_dump()],
+        "selected_candidate": candidate.model_dump(),
+        "equity_curve": [],
+        "engine_summary": engine_summary,
+    }
+    if benchmark_primary is not None:
+        backtest["backtest_payload"] = {"benchmark": {"primary": benchmark_primary}}
+    return {"backtest": backtest}
+
+
+def _clearing_metrics() -> BacktestMetrics:
+    return BacktestMetrics(
+        sharpe_ratio=1.2,
+        max_drawdown=-0.3,
+        win_rate=0.6,
+        total_return=0.5,
+        in_sample_sharpe=0.6,
+        out_sample_sharpe=0.5,
+        degradation=0.1,
+        selection_adjusted_sharpe=0.6,
+        in_sample_benchmark_return=0.05,
+        out_sample_benchmark_return=0.02,
+        out_sample_excess_return=0.2,
+        benchmark_period_count=12,
+        out_sample_benchmark_period_count=6,
+        out_sample_benchmark_period_loss_rate=0.1,
+    )
+
+
+def test_an_unloaded_official_benchmark_is_not_reported_as_a_performance_shortfall() -> None:
+    gate = _recommendation_gate(
+        _gate_state(
+            _clearing_metrics(),
+            strategy=_automatic_strategy(),
+            engine_summary={"effective_trade_count": 10},
+            benchmark_primary={
+                "available": False,
+                "unavailable_reason": "official KOSPI/KOSDAQ TR rows are not loaded",
+            },
+        )
+    )
+
+    assert gate is not None
+    assert gate.verification_complete is False
+    assert gate.unmet_objective_criteria == []
+    assert len(gate.unmet_data_requirements) == 1
+    assert "적재되지 않아" in gate.unmet_data_requirements[0]
+    assert "official KOSPI/KOSDAQ TR rows are not loaded" in gate.unmet_data_requirements[0]
+    assert "미달" not in gate.reason
+
+
+def test_a_loaded_official_benchmark_leaves_the_gate_complete() -> None:
+    gate = _recommendation_gate(
+        _gate_state(
+            _clearing_metrics(),
+            strategy=_automatic_strategy(),
+            engine_summary={"effective_trade_count": 10},
+            benchmark_primary={"available": True, "return": 0.1},
+        )
+    )
+
+    assert gate is not None
+    assert gate.validated is True
+    assert gate.verification_complete is True
+    assert gate.unmet_data_requirements == []
+    assert "objective gate를 모두 통과" in gate.reason
+
+
+def test_a_measured_shortfall_and_a_missing_input_are_reported_separately() -> None:
+    metrics = _clearing_metrics().model_copy(update={"out_sample_sharpe": None})
+    gate = _recommendation_gate(
+        _gate_state(
+            metrics,
+            strategy=make_strategy(),
+            engine_summary={"effective_trade_count": 3},
+        )
+    )
+
+    assert gate is not None
+    assert gate.validated is False
+    assert gate.verification_complete is False
+    assert any("거래 횟수" in item for item in gate.unmet_objective_criteria)
+    assert any("계산할 수 없음" in item for item in gate.unmet_data_requirements)
+    assert "그리고 아직 검증하지 못한 항목" in gate.reason
+
+
+def test_a_gate_blocked_only_on_missing_inputs_never_says_the_strategy_underperformed() -> None:
+    metrics = _clearing_metrics().model_copy(update={"out_sample_sharpe": None})
+    gate = _recommendation_gate(
+        _gate_state(
+            metrics,
+            strategy=make_strategy(),
+            engine_summary={"effective_trade_count": 10},
+        )
+    )
+
+    assert gate is not None
+    assert gate.validated is False
+    assert gate.unmet_objective_criteria == []
+    assert "성과가 기준에 미달한 것이 아니라" in gate.reason
+
+
+def test_the_universe_split_is_disclosed_on_the_ready_message() -> None:
+    from ai_graph.graph import _ready_message
+
+    message = _ready_message(
+        {
+            "data": {
+                "pipeline_data_source": {
+                    "backtest_universe": {"excluded_screening_candidate_count": 3}
+                }
+            }
+        },
+        validated=True,
+    )
+
+    assert "과거 시점(PIT)" in message
+    assert "3종목" in message
+
+
+def test_a_run_without_a_point_in_time_universe_claims_no_split() -> None:
+    from ai_graph.graph import _ready_message
+
+    message = _ready_message({"data": {"pipeline_data_source": {"source": "fixture"}}}, validated=True)
+
+    assert "과거 시점(PIT)" not in message

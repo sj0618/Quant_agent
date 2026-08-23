@@ -12,6 +12,9 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
 from ai_graph.nodes.condition_compiler import (
+    LEVEL_METRICS,
+    MARGIN_EPSILON,
+    MARGIN_SIGN,
     boolean_comparison,
     boolean_window_rule,
     canonical_metric,
@@ -61,6 +64,41 @@ class FeaturePreparationStats:
     ticker_count: int
     cached_lookbacks: tuple[int, ...]
     estimated_bytes: int
+
+
+@dataclass(frozen=True)
+class RankedActions:
+    """Per-row decisions plus the entry strength that produced each BUY.
+
+    `scores` is direction-normalized so higher always means a stronger entry, and is
+    NaN on every row that is not a BUY. The engine reuses it to decide who gets a
+    scarce slot when more entries survive to the fill open than the cap allows.
+    """
+
+    actions: array
+    scores: array
+
+
+def slot_priority(score: float, ticker: str) -> tuple[float, str]:
+    """One ordering for scarce slots, shared by every path: score first, ticker last.
+
+    The ticker code is a tie-break only. Sorting by it first hands every slot to the
+    lowest codes in the universe, which is a bias on listing order, not on the signal.
+    """
+
+    return (-score if isfinite(score) else 0.0, ticker)
+
+
+def _fallback_rank_metric(
+    rank_conditions: Sequence[Condition],
+) -> tuple[str, float] | None:
+    """The first cross-sectional cut, read as a ranking: metric name and sign."""
+
+    if not rank_conditions:
+        return None
+    condition = rank_conditions[0]
+    top = condition.operator in {ConditionOperator.GT, ConditionOperator.GTE}
+    return (condition.left, 1.0 if top else -1.0)
 
 
 class PreparedFeatureStore:
@@ -173,9 +211,19 @@ class PreparedFeatureStore:
         strategy_ir: StrategyIR,
         parameters: CandidateParameters,
     ) -> array:
+        return self.build_ranked_actions(strategy_ir, parameters).actions
+
+    def build_ranked_actions(
+        self,
+        strategy_ir: StrategyIR,
+        parameters: CandidateParameters,
+    ) -> RankedActions:
         if parameters.profile == "compiled_conditions":
             return self._compiled_actions(strategy_ir, parameters)
         return self._profile_actions(parameters)
+
+    def _empty_scores(self) -> array:
+        return array("d", [float("nan")]) * len(self.rows)
 
     def features(self, lookback: int) -> np.ndarray:
         cached = self._lookback_cache.get(lookback)
@@ -317,11 +365,12 @@ class PreparedFeatureStore:
         self._lookback_cache[lookback] = matrix
         return matrix
 
-    def _profile_actions(self, parameters: CandidateParameters) -> array:
+    def _profile_actions(self, parameters: CandidateParameters) -> RankedActions:
         features = self.features(parameters.lookback)
         if parameters.profile in AUTOMATIC_TOURNAMENT_PROFILES:
             return self._rotation_profile_actions(parameters, features)
         actions = array("b", [0]) * len(self.rows)
+        scores = self._empty_scores()
         states: dict[str, list[float | bool | int]] = {}
         profile = parameters.profile
         threshold = parameters.threshold
@@ -527,25 +576,26 @@ class PreparedFeatureStore:
             open_positions = sum(1 for state in states.values() if bool(state[0]))
             open_slots = max(0, parameters.max_positions - open_positions)
             ranked = [item for item in evaluations if item[3] and not bool(item[6][0])]
-            ranked.sort(key=lambda item: (item[5], item[1]), reverse=True)
+            ranked.sort(key=lambda item: slot_priority(item[5], item[1]))
             selected = {item[1] for item in ranked[:open_slots]}
-            for index, ticker, close, _, sell, _, state in evaluations:
+            for index, ticker, close, _, sell, score, state in evaluations:
                 if sell and bool(state[0]):
                     actions[index] = -1
                     state[:] = [False, 0.0, 0, 0.0]
                 elif ticker in selected:
                     actions[index] = 1
+                    scores[index] = score
                     state[:] = [True, close, 0, close]
                 elif bool(state[0]):
                     state[2] = int(state[2]) + 1
                     state[3] = max(float(state[3]), close)
-        return actions
+        return RankedActions(actions=actions, scores=scores)
 
     def _rotation_profile_actions(
         self,
         parameters: CandidateParameters,
         features: np.ndarray,
-    ) -> array:
+    ) -> RankedActions:
         """Monthly cross-sectional momentum rotation with past-only features.
 
         The previous automatic profiles treated each stock independently and took
@@ -556,6 +606,7 @@ class PreparedFeatureStore:
         """
 
         actions = array("b", [0]) * len(self.rows)
+        scores = self._empty_scores()
         states: dict[str, list[float | bool | int]] = {}
         profile = parameters.profile
         threshold = parameters.threshold
@@ -592,6 +643,7 @@ class PreparedFeatureStore:
                 )
 
             target: set[str] = set()
+            target_scores: dict[str, float] = {}
             if rotation_day and observations:
                 momentum_ranks = _percentile_ranks(
                     [(ticker, momentum) for _, ticker, _, momentum, _, _, _ in observations]
@@ -648,8 +700,10 @@ class PreparedFeatureStore:
                         )
                     if eligible:
                         ranked.append((score, ticker))
-                ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-                target = {ticker for _, ticker in ranked[: parameters.max_positions]}
+                ranked.sort(key=lambda item: slot_priority(item[0], item[1]))
+                selected = ranked[: parameters.max_positions]
+                target = {ticker for _, ticker in selected}
+                target_scores = {ticker: score for score, ticker in selected}
 
             for index in range(start, end):
                 ticker = self.tickers[index]
@@ -677,16 +731,18 @@ class PreparedFeatureStore:
                     state[:] = [False, 0.0, 0, 0.0]
                 elif rotation_day and ticker in target and not in_position:
                     actions[index] = 1
+                    scores[index] = target_scores[ticker]
                     state[:] = [True, close, 0, close]
 
-        return actions
+        return RankedActions(actions=actions, scores=scores)
 
     def _compiled_actions(
         self,
         strategy_ir: StrategyIR,
         parameters: CandidateParameters,
-    ) -> array:
+    ) -> RankedActions:
         actions = array("b", [0]) * len(self.rows)
+        scores = self._empty_scores()
         # in_position, entry_price, highest_close_since_entry
         states: dict[str, list[float | bool]] = {}
         entry_conditions = [
@@ -698,6 +754,8 @@ class PreparedFeatureStore:
         exit_conditions = [
             item for item in strategy_ir.exit_conditions if item.universe_rank_pct is None
         ]
+        direction = -1.0 if strategy_ir.ranking_direction == "asc" else 1.0
+        fallback_rank = _fallback_rank_metric(rank_conditions)
         for date_number, (start, end) in enumerate(self.date_ranges):
             eligible: list[tuple[int, str, float, float]] = []
             exits: list[tuple[int, str]] = []
@@ -719,7 +777,11 @@ class PreparedFeatureStore:
                         if measured is None:
                             matches_entry = False
                         else:
-                            score = measured
+                            score = direction * measured
+                    else:
+                        score = self._default_entry_score(
+                            index, fallback_rank, entry_conditions
+                        )
                     if matches_entry:
                         eligible.append((index, ticker, close, score))
                 if in_position:
@@ -758,11 +820,7 @@ class PreparedFeatureStore:
                 kept = {ticker for ticker, _ in scored[:cutoff]}
                 eligible = [entry for entry in eligible if entry[1] in kept]
 
-            if strategy_ir.ranking_metric:
-                eligible.sort(
-                    key=lambda item: (item[3], item[1]),
-                    reverse=strategy_ir.ranking_direction == "desc",
-                )
+            eligible.sort(key=lambda item: slot_priority(item[3], item[1]))
             rotation_day = (
                 strategy_ir.execution_mode == "scheduled_rotation"
                 and date_number % parameters.rebalance_interval_days == 0
@@ -791,15 +849,16 @@ class PreparedFeatureStore:
             )
             if strategy_ir.execution_mode == "scheduled_rotation" and not rotation_day:
                 entries = []
-            for index, ticker, close, _ in entries:
+            for index, ticker, close, score in entries:
                 if held >= parameters.max_positions:
                     break
                 if ticker in exited or bool(states[ticker][0]):
                     continue
                 actions[index] = 1
+                scores[index] = score
                 states[ticker] = [True, close, close]
                 held += 1
-        return actions
+        return RankedActions(actions=actions, scores=scores)
 
     def _condition_matches(self, condition: Condition, index: int) -> bool:
         if condition.consecutive is not None:
@@ -825,16 +884,63 @@ class PreparedFeatureStore:
             return bool(cached[index])
         return self._base_condition_matches(condition, index)
 
-    def _base_condition_matches(self, condition: Condition, index: int) -> bool:
-        # Flags and ratios are conditions in disguise. The compiler rewrites them when
-        # it emits Python; this evaluator - the one that actually runs - has to make the
-        # same rewrite, or a rule that "compiled" would silently match nothing here.
-        flag = boolean_comparison(condition.left)
-        if flag is not None:
-            return self._boolean_comparison_matches(condition, flag, index)
-        window_rule = boolean_window_rule(condition.left)
-        if window_rule is not None:
-            return self._boolean_window_matches(condition, window_rule, index)
+    def _default_entry_score(
+        self,
+        index: int,
+        fallback_rank: tuple[str, float] | None,
+        entry_conditions: Sequence[Condition],
+    ) -> float:
+        """Entry strength for a rule that names no ranking metric of its own.
+
+        A cross-sectional cut in the rule already states what "better" means on this
+        universe, so it wins. Otherwise the rule's own thresholds are the only stated
+        measure of strength, and the score is how far inside its entry region the name
+        sits, measured on the tightest condition and normalized by the threshold so
+        conditions on different scales stay comparable. Neither is a substitute for a
+        ranking metric the strategy declares - both only replace the ticker code.
+        """
+
+        if fallback_rank is not None:
+            metric, sign = fallback_rank
+            value = self._current_metric(metric, index)
+            if value is not None:
+                return sign * value
+        margins = [
+            margin
+            for condition in entry_conditions
+            if (margin := self._condition_margin(condition, index)) is not None
+        ]
+        return min(margins) if margins else 0.0
+
+    def _condition_margin(self, condition: Condition, index: int) -> float | None:
+        """Signed distance past the threshold, or None when the test has no distance.
+
+        Flags, streaks, band and equality tests are satisfied or not; there is no
+        "more satisfied", so they contribute nothing rather than a fabricated number.
+        Positive means the condition holds with room to spare.
+        """
+
+        sign = MARGIN_SIGN.get(condition.operator)
+        if sign is None:
+            return None
+        if boolean_comparison(condition.left) is not None:
+            return None
+        if boolean_window_rule(condition.left) is not None:
+            return None
+        if (
+            not isinstance(condition.right, str)
+            and canonical_metric(condition.left) in LEVEL_METRICS
+        ):
+            return None
+        left, right = self._comparison_operands(condition, index)
+        if left is None or right is None:
+            return None
+        margin = sign * (left - right) / max(abs(right), MARGIN_EPSILON)
+        return margin if isfinite(margin) else None
+
+    def _comparison_operands(
+        self, condition: Condition, index: int
+    ) -> tuple[float | None, float | None]:
         if isinstance(condition.right, str):
             left = self._current_metric(condition.left, index)
             right = self._condition_series_value(
@@ -855,6 +961,21 @@ class PreparedFeatureStore:
                 if isinstance(condition.right, (int, float))
                 else None
             )
+        if right is not None and condition.scale is not None:
+            right *= condition.scale
+        return left, right
+
+    def _base_condition_matches(self, condition: Condition, index: int) -> bool:
+        # Flags and ratios are conditions in disguise. The compiler rewrites them when
+        # it emits Python; this evaluator - the one that actually runs - has to make the
+        # same rewrite, or a rule that "compiled" would silently match nothing here.
+        flag = boolean_comparison(condition.left)
+        if flag is not None:
+            return self._boolean_comparison_matches(condition, flag, index)
+        window_rule = boolean_window_rule(condition.left)
+        if window_rule is not None:
+            return self._boolean_window_matches(condition, window_rule, index)
+        left, right = self._comparison_operands(condition, index)
         if left is None:
             return False
         operator = condition.operator
@@ -868,8 +989,6 @@ class PreparedFeatureStore:
             return low <= left <= high
         if right is None:
             return False
-        if condition.scale is not None:
-            right *= condition.scale
         if operator in {
             ConditionOperator.CROSS_ABOVE,
             ConditionOperator.CROSS_BELOW,

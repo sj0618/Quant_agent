@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -81,6 +82,17 @@ SYMBOL_LISTING_HISTORY_TABLE = "core.symbol_listing_history"
 SYMBOL_MASTER_TABLE = "core.symbol_master"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
+# Official KRX total-return index levels and the published KOSPI/KOSDAQ split, the two
+# inputs the backtest's primary benchmark is defined on. See
+# ai/docs/official-krx-tr-benchmark-contract.md and
+# DE/migrations/013_krx_official_benchmark_tr.sql. Neither is required to exist: absence
+# is reported as an unavailable primary benchmark, never raised.
+OFFICIAL_BENCHMARK_TR_VIEW = "mart.krx_index_total_return_daily"
+OFFICIAL_BENCHMARK_WEIGHT_VIEW = "mart.krx_benchmark_monthly_weights"
+# KRX publishes the total-return variants under their own index codes; the price-return
+# indices are deliberately not accepted here because a dividend-stripped index would
+# understate the benchmark the strategy has to beat.
+OFFICIAL_BENCHMARK_INDEX_CODES = {"kospi_tr": "KOSPI_TR", "kosdaq_tr": "KOSDAQ_TR"}
 # BOK ECOS daily 원/달러 rate. The only macro series the risk rules can be fed from
 # directly; there is no equity index and no volatility index in this warehouse.
 USD_KRW_SERIES_ID = "731Y003:0000003"
@@ -197,6 +209,10 @@ class PipelineDataBundle(BaseModel):
     # Carries the measured values plus the label saying what the equity leg was
     # measured against, so a report can never call a universe proxy "the KOSPI".
     macro_snapshot: dict[str, Any] | None = None
+    # Official KOSPI/KOSDAQ TR levels plus the monthly index split, carried as their own
+    # field rather than inside `metadata` because the series is one value per session per
+    # index and `metadata` is republished verbatim in the response envelope.
+    official_benchmark: dict[str, Any] | None = None
     data_availability: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -343,9 +359,17 @@ class PostgresPipelineDataSource:
             pit_members_without_price_rows = sorted(
                 set(tickers) - {str(row.get("ticker") or "").zfill(6) for row in price_rows}
             )
-            l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
+            # Analyst evidence has to be about the name the report is about. `ticker` is
+            # the traded PIT member, which in screening mode is the universe's lowest
+            # symbol code and is unrelated to what the reader is shown; the recommended
+            # name is what the report discusses. Outside screening mode the two are the
+            # same name anyway.
+            recommendation_ticker = recommended[0] if recommended else None
+            l4_evidence_ticker = recommendation_ticker or ticker
+            l4_evidence = self._fetch_l4_evidence(conn, l4_evidence_ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
+            official_benchmark = self._fetch_official_benchmark(conn, backtest_window)
             # Capabilities were probed up front; nothing since then can change them.
 
         source_manifest = build_source_manifest(
@@ -357,6 +381,13 @@ class PostgresPipelineDataSource:
                 PIT_UNIVERSE_VIEW,
                 SYMBOL_LISTING_HISTORY_TABLE,
                 *[INDICATOR_TABLES[family] for family in indicator_families],
+                # Listed only when they actually served this load, so the manifest does
+                # not claim provenance for a benchmark that was never computed.
+                *(
+                    [OFFICIAL_BENCHMARK_TR_VIEW, OFFICIAL_BENCHMARK_WEIGHT_VIEW]
+                    if official_benchmark.get("available")
+                    else []
+                ),
             ],
             source_version=BACKTEST_WINDOW_POLICY_ID,
         )
@@ -365,6 +396,7 @@ class PostgresPipelineDataSource:
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
             macro_snapshot=macro_snapshot,
+            official_benchmark=official_benchmark,
             data_availability=_data_availability_for_query(
                 query, source="postgres", available=capability_availability
             ),
@@ -375,7 +407,7 @@ class PostgresPipelineDataSource:
                 "ticker": ticker,
                 "tickers": tickers,
                 "recommended_tickers": recommended,
-                "recommendation_ticker": recommended[0] if recommended else None,
+                "recommendation_ticker": recommendation_ticker,
                 "backtest_universe": universe_descriptor,
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
@@ -406,7 +438,9 @@ class PostgresPipelineDataSource:
                 "raw_price_capabilities": raw_price_capabilities,
                 "dart_date_only_effective_policy": "next_krx_session_v1",
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
+                "l4_evidence_ticker": l4_evidence_ticker,
                 "l4_evidence_rows": len(l4_evidence),
+                "official_benchmark": _official_benchmark_status(official_benchmark),
                 "universe_source": universe_descriptor["source"],
                 "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
@@ -1155,6 +1189,131 @@ class PostgresPipelineDataSource:
                 "loaded universe mean daily return (no index series in the warehouse)"
             )
         return snapshot or None
+
+    def _fetch_official_benchmark(
+        self, conn: Any, window: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Official KRX TR levels and the monthly KOSPI/KOSDAQ split for the window.
+
+        Contract: ai/docs/official-krx-tr-benchmark-contract.md. A warehouse that has
+        not loaded these tables is a normal state, not an error, so every failure path
+        returns `available=False` with the sentence the report has to print. Raising here
+        would take down loads whose strategy never needed the primary benchmark.
+
+        Monthly weights are read from one month before the window: the backtest rebalances
+        each month on the previous month's published split, so the first traded month
+        needs the row that precedes it.
+        """
+
+        descriptor: dict[str, Any] = {
+            "available": False,
+            "unavailable_reason": None,
+            "level_source": OFFICIAL_BENCHMARK_TR_VIEW,
+            "weight_source": OFFICIAL_BENCHMARK_WEIGHT_VIEW,
+            "index_codes": dict(OFFICIAL_BENCHMARK_INDEX_CODES),
+            "window_start": window["start"].isoformat(),
+            "window_end": window["end"].isoformat(),
+            "weight_lag_months": 1,
+            "kospi_tr": {},
+            "kosdaq_tr": {},
+            "monthly_weights": {},
+        }
+        try:
+            level_rows = conn.execute(
+                f"""
+                SELECT index_code, trade_date, tr_value
+                FROM {OFFICIAL_BENCHMARK_TR_VIEW}
+                WHERE index_code = ANY(%s)
+                  AND trade_date BETWEEN %s::date AND %s::date
+                ORDER BY trade_date
+                """,
+                [
+                    [
+                        OFFICIAL_BENCHMARK_INDEX_CODES["kospi_tr"],
+                        OFFICIAL_BENCHMARK_INDEX_CODES["kosdaq_tr"],
+                    ],
+                    window["start"],
+                    window["end"],
+                ],
+            ).fetchall()
+        except Exception as error:
+            # A failed statement leaves the shared transaction in INERROR and discards
+            # the transaction-local statement_timeout, exactly like an indicator family
+            # that could not be loaded.
+            self._rollback_quietly(conn)
+            self._set_statement_timeout(conn)
+            descriptor["unavailable_reason"] = (
+                f"{OFFICIAL_BENCHMARK_TR_VIEW} could not be read ({_short_error_reason(error)})"
+            )
+            return descriptor
+
+        levels: dict[str, dict[str, float]] = {"kospi_tr": {}, "kosdaq_tr": {}}
+        code_to_key = {code: key for key, code in OFFICIAL_BENCHMARK_INDEX_CODES.items()}
+        for row in level_rows or ():
+            key = code_to_key.get(str(row.get("index_code") or ""))
+            trade_date = _optional_date_value(row.get("trade_date"))
+            value = _finite_float_value(row.get("tr_value"))
+            # A non-positive level cannot be a total-return index; dropping it costs the
+            # session its coverage instead of producing a negative benchmark unit.
+            if key is None or trade_date is None or value is None or value <= 0.0:
+                continue
+            levels[key][trade_date.isoformat()] = value
+        missing_series = [
+            OFFICIAL_BENCHMARK_INDEX_CODES[key] for key in ("kospi_tr", "kosdaq_tr")
+            if not levels[key]
+        ]
+        if missing_series:
+            descriptor["unavailable_reason"] = (
+                f"{OFFICIAL_BENCHMARK_TR_VIEW} has no usable rows for "
+                f"{', '.join(missing_series)} between {descriptor['window_start']} and "
+                f"{descriptor['window_end']}"
+            )
+            return descriptor
+
+        try:
+            weight_rows = conn.execute(
+                f"""
+                SELECT month, kospi_weight, kosdaq_weight
+                FROM {OFFICIAL_BENCHMARK_WEIGHT_VIEW}
+                WHERE month >= (date_trunc('month', %s::date) - INTERVAL '1 month')::date
+                  AND month <= date_trunc('month', %s::date)::date
+                ORDER BY month
+                """,
+                [window["start"], window["end"]],
+            ).fetchall()
+        except Exception as error:
+            self._rollback_quietly(conn)
+            self._set_statement_timeout(conn)
+            descriptor["unavailable_reason"] = (
+                f"{OFFICIAL_BENCHMARK_WEIGHT_VIEW} could not be read "
+                f"({_short_error_reason(error)})"
+            )
+            return descriptor
+
+        monthly_weights: dict[str, list[float]] = {}
+        for row in weight_rows or ():
+            month = _optional_date_value(row.get("month"))
+            kospi_weight = _finite_float_value(row.get("kospi_weight"))
+            kosdaq_weight = _finite_float_value(row.get("kosdaq_weight"))
+            if month is None or kospi_weight is None or kosdaq_weight is None:
+                continue
+            monthly_weights[month.isoformat()[:7]] = [kospi_weight, kosdaq_weight]
+        if not monthly_weights:
+            descriptor["unavailable_reason"] = (
+                f"{OFFICIAL_BENCHMARK_WEIGHT_VIEW} has no monthly weights covering "
+                f"{descriptor['window_start']}..{descriptor['window_end']}"
+            )
+            return descriptor
+
+        descriptor.update(
+            {
+                "available": True,
+                "kospi_tr": levels["kospi_tr"],
+                "kosdaq_tr": levels["kosdaq_tr"],
+                "monthly_weights": monthly_weights,
+            }
+        )
+        return descriptor
 
     def _fetch_macro_status(self, conn: Any) -> dict[str, Any]:
         row = conn.execute(
@@ -2636,6 +2795,50 @@ def _date_value(value: Any) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def _optional_date_value(value: Any) -> date | None:
+    """`_date_value` for columns a malformed row may leave unparseable."""
+    if value is None:
+        return None
+    try:
+        return _date_value(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _finite_float_value(value: Any) -> float | None:
+    parsed = _optional_float_value(value)
+    if parsed is None or not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _short_error_reason(error: BaseException) -> str:
+    """A one-line, length-capped rendering of a driver error for a user-facing reason."""
+    text = " ".join(str(error).split())
+    return f"{type(error).__name__}: {text[:200]}" if text else type(error).__name__
+
+
+def _official_benchmark_status(descriptor: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The counts and provenance of the benchmark load, without the series itself.
+
+    `metadata` is republished verbatim in the response envelope, so the per-session
+    levels stay on the bundle's own field and only their shape is summarised here.
+    """
+    if not isinstance(descriptor, Mapping):
+        return {"available": False, "unavailable_reason": "benchmark load was not attempted"}
+    return {
+        "available": bool(descriptor.get("available")),
+        "unavailable_reason": descriptor.get("unavailable_reason"),
+        "level_source": descriptor.get("level_source"),
+        "weight_source": descriptor.get("weight_source"),
+        "index_codes": descriptor.get("index_codes"),
+        "weight_lag_months": descriptor.get("weight_lag_months"),
+        "kospi_tr_sessions": len(descriptor.get("kospi_tr") or {}),
+        "kosdaq_tr_sessions": len(descriptor.get("kosdaq_tr") or {}),
+        "monthly_weight_months": len(descriptor.get("monthly_weights") or {}),
+    }
 
 
 def _datetime_value(value: Any) -> datetime | None:

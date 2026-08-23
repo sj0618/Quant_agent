@@ -595,3 +595,81 @@ def test_primary_benchmark_is_explicitly_unavailable_without_official_tr_inputs(
     assert provenance["primary"]["return"] is None
     assert provenance["primary"]["unavailable_reason"]
     assert provenance["auxiliary"]["label"] == backtest_node.AUXILIARY_BENCHMARK_LABEL
+
+
+def slot_contention_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "date": row_date,
+            "ticker": ticker,
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1_000_000,
+            "raw_notional": 100.0 * 1_000_000,
+            "rsi": 20 if row_date == "2026-01-02" else 50,
+        }
+        for row_date in ("2026-01-02", "2026-01-05")
+        for ticker in ("000010", "000990")
+    ]
+
+
+def slot_contention_candidate(scored: bool) -> CodeCandidate:
+    score = '"score": 2.0 if row["ticker"] == "000990" else 1.0,' if scored else ""
+    return CodeCandidate(
+        candidate_id="slot-contention-a",
+        variant="A",
+        code=f"""def build_signals(prices):
+    return [
+        {{
+            "date": row["date"],
+            "ticker": row["ticker"],
+            "action": "BUY" if row["date"] == "2026-01-02" else "HOLD",
+            "price": float(row["close"]),
+            {score}
+        }}
+        for row in prices
+    ]
+""",
+        validation_ok=True,
+    )
+
+
+def executed_buy_tickers(result) -> list[str]:
+    return [
+        event["ticker"]
+        for event in result.engine_summary["execution_audit"]["recent_events"]
+        if event["status"] == "executed" and event["side"] == "buy"
+    ]
+
+
+def test_single_slot_goes_to_the_highest_scoring_generated_signal() -> None:
+    strategy = make_strategy("slot-contention", "Slot Contention")
+    strategy = strategy.model_copy(
+        update={"risk_constraints": {"max_position_pct": 1.0, "stop_loss_pct": 0.5}}
+    )
+
+    result = run_candidate_backtest(
+        strategy,
+        [slot_contention_candidate(scored=True)],
+        price_rows=slot_contention_rows(),
+    )
+
+    assert result.engine_summary["ai_backtest_context"]["applied_max_positions"] == 1
+    assert executed_buy_tickers(result) == ["000990"]
+
+
+def test_single_slot_falls_back_to_ticker_order_when_code_reports_no_score() -> None:
+    strategy = make_strategy("slot-contention-unscored", "Slot Contention Unscored")
+    strategy = strategy.model_copy(
+        update={"risk_constraints": {"max_position_pct": 1.0, "stop_loss_pct": 0.5}}
+    )
+
+    result = run_candidate_backtest(
+        strategy,
+        [slot_contention_candidate(scored=False)],
+        price_rows=slot_contention_rows(),
+    )
+
+    assert executed_buy_tickers(result) == ["000010"]

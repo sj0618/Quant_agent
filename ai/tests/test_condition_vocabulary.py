@@ -14,9 +14,14 @@ import pytest
 
 from ai_graph.graph import _strategy_profile_base
 from ai_graph.llm.role_calls import STRATEGY_CONDITIONS_SYSTEM_PROMPT
+from ai_graph.nodes.backtest_code import _render_condition_signal_code
 from ai_graph.nodes.backtest_features import PreparedFeatureStore
-from ai_graph.nodes.condition_compiler import compile_conditions, supported_metrics
-from ai_graph.schemas import CandidateParameters, Condition, StrategyIR
+from ai_graph.nodes.condition_compiler import (
+    compile_conditions,
+    compile_score_expression,
+    supported_metrics,
+)
+from ai_graph.schemas import CandidateParameters, Condition, StrategyIR, StrategySpec
 
 
 def _bars(count: int = 40, **overrides):
@@ -160,3 +165,94 @@ def test_compiled_actions_is_an_array_of_decisions_not_an_exception() -> None:
 
     assert isinstance(actions, array)
     assert 1 not in actions
+
+
+def _contention_rows() -> list[dict[str, object]]:
+    """Three names clear the same rule on the same session, with different room."""
+
+    return [
+        {
+            "date": f"2026-01-{day:02d}",
+            "ticker": ticker,
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1_000_000.0,
+            "rsi": rsi,
+        }
+        for day in (1, 2)
+        for ticker, rsi in (("000010", 39.0), ("000500", 25.0), ("000990", 10.0))
+    ]
+
+
+def _evaluator_entry(conditions, rows) -> str:
+    store = PreparedFeatureStore(rows)
+    ranked = store.build_ranked_actions(
+        StrategyIR(
+            strategy_id="contention",
+            entry_feature="rsi",
+            exit_feature="rsi",
+            proxy_feature="rsi",
+            entry_conditions=conditions,
+            exit_conditions=[Condition(left="rsi", operator="gte", right=95)],
+        ),
+        CandidateParameters(
+            profile="compiled_conditions",
+            lookback=3,
+            threshold=0.0,
+            stop_loss_pct=0.5,
+            take_profit_pct=5.0,
+            max_positions=1,
+        ),
+    )
+    return next(
+        store.tickers[index]
+        for index, action in enumerate(ranked.actions)
+        if action == 1
+    )
+
+
+def _generated_code_entry(conditions, rows) -> str:
+    strategy = StrategySpec(
+        strategy_id="contention",
+        name="Contention",
+        market="KRX",
+        timeframe="daily",
+        entry_conditions=conditions,
+        exit_conditions=[Condition(left="rsi", operator="gte", right=95)],
+        indicators=["rsi"],
+        risk_constraints={"max_position_pct": 1.0},
+        confidence=0.9,
+    )
+    code = _render_condition_signal_code(
+        strategy, compile_conditions(conditions), max_positions=1
+    )
+    namespace: dict[str, object] = {}
+    exec(code, {"__builtins__": __builtins__}, namespace)  # noqa: S102 - fixture only
+    return next(
+        signal["ticker"]
+        for signal in namespace["build_signals"](rows)
+        if signal["action"] == "BUY"
+    )
+
+
+def test_generated_code_and_evaluator_agree_on_which_entry_deserves_the_slot() -> None:
+    """One scarce slot, one answer. The two readings of a rule must not disagree."""
+
+    conditions = [Condition(left="rsi", operator="lte", right=40)]
+    rows = _contention_rows()
+
+    assert _evaluator_entry(conditions, rows) == "000990"
+    assert _generated_code_entry(conditions, rows) == "000990"
+
+
+def test_generated_code_and_evaluator_agree_to_fall_back_on_the_ticker_code() -> None:
+    """A price level is not a strength, so both readings tie and sort by ticker."""
+
+    conditions = [Condition(left="close", operator="gt", right=1)]
+    rows = _contention_rows()
+
+    assert compile_score_expression(conditions) is None
+    assert _evaluator_entry(conditions, rows) == "000010"
+    assert _generated_code_entry(conditions, rows) == "000010"

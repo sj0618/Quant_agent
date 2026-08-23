@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 from ai_graph.nodes.backtest import (
+    BACKTEST_SPLIT_FRACTION,
     INSUFFICIENT_WALK_FORWARD_SAMPLE,
     BENCHMARK_LABEL,
     BENCHMARK_METHOD,
@@ -20,8 +21,10 @@ from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_strategy import build_strategy_explanation
 from ai_graph.schemas import (
     BacktestBenchmark,
+    BacktestEvaluationBasis,
     BacktestPerformance,
     BacktestReliability,
+    BacktestUniversePolicy,
     CandidateBacktestResult,
     PublicMetricDetail,
 )
@@ -52,6 +55,13 @@ _RELIABILITY_MIN_DAYS = 252
 
 _UNAVAILABLE_METRIC_REASON = "신뢰도 부족으로 공개 지표를 계산할 수 없습니다."
 _BENCHMARK_UNAVAILABLE_REASON = "신뢰도 부족으로 벤치마크를 표시하지 않습니다."
+
+_COST_MODEL_RATE_KEYS = ("commission_pct", "tax_pct", "slippage_pct")
+_UNIVERSE_SPLIT_SUMMARY = (
+    "백테스트는 과거 시점(PIT) 기준으로 그 시점에 상장돼 있던 종목만 거래해 규칙 자체를 "
+    "검증하고, 오늘의 추천 종목은 같은 규칙을 오늘 데이터에 적용한 결과입니다. "
+    "두 목록이 서로 다른 것은 정상입니다."
+)
 
 
 def build_public_backtest_performance(
@@ -104,7 +114,133 @@ def build_public_backtest_performance(
             selected_parameters=selected_parameters,
             generated_strategies=result.generated_strategy_blueprints,
         ),
+        evaluation_basis=_build_evaluation_basis(
+            result, pipeline_data_source=pipeline_data_source
+        ),
+        universe_policy=_build_universe_policy(
+            result, pipeline_data_source=pipeline_data_source
+        ),
     )
+
+
+def _build_evaluation_basis(
+    result: CandidateBacktestResult,
+    *,
+    pipeline_data_source: Mapping[str, Any] | None,
+) -> BacktestEvaluationBasis:
+    """State which period the public numbers cover, taken from the run that produced them."""
+
+    payload = result.backtest_payload if isinstance(result.backtest_payload, Mapping) else {}
+    metadata = pipeline_data_source if isinstance(pipeline_data_source, Mapping) else {}
+    walk_forward = result.walk_forward
+    rolling = walk_forward is not None and walk_forward.status == "ready"
+
+    # The traded rows say what was actually measured; the loader's policy window is the
+    # fallback for results that carry no row dates.
+    window_start = _text(payload.get("first_date")) or _text(metadata.get("backtest_start_session"))
+    window_end = _text(payload.get("last_date")) or _text(metadata.get("backtest_end_session"))
+    window = f"{window_start}~{window_end} 구간" if window_start and window_end else ""
+    costs_applied = _cost_model_applied(result)
+
+    if rolling and walk_forward is not None:
+        fold_count = len(walk_forward.fold_selections)
+        session_count = walk_forward.unique_evaluation_session_count
+        rolled = f"{window}을 " if window else ""
+        caption = (
+            f"{rolled}폴드 {fold_count}개로 다시 선택하며 평가한 "
+            f"검증 세션 {session_count}거래일 누적"
+        )
+        return BacktestEvaluationBasis(
+            basis="walk_forward_policy",
+            caption=_with_cost_clause(caption, costs_applied),
+            window_start=window_start,
+            window_end=window_end,
+            window_policy_id=_text(metadata.get("backtest_window_policy_id")),
+            evaluation_session_count=session_count,
+            fold_count=fold_count,
+            cost_model_applied=costs_applied,
+        )
+
+    hold_out_fraction = round(1.0 - BACKTEST_SPLIT_FRACTION, 4)
+    percent = f"{hold_out_fraction * 100:g}"
+    caption = f"{window or '전체 백테스트 구간'} 중 마지막 {percent}% 검증 구간 누적"
+    return BacktestEvaluationBasis(
+        basis="hold_out",
+        caption=_with_cost_clause(caption, costs_applied),
+        hold_out_fraction=hold_out_fraction,
+        window_start=window_start,
+        window_end=window_end,
+        window_policy_id=_text(metadata.get("backtest_window_policy_id")),
+        cost_model_applied=costs_applied,
+    )
+
+
+def _with_cost_clause(caption: str, costs_applied: bool) -> str:
+    return f"{caption} · 거래비용 반영" if costs_applied else caption
+
+
+def _cost_model_applied(result: CandidateBacktestResult) -> bool:
+    """Whether this run actually charged costs, rather than whether a cost model exists."""
+
+    cost_model = result.engine_summary.get("cost_model")
+    if isinstance(cost_model, Mapping) and any(
+        _is_numeric_metric(cost_model.get(key)) and float(cost_model[key]) > 0.0
+        for key in _COST_MODEL_RATE_KEYS
+    ):
+        return True
+    walk_forward = result.walk_forward
+    return bool(
+        walk_forward is not None and walk_forward.status == "ready" and walk_forward.costs > 0.0
+    )
+
+
+def _build_universe_policy(
+    result: CandidateBacktestResult,
+    *,
+    pipeline_data_source: Mapping[str, Any] | None,
+) -> BacktestUniversePolicy | None:
+    """Say the screen and the backtest are two applications of one rule, when they are.
+
+    Returned only for loads that carry a point-in-time universe descriptor. A fixture run
+    has no historical membership to have excluded anything from, and claiming the policy
+    there would describe a separation that did not happen.
+    """
+
+    metadata = pipeline_data_source if isinstance(pipeline_data_source, Mapping) else {}
+    descriptor = metadata.get("backtest_universe")
+    if not isinstance(descriptor, Mapping):
+        return None
+
+    excluded = descriptor.get("excluded_screening_candidate_count")
+    excluded_count = int(excluded) if isinstance(excluded, int) and excluded >= 0 else 0
+    traded = metadata.get("pit_member_count")
+    payload = result.backtest_payload if isinstance(result.backtest_payload, Mapping) else {}
+    if not isinstance(traded, int):
+        tickers = payload.get("tickers")
+        traded = len(tickers) if isinstance(tickers, list) else None
+
+    return BacktestUniversePolicy(
+        summary=_UNIVERSE_SPLIT_SUMMARY,
+        policy_id=_text(metadata.get("backtest_window_policy_id")),
+        window_start=_text(descriptor.get("as_of_start"))
+        or _text(metadata.get("backtest_start_session")),
+        window_end=_text(descriptor.get("as_of_end"))
+        or _text(metadata.get("backtest_end_session")),
+        traded_ticker_count=traded if isinstance(traded, int) and traded >= 0 else None,
+        excluded_screening_candidate_count=excluded_count,
+        excluded_notice=(
+            f"오늘 스크리닝 후보 중 {excluded_count}종목은 백테스트 구간의 과거 시점 "
+            "유니버스에 없어 백테스트 거래 대상에서 제외됐습니다."
+            if excluded_count > 0
+            else None
+        ),
+    )
+
+
+def _text(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _pipeline_source(

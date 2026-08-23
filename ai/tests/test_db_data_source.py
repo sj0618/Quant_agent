@@ -1141,6 +1141,148 @@ def test_load_never_trades_a_current_screening_candidate() -> None:
     assert bundle.metadata["backtest_universe"]["excluded_screening_candidate_count"] == 1
 
 
+class _L4Connection:
+    """The statements load() issues once screening and price fetching are stubbed out."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def rollback(self):
+        return None
+
+    def execute(self, query, params=None):
+        if "session_start" in query and "session_count" in query:
+            return FakeResult(row={
+                "session_start": date(2021, 7, 30),
+                "session_end": date(2026, 7, 30),
+                "session_count": 1_230,
+            })
+        if "AS present" in query:
+            return FakeResult(row={"present": True})
+        return FakeResult(rows=[])
+
+
+def _l4_source(universe, candidates, captured):
+    class L4Source(PostgresPipelineDataSource):
+        def _connect(self):
+            return _L4Connection()
+
+        def _screen_with_relaxation(self, _conn, _query):
+            return list(candidates), {"relaxation_rounds": 0, "relaxed": False}
+
+        def _fetch_backtest_universe(self, _conn, _window):
+            return list(universe), {
+                "selection": "lifecycle_pit_common_stock_window",
+                "source": "mart.common_stock_universe_asof",
+            }
+
+        def _fetch_symbol_info_map(self, _conn, tickers):
+            return {t: {"ticker": t, "included": True} for t in tickers}
+
+        def _fetch_price_rows(self, _conn, tickers, _info, _q, _w, _f=None):
+            return [
+                {
+                    "date": "2026-05-20", "ticker": ticker,
+                    "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1_000,
+                }
+                for ticker in tickers
+            ], 1_230
+
+        def _fetch_macro_status(self, _conn):
+            return {}
+
+        def _fetch_l4_evidence(self, _conn, ticker, trace_id):
+            captured.append(ticker)
+            return [{"ticker": ticker, "trace_id": trace_id}]
+
+    return L4Source(DataSourceConfig(database_dsn="postgresql://fake/fake"))
+
+
+def test_l4_evidence_is_fetched_for_the_recommended_name_not_the_lowest_pit_code() -> None:
+    """Analyst evidence has to be about the name the report is about.
+
+    The traded ticker is the PIT universe's first member, which is just the lowest symbol
+    code. Attaching that name's reports to a screening report put evidence about a stock
+    the reader never sees next to the recommendation.
+    """
+
+    captured: list[str] = []
+    source = _l4_source(
+        universe=["000020", "005930"],
+        candidates=[{
+            "ticker": "005930",
+            "relative_strength_20d": 0.5,
+            "matched_rules": ["test"],
+        }],
+        captured=captured,
+    )
+
+    bundle = source.load("RSI가 30 이하로 떨어진 KOSPI200", "trace-l4-recommended")
+
+    # The look-ahead contract is untouched: the traded ticker is still the PIT member.
+    assert bundle.metadata["ticker"] == "000020"
+    assert bundle.metadata["recommendation_ticker"] == "005930"
+    assert captured == ["005930"]
+    assert bundle.metadata["l4_evidence_ticker"] == "005930"
+    assert bundle.l4_evidence[0]["ticker"] == "005930"
+
+
+def test_l4_evidence_falls_back_to_the_traded_ticker_without_a_recommendation() -> None:
+    captured: list[str] = []
+    source = _l4_source(
+        universe=["000020", "005930"],
+        candidates=[{
+            "ticker": "999999",
+            "relative_strength_20d": 0.5,
+            "matched_rules": ["test"],
+        }],
+        captured=captured,
+    )
+
+    bundle = source.load("RSI가 30 이하로 떨어진 KOSPI200", "trace-l4-fallback")
+
+    assert bundle.metadata["recommendation_ticker"] is None
+    assert bundle.metadata["ticker"] == "000020"
+    assert captured == ["000020"]
+    assert bundle.metadata["l4_evidence_ticker"] == "000020"
+
+
+def test_single_ticker_load_keeps_l4_evidence_on_that_ticker() -> None:
+    captured: list[str] = []
+    source = _l4_source(universe=["000020"], candidates=[], captured=captured)
+
+    bundle = source.load("005930 RSI 추이", "trace-l4-single")
+
+    assert bundle.metadata["ticker"] == "005930"
+    assert bundle.metadata["recommendation_ticker"] is None
+    assert captured == ["005930"]
+    assert bundle.metadata["l4_evidence_ticker"] == "005930"
+
+
+def test_official_benchmark_absence_is_reported_without_failing_the_load() -> None:
+    """The benchmark tables are optional; a warehouse without them still loads."""
+
+    source = _l4_source(
+        universe=["000020"],
+        candidates=[{"ticker": "000020", "relative_strength_20d": 0.5, "matched_rules": []}],
+        captured=[],
+    )
+
+    bundle = source.load("RSI가 30 이하로 떨어진 KOSPI200", "trace-benchmark-absent")
+
+    assert bundle.official_benchmark["available"] is False
+    assert bundle.official_benchmark["unavailable_reason"]
+    status = bundle.metadata["official_benchmark"]
+    assert status["available"] is False
+    assert status["kospi_tr_sessions"] == 0
+    # The manifest must not claim provenance for a benchmark that was never computed.
+    lineage = bundle.metadata["source_manifest"]["lineage_refs"]
+    assert "mart.krx_index_total_return_daily" not in lineage
+
+
 def test_screening_frame_does_not_read_the_mart_view() -> None:
     """The one-date frame must not go through mart.kis_adjusted_feature_frame_asof.
 

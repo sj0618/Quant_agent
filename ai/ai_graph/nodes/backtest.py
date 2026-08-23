@@ -56,6 +56,22 @@ AUXILIARY_BENCHMARK_WARNING = (
     "공식 KOSPI/KOSDAQ 총수익률(TR) 시계열과 월초 목표 비중이 입력되지 않아 "
     "동일가중 보조 프록시만 계산했습니다. 공식 벤치마크로 해석할 수 없습니다."
 )
+PRIMARY_BENCHMARK_MISSING_INPUT_REASON = (
+    "official KOSPI and KOSDAQ total-return series with target weights were not supplied"
+)
+# Coverage rule for accepting the official series as the primary benchmark, measured
+# against the sessions the backtest actually holds prices for:
+#   * the first and last session must both carry a level for both indices - they alone
+#     set the headline total return the acceptance gate compares against, so an inferred
+#     endpoint would fabricate that number;
+#   * at least this fraction of the window's sessions must carry both levels, so a series
+#     with a long hole cannot be presented as a full-window comparison;
+#   * every traded month must have the preceding month's published weights, enforced by
+#     _official_krx_tr_benchmark_curve raising on a missing month.
+# Sessions missing inside that budget are skipped, not filled forward: TR levels are index
+# levels, so skipping one only lowers the curve's sampling frequency, while filling one
+# would invent a flat session the index did not have.
+OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE = 0.99
 # Legacy graph exports now describe the authoritative primary benchmark contract.
 BENCHMARK_LABEL = PRIMARY_BENCHMARK_LABEL
 BENCHMARK_METHOD = PRIMARY_BENCHMARK_METHOD
@@ -113,6 +129,9 @@ GENERATED_SIGNAL_METRIC = "generated_signal"
 BUY_SIGNAL_VALUE = 1.0
 SELL_SIGNAL_VALUE = -1.0
 HOLD_SIGNAL_VALUE = 0.0
+# Action plus entry score for a row no candidate spoke for. NaN means "unscored", not
+# "scored zero", so such a row can never outrank a measured one.
+_HOLD_DECISION = (HOLD_SIGNAL_VALUE, float("nan"))
 EXECUTION_AUDIT_TAIL_LIMIT = 20
 AI_BACKTEST_WORKERS_ENV = "AI_BACKTEST_WORKERS"
 DEFAULT_BACKTEST_WORKERS = 2
@@ -455,6 +474,9 @@ class GeneratedSignal(BaseModel):
     ticker: str | None = None
     action: str = Field(pattern="^(BUY|SELL|HOLD)$")
     price: float = Field(gt=0.0)
+    # Entry strength, higher is stronger, on BUY rows only. Optional: code that does
+    # not report one leaves the engine to fall back on the ticker code.
+    score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -479,6 +501,7 @@ class _CandidateEvaluation:
 class _CandidateTaskResult:
     evaluation: _CandidateEvaluation
     generated_actions: Sequence[int] | None
+    generated_scores: Sequence[float] | None
     action_build_seconds: float
     action_cache_hit: bool
     worker_pid: int
@@ -495,6 +518,9 @@ class _BenchmarkContext:
     primary_available: bool
     primary_unavailable_reason: str | None
     auxiliary_label: str
+    # How much of the traded window the official series actually covered, published even
+    # when the coverage rule rejected it so a reader can see how far short it fell.
+    primary_coverage: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -589,7 +615,7 @@ def _initialize_candidate_worker(
 
 
 def _evaluate_candidate_worker(
-    task: tuple[Mapping[str, Any], Sequence[int] | None, str],
+    task: tuple[Mapping[str, Any], Sequence[int] | None, Sequence[float] | None, str],
 ) -> _CandidateTaskResult:
     if (
         _WORKER_STRATEGY is None
@@ -599,7 +625,7 @@ def _evaluate_candidate_worker(
         or _WORKER_BENCHMARK_CONTEXT is None
     ):
         raise RuntimeError("candidate worker was not initialized")
-    candidate_payload, actions, metrics_mode = task
+    candidate_payload, actions, scores, metrics_mode = task
     return _evaluate_candidate_task(
         _WORKER_STRATEGY,
         CodeCandidate.model_validate(candidate_payload),
@@ -608,6 +634,7 @@ def _evaluate_candidate_worker(
         feature_store=_WORKER_FEATURE_STORE,
         benchmark_context=_WORKER_BENCHMARK_CONTEXT,
         generated_actions=actions,
+        generated_scores=scores,
         metrics_mode=metrics_mode,
     )
 
@@ -725,9 +752,12 @@ class _CandidateBacktestSession:
         self,
         strategy: AIStrategySpec,
         price_rows: Sequence[Mapping[str, Any]],
+        *,
+        official_benchmark: Mapping[str, Any] | None = None,
     ) -> None:
         prep_started = time.perf_counter()
         self.strategy = strategy
+        self.official_benchmark = official_benchmark
         phases: dict[str, float] = {}
 
         started = time.perf_counter()
@@ -800,7 +830,9 @@ class _CandidateBacktestSession:
             )
 
         started = time.perf_counter()
-        self.benchmark_context = _build_benchmark_context(self.price_rows)
+        self.benchmark_context = _build_benchmark_context(
+            self.price_rows, official_benchmark
+        )
         phases["benchmark_context_seconds"] = time.perf_counter() - started
 
         self.preparation_phases = {name: round(seconds, 6) for name, seconds in phases.items()}
@@ -808,6 +840,7 @@ class _CandidateBacktestSession:
         self._base_feature_estimated_bytes = self.feature_store.stats().estimated_bytes
         self._cache: dict[tuple[str, bool, str], _CandidateEvaluation] = {}
         self._action_cache: dict[str, Sequence[int]] = {}
+        self._score_cache: dict[str, Sequence[float]] = {}
         self._worker_feature_bytes: dict[int, int] = {}
         self._worker_feature_lookbacks: set[int] = set()
         self._disk_cache = _DiskEvaluationCache()
@@ -876,6 +909,7 @@ class _CandidateBacktestSession:
                 (
                     candidate.model_dump(mode="python"),
                     self._action_cache.get(_candidate_identity(candidate)),
+                    self._score_cache.get(_candidate_identity(candidate)),
                     metrics_mode,
                 )
                 for candidate in missing
@@ -894,6 +928,7 @@ class _CandidateBacktestSession:
                         feature_store=self.feature_store,
                         benchmark_context=self.benchmark_context,
                         generated_actions=self._action_cache.get(_candidate_identity(candidate)),
+                        generated_scores=self._score_cache.get(_candidate_identity(candidate)),
                         metrics_mode=metrics_mode,
                     )
                     for candidate in missing
@@ -912,9 +947,10 @@ class _CandidateBacktestSession:
                         + result.action_build_seconds
                     )
                 if result.generated_actions is not None:
-                    self._action_cache[_candidate_identity(result.evaluation.candidate)] = (
-                        result.generated_actions
-                    )
+                    identity = _candidate_identity(result.evaluation.candidate)
+                    self._action_cache[identity] = result.generated_actions
+                    if result.generated_scores is not None:
+                        self._score_cache[identity] = result.generated_scores
                 if result.worker_pid != os.getpid():
                     self._worker_feature_bytes[result.worker_pid] = max(
                         self._worker_feature_bytes.get(result.worker_pid, 0),
@@ -966,7 +1002,9 @@ class _CandidateBacktestSession:
 
     def _evaluate_parallel(
         self,
-        tasks: list[tuple[Mapping[str, Any], Sequence[int] | None, str]],
+        tasks: list[
+            tuple[Mapping[str, Any], Sequence[int] | None, Sequence[float] | None, str]
+        ],
         candidates: list[CodeCandidate],
         worker_count: int,
     ) -> list[_CandidateTaskResult]:
@@ -1030,6 +1068,7 @@ class _CandidateBacktestSession:
                 evaluations[index] = _CandidateTaskResult(
                     evaluation=_timeout_evaluation(candidates[index], timeout),
                     generated_actions=None,
+                    generated_scores=None,
                     action_build_seconds=0.0,
                     action_cache_hit=False,
                     worker_pid=0,
@@ -1065,6 +1104,13 @@ class _CandidateBacktestSession:
             "candidate_sha": _candidate_identity(candidate),
             "validation_ok": candidate.validation_ok,
             "metrics_mode": metrics_mode,
+            # A cached evaluation carries the benchmark provenance it was computed with,
+            # so an entry written while the official series was missing must not be
+            # replayed once it is loaded.
+            "benchmark": {
+                "available": self.benchmark_context.primary_available,
+                "return": self.benchmark_context.total_return,
+            },
         }
         encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         return sha256(encoded.encode("utf-8")).hexdigest()
@@ -1318,6 +1364,7 @@ def _evaluate_candidate_task(
     feature_store: PreparedFeatureStore,
     benchmark_context: _BenchmarkContext,
     generated_actions: Sequence[int] | None,
+    generated_scores: Sequence[float] | None,
     metrics_mode: str,
 ) -> _CandidateTaskResult:
     wall_started = time.perf_counter()
@@ -1326,6 +1373,7 @@ def _evaluate_candidate_task(
     action_cache_hit = generated_actions is not None
     action_build_started = time.perf_counter()
     actions = generated_actions
+    scores = generated_scores
     if not candidate.validation_ok:
         feature_stats = feature_store.stats()
         return _CandidateTaskResult(
@@ -1345,6 +1393,7 @@ def _evaluate_candidate_task(
                 },
             ),
             generated_actions=actions,
+            generated_scores=scores,
             action_build_seconds=0.0,
             action_cache_hit=action_cache_hit,
             worker_pid=worker_pid,
@@ -1358,13 +1407,16 @@ def _evaluate_candidate_task(
                 and candidate.strategy_ir is not None
                 and candidate.parameters is not None
             ):
-                actions = feature_store.build_actions(
+                ranked = feature_store.build_ranked_actions(
                     candidate.strategy_ir,
                     candidate.parameters,
                 )
+                actions, scores = ranked.actions, ranked.scores
             else:
                 generated_signals = _execute_candidate_code(candidate, rows)
-                actions = _compact_actions_from_signals(prepared_market, generated_signals)
+                actions, scores = _compact_actions_from_signals(
+                    prepared_market, generated_signals
+                )
         action_build_seconds = (
             0.0 if action_cache_hit else time.perf_counter() - action_build_started
         )
@@ -1374,6 +1426,7 @@ def _evaluate_candidate_task(
             rows,
             prepared_market=prepared_market,
             generated_actions=actions,
+            generated_scores=scores,
             metrics_mode=metrics_mode,
         )
     except Exception as exc:
@@ -1411,6 +1464,7 @@ def _evaluate_candidate_task(
         return _CandidateTaskResult(
             evaluation=evaluation,
             generated_actions=actions,
+            generated_scores=scores,
             action_build_seconds=action_build_seconds,
             action_cache_hit=action_cache_hit,
             worker_pid=worker_pid,
@@ -1516,6 +1570,7 @@ def _evaluate_candidate_task(
     return _CandidateTaskResult(
         evaluation=evaluation,
         generated_actions=actions,
+        generated_scores=scores,
         action_build_seconds=action_build_seconds,
         action_cache_hit=action_cache_hit,
         worker_pid=worker_pid,
@@ -1531,6 +1586,7 @@ def run_candidate_backtest(
     price_rows: Sequence[Mapping[str, Any]] | None = None,
     feature_coverage: Mapping[str, Any] | None = None,
     fallback_reasons: Sequence[str] | None = None,
+    official_benchmark: Mapping[str, Any] | None = None,
     _session: _CandidateBacktestSession | None = None,
     _walk_forward_enabled: bool = True,
 ) -> CandidateBacktestResult:
@@ -1538,13 +1594,17 @@ def run_candidate_backtest(
         raise ValueError("at least one candidate is required")
 
     rows = _session.price_rows if _session is not None else _price_rows(price_rows)
+    if official_benchmark is None and _session is not None:
+        official_benchmark = _session.official_benchmark
     sample = _walk_forward_sample(rows)
     if _walk_forward_enabled and sample.status == READY_WALK_FORWARD:
         return _run_walk_forward_candidate_backtest(
-            strategy_a, candidates, rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons
+            strategy_a, candidates, rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons, official_benchmark=official_benchmark
         )
     owns_session = _session is None
-    session = _session or _CandidateBacktestSession(strategy_a, rows)
+    session = _session or _CandidateBacktestSession(
+        strategy_a, rows, official_benchmark=official_benchmark
+    )
     enriched_candidates: list[CodeCandidate] = []
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
     equity_curves_by_candidate: dict[str, list[BacktestEquityPoint]] = {}
@@ -1689,11 +1749,13 @@ def _fold_engine(
     tradable_sessions: set[str],
 ):
     store = PreparedFeatureStore(context_rows, rows_are_sorted=True)
-    action_map = {
-        (str(row.get("date")), str(row.get("ticker", "")).zfill(6)): action
-        for row, action in zip(
+    ranked = store.build_ranked_actions(candidate.strategy_ir, candidate.parameters)
+    decision_map = {
+        (str(row.get("date")), str(row.get("ticker", "")).zfill(6)): (action, score)
+        for row, action, score in zip(
             store.rows,
-            store.build_actions(candidate.strategy_ir, candidate.parameters),
+            ranked.actions,
+            ranked.scores,
             strict=True,
         )
     }
@@ -1706,12 +1768,14 @@ def _fold_engine(
         config=EngineBacktestRunConfig(initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL, write_outputs=False, talib=EngineTalibIndicatorConfig(enabled=False, mode="none"), metrics_mode="selection"),
         inputs_normalized=True,
     )
-    actions = [
-        action_map.get((str(row.date), str(row.ticker).zfill(6)), HOLD_SIGNAL_VALUE)
-        if str(row.date) in tradable_sessions else HOLD_SIGNAL_VALUE
+    decisions = [
+        decision_map.get((str(row.date), str(row.ticker).zfill(6)), _HOLD_DECISION)
+        if str(row.date) in tradable_sessions else _HOLD_DECISION
         for row in prepared.ohlcv_rows
     ]
-    return _run_candidate_backtest(strategy, candidate, engine_rows, prepared_market=prepared, generated_actions=actions, metrics_mode="selection")
+    actions = [action for action, _ in decisions]
+    scores = [score for _, score in decisions]
+    return _run_candidate_backtest(strategy, candidate, engine_rows, prepared_market=prepared, generated_actions=actions, generated_scores=scores, metrics_mode="selection")
 
 
 def _complete_target_returns(
@@ -1752,9 +1816,9 @@ def _walk_forward_aggregate_metrics(returns: Sequence[float]) -> BacktestMetrics
         out_sample_return=round(total_return, METRIC_ROUND_DIGITS),
     )
 
-def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: list[CodeCandidate], rows: Sequence[Mapping[str, Any]], *, feature_coverage: Mapping[str, Any] | None, fallback_reasons: Sequence[str] | None) -> CandidateBacktestResult:
+def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: list[CodeCandidate], rows: Sequence[Mapping[str, Any]], *, feature_coverage: Mapping[str, Any] | None, fallback_reasons: Sequence[str] | None, official_benchmark: Mapping[str, Any] | None = None) -> CandidateBacktestResult:
     if any(candidate.representation != "structured" for candidate in candidates):
-        result = run_candidate_backtest(strategy, candidates, price_rows=rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons, _walk_forward_enabled=False)
+        result = run_candidate_backtest(strategy, candidates, price_rows=rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons, official_benchmark=official_benchmark, _walk_forward_enabled=False)
         masked = result.selected_candidate.model_copy(update={"metrics": _mask_unavailable_walk_forward_metrics(result.selected_candidate.metrics, UNSAFE_WALK_FORWARD_CANDIDATE)})
         return result.model_copy(update={"selected_candidate": masked, "walk_forward": WalkForwardPolicyResult(status="unsafe_candidate", unavailable_reason=UNSAFE_WALK_FORWARD_CANDIDATE)})
 
@@ -1842,7 +1906,7 @@ def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: l
         backtest_payload=_backtest_payload(
             strategy,
             rows,
-            benchmark_context=_build_benchmark_context(rows),
+            benchmark_context=_build_benchmark_context(rows, official_benchmark),
         ),
         feature_coverage=dict(feature_coverage or {}),
         fallback_reasons=list(fallback_reasons or ()),
@@ -1878,6 +1942,10 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
     ]
     price_rows = state["price_rows"] if "price_rows" in state else state.get("market_prices")
     rows = _price_rows(price_rows)
+    # Supplied by the data node when the warehouse carries the official KRX TR series.
+    # Absent everywhere else, which keeps the primary benchmark unavailable-with-a-reason
+    # rather than turning it into a silently different number.
+    official_benchmark = state.get("official_benchmark")
     ticker_count = _available_ticker_count(rows)
     max_positions = _applied_max_positions(strategy_a, ticker_count)
 
@@ -1900,7 +1968,9 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                 "결과는 이 종목들의 과거에 크게 좌우됩니다."
             ),
         )
-    with _CandidateBacktestSession(strategy_a, rows) as session:
+    with _CandidateBacktestSession(
+        strategy_a, rows, official_benchmark=official_benchmark
+    ) as session:
         result = run_candidate_backtest(
             strategy_a,
             candidates,
@@ -2070,12 +2140,14 @@ def _run_candidate_backtest(
     *,
     prepared_market: EnginePreparedMarketData,
     generated_actions: Sequence[int] | None,
+    generated_scores: Sequence[float] | None = None,
     metrics_mode: str,
 ):
     actions = generated_actions
+    scores = generated_scores
     if actions is None:
         generated_signals = _execute_candidate_code(candidate, price_rows)
-        actions = _compact_actions_from_signals(prepared_market, generated_signals)
+        actions, scores = _compact_actions_from_signals(prepared_market, generated_signals)
     engine_spec = _engine_strategy_spec(
         strategy,
         candidate,
@@ -2091,14 +2163,16 @@ def _run_candidate_backtest(
         ),
         prepared_market_data=prepared_market,
         generated_actions=actions,
+        generated_scores=scores,
     )
 
 
 def _compact_actions_from_signals(
     prepared_market: EnginePreparedMarketData,
     generated_signals: Sequence[GeneratedSignal],
-) -> list[int]:
+) -> tuple[list[int], list[float]]:
     actions = [0] * len(prepared_market.ohlcv_rows)
+    scores = [float("nan")] * len(prepared_market.ohlcv_rows)
     tickers_by_date: dict[str, list[str]] = {}
     for bar in prepared_market.ohlcv_rows:
         tickers_by_date.setdefault(bar.date.isoformat(), []).append(bar.ticker)
@@ -2116,7 +2190,9 @@ def _compact_actions_from_signals(
                 f"generated signal {signal.date}/{ticker} is not present in price rows"
             )
         actions[index] = int(SIGNAL_METRIC_VALUES[signal.action])
-    return actions
+        if signal.action == "BUY" and signal.score is not None:
+            scores[index] = float(signal.score)
+    return actions, scores
 
 
 def _execute_candidate_code(
@@ -2844,7 +2920,17 @@ def _daily_returns_from_benchmark_curve(
 
 def _build_benchmark_context(
     price_rows: Sequence[Mapping[str, Any]],
+    official_benchmark: Mapping[str, Any] | None = None,
 ) -> _BenchmarkContext:
+    """Auxiliary proxy always, official primary only when the supplied series covers it.
+
+    The two legs are kept separate on purpose. `daily_returns` and `selection_return`
+    belong to the equal-weight proxy and the official series is never substituted into
+    them; only the primary total return - the single value the automatic acceptance rule
+    reads - is computed from the official series. Supplying the series therefore decides
+    whether the primary benchmark exists, and nothing else.
+    """
+
     auxiliary_curve, _ = _equal_weight_benchmark_curve(price_rows)
     selection_days = max(
         1,
@@ -2854,17 +2940,165 @@ def _build_benchmark_context(
     selection_return = (
         float(auxiliary_curve[selection_index].cumulative_return) if auxiliary_curve else 0.0
     )
+    total_return, coverage, unavailable_reason = _official_benchmark_total_return(
+        price_rows, official_benchmark
+    )
     return _BenchmarkContext(
         daily_returns=tuple(_daily_returns_from_benchmark_curve(auxiliary_curve)),
         selection_days=selection_days,
         selection_return=selection_return,
-        total_return=None,
-        primary_available=False,
-        primary_unavailable_reason=(
-            "official KOSPI and KOSDAQ total-return series with target weights were not supplied"
-        ),
+        total_return=total_return,
+        primary_available=total_return is not None,
+        primary_unavailable_reason=unavailable_reason,
         auxiliary_label=AUXILIARY_BENCHMARK_LABEL,
+        primary_coverage=coverage,
     )
+
+
+def _official_benchmark_total_return(
+    price_rows: Sequence[Mapping[str, Any]],
+    official_benchmark: Mapping[str, Any] | None,
+) -> tuple[float | None, dict[str, Any] | None, str | None]:
+    """Official KOSPI/KOSDAQ TR total return over the traded window, or why there is none.
+
+    Coverage is judged against the sessions the backtest holds prices for, under the rule
+    documented at OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE. Every rejection carries the
+    sentence a report has to print: an unavailable benchmark with no stated reason cannot
+    be told apart from a benchmark that is simply broken.
+    """
+
+    if not isinstance(official_benchmark, Mapping) or not official_benchmark:
+        return None, None, PRIMARY_BENCHMARK_MISSING_INPUT_REASON
+    if not official_benchmark.get("available"):
+        reason = str(official_benchmark.get("unavailable_reason") or "").strip()
+        return None, None, reason or PRIMARY_BENCHMARK_MISSING_INPUT_REASON
+
+    sessions = sorted({str(row.get("date")) for row in price_rows if row.get("date")})
+    if not sessions:
+        return None, None, "the backtest window has no sessions to measure a benchmark over"
+
+    kospi = _official_benchmark_levels(official_benchmark.get("kospi_tr"), sessions)
+    kosdaq = _official_benchmark_levels(official_benchmark.get("kosdaq_tr"), sessions)
+    covered = sorted(set(kospi) & set(kosdaq))
+    coverage: dict[str, Any] = {
+        "backtest_sessions": len(sessions),
+        "covered_sessions": len(covered),
+        "coverage_ratio": round(len(covered) / len(sessions), METRIC_ROUND_DIGITS),
+        "minimum_coverage_ratio": OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE,
+        "first_session": sessions[0],
+        "last_session": sessions[-1],
+        "first_session_covered": bool(covered) and covered[0] == sessions[0],
+        "last_session_covered": bool(covered) and covered[-1] == sessions[-1],
+    }
+    if not covered:
+        return None, coverage, (
+            "official KOSPI and KOSDAQ TR levels share no session with the backtest window "
+            f"({sessions[0]}..{sessions[-1]})"
+        )
+    if not coverage["first_session_covered"] or not coverage["last_session_covered"]:
+        return None, coverage, (
+            "official TR levels do not cover both endpoints of the backtest window "
+            f"({sessions[0]}..{sessions[-1]}); covered {covered[0]}..{covered[-1]}"
+        )
+    if coverage["coverage_ratio"] < OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE:
+        return None, coverage, (
+            f"official TR levels cover {len(covered)}/{len(sessions)} backtest sessions, "
+            f"below the required {OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE:.0%}"
+        )
+
+    weights = _lagged_official_benchmark_weights(
+        official_benchmark.get("monthly_weights"), covered
+    )
+    try:
+        _, total_return = _official_krx_tr_benchmark_curve(kospi, kosdaq, weights)
+    except ValueError as error:
+        return None, coverage, f"official benchmark curve could not be computed: {error}"
+    if total_return is None:
+        return None, coverage, "official benchmark curve produced no observations"
+    return float(total_return), coverage, None
+
+
+def _official_benchmark_levels(
+    series: Any, sessions: Sequence[str]
+) -> dict[str, float]:
+    """The supplied index levels restricted to the traded sessions.
+
+    Levels outside the window are dropped rather than extending the curve: the benchmark
+    has to answer for the same period the strategy traded, not a longer one.
+    """
+
+    if not isinstance(series, Mapping):
+        return {}
+    wanted = set(sessions)
+    levels: dict[str, float] = {}
+    for raw_date, raw_value in series.items():
+        session = str(raw_date)
+        if session not in wanted:
+            continue
+        try:
+            level = _finite_float(raw_value, "official benchmark TR level")
+        except (TypeError, ValueError):
+            continue
+        if level > 0.0:
+            levels[session] = level
+    return levels
+
+
+def _lagged_official_benchmark_weights(
+    monthly_weights: Any, sessions: Sequence[str]
+) -> dict[str, tuple[float, float]]:
+    """Each traded month mapped to the weights published for the month before it.
+
+    The lag lives here rather than in the warehouse, which stores the plain monthly
+    observation: rebalancing month M on month M's own split would use a number that was
+    not observable until M had ended. A month whose predecessor is missing is left out, so
+    the curve builder rejects the run instead of carrying a stale split forward.
+    """
+
+    published: dict[str, tuple[float, float]] = {}
+    if isinstance(monthly_weights, Mapping):
+        for raw_month, raw_weights in monthly_weights.items():
+            pair = _official_benchmark_weight_pair(raw_weights)
+            if pair is not None:
+                published[str(raw_month)[:7]] = pair
+    lagged: dict[str, tuple[float, float]] = {}
+    for session in sessions:
+        month = str(session)[:7]
+        if month in lagged:
+            continue
+        previous = _previous_month(month)
+        if previous in published:
+            lagged[month] = published[previous]
+    return lagged
+
+
+def _official_benchmark_weight_pair(value: Any) -> tuple[float, float] | None:
+    if isinstance(value, Mapping):
+        candidate = (value.get("kospi_weight"), value.get("kosdaq_weight"))
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        if len(value) != 2:
+            return None
+        candidate = (value[0], value[1])
+    else:
+        return None
+    try:
+        return (
+            _finite_float(candidate[0], "kospi_weight"),
+            _finite_float(candidate[1], "kosdaq_weight"),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _previous_month(month: str) -> str:
+    """'2024-01' -> '2023-12'. Returns the input unchanged when it is not a month key."""
+    try:
+        year, month_number = (int(part) for part in month.split("-", 1))
+    except ValueError:
+        return month
+    if month_number == 1:
+        return f"{year - 1:04d}-12"
+    return f"{year:04d}-{month_number - 1:02d}"
 
 
 def _benchmark_provenance(context: _BenchmarkContext) -> dict[str, Any]:
@@ -2876,6 +3110,11 @@ def _benchmark_provenance(context: _BenchmarkContext) -> dict[str, Any]:
             "official_series_and_lagged_weights": context.primary_available,
             "return": context.total_return if context.primary_available else None,
             "unavailable_reason": context.primary_unavailable_reason,
+            "session_coverage": (
+                dict(context.primary_coverage)
+                if context.primary_coverage is not None
+                else None
+            ),
         },
         "auxiliary": {
             "label": context.auxiliary_label,
