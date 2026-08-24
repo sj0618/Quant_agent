@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
-from hashlib import sha256
 import json
+import math
 import os
 import time
+from datetime import date, timedelta
+from hashlib import sha256
 from types import SimpleNamespace
-
-import math
 
 import pytest
 
+from ai_graph.llm.mock import MockLLMClient
 from ai_graph.nodes import backtest as backtest_node
 from ai_graph.nodes.backtest_code import (
     Loop3Request,
@@ -29,6 +29,7 @@ from ai_graph.schemas import (
     ConditionOperator,
     StrategyIR,
     StrategySpec,
+    WalkForwardPolicyResult,
 )
 
 
@@ -256,6 +257,128 @@ def test_worker_count_and_disk_cache_are_deterministic(monkeypatch, tmp_path) ->
     result_two = backtest_node.run_candidate_backtest(strategy, candidates, price_rows=rows)
 
     assert _canonical_hash(result_one) == _canonical_hash(result_two)
+
+
+def test_final_backtest_artifact_binds_candidate_count_to_unavailable_oos_result() -> None:
+    strategy = _strategy()
+    # Keep this boundary test independent from the configured LLM provider.  The
+    # artifact is produced by the backtest runner, so a valid deterministic fallback
+    # candidate is sufficient to prove that its own output binds search width and OOS
+    # availability together.
+    candidates = [
+        CodeCandidate(
+            candidate_id="oos-artifact",
+            variant="A",
+            code="def build_signals(prices):\n    return []\n",
+            validation_ok=True,
+        )
+    ]
+
+    result = backtest_node.run_candidate_backtest(strategy, candidates, price_rows=_rows(days=45))
+    artifact = result.engine_summary["walk_forward_sample"]
+
+    assert artifact == result.backtest_payload["walk_forward_sample"]
+    assert artifact["candidates_evaluated"] == len(candidates)
+    assert artifact["aggregate_oos_available"] is False
+    assert artifact["aggregate_oos_result"] == {
+        "availability": "unavailable",
+        "reason": backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE,
+    }
+
+
+def _walk_forward_price_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for month_index in range(40):
+        year = 2020 + month_index // 12
+        month = month_index % 12 + 1
+        for day in range(1, 21):
+            for ticker_index in range(6):
+                close = 100.0 + ticker_index * 5 + month_index * 0.5 + day * 0.1
+                rows.append(
+                    {
+                        "date": date(year, month, day).isoformat(),
+                        "ticker": f"{ticker_index + 1:06d}",
+                        "open": close * 0.997,
+                        "high": close * 1.01,
+                        "low": close * 0.99,
+                        "close": close,
+                        "volume": 1_000_000.0 + day * 1_000,
+                        "rsi": 30.0 + (day % 40),
+                    }
+                )
+    return rows
+
+
+def test_rolling_walk_forward_artifact_binds_actual_oos_result(monkeypatch, tmp_path) -> None:
+    strategy = _strategy()
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="oos-rolling"),
+        llm_client=MockLLMClient(),
+    ).candidates
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "oos-rolling"))
+    result = backtest_node.run_candidate_backtest(
+        strategy,
+        candidates,
+        price_rows=_walk_forward_price_rows(),
+    )
+
+    artifact = result.engine_summary["walk_forward_sample"]
+    assert result.walk_forward is not None
+    assert result.walk_forward.status == "ready"
+    assert artifact == result.backtest_payload["walk_forward_sample"]
+    assert artifact["candidates_evaluated"] == len(candidates)
+    assert artifact["aggregate_oos_available"] is True
+    assert artifact["aggregate_oos_result"]["availability"] == "available"
+    assert artifact["aggregate_oos_result"]["evaluation_session_count"] == 480
+    assert isinstance(artifact["aggregate_oos_result"]["total_return"], float)
+    assert isinstance(artifact["aggregate_oos_result"]["sharpe_ratio"], float)
+    assert isinstance(artifact["aggregate_oos_result"]["max_drawdown"], float)
+
+
+def test_unsafe_rolling_candidate_artifact_uses_its_actual_unavailable_reason(
+    monkeypatch, tmp_path
+) -> None:
+    strategy = _strategy()
+    candidates = [
+        CodeCandidate(
+            candidate_id="unsafe-oos-rolling",
+            variant="A",
+            code="def build_signals(prices):\n    return []\n",
+            validation_ok=True,
+        )
+    ]
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "unsafe-oos"))
+    # Keep this explicit route test bounded: production-sized inputs have already
+    # selected this branch when they meet the sample minimum, while the branch itself
+    # only needs a non-structured candidate to prove that its final artifact is rebuilt.
+    monkeypatch.setattr(
+        backtest_node,
+        "_walk_forward_sample",
+        lambda _: backtest_node._WalkForwardSample(
+            session_count=480,
+            valid_fold_count=24,
+            unique_evaluation_month_count=24,
+            unique_evaluation_session_count=480,
+            status=backtest_node.READY_WALK_FORWARD,
+        ),
+    )
+
+    result = backtest_node.run_candidate_backtest(
+        strategy,
+        candidates,
+        price_rows=_rows(days=45),
+    )
+
+    artifact = result.engine_summary["walk_forward_sample"]
+    assert result.walk_forward is not None
+    assert result.walk_forward.status == "unsafe_candidate"
+    assert artifact == result.backtest_payload["walk_forward_sample"]
+    assert artifact["candidates_evaluated"] == len(candidates)
+    assert artifact["aggregate_oos_available"] is False
+    assert artifact["aggregate_oos_result"] == {
+        "availability": "unavailable",
+        "reason": backtest_node.UNSAFE_WALK_FORWARD_CANDIDATE,
+    }
 
 
 @pytest.mark.skipif(
@@ -883,14 +1006,46 @@ def test_out_of_sample_artifact_discloses_period_seed_candidates_and_result() ->
     assert metadata["selection_determinism"] == "deterministic_no_rng"
     assert metadata["selection_tie_break"] == "slot_priority:(-score, ticker)"
 
-    # Out-of-sample result: available only when the sample clears the stated minimums.
+    # Eligibility is not a result. A sample-only artifact makes that distinction
+    # explicit instead of treating enough sessions as an OOS return.
     assert metadata["status"] == backtest_node.READY_WALK_FORWARD
-    assert metadata["aggregate_oos_available"] is True
+    assert metadata["aggregate_oos_eligible"] is True
+    assert metadata["aggregate_oos_available"] is False
+    assert metadata["aggregate_oos_result"] == {
+        "availability": "unavailable",
+        "reason": "aggregate_oos_not_computed",
+    }
 
-    # Candidate count: how wide the search behind the headline was.
-    headline = backtest_node._headline_metrics({"candidates_evaluated": 7})
-    assert headline["candidates_evaluated"] == 7
-    assert headline["basis"] == "hold_out"
+    aggregate_metrics = BacktestMetrics(
+        sharpe_ratio=1.25,
+        max_drawdown=-0.12,
+        win_rate=0.58,
+        total_return=0.18,
+        in_sample_sharpe=0.0,
+        out_sample_sharpe=1.25,
+        degradation=0.0,
+        out_sample_return=0.18,
+    )
+    artifact = backtest_node._walk_forward_artifact(
+        metadata,
+        candidate_count=7,
+        walk_forward=WalkForwardPolicyResult(
+            status="ready",
+            unique_evaluation_session_count=480,
+            aggregate_metrics=aggregate_metrics,
+        ),
+    )
+
+    # The same artifact carries both the search width and the actual OOS result.
+    assert artifact["candidates_evaluated"] == 7
+    assert artifact["aggregate_oos_available"] is True
+    assert artifact["aggregate_oos_result"] == {
+        "availability": "available",
+        "total_return": 0.18,
+        "sharpe_ratio": 1.25,
+        "max_drawdown": -0.12,
+        "evaluation_session_count": 480,
+    }
 
 
 def test_no_rng_backs_the_deterministic_selection_claim() -> None:
@@ -937,7 +1092,12 @@ def test_short_history_hides_aggregate_oos_and_benchmark_claims() -> None:
     metadata = backtest_node._walk_forward_metadata(backtest_node._walk_forward_sample(_rows(days=79)))
 
     assert metadata["status"] == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
+    assert metadata["aggregate_oos_eligible"] is False
     assert metadata["aggregate_oos_available"] is False
+    assert metadata["aggregate_oos_result"] == {
+        "availability": "unavailable",
+        "reason": backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE,
+    }
     assert metadata["benchmark_comparison_available"] is False
 
 
