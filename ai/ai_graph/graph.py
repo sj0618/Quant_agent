@@ -28,6 +28,10 @@ from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_s
 from pydantic import ValidationError
 
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
+from ai_graph.freshness import (
+    build_freshness_evidence,
+    freshness_status_from_metadata,
+)
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
     generate_strategy_conditions,
@@ -693,6 +697,7 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         "source_usage": [usage.model_dump() for usage in source_usage],
         "evidence_refs": [evidence.model_dump() for evidence in evidence_refs],
         "freshness_status": _aggregate_freshness_status(source_usage),
+        "freshness_evidence": build_freshness_evidence(pipeline_data.metadata).model_dump(),
         "proxy_disclosure": _proxy_disclosure(data_requirements),
         "data": {
             "candidate_cards": [card.model_dump() for card in cards],
@@ -861,6 +866,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
                 "email_projection 예약",
                 "실거래 전 데이터 어댑터 연결",
                 *_availability_next_actions(state.get("data", {}).get("data_availability", {})),
+                *_freshness_next_actions(state.get("freshness_evidence")),
             ],
             "candidate_cards": cards,
             "report": report,
@@ -912,6 +918,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         data_requirements=state.get("data_requirements"),
         source_usage=state.get("source_usage"),
         freshness_status=state.get("freshness_status"),
+        freshness_evidence=state.get("freshness_evidence"),
         proxy_disclosure=state.get("proxy_disclosure"),
         failure_cause=state.get("failure_cause"),
         evidence_refs=state.get("evidence_refs"),
@@ -929,11 +936,15 @@ def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
     specify, instead of being stopped at a form.
     """
 
-    base = (
-        "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다."
-        if validated
-        else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
-    )
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        base = "freshness 한계로 추천을 생성하지 않았습니다. 아래 결과는 검토용입니다."
+    else:
+        base = (
+            "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다."
+            if validated
+            else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
+        )
     sections = [base, *_universe_split_disclosure(state)]
     ambiguity = state.get("ambiguity") or {}
     assumptions = [
@@ -1301,7 +1312,11 @@ def build_source_usage(
                 query=f"{requirement.family}: {query}",
                 retrieved_at=now,
                 source_refs=[str(source_ref)] if source_ref else [],
-                freshness_status="unknown",
+                freshness_status=(
+                    freshness_status_from_metadata(pipeline_metadata)
+                    if uses_postgres
+                    else "unknown"
+                ),
                 confidence=requirement.source_confidence_floor if uses_postgres else 0.0,
                 fallback_used=pipeline_metadata.get("source") == "fixture",
                 evidence_refs=[f"source:{trace_id}:{requirement.family}"],
@@ -3180,6 +3195,10 @@ def _ticker_actions(
     priced.
     """
 
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        return []
+
     backtest = state.get("backtest") or {}
     actions = [
         TickerAction.model_validate(item) for item in backtest.get("ticker_actions") or []
@@ -3275,6 +3294,15 @@ def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
     objective floor, so a strategy that failed history is not dressed up as a buy list.
     """
 
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        return RecommendationGate(
+            validated=False,
+            reason=str(
+                freshness.get("reason")
+                or "freshness 한계를 확인할 수 없어 추천을 생성하지 않습니다."
+            ),
+        )
     if state.get("backtest") is None:
         return None
     validated = bool(state.get("strategy_validated"))
@@ -3312,6 +3340,12 @@ def _availability_next_actions(data_availability: Mapping[str, Any]) -> list[str
     if isinstance(proxy_items, list) and proxy_items:
         return ["재무/공시/뉴스 조건은 proxy 여부 확인"]
     return []
+
+
+def _freshness_next_actions(evidence: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(evidence, Mapping) or not evidence.get("no_recommendation"):
+        return []
+    return ["최신 source manifest 확인 후 다시 실행"]
 
 
 def _route_after_ambiguity(state: QuantAgentState) -> str:
@@ -3373,6 +3407,15 @@ def build_public_backtest_performance(  # noqa: F811
 
 
 def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        return RecommendationGate(
+            validated=False,
+            reason=str(
+                freshness.get("reason")
+                or "freshness 한계를 확인할 수 없어 추천을 생성하지 않습니다."
+            ),
+        )
     backtest_payload = state.get("backtest")
     if backtest_payload is None:
         return None
