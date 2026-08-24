@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from hashlib import sha256
-import math
 import logging
+import math
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from hashlib import sha256
 from time import perf_counter
 from typing import Any, Literal
 from uuid import UUID
+
+from pydantic import ValidationError
 
 from ai_graph.audit import (
     AuditSession,
@@ -25,22 +27,25 @@ from ai_graph.data_sources import (
     screening_data_families,
 )
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
-from pydantic import ValidationError
-
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
+from ai_graph.freshness import (
+    build_freshness_evidence,
+    freshness_status_from_metadata,
+)
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
     generate_strategy_conditions,
     resolve_strategy_intent,
 )
+from ai_graph.memory import AnalysisMemory
 from ai_graph.nodes.backtest import (
     BENCHMARK_LABEL,
     BENCHMARK_METHOD,
     BENCHMARK_WARNING,
     MAX_OBJECTIVE_DRAWDOWN,
+    METRIC_ROUND_DIGITS,
     MIN_OBJECTIVE_SHARPE,
     MIN_OBJECTIVE_TRADES,
-    METRIC_ROUND_DIGITS,
     _annualized_return,
     _benchmark_objective_reasons,
     _calmar_ratio,
@@ -52,7 +57,11 @@ from ai_graph.nodes.backtest import (
     _summary_float_default,
     backtest_node,
 )
-from ai_graph.memory import AnalysisMemory
+from ai_graph.nodes.backtest_code import backtest_code_node
+from ai_graph.nodes.report import report_node
+from ai_graph.nodes.risk_manager import risk_manager_node
+from ai_graph.nodes.signal import signal_node
+from ai_graph.preflight import classify_research_request
 from ai_graph.progress import raise_if_cancelled, report_activity, report_node_stage
 from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_strategy import (
@@ -61,26 +70,16 @@ from ai_graph.quant_strategy import (
     robust_strategy_source_refs,
     rsi_trade_rules,
 )
-from ai_graph.nodes.backtest_code import backtest_code_node
-from ai_graph.nodes.report import report_node
-from ai_graph.nodes.risk_manager import risk_manager_node
-from ai_graph.nodes.signal import signal_node
-from ai_graph.preflight import classify_research_request
 from ai_graph.research_eligibility import PerformanceAvailable
-from ai_graph.source_manifest import (
-    build_pipeline_extract_snapshot,
-    is_release_profile,
-    validate_release_metadata,
-)
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
     BacktestBenchmark,
+    BacktestEquityPoint,
+    BacktestMetrics,
     BacktestPerformance,
     BacktestReliability,
-    BacktestEquityPoint,
     CandidateBacktestResult,
-    BacktestMetrics,
     ClarificationOption,
     Condition,
     DataRequirement,
@@ -88,14 +87,19 @@ from ai_graph.schemas import (
     EvidenceRef,
     InternalPayload,
     PublicMetricDetail,
+    RecommendationGate,
     ScreeningMatch,
     SemanticSlots,
     SourceUsage,
-    RecommendationGate,
     StrategyCandidateCard,
-    TickerAction,
     StrategySpec,
+    TickerAction,
     UserPayload,
+)
+from ai_graph.source_manifest import (
+    build_pipeline_extract_snapshot,
+    is_release_profile,
+    validate_release_metadata,
 )
 from ai_graph.state import QuantAgentState
 
@@ -705,6 +709,9 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         "source_usage": [usage.model_dump() for usage in source_usage],
         "evidence_refs": [evidence.model_dump() for evidence in evidence_refs],
         "freshness_status": _aggregate_freshness_status(source_usage),
+        "freshness_evidence": build_freshness_evidence(
+            pipeline_data.metadata
+        ).model_dump(),
         "proxy_disclosure": _proxy_disclosure(data_requirements),
         "data": {
             "candidate_cards": [card.model_dump() for card in cards],
@@ -871,6 +878,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
                 "email_projection 예약",
                 "실거래 전 데이터 어댑터 연결",
                 *_availability_next_actions(state.get("data", {}).get("data_availability", {})),
+                *_freshness_next_actions(state.get("freshness_evidence")),
             ],
             "candidate_cards": cards,
             "report": report,
@@ -922,6 +930,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         data_requirements=state.get("data_requirements"),
         source_usage=state.get("source_usage"),
         freshness_status=state.get("freshness_status"),
+        freshness_evidence=state.get("freshness_evidence"),
         proxy_disclosure=state.get("proxy_disclosure"),
         failure_cause=state.get("failure_cause"),
         evidence_refs=state.get("evidence_refs"),
@@ -939,19 +948,47 @@ def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
     specify, instead of being stopped at a form.
     """
 
-    base = (
-        "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다."
-        if validated
-        else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
-    )
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        base = "freshness 한계로 추천을 생성하지 않았습니다. 아래 결과는 검토용입니다."
+    else:
+        base = (
+            "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다."
+            if validated
+            else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
+        )
+    sections = [base, *_universe_split_disclosure(state)]
     ambiguity = state.get("ambiguity") or {}
     assumptions = [
         str(item).strip() for item in ambiguity.get("assumptions", []) if str(item).strip()
     ]
-    if not assumptions:
-        return base
-    listed = "\n".join(f"- {item}" for item in assumptions[:5])
-    return f"{base}\n\n지정하지 않으신 부분은 이렇게 정해서 진행했습니다:\n{listed}"
+    if assumptions:
+        listed = "\n".join(f"- {item}" for item in assumptions[:5])
+        sections.append(f"지정하지 않으신 부분은 이렇게 정해서 진행했습니다:\n{listed}")
+    return "\n\n".join(sections)
+
+
+def _universe_split_disclosure(state: QuantAgentState) -> list[str]:
+    """Explain any point-in-time universe split between testing and screening."""
+
+    pipeline = state.get("data", {}).get("pipeline_data_source") or {}
+    descriptor = pipeline.get("backtest_universe") if isinstance(pipeline, Mapping) else None
+    if not isinstance(descriptor, Mapping):
+        return []
+    lines = [
+        (
+            "백테스트는 과거 시점(PIT) 기준 유니버스로 규칙 자체를 검증하고, "
+            "아래 종목은 같은 규칙을 오늘 데이터에 적용한 결과입니다. "
+            "두 목록이 서로 다른 것은 정상입니다."
+        )
+    ]
+    excluded = descriptor.get("excluded_screening_candidate_count")
+    if isinstance(excluded, int) and not isinstance(excluded, bool) and excluded > 0:
+        lines.append(
+            f"오늘 스크리닝 후보 중 {excluded}종목은 백테스트 구간의 과거 시점 유니버스에 없어 "
+            "백테스트 거래 대상에서 제외됐습니다."
+        )
+    return lines
 
 
 def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> None:
@@ -1282,7 +1319,11 @@ def build_source_usage(
                 query=f"{requirement.family}: {query}",
                 retrieved_at=now,
                 source_refs=[str(source_ref)] if source_ref else [],
-                freshness_status="unknown",
+                freshness_status=(
+                    freshness_status_from_metadata(pipeline_metadata)
+                    if uses_postgres
+                    else "unknown"
+                ),
                 confidence=requirement.source_confidence_floor if uses_postgres else 0.0,
                 fallback_used=pipeline_metadata.get("source") == "fixture",
                 evidence_refs=[f"source:{trace_id}:{requirement.family}"],
@@ -3154,6 +3195,10 @@ def _ticker_actions(
     no action from the backtest come back as WATCH, explicitly.
     """
 
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        return []
+
     backtest = state.get("backtest") or {}
     actions = [
         TickerAction.model_validate(item) for item in backtest.get("ticker_actions") or []
@@ -3226,6 +3271,12 @@ def _availability_next_actions(data_availability: Mapping[str, Any]) -> list[str
     return []
 
 
+def _freshness_next_actions(evidence: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(evidence, Mapping) or not evidence.get("no_recommendation"):
+        return []
+    return ["최신 source manifest 확인 후 다시 실행"]
+
+
 def _route_after_ambiguity(state: QuantAgentState) -> str:
     if state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
         return "final"
@@ -3285,6 +3336,15 @@ def build_public_backtest_performance(  # noqa: F811
 
 
 def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        return RecommendationGate(
+            validated=False,
+            reason=str(
+                freshness.get("reason")
+                or "freshness 한계를 확인할 수 없어 추천을 생성하지 않습니다."
+            ),
+        )
     backtest_payload = state.get("backtest")
     if backtest_payload is None:
         return None
@@ -3310,12 +3370,70 @@ def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
         benchmark_return=backtest.backtest_payload.get("benchmark_return"),
     )
     validated = not reasons
-    reason = (
-        "objective gate를 모두 통과해 오늘의 추천을 유지합니다."
-        if validated
-        else "objective 조건 미충족: " + ", ".join(reasons)
+    shortfalls = [item for item in reasons if not _is_data_gap_reason(item)]
+    gaps = [
+        *_benchmark_input_gaps(backtest),
+        *(item for item in reasons if _is_data_gap_reason(item)),
+    ]
+    return RecommendationGate(
+        validated=validated,
+        reason=_gate_reason(validated, shortfalls, gaps),
+        verification_complete=not gaps,
+        unmet_objective_criteria=shortfalls,
+        unmet_data_requirements=gaps,
     )
-    return RecommendationGate(validated=validated, reason=reason)
+
+
+# These messages describe inputs that did not arrive, not an observed metric below its
+# threshold. They must remain distinct from a measured strategy shortfall.
+_DATA_GAP_REASON_MARKERS = ("is unavailable", "계산할 수 없음", "비교 구간이 없습니다")
+
+
+def _is_data_gap_reason(reason: str) -> bool:
+    return any(marker in reason for marker in _DATA_GAP_REASON_MARKERS)
+
+
+def _benchmark_input_gaps(backtest: CandidateBacktestResult) -> list[str]:
+    if backtest.strategy_a.selection_mode != "automatic":
+        return []
+    payload = backtest.backtest_payload
+    benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
+    primary = benchmark.get("primary") if isinstance(benchmark, Mapping) else None
+    if isinstance(primary, Mapping) and primary.get("available"):
+        return []
+    detail = ""
+    if isinstance(primary, Mapping):
+        stated = str(primary.get("unavailable_reason") or "").strip()
+        detail = f" ({stated})" if stated else ""
+    return [
+        (
+            "공식 KOSPI/KOSDAQ TR 벤치마크 시계열이 아직 적재되지 않아 "
+            f"벤치마크 대비 검증을 완료하지 못했습니다{detail}"
+        )
+    ]
+
+
+def _gate_reason(validated: bool, shortfalls: Sequence[str], gaps: Sequence[str]) -> str:
+    if validated and not gaps:
+        return "objective gate를 모두 통과해 오늘의 추천을 유지합니다."
+    if validated:
+        return (
+            "측정된 objective 지표는 모두 통과했지만, 검증에 필요한 데이터가 없어 "
+            "검증을 끝내지 못했습니다: " + "; ".join(gaps)
+        )
+    if shortfalls and gaps:
+        return (
+            "objective 조건 미충족: "
+            + ", ".join(shortfalls)
+            + " / 그리고 아직 검증하지 못한 항목: "
+            + "; ".join(gaps)
+        )
+    if shortfalls:
+        return "objective 조건 미충족: " + ", ".join(shortfalls)
+    return (
+        "성과가 기준에 미달한 것이 아니라, 검증에 필요한 데이터가 아직 없어 "
+        "판정을 내리지 못했습니다: " + "; ".join(gaps)
+    )
 
 
 def _objective_gate_reasons(

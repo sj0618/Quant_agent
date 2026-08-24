@@ -34,6 +34,7 @@ PUBLIC_METRIC_KEYS = (
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _IMPLEMENTATION_SOURCES = {
     "engine": "backtest_module/backtest_module/performance.py",
+    "trade": "backtest_module/backtest_module/backtest.py",
     "analysis": "ai/ai_graph/nodes/backtest.py",
     "projection": "ai/ai_graph/quant_performance.py",
 }
@@ -112,16 +113,13 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     "profit_factor": {
         "label": "수익팩터",
         "unit": "ratio",
-        "plain_explanation": (
-            "백테스트 일별 기간수익률(period-return)의 양수 합계를 음수 합계의 절대값으로 "
-            "나눈 값입니다. 승률이나 거래 수량의 근사값이 아닙니다."
-        ),
-        "why_used": "이익 기여 구간과 손실 구간의 상대 비율을 보조적으로 보여줍니다.",
+        "plain_explanation": "청산된 거래의 총이익을 총손실로 나눈 값입니다. 실현손익 기반이며 승률과는 별개입니다.",
+        "why_used": "이긴 거래가 진 거래를 얼마나 덮는지를 보여줍니다. 승률이 높아도 이 값이 1 미만이면 손실입니다.",
         "caution": (
-            "손실 기간이 없어 분모가 0이면 유한한 비율이 아니므로 값을 임의 상한이나 1로 "
-            "바꾸지 않고 검증 불가로 표시합니다."
+            "거래 수가 적으면 과도하게 변동할 수 있습니다. 진 거래가 없으면 비율이 정의되지 "
+            "않아 표시하지 않습니다."
         ),
-        "source_refs": [_QUANTSTATS_SOURCE],
+        "source_refs": [],
     },
     "benchmark_return": {
         "label": "프록시 벤치마크 수익률",
@@ -283,19 +281,19 @@ _METRIC_CONTRACTS: dict[str, dict[str, Any]] = {
         denominator="완료 거래 수",
     ),
     "profit_factor": _contract(
-        "PF = Σ max(R_t, 0) / |Σ min(R_t, 0)|",
-        inputs=["백테스트 자산곡선에서 계산한 일별 기간수익률 R_t"],
-        input_window="전체 백테스트 기간의 일별 수익률(첫 기준점 제외)",
-        implementation_source="analysis",
+        "PF = Σ max(net_pnl, 0) / |Σ min(net_pnl, 0)|",
+        inputs=["청산 거래별 순손익 net_pnl"],
+        input_window="전체 백테스트 기간의 청산 거래",
+        implementation_source="trade",
         implementation_ref=(
-            "backtest_module.performance.calculate_quantstats_metrics → "
-            "quantstats.stats.profit_factor; ai_graph.nodes.backtest._profit_factor"
+            "backtest_module.backtest.BacktestEngine._summary → trade_profit_factor; "
+            "ai_graph.nodes.backtest._profit_factor"
         ),
-        denominator="|Σ min(R_t, 0)| (음수 기간수익률의 절대 합)",
-        clip_policy="상한/하한을 적용하지 않습니다. 승률 기반 프록시·0~3 clip을 사용하지 않습니다.",
+        denominator="|Σ min(net_pnl, 0)| (손실 청산 거래의 절대 손익 합)",
+        clip_policy="상한/하한이나 승률 기반 프록시를 사용하지 않습니다.",
         null_policy=(
-            "분모가 0이어서 엔진 값이 non-finite이거나, 값이 없거나 defaulted 경고가 있으면 "
-            "value=null, is_available=false로 표시합니다."
+            "손실 청산 거래가 없어 분모가 0이거나 값이 없으면 value=null, "
+            "is_available=false로 표시합니다."
         ),
     ),
     "benchmark_return": _contract(

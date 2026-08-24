@@ -3547,22 +3547,17 @@ def _annualized_return(
 
 
 def _profit_factor(engine_summary: Mapping[str, Any]) -> float | None:
-    """Return the engine's period-return profit factor without a win-rate proxy.
+    """Return realized-trade profit factor, never a period-return substitute.
 
-    Profit factor is the sum of positive period returns divided by the absolute sum of
-    negative period returns.  A trade win rate is neither term of that ratio.  Preserve
-    the engine's finite result without clipping it, and fail closed when the engine had
-    no finite denominator/value or defaulted the metric after an error.
+    The engine records gross profit and loss from closed-trade net PnL as
+    ``trade_profit_factor``. Older summaries that only have the unrelated period-return
+    metric fail closed rather than changing the meaning of the public field.
     """
 
-    if any(
-        warning.get("metric") == "profit_factor"
-        and isinstance(warning.get("reason") or warning.get("warning"), str)
-        for warning in _summary_warning_list(engine_summary)
-    ):
+    value = engine_summary.get("trade_profit_factor")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    value = engine_summary.get("profit_factor")
-    return float(value) if _is_numeric_metric(value) else None
+    return float(value) if math.isfinite(value) else None
 
 
 def _equal_weight_benchmark_curve(

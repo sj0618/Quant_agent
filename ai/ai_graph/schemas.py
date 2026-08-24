@@ -760,6 +760,12 @@ class RecommendationGate(BaseModel):
 
     validated: bool
     reason: str = Field(min_length=1)
+    # A measured threshold miss and an acceptance rule that could not be evaluated are
+    # distinct outcomes. Keep them separate so unavailable inputs are never presented
+    # as strategy underperformance.
+    verification_complete: bool = True
+    unmet_objective_criteria: list[str] = Field(default_factory=list)
+    unmet_data_requirements: list[str] = Field(default_factory=list)
 
 
 class RuleProvenance(BaseModel):
