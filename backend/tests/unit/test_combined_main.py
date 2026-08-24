@@ -47,6 +47,9 @@ class DummySettings:
     def allowed_origins(self) -> list[str]:
         return []
 
+    def safe_summary(self) -> dict[str, object]:
+        return {}
+
 
 class DummyRedis:
     async def get(self, key: str) -> None:
@@ -223,6 +226,7 @@ def test_combined_route_surface_routes_general_and_ai_without_cross_shadowing(
 ):
     with TestClient(combined_main.app, base_url="http://testserver") as client:
         combined_health = client.get("/combined-health")
+        general_health = client.get("/health")
         general_api_status = client.get("/api/v1/api-status")
         unauthenticated_me = client.get("/api/v1/auth/me")
         ai_health = client.get("/ai-api/health")
@@ -232,12 +236,16 @@ def test_combined_route_surface_routes_general_and_ai_without_cross_shadowing(
         ai_not_found = client.get("/ai-api/not-found")
         general_not_found = client.get("/api/v1/not-found")
         bare_analysis_jobs = client.get("/analysis-jobs")
+        stripped_ai_api_status = client.get("/api-status")
         stripped_research_parse = client.post("/api/strategies/parse", json={"natural_language": "RSI 조건"})
         stripped_research_job = client.post("/api/research/jobs", json={"canonical_rule": {}, "draft_token": "signed"})
         general_ai_jobs = client.get("/api/v1/analysis-jobs")
 
     assert combined_health.status_code == 200
     assert combined_health.json() == {"status": "ok", "service": "quantagent-combined-backend"}
+
+    assert general_health.status_code == 200
+    assert general_health.json()["component"] == "backend"
 
     assert general_api_status.status_code == 200
     assert general_api_status.json()["service"] == "QuantAgent Track C API"
@@ -266,6 +274,8 @@ def test_combined_route_surface_routes_general_and_ai_without_cross_shadowing(
 
     # Root /analysis-jobs is now a compatibility alias for the mounted AI app.
     assert bare_analysis_jobs.status_code == 401
+    assert stripped_ai_api_status.status_code == 200
+    assert stripped_ai_api_status.json()["service"] == "QuantAgent AI API"
     assert stripped_research_parse.status_code == 401
     assert stripped_research_job.status_code == 401
     assert general_ai_jobs.status_code == 404
@@ -313,6 +323,10 @@ def compat_ai_app() -> FastAPI:
     @app.get("/analysis-jobs")
     async def list_analysis_jobs(request: Request):
         return JSONResponse(await capture_request(request, route="list"))
+
+    @app.get("/api-status")
+    async def get_api_status(request: Request):
+        return JSONResponse(await capture_request(request, route="api-status"))
 
     @app.get("/analysis-jobs/{job_id}")
     async def get_analysis_job(request: Request, job_id: str):
@@ -399,6 +413,48 @@ def test_legacy_ai_prefix_compatibility_rewrites_list_requests_and_preserves_que
     assert response.json()["query_string"] == "limit=20"
     assert response.json()["raw_path"] == "/ai-api/analysis-jobs"
     assert compat_ai_app.state.calls[-1]["query_string"] == "limit=20"
+
+
+def test_legacy_ai_prefix_compatibility_rewrites_api_status_without_shadowing_general_health(
+    compat_combined_app: FastAPI,
+    compat_ai_app: FastAPI,
+):
+    with TestClient(compat_combined_app, base_url="http://testserver") as client:
+        response = client.get("/api-status")
+
+    assert response.status_code == 200
+    assert response.json()["route"] == "api-status"
+    assert response.json()["mounted_path"] == "/api-status"
+    assert response.json()["root_path"] == "/ai-api"
+    assert response.json()["raw_path"] == "/ai-api/api-status"
+    assert compat_ai_app.state.calls[-1]["method"] == "GET"
+
+
+def test_legacy_ai_prefix_compatibility_leaves_general_health_and_readiness_unshadowed(
+    monkeypatch: pytest.MonkeyPatch,
+    compat_ai_app: FastAPI,
+):
+    general_app = FastAPI(title="general-compat-stub")
+
+    @general_app.get("/health")
+    async def general_health():
+        return {"component": "general-health"}
+
+    @general_app.get("/readiness")
+    async def general_readiness():
+        return {"component": "general-readiness"}
+
+    monkeypatch.setattr(combined_main, "general_app", general_app)
+    monkeypatch.setattr(combined_main, "ai_app", compat_ai_app)
+    application = combined_main.create_app()
+
+    with TestClient(application, base_url="http://testserver") as client:
+        health = client.get("/health")
+        readiness = client.get("/readiness")
+
+    assert health.json() == {"component": "general-health"}
+    assert readiness.json() == {"component": "general-readiness"}
+    assert compat_ai_app.state.calls == []
 
 
 @pytest.mark.parametrize(
@@ -520,6 +576,7 @@ def test_legacy_ai_prefix_compatibility_rewrites_only_current_research_paths(
         ("/api/research/job", 404, None),
         ("/api/research/jobs-extra", 404, None),
         ("/api/strategies/parse-extra", 404, None),
+        ("/api-status-extra", 404, None),
         ("/api/v1/analysis-jobs", 404, None),
         ("/foo/analysis-jobs", 404, None),
     ],
