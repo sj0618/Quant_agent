@@ -38,16 +38,21 @@ test("production deploy starts one non-reloading combined backend", async () => 
   assert.doesNotMatch(source, /--reload/);
 });
 
-test("production deploy serves the built frontend instead of Vite development assets", async () => {
+test("production deploy keeps the nginx frontend port but delegates route policy to the combined backend", async () => {
   const [source, serverHealth] = await Promise.all([
     readFile(new URL("../../.github/workflows/deploy.yml", import.meta.url), "utf8"),
     readFile(new URL("../../.github/workflows/server-health.yml", import.meta.url), "utf8"),
   ]);
 
   assert.match(source, /VITE_AI_API_BASE_URL="\/ai-api" npm run build/);
-  assert.match(source, /npm run preview -- --host 0\.0\.0\.0 --port 18000/);
+  assert.match(source, /node scripts\/production-gateway\.mjs/);
+  assert.match(source, /HOST="127\.0\.0\.1" PORT="18000"/);
+  assert.match(source, /unknown_route_status=.*http:\/\/127\.0\.0\.1:18000\/retired-internal-route/);
+  assert.doesNotMatch(source, /npm run preview/);
   assert.match(source, /Frontend bundle contains Vite development assets/);
   assert.doesNotMatch(source, /npm run dev/);
   assert.match(serverHealth, /Frontend bundle contains Vite development assets/);
+  assert.match(serverHealth, /unknown_route_status=/);
+  assert.match(serverHealth, /retired-internal-route/);
   assert.match(serverHealth, /http:\/\/127\.0\.0\.1:\$FE_PORT\//);
 });

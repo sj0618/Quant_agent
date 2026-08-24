@@ -36,5 +36,9 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert 'settings.auth_trusted_proxy_headers' in workflow
     assert 'set(settings.trusted_proxy_hosts) == {"127.0.0.1", "::1"}' in workflow
     assert "xfwd: true" in (REPOSITORY_ROOT / "fe" / "vite.config.ts").read_text(encoding="utf-8")
+    assert "node scripts/production-gateway.mjs" in workflow
+    assert 'HOST="127.0.0.1" PORT="18000"' in workflow
+    assert "retired-internal-route" in workflow
+    assert "npm run preview" not in workflow
     assert "AI_RULE_DRAFT_HMAC_SECRET" in workflow
     assert "ai-rule-draft-hmac.secret" in workflow
