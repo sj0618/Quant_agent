@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from ai_graph.schemas import APIEnvelope, Stage
 
@@ -68,7 +68,10 @@ class AnalysisJobRepository(Protocol):
 class RestartReconciliationRepository(Protocol):
     """Persistent repositories need a strict active-row startup read."""
 
-    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list[AnalysisJob]:
+    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> Any:
+        ...
+
+    def force_fail_undecodable_job(self, job_id: str, *, error_message: str, reason: str) -> bool:
         ...
 
 
@@ -155,7 +158,7 @@ class PersistentAnalysisJobStore:
     def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
         return self._repository.list_jobs(limit=limit)
 
-    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list[AnalysisJob]:
+    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> Any:
         """Do not let compatibility history reads weaken restart recovery."""
 
         if not isinstance(self._repository, RestartReconciliationRepository):
@@ -163,3 +166,14 @@ class PersistentAnalysisJobStore:
                 "PersistentAnalysisJobStore requires strict restart reconciliation support."
             )
         return self._repository.list_jobs_for_reconciliation(limit=limit)
+
+    def force_fail_undecodable_job(self, job_id: str, *, error_message: str, reason: str) -> bool:
+        """Settle an active row this build cannot load, so startup is not held hostage."""
+
+        if not isinstance(self._repository, RestartReconciliationRepository):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires strict restart reconciliation support."
+            )
+        return self._repository.force_fail_undecodable_job(
+            job_id, error_message=error_message, reason=reason
+        )

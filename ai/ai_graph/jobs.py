@@ -248,7 +248,10 @@ class AnalysisJobStore(Protocol):
 class RestartReconciliationStore(Protocol):
     """Optional strict active-job read used only during process startup."""
 
-    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list[AnalysisJob]:
+    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> Any:
+        ...
+
+    def force_fail_undecodable_job(self, job_id: str, *, error_message: str, reason: str) -> bool:
         ...
 
 
@@ -1227,7 +1230,7 @@ def reap_interrupted_jobs(
 
     try:
         reconciliation_store = store if isinstance(store, RestartReconciliationStore) else None
-        jobs = (
+        batch = (
             reconciliation_store.list_jobs_for_reconciliation(limit=limit)
             if reconciliation_store is not None
             else store.list_jobs(limit=limit)
@@ -1237,7 +1240,31 @@ def reap_interrupted_jobs(
             "analysis job restart reconciliation could not inspect the job store"
         ) from error
 
+    jobs = list(getattr(batch, "jobs", batch))
+    # Active rows this build cannot load at all. They are settled by id rather than
+    # skipped, and rather than refusing to start: they are already in the database, so a
+    # policy of refusing over them is an outage with no way out of it.
+    undecodable = list(getattr(batch, "undecodable_job_ids", ()))
     reaped: list[str] = []
+    for job_id in undecodable:
+        try:
+            settled = reconciliation_store.force_fail_undecodable_job(
+                job_id,
+                error_message=INTERRUPTED_BY_RESTART_MESSAGE,
+                reason=INTERRUPTED_BY_RESTART_REASON,
+            )
+        except Exception as error:
+            _logger.exception("could not settle undecodable analysis job %s", job_id)
+            raise InterruptedJobReconciliationError(
+                "analysis job restart reconciliation could not settle an undecodable job"
+            ) from error
+        if settled:
+            _logger.warning(
+                "settled analysis job %s written by an older build; it could not be decoded",
+                job_id,
+            )
+            reaped.append(job_id)
+
     for job in jobs:
         if job.status not in _REAPABLE_STATUSES or job.owner_incarnation == incarnation:
             continue

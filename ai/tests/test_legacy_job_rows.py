@@ -62,26 +62,73 @@ def test_a_legacy_row_does_not_take_the_whole_list_down(caplog):
     assert "status=running" in caplog.text
 
 
-def test_active_legacy_row_refuses_restart_reconciliation() -> None:
-    """A restart must not hide an active row that cannot be transitioned terminal."""
+def test_an_active_legacy_row_is_reported_separately_from_the_ones_that_decode() -> None:
+    """A restart must not hide an active row it cannot transition - but it can settle it.
+
+    Refusing startup over these rows is not a policy that terminates: they are already in
+    the database, so nothing the process does on boot makes them decodable. The read
+    therefore hands them back by id instead of raising, and the reaper settles them.
+    """
 
     repo = PostgresAnalysisJobRepository.__new__(PostgresAnalysisJobRepository)
     repo._dsn = "postgresql://example"
     repo._connector = lambda *a, **k: _Connection([{"job_jsonb": _legacy_document()}])
+
+    batch = repo.list_jobs_for_reconciliation()
+
+    assert batch.jobs == []
+    assert batch.undecodable_job_ids == ["job_legacy01"]
+
+
+def test_an_active_row_with_no_id_still_refuses() -> None:
+    """Settling happens by id. Without one there is nothing to settle, so fail closed."""
+
+    document = _legacy_document()
+    del document["job_id"]
+    repo = PostgresAnalysisJobRepository.__new__(PostgresAnalysisJobRepository)
+    repo._dsn = "postgresql://example"
+    repo._connector = lambda *a, **k: _Connection([{"job_jsonb": document}])
 
     with pytest.raises(PersistedJobReconciliationError):
         repo.list_jobs_for_reconciliation()
 
 
-def test_active_legacy_row_refuses_application_startup() -> None:
-    """The strict persistent read reaches the lifespan before any route can serve."""
+def test_startup_settles_an_undecodable_active_row_instead_of_refusing(caplog) -> None:
+    """The deploy blocker: production holds these rows, so refusing never let the app up."""
 
-    repo = PostgresAnalysisJobRepository.__new__(PostgresAnalysisJobRepository)
-    repo._dsn = "postgresql://example"
-    repo._connector = lambda *a, **k: _Connection([{"job_jsonb": _legacy_document()}])
+    settled: list[str] = []
+
+    class _Repo(PostgresAnalysisJobRepository):
+        def __init__(self) -> None:
+            self._dsn = "postgresql://example"
+            self._connector = lambda *a, **k: _Connection([{"job_jsonb": _legacy_document()}])
+
+        def force_fail_undecodable_job(self, job_id, *, error_message, reason):
+            settled.append(job_id)
+            return True
+
+    with caplog.at_level(logging.WARNING), TestClient(
+        create_app(PersistentAnalysisJobStore(_Repo()))
+    ) as client:
+        assert client.get("/health").status_code == 200
+
+    assert settled == ["job_legacy01"]
+    assert "job_legacy01" in caplog.text
+
+
+def test_startup_still_refuses_when_an_undecodable_row_cannot_be_settled() -> None:
+    """If even the direct write fails, the row really is stranded - say so loudly."""
+
+    class _Repo(PostgresAnalysisJobRepository):
+        def __init__(self) -> None:
+            self._dsn = "postgresql://example"
+            self._connector = lambda *a, **k: _Connection([{"job_jsonb": _legacy_document()}])
+
+        def force_fail_undecodable_job(self, job_id, *, error_message, reason):
+            raise RuntimeError("row is locked")
 
     with pytest.raises(InterruptedJobReconciliationError), TestClient(
-        create_app(PersistentAnalysisJobStore(repo))
+        create_app(PersistentAnalysisJobStore(_Repo()))
     ):
         pass
 
