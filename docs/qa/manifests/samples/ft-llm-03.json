@@ -1,0 +1,73 @@
+{
+  "document_status": "DRAFT FOR REVIEW",
+  "approval": "PENDING",
+  "wbs_id": "FT-LLM-03",
+  "quantqa_version": "QuantQA:v1",
+  "full_git_sha": null,
+  "required_tier": "T2",
+  "required_classes": ["S", "R"],
+  "observed_classes": ["S"],
+  "status": "UNVERIFIED",
+  "requirement_origin": {
+    "required_classes": "QUANTQA_V1_IMPLEMENTATION_DEFINITION",
+    "tier_label": "QUANTQA_V1_IMPLEMENTATION_DEFINITION"
+  },
+  "wbs_contract_ref": {
+    "spreadsheet_id": "1V7SnG_x-cLIFbrSurDIadtx5GCY9HfL9jRqdyAl70Ks",
+    "gid": 2030261433,
+    "sheet": "2_WBS",
+    "wbs_id": "FT-LLM-03",
+    "row_number": 26,
+    "observed_at": "2026-08-22T09:38:24.3061987+09:00"
+  },
+  "roles": {
+    "owner": "육은서",
+    "executor": null,
+    "reviewer": null,
+    "approver": "조은채",
+    "reviewer_approver_same_allowed_v1": true
+  },
+  "execution_boundary": {
+    "scope": "NOT_EXECUTED",
+    "uses_mock": null,
+    "uses_memory": null,
+    "uses_noop": null,
+    "configuration_environment_values_recorded": false,
+    "secret_values_recorded": false,
+    "production_node3_pve_load_performed": false,
+    "effective_classes": ["S"]
+  },
+  "evidence": [
+    {
+      "evidence_id": "FT-LLM-03-S-WBS-RECORD",
+      "evidence_class": "S",
+      "scenario": "Classify Azure OpenAI/provider timeout and failure without a fallback response.",
+      "pass_criteria": "There are zero mock responses, success statuses, or recommendation cards on provider failure.",
+      "actual_result": "The WBS records '#95 · pytest exit=0 · 수정 요청'; no same-revision artifact or non-mock runtime provenance is supplied.",
+      "validation_method": "cd ai && pytest -q",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": 0,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "UNVERIFIED",
+      "limitations": [
+        "A recorded pytest exit code without an artifact, full Git SHA, executor, reviewer, and provider boundary cannot establish Runtime evidence.",
+        "Mock, memory, and noop use is unknown and therefore cannot be assumed absent."
+      ]
+    }
+  ],
+  "limitations": [
+    "T2/S+R is a QuantQA:v1 implementation assignment; the Google Sheet does not explicitly assign this row a class or tier.",
+    "No provider, DB, or application runtime was accessed while preparing this draft sample."
+  ],
+  "blockers": [
+    "Same-revision non-mock Runtime evidence is required for provider timeout and failure behavior.",
+    "The WBS currently records a modification request rather than completed QA evidence."
+  ]
+}
