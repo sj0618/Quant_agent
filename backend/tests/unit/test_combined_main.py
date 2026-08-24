@@ -232,6 +232,8 @@ def test_combined_route_surface_routes_general_and_ai_without_cross_shadowing(
         ai_not_found = client.get("/ai-api/not-found")
         general_not_found = client.get("/api/v1/not-found")
         bare_analysis_jobs = client.get("/analysis-jobs")
+        stripped_research_parse = client.post("/api/strategies/parse", json={"natural_language": "RSI 조건"})
+        stripped_research_job = client.post("/api/research/jobs", json={"canonical_rule": {}, "draft_token": "signed"})
         general_ai_jobs = client.get("/api/v1/analysis-jobs")
 
     assert combined_health.status_code == 200
@@ -264,6 +266,8 @@ def test_combined_route_surface_routes_general_and_ai_without_cross_shadowing(
 
     # Root /analysis-jobs is now a compatibility alias for the mounted AI app.
     assert bare_analysis_jobs.status_code == 401
+    assert stripped_research_parse.status_code == 401
+    assert stripped_research_job.status_code == 401
     assert general_ai_jobs.status_code == 404
 
     assert any(route.path == "/static" for route in combined_main.general_app.routes)
@@ -330,6 +334,18 @@ def compat_ai_app() -> FastAPI:
             app.state.stream_finished = True
 
         return StreamingResponse(event_source(), media_type="text/event-stream")
+
+    @app.post("/api/strategies/parse")
+    async def parse_research_rule(request: Request):
+        return JSONResponse(await capture_request(request, route="rule-review"))
+
+    @app.post("/api/research/jobs")
+    async def create_research_job(request: Request):
+        return JSONResponse(await capture_request(request, route="research-create"))
+
+    @app.get("/api/research/jobs/{job_id}/result")
+    async def get_research_job_result(request: Request, job_id: str):
+        return JSONResponse(await capture_request(request, route="research-result", job_id=job_id))
 
     return app
 
@@ -461,11 +477,49 @@ def test_legacy_ai_prefix_compatibility_keeps_prefixed_ai_requests_on_the_same_a
 
 
 @pytest.mark.parametrize(
+    ("method", "path", "body", "expected_route", "job_id"),
+    [
+        ("POST", "/api/strategies/parse", {"natural_language": "RSI 조건"}, "rule-review", None),
+        (
+            "POST",
+            "/api/research/jobs",
+            {"canonical_rule": {"version": "v1"}, "draft_token": "signed"},
+            "research-create",
+            None,
+        ),
+        ("GET", "/api/research/jobs/job-123/result", None, "research-result", "job-123"),
+    ],
+)
+def test_legacy_ai_prefix_compatibility_rewrites_only_current_research_paths(
+    compat_combined_app: FastAPI,
+    compat_ai_app: FastAPI,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+    expected_route: str,
+    job_id: str | None,
+):
+    with TestClient(compat_combined_app, base_url="http://testserver") as client:
+        response = client.request(method, path, json=body)
+
+    assert response.status_code == 200
+    assert response.json()["route"] == expected_route
+    assert response.json()["mounted_path"] == path
+    assert response.json()["root_path"] == "/ai-api"
+    assert response.json()["raw_path"] == f"/ai-api{path}"
+    assert response.json()["body_json"] == body
+    assert compat_ai_app.state.calls[-1]["job_id"] == job_id
+
+
+@pytest.mark.parametrize(
     ("path", "expected_status", "expected_body_contains"),
     [
         ("/analysis-jobs-extra", 404, None),
         ("/analysis-job", 404, None),
         ("/api/analysis-jobs", 404, None),
+        ("/api/research/job", 404, None),
+        ("/api/research/jobs-extra", 404, None),
+        ("/api/strategies/parse-extra", 404, None),
         ("/api/v1/analysis-jobs", 404, None),
         ("/foo/analysis-jobs", 404, None),
     ],

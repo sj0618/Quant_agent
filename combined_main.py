@@ -26,7 +26,14 @@ ai_app = ai_main.app
 
 
 class LegacyAiPrefixCompatibilityMiddleware:
-    """Compatibility for stripped /analysis-jobs requests; only that family is restored."""
+    """Restore the known AI paths when the outer proxy strips ``/ai-api``.
+
+    The combined app normally owns the AI surface below ``/ai-api``.  The deployed
+    Nginx location currently forwards ``/ai-api/...`` as ``/...`` instead, so this
+    narrow compatibility layer restores only paths that unambiguously belong to the
+    AI app.  It must not broadly rewrite ``/api`` because that would shadow the
+    general backend's API surface.
+    """
 
     def __init__(self, app):
         self.app = app
@@ -34,7 +41,7 @@ class LegacyAiPrefixCompatibilityMiddleware:
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":
             path = scope.get("path", "")
-            if isinstance(path, str) and (path == "/analysis-jobs" or path.startswith("/analysis-jobs/")):
+            if isinstance(path, str) and self._is_stripped_ai_path(path):
                 rewritten_scope = dict(scope)
                 rewritten_scope["path"] = f"/ai-api{path}"
                 raw_path = scope.get("raw_path")
@@ -42,6 +49,12 @@ class LegacyAiPrefixCompatibilityMiddleware:
                     rewritten_scope["raw_path"] = b"/ai-api" + raw_path
                 scope = rewritten_scope
         await self.app(scope, receive, send)
+
+    @staticmethod
+    def _is_stripped_ai_path(path: str) -> bool:
+        return path in {"/analysis-jobs", "/api/strategies/parse", "/api/research/jobs"} or path.startswith(
+            ("/analysis-jobs/", "/api/research/jobs/")
+        )
 
 
 @asynccontextmanager
