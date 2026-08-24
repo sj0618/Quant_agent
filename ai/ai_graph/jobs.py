@@ -18,6 +18,12 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
+from ai_graph.analysis_capacity import (
+    ANALYSIS_CAPACITY,
+    CAPACITY_TIMEOUT_MESSAGE,
+    AnalysisCapacityGate,
+    AnalysisCapacityTimeout,
+)
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.progress import (
     AnalysisCancelled,
@@ -461,6 +467,37 @@ class CancellationRegistry:
 
 
 def run_job_sync(
+    store: AnalysisJobStore,
+    job_id: str,
+    runner: AnalysisRunner,
+    *,
+    events: JobEventBuffer | None = None,
+    cancellations: CancellationRegistry | None = None,
+    capacity: AnalysisCapacityGate = ANALYSIS_CAPACITY,
+) -> AnalysisJob:
+    """Run one analysis, waiting for a capacity slot before it starts.
+
+    The slot is taken before the job is marked RUNNING, so a job queued behind others
+    still reads as queued. Saying RUNNING while nothing is running is what makes a busy
+    service look hung, and it is also what an operator would have to disprove by hand.
+    """
+
+    try:
+        with capacity.slot():
+            return _run_analysis_job(
+                store, job_id, runner, events=events, cancellations=cancellations
+            )
+    except AnalysisCapacityTimeout:
+        _logger.warning(
+            "analysis job %s gave up waiting for a capacity slot (limit=%d, waiting=%d)",
+            job_id,
+            capacity.max_concurrency,
+            capacity.waiting,
+        )
+        return store.fail_job(job_id, CAPACITY_TIMEOUT_MESSAGE)
+
+
+def _run_analysis_job(
     store: AnalysisJobStore,
     job_id: str,
     runner: AnalysisRunner,
