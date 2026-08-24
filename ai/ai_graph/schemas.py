@@ -619,7 +619,7 @@ class CandidateBacktestResult(BaseModel):
     walk_forward: WalkForwardPolicyResult | None = None
 
 
-SignalAction = Literal["BUY", "HOLD", "DROP"]
+SignalAction = Literal["BUY", "HOLD", "DROP", "NO_RECOMMENDATION"]
 
 
 class SignalDecision(BaseModel):
@@ -837,7 +837,7 @@ class DailyDigestComparisonRow(BaseModel):
     total_return: float
     max_drawdown: float
     sharpe_ratio: float
-    status: Literal["주목", "유지", "관망"]
+    status: Literal["주목", "유지", "관망", "근거 부족"]
 
 
 class DailyDigestStrategyCard(BaseModel):

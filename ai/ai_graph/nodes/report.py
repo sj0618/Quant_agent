@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_graph.freshness import build_freshness_evidence
+from ai_graph.freshness import (
+    build_freshness_evidence,
+    withhold_recommendations_without_l4_evidence,
+)
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_report_writeup
 from ai_graph.quant_performance import project_public_performance
 from ai_graph.research_eligibility import PerformanceAvailable, PublicPerformance
@@ -18,6 +21,7 @@ def build_report_bundle(
     debate: dict[str, Any] | None = None,
     citations: list[dict[str, str]] | None = None,
     public_performance: PublicPerformance | None = None,
+    l4_evidence: list[dict[str, Any]] | None = None,
 ) -> ReportBundle:
     signal = risk.signal
     risk_text = (
@@ -35,7 +39,10 @@ def build_report_bundle(
     if citations:
         sections.append({"id": "citations", "title": "출처", "items": citations})
     if data:
-        freshness_evidence = build_freshness_evidence(data.get("pipeline_data_source"))
+        freshness_evidence = withhold_recommendations_without_l4_evidence(
+            build_freshness_evidence(data.get("pipeline_data_source")),
+            l4_evidence=l4_evidence,
+        )
         sections.insert(
             3,
             {
@@ -86,8 +93,9 @@ def build_report_bundle(
             {
                 "id": "freshness",
                 "title": "데이터 freshness",
-                "items": build_freshness_evidence(
-                    data.get("pipeline_data_source")
+                "items": withhold_recommendations_without_l4_evidence(
+                    build_freshness_evidence(data.get("pipeline_data_source")),
+                    l4_evidence=l4_evidence,
                 ).model_dump(mode="json"),
             }
         )
@@ -120,6 +128,7 @@ def report_node(state: dict) -> dict:
         debate=debate,
         citations=_screening_citations(state),
         public_performance=public_performance,
+        l4_evidence=state.get("l4_evidence"),
     )
     return {"report": report.model_dump(), "report_debate": debate}
 

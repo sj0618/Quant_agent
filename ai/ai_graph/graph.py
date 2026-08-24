@@ -31,6 +31,7 @@ from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.freshness import (
     build_freshness_evidence,
     freshness_status_from_metadata,
+    withhold_recommendations_without_l4_evidence,
 )
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
@@ -703,15 +704,17 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         screening_candidates=pipeline_data.screening_candidates,
         sector=semantic_slots.sector,
     )
+    freshness_evidence = withhold_recommendations_without_l4_evidence(
+        build_freshness_evidence(pipeline_data.metadata),
+        l4_evidence=pipeline_data.l4_evidence,
+    )
     output: dict[str, Any] = {
         "semantic_slots": semantic_slots.model_dump(),
         "data_requirements": [requirement.model_dump() for requirement in data_requirements],
         "source_usage": [usage.model_dump() for usage in source_usage],
         "evidence_refs": [evidence.model_dump() for evidence in evidence_refs],
         "freshness_status": _aggregate_freshness_status(source_usage),
-        "freshness_evidence": build_freshness_evidence(
-            pipeline_data.metadata
-        ).model_dump(),
+        "freshness_evidence": freshness_evidence.model_dump(),
         "proxy_disclosure": _proxy_disclosure(data_requirements),
         "data": {
             "candidate_cards": [card.model_dump() for card in cards],
