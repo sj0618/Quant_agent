@@ -20,6 +20,7 @@ def build_report_bundle(
     data: dict[str, Any] | None = None,
     debate: dict[str, Any] | None = None,
     citations: list[dict[str, str]] | None = None,
+    objective_floor: dict[str, Any] | None = None,
     public_performance: PublicPerformance | None = None,
     l4_evidence: list[dict[str, Any]] | None = None,
 ) -> ReportBundle:
@@ -78,6 +79,18 @@ def build_report_bundle(
         )
     if debate:
         sections.append({"id": "report_debate", "title": "Report 정반합", "items": debate})
+    if objective_floor:
+        # The acceptance floor's own verdict, printed next to the result rather than only
+        # acting on it. While the floor is report-only a strategy can be labelled
+        # 검증됨 and still be listed here as not having cleared it, and the reader is
+        # entitled to see both.
+        sections.append(
+            {
+                "id": "objective_floor",
+                "title": "수용 기준 판정 (참고)",
+                "items": objective_floor,
+            }
+        )
     web = ReportProjection(
         title=f"{strategy.name} 분석 결과",
         summary=f"{signal.action} / confidence {signal.confidence:.2f}. {risk_text}",
@@ -129,6 +142,7 @@ def report_node(state: dict) -> dict:
         citations=_screening_citations(state),
         public_performance=public_performance,
         l4_evidence=state.get("l4_evidence"),
+        objective_floor=state.get("objective_floor"),
     )
     return {"report": report.model_dump(), "report_debate": debate}
 

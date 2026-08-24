@@ -280,7 +280,9 @@ def _automatic_result(context, total_return: float) -> SimpleNamespace:
     )
 
 
-def test_automatic_gate_can_finally_pass_once_the_official_series_is_supplied() -> None:
+def test_automatic_gate_can_finally_pass_once_the_official_series_is_supplied(
+    enforced_objective_floor: None,
+) -> None:
     sessions = _sessions()
     rows = _price_rows(sessions)
     supplied = backtest_node._build_benchmark_context(rows, _official_benchmark(sessions))
@@ -291,7 +293,9 @@ def test_automatic_gate_can_finally_pass_once_the_official_series_is_supplied() 
     assert backtest_node._passes_objective_floor(_automatic_result(missing, 0.60)) is False
 
 
-def test_automatic_gate_still_fails_a_strategy_that_loses_to_the_official_benchmark() -> None:
+def test_automatic_gate_still_fails_a_strategy_that_loses_to_the_official_benchmark(
+    enforced_objective_floor: None,
+) -> None:
     sessions = _sessions()
     context = backtest_node._build_benchmark_context(
         _price_rows(sessions), _official_benchmark(sessions)
