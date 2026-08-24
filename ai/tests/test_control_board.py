@@ -16,19 +16,34 @@ def _board_text() -> str:
     return BOARD_PATH.read_text(encoding="utf-8")
 
 
-def test_sample_blocker_has_every_required_column_and_matching_aggregates() -> None:
+def test_board_is_valid_and_every_row_carries_its_required_evidence() -> None:
+    """The board is a live ledger, so assert invariants rather than today's counts.
+
+    These used to be frozen literals, which meant recording a real blocker - the one
+    thing the ledger exists for - failed the suite.
+    """
+
     result = validate_control_board(_board_text())
 
     assert result.valid, result.errors
-    assert result.summary.as_dict() == {
-        "state_transition_count": 1,
-        "state_transition_evidence_uri_count": 1,
-        "blocker_count": 1,
-        "blocker_evidence_uri_count": 2,
-        "blocker_recurrence_total": 2,
-        "recurring_blocker_count": 1,
-        "max_blocker_recurrence_count": 2,
+    summary = result.summary.as_dict()
+    assert set(summary) == {
+        "state_transition_count",
+        "state_transition_evidence_uri_count",
+        "blocker_count",
+        "blocker_evidence_uri_count",
+        "blocker_recurrence_total",
+        "recurring_blocker_count",
+        "max_blocker_recurrence_count",
     }
+    assert summary["state_transition_count"] >= 1
+    assert summary["blocker_count"] >= 1
+    # Every transition carries an evidence URI, and every blocker carries both a
+    # discovery and a current-state/resolution URI.
+    assert summary["state_transition_evidence_uri_count"] == summary["state_transition_count"]
+    assert summary["blocker_evidence_uri_count"] == summary["blocker_count"] * 2
+    assert summary["recurring_blocker_count"] <= summary["blocker_count"]
+    assert summary["max_blocker_recurrence_count"] <= summary["blocker_recurrence_total"]
 
 
 def test_missing_blocker_column_is_rejected() -> None:
@@ -67,9 +82,11 @@ def test_negative_recurrence_count_is_rejected() -> None:
 
 
 def test_visible_aggregate_mismatch_is_rejected() -> None:
-    board = _board_text().replace(
-        "| blocker_recurrence_total | 2 |",
-        "| blocker_recurrence_total | 3 |",
+    board = _board_text()
+    published = validate_control_board(board).summary.blocker_recurrence_total
+    board = board.replace(
+        f"| blocker_recurrence_total | {published} |",
+        f"| blocker_recurrence_total | {published + 1} |",
         1,
     )
 
@@ -96,4 +113,4 @@ def test_cli_returns_machine_readable_pass_result() -> None:
     assert completed.returncode == 0, completed.stderr
     payload = json.loads(completed.stdout)
     assert payload["valid"] is True
-    assert payload["summary"]["blocker_recurrence_total"] == 2
+    assert payload["summary"] == validate_control_board(_board_text()).summary.as_dict()
