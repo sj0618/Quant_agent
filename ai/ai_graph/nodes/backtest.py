@@ -3617,17 +3617,25 @@ def _annualized_return(
     return (1.0 + total_return) ** (252.0 / effective_days) - 1.0
 
 
-def _profit_factor(engine_summary: Mapping[str, Any]) -> float:
-    win_rate = _summary_float_default(
-        engine_summary,
-        "trade_win_rate",
-        _summary_float_default(engine_summary, "win_rate", 0.0),
-    )
-    if win_rate <= 0:
-        return 0.0
-    if win_rate >= 1:
-        return 2.0
-    return min(3.0, win_rate / max(1.0 - win_rate, 0.01))
+def _profit_factor(engine_summary: Mapping[str, Any]) -> float | None:
+    """Gross trade profit over gross trade loss, as the engine measured it.
+
+    This used to synthesize `win_rate / (1 - win_rate)` capped at 3.0, which is a
+    function of the hit rate and not a profit factor at all: every run with a 75% win
+    rate published exactly 3.0, however large its losses were, and two results differing
+    only in loss size published the same number. The engine records realized PnL per
+    trade, so the published figure now comes from there.
+
+    None when the ratio is undefined - no closed trades, or no losing trade to divide
+    by. The public metric contract already carries `float | None`, and an unavailable
+    metric said plainly is worth more than a capped stand-in that reads as measured.
+    """
+
+    value = engine_summary.get("trade_profit_factor")
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
 
 
 def _equal_weight_benchmark_curve(

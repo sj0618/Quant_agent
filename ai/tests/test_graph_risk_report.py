@@ -385,7 +385,9 @@ def test_public_performance_metric_details_have_explanations_and_flags() -> None
 
     details_by_key = {detail.key: detail for detail in performance.metric_details}
     assert "trade_win_rate" in details_by_key["win_rate"].plain_explanation
-    assert "period-return" in details_by_key["profit_factor"].plain_explanation
+    # The published figure is realized trade PnL, not a period-return statistic and not
+    # a function of the hit rate - the explanation has to say which one it is.
+    assert "실현손익" in details_by_key["profit_factor"].plain_explanation
 
 
 def test_public_performance_unavailable_benchmark_returns_turn_null_not_zero() -> None:

@@ -75,10 +75,10 @@ _METRIC_EXPLANATIONS: dict[str, dict[str, Any]] = {
     "profit_factor": {
         "label": "수익팩터",
         "unit": "ratio",
-        "plain_explanation": "총이익을 총손실로 나눈 값입니다. 수익분포 기반 period-return 값이며, 거래 수량 근사값이 아닙니다.",
-        "why_used": "이익 기여 구간과 손실 구간의 상대 비율을 보조적으로 보여줍니다.",
-        "caution": "거래 수가 적으면 과도하게 변동할 수 있습니다.",
-        "source_refs": [_QUANTSTATS_SOURCE],
+        "plain_explanation": "청산된 거래의 총이익을 총손실로 나눈 값입니다. 실현손익 기반이며 승률과는 별개입니다.",
+        "why_used": "이긴 거래가 진 거래를 얼마나 덮는지를 보여줍니다. 승률이 높아도 이 값이 1 미만이면 손실입니다.",
+        "caution": "거래 수가 적으면 과도하게 변동할 수 있습니다. 진 거래가 없으면 비율이 정의되지 않아 표시하지 않습니다.",
+        "source_refs": [],
     },
     "benchmark_return": {
         "label": "프록시 벤치마크 수익률",

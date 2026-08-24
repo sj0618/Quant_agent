@@ -1585,7 +1585,17 @@ class BacktestEngine:
         else:
             metrics = calculate_quantstats_metrics(equity_curve, include_montecarlo=True)
         winners = [trade for trade in trades if trade.net_pnl > 0]
+        losers = [trade for trade in trades if trade.net_pnl < 0]
         trade_win_rate = round(len(winners) / len(trades), 10) if trades else 0.0
+        # Gross profit over gross loss, from realized trade PnL. `None` when the ratio is
+        # undefined - no closed trades, or no losing trade to divide by. A capped
+        # stand-in would read as a measured result, and that is exactly how the previous
+        # win-rate-derived value misled: it reported a number in cases it had not measured.
+        gross_trade_profit = sum(float(trade.net_pnl) for trade in winners)
+        gross_trade_loss = -sum(float(trade.net_pnl) for trade in losers)
+        trade_profit_factor = (
+            round(gross_trade_profit / gross_trade_loss, 10) if gross_trade_loss > 0.0 else None
+        )
         holding_days = [
             (date.fromisoformat(trade.exit_date) - date.fromisoformat(trade.entry_date)).days
             for trade in trades
@@ -1671,6 +1681,9 @@ class BacktestEngine:
             "skew": metrics.get("skew"),
             "trade_count": len(trades),
             "trade_win_rate": trade_win_rate,
+            "trade_profit_factor": trade_profit_factor,
+            "gross_trade_profit": round(gross_trade_profit, 10),
+            "gross_trade_loss": round(gross_trade_loss, 10),
             "win_rate": trade_win_rate,
             "return_win_rate": metrics.get("win_rate"),
             "signal_count": len(signals),
