@@ -23,7 +23,10 @@ service_db/
 │   ├── 013_ai_runtime_logging.sql
 │   ├── 014_create_report_email_tables.sql
 │   ├── 015_ai_backtest_execution_process_identity.sql
-│   └── 016_ai_backtest_idempotency.sql
+│   ├── 016_ai_backtest_idempotency.sql
+│   └── 022_immutable_analysis_results.sql
+├── rollbacks/
+│   └── 022_immutable_analysis_results.down.sql
 ├── scripts/
 │   └── apply_migrations.ps1
 ├── tests/
@@ -64,6 +67,12 @@ service_db/
 ### `016_ai_backtest_idempotency.sql`
 
 동일한 AI 백테스트 요청의 중복 실행을 차단하고 실행 결과가 불명확한 요청을 안전하게 격리하기 위한 요청 lease와 대체 실행 승인 정보를 저장한다.
+
+### `022_immutable_analysis_results.sql`
+
+owner별 canonical rule/data/execution/report manifest를 `app.analysis_result`에 immutable snapshot으로 저장한다. 동일 owner와 동일 manifest hash는 하나의 `analysis_result_id`를 재사용하며, AI job·backtest run·AI report·전략 report가 같은 FK를 참조한다. public snapshot은 허용된 report projection만 저장하고 내부 provenance는 노출하지 않는다.
+
+rollback은 `rollbacks/022_immutable_analysis_results.down.sql`을 사용하며, 참조 FK/column을 먼저 제거한 뒤 immutable trigger/function/table을 역순으로 제거한다. 공용 또는 운영 DB에는 사전 승인 없이 forward/rollback을 적용하지 않는다.
 
 ## 공용 서버 적용 상태
 

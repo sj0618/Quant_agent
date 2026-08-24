@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import math
 from datetime import UTC, date, datetime
 from typing import Any, NoReturn
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -12,11 +14,32 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.errors import AppError
 from app.db import existing_report_queries
-from app.db.session import _sql_params_with_bigint_user_id, fetch_one
+from app.db.session import _sql_params_with_bigint_user_id, fetch_all, fetch_one
 from app.db import user_queries
 
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 REPORT_CONTENT_SCHEMA_VERSION = existing_report_queries.REPORT_CONTENT_SCHEMA_VERSION
+ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION = "1"
+_PRIVATE_MANIFEST_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "credential",
+    "dsn",
+    "password",
+    "private",
+    "prompt",
+    "secret",
+    "token",
+)
+_CANONICAL_RESULT_FIELDS = (
+    ("title", ("title",)),
+    ("summary", ("summary",)),
+    ("sections", ("sections",)),
+    ("recommendationGate", ("recommendationGate", "recommendation_gate")),
+    ("tickerActions", ("tickerActions", "ticker_actions")),
+    ("performance", ("performance",)),
+    ("strategySpec", ("strategySpec", "strategy_spec")),
+)
 
 
 def _first_non_empty(*values: Any) -> Any:
@@ -108,6 +131,140 @@ def _json_default(value: Any) -> Any:
 
 def _canonical_json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=_json_default)
+
+
+def _identity_manifest_value(value: Any) -> Any:
+    """Normalize one identity value without deleting contract fields.
+
+    JSON null, booleans, numbers, and strings retain distinct meanings. Integral
+    floats and negative zero are normalized so equivalent JSON numbers do not
+    depend on the Python producer's numeric representation.
+    """
+
+    if isinstance(value, dict):
+        return {str(key): _identity_manifest_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_identity_manifest_value(item) for item in value]
+    if hasattr(value, "model_dump"):
+        return _identity_manifest_value(value.model_dump(mode="json", exclude_none=False))
+    if isinstance(value, (datetime, date)):
+        return _as_iso(value)
+    if value is None or isinstance(value, (bool, int, str)):
+        return copy.deepcopy(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Analysis result manifests cannot contain non-finite numbers")
+        if value == 0:
+            return 0
+        if value.is_integer():
+            return int(value)
+        return value
+    raise TypeError(f"Unsupported analysis result manifest value: {type(value).__name__}")
+
+
+def _canonical_analysis_result_payload(
+    result: dict[str, Any],
+    *,
+    exclude_none: bool,
+) -> dict[str, Any]:
+    canonical: dict[str, Any] = {}
+    for canonical_key, aliases in _CANONICAL_RESULT_FIELDS:
+        present = [
+            (alias, _identity_manifest_value(result[alias]))
+            for alias in aliases
+            if alias in result
+        ]
+        if not present:
+            continue
+        value = present[0][1]
+        if any(_canonical_json_text(candidate) != _canonical_json_text(value) for _, candidate in present[1:]):
+            raise AppError(
+                status_code=422,
+                component="analysis_runs",
+                code="analysis_result_invalid",
+                message="Analysis result aliases contain conflicting values",
+                details={"field": canonical_key, "aliases": [alias for alias, _ in present]},
+            )
+        if value is None and exclude_none:
+            continue
+        canonical[canonical_key] = value
+    return json.loads(_canonical_json_text(canonical))
+
+
+def _public_manifest_value(value: Any) -> Any:
+    """Return a recursively filtered value for the public snapshot only."""
+
+    if isinstance(value, dict):
+        public: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key)
+            normalized_key = key.lower().replace("-", "_")
+            if any(part in normalized_key for part in _PRIVATE_MANIFEST_KEY_PARTS):
+                continue
+            public[key] = _public_manifest_value(raw_value)
+        return public
+    if isinstance(value, (list, tuple)):
+        return [_public_manifest_value(item) for item in value]
+    if hasattr(value, "model_dump"):
+        return _public_manifest_value(value.model_dump(mode="json", exclude_none=False))
+    if isinstance(value, (datetime, date)):
+        return _as_iso(value)
+    return _identity_manifest_value(value)
+
+
+def _public_analysis_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+    canonical = _canonical_analysis_result_payload(result, exclude_none=True)
+    public = {key: _public_manifest_value(value) for key, value in canonical.items()}
+    return json.loads(_canonical_json_text(public))
+
+
+def _analysis_result_manifest_bundle(
+    *,
+    result: dict[str, Any],
+    execution_manifest: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    canonical_result = _canonical_analysis_result_payload(result, exclude_none=False)
+    performance = _mapping_dict(canonical_result.get("performance"))
+    strategy_spec = _mapping_dict(canonical_result.get("strategySpec"))
+    data_manifest = {
+        "schemaVersion": ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION,
+        "reliability": _identity_manifest_value(performance.get("reliability")),
+        "dataQuality": _identity_manifest_value(
+            _first_non_empty(performance.get("dataQuality"), performance.get("data_quality"), [])
+        ),
+        "benchmark": _identity_manifest_value(performance.get("benchmark")),
+    }
+    manifests = {
+        "rule": {
+            "schemaVersion": ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION,
+            "strategySpec": _identity_manifest_value(strategy_spec),
+        },
+        "data": data_manifest,
+        "execution": {
+            "schemaVersion": ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION,
+            "ledger": _identity_manifest_value(execution_manifest),
+        },
+        "report": {
+            "schemaVersion": ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION,
+            "result": canonical_result,
+        },
+    }
+    return json.loads(_canonical_json_text(manifests))
+
+
+def _analysis_result_manifest_hash(manifests: dict[str, dict[str, Any]]) -> str:
+    return hashlib.sha256(_canonical_json_text(manifests).encode("utf-8")).hexdigest()
+
+
+def _analysis_result_uuid(user_id: str | int, manifests: dict[str, dict[str, Any]]) -> str:
+    normalized_user_id = str(_coerce_bigint_user_id(user_id))
+    manifest_hash = _analysis_result_manifest_hash(manifests)
+    return str(
+        uuid5(
+            NAMESPACE_URL,
+            f"quantagent:analysis-result:{normalized_user_id}:{manifest_hash}",
+        )
+    )
 
 
 def _now_iso() -> str:
@@ -755,6 +912,287 @@ async def _fetch_one_from_connection(connection: Any, sql: str, params: dict[str
     return dict(row) if row is not None else None
 
 
+async def _analysis_result_execution_manifest(
+    connection: Any,
+    *,
+    user_id: str,
+    run_id: str,
+    ai_job_id: str | None,
+) -> tuple[dict[str, Any], bool]:
+    if ai_job_id is None:
+        return {
+            "schema_version": ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION,
+            "source": "legacy_completion",
+            "run_identity": {"run_id": run_id},
+        }, False
+
+    job = await _fetch_one_from_connection(
+        connection,
+        """
+        SELECT job_id, user_id, job_jsonb
+        FROM app.ai_analysis_job
+        WHERE job_id = :job_id
+          AND COALESCE(NULLIF(user_id, ''), job_jsonb ->> 'user_id') = :user_id
+        LIMIT 1
+        """,
+        {"job_id": ai_job_id, "user_id": str(_coerce_bigint_user_id(user_id))},
+    )
+    if job is None:
+        return {
+            "schema_version": ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION,
+            "source": "completion_reference",
+            "run_identity": {"job_id": ai_job_id, "run_id": run_id},
+        }, False
+
+    job_owner = _non_empty_text(job.get("user_id"))
+    if job_owner is not None and job_owner != str(_coerce_bigint_user_id(user_id)):
+        raise AppError(
+            status_code=404,
+            component="analysis_jobs",
+            code="analysis_job_not_found",
+            message="Analysis job was not found",
+            details={"aiJobId": ai_job_id},
+        )
+    job_document = _json_object(job.get("job_jsonb"))
+    execution_manifest = _json_object(job_document.get("execution_manifest"))
+    if not execution_manifest:
+        _analysis_run_invalid_analysis_result(
+            details={"runId": run_id, "aiJobId": ai_job_id},
+            message="Completed analysis job does not contain an execution manifest",
+        )
+    return execution_manifest, True
+
+
+async def _persist_analysis_result(
+    connection: Any,
+    *,
+    user_id: str,
+    run_id: str,
+    report_id: str,
+    result: dict[str, Any],
+    execution_manifest: dict[str, Any],
+) -> tuple[str, dict[str, dict[str, Any]], dict[str, Any]]:
+    normalized_user_id = _coerce_bigint_user_id(user_id)
+    manifests = _analysis_result_manifest_bundle(result=result, execution_manifest=execution_manifest)
+    manifest_hash = _analysis_result_manifest_hash(manifests)
+    analysis_result_id = _analysis_result_uuid(normalized_user_id, manifests)
+    public_snapshot = {
+        "schemaVersion": ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION,
+        "analysisResultId": analysis_result_id,
+        "result": _public_analysis_result_payload(result),
+    }
+    params = {
+        "analysis_result_id": analysis_result_id,
+        "user_id": normalized_user_id,
+        "manifest_schema_version": ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION,
+        "manifest_hash": manifest_hash,
+        "rule_manifest_jsonb": _canonical_json_text(manifests["rule"]),
+        "data_manifest_jsonb": _canonical_json_text(manifests["data"]),
+        "execution_manifest_jsonb": _canonical_json_text(manifests["execution"]),
+        "report_manifest_jsonb": _canonical_json_text(manifests["report"]),
+        "public_snapshot_jsonb": _canonical_json_text(public_snapshot),
+    }
+    await connection.execute(
+        text(
+            """
+            INSERT INTO app.analysis_result (
+                analysis_result_id,
+                user_id,
+                manifest_schema_version,
+                manifest_hash,
+                rule_manifest_jsonb,
+                data_manifest_jsonb,
+                execution_manifest_jsonb,
+                report_manifest_jsonb,
+                public_snapshot_jsonb
+            ) VALUES (
+                CAST(:analysis_result_id AS uuid),
+                CAST(:user_id AS bigint),
+                :manifest_schema_version,
+                :manifest_hash,
+                CAST(:rule_manifest_jsonb AS jsonb),
+                CAST(:data_manifest_jsonb AS jsonb),
+                CAST(:execution_manifest_jsonb AS jsonb),
+                CAST(:report_manifest_jsonb AS jsonb),
+                CAST(:public_snapshot_jsonb AS jsonb)
+            )
+            ON CONFLICT (user_id, manifest_hash) DO NOTHING
+            """
+        ),
+        params,
+    )
+    persisted = await _fetch_one_from_connection(
+        connection,
+        """
+        SELECT
+            analysis_result_id,
+            user_id,
+            manifest_schema_version,
+            manifest_hash,
+            rule_manifest_jsonb,
+            data_manifest_jsonb,
+            execution_manifest_jsonb,
+            report_manifest_jsonb,
+            public_snapshot_jsonb
+        FROM app.analysis_result
+        WHERE user_id = CAST(:user_id AS bigint)
+          AND manifest_hash = :manifest_hash
+        LIMIT 1
+        """,
+        {"user_id": normalized_user_id, "manifest_hash": manifest_hash},
+    )
+    if persisted is None:
+        _report_store_unavailable(run_id=run_id, report_id=report_id, operation="persist_analysis_result")
+    persisted_contract = {
+        "analysis_result_id": _non_empty_text(persisted.get("analysis_result_id")),
+        "user_id": str(persisted.get("user_id")),
+        "manifest_schema_version": _non_empty_text(persisted.get("manifest_schema_version")),
+        "manifest_hash": _non_empty_text(persisted.get("manifest_hash")),
+        "rule": _json_object(persisted.get("rule_manifest_jsonb")),
+        "data": _json_object(persisted.get("data_manifest_jsonb")),
+        "execution": _json_object(persisted.get("execution_manifest_jsonb")),
+        "report": _json_object(persisted.get("report_manifest_jsonb")),
+        "public_snapshot": _json_object(persisted.get("public_snapshot_jsonb")),
+    }
+    expected_contract = {
+        "analysis_result_id": analysis_result_id,
+        "user_id": str(normalized_user_id),
+        "manifest_schema_version": ANALYSIS_RESULT_MANIFEST_SCHEMA_VERSION,
+        "manifest_hash": manifest_hash,
+        "rule": manifests["rule"],
+        "data": manifests["data"],
+        "execution": manifests["execution"],
+        "report": manifests["report"],
+        "public_snapshot": public_snapshot,
+    }
+    if _canonical_json_text(persisted_contract) != _canonical_json_text(expected_contract):
+        _analysis_completion_payload_conflict(
+            run_id=run_id,
+            report_id=report_id,
+            message="Analysis result manifest already exists with different content",
+        )
+    return analysis_result_id, manifests, public_snapshot
+
+
+async def _link_analysis_result_to_job(
+    connection: Any,
+    *,
+    user_id: str,
+    ai_job_id: str | None,
+    analysis_result_id: str,
+    persisted_job: bool,
+) -> None:
+    if ai_job_id is None or not persisted_job:
+        return
+    linked_job = await _fetch_one_from_connection(
+        connection,
+        """
+        SELECT analysis_result_id
+        FROM app.ai_analysis_job
+        WHERE job_id = :job_id
+          AND COALESCE(NULLIF(user_id, ''), job_jsonb ->> 'user_id') = :user_id
+        LIMIT 1
+        """,
+        {"job_id": ai_job_id, "user_id": str(_coerce_bigint_user_id(user_id))},
+    )
+    if linked_job is None:
+        raise AppError(
+            status_code=404,
+            component="analysis_jobs",
+            code="analysis_job_not_found",
+            message="Analysis job was not found",
+            details={"aiJobId": ai_job_id},
+        )
+    existing_analysis_result_id = _non_empty_text(linked_job.get("analysis_result_id"))
+    if existing_analysis_result_id is not None and existing_analysis_result_id != analysis_result_id:
+        raise AppError(
+            status_code=409,
+            component="analysis_jobs",
+            code="analysis_result_conflict",
+            message="Analysis job references a different immutable result",
+            details={"aiJobId": ai_job_id},
+        )
+    await connection.execute(
+        text(
+            """
+            UPDATE app.ai_analysis_job
+            SET analysis_result_id = CAST(:analysis_result_id AS uuid)
+            WHERE job_id = :job_id
+              AND COALESCE(NULLIF(user_id, ''), job_jsonb ->> 'user_id') = :user_id
+              AND (analysis_result_id IS NULL OR analysis_result_id = CAST(:analysis_result_id AS uuid))
+            """
+        ),
+        {
+            "analysis_result_id": analysis_result_id,
+            "job_id": ai_job_id,
+            "user_id": str(_coerce_bigint_user_id(user_id)),
+        },
+    )
+
+
+async def _owned_run_analysis_result_id(engine: Any, *, run_id: str, user_id: str) -> str | None:
+    row = await fetch_one(
+        engine,
+        """
+        SELECT analysis_result_id
+        FROM app.backtest_run
+        WHERE run_id = :run_id
+          AND user_id = CAST(:user_id AS bigint)
+        LIMIT 1
+        """,
+        {"run_id": run_id, "user_id": str(_coerce_bigint_user_id(user_id))},
+    )
+    return _non_empty_text(row.get("analysis_result_id")) if row is not None else None
+
+
+async def _owned_report_analysis_result_id(engine: Any, *, report_id: str, user_id: str) -> str | None:
+    row = await fetch_one(
+        engine,
+        """
+        SELECT report.analysis_result_id
+        FROM app.strategy_email_report AS report
+        INNER JOIN app.backtest_run AS run
+          ON run.run_id = report.backtest_run_id
+        WHERE report.report_id = :report_id
+          AND run.user_id = CAST(:user_id AS bigint)
+        LIMIT 1
+        """,
+        {"report_id": report_id, "user_id": str(_coerce_bigint_user_id(user_id))},
+    )
+    return _non_empty_text(row.get("analysis_result_id")) if row is not None else None
+
+
+async def _owned_report_analysis_result_ids(
+    engine: Any,
+    *,
+    report_ids: list[str],
+    user_id: str,
+) -> dict[str, str]:
+    if not report_ids:
+        return {}
+    rows = await fetch_all(
+        engine,
+        """
+        SELECT report.report_id, report.analysis_result_id
+        FROM app.strategy_email_report AS report
+        INNER JOIN app.backtest_run AS run
+          ON run.run_id = report.backtest_run_id
+        WHERE report.report_id = ANY(CAST(:report_ids AS text[]))
+          AND run.user_id = CAST(:user_id AS bigint)
+        """,
+        {
+            "report_ids": report_ids,
+            "user_id": str(_coerce_bigint_user_id(user_id)),
+        },
+    )
+    return {
+        report_id: analysis_result_id
+        for row in rows
+        if (report_id := _non_empty_text(row.get("report_id"))) is not None
+        and (analysis_result_id := _non_empty_text(row.get("analysis_result_id"))) is not None
+    }
+
+
 def _db_write_failed(*, component: str, feature: str, method: str, path: str, operation: str, exc: Exception) -> NoReturn:
     raise AppError(
         status_code=503,
@@ -934,7 +1372,13 @@ async def create_analysis_run_from_db(
 
 
 async def get_analysis_run_from_db(engine: Any, run_id: str, *, user_id: str) -> dict[str, Any] | None:
-    return await existing_report_queries.get_analysis_run(engine, run_id, user_id=user_id)
+    run = await existing_report_queries.get_analysis_run(engine, run_id, user_id=user_id)
+    if run is None:
+        return None
+    analysis_result_id = await _owned_run_analysis_result_id(engine, run_id=run_id, user_id=user_id)
+    if analysis_result_id is not None:
+        run["analysisResultId"] = analysis_result_id
+    return run
 
 
 async def list_reports_from_db(
@@ -946,7 +1390,7 @@ async def list_reports_from_db(
     status: str | None = None,
     q: str | None = None,
 ) -> dict[str, Any]:
-    return await existing_report_queries.list_reports(
+    result = await existing_report_queries.list_reports(
         engine,
         user_id=user_id,
         limit=limit,
@@ -954,10 +1398,43 @@ async def list_reports_from_db(
         status=status,
         q=q,
     )
+    items = result.get("items")
+    if isinstance(items, list):
+        report_ids = [
+            report_id
+            for item in items
+            if isinstance(item, dict)
+            and (report_id := _non_empty_text(item.get("id"))) is not None
+        ]
+        analysis_result_ids = await _owned_report_analysis_result_ids(
+            engine,
+            report_ids=report_ids,
+            user_id=user_id,
+        )
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            report_id = _non_empty_text(item.get("id"))
+            if report_id is None:
+                continue
+            analysis_result_id = analysis_result_ids.get(report_id)
+            if analysis_result_id is not None:
+                item["analysisResultId"] = analysis_result_id
+    return result
 
 
 async def get_report_from_db(engine: Any, report_id: str, *, user_id: str) -> dict[str, Any] | None:
-    return await existing_report_queries.get_report(engine, report_id, user_id=user_id)
+    report = await existing_report_queries.get_report(engine, report_id, user_id=user_id)
+    if report is None:
+        return None
+    analysis_result_id = await _owned_report_analysis_result_id(
+        engine,
+        report_id=report_id,
+        user_id=user_id,
+    )
+    if analysis_result_id is not None:
+        report["analysisResultId"] = analysis_result_id
+    return report
 
 
 async def _persist_server_report(
@@ -1164,6 +1641,7 @@ async def _persist_ai_backtest_report(
     user_id: str,
     run_id: str,
     report_id: str,
+    analysis_result_id: str,
     ai_job_id: str | None,
     title: str,
     summary: str,
@@ -1190,7 +1668,7 @@ async def _persist_ai_backtest_report(
     existing_report = await _fetch_one_from_connection(
         connection,
         """
-        SELECT report_id, run_id, user_id, summary, report_jsonb
+        SELECT report_id, run_id, user_id, analysis_result_id, summary, report_jsonb
         FROM app.ai_backtest_report
         WHERE report_id = :report_id
         LIMIT 1
@@ -1205,6 +1683,47 @@ async def _persist_ai_backtest_report(
                 report_id=report_id,
                 message="AI backtest report already exists with different content",
             )
+        existing_analysis_result_id = _non_empty_text(existing_report.get("analysis_result_id"))
+        if existing_analysis_result_id is None:
+            await connection.execute(
+                text(
+                    """
+                    UPDATE app.ai_backtest_report
+                    SET analysis_result_id = CAST(:analysis_result_id AS uuid)
+                    WHERE report_id = :report_id
+                      AND run_id = :run_id
+                      AND (user_id IS NULL OR user_id = CAST(:user_id AS bigint))
+                      AND analysis_result_id IS NULL
+                    """
+                ),
+                {
+                    "analysis_result_id": analysis_result_id,
+                    "report_id": report_id,
+                    "run_id": run_id,
+                    "user_id": normalized_user_id,
+                },
+            )
+            existing_report = await _fetch_one_from_connection(
+                connection,
+                """
+                SELECT report_id, run_id, user_id, analysis_result_id, summary, report_jsonb
+                FROM app.ai_backtest_report
+                WHERE report_id = :report_id
+                LIMIT 1
+                """,
+                {"report_id": report_id},
+            )
+            existing_analysis_result_id = (
+                _non_empty_text(existing_report.get("analysis_result_id"))
+                if existing_report is not None
+                else None
+            )
+        if existing_analysis_result_id != analysis_result_id:
+            _analysis_completion_payload_conflict(
+                run_id=run_id,
+                report_id=report_id,
+                message="AI backtest report references a different analysis result",
+            )
         return existing_report, False
 
     await connection.execute(
@@ -1214,6 +1733,7 @@ async def _persist_ai_backtest_report(
                 report_id,
                 run_id,
                 user_id,
+                analysis_result_id,
                 summary,
                 report_jsonb,
                 created_at
@@ -1221,6 +1741,7 @@ async def _persist_ai_backtest_report(
                 :report_id,
                 :run_id,
                 CAST(:user_id AS bigint),
+                CAST(:analysis_result_id AS uuid),
                 :summary,
                 CAST(:report_jsonb AS jsonb),
                 :created_at
@@ -1232,6 +1753,7 @@ async def _persist_ai_backtest_report(
             "report_id": report_id,
             "run_id": run_id,
             "user_id": normalized_user_id,
+            "analysis_result_id": analysis_result_id,
             "summary": summary,
             "report_jsonb": ai_document_text,
             "created_at": completed_at_dt,
@@ -1241,7 +1763,7 @@ async def _persist_ai_backtest_report(
     persisted_report = await _fetch_one_from_connection(
         connection,
         """
-        SELECT report_id, run_id, user_id, summary, report_jsonb
+        SELECT report_id, run_id, user_id, analysis_result_id, summary, report_jsonb
         FROM app.ai_backtest_report
         WHERE report_id = :report_id
         LIMIT 1
@@ -1250,6 +1772,12 @@ async def _persist_ai_backtest_report(
     )
     if persisted_report is None:
         _report_store_unavailable(run_id=run_id, report_id=report_id, operation="persist_ai_backtest_report")
+    if _non_empty_text(persisted_report.get("analysis_result_id")) != analysis_result_id:
+        _analysis_completion_payload_conflict(
+            run_id=run_id,
+            report_id=report_id,
+            message="AI backtest report references a different analysis result",
+        )
     persisted_document_text = _canonical_json_text(_json_object(persisted_report.get("report_jsonb")))
     if persisted_document_text != ai_document_text:
         _analysis_completion_payload_conflict(
@@ -1273,6 +1801,7 @@ async def _persist_completion_report(
     published_at: str | None = None,
     report_id: str | None = None,
     ai_report_id: str | None = None,
+    analysis_result_id: str,
 ) -> tuple[dict[str, Any], bool]:
     normalized_user_id = _coerce_bigint_user_id(user_id)
     normalized_strategy_id = _non_empty_text(strategy_id)
@@ -1344,6 +1873,7 @@ async def _persist_completion_report(
             strategy_id,
             backtest_run_id,
             ai_report_id,
+            analysis_result_id,
             report_date,
             weekday,
             sent_at,
@@ -1382,6 +1912,58 @@ async def _persist_completion_report(
                 report_id=report_id,
                 message="Analysis run is already completed with different content",
             )
+        existing_analysis_result_id = _non_empty_text(existing_report.get("analysis_result_id"))
+        if existing_analysis_result_id is None:
+            await connection.execute(
+                text(
+                    """
+                    UPDATE app.strategy_email_report
+                    SET analysis_result_id = CAST(:analysis_result_id AS uuid)
+                    WHERE report_id = :report_id
+                      AND backtest_run_id = :run_id
+                      AND analysis_result_id IS NULL
+                    """
+                ),
+                {
+                    "analysis_result_id": analysis_result_id,
+                    "report_id": report_id,
+                    "run_id": run_id,
+                },
+            )
+            existing_report = await _fetch_one_from_connection(
+                connection,
+                """
+                SELECT
+                    report_id,
+                    strategy_id,
+                    backtest_run_id,
+                    ai_report_id,
+                    analysis_result_id,
+                    report_date,
+                    weekday,
+                    sent_at,
+                    title,
+                    summary,
+                    status,
+                    content_md,
+                    content_html
+                FROM app.strategy_email_report
+                WHERE report_id = :report_id
+                LIMIT 1
+                """,
+                {"report_id": report_id},
+            )
+            existing_analysis_result_id = (
+                _non_empty_text(existing_report.get("analysis_result_id"))
+                if existing_report is not None
+                else None
+            )
+        if existing_analysis_result_id != analysis_result_id:
+            _analysis_completion_payload_conflict(
+                run_id=run_id,
+                report_id=report_id,
+                message="Report references a different analysis result",
+            )
         return existing_report, False
 
     await connection.execute(
@@ -1392,6 +1974,7 @@ async def _persist_completion_report(
                 strategy_id,
                 backtest_run_id,
                 ai_report_id,
+                analysis_result_id,
                 report_date,
                 weekday,
                 sent_at,
@@ -1414,6 +1997,7 @@ async def _persist_completion_report(
                 :strategy_id,
                 :backtest_run_id,
                 :ai_report_id,
+                CAST(:analysis_result_id AS uuid),
                 :report_date,
                 :weekday,
                 CAST(:sent_at AS timestamptz),
@@ -1440,6 +2024,7 @@ async def _persist_completion_report(
             "strategy_id": normalized_strategy_id,
             "backtest_run_id": run_id,
             "ai_report_id": ai_report_id_value,
+            "analysis_result_id": analysis_result_id,
             "report_date": report_date,
             "weekday": completed_at_dt.strftime("%A"),
             "sent_at": completed_at_dt,
@@ -1468,6 +2053,7 @@ async def _persist_completion_report(
             strategy_id,
             backtest_run_id,
             ai_report_id,
+            analysis_result_id,
             report_date,
             weekday,
             sent_at,
@@ -1484,6 +2070,12 @@ async def _persist_completion_report(
     )
     if persisted_report is None:
         _report_store_unavailable(run_id=run_id, report_id=report_id, operation="persist_strategy_email_report")
+    if _non_empty_text(persisted_report.get("analysis_result_id")) != analysis_result_id:
+        _analysis_completion_payload_conflict(
+            run_id=run_id,
+            report_id=report_id,
+            message="Report references a different analysis result",
+        )
     persisted_snapshot = _canonical_json_text(
         {
             "reportId": _non_empty_text(persisted_report.get("report_id")) or report_id,
@@ -1523,6 +2115,7 @@ async def _load_owned_run_for_completion(
             run_id,
             strategy_id,
             user_id,
+            analysis_result_id,
             status,
             config_jsonb,
             strategy_snapshot_jsonb,
@@ -1969,6 +2562,34 @@ async def complete_analysis_run_from_db(
                 sections=sections,
                 result_snapshot=result_snapshot,
             )
+            execution_manifest, persisted_job = await _analysis_result_execution_manifest(
+                connection,
+                user_id=user_id_param,
+                run_id=run_id,
+                ai_job_id=request_ai_job_id or expected_ai_job_id,
+            )
+            analysis_result_id, _, _ = await _persist_analysis_result(
+                connection,
+                user_id=user_id_param,
+                run_id=run_id,
+                report_id=report_id,
+                result=result,
+                execution_manifest=execution_manifest,
+            )
+            existing_analysis_result_id = _non_empty_text(run.get("analysis_result_id"))
+            if existing_analysis_result_id is not None and existing_analysis_result_id != analysis_result_id:
+                _analysis_completion_payload_conflict(
+                    run_id=run_id,
+                    report_id=report_id,
+                    message="Analysis run references a different analysis result",
+                )
+            await _link_analysis_result_to_job(
+                connection,
+                user_id=user_id_param,
+                ai_job_id=request_ai_job_id or expected_ai_job_id,
+                analysis_result_id=analysis_result_id,
+                persisted_job=persisted_job,
+            )
 
             persisted_completed_at = _as_iso(run.get("ended_at")) if run_status == "completed" else None
             completed_at_iso = requested_completed_at or persisted_completed_at or _now_iso()
@@ -1978,6 +2599,7 @@ async def complete_analysis_run_from_db(
                     UPDATE app.backtest_run
                     SET
                         strategy_id = COALESCE(strategy_id, :strategy_id),
+                        analysis_result_id = COALESCE(analysis_result_id, CAST(:analysis_result_id AS uuid)),
                         status = 'completed',
                         ended_at = COALESCE(ended_at, :ended_at),
                         error_message = NULL
@@ -1990,6 +2612,7 @@ async def complete_analysis_run_from_db(
                     update_sql,
                     {
                         "strategy_id": strategy_id,
+                        "analysis_result_id": analysis_result_id,
                         "ended_at": completed_at_dt,
                         "run_id": run_id,
                         "user_id": user_id_param,
@@ -2002,6 +2625,7 @@ async def complete_analysis_run_from_db(
                 user_id=user_id_param,
                 run_id=run_id,
                 report_id=ai_report_id,
+                analysis_result_id=analysis_result_id,
                 ai_job_id=request_ai_job_id or expected_ai_job_id,
                 title=title,
                 summary=summary,
@@ -2028,6 +2652,7 @@ async def complete_analysis_run_from_db(
                 published_at=completed_at_iso,
                 report_id=report_id,
                 ai_report_id=ai_report_id,
+                analysis_result_id=analysis_result_id,
             )
 
             await _persist_completion_report_children(
@@ -2060,6 +2685,7 @@ async def complete_analysis_run_from_db(
             return {
                 "runId": run_id,
                 "reportId": _non_empty_text(final_report.get("id")) or report_id,
+                "analysisResultId": analysis_result_id,
                 "status": "completed",
                 "created": report_created,
             }
