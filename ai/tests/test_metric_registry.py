@@ -58,3 +58,66 @@ def test_graph_metric_detail_carries_the_same_registry_provenance() -> None:
     assert detail.registry_version == registry["registry_version"]
     assert detail.provenance.implementation_path == registry["implementation_path"]
     assert detail.provenance.implementation_hash == registry["implementation_hash"]
+
+
+def test_the_published_implementation_path_is_the_file_that_was_hashed() -> None:
+    """Provenance that cannot be checked is decoration.
+
+    The MR-ENG-01 row names "hash가 코드 변경에 뒤처질 위험" as this work's risk. The
+    hash cannot lag, because it is computed from the source file at import time rather
+    than written down - but only for as long as the path published beside it is the file
+    that was actually read. Nothing tied those two together, so a path that drifted (a
+    module moved, an entry copy-pasted from a neighbour) would publish a hash of one file
+    under the name of another and still look consistent.
+
+    Recomputing the digest here from the published path is what makes the pair
+    falsifiable rather than self-consistent.
+    """
+
+    from hashlib import sha256
+    from pathlib import Path
+
+    repository_root = Path(__file__).resolve().parents[2]
+    for key in PUBLIC_METRIC_KEYS:
+        registry = metric_registry_provenance(key)
+        source = repository_root / registry["implementation_path"]
+        assert source.is_file(), f"{key} publishes a path that does not exist: {source}"
+        assert registry["implementation_hash"] == sha256(source.read_bytes()).hexdigest(), (
+            f"{key} publishes a hash that is not the digest of the file it names"
+        )
+
+
+def test_the_published_implementation_ref_names_something_importable() -> None:
+    """The ref has to survive a rename, or it is a comment that looks like a reference.
+
+    16 of the 18 public metrics share an implementation file with at least one other
+    metric, so the path narrows the search to a file and the ref is what points inside
+    it. A ref that no longer resolves sends a reader to a function that is not there.
+    """
+
+    from importlib import import_module
+
+    def resolve(dotted: str) -> object:
+        """Walk a dotted name that may end in a class and a method, not just a module."""
+
+        parts = dotted.split(".")
+        target = None
+        for index in range(len(parts), 0, -1):
+            try:
+                target = import_module(".".join(parts[:index]))
+            except ModuleNotFoundError:
+                continue
+            remainder = parts[index:]
+            break
+        else:
+            raise AssertionError(f"no importable module prefix in {dotted}")
+        for attribute in remainder:
+            target = getattr(target, attribute)
+        return target
+
+    for key in PUBLIC_METRIC_KEYS:
+        ref = metric_registry_provenance(key)["implementation_ref"]
+        # Entries may describe a chain ("a.b.c → d.e.f"); the first element is the one
+        # this registry row is responsible for.
+        head = ref.split("→")[0].split("←")[0].strip()
+        assert resolve(head) is not None, f"{key} names {head}, which does not resolve"

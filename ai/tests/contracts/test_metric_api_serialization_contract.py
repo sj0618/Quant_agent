@@ -107,6 +107,7 @@ def test_metric_api_serialization_matches_the_registry_field_by_field() -> None:
         assert detail["registry_version"] == registry["registry_version"]
         assert detail["provenance"] == {
             "implementation_path": registry["implementation_path"],
+            "implementation_ref": registry["implementation_ref"],
             "implementation_hash": registry["implementation_hash"],
         }
         if detail["is_available"]:
