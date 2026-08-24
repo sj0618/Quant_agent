@@ -58,7 +58,7 @@ export interface AIFailureDiagnostic {
   category: string;
   subcause: string;
   failure_stage: string;
-  owner: "ai_graph" | "data_source_config" | "fe_state" | "outside_owner" | "product_data_gap" | "unknown";
+  owner: "ai_graph" | "data_source_config" | "fe_state" | "outside_owner" | "product_data_gap" | "user" | "unknown";
   retryable: boolean;
   safe_message: string;
   evidence_refs: string[];

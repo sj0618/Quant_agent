@@ -9,6 +9,7 @@ run (``run_job_sync``) installs. When nobody installs one - unit tests, direct
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -125,6 +126,56 @@ def raise_if_cancelled() -> None:
     check = _CANCEL_CHECK.get()
     if check is not None and check():
         raise AnalysisCancelled("analysis cancelled by user")
+
+
+class AnalysisDeadlineExceeded(RuntimeError):
+    """Raised at a checkpoint when the run has used its whole time budget."""
+
+
+# A monotonic instant, not a duration: every checkpoint has to measure against the same
+# point, and the phases each carry their own separate budget already.
+_DEADLINE: ContextVar[float | None] = ContextVar("analysis_deadline", default=None)
+
+
+@contextmanager
+def analysis_deadline(seconds: float | None) -> Iterator[None]:
+    """Bound one whole request, not just the phase that happens to be running.
+
+    The per-phase budgets are each honoured on their own, so their sum has no ceiling:
+    the backtest node's wall budget is checked between self-improvement rounds, and the
+    round's own budget is `timeout x wave_count`, which grows with the candidate count.
+    Screening relaxation rounds and provider calls upstream have no aggregate budget at
+    all. A run could therefore take far longer than any single number in the code, and
+    with a bounded number of analysis slots one such run holds a slot the whole time.
+
+    `None` disables the ceiling, which is what the existing per-phase budgets did.
+    """
+
+    if seconds is None or seconds <= 0:
+        token = _DEADLINE.set(None)
+    else:
+        token = _DEADLINE.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def deadline_remaining_seconds() -> float | None:
+    """Time left for this request, or None when it is not bounded."""
+
+    deadline = _DEADLINE.get()
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
+def raise_if_past_deadline() -> None:
+    """Stop at the next checkpoint if the request has spent its whole budget."""
+
+    remaining = deadline_remaining_seconds()
+    if remaining is not None and remaining <= 0:
+        raise AnalysisDeadlineExceeded("analysis exceeded its total time budget")
 
 
 def report_node_stage(node_name: str) -> None:
