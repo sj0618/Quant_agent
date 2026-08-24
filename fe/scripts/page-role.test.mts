@@ -6,7 +6,7 @@ async function read(relativePath: string) {
   return readFile(new URL(relativePath, import.meta.url), "utf8");
 }
 
-test("/reports restores generated report roles and export controls", async () => {
+test("/reports renders a read-only archive with local export controls", async () => {
   const [reportsPage, reportList, reportActions, clientSource] = await Promise.all([
     read("../src/pages/ReportsPage.tsx"),
     read("../src/features/reports/ReportList.tsx"),
@@ -18,11 +18,11 @@ test("/reports restores generated report roles and export controls", async () =>
   assert.match(reportsPage, /downloadReportsCsv/);
   assert.match(reportsPage, /printCurrentView/);
   assert.match(reportsPage, /ReportList/);
-  assert.match(reportList, /resendReportEmail/);
   assert.match(reportList, /copyReportShareLink/);
   assert.match(reportList, /printCurrentView/);
-  assert.match(reportList, /ROUTES\.notifications/);
-  assert.match(reportActions, /export async function resendReportEmail/);
+  assert.doesNotMatch(reportList, /ROUTES\.notifications/);
+  assert.doesNotMatch(reportList, /resendReportEmail|재발송/);
+  assert.doesNotMatch(reportActions, /resendReportEmail|\/resend/);
   assert.match(clientSource, /export async function getReports/);
   assert.doesNotMatch(reportsPage, /getReportStrategies/);
   assert.doesNotMatch(reportList, /getDigestStrategySelection|getEmailDeliveryHistory|reportsHistory|reportStrategies/);
@@ -70,17 +70,21 @@ test("/search stays report-centric and forwards the submitted q to report search
   assert.doesNotMatch(searchPage, /searchInstruments/);
 });
 
-test("/reports/:id keeps generated report detail navigation and actions", async () => {
-  const [detailPage, reportActions] = await Promise.all([
+test("/reports/:id keeps read-only detail navigation with local actions", async () => {
+  const [detailPage, reportDetail, reportActions, archivePolicy] = await Promise.all([
     read("../src/pages/ReportDetailPage.tsx"),
+    read("../src/features/reports/ReportDetail.tsx"),
     read("../src/api/reportActionsClient.ts"),
+    read("../src/features/reports/reportArchive.ts"),
   ]);
 
   assert.match(detailPage, /getReportById/);
   assert.match(detailPage, /copyReportShareLink/);
   assert.match(detailPage, /printCurrentView/);
-  assert.match(detailPage, /resendReportEmail/);
   assert.match(detailPage, /ROUTES\.reports/);
   assert.doesNotMatch(detailPage, /mock data/);
-  assert.match(reportActions, /export async function resendReportEmail/);
+  assert.doesNotMatch(detailPage, /resendReportEmail|이메일 재발송/);
+  assert.doesNotMatch(reportActions, /resendReportEmail|\/resend/);
+  assert.match(reportDetail, /보관 기록 시각/);
+  assert.match(archivePolicy, /snapshot은 90일 보관/);
 });

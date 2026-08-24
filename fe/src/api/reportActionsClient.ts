@@ -1,5 +1,4 @@
 import { ROUTES } from "../config/routes";
-import { backendRequest } from "./backendClient";
 import type { PerformanceSummary, ReportDetail, ReportSummary } from "../types/quantagent";
 import { downloadTextFile, toCsvValue } from "../utils/download";
 
@@ -34,12 +33,6 @@ export async function copyReportShareLink(reportId: string) {
   const url = `${window.location.origin}${ROUTES.reportDetail(reportId)}`;
   await window.navigator.clipboard.writeText(url);
   return url;
-}
-
-export async function resendReportEmail(reportId: string) {
-  await backendRequest<void>(`/reports/${encodeURIComponent(reportId)}/resend`, {
-    method: "POST",
-  });
 }
 
 export function buildReportPrintTitle(report: ReportDetail | ReportSummary) {

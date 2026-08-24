@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
-import { copyReportShareLink, printCurrentView, resendReportEmail } from "../../api/reportActionsClient";
+import { copyReportShareLink, printCurrentView } from "../../api/reportActionsClient";
 import { ROUTES } from "../../config/routes";
 import type { ReportSummary, SignalType } from "../../types/quantagent";
+import { ARCHIVE_READ_ONLY_NOTICE, archiveTimestamp } from "./reportArchive";
 import { DEFAULT_REPORT_FILTERS, getReportStrategyNames, type ReportFilters, type ReportRange } from "./reportFilters";
 
 interface ReportListProps {
@@ -32,7 +33,7 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
     setDraftFilters((current) => ({ ...current, signals: { ...current.signals, [signal]: checked } }));
   };
 
-  const handleReportAction = async (action: "print" | "share" | "resend", report: ReportSummary) => {
+  const handleReportAction = async (action: "print" | "share", report: ReportSummary) => {
     setStatus(null);
     try {
       if (action === "print") {
@@ -45,10 +46,6 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
         setStatus(`공유 링크를 복사했습니다: ${url}`);
       }
 
-      if (action === "resend") {
-        await resendReportEmail(report.id);
-        setStatus(`${report.date} 리포트를 이메일로 재발송했습니다.`);
-      }
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "리포트 액션 처리에 실패했습니다.");
     }
@@ -152,7 +149,7 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
             <a className="report-row" href={ROUTES.reportDetail(report.id)} key={report.id}>
               <div className="report-row__date">
                 <strong>{report.date}</strong>
-                <span>{report.weekday}</span>
+                <span>{archiveTimestamp(report)}</span>
               </div>
               <div className="report-row__content">
                 <strong>{report.title}</strong>
@@ -187,12 +184,9 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
           </div>
         ) : null}
         <Card className="tip-card">
-          <Badge variant="dark">TIP</Badge>
-          <strong>리포트가 적게 보이시나요?</strong>
-          <p>
-            전략 활성화 다음 날부터 일일 리포트가 자동 생성됩니다.{" "}
-            <a href={ROUTES.notifications}>마이페이지 &gt; 알림 설정</a>에서 Daily 리포트 수신을 켜두시면 이메일로도 함께 받아보실 수 있습니다.
-          </p>
+          <Badge variant="dark">READ ONLY</Badge>
+          <strong>보관 리포트를 확인하고 계십니다</strong>
+          <p>{ARCHIVE_READ_ONLY_NOTICE}</p>
         </Card>
       </section>
     </div>
@@ -203,7 +197,7 @@ function FeaturedReport({
   onAction,
   report,
 }: {
-  onAction: (action: "print" | "share" | "resend", report: ReportSummary) => void;
+  onAction: (action: "print" | "share", report: ReportSummary) => void;
   report: ReportSummary;
 }) {
   return (
@@ -238,7 +232,6 @@ function FeaturedReport({
       <div className="featured-report__actions">
         <button onClick={() => onAction("print", report)} type="button">↓ PDF</button>
         <button onClick={() => onAction("share", report)} type="button">공유</button>
-        <button onClick={() => onAction("resend", report)} type="button">재발송</button>
         <a href={ROUTES.reportDetail(report.id)}>리포트 열기 →</a>
       </div>
     </Card>

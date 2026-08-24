@@ -52,7 +52,7 @@ export function ReportsPage() {
         ) : error ? (
           <AsyncState title="리포트 목록을 불러오지 못했습니다" description={error.message} tone="error" />
         ) : (
-          <AsyncState title="아직 생성된 리포트가 없습니다" description="전략 분석이 완료되면 이곳에 리포트가 쌓입니다." tone="empty" />
+          <AsyncState title="보관된 리포트가 없습니다" description="공개 조건을 통과한 기록만 이 보관함에 표시됩니다." tone="empty" />
         )}
       </AppLayout>
     );
@@ -64,7 +64,7 @@ export function ReportsPage() {
         <div className="reports-page__head">
           <div>
             <h1>리포트</h1>
-            <p>매일 오전 8시 발송된 일일 분석 리포트를 모두 확인할 수 있습니다.</p>
+            <p>검증 범위와 보관 조건이 함께 기록된 읽기 전용 리포트를 확인할 수 있습니다.</p>
           </div>
           <div>
             <button onClick={handlePrintPdf} type="button">전체 PDF 다운로드</button>
