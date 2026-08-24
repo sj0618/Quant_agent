@@ -280,14 +280,97 @@ class ReadOnlyAnalysisJobStore:
 
     def __init__(self, store: AnalysisJobStore) -> None:
         self._store = store
+        # Keep the selected backing-store identity visible to readiness and API
+        # diagnostics; this wrapper changes the write policy, not persistence mode.
+        self.store_mode = store.store_mode
 
-    def create_job(self, *_args: Any, **_kwargs: Any) -> AnalysisJob:
+    def create_job(
+        self,
+        request_text: str,
+        *,
+        user_id: str | None = None,
+        strategy_id: str | None = None,
+        run_id: str | None = None,
+        fallback_reasons: Sequence[str] | None = None,
+    ) -> AnalysisJob:
         raise AnalysisHistoryReadOnlyError(
             "analysis history is read-only: no enabled surface may create an analysis job"
         )
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._store, name)
+    def get_job(self, job_id: str) -> AnalysisJob | None:
+        return self._store.get_job(job_id)
+
+    def update_job_status(
+        self,
+        job_id: str,
+        status: AnalysisJobStatus | str,
+        polling_stage: Stage | str,
+        *,
+        fallback_reasons: Sequence[str] | None = None,
+        error_message: str | None = None,
+        message: str | None = None,
+    ) -> AnalysisJob:
+        return self._store.update_job_status(
+            job_id,
+            status,
+            polling_stage,
+            fallback_reasons=fallback_reasons,
+            error_message=error_message,
+            message=message,
+        )
+
+    def complete_job(
+        self,
+        job_id: str,
+        result_envelope: APIEnvelope,
+        *,
+        fallback_reasons: Sequence[str] | None = None,
+    ) -> AnalysisJob:
+        return self._store.complete_job(
+            job_id,
+            result_envelope,
+            fallback_reasons=fallback_reasons,
+        )
+
+    def fail_job(
+        self,
+        job_id: str,
+        error_message: str,
+        *,
+        fallback_reasons: Sequence[str] | None = None,
+        result_envelope: APIEnvelope | None = None,
+    ) -> AnalysisJob:
+        return self._store.fail_job(
+            job_id,
+            error_message,
+            fallback_reasons=fallback_reasons,
+            result_envelope=result_envelope,
+        )
+
+    def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
+        return self._store.list_jobs(limit=limit)
+
+    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> Any:
+        if isinstance(self._store, RestartReconciliationStore):
+            return self._store.list_jobs_for_reconciliation(limit=limit)
+        return self._store.list_jobs(limit=limit)
+
+    def force_fail_undecodable_job(
+        self,
+        job_id: str,
+        *,
+        error_message: str,
+        reason: str,
+    ) -> bool:
+        if not isinstance(self._store, RestartReconciliationStore):
+            raise JobStoreConfigurationError(
+                "ReadOnlyAnalysisJobStore has no backing support for undecodable-job reconciliation."
+            )
+        return self._store.force_fail_undecodable_job(
+            job_id,
+            error_message=error_message,
+            reason=reason,
+        )
 
 
 class JobStoreConfigurationError(RuntimeError):
@@ -1277,8 +1360,16 @@ def reap_interrupted_jobs(
     # policy of refusing over them is an outage with no way out of it.
     undecodable = list(getattr(batch, "undecodable_job_ids", ()))
     reaped: list[str] = []
+    if reconciliation_store is None and undecodable:
+        raise InterruptedJobReconciliationError(
+            "analysis job restart reconciliation cannot settle undecodable rows"
+    )
     for job_id in undecodable:
         try:
+            if reconciliation_store is None:
+                raise InterruptedJobReconciliationError(
+                    "analysis job restart reconciliation cannot settle undecodable rows"
+                )
             settled = reconciliation_store.force_fail_undecodable_job(
                 job_id,
                 error_message=INTERRUPTED_BY_RESTART_MESSAGE,

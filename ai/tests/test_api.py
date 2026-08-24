@@ -440,6 +440,31 @@ def test_read_only_history_still_lets_a_restart_finish_interrupted_jobs() -> Non
     assert inner.force_failed == ["j-1"]
 
 
+def test_read_only_history_lifespan_reaps_a_prior_process_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup can settle historical work without reopening the create surface."""
+
+    monkeypatch.setenv("APP_ENV", "production")
+    inner = InMemoryAnalysisJobStore()
+    job = inner.create_job("이전 프로세스의 분석", user_id="local-dev-user")
+    running = inner.update_job_status(job.job_id, AnalysisJobStatus.RUNNING, "backtest")
+    inner.jobs[job.job_id] = running.model_copy(update={"owner_incarnation": "previous-process"})
+
+    app = create_app(inner, research_execution_enabled=False)
+    with TestClient(app):
+        read_only = app.state.job_store
+        assert isinstance(read_only, ReadOnlyAnalysisJobStore)
+        assert read_only.store_mode == inner.store_mode
+        with pytest.raises(AnalysisHistoryReadOnlyError):
+            read_only.create_job("새 분석")
+
+    settled = inner.get_job(job.job_id)
+    assert settled is not None
+    assert settled.status is AnalysisJobStatus.FAILED
+    assert settled.error_message is not None
+
+
 def test_backtest_api_redacts_legacy_insufficient_performance_before_serialization() -> None:
     legacy_available = PerformanceAvailable.model_construct(
         availability="available",
