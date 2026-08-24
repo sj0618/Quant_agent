@@ -44,6 +44,17 @@ DATA_SOURCE_ENV_KEYS = (
 MOCK_PROVIDER_CREDENTIAL_ENV = "AI_AOAI_API_KEY"
 MOCK_PROVIDER_CREDENTIAL_SENTINEL = "qa-mock-provider-sentinel-key"
 MOCK_PROVIDER_STAGES = ["interpreting", "code_generation", "backtest", "debate", "finalizing"]
+LIVE_PROVIDER_ENV = {
+    "AI_LLM_PROVIDER": "aoai",
+    "AI_AOAI_RESPONSES_URL": "https://example.test/openai/responses?api-version=2025-04-01-preview",
+    "AI_AOAI_API_KEY": "test-api-key",
+    "AI_AOAI_MODEL": "test-model",
+}
+
+
+def _configure_live_provider(monkeypatch) -> None:
+    for key, value in LIVE_PROVIDER_ENV.items():
+        monkeypatch.setenv(key, value)
 
 
 def _poll_job(client, job_id: str) -> dict:
@@ -132,6 +143,7 @@ def test_release_readiness_requires_durable_job_store_before_other_dependencies(
 
 
 def test_release_readiness_rejects_missing_migration_and_contract_drift(monkeypatch) -> None:
+    _configure_live_provider(monkeypatch)
     missing_migration = TestClient(
         create_app(
             job_store_runtime=_persistent_job_store_runtime(),
@@ -161,6 +173,52 @@ def test_release_readiness_rejects_missing_migration_and_contract_drift(monkeypa
         "ready": False,
         "reason": "ai_contract_version_mismatch",
     }
+    assert checks["provider_config"] == {
+        "name": "provider_config",
+        "ready": True,
+        "reason": None,
+    }
+
+
+def test_release_readiness_rejects_mock_provider_configuration() -> None:
+    response = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    ).get(READINESS_PATH)
+
+    assert response.status_code == 503
+    checks = {check["name"]: check for check in response.json()["checks"]}
+    assert checks["provider_config"] == {
+        "name": "provider_config",
+        "ready": False,
+        "reason": "live_provider_required",
+    }
+
+
+def test_release_readiness_rejects_role_specific_provider_configuration_drift(monkeypatch) -> None:
+    _configure_live_provider(monkeypatch)
+    monkeypatch.setenv("AI_LLM_REPORT_WRITER_RESPONSES_URL", "not-a-url")
+
+    response = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    ).get(READINESS_PATH)
+
+    assert response.status_code == 503
+    checks = {check["name"]: check for check in response.json()["checks"]}
+    assert checks["provider_config"] == {
+        "name": "provider_config",
+        "ready": False,
+        "reason": "provider_config_invalid",
+    }
+    assert "test-api-key" not in response.text
+    assert "not-a-url" not in response.text
 
 
 def test_release_readiness_requires_a_rule_draft_signer() -> None:

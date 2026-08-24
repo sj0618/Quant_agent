@@ -1,5 +1,6 @@
 import json
 from hashlib import sha256
+import time
 from uuid import uuid4
 
 import httpx
@@ -15,7 +16,7 @@ from ai_graph.llm.base import (
     LLMProviderConfigError,
     LLMResponseParseError,
 )
-from ai_graph.llm.factory import create_llm_client
+from ai_graph.llm.factory import create_llm_client, live_provider_configuration_ready
 from ai_graph.llm.mock import MockLLMClient
 
 
@@ -155,6 +156,46 @@ def test_aoai_client_separates_response_start_and_body_idle_timeouts() -> None:
     assert response_start_timeouts == [10.0]
     # Header arrival is not response start; the 10-second limit remains until text arrives.
     assert body_idle_timeouts == [10.0]
+
+
+def test_aoai_web_search_activity_starts_the_response_timeout() -> None:
+    class SearchStream(httpx.SyncByteStream):
+        def __iter__(self):
+            events = [
+                {"type": "response.web_search_call.searching"},
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "web_search_call",
+                        "action": {"query": "KOSPI strategy"},
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {"output_text": '{"message":"ok"}'},
+                },
+            ]
+            yield f"data: {json.dumps(events[0])}\n\n".encode()
+            time.sleep(0.02)
+            for event in events[1:]:
+                yield f"data: {json.dumps(event)}\n\n".encode()
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=SearchStream(),
+        )
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        response_start_timeout_seconds=0.01,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_json(make_request()) == {"message": "ok"}
 
 
 def test_aoai_client_retries_without_unsupported_temperature() -> None:
@@ -745,6 +786,72 @@ def test_llm_factory_falls_back_to_global_model_without_role_override() -> None:
 def test_llm_factory_requires_all_aoai_env_values() -> None:
     with pytest.raises(LLMProviderConfigError):
         create_llm_client({"AI_LLM_PROVIDER": "aoai"})
+
+
+def test_live_provider_configuration_rejects_mock_provider() -> None:
+    ready, reason = live_provider_configuration_ready({"AI_LLM_PROVIDER": "mock"})
+
+    assert ready is False
+    assert reason == "live_provider_required"
+
+
+def test_live_provider_configuration_requires_valid_aoai_configuration() -> None:
+    ready, reason = live_provider_configuration_ready(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": "not-a-url",
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "test-model",
+        }
+    )
+
+    assert ready is False
+    assert reason == "provider_config_invalid"
+
+
+def test_live_provider_configuration_accepts_valid_aoai_configuration() -> None:
+    ready, reason = live_provider_configuration_ready(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": "https://example.test/openai/responses?api-version=2025-04-01-preview",
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "test-model",
+        }
+    )
+
+    assert ready is True
+    assert reason is None
+
+
+def test_live_provider_configuration_rejects_invalid_role_specific_override() -> None:
+    ready, reason = live_provider_configuration_ready(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": "https://example.test/openai/responses?api-version=2025-04-01-preview",
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "test-model",
+            "AI_LLM_REPORT_WRITER_RESPONSES_URL": "not-a-url",
+        }
+    )
+
+    assert ready is False
+    assert reason == "provider_config_invalid"
+
+
+def test_live_provider_configuration_returns_a_reason_for_targeted_role() -> None:
+    ready, reason = live_provider_configuration_ready(
+        {
+            "AI_LLM_PROVIDER": "aoai",
+            "AI_AOAI_RESPONSES_URL": "https://example.test/openai/responses?api-version=2025-04-01-preview",
+            "AI_AOAI_API_KEY": "test-api-key",
+            "AI_AOAI_MODEL": "test-model",
+            "AI_LLM_REPORT_WRITER_RESPONSES_URL": "not-a-url",
+        },
+        role="report writer",
+    )
+
+    assert ready is False
+    assert reason == "provider_config_invalid"
 
 
 def test_response_start_deadline_measures_silence_not_thinking_time(monkeypatch) -> None:

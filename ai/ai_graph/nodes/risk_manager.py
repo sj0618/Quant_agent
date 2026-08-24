@@ -5,6 +5,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import numpy as np
 from pydantic import BaseModel, ConfigDict
 
 from ai_graph.schemas import PortfolioRisk, RiskAdjustment, RiskDecision, SignalDecision
@@ -220,29 +221,41 @@ def _average_pairwise_correlation(
             returns[ticker] = daily
 
     keys = list(returns)
-    correlations: list[float] = []
-    for i in range(len(keys)):
-        for j in range(i + 1, len(keys)):
-            corr = _correlation(returns[keys[i]], returns[keys[j]])
-            if corr is not None:
-                correlations.append(corr)
-    if not correlations:
+    if len(keys) < 2:
         return None
-    return sum(correlations) / len(correlations)
 
+    dates = sorted({date for daily in returns.values() for date in daily})
+    date_index = {date: index for index, date in enumerate(dates)}
+    values = np.full((len(keys), len(dates)), np.nan, dtype=np.float64)
+    for row_index, ticker in enumerate(keys):
+        for date, value in returns[ticker].items():
+            values[row_index, date_index[date]] = value
 
-def _correlation(a: Mapping[str, float], b: Mapping[str, float]) -> float | None:
-    common = sorted(set(a) & set(b))
-    if len(common) < 2:
+    observed = np.isfinite(values).astype(np.float64)
+    filled = np.nan_to_num(values, nan=0.0)
+    counts = observed @ observed.T
+    sums = filled @ observed.T
+    squares = (filled * filled) @ observed.T
+    products = filled @ filled.T
+
+    left, right = np.triu_indices(len(keys), k=1)
+    pair_counts = counts[left, right]
+    valid = pair_counts >= 2
+    if not np.any(valid):
         return None
-    xs = [a[d] for d in common]
-    ys = [b[d] for d in common]
-    n = len(common)
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-    var_x = sum((x - mean_x) ** 2 for x in xs)
-    var_y = sum((y - mean_y) ** 2 for y in ys)
-    if var_x <= 0 or var_y <= 0:
+
+    left = left[valid]
+    right = right[valid]
+    pair_counts = pair_counts[valid]
+    sum_x = sums[left, right]
+    sum_y = sums[right, left]
+    covariance = products[left, right] - (sum_x * sum_y / pair_counts)
+    variance_x = squares[left, right] - (sum_x * sum_x / pair_counts)
+    variance_y = squares[right, left] - (sum_y * sum_y / pair_counts)
+    valid_variance = (variance_x > 0) & (variance_y > 0)
+    if not np.any(valid_variance):
         return None
-    return cov / math.sqrt(var_x * var_y)
+    correlations = covariance[valid_variance] / np.sqrt(
+        variance_x[valid_variance] * variance_y[valid_variance]
+    )
+    return float(np.mean(correlations))

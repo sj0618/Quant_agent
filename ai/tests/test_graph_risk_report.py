@@ -10,7 +10,11 @@ from ai_graph.nodes.backtest import (
     _equal_weight_benchmark_curve,
 )
 from ai_graph.nodes.report import build_report_bundle
-from ai_graph.nodes.risk_manager import MacroSnapshot, apply_risk_rules
+from ai_graph.nodes.risk_manager import (
+    MacroSnapshot,
+    _average_pairwise_correlation,
+    apply_risk_rules,
+)
 from ai_graph.schemas import (
     BacktestMetrics,
     CodeCandidate,
@@ -152,6 +156,26 @@ def test_risk_manager_caps_buy_confidence_for_fx_and_vkospi() -> None:
         "FX_DAILY_MOVE_2PCT_CAP",
         "VKOSPI_30_CAP",
     }
+
+
+def test_portfolio_correlation_keeps_pairwise_missing_date_semantics() -> None:
+    rows = [
+        {"ticker": "000001", "date": "2026-01-01", "close": 100},
+        {"ticker": "000001", "date": "2026-01-02", "close": 110},
+        {"ticker": "000001", "date": "2026-01-03", "close": 99},
+        {"ticker": "000001", "date": "2026-01-04", "close": 118.8},
+        {"ticker": "000002", "date": "2026-01-01", "close": 100},
+        {"ticker": "000002", "date": "2026-01-02", "close": 80},
+        {"ticker": "000002", "date": "2026-01-04", "close": 88},
+        {"ticker": "000003", "date": "2026-01-01", "close": 100},
+        {"ticker": "000003", "date": "2026-01-03", "close": 120},
+        {"ticker": "000003", "date": "2026-01-04", "close": 108},
+    ]
+
+    correlation = _average_pairwise_correlation({"000001", "000002", "000003"}, rows)
+
+    assert correlation is not None
+    assert abs(correlation) < 1e-12
 
 
 def test_report_builds_web_and_email_projection_from_same_decision() -> None:
