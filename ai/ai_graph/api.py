@@ -627,8 +627,12 @@ def create_app(
                 deployment_revision=(environ.get(DEPLOYMENT_REVISION_ENV) or "").strip() or None,
             )
 
+    # async on purpose: a sync handler runs in the same anyio worker pool the analysis
+    # background tasks occupy, so a burst of analyses used to make liveness time out and
+    # the service look dead to whatever was watching it. Neither of these touches the
+    # database or blocks, so neither needs a worker thread.
     @app.get(HEALTH_PATH, response_model=HealthResponse, tags=["System"])
-    def health() -> HealthResponse:
+    async def health() -> HealthResponse:
         return HealthResponse(status="ok", schema_version=SCHEMA_VERSION)
 
     @app.get(
@@ -637,7 +641,7 @@ def create_app(
         responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ReadinessResponse}},
         tags=["System"],
     )
-    def readiness(response: Response) -> ReadinessResponse:
+    async def readiness(response: Response) -> ReadinessResponse:
         result = _release_readiness(
             runtime,
             migration_probe=migration_probe,
