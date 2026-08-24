@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha256
-from os import environ
+from os import environ, getpid
 from typing import Any, ClassVar, Literal, Protocol
 from uuid import uuid4
 
@@ -28,6 +28,17 @@ from ai_graph.progress import (
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
 
 _logger = logging.getLogger(__name__)
+
+# One value per process start. A job records the incarnation that owned it, so a job
+# still marked RUNNING under a different incarnation belongs to a process that is gone.
+# This is the ordinary case rather than an exotic one: every deploy stops uvicorn and
+# starts it again, so every deploy strands whatever was in flight.
+PROCESS_INCARNATION = f"{getpid()}:{uuid4().hex[:12]}"
+
+INTERRUPTED_BY_RESTART_REASON = "interrupted_by_restart"
+INTERRUPTED_BY_RESTART_MESSAGE = (
+    "서버가 재시작되어 분석이 중단되었습니다. 같은 요청으로 다시 실행해 주세요."
+)
 
 AI_JOB_STORE_ENV = "AI_JOB_STORE"
 BE_JOB_STORE_MODE_ENV = "BE_JOB_STORE_MODE"
@@ -144,6 +155,9 @@ class AnalysisJob(BaseModel):
     debug_ref: str | None = Field(default=None, exclude=True)
     fallback_reasons: list[str] = Field(default_factory=list, exclude=True)
     error_message: str | None = Field(default=None, exclude=True)
+    # Which process incarnation owns this job. Storage-only, like the fields above; the
+    # restart reaper reads it to tell "still running" from "nothing is running this".
+    owner_incarnation: str | None = Field(default=None, exclude=True)
     # Canonical writer persists this versioned ledger in job_jsonb; it deliberately has
     # no DSN, credential, or arbitrary provider payload fields.
     execution_manifest: ExecutionManifest = Field(exclude=True)
@@ -247,6 +261,7 @@ class InMemoryAnalysisJobStore:
             run_id=run_id,
             status=AnalysisJobStatus.QUEUED,
             polling_stage=Stage.INTERPRETING,
+            owner_incarnation=PROCESS_INCARNATION,
             created_at=now,
             updated_at=now,
             stages=_stage_progresses(Stage.INTERPRETING, AnalysisJobStatus.QUEUED, now),
@@ -1008,3 +1023,42 @@ def _failure_envelope(
         retryable=diagnostic.retryable,
         failure_cause=diagnostic,
     )
+
+
+_REAPABLE_STATUSES = frozenset({AnalysisJobStatus.QUEUED, AnalysisJobStatus.RUNNING})
+
+
+def reap_interrupted_jobs(
+    store: AnalysisJobStore,
+    *,
+    incarnation: str = PROCESS_INCARNATION,
+    limit: int = 500,
+) -> list[str]:
+    """Fail the jobs a previous process left mid-flight, and return their ids.
+
+    Without this a restart leaves rows that say RUNNING forever: the client polls a
+    spinner that will never resolve, and an operator cannot tell a stuck job apart from
+    a slow one. Because the work lives in this process's background tasks, a job whose
+    recorded incarnation is not ours has nothing working on it - the run did not pause,
+    it ended.
+
+    A job with no recorded incarnation predates the field, which means an earlier process
+    wrote it, so it is reaped for the same reason. One job that cannot be failed does not
+    stop the sweep: leaving the other stranded jobs spinning would be the worse outcome.
+    """
+
+    reaped: list[str] = []
+    for job in store.list_jobs(limit=limit):
+        if job.status not in _REAPABLE_STATUSES or job.owner_incarnation == incarnation:
+            continue
+        try:
+            store.fail_job(
+                job.job_id,
+                INTERRUPTED_BY_RESTART_MESSAGE,
+                fallback_reasons=[*job.fallback_reasons, INTERRUPTED_BY_RESTART_REASON],
+            )
+        except Exception:
+            _logger.exception("could not reap interrupted analysis job %s", job.job_id)
+            continue
+        reaped.append(job.job_id)
+    return reaped
