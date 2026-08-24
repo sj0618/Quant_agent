@@ -3,7 +3,8 @@
   "compilerOptions": {
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.scripts.tsbuildinfo",
     "types": ["node", "vite/client"],
+    "allowJs": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["scripts/**/*.mts"]
+  "include": ["scripts/**/*.mts", "scripts/**/*.mjs"]
 }

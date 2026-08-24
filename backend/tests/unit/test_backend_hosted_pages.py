@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import pytest
+from app.api.routes import pages
+from app.core.errors import register_exception_handlers
+from app.services.session_store import AuthSessionStore
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 
-from app.api.routes import pages
-from app.core.errors import register_exception_handlers
-from app.services.session_store import AuthSessionStore
 from tests.unit.test_auth_config import valid_settings
 from tests.unit.test_auth_core import FakeRedis
 
@@ -61,18 +62,41 @@ def test_app_page_requires_valid_session_then_serves_shell(frontend_dist: Path, 
 
 def test_known_frontend_routes_use_spa_fallback(frontend_dist: Path, monkeypatch: pytest.MonkeyPatch):
     client, _app = make_client(frontend_dist, monkeypatch)
-    search = client.get("/search")
+    static_routes = [
+        "/",
+        "/login",
+        "/app",
+        "/reports",
+        "/me",
+        "/me/notifications",
+        "/search",
+        "/terms",
+        "/privacy",
+        "/disclaimer",
+        "/trust",
+        "/unsubscribe",
+    ]
+    frontend_routes_source = (Path(__file__).resolve().parents[3] / "fe" / "src" / "config" / "routes.ts").read_text(
+        encoding="utf-8"
+    )
+    configured_static_routes = set(re.findall(r'^  \w+: "([^"]+)",$', frontend_routes_source, flags=re.MULTILINE))
+    # The OAuth callback is owned by the backend auth router. Every other static
+    # frontend URL must be served by the same HTTP policy as this test.
+    assert set(static_routes) == configured_static_routes - {"/auth/google/callback"}
+    responses = {route: client.get(route, follow_redirects=False) for route in static_routes}
     report_detail = client.get("/reports/report-123")
-    root = client.get("/")
     asset = client.get("/assets/app.js")
 
-    assert search.status_code == 200
+    # /login and /app deliberately have authentication-specific routes; every other
+    # public React route must remain in lockstep with FRONTEND_EXACT_ROUTES.
+    assert responses["/login"].status_code == 200
+    assert responses["/app"].status_code == 303
+    assert all(response.status_code == 200 for route, response in responses.items() if route != "/app")
     assert report_detail.status_code == 200
-    assert root.status_code == 200
     assert asset.status_code == 200
-    assert search.text == "<!doctype html><html><body>FE SPA</body></html>"
+    assert responses["/search"].text == "<!doctype html><html><body>FE SPA</body></html>"
     assert report_detail.text == "<!doctype html><html><body>FE SPA</body></html>"
-    assert root.text == "<!doctype html><html><body>FE SPA</body></html>"
+    assert responses["/"].text == "<!doctype html><html><body>FE SPA</body></html>"
     assert asset.text == "console.log('FE SPA asset');"
 
 
