@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.quant_strategy import rsi_trade_rules
+from ai_graph.immutable_snapshot import build_snapshot_bundle
 from ai_graph.source_manifest import build_source_manifest
 
 from .sectors import extract_sector_from_query, get_known_sectors
@@ -447,13 +448,37 @@ class PostgresPipelineDataSource:
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
             # Capabilities were probed up front; nothing since then can change them.
 
-        source_manifest_as_of = max(
+        snapshot_as_of = max(
             (date.fromisoformat(str(row["date"])) for row in price_rows if row.get("date")),
             default=datetime.now(UTC).date(),
         )
+        snapshot_bundle = build_snapshot_bundle(
+            as_of=snapshot_as_of,
+            source="postgres",
+            pit_universe={
+                "members": sorted(tickers),
+                "selection": "split-pipeline-backtest-universe",
+                "member_count": len(tickers),
+            },
+            delisting={
+                "policy_version": "official-event-then-final-close-v1",
+                "provenance": UNIVERSE_VIEW,
+            },
+            indicator_input={
+                "families": list(indicator_families),
+                "sources": [INDICATOR_TABLES[family] for family in indicator_families],
+                "lookback_days": effective_lookback_days,
+                "query": query,
+            },
+            lineage_refs=[
+                UNIVERSE_VIEW,
+                KIS_ADJUSTED_OHLCV_TABLE,
+                *[INDICATOR_TABLES[family] for family in indicator_families],
+            ],
+        )
         source_manifest = build_source_manifest(
             source="postgres",
-            as_of=source_manifest_as_of,
+            as_of=snapshot_as_of,
             freshness="unknown",
             lineage_refs=[
                 KIS_ADJUSTED_OHLCV_TABLE,
@@ -472,6 +497,7 @@ class PostgresPipelineDataSource:
             ),
             metadata={
                 "source": "postgres",
+                "immutable_snapshot_bundle": snapshot_bundle.model_dump(mode="json"),
                 "source_manifest": source_manifest.model_dump(mode="json"),
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
@@ -1317,6 +1343,14 @@ def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
         data_availability=_data_availability_for_query(query, source="fixture"),
         metadata={
             "source": "fixture",
+            "immutable_snapshot_bundle": build_snapshot_bundle(
+                as_of=datetime.now(UTC).date(),
+                source="fixture",
+                pit_universe={"members": [], "policy": "fixture"},
+                delisting={"events": [], "policy": "fixture"},
+                indicator_input={"families": [], "query": query},
+                lineage_refs=[reason, query],
+            ).model_dump(mode="json"),
             "source_manifest": build_source_manifest(
                 source="fixture",
                 as_of=datetime.now(UTC).date(),
