@@ -1,5 +1,6 @@
 from ai_graph.data_sources import PipelineDataUnavailableError
 from ai_graph.jobs import InMemoryAnalysisJobStore, classify_failure
+from ai_graph.schemas import APIEnvelope
 
 
 def test_connection_timeout_maps_to_safe_failure_bucket() -> None:
@@ -84,6 +85,41 @@ def test_run_job_sync_uses_safe_failed_envelope_instead_of_raw_exception() -> No
     assert failed.result.failure_cause is not None
     assert failed.result.failure_cause.subcause == "db_connect_timeout"
     assert "raw host" not in failed.result.user_payload.message
+
+
+def test_schema_validation_failure_does_not_zero_fill_a_successful_analysis() -> None:
+    """Malformed graph output is terminal and cannot inherit success-shaped values.
+
+    A schema mismatch is not a data shortage: retrying it cannot make the malformed
+    payload valid.  The job therefore needs the stable contract failure code and a
+    payload with none of the fields that a client could render as a completed analysis.
+    """
+
+    store = InMemoryAnalysisJobStore()
+    job = store.create("RSI가 30 이하인 KOSPI200")
+
+    def runner(_query: str, _trace_id: str) -> APIEnvelope:
+        # Use the actual public result schema rather than a message-shaped ValueError.
+        # This lacks all required envelope fields except the nominal status, so Pydantic
+        # raises a genuine ValidationError at the runner boundary.
+        return APIEnvelope.model_validate({"status": "ready"})
+
+    failed = store.run_sync(job.job_id, runner)  # type: ignore[arg-type]
+
+    assert failed.status == "failed"
+    assert failed.completed_at is not None
+    assert failed.result is not None
+    assert failed.result.status == "failed"
+    assert failed.result.retryable is False
+    assert failed.result.failure_cause is not None
+    assert failed.result.failure_cause.category == "semantic_failure"
+    assert failed.result.failure_cause.subcause == "contract_shape_error"
+    assert failed.result.strategy_spec is None
+    assert failed.result.user_payload.candidate_cards == []
+    assert failed.result.user_payload.ticker_actions == []
+    assert failed.result.user_payload.performance is None
+    assert failed.result.user_payload.report is None
+    assert failed.result.user_payload.recommendation_gate is None
 
 
 def test_lock_exhaustion_is_named_not_swallowed_as_unknown() -> None:
