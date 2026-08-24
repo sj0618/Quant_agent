@@ -10,6 +10,7 @@ from typing import ClassVar, Literal
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ai_graph.audit import (
@@ -53,6 +54,7 @@ from ai_graph.preflight import (
     classify_research_request,
 )
 from ai_graph.quant_performance import sanitize_public_backtest_performance
+from ai_graph.scope_review import review_research_scope
 from ai_graph.research_contract import (
     CanonicalRuleV1,
     DraftConflictV1,
@@ -165,6 +167,20 @@ class ParseStrategyRequest(BaseModel):
 
 
 PreflightRejectionResponse = ScopeRefusalV1 | UnsupportedScopeV1
+
+
+async def _scope_decision(query: str) -> ResearchRequestPreflight:
+    """The deterministic verdict, with a second opinion only where wording is ambiguous.
+
+    Requests the guard settles on its own never reach a provider, so an ordinary or an
+    unambiguously prohibited request still costs nothing here. The adjudication call is
+    blocking, so the ambiguous branch runs off the event loop.
+    """
+
+    decision = classify_research_request(query)
+    if decision.allowed or not decision.adjudicable:
+        return decision
+    return await run_in_threadpool(review_research_scope, query, decision)
 
 
 def _preflight_rejection_response(
@@ -573,7 +589,7 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
-        scope_response = _preflight_rejection_response(classify_research_request(request.query))
+        scope_response = _preflight_rejection_response(await _scope_decision(request.query))
         if scope_response is not None:
             return scope_response
         await require_preflight_user.consume_quota_after_preflight(http_request)
@@ -710,7 +726,7 @@ def create_app(
         request: ParseStrategyRequest,
         user_id: str = Depends(require_preflight_user),
     ) -> ParseReviewV1 | JSONResponse:
-        scope_response = _preflight_rejection_response(classify_research_request(request.request_text))
+        scope_response = _preflight_rejection_response(await _scope_decision(request.request_text))
         if scope_response is not None:
             return scope_response
         signer = app.state.rule_draft_signer

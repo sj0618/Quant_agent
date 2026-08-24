@@ -70,6 +70,7 @@ from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
 from ai_graph.preflight import classify_research_request
+from ai_graph.scope_review import review_research_scope
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
@@ -231,7 +232,7 @@ def run_analysis(
 ) -> APIEnvelope:
     query = _normalize_user_query(user_query)
     resolved_trace_id = trace_id or (_trace_id(query) if query else None)
-    scope_decision = classify_research_request(query)
+    scope_decision = review_research_scope(query, classify_research_request(query))
     if not scope_decision.allowed:
         # This guard intentionally precedes audit-session construction and graph setup.
         # A refused personalized request must not persist a job/audit record, consume a
