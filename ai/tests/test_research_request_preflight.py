@@ -67,3 +67,28 @@ def test_analysis_job_openapi_example_uses_a_research_rule_not_an_action_prompt(
 
     assert classify_research_request(example).allowed is True
     assert not {term for term in ("매수", "매도", "보유", "추천") if term in example}
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "사람들이 많이 쓰는 검증된 퀀트 전략을 자동으로 선택해 검토해 주세요",
+        "널리 쓰이는 검증된 퀀트 전략을 자동으로 만들어 검토해 주세요",
+        "KOSPI 대형주 중에서 모멘텀이 강한 종목을 조건식으로 검토해 주세요",
+    ),
+)
+def test_the_automatic_strategy_path_is_reachable_through_the_preflight(query: str) -> None:
+    """The scope guard and the automatic strategy mode have to agree on the same request.
+
+    These two classifiers live in different modules and were written at different times,
+    so nothing structural stops one from closing over what the other treats as its main
+    entry point. That already happened once: every phrasing containing "추천해" is
+    refused as an action imperative, which silently rejected the automatic path's own
+    test prompt. Automatic mode is the default for free-form requests, so a request does
+    not need that word - but something has to assert the two still meet.
+    """
+
+    from ai_graph.quant_strategy import classify_strategy_request
+
+    assert classify_research_request(query).allowed is True
+    assert classify_strategy_request(query) in {"automatic", "user_defined"}
