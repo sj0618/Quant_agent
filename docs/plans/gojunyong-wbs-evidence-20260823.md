@@ -4,7 +4,10 @@
 
 두 가지가 어제와 다르다. 첫째, S 증적은 전부 그대로 유효하고 이제 실제 CI URI가 붙는다. 둘째, 어제 "대기"로만 적혀 있던 배포·서버 증적은 **대기가 아니라 차단**이다. 배포 대상 서버가 2026-08-13부터 SSH를 서비스하지 않는다.
 
-## 1. 배포 서버 장애 — BLK-DEPLOY-SSH-001
+## 1. 배포 서버 장애 — BLK-DEPLOY-SSH-001 (2026-08-24 해소)
+
+> **2026-08-24 갱신 — 해소.** 아래 진단은 발생 당시(2026-08-23) 관측 그대로 보존한다.
+> 현재 상태는 [1.1 해소 기록](#11-해소-기록--2026-08-24)에 있다.
 
 `Deploy to SSH Server`와 `Server health check`가 모두 `ssh-keyscan` 단계에서 죽는다.
 
@@ -36,7 +39,13 @@ quant-agent.kro.kr: Connection closed by remote host   (x5, 키 종류마다 1�
 - 최신 실패(`fd3dbeb`): <https://github.com/sj0618/Qaunt_agent/actions/runs/32620823967/job/97148769504>
 - `Server health check` 최신 실패: <https://github.com/sj0618/Qaunt_agent/actions/runs/32621204444>
 
-[control board](quantagent-production-control-board.md)에 `BLK-DEPLOY-SSH-001`로 등재했다. `owner`·`last_reviewer`는 배정되지 않은 역할 자리표시자다.
+[control board](quantagent-production-control-board.md)에 `BLK-DEPLOY-SSH-001`로 등재한다고 적었다.
+
+> **2026-08-24 정정.** 실제로는 등재되지 않았다. 현재 board의 `blockers` 배열에는
+> `BL-PLAN-001`, `BL-DATA-001`, `BL-METRIC-001` 셋만 있고 `BLK-DEPLOY-SSH-001`은
+> 없다. 이 문장은 사실이 아니었다. 그래서 해소를 board에서 닫을 것도 없다 — 열린 적이
+> 없는 항목은 닫을 수 없다. board를 다루는 사람이 사후 등재까지 원한다면 그건 별도
+> 결정이며, 이 문서는 board를 고치지 않는다.
 
 ### 재시도로 덮지 않은 이유
 
@@ -47,6 +56,43 @@ quant-agent.kro.kr: Connection closed by remote host   (x5, 키 종류마다 1�
 1. `138.2.113.134`에서 sshd 상태와 30233 포트포워드 대상을 확인한다.
 2. 복구 후 `Deploy to SSH Server`를 재실행하고 그 run URI를 P0-REL-01·P1-CI-01 증적으로 남긴다.
 3. 10일간 배포가 없었으므로 현재 서버에 무엇이 올라가 있는지부터 확인한다. 배포본과 `main`의 차이는 이 문서로 증명할 수 없다.
+
+### 1.1 해소 기록 — 2026-08-24
+
+2026-08-24에 다시 관측했다. 인증은 시도하지 않았고 읽기 전용 probe와 CI 이력 조회만 했다.
+
+| 관측 | 2026-08-23 | 2026-08-24 |
+|---|---|---|
+| DNS `quant-agent.kro.kr` | `138.2.113.134` | `138.2.113.134` (동일) |
+| SSH 배너 (30233) | **없음** — 즉시 끊김 | **`SSH-2.0-OpenSSH_8.0`** |
+
+`Deploy to SSH Server`가 같은 날 오전에 회복했다. 마지막 실패와 첫 성공이 9분 간격이다.
+
+| 시각 (UTC) | 커밋 | 결과 | Run |
+|---|---|---|---|
+| 09:38 | `a6d9e1d` | failure | <https://github.com/sj0618/Qaunt_agent/actions/runs/32712666332> |
+| 09:47 | `11ad44f` | **success** | <https://github.com/sj0618/Qaunt_agent/actions/runs/32713383696> |
+| 10:38 | `2b7c010` | success | <https://github.com/sj0618/Qaunt_agent/actions/runs/32717807498> |
+| 10:46 | `29eaef2` | success | <https://github.com/sj0618/Qaunt_agent/actions/runs/32718454031> |
+
+`Server health check`는 최근 6회 연속 success이며 최신은 `29eaef2` 기준
+<https://github.com/sj0618/Qaunt_agent/actions/runs/32726256341> (12:16 UTC)다.
+
+배포된 서비스도 응답한다. `GET /ai-api/ai-api/api-status`와 `GET /ai-api/ai-api/readiness`가
+각각 `200`이고, readiness는 `status: ready`로 다섯 체크가 모두 `ready: true`다.
+`job_store`는 `active_mode: persistent`, `fallback: false`다.
+
+#### 그래도 남아 있는 것
+
+- **원인은 확인되지 않았다.** 배너가 돌아왔다는 사실만 안다. sshd가 재시작됐는지,
+  포트포워드가 복구됐는지, 차단 규칙이 풀렸는지는 서버에 들어가 봐야 알 수 있다.
+  원인을 모르면 재발 여부도 예측할 수 없다.
+- **위 "사람이 해야 하는 일" 3번은 그대로 열려 있다.** 10일 공백 동안 서버에 무엇이
+  올라가 있었는지는 여전히 이 문서로 증명되지 않는다. 8/24 배포가 성공했으므로 지금은
+  `29eaef2`가 올라가 있을 것으로 보이지만, 그건 추정이지 관측이 아니다.
+- `RMP-ENV-01`, `P0-REL-01`, `P1-CI-01`의 차단 사유는 이 blocker였다. 차단은 풀렸으나
+  각 행의 완료 조건(서버 import·백테스트 확인, 배포 권한·release ID·rollback 절차·검토자
+  2명, deploy/rollback run URI)은 별개이며 이 기록으로 충족되지 않는다.
 
 ## 2. S 증적 재검증 — 현재 `main`(`fd3dbeb`)
 
