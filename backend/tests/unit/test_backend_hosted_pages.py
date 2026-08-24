@@ -52,6 +52,10 @@ def test_app_page_requires_valid_session_then_serves_shell(frontend_dist: Path, 
     missing = client.get("/app", follow_redirects=False)
     assert missing.status_code == 303
     assert missing.headers["location"] == "/login?returnTo=%2Fapp"
+
+    missing_with_query = client.get("/app?tab=security", follow_redirects=False)
+    assert missing_with_query.status_code == 303
+    assert missing_with_query.headers["location"] == "/login?returnTo=%2Fapp%3Ftab%3Dsecurity"
     session_id, _csrf = asyncio.run(
         AuthSessionStore(app.state.redis_client, app.state.settings).create_session(user_id="user-1")
     )

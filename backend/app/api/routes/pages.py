@@ -90,7 +90,10 @@ async def login_page(request: Request):
 @router.get("/app", include_in_schema=False)
 async def app_page(request: Request):
     if not await _has_valid_session(request):
-        return RedirectResponse(f"/login?{urlencode({'returnTo': request.url.path})}", status_code=303)
+        return_to = request.url.path
+        if request.url.query:
+            return_to = f"{return_to}?{request.url.query}"
+        return RedirectResponse(f"/login?{urlencode({'returnTo': return_to})}", status_code=303)
     index_path = _frontend_index_path()
     if index_path is not None:
         return FileResponse(index_path, media_type="text/html; charset=utf-8")
