@@ -15,6 +15,7 @@ on:
           - live-audit
           - server-diagnostics
           - analysis-job-inventory
+          - pipeline-load-timing
           - trace-diagnostic
 
 permissions:
@@ -180,6 +181,60 @@ jobs:
               "check_constraints": {name: validated for name, validated in constraints},
           }, ensure_ascii=False, sort_keys=True))
           PY
+          REMOTE
+
+      - name: Time one pipeline data load
+        if: ${{ inputs.mode == 'pipeline-load-timing' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="$1"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          test -s "$PID_FILE"
+          PID="$(cat "$PID_FILE")"
+          [[ "$PID" =~ ^[1-9][0-9]*$ ]]
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*|AI_DB_*=*) export "$entry" ;;
+            esac
+          done < "/proc/$PID/environ"
+          echo "load average before: $(cut -d' ' -f1-3 /proc/loadavg)"
+          cd "$APP_DIR/ai"
+          AI_LLM_PROVIDER=mock "$APP_DIR/ai/.venv/bin/python" -u <<'PY'
+          # The fenced backend runner calls load_pipeline_data_from_env() once per
+          # invocation. The graph calls it once per analysis and reuses the prepared
+          # market data across every candidate and self-improvement round. This measures
+          # what routing each candidate through that runner would cost per candidate.
+          import json
+          import time
+
+          from ai_graph.data_sources import load_pipeline_data_from_env
+
+          PROMPT = "삼성전자 RSI 30 이하 매수 70 이상 매도 최근 1년 백테스트"
+          samples = []
+          rows = 0
+          for index in range(3):
+              started = time.perf_counter()
+              pipeline = load_pipeline_data_from_env(PROMPT, f"pipeline-load-timing-{index}")
+              samples.append(round(time.perf_counter() - started, 3))
+              rows = len(pipeline.price_rows or ())
+              time.sleep(2)
+
+          print(json.dumps({
+              "seconds_per_load": samples,
+              "median_seconds": sorted(samples)[len(samples) // 2],
+              "price_rows": rows,
+          }, sort_keys=True))
+          PY
+          echo "load average after: $(cut -d' ' -f1-3 /proc/loadavg)"
           REMOTE
 
       - name: Run live AOAI and branch backtest benchmarks
