@@ -10,6 +10,7 @@ UI reported "매수 조건 N개 생성 완료".
 
 from array import array
 
+import numpy as np
 import pytest
 
 from ai_graph.graph import _strategy_profile_base
@@ -256,3 +257,65 @@ def test_generated_code_and_evaluator_agree_to_fall_back_on_the_ticker_code() ->
     assert compile_score_expression(conditions) is None
     assert _evaluator_entry(conditions, rows) == "000010"
     assert _generated_code_entry(conditions, rows) == "000010"
+
+
+def test_a_windowed_metric_is_unavailable_until_its_window_is_full() -> None:
+    """QV-WRM-01: a rolling window must not report a shorter window under its own name.
+
+    The generated-code path already gated on `warmup_bars`, and the profile path already
+    masked rows below its lookback. This one - the path a compiled user rule actually
+    runs on - emitted an average as soon as a single prior bar existed, so a 20-day
+    average was a 3-day average on bar three and a rule written against it fired on a
+    number nobody measured.
+    """
+
+    rows = _bars(40)
+    store = PreparedFeatureStore(rows)
+
+    average = store._rolling_metric("close", 20, "avg")
+
+    assert np.all(np.isnan(average[:20])), "a partial window must not report a value"
+    assert np.all(np.isfinite(average[20:])), "a full window must report one"
+
+
+def test_a_windowed_extreme_is_unavailable_until_its_window_is_full() -> None:
+    """The 52-week-high shape: `max` over a window is the one that fires a false breakout."""
+
+    rows = _bars(40)
+    store = PreparedFeatureStore(rows)
+
+    highest = store._rolling_metric("high", 20, "max")
+
+    assert np.all(np.isnan(highest[:20]))
+    assert np.all(np.isfinite(highest[20:]))
+
+
+def test_a_lookback_is_not_subject_to_window_warmup() -> None:
+    """`last` reads the most recent prior value; the window only bounds its staleness.
+
+    Gating it on a full window would turn a lookback into an aggregate and hide a value
+    that was measured exactly as named.
+    """
+
+    rows = _bars(40)
+    store = PreparedFeatureStore(rows)
+
+    previous = store._rolling_metric("close", 20, "last")
+
+    assert np.isnan(previous[0]), "there is no prior bar on the first row"
+    assert np.all(np.isfinite(previous[1:20])), "a lookback needs one prior bar, not 20"
+
+
+def test_a_compiled_rule_cannot_enter_before_its_window_has_filled() -> None:
+    """The warm-up mask has to reach the actions, not just the indicator series."""
+
+    rows = _bars(40)
+    conditions = [
+        Condition(left="close", operator="gt", right="close", window=20, aggregate="avg")
+    ]
+
+    actions = _actions(conditions, rows)
+
+    entries = [index for index, action in enumerate(actions) if action == 1]
+    assert entries, "the rule must still be able to fire once warmed up"
+    assert min(entries) >= 20, f"entered during warm-up at bar {min(entries)}"

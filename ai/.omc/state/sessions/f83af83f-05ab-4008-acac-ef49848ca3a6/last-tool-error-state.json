@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"sed -n '95,135p' ai/tests/test_backtest_optimization.py\",\"description\":\"Read the failing prior-only rolling test\"}",
+  "error": "Exit code 1\nsed: ai/tests/test_backtest_optimization.py: No such file or directory",
+  "timestamp": "2026-08-24T12:24:46.204Z",
+  "retry_count": 1
+}
