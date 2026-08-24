@@ -372,6 +372,7 @@ jobs:
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
               --host 0.0.0.0 \
               --port 18001 \
+              --workers 1 \
               > "$RUN_DIR/combined.log" 2>&1 &
             echo "$!" > "$RUN_DIR/combined.pid"
 
