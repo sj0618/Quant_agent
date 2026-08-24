@@ -26,10 +26,13 @@ from ai_graph.api import (
 from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import (
+    AnalysisHistoryReadOnlyError,
     AnalysisJobStatus,
     InMemoryAnalysisJobStore,
     JobStoreConfigurationError,
     JobStoreRuntime,
+    ReadOnlyAnalysisJobStore,
+    RestartReconciliationStore,
 )
 from ai_graph.research_contract import RuleDraftSigner
 from ai_graph.research_eligibility import PerformanceAvailable
@@ -358,6 +361,79 @@ def test_production_retires_raw_analysis_jobs_before_side_effects(
     assert store.list_jobs() == []
     assert runner_calls == 0
     assert sink.sessions == ()
+
+
+def test_analysis_history_is_read_only_while_no_surface_may_create_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With both creating routes retired, the store itself stops accepting new rows.
+
+    The routes already refuse, so this is the structural half of the same guarantee: a
+    consumer added later cannot start extending the history just by calling the store.
+    Past results stay readable and stay put - nothing here removes one.
+    """
+
+    monkeypatch.setenv("APP_ENV", "production")
+    store = InMemoryAnalysisJobStore()
+    existing = store.create_job("과거에 실행된 분석", user_id="local-dev-user")
+
+    client = TestClient(create_app(store, research_execution_enabled=False))
+    read_only = client.app.state.job_store
+
+    assert isinstance(read_only, ReadOnlyAnalysisJobStore)
+
+    with pytest.raises(AnalysisHistoryReadOnlyError):
+        read_only.create_job("새 분석", user_id="local-dev-user")
+
+    # The history is still there, still readable, over HTTP and through the store.
+    response = client.get(f"{ANALYSIS_JOBS_PATH}/{existing.job_id}")
+    assert response.status_code == 200
+    assert response.json()["job_id"] == existing.job_id
+    assert [job.job_id for job in read_only.list_jobs()] == [existing.job_id]
+
+
+def test_activating_research_execution_restores_the_write_surface() -> None:
+    """The read-only wrapper follows the enabled surfaces, not the deploy environment.
+
+    Otherwise the day research execution is activated in production it would be blocked
+    by a rule that was only ever about the retired legacy flow.
+    """
+
+    client = TestClient(
+        create_app(InMemoryAnalysisJobStore(), research_execution_enabled=True)
+    )
+
+    assert not isinstance(client.app.state.job_store, ReadOnlyAnalysisJobStore)
+
+
+def test_read_only_history_still_lets_a_restart_finish_interrupted_jobs() -> None:
+    """Reconciliation finishes existing history; it does not open new history.
+
+    Startup fails a job a dead process left RUNNING. Blocking that along with creation
+    would leave those rows spinning forever and make readiness fail closed for a reason
+    that has nothing to do with the retired flow.
+    """
+
+    class ReconcilableStore(InMemoryAnalysisJobStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.force_failed: list[str] = []
+
+        def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list:
+            return []
+
+        def force_fail_undecodable_job(
+            self, job_id: str, *, error_message: str, reason: str
+        ) -> bool:
+            self.force_failed.append(job_id)
+            return True
+
+    inner = ReconcilableStore()
+    read_only = ReadOnlyAnalysisJobStore(inner)
+
+    assert isinstance(read_only, RestartReconciliationStore)
+    assert read_only.force_fail_undecodable_job("j-1", error_message="e", reason="r") is True
+    assert inner.force_failed == ["j-1"]
 
 
 def test_backtest_api_redacts_legacy_insufficient_performance_before_serialization() -> None:
