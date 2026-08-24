@@ -3,9 +3,11 @@ from __future__ import annotations
 # pyright: reportUnannotatedClassAttribute=false, reportUnusedFunction=false
 import asyncio
 import json
+import logging
 import secrets
 import uuid
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from os import environ
 from typing import ClassVar, Literal
 
@@ -23,6 +25,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.concurrency import run_in_threadpool
 
 from ai_graph.audit import (
     AuditSession,
@@ -55,6 +58,7 @@ from ai_graph.jobs import (
     CancellationRegistry,
     JobStoreRuntime,
     create_analysis_job_store_from_env,
+    reap_interrupted_jobs,
     run_job_sync,
 )
 from ai_graph.llm.role_calls import generate_strategy_description
@@ -91,6 +95,8 @@ from ai_graph.schemas import (
     EnvelopeStatus,
     UserPayload,
 )
+from ai_graph.scope_review import review_research_scope
+from ai_graph.single_process import enforce_single_process
 from ai_graph.token_auth import (
     AccountTokenQuota,
     AccountTokenResolver,
@@ -98,6 +104,8 @@ from ai_graph.token_auth import (
     RequireUserIdentity,
     RequireUserIdentityWithinQuota,
 )
+
+_logger = logging.getLogger(__name__)
 
 API_TITLE = "QuantAgent AI API"
 API_VERSION = "0.1.0"
@@ -201,6 +209,15 @@ class DataEvidenceProbeResponse(BaseModel):
 
 
 PreflightRejectionResponse = ScopeRefusalV1 | UnsupportedScopeV1
+
+
+async def _scope_decision(query: str) -> ResearchRequestPreflight:
+    """Use a judge only for an otherwise fail-closed, object-ambiguous refusal."""
+
+    decision = classify_research_request(query)
+    if decision.allowed or not decision.adjudicable:
+        return decision
+    return await asyncio.to_thread(review_research_scope, query, decision)
 
 
 def _preflight_rejection_response(
@@ -525,12 +542,30 @@ def create_app(
         token_resolver=account_token_resolver,
         quota=account_token_quota,
     )
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Reject unsafe worker fan-out and reconcile jobs left running after a restart."""
+
+        enforce_single_process()
+        # A partial sweep leaves jobs that still claim to be executing, so the job API
+        # cannot be served honestly until reconciliation succeeds.  The typed error
+        # from the store crosses the lifespan boundary and makes readiness fail closed.
+        reaped = await run_in_threadpool(reap_interrupted_jobs, store)
+        if reaped:
+            _logger.warning(
+                "failed %d analysis job(s) left running by a previous process: %s",
+                len(reaped),
+                ", ".join(reaped),
+            )
+        yield
+
     app = FastAPI(
         title=API_TITLE,
         version=API_VERSION,
         description=API_DESCRIPTION,
         docs_url=DOCS_URL,
         openapi_url=OPENAPI_URL,
+        lifespan=lifespan,
     )
     cors_allow_origins = _cors_allow_origins()
     if cors_allow_origins:
@@ -656,7 +691,7 @@ def create_app(
                     "alternative": RESEARCH_JOB_CREATE_PATH,
                 },
             )
-        scope_response = _preflight_rejection_response(classify_research_request(request.query))
+        scope_response = _preflight_rejection_response(await _scope_decision(request.query))
         if scope_response is not None:
             return scope_response
         await require_preflight_user.consume_quota_after_preflight(http_request)
@@ -793,7 +828,7 @@ def create_app(
         request: ParseStrategyRequest,
         user_id: str = Depends(require_preflight_user),
     ) -> ParseReviewV1 | JSONResponse:
-        scope_response = _preflight_rejection_response(classify_research_request(request.request_text))
+        scope_response = _preflight_rejection_response(await _scope_decision(request.request_text))
         if scope_response is not None:
             return scope_response
         signer = app.state.rule_draft_signer

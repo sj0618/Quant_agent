@@ -26,7 +26,14 @@ from ai_graph.progress import (
     stage_reporter,
 )
 from ai_graph.research_eligibility import PerformanceAvailable
-from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
+from ai_graph.schemas import (
+    APIEnvelope,
+    EnvelopeStatus,
+    FailureDiagnostic,
+    Stage,
+    StageStatus,
+    UserPayload,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -40,6 +47,10 @@ INTERRUPTED_BY_RESTART_REASON = "interrupted_by_restart"
 INTERRUPTED_BY_RESTART_MESSAGE = (
     "서버가 재시작되어 분석이 중단되었습니다. 같은 요청으로 다시 실행해 주세요."
 )
+
+
+class InterruptedJobReconciliationError(RuntimeError):
+    """The process cannot safely serve jobs until restart reconciliation completes."""
 
 AI_JOB_STORE_ENV = "AI_JOB_STORE"
 BE_JOB_STORE_MODE_ENV = "BE_JOB_STORE_MODE"
@@ -912,6 +923,16 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             ),
             evidence_refs=[f"failure:{exc.reason}"],
         )
+    if any(_is_postgres_connection_failure(error) for error in exception_chain):
+        return FailureDiagnostic(
+            category="infrastructure_failure",
+            subcause="db_connection_unavailable",
+            failure_stage=stage,
+            owner="data_source_config",
+            retryable=True,
+            safe_message="운영 데이터 소스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+            evidence_refs=["failure:db_connection_unavailable"],
+        )
     raw = str(exc).lower()
     if "connection timeout" in raw or "connect timeout" in raw or "connection timed out" in raw:
         return FailureDiagnostic(
@@ -974,6 +995,27 @@ def _exception_chain(exc: Exception) -> tuple[BaseException, ...]:
         cause = current.__cause__
         current = cause if isinstance(cause, BaseException) else None
     return tuple(chain)
+
+
+def _is_postgres_connection_failure(error: BaseException) -> bool:
+    """Recognize driver connection failures without importing a database driver here.
+
+    Jobs intentionally stay usable in non-PostgreSQL test/runtime modes.  The driver
+    nevertheless preserves a stable module/type identity for connection-establishment
+    failures, including the direct ``psycopg.OperationalError`` emitted by ``connect``
+    before a SQLSTATE exists.  SQLSTATE class 08 is the PostgreSQL-defined connection
+    family; other database errors remain subject to their more specific classifiers.
+    """
+
+    error_type = type(error)
+    module = error_type.__module__
+    sqlstate = getattr(error, "sqlstate", None)
+    if isinstance(sqlstate, str) and sqlstate.startswith("08"):
+        return module.startswith("psycopg")
+    return module == "psycopg" and error_type.__name__ in {
+        "OperationalError",
+        "InterfaceError",
+    }
 
 
 def _aoai_failure_diagnostic(
@@ -1040,12 +1082,20 @@ def reap_interrupted_jobs(
     it ended.
 
     A job with no recorded incarnation predates the field, which means an earlier process
-    wrote it, so it is reaped for the same reason. One job that cannot be failed does not
-    stop the sweep: leaving the other stranded jobs spinning would be the worse outcome.
+    wrote it, so it is reaped for the same reason.  A partial reconciliation is not safe:
+    any row that cannot be transitioned can still spin forever, so startup must stop and
+    expose the dependency failure rather than serving a misleading job API.
     """
 
+    try:
+        jobs = store.list_jobs(limit=limit)
+    except Exception as error:
+        raise InterruptedJobReconciliationError(
+            "analysis job restart reconciliation could not inspect the job store"
+        ) from error
+
     reaped: list[str] = []
-    for job in store.list_jobs(limit=limit):
+    for job in jobs:
         if job.status not in _REAPABLE_STATUSES or job.owner_incarnation == incarnation:
             continue
         try:
@@ -1054,8 +1104,10 @@ def reap_interrupted_jobs(
                 INTERRUPTED_BY_RESTART_MESSAGE,
                 fallback_reasons=[*job.fallback_reasons, INTERRUPTED_BY_RESTART_REASON],
             )
-        except Exception:
+        except Exception as error:
             _logger.exception("could not reap interrupted analysis job %s", job.job_id)
-            continue
+            raise InterruptedJobReconciliationError(
+                "analysis job restart reconciliation could not settle an interrupted job"
+            ) from error
         reaped.append(job.job_id)
     return reaped

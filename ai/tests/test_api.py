@@ -3,6 +3,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from psycopg import OperationalError
 
 if TYPE_CHECKING:
     from offline_test_environment import OfflineTestEnvironment
@@ -944,6 +945,43 @@ def test_failed_analysis_job_returns_error_contract() -> None:
     assert "runner failed" not in failed_job["result"]["user_payload"]["message"]
     assert failed_job["result"]["debug_ref"].startswith("job-error:")
     assert failed_job["stages"][-1]["status"] == "failed"
+
+
+def test_database_connection_failure_has_a_safe_retryable_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PostgreSQL connection error must not degrade into ``unknown`` for the UI."""
+
+    monkeypatch.setenv("AUTH_ENABLED", "0")
+
+    def failing_runner(_query: str, _trace_id: str) -> APIEnvelope:
+        raise OperationalError("password=must-not-leak connection refused")
+
+    client = TestClient(
+        create_app(InMemoryAnalysisJobStore(), analysis_runner=failing_runner)
+    )
+    response = client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 조건"})
+
+    assert response.status_code == 201
+    failed_job = _poll_job(client, response.json()["job_id"])
+    result = failed_job["result"]
+    public = repr(result)
+    assert result["status"] == "failed"
+    assert result["retryable"] is True
+    assert result["failure_cause"] == {
+        "category": "infrastructure_failure",
+        "subcause": "db_connection_unavailable",
+        "failure_stage": "interpreting",
+        "owner": "data_source_config",
+        "retryable": True,
+        "safe_message": "운영 데이터 소스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+        "evidence_refs": ["failure:db_connection_unavailable"],
+    }
+    assert result["strategy_spec"] is None
+    assert result["user_payload"]["candidate_cards"] == []
+    assert result["user_payload"]["performance"] is None
+    assert result["user_payload"]["report"] is None
+    assert "must-not-leak" not in public
 
 
 def test_unknown_analysis_job_returns_404() -> None:

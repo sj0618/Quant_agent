@@ -10,12 +10,17 @@ from ai_graph.source_manifest_audit import (
 
 
 def _manifest(*, source: str = "postgres") -> dict[str, object]:
+    # This is audit-fixture metadata only, never a substituted production extract.
+    # `extract_snapshot` is deliberately explicit because the release manifest binds
+    # its integrity hash to the concrete adapter payload.
+    extract_snapshot = {"test_sample": source, "rows": []}
     return build_source_manifest(
         source=source,
         as_of="2026-08-20",
         freshness="fresh",
         lineage_refs=["mart.common_stock_universe_asof", "core.adjusted_ohlcv"],
         source_version="warehouse-release-v1",
+        extract_snapshot=extract_snapshot,
     ).model_dump(mode="json")
 
 

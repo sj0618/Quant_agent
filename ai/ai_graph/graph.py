@@ -727,6 +727,8 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         output["l4_evidence"] = pipeline_data.l4_evidence
     if pipeline_data.macro_snapshot:
         output["macro_snapshot"] = pipeline_data.macro_snapshot
+    if pipeline_data.official_benchmark is not None:
+        output["official_benchmark"] = pipeline_data.official_benchmark
 
     # Stop rather than screen on whatever data happens to exist. Conditions we cannot
     # evaluate used to fall through to a price-only profile, so a flow or short-interest
@@ -3192,7 +3194,9 @@ def _ticker_actions(
     not a recommendation it can make about a stock it never looked at. The screen, on the
     other hand, hands the user a specific list and that list needs a verdict for every
     row - otherwise a name silently disappearing reads as "sell". So screened names with
-    no action from the backtest come back as WATCH, explicitly.
+    no action from the backtest come back as WATCH, explicitly.  The explanation is
+    constrained to facts recorded by the run; this formatter never re-evaluates entry
+    conditions for a ticker the backtest did not price.
     """
 
     freshness = state.get("freshness_evidence") or {}
@@ -3205,6 +3209,8 @@ def _ticker_actions(
     ]
     decided = {action.ticker for action in actions}
     as_of = actions[0].as_of_date if actions else None
+    traded = _traded_universe(backtest)
+    slots_full_reason = _slots_full_reason(backtest)
     for card in cards:
         for match in card.matches:
             if match.ticker in decided:
@@ -3215,13 +3221,63 @@ def _ticker_actions(
                     ticker=match.ticker,
                     name=match.name or match.ticker,
                     action="WATCH",
-                    reason="스크리닝에는 걸렸으나 전략의 진입 조건은 아직 충족하지 않았습니다.",
+                    reason=_watch_reason(
+                        match.ticker, traded=traded, slots_full_reason=slots_full_reason
+                    ),
                     as_of_date=as_of or match.as_of_date,
                     close=match.close,
                 )
             )
     order = {"SELL": 0, "BUY": 1, "HOLD": 2, "WATCH": 3}
     return sorted(actions, key=lambda a: (order[a.action], a.ticker))
+
+
+_WATCH_OUTSIDE_UNIVERSE = (
+    "백테스트가 거래한 과거 시점(PIT) 유니버스에 없는 종목이라 백테스트가 판정한 적이 "
+    "없습니다. 오늘 스크리닝 조건에는 부합합니다."
+)
+_WATCH_NO_INSTRUCTION = "백테스트 마지막 거래일에 이 종목에 대한 신규 진입·청산 지시가 없었습니다."
+
+
+def _watch_reason(
+    ticker: str, *, traded: set[str] | None, slots_full_reason: str | None
+) -> str:
+    if traded is not None and str(ticker).zfill(6) not in traded:
+        return _WATCH_OUTSIDE_UNIVERSE
+    if slots_full_reason is not None:
+        return slots_full_reason
+    return _WATCH_NO_INSTRUCTION
+
+
+def _traded_universe(backtest: Mapping[str, Any]) -> set[str] | None:
+    """The tickers actually priced by the backtest, if the run recorded them."""
+
+    payload = backtest.get("backtest_payload")
+    tickers = payload.get("tickers") if isinstance(payload, Mapping) else None
+    if not isinstance(tickers, list) or not tickers:
+        return None
+    return {str(ticker).zfill(6) for ticker in tickers}
+
+
+def _slots_full_reason(backtest: Mapping[str, Any]) -> str | None:
+    """Name a full-position limit only when the engine recorded both inputs."""
+
+    summary = backtest.get("engine_summary")
+    if not isinstance(summary, Mapping):
+        return None
+    held = summary.get("open_position_tickers")
+    if not isinstance(held, list):
+        return None
+    context = summary.get("ai_backtest_context")
+    limit = context.get("applied_max_positions") if isinstance(context, Mapping) else None
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return None
+    if len(held) < limit:
+        return None
+    return (
+        f"백테스트 마지막 거래일에 전략 보유 슬롯 {len(held)}/{limit}이 모두 차 있어 "
+        "신규 진입이 제한된 상태였습니다."
+    )
 
 
 def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:

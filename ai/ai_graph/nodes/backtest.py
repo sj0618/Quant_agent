@@ -57,6 +57,11 @@ AUXILIARY_BENCHMARK_WARNING = (
     "공식 KOSPI/KOSDAQ 총수익률(TR) 시계열과 월초 목표 비중이 입력되지 않아 "
     "동일가중 보조 프록시만 계산했습니다. 공식 벤치마크로 해석할 수 없습니다."
 )
+PRIMARY_BENCHMARK_MISSING_INPUT_REASON = (
+    "official KOSPI and KOSDAQ total-return series with target weights were not supplied"
+)
+PRIMARY_BENCHMARK_SOURCE_UNAVAILABLE_REASON = "official_benchmark_source_unavailable"
+OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE = 0.99
 # Legacy graph exports now describe the authoritative primary benchmark contract.
 BENCHMARK_LABEL = PRIMARY_BENCHMARK_LABEL
 BENCHMARK_METHOD = PRIMARY_BENCHMARK_METHOD
@@ -628,6 +633,7 @@ class _BenchmarkContext:
     primary_available: bool
     primary_unavailable_reason: str | None
     auxiliary_label: str
+    primary_coverage: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -865,9 +871,12 @@ class _CandidateBacktestSession:
         self,
         strategy: AIStrategySpec,
         price_rows: Sequence[Mapping[str, Any]],
+        *,
+        official_benchmark: Mapping[str, Any] | None = None,
     ) -> None:
         prep_started = time.perf_counter()
         self.strategy = strategy
+        self.official_benchmark = official_benchmark
         phases: dict[str, float] = {}
 
         started = time.perf_counter()
@@ -940,7 +949,9 @@ class _CandidateBacktestSession:
             )
 
         started = time.perf_counter()
-        self.benchmark_context = _build_benchmark_context(self.price_rows)
+        self.benchmark_context = _build_benchmark_context(
+            self.price_rows, official_benchmark
+        )
         phases["benchmark_context_seconds"] = time.perf_counter() - started
 
         self.preparation_phases = {name: round(seconds, 6) for name, seconds in phases.items()}
@@ -1212,6 +1223,10 @@ class _CandidateBacktestSession:
             "candidate_sha": _candidate_identity(candidate),
             "validation_ok": candidate.validation_ok,
             "metrics_mode": metrics_mode,
+            "benchmark": {
+                "available": self.benchmark_context.primary_available,
+                "return": self.benchmark_context.total_return,
+            },
         }
         encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         return sha256(encoded.encode("utf-8")).hexdigest()
@@ -2062,7 +2077,11 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                 "결과는 이 종목들의 과거에 크게 좌우됩니다."
             ),
         )
-    with _CandidateBacktestSession(strategy_a, rows) as session:
+    with _CandidateBacktestSession(
+        strategy_a,
+        rows,
+        official_benchmark=state.get("official_benchmark"),
+    ) as session:
         result = run_candidate_backtest(
             strategy_a,
             candidates,
@@ -3012,7 +3031,10 @@ def _daily_returns_from_benchmark_curve(
 
 def _build_benchmark_context(
     price_rows: Sequence[Mapping[str, Any]],
+    official_benchmark: Mapping[str, Any] | None = None,
 ) -> _BenchmarkContext:
+    """Keep auxiliary proxy legs separate from the optional official primary series."""
+
     auxiliary_curve, _ = _equal_weight_benchmark_curve(price_rows)
     selection_days = max(
         1,
@@ -3022,17 +3044,142 @@ def _build_benchmark_context(
     selection_return = (
         float(auxiliary_curve[selection_index].cumulative_return) if auxiliary_curve else 0.0
     )
+    total_return, coverage, unavailable_reason = _official_benchmark_total_return(
+        price_rows, official_benchmark
+    )
     return _BenchmarkContext(
         daily_returns=tuple(_daily_returns_from_benchmark_curve(auxiliary_curve)),
         selection_days=selection_days,
         selection_return=selection_return,
-        total_return=None,
-        primary_available=False,
-        primary_unavailable_reason=(
-            "official KOSPI and KOSDAQ total-return series with target weights were not supplied"
-        ),
+        total_return=total_return,
+        primary_available=total_return is not None,
+        primary_unavailable_reason=unavailable_reason,
         auxiliary_label=AUXILIARY_BENCHMARK_LABEL,
+        primary_coverage=coverage,
     )
+
+
+def _official_benchmark_total_return(
+    price_rows: Sequence[Mapping[str, Any]],
+    official_benchmark: Mapping[str, Any] | None,
+) -> tuple[float | None, dict[str, Any] | None, str | None]:
+    if not isinstance(official_benchmark, Mapping) or not official_benchmark:
+        return None, None, PRIMARY_BENCHMARK_MISSING_INPUT_REASON
+    if not official_benchmark.get("available"):
+        # This value reaches public metric details.  The source adapter may have
+        # caught a driver exception, so its explanatory text must never cross this
+        # boundary even if an older adapter or persisted job supplied it.
+        return None, None, PRIMARY_BENCHMARK_SOURCE_UNAVAILABLE_REASON
+
+    sessions = sorted({str(row.get("date")) for row in price_rows if row.get("date")})
+    if not sessions:
+        return None, None, "the backtest window has no sessions to measure a benchmark over"
+    kospi = _official_benchmark_levels(official_benchmark.get("kospi_tr"), sessions)
+    kosdaq = _official_benchmark_levels(official_benchmark.get("kosdaq_tr"), sessions)
+    covered = sorted(set(kospi) & set(kosdaq))
+    coverage: dict[str, Any] = {
+        "backtest_sessions": len(sessions),
+        "covered_sessions": len(covered),
+        "coverage_ratio": round(len(covered) / len(sessions), METRIC_ROUND_DIGITS),
+        "minimum_coverage_ratio": OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE,
+        "first_session": sessions[0],
+        "last_session": sessions[-1],
+        "first_session_covered": bool(covered) and covered[0] == sessions[0],
+        "last_session_covered": bool(covered) and covered[-1] == sessions[-1],
+    }
+    if not covered:
+        return None, coverage, (
+            "official KOSPI and KOSDAQ TR levels share no session with the backtest window "
+            f"({sessions[0]}..{sessions[-1]})"
+        )
+    if not coverage["first_session_covered"] or not coverage["last_session_covered"]:
+        return None, coverage, (
+            "official TR levels do not cover both endpoints of the backtest window "
+            f"({sessions[0]}..{sessions[-1]}); covered {covered[0]}..{covered[-1]}"
+        )
+    if coverage["coverage_ratio"] < OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE:
+        return None, coverage, (
+            f"official TR levels cover {len(covered)}/{len(sessions)} backtest sessions, "
+            f"below the required {OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE:.0%}"
+        )
+    weights = _lagged_official_benchmark_weights(
+        official_benchmark.get("monthly_weights"), covered
+    )
+    try:
+        _, total_return = _official_krx_tr_benchmark_curve(kospi, kosdaq, weights)
+    except ValueError as error:
+        return None, coverage, f"official benchmark curve could not be computed: {error}"
+    if total_return is None:
+        return None, coverage, "official benchmark curve produced no observations"
+    return float(total_return), coverage, None
+
+
+def _official_benchmark_levels(
+    series: Any, sessions: Sequence[str]
+) -> dict[str, float]:
+    if not isinstance(series, Mapping):
+        return {}
+    wanted = set(sessions)
+    levels: dict[str, float] = {}
+    for raw_date, raw_value in series.items():
+        session = str(raw_date)
+        if session not in wanted:
+            continue
+        try:
+            level = _finite_float(raw_value, "official benchmark TR level")
+        except (TypeError, ValueError):
+            continue
+        if level > 0.0:
+            levels[session] = level
+    return levels
+
+
+def _lagged_official_benchmark_weights(
+    monthly_weights: Any, sessions: Sequence[str]
+) -> dict[str, tuple[float, float]]:
+    published: dict[str, tuple[float, float]] = {}
+    if isinstance(monthly_weights, Mapping):
+        for raw_month, raw_weights in monthly_weights.items():
+            pair = _official_benchmark_weight_pair(raw_weights)
+            if pair is not None:
+                published[str(raw_month)[:7]] = pair
+    lagged: dict[str, tuple[float, float]] = {}
+    for session in sessions:
+        month = str(session)[:7]
+        if month in lagged:
+            continue
+        previous = _previous_month(month)
+        if previous in published:
+            lagged[month] = published[previous]
+    return lagged
+
+
+def _official_benchmark_weight_pair(value: Any) -> tuple[float, float] | None:
+    if isinstance(value, Mapping):
+        candidate = (value.get("kospi_weight"), value.get("kosdaq_weight"))
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        if len(value) != 2:
+            return None
+        candidate = (value[0], value[1])
+    else:
+        return None
+    try:
+        return (
+            _finite_float(candidate[0], "kospi_weight"),
+            _finite_float(candidate[1], "kosdaq_weight"),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _previous_month(month: str) -> str:
+    try:
+        year, month_number = (int(part) for part in month.split("-", 1))
+    except ValueError:
+        return month
+    if month_number == 1:
+        return f"{year - 1:04d}-12"
+    return f"{year:04d}-{month_number - 1:02d}"
 
 
 def _benchmark_provenance(context: _BenchmarkContext) -> dict[str, Any]:
@@ -3044,6 +3191,11 @@ def _benchmark_provenance(context: _BenchmarkContext) -> dict[str, Any]:
             "official_series_and_lagged_weights": context.primary_available,
             "return": context.total_return if context.primary_available else None,
             "unavailable_reason": context.primary_unavailable_reason,
+            "session_coverage": (
+                dict(context.primary_coverage)
+                if context.primary_coverage is not None
+                else None
+            ),
         },
         "auxiliary": {
             "label": context.auxiliary_label,

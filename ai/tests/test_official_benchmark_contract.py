@@ -17,8 +17,10 @@ import pytest
 
 from ai_graph.data_sources.db import (
     OFFICIAL_BENCHMARK_INDEX_CODES,
+    OFFICIAL_BENCHMARK_LEVELS_UNAVAILABLE,
     OFFICIAL_BENCHMARK_TR_VIEW,
     OFFICIAL_BENCHMARK_WEIGHT_VIEW,
+    OFFICIAL_BENCHMARK_WEIGHTS_UNAVAILABLE,
     DataSourceConfig,
     PostgresPipelineDataSource,
     _official_benchmark_status,
@@ -224,7 +226,7 @@ def test_no_supplied_series_keeps_the_documented_unavailable_reason() -> None:
     )
 
 
-def test_warehouse_reason_is_carried_through_instead_of_a_generic_message() -> None:
+def test_warehouse_reason_is_replaced_before_the_public_benchmark_contract() -> None:
     context = backtest_node._build_benchmark_context(
         _price_rows(_sessions()),
         {
@@ -234,7 +236,10 @@ def test_warehouse_reason_is_carried_through_instead_of_a_generic_message() -> N
     )
 
     assert context.primary_available is False
-    assert OFFICIAL_BENCHMARK_TR_VIEW in context.primary_unavailable_reason
+    assert (
+        context.primary_unavailable_reason
+        == backtest_node.PRIMARY_BENCHMARK_SOURCE_UNAVAILABLE_REASON
+    )
 
 
 def _automatic_metrics(total_return: float) -> BacktestMetrics:
@@ -347,11 +352,28 @@ def test_absent_benchmark_tables_are_unavailable_with_a_reason_not_an_exception(
     descriptor = _source()._fetch_official_benchmark(connection, WINDOW)
 
     assert descriptor["available"] is False
-    assert OFFICIAL_BENCHMARK_TR_VIEW in descriptor["unavailable_reason"]
-    assert "does not exist" in descriptor["unavailable_reason"]
+    assert descriptor["unavailable_reason"] == OFFICIAL_BENCHMARK_LEVELS_UNAVAILABLE
     # A failed statement aborts the transaction and drops the transaction-local timeout.
     assert connection.rollbacks == 1
     assert "set_config('statement_timeout'" in connection.statements[-1]
+
+
+def test_benchmark_driver_error_never_reaches_public_unavailable_reason() -> None:
+    connection = _BenchmarkConnection()
+
+    def secret_error(query: str, _params=None):
+        if OFFICIAL_BENCHMARK_TR_VIEW in query:
+            raise RuntimeError("password=synthetic-secret host=example.internal")
+        return SimpleNamespace(fetchall=lambda: [], fetchone=lambda: None)
+
+    connection.execute = secret_error  # type: ignore[method-assign]
+    descriptor = _source()._fetch_official_benchmark(connection, WINDOW)
+    context = backtest_node._build_benchmark_context(_price_rows(_sessions()), descriptor)
+
+    assert descriptor["unavailable_reason"] == OFFICIAL_BENCHMARK_LEVELS_UNAVAILABLE
+    assert context.primary_unavailable_reason == backtest_node.PRIMARY_BENCHMARK_SOURCE_UNAVAILABLE_REASON
+    assert "synthetic-secret" not in repr(descriptor)
+    assert "example.internal" not in repr(context)
 
 
 def test_absent_weight_table_is_reported_against_its_own_view() -> None:
@@ -362,7 +384,7 @@ def test_absent_weight_table_is_reported_against_its_own_view() -> None:
     descriptor = _source()._fetch_official_benchmark(connection, WINDOW)
 
     assert descriptor["available"] is False
-    assert OFFICIAL_BENCHMARK_WEIGHT_VIEW in descriptor["unavailable_reason"]
+    assert descriptor["unavailable_reason"] == OFFICIAL_BENCHMARK_WEIGHTS_UNAVAILABLE
     assert connection.rollbacks == 1
 
 
@@ -372,9 +394,7 @@ def test_empty_tr_table_names_both_index_codes_and_the_window() -> None:
     descriptor = _source()._fetch_official_benchmark(connection, WINDOW)
 
     assert descriptor["available"] is False
-    assert "KOSPI_TR" in descriptor["unavailable_reason"]
-    assert "KOSDAQ_TR" in descriptor["unavailable_reason"]
-    assert "2024-01-01" in descriptor["unavailable_reason"]
+    assert descriptor["unavailable_reason"] == "official_benchmark_levels_missing"
     assert connection.rollbacks == 0
 
 
@@ -391,8 +411,7 @@ def test_one_index_without_rows_is_not_treated_as_a_covered_benchmark() -> None:
     descriptor = _source()._fetch_official_benchmark(connection, WINDOW)
 
     assert descriptor["available"] is False
-    assert "KOSDAQ_TR" in descriptor["unavailable_reason"]
-    assert "KOSPI_TR" not in descriptor["unavailable_reason"]
+    assert descriptor["unavailable_reason"] == "official_benchmark_levels_missing"
 
 
 def test_loaded_tables_produce_iso_keyed_series_and_unlagged_month_keys() -> None:

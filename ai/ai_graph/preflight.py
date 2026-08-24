@@ -21,6 +21,7 @@ class ResearchRequestPreflight:
 
     allowed: bool
     reason_code: str | None = None
+    adjudicable: bool = False
 
     @property
     def kind(self) -> str:
@@ -78,13 +79,10 @@ _ACTION_IMPERATIVE_TERMS = (
     "매도해",
     "매도해야",
     "보유해",
-    "추천해",
-    "추천해줘",
     "추천종목",
     "종목추천",
     "매수추천",
     "매도추천",
-    "골라줘",
     "무엇을사",
     "뭘사",
     "돈되는",
@@ -97,6 +95,14 @@ _ACTION_IMPERATIVE_TERMS = (
     "sellforme",
     "recommendstock",
     "stockrecommendation",
+)
+
+_AMBIGUOUS_RECOMMENDATION_TERMS = (
+    "추천해",
+    "추천좀",
+    "추천부탁",
+    "골라줘",
+    "골라주세",
 )
 
 _PERSONAL_ACTION_TERMS = (
@@ -156,6 +162,8 @@ def classify_research_request(query: str) -> ResearchRequestPreflight:
         return ResearchRequestPreflight(False, SCOPE_REFUSAL_REASON)
     if any(term in compact for term in _UNSUPPORTED_ASSET_TERMS):
         return ResearchRequestPreflight(False, UNSUPPORTED_SCOPE_REASON)
+    if any(term in compact for term in _AMBIGUOUS_RECOMMENDATION_TERMS):
+        return ResearchRequestPreflight(False, SCOPE_REFUSAL_REASON, adjudicable=True)
     return ResearchRequestPreflight(allowed=True)
 
 
