@@ -1,0 +1,71 @@
+{
+  "document_status": "DRAFT FOR REVIEW",
+  "approval": "PENDING",
+  "wbs_id": "RS-LED-01",
+  "quantqa_version": "QuantQA:v1",
+  "full_git_sha": "dba9ea14171456ea1e01a4f61a06d288cd582f4e",
+  "required_tier": "T1",
+  "required_classes": ["S"],
+  "observed_classes": [],
+  "status": "UNVERIFIED",
+  "requirement_origin": {
+    "required_classes": "QUANTQA_V1_IMPLEMENTATION_DEFINITION",
+    "tier_label": "QUANTQA_V1_IMPLEMENTATION_DEFINITION"
+  },
+  "wbs_contract_ref": {
+    "spreadsheet_id": "1V7SnG_x-cLIFbrSurDIadtx5GCY9HfL9jRqdyAl70Ks",
+    "gid": 2030261433,
+    "sheet": "2_WBS",
+    "wbs_id": "RS-LED-01",
+    "row_number": 11,
+    "observed_at": "2026-08-22T09:38:24.3061987+09:00"
+  },
+  "roles": {
+    "owner": "윤서준",
+    "executor": null,
+    "reviewer": null,
+    "approver": "조은채",
+    "reviewer_approver_same_allowed_v1": true
+  },
+  "execution_boundary": {
+    "scope": "NOT_EXECUTED",
+    "uses_mock": null,
+    "uses_memory": null,
+    "uses_noop": null,
+    "configuration_environment_values_recorded": false,
+    "secret_values_recorded": false,
+    "production_node3_pve_load_performed": false,
+    "effective_classes": []
+  },
+  "evidence": [
+    {
+      "evidence_id": "RS-LED-01-S-PENDING",
+      "evidence_class": "S",
+      "scenario": "Re-review the current-HEAD state and counterevidence for every claim in the research claim ledger.",
+      "pass_criteria": "Every claim has a date, grade, counterevidence, and acceptance-criteria ID.",
+      "actual_result": "The WBS records git:dba9ea1 as commit-only evidence and states that the evidence bundle and review are pending.",
+      "validation_method": "node .omx/scripts/verify-production-readiness-plan.mjs",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": "dba9ea14171456ea1e01a4f61a06d288cd582f4e",
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "UNVERIFIED",
+      "limitations": [
+        "The short SHA in the WBS was resolved against repository history, but no same-revision evidence artifact or reviewer record is available in this sample."
+      ]
+    }
+  ],
+  "limitations": [
+    "T1/S is a QuantQA:v1 implementation assignment; the Google Sheet does not explicitly assign this row a class or tier.",
+    "No validation command was executed while preparing this draft sample."
+  ],
+  "blockers": [
+    "A retrievable evidence artifact, SHA-256, execution record, and independent reviewer decision are required before PASS."
+  ]
+}

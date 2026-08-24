@@ -2,6 +2,7 @@ import os
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -385,6 +386,9 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
 
     assert bundle.metadata["source"] == "postgres"
     assert bundle.price_rows[0]["rsi"] == 28.5
+    assert bundle.metadata["timings"]["total_seconds"] >= 0
+    assert bundle.metadata["timings"]["price_rows_seconds"] >= 0
+    assert bundle.metadata["timings"]["price_indicator_seconds"] >= 0
     assert source.conn.calls[0] == (
         "SELECT set_config('statement_timeout', %s, true)",
         ["12345ms"],
@@ -601,6 +605,9 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
     "데이터 조회 시간이 초과되었습니다".
     """
 
+    screening_started = Event()
+    backtest_started = Event()
+
     class Result:
         def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
             self.rows = rows or []
@@ -646,6 +653,15 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
         def _connect(self) -> CountingConnection:
             return connection
 
+        def _screen_with_relaxation(
+            self, _conn: object, _query: str
+        ) -> tuple[list[dict[str, object]], dict[str, object]]:
+            connection.baseline_screens += 1
+            screening_started.set()
+            # Deadlocks unless the price load is genuinely running at the same time.
+            assert backtest_started.wait(5)
+            return [], {"relaxation_rounds": 3}
+
         def _fetch_backtest_universe(
             self, _conn: object, window: dict[str, object]
         ) -> tuple[list[str], dict[str, object]]:
@@ -665,7 +681,11 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
             _query: str,
             _window: object,
             _indicator_families: object | None = None,
+            *,
+            timings: dict[str, float] | None = None,
         ) -> tuple[list[dict[str, object]], int]:
+            backtest_started.set()
+            assert screening_started.wait(5)
             return [
                 {
                     "date": "2016-08-03",
@@ -694,6 +714,7 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
     assert connection.baseline_screens == 1
     assert bundle.metadata["recommended_tickers"] == []
     assert bundle.metadata["tickers"] == ["000660"]
+    assert bundle.metadata["parallel_screening_backtest"] is True
     assert bundle.price_rows[0]["ticker"] == "000660"
 
 
@@ -1014,6 +1035,274 @@ def test_backtest_universe_does_not_expand_with_current_recommendations() -> Non
 
     assert universe == ["000660"]
     assert descriptor["member_count"] == 1
+
+def test_current_screening_candidate_pool_is_capped() -> None:
+    """The current candidate pool is capped before it can reach the backtest pool."""
+    from ai_graph.data_sources.db import _backtest_ticker_pool
+
+    candidates = [
+        {"ticker": f"{i:06d}", "relative_strength_20d": i / 1000.0}
+        for i in range(50)
+    ]
+    pool = _backtest_ticker_pool(candidates, 20)
+    assert len(pool) == 20
+    assert pool[0] == "000049"
+
+def test_backtest_universe_excludes_current_screening_candidates() -> None:
+    """A current candidate outside the PIT universe must not become the traded ticker.
+
+    The screen runs today but the backtest window started five years ago, so a name
+    absent from historical membership must be excluded and counted as such.
+    """
+    class Connection:
+        def execute(self, _query: str, _params: object) -> FakeResult:
+            return FakeResult(rows=[{"symbol": "000660"}])
+
+    universe, descriptor = PostgresPipelineDataSource(
+        DataSourceConfig(database_dsn="postgresql://example")
+    )._fetch_backtest_universe(
+        Connection(),
+        {"start": date(2021, 8, 12), "end": date(2026, 8, 11), "session_count": 1_229},
+    )
+    assert universe == ["000660"]
+    assert descriptor["selection"] == "lifecycle_pit_common_stock_window"
+
+    from ai_graph.data_sources.db import _backtest_ticker_pool
+
+    recommended = _backtest_ticker_pool(
+        [{"ticker": "000660"}, {"ticker": "999999"}], 20
+    )
+    pit_set = set(universe)
+    excluded = sum(1 for item in recommended if item not in pit_set)
+    kept = [item for item in recommended if item in pit_set]
+    assert excluded == 1
+    assert kept == ["000660"]
+
+
+def test_load_never_trades_a_current_screening_candidate() -> None:
+    """End-to-end: the traded ticker comes from the PIT universe, not today's screen.
+
+    A current candidate that is not in the PIT universe must be excluded from the
+    recommendation, counted in the descriptor, and the traded ticker must fall back
+    to the historical universe's first member with recommendation_ticker=None.
+    """
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows or []
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def rollback(self):
+            return None
+
+        def execute(self, query, params=None):
+            if "session_start" in query and "session_count" in query:
+                return Result([{
+                    "session_start": date(2021, 7, 30),
+                    "session_end": date(2026, 7, 30),
+                    "session_count": 1_230,
+                }])
+            if "max(time) AS as_of_date" in query:
+                return Result([{"as_of_date": date(2026, 7, 30)}])
+            if "AS present" in query:
+                return Result([{"present": True}])
+            return Result([])
+
+    class CandidateOutsideUniverseSource(PostgresPipelineDataSource):
+        def _connect(self):
+            return Connection()
+
+        def _screen_with_relaxation(self, _conn, _query):
+            candidate = {
+                "ticker": "999999",
+                "relative_strength_20d": 0.5,
+                "matched_rules": ["test"],
+            }
+            return [candidate], {"relaxation_rounds": 0, "relaxed": False}
+
+        def _fetch_backtest_universe(self, _conn, _window):
+            return ["000660"], {
+                "selection": "lifecycle_pit_common_stock_window",
+                "source": "mart.common_stock_universe_asof",
+            }
+
+        def _fetch_symbol_info_map(self, _conn, tickers):
+            return {t: {"ticker": t, "included": True} for t in tickers}
+
+        def _fetch_price_rows(self, _conn, tickers, _info, _q, _w, _f=None, *, timings=None):
+            return [{
+                "date": "2026-05-20", "ticker": tickers[0],
+                "open": 100, "high": 101, "low": 99, "close": 100,
+                "volume": 1_000,
+            }], 1_230
+
+        def _fetch_macro_status(self, _conn):
+            return {}
+
+    bundle = CandidateOutsideUniverseSource(
+        DataSourceConfig(database_dsn="postgresql://fake/fake")
+    ).load("RSI가 30 이하로 떨어진 KOSPI200", "trace-lookahead")
+
+    assert bundle.metadata["recommendation_ticker"] is None
+    assert bundle.metadata["recommended_tickers"] == []
+    assert bundle.metadata["ticker"] == "000660"
+    assert bundle.price_rows[0]["ticker"] == "000660"
+    assert bundle.metadata["backtest_universe"]["excluded_screening_candidate_count"] == 1
+
+
+class _L4Connection:
+    """The statements load() issues once screening and price fetching are stubbed out."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def rollback(self):
+        return None
+
+    def execute(self, query, params=None):
+        if "session_start" in query and "session_count" in query:
+            return FakeResult(row={
+                "session_start": date(2021, 7, 30),
+                "session_end": date(2026, 7, 30),
+                "session_count": 1_230,
+            })
+        if "AS present" in query:
+            return FakeResult(row={"present": True})
+        return FakeResult(rows=[])
+
+
+def _l4_source(universe, candidates, captured):
+    class L4Source(PostgresPipelineDataSource):
+        def _connect(self):
+            return _L4Connection()
+
+        def _screen_with_relaxation(self, _conn, _query):
+            return list(candidates), {"relaxation_rounds": 0, "relaxed": False}
+
+        def _fetch_backtest_universe(self, _conn, _window):
+            return list(universe), {
+                "selection": "lifecycle_pit_common_stock_window",
+                "source": "mart.common_stock_universe_asof",
+            }
+
+        def _fetch_symbol_info_map(self, _conn, tickers):
+            return {t: {"ticker": t, "included": True} for t in tickers}
+
+        def _fetch_price_rows(self, _conn, tickers, _info, _q, _w, _f=None, *, timings=None):
+            return [
+                {
+                    "date": "2026-05-20", "ticker": ticker,
+                    "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1_000,
+                }
+                for ticker in tickers
+            ], 1_230
+
+        def _fetch_macro_status(self, _conn):
+            return {}
+
+        def _fetch_l4_evidence(self, _conn, ticker, trace_id):
+            captured.append(ticker)
+            return [{"ticker": ticker, "trace_id": trace_id}]
+
+    return L4Source(DataSourceConfig(database_dsn="postgresql://fake/fake"))
+
+
+def test_l4_evidence_is_fetched_for_the_recommended_name_not_the_lowest_pit_code() -> None:
+    """Analyst evidence has to be about the name the report is about.
+
+    The traded ticker is the PIT universe's first member, which is just the lowest symbol
+    code. Attaching that name's reports to a screening report put evidence about a stock
+    the reader never sees next to the recommendation.
+    """
+
+    captured: list[str] = []
+    source = _l4_source(
+        universe=["000020", "005930"],
+        candidates=[{
+            "ticker": "005930",
+            "relative_strength_20d": 0.5,
+            "matched_rules": ["test"],
+        }],
+        captured=captured,
+    )
+
+    bundle = source.load("RSI가 30 이하로 떨어진 KOSPI200", "trace-l4-recommended")
+
+    # The look-ahead contract is untouched: the traded ticker is still the PIT member.
+    assert bundle.metadata["ticker"] == "000020"
+    assert bundle.metadata["recommendation_ticker"] == "005930"
+    assert captured == ["005930"]
+    assert bundle.metadata["l4_evidence_ticker"] == "005930"
+    assert bundle.l4_evidence[0]["ticker"] == "005930"
+
+
+def test_l4_evidence_falls_back_to_the_traded_ticker_without_a_recommendation() -> None:
+    captured: list[str] = []
+    source = _l4_source(
+        universe=["000020", "005930"],
+        candidates=[{
+            "ticker": "999999",
+            "relative_strength_20d": 0.5,
+            "matched_rules": ["test"],
+        }],
+        captured=captured,
+    )
+
+    bundle = source.load("RSI가 30 이하로 떨어진 KOSPI200", "trace-l4-fallback")
+
+    assert bundle.metadata["recommendation_ticker"] is None
+    assert bundle.metadata["ticker"] == "000020"
+    assert captured == ["000020"]
+    assert bundle.metadata["l4_evidence_ticker"] == "000020"
+
+
+def test_single_ticker_load_keeps_l4_evidence_on_that_ticker() -> None:
+    captured: list[str] = []
+    source = _l4_source(universe=["000020"], candidates=[], captured=captured)
+
+    bundle = source.load("005930 RSI 추이", "trace-l4-single")
+
+    assert bundle.metadata["ticker"] == "005930"
+    assert bundle.metadata["recommendation_ticker"] is None
+    assert captured == ["005930"]
+    assert bundle.metadata["l4_evidence_ticker"] == "005930"
+
+
+def test_official_benchmark_absence_is_reported_without_failing_the_load() -> None:
+    """The benchmark tables are optional; a warehouse without them still loads."""
+
+    source = _l4_source(
+        universe=["000020"],
+        candidates=[{"ticker": "000020", "relative_strength_20d": 0.5, "matched_rules": []}],
+        captured=[],
+    )
+
+    bundle = source.load("RSI가 30 이하로 떨어진 KOSPI200", "trace-benchmark-absent")
+
+    assert bundle.official_benchmark["available"] is False
+    assert bundle.official_benchmark["unavailable_reason"]
+    status = bundle.metadata["official_benchmark"]
+    assert status["available"] is False
+    assert status["kospi_tr_sessions"] == 0
+    # The manifest must not claim provenance for a benchmark that was never computed.
+    lineage = bundle.metadata["source_manifest"]["lineage_refs"]
+    assert "mart.krx_index_total_return_daily" not in lineage
+
 
 def test_screening_frame_does_not_read_the_mart_view() -> None:
     """The one-date frame must not go through mart.kis_adjusted_feature_frame_asof.

@@ -9,11 +9,10 @@ from app.api.routes.auth import get_session_cookie, get_session_store
 from app.core.errors import AppError
 from app.core.security import csrf_token_required, require_csrf_token, validate_unsafe_request_origin
 from app.db import email_delivery_history as email_delivery_history_db
-from app.db import email_strategy_subscriptions, user_preferences
+from app.db import user_preferences
 from app.db.user_queries import load_user_by_id
 from app.dependencies import get_db_engine, get_runtime_settings
 from app.schemas.email_delivery_history import EmailDeliveryHistoryResponse
-from app.schemas.email_strategy_subscriptions import EmailStrategySubscriptionRequest, EmailStrategySubscriptionsResponse
 from app.schemas.email_unsubscribe import UnsubscribeInspectionResponse, UnsubscribeMutationResponse
 from app.services import email_delivery, email_unsubscribe
 
@@ -100,33 +99,27 @@ async def patch_my_notification_settings(request: Request, payload: Notification
     )
 
 
-@router.get("/me/email-strategy-subscriptions", response_model=EmailStrategySubscriptionsResponse)
-async def get_my_email_strategy_subscriptions(request: Request) -> EmailStrategySubscriptionsResponse:
-    user_id = await _require_current_user_id(request)
-    return await email_strategy_subscriptions.list_subscriptions(get_db_engine(request), user_id=user_id)
-
-
-@router.post("/me/email-strategy-subscriptions", response_model=EmailStrategySubscriptionsResponse)
-async def create_my_email_strategy_subscription(
-    request: Request, payload: EmailStrategySubscriptionRequest
-) -> EmailStrategySubscriptionsResponse:
-    await _require_csrf(request)
-    user_id = await _require_current_user_id(request)
-    return await email_strategy_subscriptions.save_subscription(
-        get_db_engine(request),
-        user_id=user_id,
-        strategy_id=payload.strategyId,
-        display_name=payload.displayName,
+def _retired_subscription_route() -> None:
+    raise AppError(
+        status_code=410,
+        component="email_reports",
+        code="daily_digest_subscriptions_retired",
+        message="정기 다이제스트 구독은 현재 제공하지 않습니다.",
     )
 
 
-@router.delete("/me/email-strategy-subscriptions/{strategy_id}", response_model=EmailStrategySubscriptionsResponse)
-async def delete_my_email_strategy_subscription(request: Request, strategy_id: str) -> EmailStrategySubscriptionsResponse:
-    await _require_csrf(request)
-    user_id = await _require_current_user_id(request)
-    return await email_strategy_subscriptions.delete_subscription(
-        get_db_engine(request), user_id=user_id, strategy_id=strategy_id
-    )
+@router.api_route(
+    "/me/email-strategy-subscriptions",
+    methods=["GET", "POST"],
+    response_model=None,
+)
+async def retired_email_strategy_subscriptions() -> None:
+    _retired_subscription_route()
+
+
+@router.delete("/me/email-strategy-subscriptions/{strategy_id}", response_model=None)
+async def retired_email_strategy_subscription(strategy_id: str) -> None:
+    _retired_subscription_route()
 
 
 @router.get("/me/email-deliveries", response_model=EmailDeliveryHistoryResponse)

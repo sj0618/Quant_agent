@@ -1,5 +1,4 @@
 import json
-import os
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -29,10 +28,9 @@ def test_offline_environment_rebinds_imported_consumers_and_tripwires_boundaries
 ) -> None:
     isolated = offline_test_environment
 
-    assert os.environ["AI_LLM_PROVIDER"] == "mock"
-    assert os.environ["AI_AUDIT_SINK"] == "noop"
-    assert all(name not in os.environ for name in isolated.database_env_names)
-    assert all(name not in os.environ for name in isolated.provider_credential_names)
+    assert isolated.database_env_names == ("AI_DATABASE_DSN", "QUANT_DB_DSN", "DATABASE_URL")
+    assert isolated.provider_credential_names
+    assert isolated.cache_dir.parent.exists()
     assert isolated.graph_module.load_pipeline_data_from_env is isolated.offline_loader
     assert (
         isolated.api_module.create_app.__kwdefaults__["analysis_runner"]
@@ -118,23 +116,54 @@ def test_ready_analysis_connects_trace_nodes_model_calls_and_full_prompts() -> N
     )
 
 
-def test_out_of_scope_route_logs_only_nodes_that_really_execute() -> None:
+def test_unsupported_scope_is_rejected_before_audit_or_graph_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sink = RecordingAuditSink()
+    query = "옵션 양매도 전략 만들어줘"
+    monkeypatch.setattr(
+        "ai_graph.graph.build_graph",
+        lambda *_args, **_kwargs: pytest.fail("unsupported request must not build a graph"),
+    )
 
     envelope = run_analysis(
-        "옵션 양매도 전략 만들어줘",
+        query,
         trace_id="trace-logging-rejected",
         audit_sink=_create_test_audit_sink(sink),
     )
 
-    assert envelope.status == "rejected"
-    assert [record.agent_name for record in sink.sessions[0].agent_executions] == [
-        "Supervisor",
-        "Ambiguity Classifier",
-        "Data",
-        "Envelope",
-    ]
-    assert sink.sessions[0].model_calls == ()
+    assert envelope.status == EnvelopeStatus.REJECTED
+    assert envelope.user_payload.headline == "현재 지원 범위 밖의 요청입니다."
+    assert query not in envelope.model_dump_json()
+    assert sink.sessions == ()
+
+
+def test_personalized_request_is_rejected_before_audit_or_graph_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = RecordingAuditSink()
+    query = "내 보유 종목을 지금 팔아줘"
+    monkeypatch.setattr(
+        "ai_graph.graph.build_graph",
+        lambda *_args, **_kwargs: pytest.fail("personalized request must not build a graph"),
+    )
+
+    envelope = run_analysis(
+        query,
+        trace_id="trace-personalized-refusal",
+        audit_sink=_create_test_audit_sink(sink),
+    )
+
+    assert envelope.status == EnvelopeStatus.REJECTED
+    assert envelope.retryable is False
+    assert envelope.strategy_spec is None
+    assert envelope.data_requirements == []
+    assert envelope.source_usage == []
+    assert envelope.user_payload.candidate_cards == []
+    assert envelope.user_payload.performance is None
+    assert envelope.user_payload.report is None
+    assert query not in envelope.model_dump_json()
+    assert sink.sessions == ()
 
 
 def test_underspecified_request_is_answered_instead_of_questioned() -> None:
@@ -320,7 +349,7 @@ def test_work_agent_failure_stops_downstream_and_keeps_one_correlated_error(monk
 
     with pytest.raises(RejectMarkerError, match="private backtest failure"):
         run_analysis(
-            "RSI가 30 이하로 떨어진 종목을 사고 70 이상이면 팔아줘",
+            "RSI가 30 이하로 떨어진 종목을 매수하고 70 이상이면 매도",
             trace_id="trace-work-agent-failure",
             audit_sink=_create_test_audit_sink(sink),
         )

@@ -279,6 +279,36 @@ export interface AIStrategyExplanation {
   source_refs: string[];
 }
 
+/**
+ * Which slice of the history the public numbers were measured on. The backend decides
+ * this per run - a single hold-out tail, or the rolling policy's evaluation sessions -
+ * so a caption written in the client would be wrong whenever the run takes the other
+ * path. Render `caption`; the structured fields are there for anything that needs to
+ * reason about the basis rather than print it.
+ */
+export interface AIBacktestEvaluationBasis {
+  basis: "hold_out" | "walk_forward_policy";
+  caption: string;
+  hold_out_fraction?: number | null;
+  window_start?: string | null;
+  window_end?: string | null;
+  window_policy_id?: string | null;
+  evaluation_session_count?: number | null;
+  fold_count?: number | null;
+  cost_model_applied?: boolean;
+}
+
+/** Why a name recommended today can be missing from the backtest that was run. */
+export interface AIBacktestUniversePolicy {
+  summary: string;
+  policy_id?: string | null;
+  window_start?: string | null;
+  window_end?: string | null;
+  traded_ticker_count?: number | null;
+  excluded_screening_candidate_count: number;
+  excluded_notice?: string | null;
+}
+
 export interface AIBacktestPerformance {
   selected_candidate_id: string;
   metrics: AIBacktestMetrics;
@@ -289,11 +319,21 @@ export interface AIBacktestPerformance {
   benchmark?: AIBacktestBenchmark | null;
   metric_details?: AIBacktestMetricDetail[];
   strategy_explanation?: AIStrategyExplanation | null;
+  evaluation_basis?: AIBacktestEvaluationBasis | null;
+  universe_policy?: AIBacktestUniversePolicy | null;
 }
 
 export interface AIRecommendationGate {
   validated: boolean;
   reason: string;
+  /**
+   * False when the acceptance rule could not be evaluated at all - a missing input, not a
+   * measured shortfall. A gate can be `validated` on the metrics it did measure and still
+   * be incomplete, so both flags have to be read.
+   */
+  verification_complete?: boolean;
+  unmet_objective_criteria?: string[];
+  unmet_data_requirements?: string[];
 }
 
 export type AITickerActionType = 'BUY' | 'SELL' | 'HOLD' | 'WATCH';
@@ -427,6 +467,8 @@ export interface PerformanceSummary {
   benchmark?: AIBacktestBenchmark;
   metricDetails?: AIBacktestMetricDetail[];
   strategyExplanation?: AIStrategyExplanation | null;
+  evaluationBasis?: AIBacktestEvaluationBasis | null;
+  universePolicy?: AIBacktestUniversePolicy | null;
   disclaimer: string;
 }
 
@@ -467,6 +509,11 @@ export interface AppOverview {
   candidates: TradingCandidate[];
   performance: PerformanceSummary;
   recentReports: ReportSummary[];
+  // The graph's own verdict per stock, and why the picks are (or are not) validated.
+  // Both are decided in the backtest run behind `performance`, so the overview reads
+  // them rather than deriving a second opinion from the candidate rows.
+  tickerActions?: AITickerAction[];
+  recommendationGate?: AIRecommendationGate | null;
   envelope: AIEnvelope<{ active_tab: "overview" } | AIUserPayload, StrategySpec | AIStrategySpec | null> | null;
   jobStatus: AnalysisJobStatus | null;
 }

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 # pyright: reportUnannotatedClassAttribute=false
-
 import json
 import logging
 import threading
@@ -15,6 +14,7 @@ from os import environ
 from typing import Any, ClassVar, Literal, Protocol
 from uuid import uuid4
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
@@ -26,7 +26,6 @@ from ai_graph.progress import (
     stage_reporter,
 )
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, FailureDiagnostic, Stage, StageStatus, UserPayload
-
 
 _logger = logging.getLogger(__name__)
 
@@ -796,13 +795,61 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             safe_message="현재 AI 분석 요청이 몰려 대기 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:aoai_capacity_exhausted"],
         )
+    exception_chain = _exception_chain(exc)
+    provider_failure = any(
+        type(error).__name__ in {"LLMClientError", "LLMTimeoutError"}
+        for error in exception_chain
+    )
+    if provider_failure:
+        provider_timeout = next(
+            (error for error in exception_chain if isinstance(error, httpx.TimeoutException)),
+            None,
+        )
+        if provider_timeout is not None:
+            return _aoai_failure_diagnostic(
+                subcause="aoai_response_timeout",
+                stage=stage,
+                retryable=True,
+                safe_message=(
+                    "AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요."
+                ),
+            )
+        provider_connection_error = next(
+            (error for error in exception_chain if isinstance(error, httpx.ConnectError)),
+            None,
+        )
+        if provider_connection_error is not None:
+            return _aoai_failure_diagnostic(
+                subcause="aoai_connection_error",
+                stage=stage,
+                retryable=True,
+                safe_message=(
+                    "AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요."
+                ),
+            )
+        provider_http_error = next(
+            (error for error in exception_chain if isinstance(error, httpx.HTTPStatusError)),
+            None,
+        )
+        if provider_http_error is not None:
+            status_code = provider_http_error.response.status_code
+            if status_code >= 500:
+                subcause = "aoai_http_5xx"
+            elif status_code >= 400:
+                subcause = "aoai_http_4xx"
+            else:
+                subcause = "aoai_http_error"
+            return _aoai_failure_diagnostic(
+                subcause=subcause,
+                stage=stage,
+                retryable=status_code >= 500 or status_code in {408, 409, 429},
+                safe_message="AI 제공자 응답을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+            )
     # The provider accepted the request and then stopped producing, so retries burned the
-    # budget without a usable answer. Its message says "Model request timed out after
-    # retry attempts", which contains none of the substrings the heuristics below look for
-    # - they are all about the warehouse - so a run killed by a slow deployment was
-    # reported as "분류되지 않은 오류" and read as a bug in the analysis rather than a
-    # provider that needed more time.
-    if type(exc).__name__ in {"LLMClientError", "LLMTimeoutError"} and "timed out" in str(exc).lower():
+    # budget without a usable answer. Some callers raise LLMTimeoutError directly, with
+    # no httpx cause to inspect, so retain this compatible fallback after the causal
+    # classification above.
+    if provider_failure and "timed out" in str(exc).lower():
         return FailureDiagnostic(
             category="infrastructure_failure",
             subcause="aoai_response_timeout",
@@ -900,6 +947,44 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
         retryable=True,
         safe_message="AI 분석 중 분류되지 않은 오류가 발생했습니다. 원문 오류는 공개 응답에 노출하지 않고 debug_ref로 추적합니다.",
         evidence_refs=["failure:unknown"],
+    )
+
+
+def _exception_chain(exc: Exception) -> tuple[BaseException, ...]:
+    """Return a finite explicit-cause chain without relying on provider messages."""
+
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        cause = current.__cause__
+        current = cause if isinstance(cause, BaseException) else None
+    return tuple(chain)
+
+
+def _aoai_failure_diagnostic(
+    *,
+    subcause: Literal[
+        "aoai_response_timeout",
+        "aoai_connection_error",
+        "aoai_http_4xx",
+        "aoai_http_5xx",
+        "aoai_http_error",
+    ],
+    stage: str,
+    retryable: bool,
+    safe_message: str,
+) -> FailureDiagnostic:
+    return FailureDiagnostic(
+        category="infrastructure_failure",
+        subcause=subcause,
+        failure_stage=stage,
+        owner="ai_graph",
+        retryable=retryable,
+        safe_message=safe_message,
+        evidence_refs=[f"failure:{subcause}"],
     )
 
 

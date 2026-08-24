@@ -49,6 +49,56 @@ def test_google_start_redirects_and_stores_state():
     assert any(key.startswith("qa:auth:state:") for key in app.state.redis_client.values)
 
 
+def test_google_start_rate_limits_before_creating_new_oauth_state():
+    settings = valid_settings(
+        AUTH_PUBLIC_BACKEND_ORIGIN=API_ORIGIN,
+        AUTH_LOGIN_RATE_LIMIT_MAX_ATTEMPTS=2,
+        AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS=60,
+    )
+    client, app = make_client(settings)
+
+    first = client.get("/api/v1/auth/google/start", follow_redirects=False)
+    second = client.get("/api/v1/auth/google/start", follow_redirects=False)
+    limited = client.get("/api/v1/auth/google/start", follow_redirects=False)
+
+    assert first.status_code == second.status_code == 307
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "oauth_start_rate_limited"
+    state_keys = [key for key in app.state.redis_client.values if key.startswith("qa:auth:state:")]
+    assert len(state_keys) == 2
+    assert all("testclient" not in key for key in app.state.redis_client.values)
+
+
+def test_google_start_uses_only_a_trusted_proxy_appended_client_identifier():
+    settings = valid_settings(
+        AUTH_PUBLIC_BACKEND_ORIGIN=API_ORIGIN,
+        AUTH_TRUSTED_PROXY_HEADERS=True,
+        AUTH_TRUSTED_PROXY_HOSTS="testclient",
+        AUTH_LOGIN_RATE_LIMIT_MAX_ATTEMPTS=1,
+        AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS=60,
+    )
+    client, _app = make_client(settings)
+
+    first_client = client.get(
+        "/api/v1/auth/google/start",
+        headers={"X-Forwarded-For": "spoofed, 198.51.100.11"},
+        follow_redirects=False,
+    )
+    second_client = client.get(
+        "/api/v1/auth/google/start",
+        headers={"X-Forwarded-For": "spoofed, 198.51.100.12"},
+        follow_redirects=False,
+    )
+    repeated_first_client = client.get(
+        "/api/v1/auth/google/start",
+        headers={"X-Forwarded-For": "another-spoof, 198.51.100.11"},
+        follow_redirects=False,
+    )
+
+    assert first_client.status_code == second_client.status_code == 307
+    assert repeated_first_client.status_code == 429
+
+
 def test_google_start_rejects_external_return_to():
     client, _app = make_client()
     response = client.get("/api/v1/auth/google/start?return_to=https://evil.example", follow_redirects=False)
@@ -129,6 +179,7 @@ def test_google_callback_sets_cookie_and_redirects(monkeypatch):
         await store.store_oauth_state(state="state-1", nonce="nonce-1", return_to="/app")
 
     asyncio.run(seed_state())
+    previous_session_id, _csrf_token = asyncio.run(store.create_session(user_id="old-user"))
 
     async def fake_exchange(settings, *, code, redirect_uri=None):
         assert redirect_uri is None
@@ -146,11 +197,17 @@ def test_google_callback_sets_cookie_and_redirects(monkeypatch):
     monkeypatch.setattr(auth, "validate_google_id_token", fake_validate)
     monkeypatch.setattr(auth, "upsert_google_user", fake_upsert)
 
-    response = client.get("/api/v1/auth/google/callback?code=code-1&state=state-1", follow_redirects=False)
+    response = client.get(
+        "/api/v1/auth/google/callback?code=code-1&state=state-1",
+        cookies={"qa_session": previous_session_id},
+        follow_redirects=False,
+    )
     assert response.status_code == 303
     assert response.headers["location"] == "/app"
     assert "qa_session=" in response.headers["set-cookie"]
     assert "HttpOnly" in response.headers["set-cookie"]
+    assert response.cookies.get("qa_session") != previous_session_id
+    assert asyncio.run(store.get_session_user_id(previous_session_id)) is None
 
 
 def test_google_callback_session_supports_follow_up_auth_me(monkeypatch):
@@ -426,6 +483,61 @@ def test_auth_me_diagnostics_preserve_401_and_200_contracts(monkeypatch, caplog)
     assert "cookie_parse" in caplog.text
     assert "session_decode" in caplog.text
     assert "auth_mapping" in caplog.text
+
+
+def test_auth_me_redis_failure_has_a_redacted_envelope_and_allows_retry(monkeypatch):
+    marker = "auth-route-password-marker"
+
+    class FailOnceRedis(FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.fail_next_read = True
+
+        async def get(self, key):
+            if self.fail_next_read:
+                self.fail_next_read = False
+                raise RuntimeError(f"redis transport failed password={marker}")
+            return await super().get(key)
+
+    settings = valid_settings(AUTH_PUBLIC_BACKEND_ORIGIN=API_ORIGIN)
+    redis = FailOnceRedis()
+    client, _app = make_client(settings, redis)
+    session_id, _csrf = asyncio.run(
+        AuthSessionStore(redis, settings).create_session(user_id="user-1")
+    )
+
+    async def fake_load(_engine, _user_id):
+        return {
+            "id": "user-1",
+            "email": "user@example.co.kr",
+            "name": "User",
+            "avatar_url": None,
+        }
+
+    monkeypatch.setattr(auth, "load_user_by_id", fake_load)
+
+    failed = client.get("/api/v1/auth/me", cookies={"qa_session": session_id})
+    assert failed.status_code == 503
+    assert failed.json() == {
+        "error": {
+            "component": "redis",
+            "code": "redis_read_failed",
+            "message": "Redis read failed",
+            "details": {"error": "RuntimeError: redis transport failed password=<redacted>"},
+        }
+    }
+    assert marker not in failed.text
+    assert session_id not in failed.text
+
+    retried = client.get("/api/v1/auth/me", cookies={"qa_session": session_id})
+    assert retried.status_code == 200
+    assert retried.json()["user"] == {
+        "id": "user-1",
+        "name": "User",
+        "email": "user@example.co.kr",
+        "provider": "google",
+        "avatarUrl": None,
+    }
 
 
 def test_auth_me_diagnostics_attribute_forced_session_touch_to_redis(monkeypatch):
