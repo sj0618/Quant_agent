@@ -186,6 +186,21 @@ class DataSourceConfig(BaseModel):
         )
 
 
+RELEASE_PROFILE_ENV = "APP_ENV"
+RELEASE_PROFILE_VALUES = frozenset({"production", "prod"})
+
+
+def is_release_profile() -> bool:
+    """Whether this process is running as a release deployment.
+
+    One definition, because "is this production?" is asked from both the API layer and
+    the data layer and the two must never disagree. A second copy of this literal set
+    is how a fixture guard ends up silently disabled on the host it exists to protect.
+    """
+
+    return (os.environ.get(RELEASE_PROFILE_ENV) or "").strip().lower() in RELEASE_PROFILE_VALUES
+
+
 class PipelineDataUnavailableError(ValueError):
     """The warehouse is healthy but has nothing to run this strategy on.
 
@@ -204,6 +219,27 @@ class PipelineDataUnavailableError(ValueError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+class FixtureModeForbiddenError(PipelineDataUnavailableError):
+    """A release profile asked for the local fixture bundle. FT-FIX-08 forbids it.
+
+    Fixtures existed as a convenience for running without a warehouse, and the release
+    profile inherited that convenience by accident: with no DSN configured, production
+    fell through to fixture rows and produced a complete analysis - status `ready`, a
+    report, metrics - labelled `production_eligible: false` and nothing more. A label is
+    not a gate. This is the gate.
+
+    It subclasses `PipelineDataUnavailableError` so the job layer classifies it as an
+    answerable failure with a reason code rather than an unknown crash.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            "fixture_mode_forbidden_in_release",
+            "운영 환경에서는 로컬 fixture 데이터로 분석할 수 없습니다. "
+            f"데이터 소스를 설정한 뒤 다시 시도해 주세요. ({detail})",
+        )
 
 
 class PipelineDataBundle(BaseModel):
@@ -1546,6 +1582,8 @@ def measure_research_runtime_facts_from_env(
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
     """Return an explicitly labelled local fixture; configured DB failures never use it."""
+    if is_release_profile():
+        raise FixtureModeForbiddenError(reason)
     fixture_as_of = datetime.now(UTC).date()
     data_availability = _data_availability_for_query(query, source="fixture")
     extract_snapshot = build_pipeline_extract_snapshot(
