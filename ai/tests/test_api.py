@@ -25,7 +25,12 @@ from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import InMemoryAnalysisJobStore, JobStoreConfigurationError, JobStoreRuntime
 from ai_graph.research_contract import RuleDraftSigner
-from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
+from ai_graph.research_eligibility import PerformanceAvailable
+from ai_graph.schemas import (
+    APIEnvelope,
+    EnvelopeStatus,
+    UserPayload,
+)
 
 pytest_plugins = ("offline_test_environment",)
 pytestmark = pytest.mark.usefixtures("offline_test_environment")
@@ -316,6 +321,90 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert "performance" not in performance
     assert "metrics" not in performance
     assert "equity_curve" not in performance
+
+
+def test_production_retires_raw_analysis_jobs_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    store = InMemoryAnalysisJobStore()
+    sink = RecordingAuditSink()
+    runner_calls = 0
+
+    def runner(_query: str, _trace_id: str) -> APIEnvelope:
+        nonlocal runner_calls
+        runner_calls += 1
+        raise AssertionError("retired raw endpoint reached the analysis runner")
+
+    client = TestClient(
+        create_app(
+            store,
+            analysis_runner=runner,
+            audit_sink=_create_test_audit_sink(sink),
+        )
+    )
+
+    response = client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
+
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "legacy_raw_analysis_job_retired"
+    assert store.list_jobs() == []
+    assert runner_calls == 0
+    assert sink.sessions == ()
+
+
+def test_backtest_api_redacts_legacy_insufficient_performance_before_serialization() -> None:
+    legacy_available = PerformanceAvailable.model_construct(
+        availability="available",
+        performance={
+            "metrics": {"total_return": 0.12, "sharpe_ratio": 0.3},
+            "equity_curve": [{"date": "2026-01-01", "cumulative_return": 0.12}],
+            "reliability": {
+                "source": "fixture",
+                "status": "insufficient",
+                "row_count": 4,
+                "ticker_count": 1,
+                "trading_days": 4,
+                "trade_count": 7,
+            },
+        },
+        method_manifest=None,
+        limitations=[],
+    )
+    envelope = APIEnvelope.model_construct(
+        status=EnvelopeStatus.READY,
+        trace_id="legacy-warmup-trace",
+        user_payload=UserPayload.model_construct(
+            headline="ready",
+            message="analysis completed",
+            next_actions=[],
+            performance=legacy_available,
+        ),
+        strategy_spec=None,
+        debug_ref="debug:legacy-warmup",
+        retryable=False,
+    )
+    store = InMemoryAnalysisJobStore()
+    job = store.create_job("legacy warm-up RSI 전략", user_id="local-dev-user")
+    store.complete_job(job.job_id, envelope)
+    client = TestClient(create_app(store))
+    response = client.get(f"{ANALYSIS_JOBS_PATH}/{job.job_id}")
+
+    assert response.status_code == 200
+    public_performance = response.json()["result"]["user_payload"]["performance"]
+    assert public_performance["availability"] == "unavailable"
+    assert public_performance["reason_code"] == "insufficient_reliability"
+    assert public_performance["safe_facts"] == {
+        "source": "fixture",
+        "row_count": 4,
+        "ticker_count": 1,
+        "trading_days": 4,
+        "trade_count": 7,
+        "history_start": None,
+        "history_end": None,
+    }
+    assert "metrics" not in public_performance
+    assert "equity_curve" not in public_performance
 
 
 def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> None:

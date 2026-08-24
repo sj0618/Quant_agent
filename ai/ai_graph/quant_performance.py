@@ -41,6 +41,7 @@ _RELIABILITY_MIN_DAYS = 252
 
 _UNAVAILABLE_METRIC_REASON = "신뢰도 부족으로 공개 지표를 계산할 수 없습니다."
 _BENCHMARK_UNAVAILABLE_REASON = "신뢰도 부족으로 벤치마크를 표시하지 않습니다."
+_UNAVAILABLE_ENGINE_SUMMARY_KEYS = frozenset({"effective_trade_count"})
 
 
 def project_public_performance(
@@ -153,7 +154,7 @@ def build_public_backtest_performance(
     benchmark = _build_public_benchmark(result, reliability=reliability)
     selected_parameters = result.selected_candidate.parameters
     public_metrics = _public_metrics(metrics, result.engine_summary)
-    return BacktestPerformance(
+    performance = BacktestPerformance(
         selected_candidate_id=(
             "walk-forward-selection-policy"
             if walk_forward is not None and walk_forward.status == "ready"
@@ -179,6 +180,100 @@ def build_public_backtest_performance(
             generated_strategies=result.generated_strategy_blueprints,
         ),
     )
+    return sanitize_public_backtest_performance(performance)
+
+
+def sanitize_public_backtest_performance(
+    performance: BacktestPerformance | None,
+) -> BacktestPerformance | None:
+    """Redact legacy insufficient results before any public serialization boundary.
+
+    New projections are sanitized above, but persisted envelopes may predate that
+    invariant.  This function is idempotent so API readers can enforce the same rule
+    without mutating the stored execution result.
+    """
+
+    if performance is None:
+        return None
+    reliability = performance.reliability
+    if reliability is None or reliability.status != "insufficient":
+        return performance
+
+    reason = performance.unavailable_reason or _UNAVAILABLE_METRIC_REASON
+    benchmark = performance.benchmark
+    if benchmark is not None:
+        benchmark = benchmark.model_copy(
+            update={
+                "total_return": None,
+                "cumulative_curve": [],
+                "is_available": False,
+                "unavailable_reason": benchmark.unavailable_reason
+                or _BENCHMARK_UNAVAILABLE_REASON,
+            }
+        )
+    metric_details = [
+        detail.model_copy(
+            update={
+                "value": None,
+                "is_available": False,
+                "unavailable_reason": detail.unavailable_reason or reason,
+            }
+        )
+        for detail in performance.metric_details
+    ]
+    return performance.model_copy(
+        update={
+            "metrics": None,
+            "equity_curve": [],
+            "engine_summary": _unavailable_engine_summary(performance.engine_summary),
+            "benchmark": benchmark,
+            "metric_details": metric_details,
+            "is_available": False,
+            "unavailable_reason": reason,
+        }
+    )
+
+
+def sanitize_public_performance(performance: PublicPerformance | None) -> PublicPerformance | None:
+    """Fail closed when a legacy public envelope claims availability without reliability.
+
+    New envelopes are built through :func:`project_public_performance`, but a stored
+    payload from before that boundary can still carry an available variant whose nested
+    performance document says the warm-up/history was insufficient.  Readers must
+    downgrade that object before it reaches any API response.
+    """
+
+    if not isinstance(performance, PerformanceAvailable):
+        return performance
+    payload = performance.performance
+    reliability = payload.get("reliability") if isinstance(payload, Mapping) else None
+    if not isinstance(reliability, Mapping) or reliability.get("status") != "insufficient":
+        return performance
+    safe_facts = {
+        key: reliability.get(key)
+        for key in (
+            "source",
+            "row_count",
+            "ticker_count",
+            "trading_days",
+            "trade_count",
+            "history_start",
+            "history_end",
+        )
+        if isinstance(reliability.get(key), (str, int, bool)) or reliability.get(key) is None
+    }
+    return PerformanceUnavailable(
+        reason_code="insufficient_reliability",
+        safe_facts=safe_facts,
+    )
+
+
+def _unavailable_engine_summary(engine_summary: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in engine_summary.items()
+        if key in _UNAVAILABLE_ENGINE_SUMMARY_KEYS
+    }
 
 
 def _pipeline_source(

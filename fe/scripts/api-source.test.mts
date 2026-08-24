@@ -77,7 +77,8 @@ test("public navigation and bundle sources contain no development preview, fake 
   assert.doesNotMatch(appSource, /EmailTemplatePreviewPage|Figma HI-FI/);
   assert.doesNotMatch(routesSource, /emailTemplatePreview|dev\/email-template/);
   assert.doesNotMatch(landingSource, /reportDetail\("2026-04-18"\)|KRX LIVE|Sharpe 1\.42/);
-  assert.match(landingSource, /현재는 보관된 검증 리포트 열람만 지원합니다/);
+  assert.match(landingSource, /로그인 후 읽기 전용 리포트 보관함으로 이동합니다/);
+  assert.match(landingSource, /새 분석은 지원하지 않습니다/);
   assert.doesNotMatch(landingSource, /매수|매도|보유|추천|BUY|SELL|HOLD/);
   assert.doesNotMatch(await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"), /landing\.mock|getLandingSample|LandingSample/);
   assert.doesNotMatch(landingSource, /RELEASE VALIDATION|VALIDATION PRINCIPLES|READ-ONLY ARCHIVE|CURRENT SCOPE/);

@@ -86,7 +86,11 @@ class _FakeConnection:
             profile = self.engine.strategy_profiles.get(str(params["strategy_id"]))
             return _FakeResult([profile] if profile is not None else [])
 
-        if normalized.startswith("select run_id, strategy_id, user_id, status, config_jsonb, strategy_snapshot_jsonb"):
+        if (
+            normalized.startswith("select run_id, strategy_id, user_id")
+            and "from app.backtest_run" in normalized
+            and "for update" in normalized
+        ):
             run = self.engine.backtest_runs.get(str(params["run_id"]))
             if run is None or str(run.get("user_id")) != str(params.get("user_id")):
                 return _FakeResult()
@@ -109,6 +113,7 @@ class _FakeConnection:
                     "trace_id": params.get("trace_id"),
                     "execution_run_id": params.get("execution_run_id"),
                     "benchmark_ticker": None,
+                    "analysis_result_id": None,
                 }
             return _FakeResult()
 
@@ -116,15 +121,87 @@ class _FakeConnection:
             run_id = params["run_id"]
             row = self.engine.backtest_runs[run_id]
             row["strategy_id"] = params.get("strategy_id") or row.get("strategy_id")
+            row["analysis_result_id"] = params.get("analysis_result_id") or row.get("analysis_result_id")
             row["status"] = "completed"
             row["ended_at"] = params.get("ended_at")
             row["error_message"] = None
             return _FakeResult()
 
-        if normalized.startswith("select report_id, run_id, user_id, summary, report_jsonb from app.ai_backtest_report"):
+        if normalized.startswith("select job_id, user_id, job_jsonb from app.ai_analysis_job"):
+            job = self.engine.analysis_jobs.get(str(params["job_id"]))
+            job_document = job.get("job_jsonb") if job is not None else None
+            persisted_owner = job.get("user_id") if job is not None else None
+            document_owner = job_document.get("user_id") if isinstance(job_document, dict) else None
+            if job is not None and str(persisted_owner or document_owner) != str(params.get("user_id")):
+                job = None
+            return _FakeResult([job] if job is not None else [])
+
+        if normalized.startswith("select analysis_result_id from app.ai_analysis_job"):
+            job = self.engine.analysis_jobs.get(str(params["job_id"]))
+            job_document = job.get("job_jsonb") if job is not None else None
+            persisted_owner = job.get("user_id") if job is not None else None
+            document_owner = job_document.get("user_id") if isinstance(job_document, dict) else None
+            if job is None or str(persisted_owner or document_owner) != str(params["user_id"]):
+                return _FakeResult()
+            return _FakeResult([{"analysis_result_id": job.get("analysis_result_id")}])
+
+        if normalized.startswith("update app.ai_analysis_job"):
+            job = self.engine.analysis_jobs.get(str(params["job_id"]))
+            job_document = job.get("job_jsonb") if job is not None else None
+            persisted_owner = job.get("user_id") if job is not None else None
+            document_owner = job_document.get("user_id") if isinstance(job_document, dict) else None
+            if job is not None and str(persisted_owner or document_owner) == str(params["user_id"]):
+                job["analysis_result_id"] = params["analysis_result_id"]
+            return _FakeResult()
+
+        if normalized.startswith("insert into app.analysis_result"):
+            key = (str(params["user_id"]), str(params["manifest_hash"]))
+            if key not in self.engine.analysis_results:
+                self.engine.analysis_results[key] = dict(params)
+            return _FakeResult()
+
+        if normalized.startswith("select analysis_result_id, user_id, manifest_schema_version, manifest_hash"):
+            key = (str(params["user_id"]), str(params["manifest_hash"]))
+            row = self.engine.analysis_results.get(key)
+            return _FakeResult([row] if row is not None else [])
+
+        if normalized.startswith("select analysis_result_id from app.backtest_run"):
+            row = self.engine.backtest_runs.get(str(params["run_id"]))
+            if row is None or str(row.get("user_id")) != str(params.get("user_id")):
+                return _FakeResult()
+            return _FakeResult([{"analysis_result_id": row.get("analysis_result_id")}])
+
+        if normalized.startswith("select report.analysis_result_id from app.strategy_email_report as report"):
+            report = self.engine.strategy_email_reports.get(str(params["report_id"]))
+            run = self.engine.backtest_runs.get(str(report.get("backtest_run_id"))) if report else None
+            if report is None or run is None or str(run.get("user_id")) != str(params.get("user_id")):
+                return _FakeResult()
+            return _FakeResult([{"analysis_result_id": report.get("analysis_result_id")}])
+
+        if normalized.startswith("select report.report_id, report.analysis_result_id from app.strategy_email_report as report"):
+            rows = []
+            for report_id in params["report_ids"]:
+                report = self.engine.strategy_email_reports.get(str(report_id))
+                run = self.engine.backtest_runs.get(str(report.get("backtest_run_id"))) if report else None
+                if report is not None and run is not None and str(run.get("user_id")) == str(params.get("user_id")):
+                    rows.append({"report_id": report_id, "analysis_result_id": report.get("analysis_result_id")})
+            return _FakeResult(rows)
+
+        if normalized.startswith("select report_id, run_id, user_id, analysis_result_id, summary, report_jsonb from app.ai_backtest_report"):
             report_id = params["report_id"]
             row = self.engine.ai_backtest_reports.get(report_id)
             return _FakeResult([row] if row is not None else [])
+
+        if normalized.startswith("update app.ai_backtest_report"):
+            row = self.engine.ai_backtest_reports.get(params["report_id"])
+            if (
+                row is not None
+                and str(row.get("run_id")) == str(params["run_id"])
+                and (row.get("user_id") is None or str(row.get("user_id")) == str(params["user_id"]))
+                and row.get("analysis_result_id") is None
+            ):
+                row["analysis_result_id"] = params["analysis_result_id"]
+            return _FakeResult()
 
         if normalized.startswith("insert into app.ai_backtest_report"):
             report_id = params["report_id"]
@@ -138,7 +215,17 @@ class _FakeConnection:
                 self.engine.strategy_email_reports[report_id] = dict(params)
             return _FakeResult()
 
-        if normalized.startswith("select report_id, strategy_id, backtest_run_id, ai_report_id, report_date, weekday, sent_at, title, summary, status, content_md, content_html from app.strategy_email_report"):
+        if normalized.startswith("update app.strategy_email_report"):
+            row = self.engine.strategy_email_reports.get(params["report_id"])
+            if (
+                row is not None
+                and str(row.get("backtest_run_id")) == str(params["run_id"])
+                and row.get("analysis_result_id") is None
+            ):
+                row["analysis_result_id"] = params["analysis_result_id"]
+            return _FakeResult()
+
+        if normalized.startswith("select report_id, strategy_id, backtest_run_id, ai_report_id, analysis_result_id, report_date"):
             report_id = params["report_id"]
             row = self.engine.strategy_email_reports.get(report_id)
             return _FakeResult([row] if row is not None else [])
@@ -157,6 +244,8 @@ class _FakeTransaction:
             "backtest_runs": copy.deepcopy(self.engine.backtest_runs),
             "ai_backtest_reports": copy.deepcopy(self.engine.ai_backtest_reports),
             "strategy_email_reports": copy.deepcopy(self.engine.strategy_email_reports),
+            "analysis_results": copy.deepcopy(self.engine.analysis_results),
+            "analysis_jobs": copy.deepcopy(self.engine.analysis_jobs),
         }
         return _FakeConnection(self.engine)
 
@@ -167,6 +256,8 @@ class _FakeTransaction:
             self.engine.backtest_runs = self.snapshot["backtest_runs"]
             self.engine.ai_backtest_reports = self.snapshot["ai_backtest_reports"]
             self.engine.strategy_email_reports = self.snapshot["strategy_email_reports"]
+            self.engine.analysis_results = self.snapshot["analysis_results"]
+            self.engine.analysis_jobs = self.snapshot["analysis_jobs"]
         return False
 
 
@@ -185,6 +276,8 @@ class TrackCFakeEngine:
         self.backtest_runs: dict[str, dict[str, object]] = {}
         self.ai_backtest_reports: dict[str, dict[str, object]] = {}
         self.strategy_email_reports: dict[str, dict[str, object]] = {}
+        self.analysis_results: dict[tuple[str, str], dict[str, object]] = {}
+        self.analysis_jobs: dict[str, dict[str, object]] = {}
         self.write_log: list[dict[str, object]] = []
         self.fail_sql_contains: str | None = None
 
@@ -408,14 +501,105 @@ async def test_track_c_component_integration_complete_analysis_run_replays_and_c
         },
     }
 
-    assert created == {"runId": run["id"], "reportId": created["reportId"], "status": "completed", "created": True}
-    assert replayed == {"runId": run["id"], "reportId": created["reportId"], "status": "completed", "created": False}
+    assert created == {
+        "runId": run["id"],
+        "reportId": created["reportId"],
+        "analysisResultId": created["analysisResultId"],
+        "status": "completed",
+        "created": True,
+    }
+    assert replayed == {
+        "runId": run["id"],
+        "reportId": created["reportId"],
+        "analysisResultId": created["analysisResultId"],
+        "status": "completed",
+        "created": False,
+    }
+    assert engine.backtest_runs[run["id"]]["analysis_result_id"] == created["analysisResultId"]
+    assert engine.ai_backtest_reports[created["reportId"]]["analysis_result_id"] == created["analysisResultId"]
+    assert engine.strategy_email_reports[created["reportId"]]["analysis_result_id"] == created["analysisResultId"]
+    assert len(engine.analysis_results) == 1
     with pytest.raises(AppError) as exc:
         await fe_contract_store.complete_analysis_run_from_db(engine, user_id="42", run_id=run["id"], payload=conflict)
     assert exc.value.status_code == 409
     assert sum(1 for entry in engine.write_log if "insert into app.backtest_run" in str(entry["sql"]).lower()) == 1
     assert sum(1 for entry in engine.write_log if "insert into app.ai_backtest_report" in str(entry["sql"]).lower()) == 1
     assert sum(1 for entry in engine.write_log if "insert into app.strategy_email_report" in str(entry["sql"]).lower()) == 1
+
+
+@pytest.mark.asyncio
+async def test_track_c_legacy_completed_rows_with_null_result_id_replay_and_backfill(monkeypatch):
+    engine = TrackCFakeEngine()
+    _install_state_readers(monkeypatch, engine)
+    run = await fe_contract_store.create_analysis_run_from_db(
+        engine,
+        user_id="42",
+        payload={"query": "RSI 30", "strategyId": "strategy-1", "requestPayload": {"seed": "legacy"}},
+    )
+    completion = {
+        "status": "completed",
+        "result": {
+            "title": "Legacy report",
+            "summary": "Legacy summary",
+            "sections": [{"title": "Section", "summary": "Body"}],
+        },
+    }
+    created = await fe_contract_store.complete_analysis_run_from_db(
+        engine, user_id="42", run_id=run["id"], payload=completion
+    )
+    report_id = created["reportId"]
+    expected_result_id = created["analysisResultId"]
+    engine.backtest_runs[run["id"]]["analysis_result_id"] = None
+    engine.ai_backtest_reports[report_id]["analysis_result_id"] = None
+    engine.strategy_email_reports[report_id]["analysis_result_id"] = None
+
+    replayed = await fe_contract_store.complete_analysis_run_from_db(
+        engine, user_id="42", run_id=run["id"], payload=completion
+    )
+
+    assert replayed["analysisResultId"] == expected_result_id
+    assert replayed["created"] is False
+    assert engine.backtest_runs[run["id"]]["analysis_result_id"] == expected_result_id
+    assert engine.ai_backtest_reports[report_id]["analysis_result_id"] == expected_result_id
+    assert engine.strategy_email_reports[report_id]["analysis_result_id"] == expected_result_id
+    assert len(engine.analysis_results) == 1
+
+
+@pytest.mark.asyncio
+async def test_track_c_legacy_completed_rows_with_null_result_id_reject_changed_replay(monkeypatch):
+    engine = TrackCFakeEngine()
+    _install_state_readers(monkeypatch, engine)
+    run = await fe_contract_store.create_analysis_run_from_db(
+        engine,
+        user_id="42",
+        payload={"query": "RSI 30", "strategyId": "strategy-1", "requestPayload": {"seed": "legacy-conflict"}},
+    )
+    completion = {
+        "status": "completed",
+        "result": {"title": "Legacy report", "summary": "Legacy summary"},
+    }
+    created = await fe_contract_store.complete_analysis_run_from_db(
+        engine, user_id="42", run_id=run["id"], payload=completion
+    )
+    report_id = created["reportId"]
+    engine.backtest_runs[run["id"]]["analysis_result_id"] = None
+    engine.ai_backtest_reports[report_id]["analysis_result_id"] = None
+    engine.strategy_email_reports[report_id]["analysis_result_id"] = None
+    changed = {
+        "status": "completed",
+        "result": {"title": "Legacy report", "summary": "Changed summary"},
+    }
+
+    with pytest.raises(AppError) as exc:
+        await fe_contract_store.complete_analysis_run_from_db(
+            engine, user_id="42", run_id=run["id"], payload=changed
+        )
+
+    assert exc.value.status_code == 409
+    assert engine.backtest_runs[run["id"]]["analysis_result_id"] is None
+    assert engine.ai_backtest_reports[report_id]["analysis_result_id"] is None
+    assert engine.strategy_email_reports[report_id]["analysis_result_id"] is None
+    assert len(engine.analysis_results) == 1
 
 
 @pytest.mark.asyncio
@@ -498,6 +682,154 @@ def test_track_c_generated_strategy_id_is_stable_user_scoped_and_not_run_id():
     assert first == replay
     assert first != other_user
     assert first != run_id
+
+
+def test_analysis_result_identity_is_canonical_owner_scoped_and_changes_with_manifest():
+    result = {
+        "summary": "Summary",
+        "title": "Report",
+        "recommendationGate": {"status": "PASS"},
+        "strategySpec": {
+            "entry": ["rsi < 30"],
+            "exit": ["rsi > 70"],
+            "risk_constraints": {"private_market_limit": 0.2},
+        },
+        "performance": {"dataQuality": ["postgres"], "reliability": {"status": "sufficient"}},
+    }
+    execution = {
+        "schema_version": "1",
+        "run_identity": {"job_id": "job-1", "run_id": "run-1"},
+        "policy_hashes": {"strategy": "a" * 64},
+    }
+    first = fe_contract_store._analysis_result_manifest_bundle(result=result, execution_manifest=execution)
+    reordered = fe_contract_store._analysis_result_manifest_bundle(
+        result={
+            "performance": result["performance"],
+            "strategy_spec": result["strategySpec"],
+            "recommendation_gate": result["recommendationGate"],
+            "title": "Report",
+            "summary": "Summary",
+        },
+        execution_manifest={"policy_hashes": execution["policy_hashes"], "run_identity": execution["run_identity"], "schema_version": "1"},
+    )
+    changed_result = copy.deepcopy(result)
+    changed_result["strategySpec"]["risk_constraints"]["private_market_limit"] = 0.3
+    changed = fe_contract_store._analysis_result_manifest_bundle(
+        result=changed_result,
+        execution_manifest=execution,
+    )
+
+    assert fe_contract_store._analysis_result_uuid("42", first) == fe_contract_store._analysis_result_uuid("42", reordered)
+    assert fe_contract_store._analysis_result_uuid("42", first) != fe_contract_store._analysis_result_uuid("42", changed)
+    assert fe_contract_store._analysis_result_uuid("42", first) != fe_contract_store._analysis_result_uuid("43", first)
+    assert first["report"]["result"]["strategySpec"]["risk_constraints"]["private_market_limit"] == 0.2
+
+
+def test_analysis_result_identity_normalizes_numbers_and_preserves_null_string_semantics():
+    execution = {"schema_version": "1", "run_identity": {"run_id": "run-1"}}
+    numeric_float = fe_contract_store._analysis_result_manifest_bundle(
+        result={"title": "Report", "sections": [{"value": 1.0, "optional": None}]},
+        execution_manifest=execution,
+    )
+    numeric_int = fe_contract_store._analysis_result_manifest_bundle(
+        result={"title": "Report", "sections": [{"optional": None, "value": 1}]},
+        execution_manifest=execution,
+    )
+    numeric_string = fe_contract_store._analysis_result_manifest_bundle(
+        result={"title": "Report", "sections": [{"value": "1", "optional": None}]},
+        execution_manifest=execution,
+    )
+    missing_null = fe_contract_store._analysis_result_manifest_bundle(
+        result={"title": "Report", "sections": [{"value": 1}]},
+        execution_manifest=execution,
+    )
+
+    assert fe_contract_store._analysis_result_manifest_hash(numeric_float) == fe_contract_store._analysis_result_manifest_hash(numeric_int)
+    assert fe_contract_store._analysis_result_manifest_hash(numeric_int) != fe_contract_store._analysis_result_manifest_hash(numeric_string)
+    assert fe_contract_store._analysis_result_manifest_hash(numeric_int) != fe_contract_store._analysis_result_manifest_hash(missing_null)
+
+
+def test_analysis_result_public_snapshot_filters_nested_fields_without_changing_identity_manifest():
+    result = {
+        "title": "Public report",
+        "summary": "Public summary",
+        "sections": [{"title": "Visible", "privateNote": "remove me"}],
+        "performance": {"reliability": {"status": "sufficient"}, "apiKey": "remove me"},
+        "internalPayload": {"node_outputs": {"secret": "remove me"}},
+        "debugRef": "remove me",
+    }
+    execution = {
+        "schema_version": "1",
+        "run_identity": {"job_id": "job-1"},
+        "events": {"fills": [{"document": {"token_count": 10}}]},
+    }
+
+    public_result = fe_contract_store._public_analysis_result_payload(result)
+    manifests = fe_contract_store._analysis_result_manifest_bundle(result=result, execution_manifest=execution)
+    public_serialized = json.dumps(public_result, sort_keys=True).lower()
+    identity_serialized = json.dumps(manifests, sort_keys=True).lower()
+
+    assert "internalpayload" not in public_serialized
+    assert "debugref" not in public_serialized
+    assert "privatenote" not in public_serialized
+    assert "apikey" not in public_serialized
+    assert "privatenote" in identity_serialized
+    assert "apikey" in identity_serialized
+    assert "token_count" in identity_serialized
+
+
+@pytest.mark.asyncio
+async def test_analysis_result_links_persisted_job_run_report_and_owner_projection(monkeypatch):
+    engine = TrackCFakeEngine()
+    _install_state_readers(monkeypatch, engine)
+    engine.analysis_jobs["job-1"] = {
+        "job_id": "job-1",
+        "user_id": None,
+        "job_jsonb": {
+            "user_id": "42",
+            "execution_manifest": {
+                "schema_version": "1",
+                "run_identity": {"job_id": "job-1", "run_id": "run-1"},
+                "policy_hashes": {"strategy": "a" * 64},
+            }
+        },
+        "analysis_result_id": None,
+    }
+    run = await fe_contract_store.create_analysis_run_from_db(
+        engine,
+        user_id="42",
+        payload={"query": "RSI 30", "strategyId": "strategy-1", "aiJobId": "job-1"},
+    )
+    completed = await fe_contract_store.complete_analysis_run_from_db(
+        engine,
+        user_id="42",
+        run_id=run["id"],
+        payload={
+            "status": "completed",
+            "aiJobId": "job-1",
+            "result": {"title": "Report", "summary": "Summary"},
+        },
+    )
+
+    result_id = completed["analysisResultId"]
+    assert engine.analysis_jobs["job-1"]["analysis_result_id"] == result_id
+    assert engine.backtest_runs[run["id"]]["analysis_result_id"] == result_id
+    assert engine.ai_backtest_reports[completed["reportId"]]["analysis_result_id"] == result_id
+    assert engine.strategy_email_reports[completed["reportId"]]["analysis_result_id"] == result_id
+    assert (await fe_contract_store.get_analysis_run_from_db(engine, run["id"], user_id="42"))["analysisResultId"] == result_id
+    assert (await fe_contract_store.get_report_from_db(engine, completed["reportId"], user_id="42"))["analysisResultId"] == result_id
+
+    async def fake_list_reports(_engine, **_kwargs):
+        return {
+            "items": [{"id": completed["reportId"], "runId": run["id"]}],
+            "meta": {"limit": 20, "hasMore": False, "nextCursor": None},
+        }
+
+    monkeypatch.setattr(existing_report_queries, "list_reports", fake_list_reports)
+    listed = await fe_contract_store.list_reports_from_db(engine, user_id="42")
+    assert listed["items"][0]["analysisResultId"] == result_id
+    assert await fe_contract_store.get_analysis_run_from_db(engine, run["id"], user_id="99") is None
+    assert await fe_contract_store.get_report_from_db(engine, completed["reportId"], user_id="99") is None
 
 
 @pytest.mark.asyncio

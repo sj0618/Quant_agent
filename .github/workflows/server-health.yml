@@ -112,6 +112,19 @@ jobs:
             | "$APP_DIR/ai/.venv/bin/python" -c \
               'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
           check_http "FE" "http://127.0.0.1:$FE_PORT/"
+          frontend_html="$(mktemp)"
+          if ! curl -q --fail --silent --show-error \
+            --connect-timeout 5 --max-time 15 \
+            -o "$frontend_html" "http://127.0.0.1:$FE_PORT/"; then
+            rm -f "$frontend_html"
+            exit 1
+          fi
+          if grep -Eq '(/@vite/client|/src/[^"[:space:]]+\.(tsx?|jsx?))' "$frontend_html"; then
+            rm -f "$frontend_html"
+            echo "Frontend bundle contains Vite development assets"
+            exit 1
+          fi
+          rm -f "$frontend_html"
 
           if command -v git >/dev/null 2>&1 && git -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
             printf 'deployed revision: %s\n' "$(git -C "$APP_DIR" rev-parse --short HEAD)"

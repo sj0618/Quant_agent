@@ -564,6 +564,9 @@ class GeneratedSignal(BaseModel):
     ticker: str | None = None
     action: str = Field(pattern="^(BUY|SELL|HOLD)$")
     price: float = Field(gt=0.0)
+    # Optional entry strength for scarce same-session slots.  Missing scores preserve
+    # the engine's deterministic ticker-order fallback instead of inventing a rank.
+    score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -608,6 +611,7 @@ def _is_cacheable_evaluation(evaluation: _CandidateEvaluation) -> bool:
 class _CandidateTaskResult:
     evaluation: _CandidateEvaluation
     generated_actions: Sequence[int] | None
+    generated_scores: Sequence[float] | None
     action_build_seconds: float
     action_cache_hit: bool
     worker_pid: int
@@ -718,7 +722,7 @@ def _initialize_candidate_worker(
 
 
 def _evaluate_candidate_worker(
-    task: tuple[Mapping[str, Any], Sequence[int] | None, str],
+    task: tuple[Mapping[str, Any], Sequence[int] | None, Sequence[float] | None, str],
 ) -> _CandidateTaskResult:
     if (
         _WORKER_STRATEGY is None
@@ -728,7 +732,7 @@ def _evaluate_candidate_worker(
         or _WORKER_BENCHMARK_CONTEXT is None
     ):
         raise RuntimeError("candidate worker was not initialized")
-    candidate_payload, actions, metrics_mode = task
+    candidate_payload, actions, scores, metrics_mode = task
     return _evaluate_candidate_task(
         _WORKER_STRATEGY,
         CodeCandidate.model_validate(candidate_payload),
@@ -737,6 +741,7 @@ def _evaluate_candidate_worker(
         feature_store=_WORKER_FEATURE_STORE,
         benchmark_context=_WORKER_BENCHMARK_CONTEXT,
         generated_actions=actions,
+        generated_scores=scores,
         metrics_mode=metrics_mode,
     )
 
@@ -943,6 +948,7 @@ class _CandidateBacktestSession:
         self._base_feature_estimated_bytes = self.feature_store.stats().estimated_bytes
         self._cache: dict[tuple[str, bool, str], _CandidateEvaluation] = {}
         self._action_cache: dict[str, Sequence[int]] = {}
+        self._score_cache: dict[str, Sequence[float]] = {}
         self._worker_feature_bytes: dict[int, int] = {}
         self._worker_feature_lookbacks: set[int] = set()
         self._disk_cache = _DiskEvaluationCache()
@@ -1011,6 +1017,7 @@ class _CandidateBacktestSession:
                 (
                     candidate.model_dump(mode="python"),
                     self._action_cache.get(_candidate_identity(candidate)),
+                    self._score_cache.get(_candidate_identity(candidate)),
                     metrics_mode,
                 )
                 for candidate in missing
@@ -1029,6 +1036,7 @@ class _CandidateBacktestSession:
                         feature_store=self.feature_store,
                         benchmark_context=self.benchmark_context,
                         generated_actions=self._action_cache.get(_candidate_identity(candidate)),
+                        generated_scores=self._score_cache.get(_candidate_identity(candidate)),
                         metrics_mode=metrics_mode,
                     )
                     for candidate in missing
@@ -1047,9 +1055,10 @@ class _CandidateBacktestSession:
                         + result.action_build_seconds
                     )
                 if result.generated_actions is not None:
-                    self._action_cache[_candidate_identity(result.evaluation.candidate)] = (
-                        result.generated_actions
-                    )
+                    identity = _candidate_identity(result.evaluation.candidate)
+                    self._action_cache[identity] = result.generated_actions
+                    if result.generated_scores is not None:
+                        self._score_cache[identity] = result.generated_scores
                 if result.worker_pid != os.getpid():
                     self._worker_feature_bytes[result.worker_pid] = max(
                         self._worker_feature_bytes.get(result.worker_pid, 0),
@@ -1101,7 +1110,9 @@ class _CandidateBacktestSession:
 
     def _evaluate_parallel(
         self,
-        tasks: list[tuple[Mapping[str, Any], Sequence[int] | None, str]],
+        tasks: list[
+            tuple[Mapping[str, Any], Sequence[int] | None, Sequence[float] | None, str]
+        ],
         candidates: list[CodeCandidate],
         worker_count: int,
     ) -> list[_CandidateTaskResult]:
@@ -1165,6 +1176,7 @@ class _CandidateBacktestSession:
                 evaluations[index] = _CandidateTaskResult(
                     evaluation=_timeout_evaluation(candidates[index], timeout),
                     generated_actions=None,
+                    generated_scores=None,
                     action_build_seconds=0.0,
                     action_cache_hit=False,
                     worker_pid=0,
@@ -1453,6 +1465,7 @@ def _evaluate_candidate_task(
     feature_store: PreparedFeatureStore,
     benchmark_context: _BenchmarkContext,
     generated_actions: Sequence[int] | None,
+    generated_scores: Sequence[float] | None,
     metrics_mode: str,
 ) -> _CandidateTaskResult:
     wall_started = time.perf_counter()
@@ -1461,6 +1474,7 @@ def _evaluate_candidate_task(
     action_cache_hit = generated_actions is not None
     action_build_started = time.perf_counter()
     actions = generated_actions
+    scores = generated_scores
     if not candidate.validation_ok:
         feature_stats = feature_store.stats()
         return _CandidateTaskResult(
@@ -1480,6 +1494,7 @@ def _evaluate_candidate_task(
                 },
             ),
             generated_actions=actions,
+            generated_scores=scores,
             action_build_seconds=0.0,
             action_cache_hit=action_cache_hit,
             worker_pid=worker_pid,
@@ -1499,7 +1514,7 @@ def _evaluate_candidate_task(
                 )
             else:
                 generated_signals = _execute_candidate_code(candidate, rows)
-                actions = _compact_actions_from_signals(prepared_market, generated_signals)
+                actions, scores = _compact_actions_from_signals(prepared_market, generated_signals)
         action_build_seconds = (
             0.0 if action_cache_hit else time.perf_counter() - action_build_started
         )
@@ -1509,6 +1524,7 @@ def _evaluate_candidate_task(
             rows,
             prepared_market=prepared_market,
             generated_actions=actions,
+            generated_scores=scores,
             metrics_mode=metrics_mode,
         )
     except Exception as exc:
@@ -1546,6 +1562,7 @@ def _evaluate_candidate_task(
         return _CandidateTaskResult(
             evaluation=evaluation,
             generated_actions=actions,
+            generated_scores=scores,
             action_build_seconds=action_build_seconds,
             action_cache_hit=action_cache_hit,
             worker_pid=worker_pid,
@@ -1660,6 +1677,7 @@ def _evaluate_candidate_task(
     return _CandidateTaskResult(
         evaluation=evaluation,
         generated_actions=actions,
+        generated_scores=scores,
         action_build_seconds=action_build_seconds,
         action_cache_hit=action_cache_hit,
         worker_pid=worker_pid,
@@ -2214,12 +2232,14 @@ def _run_candidate_backtest(
     *,
     prepared_market: EnginePreparedMarketData,
     generated_actions: Sequence[int] | None,
+    generated_scores: Sequence[float] | None = None,
     metrics_mode: str,
 ):
     actions = generated_actions
+    scores = generated_scores
     if actions is None:
         generated_signals = _execute_candidate_code(candidate, price_rows)
-        actions = _compact_actions_from_signals(prepared_market, generated_signals)
+        actions, scores = _compact_actions_from_signals(prepared_market, generated_signals)
     engine_spec = _engine_strategy_spec(
         strategy,
         candidate,
@@ -2235,14 +2255,16 @@ def _run_candidate_backtest(
         ),
         prepared_market_data=prepared_market,
         generated_actions=actions,
+        generated_scores=scores,
     )
 
 
 def _compact_actions_from_signals(
     prepared_market: EnginePreparedMarketData,
     generated_signals: Sequence[GeneratedSignal],
-) -> list[int]:
+) -> tuple[list[int], list[float]]:
     actions = [0] * len(prepared_market.ohlcv_rows)
+    scores = [float("nan")] * len(prepared_market.ohlcv_rows)
     tickers_by_date: dict[str, list[str]] = {}
     for bar in prepared_market.ohlcv_rows:
         tickers_by_date.setdefault(bar.date.isoformat(), []).append(bar.ticker)
@@ -2260,7 +2282,9 @@ def _compact_actions_from_signals(
                 f"generated signal {signal.date}/{ticker} is not present in price rows"
             )
         actions[index] = int(SIGNAL_METRIC_VALUES[signal.action])
-    return actions
+        if signal.action == "BUY" and signal.score is not None:
+            scores[index] = float(signal.score)
+    return actions, scores
 
 
 def _execute_candidate_code(

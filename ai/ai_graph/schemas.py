@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
 
@@ -146,6 +146,18 @@ class SourceUsage(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     fallback_used: bool = False
     evidence_refs: list[str] = Field(default_factory=list)
+
+
+class FreshnessEvidence(BaseModel):
+    """The bounded freshness decision carried by a public envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: FreshnessStatus
+    as_of: date | None = None
+    reason: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    no_recommendation: bool
 
 
 class FailureDiagnostic(BaseModel):
@@ -675,18 +687,53 @@ class ReportBundle(BaseModel):
     risk_adjustments: list[RiskAdjustment] = Field(default_factory=list)
 
 
+class BacktestEvaluationBasis(BaseModel):
+    """Reader-facing statement of the historical slice used for performance."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    basis: Literal["hold_out", "walk_forward_policy"]
+    caption: str = Field(min_length=1)
+    hold_out_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+    window_start: str | None = None
+    window_end: str | None = None
+    window_policy_id: str | None = None
+    evaluation_session_count: int | None = Field(default=None, ge=0)
+    fold_count: int | None = Field(default=None, ge=0)
+    cost_model_applied: bool = False
+
+
+class BacktestUniversePolicy(BaseModel):
+    """Reader-facing distinction between a PIT backtest universe and today's screen."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1)
+    policy_id: str | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    traded_ticker_count: int | None = Field(default=None, ge=0)
+    excluded_screening_candidate_count: int = Field(default=0, ge=0)
+    excluded_notice: str | None = None
+
+
 class BacktestPerformance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     selected_candidate_id: str = Field(min_length=1)
-    metrics: BacktestMetrics
-    equity_curve: list[BacktestEquityPoint]
+    # ``None`` is unavailable data, never a measured zero return.
+    metrics: BacktestMetrics | None = None
+    equity_curve: list[BacktestEquityPoint] = Field(default_factory=list)
     engine_summary: dict[str, Any] = Field(default_factory=dict)
     reliability: BacktestReliability | None = None
     data_quality: list[str] = Field(default_factory=list)
     benchmark: BacktestBenchmark | None = None
     metric_details: list[PublicMetricDetail] = Field(default_factory=list)
     strategy_explanation: PublicStrategyExplanation | None = None
+    is_available: bool = True
+    unavailable_reason: str | None = None
+    evaluation_basis: BacktestEvaluationBasis | None = None
+    universe_policy: BacktestUniversePolicy | None = None
 
 
 class InternalPayload(BaseModel):
@@ -853,6 +900,7 @@ class APIEnvelope(BaseModel):
     data_requirements: list[DataRequirement] = Field(default_factory=list)
     source_usage: list[SourceUsage] = Field(default_factory=list)
     freshness_status: FreshnessStatus | None = None
+    freshness_evidence: FreshnessEvidence | None = None
     proxy_disclosure: dict[str, str] | None = None
     failure_cause: FailureDiagnostic | None = None
     evidence_refs: list[EvidenceRef] = Field(default_factory=list)

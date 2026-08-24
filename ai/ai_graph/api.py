@@ -9,7 +9,17 @@ from collections.abc import AsyncIterator, Callable
 from os import environ
 from typing import ClassVar, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -38,12 +48,12 @@ from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
 from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.jobs import (
     AI_JOB_STORE_ENV,
+    PERSISTENT_JOB_STORE_MODE,
     AnalysisJob,
     AnalysisJobStore,
     AnalysisRunner,
     CancellationRegistry,
     JobStoreRuntime,
-    PERSISTENT_JOB_STORE_MODE,
     create_analysis_job_store_from_env,
     run_job_sync,
 )
@@ -54,6 +64,7 @@ from ai_graph.preflight import (
     ResearchRequestPreflight,
     classify_research_request,
 )
+from ai_graph.quant_performance import sanitize_public_performance
 from ai_graph.research_contract import (
     CanonicalRuleV1,
     DraftConflictV1,
@@ -122,6 +133,7 @@ DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
 READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
 REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
 ANALYSIS_JOBS_MIGRATION_REVISION = "021_ai_analysis_jobs"
+IMMUTABLE_RESULTS_MIGRATION_REVISION = "022_immutable_analysis_results"
 AI_LLM_PROVIDER_ENV = "AI_LLM_PROVIDER"
 AI_AOAI_RESPONSES_URL_ENV = "AI_AOAI_RESPONSES_URL"
 AI_AOAI_API_KEY_ENV = "AI_AOAI_API_KEY"
@@ -299,7 +311,7 @@ class ReadinessResponse(BaseModel):
 
     status: Literal["ready", "unavailable"]
     contract_version: str = READINESS_CONTRACT_VERSION
-    migration_revision: str = ANALYSIS_JOBS_MIGRATION_REVISION
+    migration_revision: str = IMMUTABLE_RESULTS_MIGRATION_REVISION
     ai_contract_version: str
     checks: list[ReadinessCheck]
 
@@ -541,6 +553,9 @@ def create_app(
         if research_execution_enabled is not None
         else _research_execution_enabled()
     )
+    # Deployed services accept only the signed RuleDraft flow.  The raw endpoint is
+    # retained for local compatibility harnesses, never as a production escape hatch.
+    app.state.legacy_analysis_jobs_enabled = not _production_runtime()
     migration_probe = readiness_migration_probe or _analysis_jobs_migration_is_current
 
     probe_token = (environ.get(DATA_EVIDENCE_PROBE_TOKEN_ENV) or "").strip()
@@ -632,6 +647,15 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
+        if not app.state.legacy_analysis_jobs_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail={
+                    "code": "legacy_raw_analysis_job_retired",
+                    "message": "원문 요청 실행은 지원하지 않습니다. 규칙 검토 후 확인된 연구 작업만 실행할 수 있습니다.",
+                    "alternative": RESEARCH_JOB_CREATE_PATH,
+                },
+            )
         scope_response = _preflight_rejection_response(classify_research_request(request.query))
         if scope_response is not None:
             return scope_response
@@ -753,7 +777,10 @@ def create_app(
         user_id: str = Depends(require_user),
     ) -> list[AnalysisJob]:
         owned_jobs = (job for job in store.list_jobs(limit=100) if job.user_id == user_id)
-        return sorted(owned_jobs, key=lambda job: job.updated_at, reverse=True)[:limit]
+        return [
+            _public_job(job)
+            for job in sorted(owned_jobs, key=lambda job: job.updated_at, reverse=True)[:limit]
+        ]
 
     @app.post(
         SPEC_STRATEGY_PARSE_PATH,
@@ -925,7 +952,7 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="analysis job not found",
             )
-        return job
+        return _public_job(job)
 
     @app.get(
         SPEC_ANALYSIS_JOB_DETAIL_PATH,
@@ -942,8 +969,9 @@ def create_app(
     )
     def get_backtest(strategy_id: str, user_id: str = Depends(require_user)) -> APIEnvelope:
         job = _find_job_by_strategy(store, strategy_id, user_id)
-        if job and job.result and job.result.user_payload.performance is not None:
-            return job.result
+        result = _public_envelope(job.result) if job and job.result else None
+        if result and result.user_payload.performance is not None:
+            return result
         return _not_found_envelope(
             resource_type="backtest",
             resource_id=strategy_id,
@@ -1081,6 +1109,10 @@ def _research_execution_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _production_runtime() -> bool:
+    return (environ.get("APP_ENV") or "").strip().lower() in {"production", "prod"}
+
+
 def _data_source_status() -> DataSourceStatus:
     dsn_value, dsn_env = resolve_database_dsn_from_env()
     return DataSourceStatus(
@@ -1203,6 +1235,20 @@ def _analysis_jobs_migration_is_current() -> bool:
                         SELECT 1
                         FROM pg_class
                         WHERE relname = 'idx_ai_analysis_job_execution_manifest_schema'
+                    ),
+                    to_regclass('app.analysis_result') IS NOT NULL,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'app'
+                          AND table_name = 'ai_analysis_job'
+                          AND column_name = 'analysis_result_id'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_trigger
+                        WHERE tgname = 'trg_analysis_result_immutable'
+                          AND tgrelid = 'app.analysis_result'::regclass
                     )
                 """
             ).fetchone()
@@ -1245,6 +1291,28 @@ def _job_store_status(runtime: JobStoreRuntime) -> JobStoreStatus:
 def _owned_job(store: AnalysisJobStore, job_id: str, user_id: str) -> AnalysisJob | None:
     job = store.get_job(job_id)
     return job if job is not None and job.user_id == user_id else None
+
+
+def _public_envelope(envelope: APIEnvelope | None) -> APIEnvelope | None:
+    """Return a response-safe copy without rewriting the persisted result."""
+
+    if envelope is None:
+        return None
+    performance = envelope.user_payload.performance
+    public_performance = sanitize_public_performance(performance)
+    if public_performance is performance:
+        return envelope
+    payload = envelope.user_payload.model_copy(
+        update={"performance": public_performance}
+    )
+    return envelope.model_copy(update={"user_payload": payload})
+
+
+def _public_job(job: AnalysisJob) -> AnalysisJob:
+    result = _public_envelope(job.result)
+    if result is job.result:
+        return job
+    return job.model_copy(update={"result": result})
 
 
 def _find_job_by_strategy(store: AnalysisJobStore, strategy_id: str, user_id: str) -> AnalysisJob | None:

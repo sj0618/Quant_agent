@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ai_graph.schemas import APIEnvelope, EnvelopeStatus, InternalPayload, UserPayload
+from ai_graph.schemas import (
+    APIEnvelope,
+    EnvelopeStatus,
+    FreshnessEvidence,
+    InternalPayload,
+    UserPayload,
+)
 
 
 @dataclass
@@ -31,6 +37,7 @@ def build_envelope(
     data_requirements: list[dict[str, Any]] | None = None,
     source_usage: list[dict[str, Any]] | None = None,
     freshness_status: str | None = None,
+    freshness_evidence: FreshnessEvidence | dict[str, Any] | None = None,
     proxy_disclosure: dict[str, str] | None = None,
     failure_cause: dict[str, Any] | None = None,
     evidence_refs: list[dict[str, Any]] | None = None,
@@ -52,6 +59,7 @@ def build_envelope(
         data_requirements=data_requirements or [],
         source_usage=source_usage or [],
         freshness_status=freshness_status,
+        freshness_evidence=freshness_evidence,
         proxy_disclosure=proxy_disclosure,
         failure_cause=failure_cause,
         evidence_refs=evidence_refs or [],

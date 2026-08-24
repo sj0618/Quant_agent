@@ -25,6 +25,7 @@ def _job_document(job: AnalysisJob) -> dict[str, Any]:
             "debug_ref": job.debug_ref,
             "fallback_reasons": job.fallback_reasons,
             "error_message": job.error_message,
+            "owner_incarnation": job.owner_incarnation,
             "execution_manifest": job.execution_manifest.model_dump(mode="json"),
         }
     )

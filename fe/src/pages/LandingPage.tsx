@@ -6,6 +6,7 @@ import { ROUTES, withReturnTo } from "../config/routes";
 
 export function LandingPage() {
   const reportsHref = withReturnTo(ROUTES.login, ROUTES.reports);
+  const archiveAccessNoteId = "archive-access-note";
 
   return (
     <main className="landing-page">
@@ -19,7 +20,7 @@ export function LandingPage() {
           <a href="#archive">리포트 보관함</a>
           <a href="#limits">이용 범위</a>
         </div>
-        <a className="button button--dark" href={reportsHref}>리포트 로그인</a>
+        <a aria-describedby={archiveAccessNoteId} className="button button--dark" href={reportsHref}>리포트 로그인</a>
       </nav>
 
       <section className="hero" id="service">
@@ -34,10 +35,10 @@ export function LandingPage() {
           현재 공개 화면은 검증을 통과한 보관 리포트 열람에만 집중합니다.
         </p>
         <div className="hero__actions">
-          <a className="button button--primary" href={reportsHref}>리포트 보관함 보기 →</a>
+          <a aria-describedby={archiveAccessNoteId} className="button button--primary" href={reportsHref}>리포트 보관함 보기 →</a>
           <a className="button button--ghost" href="#limits">현재 이용 범위</a>
         </div>
-        <small>현재는 보관된 검증 리포트 열람만 지원합니다.</small>
+        <small id={archiveAccessNoteId}>로그인 후 읽기 전용 리포트 보관함으로 이동합니다. 새 분석은 지원하지 않습니다.</small>
       </section>
 
       <section className="landing-section" id="principles">
@@ -72,7 +73,7 @@ export function LandingPage() {
           </div>
           <h3>새 분석을 시작하지 않는 리포트 경험</h3>
           <p>보관 리포트는 과거 기록을 확인하기 위한 화면입니다. 검증 상태가 불충분하거나 출처가 확인되지 않는 기록은 투자 판단으로 연결하지 않습니다.</p>
-          <a href={reportsHref}>로그인 후 리포트 보관함 열기 →</a>
+          <a aria-describedby={archiveAccessNoteId} href={reportsHref}>로그인 후 리포트 보관함 열기 →</a>
         </Card>
       </section>
 

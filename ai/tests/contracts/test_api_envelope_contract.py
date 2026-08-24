@@ -32,6 +32,7 @@ API_ENVELOPE_FIELDS = {
     "data_requirements",
     "source_usage",
     "freshness_status",
+    "freshness_evidence",
     "proxy_disclosure",
     "failure_cause",
     "evidence_refs",
@@ -84,6 +85,13 @@ def test_analysis_job_and_api_envelope_public_fields_are_frozen() -> None:
     assert result["source_usage"]
     assert all(source["fallback_used"] for source in result["source_usage"])
     assert result["evidence_refs"]
+    assert set(result["freshness_evidence"]) == {
+        "status",
+        "as_of",
+        "reason",
+        "source",
+        "no_recommendation",
+    }
     assert set(user_payload) == USER_PAYLOAD_FIELDS
     performance = user_payload["performance"]
     assert performance["availability"] in {"available", "unavailable"}

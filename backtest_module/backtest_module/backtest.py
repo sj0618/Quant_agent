@@ -5,13 +5,14 @@ import csv
 import gzip
 import json
 import math
-from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
-import numpy as np
-from functools import lru_cache
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Literal, Mapping, Sequence
+
+import numpy as np
 
 from .models import (
     Condition,
@@ -87,6 +88,22 @@ class PendingOrder:
     signal_date: date
     reason: str
     prior_raw_notional: float | None = None
+    # Higher means a stronger entry signal. None when the caller supplied no ranking,
+    # which is the only case where the ticker code decides who gets a scarce slot.
+    signal_score: float | None = None
+
+
+def _buy_priority(order: PendingOrder) -> tuple[int, float, str]:
+    """Scarce slots follow signal strength; the ticker code only breaks ties.
+
+    Unscored orders sort after scored ones so a caller that ranks part of a day cannot
+    have an unranked order outrank a measured one on the strength of a default number.
+    """
+
+    score = order.signal_score
+    if score is None or not math.isfinite(score):
+        return (1, 0.0, order.ticker)
+    return (0, -score, order.ticker)
 
 
 @dataclass(frozen=True)
@@ -706,6 +723,7 @@ class BacktestEngine:
         config: BacktestRunConfig | None = None,
         prepared_market_data: PreparedMarketData | None = None,
         generated_actions: Sequence[int] | None = None,
+        generated_scores: Sequence[float] | None = None,
         inputs_normalized: bool = False,
     ):
         self.spec = spec
@@ -713,6 +731,7 @@ class BacktestEngine:
         self.config = config or BacktestRunConfig()
         self.prepared_market_data = prepared_market_data
         self.generated_actions = generated_actions
+        self.generated_scores = generated_scores
         self.inputs_normalized = inputs_normalized
         if prepared_market_data is None:
             self.ohlcv_rows = (
@@ -730,6 +749,8 @@ class BacktestEngine:
             self.metric_rows = {}
             if generated_actions is not None and len(generated_actions) != len(self.ohlcv_rows):
                 raise ValueError("generated_actions must align one-to-one with prepared OHLCV rows")
+            if generated_scores is not None and len(generated_scores) != len(self.ohlcv_rows):
+                raise ValueError("generated_scores must align one-to-one with prepared OHLCV rows")
         self.indicator_report: dict[str, object] = {}
         if self.config.max_tickers is not None:
             allowed = sorted({row.ticker for row in self.ohlcv_rows})[: self.config.max_tickers]
@@ -1189,7 +1210,7 @@ class BacktestEngine:
                 commission_cost_text=str(commission_decimal), tax_cost_text=str(tax_decimal),
                 slippage_cost_text=str(slippage_decimal), total_cost_text=str(commission_decimal + tax_decimal), detail="Filled at the eligible next-session open.",
             ))
-        buy_orders = sorted((item for item in executable if item.side == "buy" and item.ticker not in positions), key=lambda order: order.ticker)
+        buy_orders = sorted((item for item in executable if item.side == "buy" and item.ticker not in positions), key=_buy_priority)
         for order in buy_orders:
             max_positions = self.spec.position_sizing.max_positions
             if max_positions is not None and len(positions) >= max_positions:
@@ -1405,7 +1426,8 @@ class BacktestEngine:
         audit: list[OrderAuditRecord] = []
         row_index_by_key = self.prepared_market_data.row_index_by_key
         for ticker in sorted(today_bars):
-            action_value = int(self.generated_actions[row_index_by_key[(current_date, ticker)]])
+            row_index = row_index_by_key[(current_date, ticker)]
+            action_value = int(self.generated_actions[row_index])
             has_position = ticker in positions
             if action_value == 1 and not has_position:
                 action = "buy"
@@ -1418,6 +1440,7 @@ class BacktestEngine:
                             signal_date=current_date,
                             reason=reason,
                             prior_raw_notional=today_bars[ticker].raw_notional,
+                            signal_score=self._generated_score(row_index),
                         )
                     )
                     audit.append(
@@ -1511,6 +1534,12 @@ class BacktestEngine:
                     )
         return orders, signals, audit
 
+    def _generated_score(self, row_index: int) -> float | None:
+        if self.generated_scores is None:
+            return None
+        score = float(self.generated_scores[row_index])
+        return score if math.isfinite(score) else None
+
     def _risk_exit_reason(self, position: Position, bar: OhlcvBar) -> str | None:
         stop_loss = self.spec.risk_controls.stop_loss_pct
         if stop_loss and bar.close <= position.entry_price * (1 - stop_loss):
@@ -1557,7 +1586,17 @@ class BacktestEngine:
         else:
             metrics = calculate_quantstats_metrics(equity_curve, include_montecarlo=True)
         winners = [trade for trade in trades if trade.net_pnl > 0]
+        losers = [trade for trade in trades if trade.net_pnl < 0]
         trade_win_rate = round(len(winners) / len(trades), 10) if trades else 0.0
+        # Gross profit over gross loss, from realized trade PnL. `None` when the ratio is
+        # undefined - no closed trades, or no losing trade to divide by. A capped
+        # stand-in would read as a measured result, and that is exactly how the previous
+        # win-rate-derived value misled: it reported a number in cases it had not measured.
+        gross_trade_profit = sum(float(trade.net_pnl) for trade in winners)
+        gross_trade_loss = -sum(float(trade.net_pnl) for trade in losers)
+        trade_profit_factor = (
+            round(gross_trade_profit / gross_trade_loss, 10) if gross_trade_loss > 0.0 else None
+        )
         holding_days = [
             (date.fromisoformat(trade.exit_date) - date.fromisoformat(trade.entry_date)).days
             for trade in trades
@@ -1643,6 +1682,9 @@ class BacktestEngine:
             "skew": metrics.get("skew"),
             "trade_count": len(trades),
             "trade_win_rate": trade_win_rate,
+            "trade_profit_factor": trade_profit_factor,
+            "gross_trade_profit": round(gross_trade_profit, 10),
+            "gross_trade_loss": round(gross_trade_loss, 10),
             "win_rate": trade_win_rate,
             "return_win_rate": metrics.get("win_rate"),
             "signal_count": len(signals),
@@ -1832,6 +1874,7 @@ def run_backtest(
     config: BacktestRunConfig | None = None,
     prepared_market_data: PreparedMarketData | None = None,
     generated_actions: Sequence[int] | None = None,
+    generated_scores: Sequence[float] | None = None,
 ) -> BacktestResult:
     if ohlcv_rows is None and prepared_market_data is None:
         ohlcv_rows = load_ohlcv_csv(ohlcv_path or DEFAULT_OHLCV_PATH)
@@ -1845,6 +1888,7 @@ def run_backtest(
         config=config,
         prepared_market_data=prepared_market_data,
         generated_actions=generated_actions,
+        generated_scores=generated_scores,
     ).run()
 
 
