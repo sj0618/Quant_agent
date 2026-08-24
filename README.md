@@ -126,8 +126,9 @@ SERVICE_DB_ARCHIVE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgr
 
 | 환경변수 | 기본값 | 뜻 |
 |---|---|---|
-| `AI_ANALYSIS_MAX_CONCURRENCY` | `4` | 동시에 실행할 분석 수. AOAI 게이트 capacity(8)보다 낮게 둔다 — 분석 1건이 프로바이더 호출을 여러 번 내므로 |
+| `AI_ANALYSIS_MAX_CONCURRENCY` | `4` | 동시에 실행할 분석 수. AOAI 게이트의 성장 상한(8)보다 낮게 둔 값이다 — 분석 1건이 프로바이더 호출을 여러 번 내므로. 다만 그 게이트는 capacity `2`에서 시작해 정상 응답 10회마다 한 단계씩만 올라가므로, `8`은 평상시 운용값이 아니라 천장이다. 이 기본값은 CPU 축을 보지 않는다 — [동시성 상한 재검토](docs/plans/analysis-concurrency-cap-review-20260824.md) 참조 |
 | `AI_ANALYSIS_QUEUE_WAIT_SECONDS` | `600` | 슬롯을 기다리는 한도. 분석 1건의 wall budget보다 길게 둬서, 한 건 뒤에 선 잡이 차례를 받게 한다 |
+| `AI_BACKTEST_WORKERS` | `2` | 분석 **1건**이 후보 평가에 쓸 프로세스 풀 워커 수. 실제 워커 수는 `min(후보 수, 이 값, os.cpu_count())`이고, 후보×행 수가 250,000 미만이면 직렬(1)로 떨어진다. 분석 **여러 건**에 걸친 워커 합계에는 상한이 없다 |
 
 상한을 넘은 잡은 **거절이 아니라 대기**한다. 클라이언트는 이미 큐잉된 잡을 폴링하고
 있으므로 기다림이 새로 드는 비용이 아니고, 1분 뒤면 처리할 수 있는 일을 거절하는 편이
