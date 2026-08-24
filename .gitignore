@@ -253,3 +253,13 @@ readme_quant.md
 # `lib/` above is a Python build-output rule, but fe/src/lib is application source
 # (shadcn's `cn` helper). It silently swallowed the file and broke the CI build.
 !fe/src/lib/
+
+# Agent runtime state. `.omc/` is written by the agent harness while it works -
+# session telemetry, throttle counters, scratch handoffs - and a new session
+# creates a new path under it every time, so it accumulates rather than settling.
+# It leaked into three pull requests before this rule existed, because source
+# changes get staged with `git add -A <dir>` and these files sit inside those
+# directories. `.omc/skills/` is the documented exception: project-scoped skills
+# are meant to be committed.
+.omc/
+!.omc/skills/
