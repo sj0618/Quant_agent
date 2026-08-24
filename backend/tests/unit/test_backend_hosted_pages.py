@@ -5,13 +5,13 @@ import re
 from pathlib import Path
 
 import pytest
-from app.api.routes import pages
-from app.core.errors import register_exception_handlers
-from app.services.session_store import AuthSessionStore
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 
+from app.api.routes import pages
+from app.core.errors import register_exception_handlers
+from app.services.session_store import AuthSessionStore
 from tests.unit.test_auth_config import valid_settings
 from tests.unit.test_auth_core import FakeRedis
 
@@ -51,7 +51,7 @@ def test_app_page_requires_valid_session_then_serves_shell(frontend_dist: Path, 
     client, app = make_client(frontend_dist, monkeypatch)
     missing = client.get("/app", follow_redirects=False)
     assert missing.status_code == 303
-    assert missing.headers["location"] == "/login"
+    assert missing.headers["location"] == "/login?returnTo=%2Fapp"
     session_id, _csrf = asyncio.run(
         AuthSessionStore(app.state.redis_client, app.state.settings).create_session(user_id="user-1")
     )
