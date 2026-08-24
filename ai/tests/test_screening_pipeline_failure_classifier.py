@@ -1,3 +1,5 @@
+import pytest
+
 from ai_graph.data_sources import PipelineDataUnavailableError
 from ai_graph.jobs import InMemoryAnalysisJobStore, classify_failure
 from ai_graph.schemas import APIEnvelope
@@ -120,6 +122,41 @@ def test_schema_validation_failure_does_not_zero_fill_a_successful_analysis() ->
     assert failed.result.user_payload.performance is None
     assert failed.result.user_payload.report is None
     assert failed.result.user_payload.recommendation_gate is None
+    assert "analysis runner" not in failed.result.user_payload.message
+
+
+@pytest.mark.parametrize("empty_result", [{}, None])
+def test_empty_runner_result_is_not_completed_or_reused_as_an_analysis(
+    empty_result: object,
+) -> None:
+    """An empty runner result must be a terminal unavailable envelope, not a crash.
+
+    Empty output and malformed schema output are separate operator diagnoses.  Neither
+    may reach the completed-job path or leak a prior success-shaped analysis payload.
+    """
+
+    store = InMemoryAnalysisJobStore()
+    job = store.create("RSI가 30 이하인 KOSPI200")
+
+    failed = store.run_sync(  # type: ignore[arg-type]
+        job.job_id,
+        lambda _query, _trace_id: empty_result,
+    )
+
+    assert failed.status == "failed"
+    assert failed.completed_at is not None
+    assert failed.result is not None
+    assert failed.result.status == "failed"
+    assert failed.result.retryable is False
+    assert failed.result.failure_cause is not None
+    assert failed.result.failure_cause.category == "data_gap"
+    assert failed.result.failure_cause.subcause == "empty_analysis_result"
+    assert failed.result.user_payload.candidate_cards == []
+    assert failed.result.user_payload.ticker_actions == []
+    assert failed.result.user_payload.performance is None
+    assert failed.result.user_payload.report is None
+    assert failed.result.user_payload.recommendation_gate is None
+    assert "analysis runner" not in failed.result.user_payload.message
 
 
 def test_lock_exhaustion_is_named_not_swallowed_as_unknown() -> None:

@@ -63,6 +63,7 @@ FailureSubcause = Literal[
     # tight rather than that something broke.
     "no_screening_matches",
     "no_price_rows",
+    "empty_analysis_result",
     "outside_owner",
     "product_data_gap",
     "unknown",

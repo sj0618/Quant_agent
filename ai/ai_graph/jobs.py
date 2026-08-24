@@ -235,6 +235,10 @@ class JobStoreConfigurationError(RuntimeError):
     """Raised when a requested job store mode cannot be configured safely."""
 
 
+class EmptyAnalysisResultError(ValueError):
+    """The analysis runner returned no public result envelope."""
+
+
 @dataclass(frozen=True)
 class JobStoreRuntime:
     store: AnalysisJobStore
@@ -489,7 +493,7 @@ def run_job_sync(
                 scope.enter_context(
                     cancellation_check(lambda: cancellations.is_cancelled(job_id))
                 )
-            result = runner(job.query, job.trace_id)
+            result = _require_analysis_envelope(runner(job.query, job.trace_id))
     except AnalysisCancelled:
         _logger.info("analysis job cancelled: job_id=%s", job_id)
         message = "사용자가 분석을 중단했습니다."
@@ -804,6 +808,19 @@ def _stage_status_for(
 
 
 def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
+    if isinstance(exc, EmptyAnalysisResultError):
+        return FailureDiagnostic(
+            category="data_gap",
+            subcause="empty_analysis_result",
+            failure_stage=stage,
+            owner="ai_graph",
+            retryable=False,
+            safe_message=(
+                "분석 결과를 생성하지 못했습니다. 같은 결과를 재사용하지 않고 중단했습니다. "
+                "조건을 조정해 다시 시도해 주세요."
+            ),
+            evidence_refs=["failure:empty_analysis_result"],
+        )
     # Matched on the exception type before any of the message heuristics below, and by
     # name rather than by import so this module stays free of the llm package. A queued
     # request that never got a provider slot is a capacity problem, not the generic
@@ -981,6 +998,22 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
         safe_message="AI 분석 중 분류되지 않은 오류가 발생했습니다. 원문 오류는 공개 응답에 노출하지 않고 debug_ref로 추적합니다.",
         evidence_refs=["failure:unknown"],
     )
+
+
+def _require_analysis_envelope(value: object) -> APIEnvelope:
+    """Accept only a non-empty, schema-valid terminal result from a runner.
+
+    ``AnalysisRunner`` is a typing protocol, not a runtime boundary.  A runner can
+    therefore return an empty mapping or ``None`` after an upstream empty response.
+    Validate it before `complete_job` so an AttributeError cannot strand the job in
+    RUNNING or let a caller reuse a prior successful payload.
+    """
+
+    if value is None or (isinstance(value, Mapping) and not value):
+        raise EmptyAnalysisResultError("analysis runner returned no result envelope")
+    if isinstance(value, APIEnvelope):
+        return value
+    return APIEnvelope.model_validate(value)
 
 
 def _exception_chain(exc: Exception) -> tuple[BaseException, ...]:
