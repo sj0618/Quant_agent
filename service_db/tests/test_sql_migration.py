@@ -12,6 +12,18 @@ SERVICE_DB_ROOT = Path(__file__).resolve().parents[1]
 REPLAY_VERIFIER_PATH = SERVICE_DB_ROOT / "scripts/verify_fixed_migration_replay.py"
 REPLAY_RUNNER_PATH = SERVICE_DB_ROOT / "scripts/run_fixed_migration_replay.py"
 WORKFLOW_PATH = SERVICE_DB_ROOT.parents[0] / ".github/workflows/ai-logging.yml"
+ARCHIVE_MIGRATION = "023_archive_undecodable_analysis_jobs.sql"
+ARCHIVE_TEST_DSN_ENV = "SERVICE_DB_ARCHIVE_TEST_DSN"
+ARCHIVE_TEST_DATABASE = "ai_analysis_job_archive_test"
+
+
+def _normalized(sql_fragment: str) -> str:
+    return " ".join(sql_fragment.split())
+
+
+def _between(sql: str, opening: str, closing: str) -> str:
+    start = sql.index(opening) + len(opening)
+    return sql[start : sql.index(closing, start)]
 
 
 def load_replay_verifier():
@@ -262,6 +274,235 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         self.assertIn("DROP DATABASE IF EXISTS", runner)
         self.assertIn("forced_discard", runner)
         self.assertIn("missing_external_inputs", runner)
+
+
+    def test_archive_migration_moves_undecodable_rows_in_one_statement(self):
+        sql = (SERVICE_DB_ROOT / "migrations" / ARCHIVE_MIGRATION).read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE IF NOT EXISTS app.ai_analysis_job_legacy", sql)
+        # The delete and the insert must be one statement, so a row can never be removed
+        # from the live table without landing in the archive.
+        delete_at = sql.index("DELETE FROM app.ai_analysis_job")
+        insert_at = sql.index("INSERT INTO app.ai_analysis_job_legacy")
+        self.assertLess(sql.index("WITH moved AS ("), delete_at)
+        self.assertLess(delete_at, insert_at)
+        self.assertEqual(sql.count("DELETE FROM"), 1)
+        self.assertNotIn("DROP TABLE", sql.upper())
+        self.assertNotIn("TRUNCATE ", sql.upper())
+        self.assertIn(
+            "VALIDATE CONSTRAINT ai_analysis_job_execution_manifest_v1_check", sql
+        )
+
+    def test_archive_predicate_is_the_exact_negation_of_the_closing_check(self):
+        """A row must not be able to both survive the move and fail the new constraint."""
+
+        sql = (SERVICE_DB_ROOT / "migrations" / ARCHIVE_MIGRATION).read_text(encoding="utf-8")
+        moved = _between(sql, "DELETE FROM app.ai_analysis_job\n    WHERE (", ") IS NOT TRUE")
+        checked = _between(
+            sql,
+            "ADD CONSTRAINT ai_analysis_job_decodable_document_check CHECK ((",
+            ") IS TRUE);",
+        )
+        self.assertEqual(_normalized(moved), _normalized(checked))
+
+    def test_archive_migration_is_null_safe_on_every_json_type_test(self):
+        """`jsonb_typeof` returns NULL for an absent key, and NULL passes a CHECK.
+
+        That is how migration 021's constraint came to accept the manifest-less rows it was
+        written to forbid, and an un-COALESCEd test in the move predicate would likewise
+        leave those rows in place - or, on the performance branch, sweep valid rows out.
+        """
+
+        sql = (SERVICE_DB_ROOT / "migrations" / ARCHIVE_MIGRATION).read_text(encoding="utf-8")
+        for line in sql.splitlines():
+            if "jsonb_typeof" in line and not line.lstrip().startswith("--"):
+                self.assertIn("COALESCE(jsonb_typeof", line, f"un-COALESCEd type test: {line.strip()}")
+        self.assertIn(") IS NOT TRUE", sql)
+        self.assertIn(") IS TRUE);", sql)
+
+    def test_archive_migration_is_registered_everywhere_it_has_to_run(self):
+        verifier = load_replay_verifier()
+        self.assertIn(ARCHIVE_MIGRATION, verifier.FIXED_MIGRATIONS)
+        self.assertIn("ai_analysis_job_legacy", verifier.OWNED_RELATIONS["r"])
+        self.assertIn("ai_analysis_job_decodable_document_check", verifier.OWNED_CONSTRAINTS)
+        self.assertIn("ai_analysis_job_execution_manifest_v1_check", verifier.OWNED_CONSTRAINTS)
+        deploy = (SERVICE_DB_ROOT.parents[0] / ".github/workflows/deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(ARCHIVE_MIGRATION, deploy)
+
+
+@unittest.skipUnless(
+    os.getenv(ARCHIVE_TEST_DSN_ENV), f"{ARCHIVE_TEST_DSN_ENV} is not configured"
+)
+class AnalysisJobArchiveMigrationTests(unittest.TestCase):
+    """Replay 023 against a real server; string assertions cannot see three-valued logic."""
+
+    MANIFEST = json.dumps(
+        {
+            "schema_version": "1",
+            "contract_hash": "0" * 64,
+            "run_identity": {"incarnation": "x"},
+            "policy_hashes": {"p": "h"},
+            "session": {},
+            "capabilities": {},
+            "events": {
+                "signals": [], "orders": [], "fills": [],
+                "positions": [], "trades": [], "equity": [],
+            },
+        }
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        import psycopg
+
+        cls.psycopg = psycopg
+        admin = os.environ[ARCHIVE_TEST_DSN_ENV]
+        with psycopg.connect(admin, autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{ARCHIVE_TEST_DATABASE}"')
+            conn.execute(f'CREATE DATABASE "{ARCHIVE_TEST_DATABASE}"')
+        cls.dsn = admin.rsplit("/", 1)[0] + "/" + ARCHIVE_TEST_DATABASE
+
+    @classmethod
+    def tearDownClass(cls):
+        with cls.psycopg.connect(os.environ[ARCHIVE_TEST_DSN_ENV], autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{ARCHIVE_TEST_DATABASE}"')
+
+    def _migration(self, name):
+        return (SERVICE_DB_ROOT / "migrations" / name).read_text(encoding="utf-8")
+
+    def _seeded_connection(self, conn):
+        # Each test replays onto a clean schema, the way the fixed replay resets between passes.
+        conn.execute("DROP SCHEMA IF EXISTS app CASCADE")
+        conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        for path in sorted((SERVICE_DB_ROOT / "migrations").glob("*.sql")):
+            if path.name != ARCHIVE_MIGRATION:
+                conn.execute(path.read_text(encoding="utf-8"))
+        # These rows predate 021, so seed them with its constraint absent and then re-apply
+        # 021, whose ADD CONSTRAINT ... NOT VALID grandfathers them exactly as production does.
+        conn.execute(
+            "ALTER TABLE app.ai_analysis_job"
+            " DROP CONSTRAINT ai_analysis_job_execution_manifest_v1_check"
+        )
+        for job_id, document in self._fixtures().items():
+            conn.execute(
+                "INSERT INTO app.ai_analysis_job (job_id, user_id, job_jsonb, created_at, updated_at)"
+                " VALUES (%s, 'u', %s::jsonb, now(), now())",
+                (job_id, document),
+            )
+        conn.execute(self._migration("021_ai_analysis_jobs.sql"))
+
+    def _fixtures(self):
+        manifest = json.loads(self.MANIFEST)
+        no_equity = json.loads(self.MANIFEST)
+        del no_equity["events"]["equity"]
+        empty_policy = json.loads(self.MANIFEST)
+        empty_policy["policy_hashes"] = {}
+        return {
+            # Decodable: performance may be absent, JSON null, or either union member.
+            "keep_no_result": json.dumps({"execution_manifest": manifest}),
+            "keep_no_performance": json.dumps(
+                {"execution_manifest": manifest, "result": {"summary": "s"}}
+            ),
+            "keep_null_performance": json.dumps(
+                {"execution_manifest": manifest, "result": {"performance": None}}
+            ),
+            "keep_available": json.dumps(
+                {
+                    "execution_manifest": manifest,
+                    "result": {"performance": {"availability": "available"}},
+                }
+            ),
+            "keep_unavailable": json.dumps(
+                {
+                    "execution_manifest": manifest,
+                    "result": {"performance": {"availability": "unavailable"}},
+                }
+            ),
+            # Undecodable, one per way a legacy document falls short.
+            "drop_no_manifest": json.dumps({"status": "completed"}),
+            "drop_partial_manifest": json.dumps({"execution_manifest": no_equity}),
+            "drop_empty_policy_hashes": json.dumps({"execution_manifest": empty_policy}),
+            "drop_no_availability": json.dumps(
+                {"execution_manifest": manifest, "result": {"performance": {"x": 1}}}
+            ),
+            "drop_bad_availability": json.dumps(
+                {
+                    "execution_manifest": manifest,
+                    "result": {"performance": {"availability": "maybe"}},
+                }
+            ),
+        }
+
+    def test_archive_keeps_decodable_rows_and_collects_every_legacy_shape(self):
+        with self.psycopg.connect(self.dsn, autocommit=True) as conn:
+            self._seeded_connection(conn)
+            conn.execute(self._migration(ARCHIVE_MIGRATION))
+
+            live = {row[0] for row in conn.execute("SELECT job_id FROM app.ai_analysis_job")}
+            archived = dict(
+                conn.execute("SELECT job_id, archive_reason FROM app.ai_analysis_job_legacy")
+            )
+
+        expected_live = {name for name in self._fixtures() if name.startswith("keep_")}
+        self.assertEqual(live, expected_live)
+        self.assertEqual(
+            set(archived), {name for name in self._fixtures() if name.startswith("drop_")}
+        )
+        self.assertEqual(archived["drop_no_manifest"], "missing_execution_manifest")
+        self.assertEqual(archived["drop_no_availability"], "missing_performance_availability")
+        self.assertEqual(archived["drop_bad_availability"], "missing_performance_availability")
+        self.assertEqual(archived["drop_partial_manifest"], "incomplete_execution_manifest")
+        self.assertEqual(archived["drop_empty_policy_hashes"], "incomplete_execution_manifest")
+
+    def test_archive_ends_the_grandfathering_and_closes_the_table(self):
+        with self.psycopg.connect(self.dsn, autocommit=True) as conn:
+            self._seeded_connection(conn)
+            conn.execute(self._migration(ARCHIVE_MIGRATION))
+
+            validated = dict(
+                conn.execute(
+                    "SELECT conname, convalidated FROM pg_constraint"
+                    " WHERE conrelid = 'app.ai_analysis_job'::regclass AND contype = 'c'"
+                )
+            )
+            self.assertTrue(validated["ai_analysis_job_execution_manifest_v1_check"])
+            self.assertTrue(validated["ai_analysis_job_decodable_document_check"])
+
+            # The shapes 021 admitted must now be refused outright.
+            for document in (
+                '{"job_id": "probe"}',
+                json.dumps(
+                    {
+                        "execution_manifest": json.loads(self.MANIFEST),
+                        "result": {"performance": {"x": 1}},
+                    }
+                ),
+            ):
+                with self.assertRaises(self.psycopg.errors.CheckViolation):
+                    conn.execute(
+                        "INSERT INTO app.ai_analysis_job"
+                        " (job_id, user_id, job_jsonb, created_at, updated_at)"
+                        " VALUES ('probe', 'u', %s::jsonb, now(), now())",
+                        (document,),
+                    )
+
+    def test_archive_migration_is_idempotent(self):
+        with self.psycopg.connect(self.dsn, autocommit=True) as conn:
+            self._seeded_connection(conn)
+            conn.execute(self._migration(ARCHIVE_MIGRATION))
+            first = conn.execute(
+                "SELECT (SELECT count(*) FROM app.ai_analysis_job),"
+                " (SELECT count(*) FROM app.ai_analysis_job_legacy)"
+            ).fetchone()
+            conn.execute(self._migration(ARCHIVE_MIGRATION))
+            second = conn.execute(
+                "SELECT (SELECT count(*) FROM app.ai_analysis_job),"
+                " (SELECT count(*) FROM app.ai_analysis_job_legacy)"
+            ).fetchone()
+        self.assertEqual(first, second)
+
+
 
 if __name__ == "__main__":
     unittest.main()

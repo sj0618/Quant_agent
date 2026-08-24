@@ -64,6 +64,9 @@ jobs:
     env:
       AI_PROMPT_RETENTION_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5434/ai_prompt_retention_test_ci
       SERVICE_DB_REPLAY_DSN: postgresql://postgres:postgres@127.0.0.1:5433/p0_replay_disposable?application_name=disposable
+      # Admin DSN for the 023 archive replay; the test creates and drops its own
+      # scratch database so it never touches the disposable replay database.
+      SERVICE_DB_ARCHIVE_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5433/postgres
       SERVICE_DB_REPLAY_EXPECTED_HOST: 127.0.0.1
       SERVICE_DB_REPLAY_EXPECTED_PORT: "5433"
       SERVICE_DB_REPLAY_EXPECTED_USER: postgres

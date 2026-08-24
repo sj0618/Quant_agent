@@ -88,6 +88,20 @@ AUTH_ENABLED=0 AI_LLM_PROVIDER=mock AI_JOB_STORE=memory AI_AUDIT_SINK=noop ~/.ve
 위 네 env는 `ai/tests` 전용이다. `backend/tests`에 같이 넘기면 프로덕션 보안 설정을 검증하는
 테스트가 완화된 값을 읽고 실패하므로, 백엔드 테스트는 env 없이 돌린다.
 
+### SQL 마이그레이션 테스트
+
+`service_db/tests/test_sql_migration.py`의 대부분은 마이그레이션 파일을 읽는 정적 검사지만,
+`023_archive_undecodable_analysis_jobs.sql`은 실제 PostgreSQL에 적용해야만 검증된다. SQL의
+3값 논리(`jsonb_typeof`는 없는 키에 NULL을 돌려주고, CHECK와 `NOT`은 둘 다 NULL을 통과시킨다)는
+문자열 단언으로 볼 수 없기 때문이다. DSN이 없으면 해당 테스트는 조용히 skip되므로, 이 파일을
+건드렸다면 DSN을 주고 돌린다.
+
+```bash
+SERVICE_DB_ARCHIVE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgres ~/.venvs/quantagent/bin/python -m unittest service_db/tests/test_sql_migration.py
+```
+
+테스트는 지정한 서버에 자기 전용 데이터베이스를 만들고 끝나면 지운다. 관리용 DSN을 준다.
+
 ### 로컬에서 끝나지 않는 것
 
 이 애플리케이션은 배포 서버에서 실행된다. 로컬에서 띄워 눌러보는 것은 실사용 검증이 아니다.

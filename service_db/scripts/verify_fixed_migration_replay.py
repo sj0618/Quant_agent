@@ -31,6 +31,7 @@ FIXED_MIGRATIONS = (
     "020_ai_account_tokens.sql",
     "021_ai_analysis_jobs.sql",
     "022_immutable_analysis_results.sql",
+    "023_archive_undecodable_analysis_jobs.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 PG17_MIN_VERSION_NUM = 170000
@@ -58,7 +59,8 @@ OWNED_RELATIONS = {
         "strategy_email_report_candidate", "email_digest_subscription",
         "email_delivery_history", "ai_backtest_request",
         "ai_backtest_replacement_approval", "email_delivery_outbox",
-        "ai_account_token", "ai_analysis_job", "analysis_result",
+        "ai_account_token", "ai_analysis_job", "ai_analysis_job_legacy",
+        "analysis_result",
     ),
     "i": (
         "idx_users_email", "idx_users_provider_user_id", "idx_strategy_user_created",
@@ -149,6 +151,8 @@ OWNED_CONSTRAINTS = (
     "fk_backtest_run_analysis_result",
     "fk_ai_backtest_report_analysis_result",
     "fk_strategy_email_report_analysis_result",
+    "ai_analysis_job_execution_manifest_v1_check",
+    "ai_analysis_job_decodable_document_check",
 )
 OWNED_TRIGGERS = (
     "trg_email_digest_subscription_limit",
