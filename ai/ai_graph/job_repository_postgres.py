@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -9,6 +10,8 @@ from psycopg.types.json import Jsonb
 
 from ai_graph.jobs import AnalysisJob, AnalysisJobStatus, InMemoryAnalysisJobStore
 from ai_graph.schemas import APIEnvelope, Stage
+
+_logger = logging.getLogger(__name__)
 
 
 def _job_document(job: AnalysisJob) -> dict[str, Any]:
@@ -137,7 +140,45 @@ class PostgresAnalysisJobRepository:
                 """,
                 (limit,),
             ).fetchall()
-        return [AnalysisJob.model_validate(row["job_jsonb"]) for row in rows]
+        return self._decode_rows(rows)
+
+    def _decode_rows(self, rows: Sequence[Any]) -> list[AnalysisJob]:
+        """Decode what this table can still be read as, and say what it cannot.
+
+        Fields have been added to the job document without a backfill - `execution_manifest`,
+        and the `availability` tag the public performance union now discriminates on - so
+        rows written by an older build no longer validate. One such row used to take down
+        the whole call: `GET /analysis-jobs` returned 500 for any user whose history
+        contained one, and once startup began reconciling interrupted jobs it stopped the
+        deploy outright.
+
+        A list that is already limit-truncated is the wrong place to be all-or-nothing, so
+        undecodable rows are dropped from the result. They are not dropped quietly: each is
+        logged with its job id, because a row that cannot be decoded is also a row the
+        restart reaper cannot transition, and one stuck in `running` will spin forever
+        until someone acts on it.
+        """
+
+        decoded: list[AnalysisJob] = []
+        undecodable: list[str] = []
+        for row in rows:
+            document = row["job_jsonb"]
+            try:
+                decoded.append(AnalysisJob.model_validate(document))
+            except Exception:
+                job_id = "unknown"
+                if isinstance(document, dict):
+                    job_id = str(document.get("job_id") or "unknown")
+                    status = str(document.get("status") or "unknown")
+                    job_id = f"{job_id}(status={status})"
+                undecodable.append(job_id)
+        if undecodable:
+            _logger.warning(
+                "skipped %d analysis job row(s) written by an older build: %s",
+                len(undecodable),
+                ", ".join(undecodable),
+            )
+        return decoded
 
     def _connect(self):
         return self._connector(
