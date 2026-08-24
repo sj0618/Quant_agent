@@ -481,8 +481,8 @@ def _build_public_metric_details(
 
     public_availability = summary.get("public_metric_availability")
     availability = {
-        **_undefined_metric_availability(_summary_warning_list(summary)),
         **(public_availability if isinstance(public_availability, Mapping) else {}),
+        **_undefined_metric_availability(_summary_warning_list(summary)),
     }
     if reliability.status == "insufficient":
         unavailable_reason = _UNAVAILABLE_METRIC_REASON
