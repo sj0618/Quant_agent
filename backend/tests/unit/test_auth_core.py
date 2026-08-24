@@ -41,6 +41,18 @@ class FakeRedis:
     async def get(self, key):
         return self.values.get(key)
 
+    async def incr(self, key):
+        value = int(self.values.get(key, "0")) + 1
+        self.values[key] = str(value)
+        return value
+
+    async def eval(self, _script, key_count, key, ttl_seconds):
+        assert key_count == 1
+        value = await self.incr(key)
+        if value == 1:
+            await self.expire(key, int(ttl_seconds))
+        return value
+
     async def delete(self, *keys):
         for key in keys:
             self.values.pop(key, None)
@@ -215,6 +227,31 @@ async def test_session_store_oauth_state_round_trips_json_flow_metadata():
         "flow_mode": "json",
         "transaction_token_hash": "transaction-hash",
     }
+
+
+@pytest.mark.asyncio
+async def test_login_rate_limit_lua_failure_does_not_leave_a_permanent_counter():
+    marker = "rate-limit-password-marker"
+
+    class ExpiryFailingRedis(FakeRedis):
+        async def eval(self, script, key_count, key, _ttl_seconds):
+            assert key_count == 1
+            assert "redis.pcall('EXPIRE'" in script
+            assert "redis.call('DEL', KEYS[1])" in script
+            await self.incr(key)
+            await self.delete(key)
+            raise RuntimeError(f"expiry failed password={marker}")
+
+    redis = ExpiryFailingRedis()
+    store = AuthSessionStore(redis, valid_settings())
+
+    with pytest.raises(AppError) as rejected:
+        await store.enforce_login_rate_limit("198.51.100.11")
+
+    assert rejected.value.status_code == 503
+    assert rejected.value.code == "redis_write_failed"
+    assert marker not in str(rejected.value.details)
+    assert store.login_rate_limit_key("198.51.100.11") not in redis.values
 
 
 @pytest.mark.asyncio

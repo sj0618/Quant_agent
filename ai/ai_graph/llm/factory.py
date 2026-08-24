@@ -4,6 +4,7 @@ import atexit
 import os
 from collections.abc import Mapping
 from threading import Lock
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -16,7 +17,6 @@ from ai_graph.llm.aoai import (
 from ai_graph.llm.base import LLMClient, LLMProviderConfigError
 from ai_graph.llm.mock import MockLLMClient
 
-
 AI_LLM_PROVIDER_ENV = "AI_LLM_PROVIDER"
 AI_AOAI_RESPONSES_URL_ENV = "AI_AOAI_RESPONSES_URL"
 AI_AOAI_API_KEY_ENV = "AI_AOAI_API_KEY"
@@ -28,6 +28,15 @@ AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV = "AI_AOAI_WEB_SEARCH_TOOL_TYPE"
 
 LLM_PROVIDER_MOCK = "mock"
 LLM_PROVIDER_AOAI = "aoai"
+_AOAI_ROLE_OVERRIDE_SUFFIXES = (
+    "RESPONSES_URL",
+    "API_KEY",
+    "MODEL",
+    "TIMEOUT_SECONDS",
+    "MAX_RETRIES",
+    "RETRY_BACKOFF_SECONDS",
+    "WEB_SEARCH_TOOL_TYPE",
+)
 _shared_http_client_lock = Lock()
 _shared_http_client: httpx.Client | None = None
 
@@ -69,6 +78,87 @@ def create_llm_client(
 def is_live_llm_provider(environ: Mapping[str, str] | None = None) -> bool:
     env = os.environ if environ is None else environ
     return env.get(AI_LLM_PROVIDER_ENV, LLM_PROVIDER_MOCK).strip().lower() == LLM_PROVIDER_AOAI
+
+
+def live_provider_configuration_ready(
+    environ: Mapping[str, str] | None = None,
+    *,
+    role: str | None = None,
+) -> tuple[bool, str | None]:
+    """Check whether live AOAI provider config is usable without issuing requests.
+
+    When *role* is omitted, validate both the global AOAI configuration and any
+    role-scoped AOAI overrides present in the environment so a broken override cannot
+    make readiness report a misleading green state.
+    """
+
+    env = os.environ if environ is None else environ
+    provider = env.get(AI_LLM_PROVIDER_ENV, LLM_PROVIDER_MOCK).strip().lower()
+    if provider != LLM_PROVIDER_AOAI:
+        return False, "live_provider_required"
+
+    if not _live_provider_configuration_ready_for_role(env, role=None):
+        return False, "provider_config_invalid"
+    if role is not None:
+        role_ready = _live_provider_configuration_ready_for_role(env, role)
+        return role_ready, None if role_ready else "provider_config_invalid"
+
+    for configured_role in _configured_aoai_roles(env):
+        if not _live_provider_configuration_ready_for_role(env, configured_role):
+            return False, "provider_config_invalid"
+    return True, None
+
+
+def _live_provider_configuration_ready_for_role(
+    env: Mapping[str, str],
+    role: str | None,
+) -> bool:
+    try:
+        responses_url = _role_or_global_env(env, role, "RESPONSES_URL", AI_AOAI_RESPONSES_URL_ENV)
+        parsed = urlsplit(responses_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+
+        _role_or_global_env(env, role, "API_KEY", AI_AOAI_API_KEY_ENV)
+        _role_or_global_env(env, role, "MODEL", AI_AOAI_MODEL_ENV)
+        _float_env(
+            env,
+            _role_env_name(role, "TIMEOUT_SECONDS"),
+            _float_env(env, AI_AOAI_TIMEOUT_SECONDS_ENV, DEFAULT_TIMEOUT_SECONDS),
+        )
+        _int_env(
+            env,
+            _role_env_name(role, "MAX_RETRIES"),
+            _int_env(env, AI_AOAI_MAX_RETRIES_ENV, DEFAULT_MAX_RETRIES),
+        )
+        _float_env(
+            env,
+            _role_env_name(role, "RETRY_BACKOFF_SECONDS"),
+            _float_env(env, AI_AOAI_RETRY_BACKOFF_SECONDS_ENV, 0.25),
+        )
+        _str_env(
+            env,
+            _role_env_name(role, "WEB_SEARCH_TOOL_TYPE"),
+            _str_env(env, AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV, DEFAULT_WEB_SEARCH_TOOL_TYPE),
+        )
+    except (LLMProviderConfigError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _configured_aoai_roles(env: Mapping[str, str]) -> list[str]:
+    roles: set[str] = set()
+    for key in env:
+        if not key.startswith("AI_LLM_"):
+            continue
+        for suffix in _AOAI_ROLE_OVERRIDE_SUFFIXES:
+            marker = f"_{suffix}"
+            if key.endswith(marker):
+                role = key[len("AI_LLM_") : -len(marker)]
+                if role:
+                    roles.add(role)
+                break
+    return sorted(roles)
 
 
 def _create_aoai_client(

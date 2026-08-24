@@ -327,6 +327,26 @@ _AGGREGATE: dict[str, str] = {
     "last": "_last",
 }
 
+# How far past its threshold a condition sits, signed so positive always means "holds
+# with room to spare". Shared with the structured evaluator so both readings of the
+# same rule agree on which of two names has the stronger entry. Operators absent here
+# (eq, ne, between) either hold or do not; there is no "more satisfied".
+MARGIN_SIGN: dict[ConditionOperator, float] = {
+    ConditionOperator.GT: 1.0,
+    ConditionOperator.GTE: 1.0,
+    ConditionOperator.CROSS_ABOVE: 1.0,
+    ConditionOperator.LT: -1.0,
+    ConditionOperator.LTE: -1.0,
+    ConditionOperator.CROSS_BELOW: -1.0,
+}
+# Zero thresholds would otherwise divide the margin by nothing.
+MARGIN_EPSILON = 1e-9
+# Raw levels off the bar. How far one of these sits past a fixed number is a fact about
+# the size of the company, not about the strength of its signal, so those conditions
+# contribute no margin. Compared against another series - a moving average, a prior
+# high - the same metric yields a scale-free ratio and does count.
+LEVEL_METRICS = frozenset({"open", "high", "low", "close", "price", "volume"})
+
 
 class CompiledConditions:
     """A strategy's entry rule split into the two kinds build_signals evaluates.
@@ -397,6 +417,57 @@ def _rank_filter(condition: Condition) -> tuple[str, float, bool] | None:
     # gt/gte -> want the top of the distribution; lt/lte -> the bottom.
     top = condition.operator in {ConditionOperator.GT, ConditionOperator.GTE}
     return (metric, float(condition.universe_rank_pct), top)
+
+
+def compile_score_expression(conditions: Sequence[Condition]) -> str | None:
+    """Entry strength for a rule that declares no ranking metric, or None.
+
+    The rule's own thresholds are the only stated measure of strength, so the score is
+    how far inside its entry region a name sits, on the tightest condition that has a
+    distance at all, normalized by the threshold so conditions on different scales stay
+    comparable. Cross-sectional cuts are excluded here: build_signals ranks on those
+    directly, the same order of preference the structured evaluator applies.
+    """
+
+    margins = [
+        expression
+        for condition in conditions
+        if (expression := _margin_expression(condition)) is not None
+    ]
+    if not margins:
+        return None
+    if len(margins) == 1:
+        return margins[0]
+    return f"min({', '.join(margins)})"
+
+
+def _margin_expression(condition: Condition) -> str | None:
+    sign = MARGIN_SIGN.get(condition.operator)
+    if sign is None:
+        return None
+    if condition.universe_rank_pct is not None or condition.consecutive is not None:
+        return None
+    flag = condition.left.strip().lower()
+    if flag in _BOOLEAN_EXPRESSIONS or flag in _BOOLEAN_COMPARISONS:
+        return None
+    if isinstance(condition.right, str):
+        left = _series_value(condition.left, None, None)
+        right = _series_value(condition.right, condition.window, condition.aggregate)
+    elif isinstance(condition.right, (int, float)):
+        if canonical_metric(condition.left) in LEVEL_METRICS:
+            return None
+        left = _series_value(condition.left, condition.window, condition.aggregate)
+        scale = _PERCENT_SCALED.get(condition.left.strip().lower())
+        right = repr(float(condition.right) * (scale[1] if scale else 1.0))
+    else:
+        return None
+    if left is None or right is None:
+        return None
+    if condition.scale is not None:
+        right = f"({right} * {float(condition.scale)!r})"
+    return (
+        f"({sign!r} * (({left}) - ({right})) / max(abs({right}), {MARGIN_EPSILON!r}))"
+    )
 
 
 def compile_entry_expression(conditions: Sequence[Condition]) -> str | None:

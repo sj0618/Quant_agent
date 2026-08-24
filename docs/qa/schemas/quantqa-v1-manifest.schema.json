@@ -1,0 +1,654 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "quantqa-v1-manifest.schema.json",
+  "title": "QuantQA:v1 WBS QA manifest (DRAFT FOR REVIEW)",
+  "description": "Canonical draft JSON manifest for QA-WBS-01. Approval is pending.",
+  "$comment": "Role inequality, URI retrievability, artifact hash verification, required-class-to-evidence SHA equality, and manifest/report agreement require reviewer or validator checks outside JSON Schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "document_status",
+    "approval",
+    "wbs_id",
+    "quantqa_version",
+    "full_git_sha",
+    "required_tier",
+    "required_classes",
+    "status",
+    "requirement_origin",
+    "wbs_contract_ref",
+    "roles",
+    "execution_boundary",
+    "observed_classes",
+    "evidence",
+    "limitations",
+    "blockers"
+  ],
+  "properties": {
+    "document_status": {
+      "const": "DRAFT FOR REVIEW"
+    },
+    "approval": {
+      "const": "PENDING"
+    },
+    "wbs_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "quantqa_version": {
+      "const": "QuantQA:v1"
+    },
+    "full_git_sha": {
+      "description": "The evaluated 40-character Git SHA. Null until a same-revision run is identified.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "required_tier": {
+      "enum": ["T1", "T2", "T3", "T4"]
+    },
+    "required_classes": {
+      "$ref": "#/$defs/classSet"
+    },
+    "observed_classes": {
+      "$ref": "#/$defs/classSetOrEmpty"
+    },
+    "status": {
+      "$ref": "#/$defs/status"
+    },
+    "requirement_origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_classes", "tier_label"],
+      "properties": {
+        "required_classes": {
+          "enum": [
+            "GOOGLE_SHEET_DIRECT",
+            "QUANTQA_V1_IMPLEMENTATION_DEFINITION"
+          ]
+        },
+        "tier_label": {
+          "const": "QUANTQA_V1_IMPLEMENTATION_DEFINITION"
+        }
+      }
+    },
+    "wbs_contract_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "spreadsheet_id",
+        "gid",
+        "sheet",
+        "wbs_id",
+        "row_number",
+        "observed_at"
+      ],
+      "properties": {
+        "spreadsheet_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sheet": {
+          "type": "string",
+          "minLength": 1
+        },
+        "wbs_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "row_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner",
+        "executor",
+        "reviewer",
+        "approver",
+        "reviewer_approver_same_allowed_v1"
+      ],
+      "properties": {
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "executor": {
+          "type": ["string", "null"]
+        },
+        "reviewer": {
+          "type": ["string", "null"]
+        },
+        "approver": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewer_approver_same_allowed_v1": {
+          "const": true
+        }
+      }
+    },
+    "execution_boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "uses_mock",
+        "uses_memory",
+        "uses_noop",
+        "configuration_environment_values_recorded",
+        "secret_values_recorded",
+        "production_node3_pve_load_performed",
+        "effective_classes"
+      ],
+      "properties": {
+        "scope": {
+          "enum": [
+            "NOT_EXECUTED",
+            "LOCAL",
+            "CI",
+            "ISOLATED_STAGING",
+            "DEPLOYED_READ_ONLY"
+          ]
+        },
+        "uses_mock": {
+          "type": ["boolean", "null"]
+        },
+        "uses_memory": {
+          "type": ["boolean", "null"]
+        },
+        "uses_noop": {
+          "type": ["boolean", "null"]
+        },
+        "configuration_environment_values_recorded": {
+          "const": false
+        },
+        "secret_values_recorded": {
+          "const": false
+        },
+        "production_node3_pve_load_performed": {
+          "const": false
+        },
+        "effective_classes": {
+          "$ref": "#/$defs/classSetOrEmpty"
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidenceItem"
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "class": {
+      "enum": ["S", "R", "O", "C"]
+    },
+    "classSet": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/class"
+      }
+    },
+    "classSetOrEmpty": {
+      "type": "array",
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/class"
+      }
+    },
+    "status": {
+      "enum": ["PASS", "FAIL", "BLOCKED", "UNVERIFIED"]
+    },
+    "nullableActor": {
+      "type": ["string", "null"]
+    },
+    "nullableSha": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullableSha256": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidenceItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id",
+        "evidence_class",
+        "scenario",
+        "pass_criteria",
+        "actual_result",
+        "validation_method",
+        "uses_mock",
+        "uses_memory",
+        "uses_noop",
+        "exit_code",
+        "evidence_uri",
+        "artifact_sha256",
+        "artifact_subject_sha",
+        "executor",
+        "reviewer",
+        "executed_at",
+        "status",
+        "limitations"
+      ],
+      "properties": {
+        "evidence_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_class": {
+          "$ref": "#/$defs/class"
+        },
+        "scenario": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pass_criteria": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actual_result": {
+          "type": "string",
+          "minLength": 1
+        },
+        "validation_method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "uses_mock": {
+          "type": ["boolean", "null"]
+        },
+        "uses_memory": {
+          "type": ["boolean", "null"]
+        },
+        "uses_noop": {
+          "type": ["boolean", "null"]
+        },
+        "exit_code": {
+          "type": ["integer", "null"]
+        },
+        "evidence_uri": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "uri",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_sha256": {
+          "$ref": "#/$defs/nullableSha256"
+        },
+        "artifact_subject_sha": {
+          "$ref": "#/$defs/nullableSha"
+        },
+        "executor": {
+          "$ref": "#/$defs/nullableActor"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/nullableActor"
+        },
+        "executed_at": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": { "uses_mock": { "const": true } },
+                "required": ["uses_mock"]
+              },
+              {
+                "properties": { "uses_memory": { "const": true } },
+                "required": ["uses_memory"]
+              },
+              {
+                "properties": { "uses_noop": { "const": true } },
+                "required": ["uses_noop"]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence_class": { "const": "S" }
+            }
+          }
+        }
+      ]
+    },
+    "passEvidenceS": {
+      "contains": {
+        "properties": {
+          "evidence_class": { "const": "S" },
+          "status": { "const": "PASS" }
+        },
+        "required": ["evidence_class", "status"]
+      },
+      "minContains": 1
+    },
+    "passEvidenceR": {
+      "contains": {
+        "properties": {
+          "evidence_class": { "const": "R" },
+          "status": { "const": "PASS" }
+        },
+        "required": ["evidence_class", "status"]
+      },
+      "minContains": 1
+    },
+    "passEvidenceO": {
+      "contains": {
+        "properties": {
+          "evidence_class": { "const": "O" },
+          "status": { "const": "PASS" }
+        },
+        "required": ["evidence_class", "status"]
+      },
+      "minContains": 1
+    },
+    "passEvidenceC": {
+      "contains": {
+        "properties": {
+          "evidence_class": { "const": "C" },
+          "status": { "const": "PASS" }
+        },
+        "required": ["evidence_class", "status"]
+      },
+      "minContains": 1
+    },
+    "passCoverageT1": {
+      "properties": {
+        "evidence": {
+          "allOf": [{ "$ref": "#/$defs/passEvidenceS" }]
+        }
+      }
+    },
+    "passCoverageT2": {
+      "properties": {
+        "evidence": {
+          "allOf": [
+            { "$ref": "#/$defs/passEvidenceS" },
+            { "$ref": "#/$defs/passEvidenceR" }
+          ]
+        }
+      }
+    },
+    "passCoverageT3": {
+      "properties": {
+        "evidence": {
+          "allOf": [
+            { "$ref": "#/$defs/passEvidenceS" },
+            { "$ref": "#/$defs/passEvidenceR" },
+            { "$ref": "#/$defs/passEvidenceO" }
+          ]
+        }
+      }
+    },
+    "passCoverageT4": {
+      "properties": {
+        "evidence": {
+          "allOf": [
+            { "$ref": "#/$defs/passEvidenceS" },
+            { "$ref": "#/$defs/passEvidenceR" },
+            { "$ref": "#/$defs/passEvidenceO" },
+            { "$ref": "#/$defs/passEvidenceC" }
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "required_tier": {
+            "const": "T1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "required_classes": {
+            "const": ["S"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "required_tier": {
+            "const": "T2"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "required_classes": {
+            "const": ["S", "R"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "required_tier": {
+            "const": "T3"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "required_classes": {
+            "const": ["S", "R", "O"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "required_tier": {
+            "const": "T4"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "required_classes": {
+            "const": ["S", "R", "O", "C"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "PASS"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "full_git_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "roles": {
+            "properties": {
+              "executor": {
+                "type": "string",
+                "minLength": 1
+              },
+              "reviewer": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "evidence": {
+            "minItems": 1,
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/evidenceItem"
+                },
+                {
+                  "properties": {
+                    "evidence_uri": {
+                      "type": "string",
+                      "format": "uri",
+                      "minLength": 1
+                    },
+                    "artifact_sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "artifact_subject_sha": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{40}$"
+                    },
+                    "executor": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "reviewer": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "executed_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "status": {
+                      "const": "PASS"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": { "const": "PASS" },
+          "required_tier": { "const": "T1" }
+        },
+        "required": ["status", "required_tier"]
+      },
+      "then": { "$ref": "#/$defs/passCoverageT1" }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": { "const": "PASS" },
+          "required_tier": { "const": "T2" }
+        },
+        "required": ["status", "required_tier"]
+      },
+      "then": { "$ref": "#/$defs/passCoverageT2" }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": { "const": "PASS" },
+          "required_tier": { "const": "T3" }
+        },
+        "required": ["status", "required_tier"]
+      },
+      "then": { "$ref": "#/$defs/passCoverageT3" }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": { "const": "PASS" },
+          "required_tier": { "const": "T4" }
+        },
+        "required": ["status", "required_tier"]
+      },
+      "then": { "$ref": "#/$defs/passCoverageT4" }
+    }
+  ]
+}

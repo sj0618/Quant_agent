@@ -6,10 +6,9 @@ provided by the runtime environment, Airflow Connections, or a secret backend.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import date, timedelta
-import os
-
 
 DEFAULT_KRX_DAILY_MARKET_ENDPOINTS = (
     "https://data-dbg.krx.co.kr/svc/apis/sto/stk_bydd_trd",
@@ -93,6 +92,12 @@ def _env_int(name: str, default: int) -> int:
 class RetryConfig:
     attempts: int = DEFAULT_RETRY_ATTEMPTS
     backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS
+
+    def __post_init__(self) -> None:
+        if self.attempts < 1:
+            raise ValueError("retry attempts must be >= 1.")
+        if self.backoff_seconds < 0:
+            raise ValueError("retry backoff_seconds must be >= 0.")
 
     @classmethod
     def from_env(cls) -> "RetryConfig":

@@ -36,6 +36,7 @@ from ai_graph.schemas import (
 from ai_graph.nodes.condition_compiler import (
     CompiledConditions,
     compile_conditions,
+    compile_score_expression,
     indicator_row_keys,
 )
 from ai_graph.quant_strategy import (
@@ -1050,6 +1051,10 @@ def _render_condition_signal_code(
     stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", 0.08))
     take_profit = float(strategy.risk_constraints.get("take_profit_pct", 0.2))
     entry_expr = compiled.per_stock
+    # How far past its thresholds a name sits, used to order same-day entries when more
+    # of them qualify than there are slots. "0.0" leaves every entry tied, which the
+    # sort below resolves by ticker code, the old behaviour.
+    score_expr = compile_score_expression(strategy.entry_conditions) or "0.0"
     # (metric, pct, top) triples, evaluated against the day's universe below.
     rank_filters = list(compiled.rank_filters)
     # Bars the widest condition needs before it evaluates to what it claims.
@@ -1118,11 +1123,21 @@ def _render_condition_signal_code(
             # against a one-day high, and matched.
             ready = len(closes) >= warmup_bars
             entry_ok = False
+            entry_score = 0.0
             if ready:
                 try:
                     entry_ok = bool({entry_expr})
                 except (ValueError, ZeroDivisionError, IndexError):
                     entry_ok = False
+                if entry_ok:
+                    try:
+                        entry_score = float({score_expr})
+                    except (ValueError, ZeroDivisionError, IndexError):
+                        entry_score = 0.0
+                    # NaN and the _fin() sentinel both fall outside this band; neither is
+                    # a strength, so they rank as untested rather than as best or worst.
+                    if not -1e18 < entry_score < 1e18:
+                        entry_score = 0.0
             if state["in_position"]:
                 entry_price = state["entry_price"]
                 gain = (close / entry_price - 1) if entry_price else 0.0
@@ -1131,7 +1146,7 @@ def _render_condition_signal_code(
                     state["in_position"] = False
                     state["entry_price"] = 0.0
             elif entry_ok:
-                entries.append((ticker, close))
+                entries.append((ticker, close, entry_score))
             # The percentile cut ranks the whole day's universe, not just today's
             # candidates - otherwise buying the leaders shrinks the pool and lets the
             # next names drift into the "top". Collect every stock's metric here.
@@ -1144,6 +1159,10 @@ def _render_condition_signal_code(
             lows.append(low_price)
             closes.append(close)
             volumes.append(volume)
+        # A cross-sectional cut already states what "better" means on this universe, so
+        # the first one outranks the per-stock margins as the entry score.
+        rank_scores = dict(universe_metrics.get(rank_filters[0][0], [])) if rank_filters else {{}}
+        rank_sign = 1.0 if (rank_filters and rank_filters[0][2]) else -1.0
         # Cross-sectional cuts against the full universe: keep only candidates inside the
         # requested top/bottom percentile of that day's ranking on each metric.
         for metric, pct, top in rank_filters:
@@ -1154,12 +1173,19 @@ def _render_condition_signal_code(
             scored.sort(key=lambda item: item[1], reverse=top)
             cutoff = max(1, int(len(scored) * pct))
             kept = {{t for t, _v in scored[:cutoff]}}
-            entries = [e for e in entries if e[0] in kept]
+            entries = [
+                (t, p, rank_sign * rank_scores[t] if t in rank_scores else s)
+                for t, p, s in entries
+                if t in kept
+            ]
+        # Signal strength decides who gets a scarce slot; the ticker code only breaks
+        # ties. Sorting by the code first hands every slot to the lowest codes listed.
+        entries.sort(key=lambda item: (-item[2], item[0]))
         held = sum(1 for s in states.values() if s["in_position"])
-        for ticker, price in entries:
+        for ticker, price, entry_score in entries:
             if held >= max_positions:
                 break
-            signals.append({{"date": current_date, "ticker": ticker, "action": "BUY", "price": price}})
+            signals.append({{"date": current_date, "ticker": ticker, "action": "BUY", "price": price, "score": entry_score}})
             states[ticker]["in_position"] = True
             states[ticker]["entry_price"] = price
             held += 1
@@ -1446,23 +1472,26 @@ def _render_adaptive_signal_code(
         open_positions = sum(1 for state in states.values() if state["in_position"])
         open_slots = max(0, max_positions - open_positions)
         ranked_buys = [item for item in evaluations if item["buy"] and not item["state"]["in_position"]]
-        ranked_buys = sorted(ranked_buys, key=lambda item: (item["score"], item["ticker"]), reverse=True)[:open_slots]
+        # Strongest signal first; the ticker code only breaks ties, ascending.
+        ranked_buys = sorted(ranked_buys, key=lambda item: (-item["score"], item["ticker"]))[:open_slots]
         selected_buys = {{}}
         for item in ranked_buys:
-            selected_buys[item["ticker"]] = True
+            selected_buys[item["ticker"]] = item["score"]
         for item in evaluations:
             ticker = item["ticker"]
             row = item["row"]
             close = item["close"]
             state = item["state"]
+            entry_score = None
             if item["sell"] and state["in_position"]:
                 action = "SELL"
                 state["in_position"] = False
                 state["entry_price"] = 0.0
                 state["days"] = 0
                 state["peak"] = 0.0
-            elif selected_buys.get(ticker, False):
+            elif ticker in selected_buys:
                 action = "BUY"
+                entry_score = selected_buys[ticker]
                 state["in_position"] = True
                 state["entry_price"] = close
                 state["days"] = 0
@@ -1472,7 +1501,7 @@ def _render_adaptive_signal_code(
                 if state["in_position"]:
                     state["days"] += 1
                     state["peak"] = max(state["peak"], close)
-            signals.append({{"date": row["date"], "ticker": ticker, "action": action, "price": close}})
+            signals.append({{"date": row["date"], "ticker": ticker, "action": action, "price": close, "score": entry_score}})
             item["history"]["closes"].append(close)
             item["history"]["volumes"].append(item["volume"])
     return signals

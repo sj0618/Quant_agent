@@ -6,7 +6,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 SCHEMA_VERSION = "ai-mvp.v1"
 
 
@@ -46,6 +45,13 @@ FailureSubcause = Literal[
     # The provider took the request and then did not answer within the client's budget,
     # as opposed to refusing it for capacity (aoai_capacity_exhausted above).
     "aoai_response_timeout",
+    # Provider failures are kept separate from warehouse connection failures so the
+    # operator can distinguish an AOAI incident from a database incident without
+    # exposing provider response bodies to API consumers.
+    "aoai_connection_error",
+    "aoai_http_4xx",
+    "aoai_http_5xx",
+    "aoai_http_error",
     "parser_low_confidence",
     "source_conflict",
     "data_required",
@@ -667,6 +673,55 @@ class ReportBundle(BaseModel):
     risk_adjustments: list[RiskAdjustment] = Field(default_factory=list)
 
 
+class BacktestEvaluationBasis(BaseModel):
+    """Which slice of the history the public performance numbers were measured on.
+
+    A cumulative return with no stated basis is read as "what the strategy made". These
+    figures come from the part of the history selection never saw, and which part that is
+    differs per run - one hold-out tail, or the rolling policy's evaluation sessions. The
+    basis therefore travels with the numbers instead of being restated as a caption each
+    client writes for itself and gets wrong when the run takes the other path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    basis: Literal["hold_out", "walk_forward_policy"]
+    # Ready-to-render sentence built from the fields below, so a client never has to
+    # reconstruct which period the number covers.
+    caption: str = Field(min_length=1)
+    hold_out_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+    window_start: str | None = None
+    window_end: str | None = None
+    window_policy_id: str | None = None
+    evaluation_session_count: int | None = Field(default=None, ge=0)
+    fold_count: int | None = Field(default=None, ge=0)
+    # Only true when the engine summary or the walk-forward fills show costs charged;
+    # "거래비용 반영" is a claim about the run, not a house style.
+    cost_model_applied: bool = False
+
+
+class BacktestUniversePolicy(BaseModel):
+    """How the universe the backtest traded relates to the names shown for today.
+
+    The backtest trades the point-in-time membership of its fixed window; today's screen
+    is the same rule evaluated on today's data. A reader who is never told this reads a
+    recommended name that is absent from the backtest as a defect, and there is no way
+    for them to tell the two lists apart from the numbers alone.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1)
+    policy_id: str | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    traded_ticker_count: int | None = Field(default=None, ge=0)
+    excluded_screening_candidate_count: int = Field(default=0, ge=0)
+    # Present only when at least one of today's candidates fell outside the window's
+    # membership, so an empty exclusion never prints a notice about nothing.
+    excluded_notice: str | None = None
+
+
 class BacktestPerformance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -684,6 +739,8 @@ class BacktestPerformance(BaseModel):
     strategy_explanation: PublicStrategyExplanation | None = None
     is_available: bool = True
     unavailable_reason: str | None = None
+    evaluation_basis: BacktestEvaluationBasis | None = None
+    universe_policy: BacktestUniversePolicy | None = None
 
 
 class InternalPayload(BaseModel):
@@ -710,6 +767,14 @@ class RecommendationGate(BaseModel):
 
     validated: bool
     reason: str = Field(min_length=1)
+    # A strategy that missed a measured threshold and a strategy whose acceptance rule
+    # could not be evaluated at all are two different answers. Collapsing both into
+    # "did not clear the floor" tells a reader their rule underperformed when in fact
+    # nothing was measured, so the two lists stay separate and the second one also
+    # flips verification_complete rather than hiding inside the reason sentence.
+    verification_complete: bool = True
+    unmet_objective_criteria: list[str] = Field(default_factory=list)
+    unmet_data_requirements: list[str] = Field(default_factory=list)
 
 
 class RuleProvenance(BaseModel):

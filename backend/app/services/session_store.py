@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -10,6 +11,23 @@ from app.core.config import Settings, redact_secrets
 from app.core.errors import AppError
 from app.core.runtime_perf import measure_span
 from app.core.security import generate_token_urlsafe
+
+
+_LOGIN_RATE_LIMIT_LUA = """
+local attempts = redis.call('INCR', KEYS[1])
+if attempts == 1 then
+    local expiry = redis.pcall('EXPIRE', KEYS[1], ARGV[1])
+    if type(expiry) == 'table' and expiry.err then
+        redis.call('DEL', KEYS[1])
+        return redis.error_reply('rate-limit expiry failed')
+    end
+    if expiry ~= 1 then
+        redis.call('DEL', KEYS[1])
+        return redis.error_reply('rate-limit expiry failed')
+    end
+end
+return attempts
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +68,12 @@ class AuthSessionStore:
 
     def csrf_key(self, session_id: str) -> str:
         return f"{self.prefix}:csrf:{session_id}"
+
+    def login_rate_limit_key(self, client_identifier: str) -> str:
+        """Return a bounded Redis key without retaining a raw network identifier."""
+
+        identifier_hash = sha256(client_identifier.encode("utf-8")).hexdigest()
+        return f"{self.prefix}:login-rate:{identifier_hash}"
 
     async def store_oauth_state(
         self,
@@ -136,6 +160,63 @@ class AuthSessionStore:
         )
 
         return session_id, csrf_token
+
+    async def rotate_session(
+        self,
+        *,
+        user_id: str,
+        previous_session_id: str | None,
+    ) -> tuple[str, str]:
+        """Issue a new authenticated session and invalidate a supplied old cookie."""
+
+        session_id, csrf_token = await self.create_session(user_id=user_id)
+        if previous_session_id and previous_session_id != session_id:
+            try:
+                await self.revoke_session(previous_session_id)
+            except AppError:
+                try:
+                    await self.revoke_session(session_id)
+                except AppError:
+                    pass
+                raise
+        return session_id, csrf_token
+
+    async def enforce_login_rate_limit(self, client_identifier: str) -> None:
+        """Fail closed when one client exceeds the bounded OAuth-start allowance."""
+
+        key = self.login_rate_limit_key(client_identifier)
+        try:
+            with measure_span("redis"):
+                attempt_count = int(
+                    await self.redis.eval(
+                        _LOGIN_RATE_LIMIT_LUA,
+                        1,
+                        key,
+                        self.settings.auth_login_rate_limit_window_seconds,
+                    )
+                )
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                status_code=503,
+                component="redis",
+                code="redis_write_failed",
+                message="Redis write failed",
+                details={
+                    "error": redact_secrets(
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                },
+            ) from exc
+
+        if attempt_count > self.settings.auth_login_rate_limit_max_attempts:
+            raise AppError(
+                status_code=429,
+                component="auth",
+                code="oauth_start_rate_limited",
+                message="Too many authentication attempts",
+            )
 
     async def get_session_user_id(
         self,

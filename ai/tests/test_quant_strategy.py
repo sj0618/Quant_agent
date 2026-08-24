@@ -25,6 +25,7 @@ from ai_graph.quant_strategy import (
     classify_strategy_request,
     compute_academic_factor_arrays,
     infer_automatic_strategy_preferences,
+    rsi_trade_rules,
 )
 from ai_graph.schemas import CandidateParameters, StrategyIR
 
@@ -71,6 +72,21 @@ def test_concrete_rule_wins_over_automatic_request() -> None:
     assert classify_strategy_request("매수할 종목을 자동 추천해줘") == "automatic"
     assert classify_strategy_request("인기 있는 모멘텀 퀀트 전략을 자동 추천해줘") == "automatic"
     assert classify_strategy_request("시장 상황을 설명해줘") == "standard"
+
+
+def test_inverse_rsi_rule_preserves_explicit_buy_sell_direction() -> None:
+    query = "RSI가 30미만일때 매도 70이상일때 매수하는 전략"
+
+    rules = rsi_trade_rules(query)
+    assert rules.entry_side == "overbought"
+    assert (rules.entry_operator, rules.entry_threshold) == ("gte", 70.0)
+    assert (rules.exit_operator, rules.exit_threshold) == ("lt", 30.0)
+
+    strategy = build_strategy_spec(query, variant="A", semantic_slots={})
+    assert strategy.entry_conditions[0].operator.value == "gte"
+    assert strategy.entry_conditions[0].right == 70
+    assert strategy.exit_conditions[0].operator.value == "lt"
+    assert strategy.exit_conditions[0].right == 30
 
 
 def test_vague_strategy_requests_become_automatic_without_magic_words() -> None:

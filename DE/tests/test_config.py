@@ -1,10 +1,19 @@
 import ast
-from datetime import date
 import os
-from pathlib import Path
 import unittest
+from datetime import date
+from pathlib import Path
 
-from quant_agent.data.config import BokConfig, DartConfig, DatabaseConfig, KisConfig, KrxConfig, PilotConfig, SeibroConfig
+from quant_agent.data.config import (
+    BokConfig,
+    DartConfig,
+    DatabaseConfig,
+    KisConfig,
+    KrxConfig,
+    PilotConfig,
+    RetryConfig,
+    SeibroConfig,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_MODULE = PROJECT_ROOT / "quant_agent" / "data" / "config.py"
@@ -74,6 +83,14 @@ class ConfigTests(unittest.TestCase):
             config = DartConfig.from_env()
         self.assertEqual(config.api_keys, ("fss-1", "fss-2", "fss-3"))
         self.assertEqual(config.api_key, "fss-1")
+
+    def test_retry_config_rejects_non_positive_attempts(self):
+        with self.assertRaises(ValueError):
+            RetryConfig(attempts=0)
+
+    def test_retry_config_rejects_negative_backoff(self):
+        with self.assertRaises(ValueError):
+            RetryConfig(backoff_seconds=-1)
 
 
 class ConfigModuleSecurityTests(unittest.TestCase):

@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "wbsId": "UX-AUTH-02",
+  "verificationSha": "a63fc23d2e3e6380018ba05d67f5ea7daf125962",
+  "executedAt": "2026-08-23T04:52:04.117Z",
+  "scope": "local negative-auth E2E contract",
+  "actualGoogleCredentialUsed": false,
+  "productionVerified": false,
+  "verdict": "PASS",
+  "doneConditions": {
+    "authFailureCode": "PASS",
+    "noDataLeak": "PASS",
+    "retryAction": "PASS"
+  },
+  "browser": {
+    "engine": "system Chrome",
+    "connection": "localhost CDP via bundled Playwright",
+    "isolatedTemporaryProfile": true,
+    "harnessExitCode": 0
+  },
+  "callback": {
+    "requestCount": 1,
+    "method": "POST",
+    "pathname": "/api/v1/auth/google/callback",
+    "status": 401,
+    "applicationCode": "oauth_transaction_invalid"
+  },
+  "dom": {
+    "failureVisualTitleCount": 1,
+    "failureSafeMessageCount": 1,
+    "failureProtectedDataMatchCount": 0,
+    "failureSensitiveMarkerMatchCount": 0,
+    "failureStackTraceMatchCount": 0,
+    "failureInternalInfoMatchCount": 0,
+    "failureLocalStorageEntryCount": 0,
+    "failureSessionStorageEntryCount": 0,
+    "loginProtectedDataMatchCount": 0,
+    "loginSensitiveMarkerMatchCount": 0,
+    "loginStackTraceMatchCount": 0,
+    "loginInternalInfoMatchCount": 0
+  },
+  "cookies": {
+    "authenticatedSessionCookieCountAfterFailure": 0,
+    "authenticatedSessionCookieCountAfterRetry": 0,
+    "authenticatedSessionCookieCountFinal": 0
+  },
+  "console": {
+    "errorCount": 2,
+    "warningCount": 0,
+    "pageErrorCount": 0,
+    "sensitiveMarkerMatchCount": 0
+  },
+  "retry": {
+    "role": "link",
+    "accessibleNameMatchCount": 1,
+    "clickPassed": true,
+    "pathnameAfterClick": "/login",
+    "googleActionRole": "button",
+    "googleActionAccessibleNameMatchCount": 1,
+    "googleActionClickPassed": true
+  },
+  "authStart": {
+    "requestCount": 1,
+    "method": "GET",
+    "pathname": "/api/v1/auth/google/start",
+    "status": 503,
+    "applicationCode": "redis_write_failed",
+    "retryUiPassed": true,
+    "loginNavigationPassed": true,
+    "requestEmissionPassed": true
+  },
+  "externalGoogle": {
+    "interceptedAttemptCount": 0,
+    "transmittedRequestCount": 0
+  },
+  "protectedRouteRequestCount": 0,
+  "network": [
+    {
+      "method": "GET",
+      "pathname": "/auth/google/callback",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "pathname": "/api/v1/auth/google/callback",
+      "status": 401
+    },
+    {
+      "method": "GET",
+      "pathname": "/login",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "pathname": "/api/v1/auth/google/start",
+      "status": 503
+    }
+  ],
+  "screenshots": {
+    "failureSafetyGatePassed": true,
+    "failureCreated": true,
+    "failureFile": "callback-failure.png",
+    "loginSafetyGatePassed": true,
+    "loginCreated": true,
+    "loginFile": "retry-login.png"
+  },
+  "tests": {
+    "fe": {
+      "passed": 34,
+      "failed": 0,
+      "skipped": 0,
+      "typecheck": "PASS",
+      "productionBuild": "PASS",
+      "exitCode": 0
+    },
+    "backendTarget": {
+      "passed": 2,
+      "failed": 0,
+      "warnings": 2,
+      "exitCode": 0
+    }
+  },
+  "nonBlockingObservation": {
+    "failureSemanticHeadingRoleCount": 0,
+    "failureVisualTitleElement": "STRONG"
+  }
+}

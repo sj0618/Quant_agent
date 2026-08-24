@@ -918,3 +918,120 @@ def test_official_tr_benchmark_rejects_missing_monthly_lagged_weight() -> None:
             {"2024-01-02": 100.0, "2024-02-01": 101.0},
             {"2024-01": (0.5, 0.5)},
         )
+
+
+def _contention_rows(rsi_by_ticker: dict[str, float]) -> list[dict[str, object]]:
+    return [
+        {
+            "date": (date(2026, 1, 1) + timedelta(days=day_index)).isoformat(),
+            "ticker": ticker,
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1_000_000.0,
+            "rsi": rsi,
+        }
+        for day_index in range(2)
+        for ticker, rsi in sorted(rsi_by_ticker.items())
+    ]
+
+
+def _contention_ir(entry: Condition) -> StrategyIR:
+    return StrategyIR(
+        strategy_id="slot-contention",
+        entry_feature="rsi",
+        exit_feature="rsi",
+        proxy_feature="rsi",
+        entry_conditions=[entry],
+        exit_conditions=[
+            Condition(left="rsi", operator=ConditionOperator.GTE, right=95.0)
+        ],
+    )
+
+
+def _contention_parameters() -> CandidateParameters:
+    return CandidateParameters(
+        profile="compiled_conditions",
+        lookback=3,
+        threshold=0.0,
+        stop_loss_pct=0.5,
+        take_profit_pct=5.0,
+        max_positions=1,
+    )
+
+
+def _entered_tickers(store: PreparedFeatureStore, ranked) -> list[str]:
+    return [
+        store.tickers[index]
+        for index, action in enumerate(ranked.actions)
+        if action == 1
+    ]
+
+
+def test_compiled_entry_slot_goes_to_the_strongest_signal_not_the_lowest_ticker() -> None:
+    rows = _contention_rows({"000010": 39.0, "000500": 25.0, "000990": 10.0})
+    store = PreparedFeatureStore(rows)
+    ranked = store.build_ranked_actions(
+        _contention_ir(Condition(left="rsi", operator=ConditionOperator.LTE, right=40.0)),
+        _contention_parameters(),
+    )
+
+    # All three clear rsi <= 40 on the same session and only one slot exists. The
+    # deepest oversold reading wins; 000010 used to win on its ticker code alone.
+    assert _entered_tickers(store, ranked) == ["000990"]
+    entered = next(index for index, action in enumerate(ranked.actions) if action == 1)
+    assert ranked.scores[entered] == pytest.approx(0.75)
+
+
+def test_compiled_entry_slot_falls_back_to_ticker_order_without_a_measurable_score() -> None:
+    # `close` against a fixed number is a level, not a strength, so no condition here
+    # yields a margin and every candidate ties.
+    rows = _contention_rows({"000010": 39.0, "000500": 25.0, "000990": 10.0})
+    store = PreparedFeatureStore(rows)
+    ranked = store.build_ranked_actions(
+        _contention_ir(Condition(left="close", operator=ConditionOperator.GT, right=1.0)),
+        _contention_parameters(),
+    )
+
+    assert _entered_tickers(store, ranked) == ["000010"]
+
+
+def test_compiled_entry_slot_follows_a_declared_ranking_metric_and_its_direction() -> None:
+    rows = _contention_rows({"000010": 39.0, "000500": 25.0, "000990": 10.0})
+    store = PreparedFeatureStore(rows)
+    strategy_ir = _contention_ir(
+        Condition(left="rsi", operator=ConditionOperator.LTE, right=40.0)
+    )
+    parameters = _contention_parameters()
+
+    highest = store.build_ranked_actions(
+        strategy_ir.model_copy(
+            update={"ranking_metric": "rsi", "ranking_direction": "desc"}
+        ),
+        parameters,
+    )
+    lowest = store.build_ranked_actions(
+        strategy_ir.model_copy(
+            update={"ranking_metric": "rsi", "ranking_direction": "asc"}
+        ),
+        parameters,
+    )
+
+    assert _entered_tickers(store, highest) == ["000010"]
+    assert _entered_tickers(store, lowest) == ["000990"]
+
+
+def test_compiled_entry_scores_are_emitted_only_for_entry_rows() -> None:
+    rows = _contention_rows({"000010": 39.0, "000990": 10.0})
+    store = PreparedFeatureStore(rows)
+    ranked = store.build_ranked_actions(
+        _contention_ir(Condition(left="rsi", operator=ConditionOperator.LTE, right=40.0)),
+        _contention_parameters(),
+    )
+
+    assert len(ranked.scores) == len(rows)
+    assert all(
+        (action == 1) == (score == score)
+        for action, score in zip(ranked.actions, ranked.scores, strict=True)
+    )

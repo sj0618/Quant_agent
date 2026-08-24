@@ -19,13 +19,15 @@ from ai_graph.audit import (
     report_audit_failure,
 )
 from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_sink
-from ai_graph.data_sources import load_pipeline_data_from_env, screening_data_families
+from ai_graph.data_sources import (
+    PipelineDataUnavailableError,
+    load_pipeline_data_from_env,
+    screening_data_families,
+)
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from pydantic import ValidationError
 
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
-from ai_graph.memory import AnalysisMemory
-from ai_graph.progress import raise_if_cancelled, report_activity, report_node_stage
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
     generate_strategy_conditions,
@@ -50,16 +52,20 @@ from ai_graph.nodes.backtest import (
     _summary_float_default,
     backtest_node,
 )
+from ai_graph.memory import AnalysisMemory
+from ai_graph.progress import raise_if_cancelled, report_activity, report_node_stage
 from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_strategy import (
     classify_strategy_request,
     infer_automatic_strategy_preferences,
     robust_strategy_source_refs,
+    rsi_trade_rules,
 )
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
+from ai_graph.preflight import classify_research_request
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
@@ -69,13 +75,13 @@ from ai_graph.schemas import (
     BacktestEquityPoint,
     CandidateBacktestResult,
     BacktestMetrics,
-    PublicMetricDetail,
     ClarificationOption,
     Condition,
     DataRequirement,
     EnvelopeStatus,
     EvidenceRef,
     InternalPayload,
+    PublicMetricDetail,
     ScreeningMatch,
     SemanticSlots,
     SourceUsage,
@@ -83,9 +89,10 @@ from ai_graph.schemas import (
     StrategyCandidateCard,
     TickerAction,
     StrategySpec,
+    UserPayload,
 )
+from ai_graph.source_manifest import is_release_profile, validate_release_metadata
 from ai_graph.state import QuantAgentState
-
 
 _logger = logging.getLogger(__name__)
 
@@ -220,6 +227,13 @@ def run_analysis(
 ) -> APIEnvelope:
     query = _normalize_user_query(user_query)
     resolved_trace_id = trace_id or (_trace_id(query) if query else None)
+    scope_decision = classify_research_request(query)
+    if not scope_decision.allowed:
+        # This guard intentionally precedes audit-session construction and graph setup.
+        # A refused personalized request must not persist a job/audit record, consume a
+        # provider slot, or invoke a data source merely because another entrypoint
+        # bypassed the HTTP preflight adapter.
+        return _scope_refusal_envelope(query, resolved_trace_id or _trace_id(query))
     if audit_session is not None and not is_authorized_audit_session(audit_session):
         report_audit_failure("unapproved_audit_session")
         audit_session = None
@@ -274,6 +288,29 @@ def run_analysis(
         metadata_jsonb={"debug_ref": envelope.debug_ref, "public_trace_id": envelope.trace_id},
     )
     return envelope
+
+
+def _scope_refusal_envelope(query: str, trace_id: str) -> APIEnvelope:
+    decision = classify_research_request(query)
+    if decision.allowed:
+        raise ValueError("scope refusal envelope requires a refused request")
+    headline = (
+        "현재 지원 범위 밖의 요청입니다."
+        if decision.kind == "unsupported_scope"
+        else "개인화된 투자 요청은 분석하지 않습니다."
+    )
+    return APIEnvelope(
+        status=EnvelopeStatus.REJECTED,
+        trace_id=trace_id,
+        user_payload=UserPayload(
+            headline=headline,
+            message=decision.public_message,
+            next_actions=[decision.public_guidance],
+        ),
+        strategy_spec=None,
+        debug_ref=f"scope-refusal:{_trace_id(query)}",
+        retryable=False,
+    )
 
 
 def instrument_node(
@@ -372,6 +409,15 @@ def _safe_state_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
         candidate = value.get(key)
         if isinstance(candidate, (str, int, float, bool)):
             metadata[key] = str(candidate)[:128]
+    data = value.get("data")
+    pipeline = data.get("pipeline_data_source") if isinstance(data, Mapping) else None
+    timings = pipeline.get("timings") if isinstance(pipeline, Mapping) else None
+    if isinstance(timings, Mapping):
+        metadata["timings"] = {
+            str(key): seconds
+            for key, seconds in timings.items()
+            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+        }
     return metadata
 
 
@@ -622,6 +668,13 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         detail=f"조회할 데이터 항목 {len(data_requirements)}종을 확정했습니다.",
     )
     pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
+    if is_release_profile():
+        manifest_errors = validate_release_metadata(pipeline_data.metadata)
+        if manifest_errors:
+            raise PipelineDataUnavailableError(
+                "release_source_manifest_invalid",
+                "release source manifest is invalid: " + "; ".join(manifest_errors),
+            )
     source_usage = build_source_usage(
         query,
         data_requirements,
@@ -655,6 +708,8 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         output["l4_evidence"] = pipeline_data.l4_evidence
     if pipeline_data.macro_snapshot:
         output["macro_snapshot"] = pipeline_data.macro_snapshot
+    if pipeline_data.official_benchmark:
+        output["official_benchmark"] = pipeline_data.official_benchmark
 
     # Stop rather than screen on whatever data happens to exist. Conditions we cannot
     # evaluate used to fall through to a price-only profile, so a flow or short-interest
@@ -879,14 +934,41 @@ def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
         if validated
         else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
     )
+    sections = [base, *_universe_split_disclosure(state)]
     ambiguity = state.get("ambiguity") or {}
     assumptions = [
         str(item).strip() for item in ambiguity.get("assumptions", []) if str(item).strip()
     ]
-    if not assumptions:
-        return base
-    listed = "\n".join(f"- {item}" for item in assumptions[:5])
-    return f"{base}\n\n지정하지 않으신 부분은 이렇게 정해서 진행했습니다:\n{listed}"
+    if assumptions:
+        listed = "\n".join(f"- {item}" for item in assumptions[:5])
+        sections.append(f"지정하지 않으신 부분은 이렇게 정해서 진행했습니다:\n{listed}")
+    return "\n\n".join(sections)
+
+
+def _universe_split_disclosure(state: QuantAgentState) -> list[str]:
+    """Why a recommended name can be absent from the backtest, said before it is asked.
+
+    Only emitted for loads that carry a point-in-time universe descriptor; a run with no
+    historical membership excluded nothing, and describing the split there would state a
+    separation that did not happen.
+    """
+
+    pipeline = state.get("data", {}).get("pipeline_data_source") or {}
+    descriptor = pipeline.get("backtest_universe") if isinstance(pipeline, Mapping) else None
+    if not isinstance(descriptor, Mapping):
+        return []
+    lines = [
+        "백테스트는 과거 시점(PIT) 기준 유니버스로 규칙 자체를 검증하고, "
+        "아래 종목은 같은 규칙을 오늘 데이터에 적용한 결과입니다. "
+        "두 목록이 서로 다른 것은 정상입니다."
+    ]
+    excluded = descriptor.get("excluded_screening_candidate_count")
+    if isinstance(excluded, int) and not isinstance(excluded, bool) and excluded > 0:
+        lines.append(
+            f"오늘 스크리닝 후보 중 {excluded}종목은 백테스트 구간의 과거 시점 유니버스에 없어 "
+            "백테스트 거래 대상에서 제외됐습니다."
+        )
+    return lines
 
 
 def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> None:
@@ -1053,8 +1135,12 @@ def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
     if "roe" in lowered or "ROE" in query:
         indicator.append("roe")
 
-    if "30" in query and "rsi" in lowered:
-        threshold.append("rsi <= 30")
+    if "rsi" in lowered and any(value in query for value in ("30", "70")):
+        rsi_rules = rsi_trade_rules(query)
+        operator = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">="}[
+            rsi_rules.entry_operator
+        ]
+        threshold.append(f"rsi {operator} {int(rsi_rules.entry_threshold)}")
     if "40" in query and "rsi" in lowered:
         threshold.append("rsi <= 40")
     if "150" in query and "거래량" in query:
@@ -1896,6 +1982,17 @@ def _strategy_profile_base(
     lowered = query.lower()
     slot_indicator = set(semantic_slots.get("indicator", [])) if semantic_slots else set()
     slot_event = set(semantic_slots.get("event", [])) if semantic_slots else set()
+    rsi_rules = rsi_trade_rules(query)
+    rsi_operator_symbols = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
+    rsi_is_overbought = rsi_rules.entry_side == "overbought"
+    rsi_entry_description = (
+        f"RSI {rsi_operator_symbols[rsi_rules.entry_operator]} {int(rsi_rules.entry_threshold)}"
+    )
+    if not rsi_is_overbought and rsi_rules.entry_operator == "lte":
+        rsi_entry_description += " 또는 30 상향 회복"
+    rsi_exit_description = (
+        f"RSI {rsi_operator_symbols[rsi_rules.exit_operator]} {int(rsi_rules.exit_threshold)}"
+    )
     if (selection_mode or classify_strategy_request(query)) == "automatic":
         return {
             "strategy_id": "automatic_performance_momentum",
@@ -2821,17 +2918,29 @@ def _strategy_profile_base(
     if "rsi" in lowered or "rsi" in slot_indicator or "과매도" in query or "반등" in query:
         return {
             "strategy_id": "rsi_rebound",
-            "name": "RSI 과매도 반등",
+            "name": "RSI 과매수 모멘텀" if rsi_is_overbought else "RSI 과매도 반등",
             "entry_conditions": [
                 Condition(
-                    left="rsi", operator="lte", right=30, description="RSI <= 30 또는 30 상향 회복"
+                    left="rsi",
+                    operator=rsi_rules.entry_operator,
+                    right=rsi_rules.entry_threshold,
+                    description=rsi_entry_description,
                 )
             ],
             "exit_conditions": [
-                Condition(left="rsi", operator="gte", right=70, description="RSI >= 70")
+                Condition(
+                    left="rsi",
+                    operator=rsi_rules.exit_operator,
+                    right=rsi_rules.exit_threshold,
+                    description=rsi_exit_description,
+                )
             ],
             "indicators": ["RSI"],
-            "assumptions": ["RSI 30 회복 조건은 L2에서 과매도 반등 proxy로 해석"],
+            "assumptions": [
+                "RSI 70 이상 매수·30 미만 매도 조건을 그대로 적용"
+                if rsi_is_overbought
+                else "RSI 30 회복 조건은 L2에서 과매도 반등 proxy로 해석"
+            ],
             "confidence": 0.84,
         }
     if any(term in query for term in ("52주", "120일", "신고가", "거래량", "돌파", "갭")):
@@ -2962,15 +3071,29 @@ def _strategy_profile_base(
         }
     return {
         "strategy_id": "rsi_rebound",
-        "name": "RSI 과매도 반등",
+        "name": "RSI 과매수 모멘텀" if rsi_is_overbought else "RSI 과매도 반등",
         "entry_conditions": [
-            Condition(left="rsi", operator="lte", right=30, description="RSI <= 30")
+            Condition(
+                left="rsi",
+                operator=rsi_rules.entry_operator,
+                right=rsi_rules.entry_threshold,
+                description=rsi_entry_description,
+            )
         ],
         "exit_conditions": [
-            Condition(left="rsi", operator="gte", right=70, description="RSI >= 70")
+            Condition(
+                left="rsi",
+                operator=rsi_rules.exit_operator,
+                right=rsi_rules.exit_threshold,
+                description=rsi_exit_description,
+            )
         ],
         "indicators": ["RSI"],
-        "assumptions": ["명확한 기술 조건이 없으면 RSI 평균회귀 후보를 기본 제안"],
+        "assumptions": [
+            "RSI 70 이상 매수·30 미만 매도 조건을 그대로 적용"
+            if rsi_is_overbought
+            else "명확한 기술 조건이 없으면 RSI 평균회귀 후보를 기본 제안"
+        ],
         "confidence": 0.68,
     }
 
@@ -3048,6 +3171,13 @@ def _ticker_actions(
     other hand, hands the user a specific list and that list needs a verdict for every
     row - otherwise a name silently disappearing reads as "sell". So screened names with
     no action from the backtest come back as WATCH, explicitly.
+
+    The WATCH sentence only ever states something the run already recorded: whether the
+    name was inside the traded universe at all, and whether the book was full on the last
+    session. Nothing here re-evaluates the entry conditions - a second evaluator would be
+    free to disagree with the one the performance numbers came from, and "did not meet the
+    entry condition" was exactly that: a cause asserted about names the backtest had never
+    priced.
     """
 
     backtest = state.get("backtest") or {}
@@ -3056,6 +3186,8 @@ def _ticker_actions(
     ]
     decided = {action.ticker for action in actions}
     as_of = actions[0].as_of_date if actions else None
+    traded = _traded_universe(backtest)
+    slots_full_reason = _slots_full_reason(backtest)
     for card in cards:
         for match in card.matches:
             if match.ticker in decided:
@@ -3066,13 +3198,73 @@ def _ticker_actions(
                     ticker=match.ticker,
                     name=match.name or match.ticker,
                     action="WATCH",
-                    reason="스크리닝에는 걸렸으나 전략의 진입 조건은 아직 충족하지 않았습니다.",
+                    reason=_watch_reason(
+                        match.ticker, traded=traded, slots_full_reason=slots_full_reason
+                    ),
                     as_of_date=as_of or match.as_of_date,
                     close=match.close,
                 )
             )
     order = {"SELL": 0, "BUY": 1, "HOLD": 2, "WATCH": 3}
     return sorted(actions, key=lambda a: (order[a.action], a.ticker))
+
+
+_WATCH_OUTSIDE_UNIVERSE = (
+    "백테스트가 거래한 과거 시점(PIT) 유니버스에 없는 종목이라 백테스트가 판정한 적이 "
+    "없습니다. 오늘 스크리닝 조건에는 부합합니다."
+)
+_WATCH_NO_INSTRUCTION = (
+    "백테스트 마지막 거래일에 이 종목에 대한 신규 진입·청산 지시가 없었습니다."
+)
+
+
+def _watch_reason(
+    ticker: str, *, traded: set[str] | None, slots_full_reason: str | None
+) -> str:
+    if traded is not None and str(ticker).zfill(6) not in traded:
+        return _WATCH_OUTSIDE_UNIVERSE
+    if slots_full_reason is not None:
+        return slots_full_reason
+    return _WATCH_NO_INSTRUCTION
+
+
+def _traded_universe(backtest: Mapping[str, Any]) -> set[str] | None:
+    """The tickers the backtest priced, or None when the run did not record them.
+
+    Both sides zero-pad to six digits at their source; padding again here keeps an
+    unpadded code from being reported as a name the backtest never looked at.
+    """
+
+    payload = backtest.get("backtest_payload")
+    tickers = payload.get("tickers") if isinstance(payload, Mapping) else None
+    if not isinstance(tickers, list) or not tickers:
+        return None
+    return {str(ticker).zfill(6) for ticker in tickers}
+
+
+def _slots_full_reason(backtest: Mapping[str, Any]) -> str | None:
+    """Whether the book was full on the last session, from the engine's own position list.
+
+    Only stated when both halves are recorded. The rolling-policy path builds its own
+    summary and carries neither, so it falls through rather than guessing at a cause.
+    """
+
+    summary = backtest.get("engine_summary")
+    if not isinstance(summary, Mapping):
+        return None
+    held = summary.get("open_position_tickers")
+    if not isinstance(held, list):
+        return None
+    context = summary.get("ai_backtest_context")
+    limit = context.get("applied_max_positions") if isinstance(context, Mapping) else None
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return None
+    if len(held) < limit:
+        return None
+    return (
+        f"백테스트 마지막 거래일에 전략 보유 슬롯 {len(held)}/{limit}이 모두 차 있어 "
+        "신규 진입이 제한된 상태였습니다."
+    )
 
 
 def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
@@ -3206,12 +3398,77 @@ def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
         benchmark_return=backtest.backtest_payload.get("benchmark_return"),
     )
     validated = not reasons
-    reason = (
-        "objective gate를 모두 통과해 오늘의 추천을 유지합니다."
-        if validated
-        else "objective 조건 미충족: " + ", ".join(reasons)
+    shortfalls = [item for item in reasons if not _is_data_gap_reason(item)]
+    gaps = [
+        *_benchmark_input_gaps(backtest),
+        *(item for item in reasons if _is_data_gap_reason(item)),
+    ]
+    return RecommendationGate(
+        validated=validated,
+        reason=_gate_reason(validated, shortfalls, gaps),
+        verification_complete=not gaps,
+        unmet_objective_criteria=shortfalls,
+        unmet_data_requirements=gaps,
     )
-    return RecommendationGate(validated=validated, reason=reason)
+
+
+# Emitted by the "could not be computed" branches of _objective_gate_reasons and
+# _benchmark_objective_reasons. Those describe an input that never arrived, not a number
+# that came in under a threshold, and the two must not share one sentence.
+_DATA_GAP_REASON_MARKERS = ("is unavailable", "계산할 수 없음", "비교 구간이 없습니다")
+
+
+def _is_data_gap_reason(reason: str) -> bool:
+    return any(marker in reason for marker in _DATA_GAP_REASON_MARKERS)
+
+
+def _benchmark_input_gaps(backtest: CandidateBacktestResult) -> list[str]:
+    """The official benchmark series the automatic acceptance rule needs and may not have.
+
+    _objective_gate_reasons never looks at the primary benchmark's availability, so a run
+    blocked purely on the series not being loaded yet used to reach the reader as
+    "objective 조건 미충족" - a claim that the strategy underperformed, about a comparison
+    that was never made.
+    """
+
+    if backtest.strategy_a.selection_mode != "automatic":
+        return []
+    payload = backtest.backtest_payload
+    benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
+    primary = benchmark.get("primary") if isinstance(benchmark, Mapping) else None
+    if isinstance(primary, Mapping) and primary.get("available"):
+        return []
+    detail = ""
+    if isinstance(primary, Mapping):
+        stated = str(primary.get("unavailable_reason") or "").strip()
+        detail = f" ({stated})" if stated else ""
+    return [
+        "공식 KOSPI/KOSDAQ TR 벤치마크 시계열이 아직 적재되지 않아 "
+        f"벤치마크 대비 검증을 완료하지 못했습니다{detail}"
+    ]
+
+
+def _gate_reason(validated: bool, shortfalls: Sequence[str], gaps: Sequence[str]) -> str:
+    if validated and not gaps:
+        return "objective gate를 모두 통과해 오늘의 추천을 유지합니다."
+    if validated:
+        return (
+            "측정된 objective 지표는 모두 통과했지만, 검증에 필요한 데이터가 없어 "
+            "검증을 끝내지 못했습니다: " + "; ".join(gaps)
+        )
+    if shortfalls and gaps:
+        return (
+            "objective 조건 미충족: "
+            + ", ".join(shortfalls)
+            + " / 그리고 아직 검증하지 못한 항목: "
+            + "; ".join(gaps)
+        )
+    if shortfalls:
+        return "objective 조건 미충족: " + ", ".join(shortfalls)
+    return (
+        "성과가 기준에 미달한 것이 아니라, 검증에 필요한 데이터가 아직 없어 "
+        "판정을 내리지 못했습니다: " + "; ".join(gaps)
+    )
 
 
 def _objective_gate_reasons(

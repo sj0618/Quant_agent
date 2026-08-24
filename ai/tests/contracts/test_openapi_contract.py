@@ -7,6 +7,8 @@ from ai_graph.api import (
     DAILY_DIGEST_PATH,
     HEALTH_PATH,
     OPENAPI_URL,
+    RESEARCH_JOB_CREATE_PATH,
+    RESEARCH_JOB_RESULT_PATH,
     SPEC_STRATEGY_PARSE_PATH,
     STRATEGY_DESCRIPTIONS_PATH,
     create_app,
@@ -28,6 +30,8 @@ def test_openapi_contract_keeps_core_routes_and_components() -> None:
     assert ANALYSIS_JOBS_PATH in schema["paths"]
     assert ANALYSIS_JOB_DETAIL_PATH in schema["paths"]
     assert SPEC_STRATEGY_PARSE_PATH in schema["paths"]
+    assert RESEARCH_JOB_CREATE_PATH in schema["paths"]
+    assert RESEARCH_JOB_RESULT_PATH in schema["paths"]
     assert STRATEGY_DESCRIPTIONS_PATH in schema["paths"]
     assert DAILY_DIGEST_PATH in schema["paths"]
     assert "/api/backtests/{strategy_id}" in schema["paths"]
@@ -35,6 +39,12 @@ def test_openapi_contract_keeps_core_routes_and_components() -> None:
     assert "APIEnvelope" in components
     assert "AnalysisJob" in components
     assert "ReportBundle" in components
+    assert "RuleDraftV1" in components
+    assert "ResearchJobAcceptedV1" in components
+    assert "ResearchDevPreviewV1" in components
+    parse = schema["paths"][SPEC_STRATEGY_PARSE_PATH]["post"]
+    assert "200" in parse["responses"]
+    assert "201" not in parse["responses"]
 
 
 def test_openapi_analysis_job_result_uses_api_envelope_schema() -> None:

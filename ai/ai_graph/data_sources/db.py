@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import logging
+import math
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from time import perf_counter
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-import logging
+from ai_graph.quant_strategy import rsi_trade_rules
+from ai_graph.source_manifest import build_source_manifest
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -79,6 +84,17 @@ SYMBOL_LISTING_HISTORY_TABLE = "core.symbol_listing_history"
 SYMBOL_MASTER_TABLE = "core.symbol_master"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
+# Official KRX total-return index levels and the published KOSPI/KOSDAQ split, the two
+# inputs the backtest's primary benchmark is defined on. See
+# ai/docs/official-krx-tr-benchmark-contract.md and
+# DE/migrations/013_krx_official_benchmark_tr.sql. Neither is required to exist: absence
+# is reported as an unavailable primary benchmark, never raised.
+OFFICIAL_BENCHMARK_TR_VIEW = "mart.krx_index_total_return_daily"
+OFFICIAL_BENCHMARK_WEIGHT_VIEW = "mart.krx_benchmark_monthly_weights"
+# KRX publishes the total-return variants under their own index codes; the price-return
+# indices are deliberately not accepted here because a dividend-stripped index would
+# understate the benchmark the strategy has to beat.
+OFFICIAL_BENCHMARK_INDEX_CODES = {"kospi_tr": "KOSPI_TR", "kosdaq_tr": "KOSDAQ_TR"}
 # BOK ECOS daily 원/달러 rate. The only macro series the risk rules can be fed from
 # directly; there is no equity index and no volatility index in this warehouse.
 USD_KRW_SERIES_ID = "731Y003:0000003"
@@ -101,6 +117,7 @@ RSI_KEYS = ("rsi", "RSI", "rsi_14", "RSI_14", "talib_rsi_14", "TA_RSI_14")
 # match can carry RSI 33 while the strategy card reads "RSI <= 30", so the label prints the
 # actual reading - "RSI 과매도권" alone let a 33 pass for a 30.
 RSI_OVERSOLD_MAX = 35
+RSI_OVERBOUGHT_MIN = 65
 MARKET_SCOPE_TERMS = (
     "KOSPI200",
     "KOSPI 200",
@@ -194,6 +211,10 @@ class PipelineDataBundle(BaseModel):
     # Carries the measured values plus the label saying what the equity leg was
     # measured against, so a report can never call a universe proxy "the KOSPI".
     macro_snapshot: dict[str, Any] | None = None
+    # Official KOSPI/KOSDAQ TR levels plus the monthly index split, carried as their own
+    # field rather than inside `metadata` because the series is one value per session per
+    # index and `metadata` is republished verbatim in the response envelope.
+    official_benchmark: dict[str, Any] | None = None
     data_availability: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -208,7 +229,14 @@ class PostgresPipelineDataSource:
         self.unavailable_indicator_families: tuple[str, ...] = ()
 
     def load(self, query: str, trace_id: str) -> PipelineDataBundle:
+        # Wall-clock per phase. A slow load used to surface as one opaque number, which
+        # named neither the read that spent the time nor whether it was the connection,
+        # the screen or the price scan.
+        timings: dict[str, float] = {}
+        load_started = perf_counter()
+        connect_started = perf_counter()
         with self._connect() as conn:
+            timings["connect_seconds"] = perf_counter() - connect_started
             self._set_statement_timeout(conn)
             # Ask what the warehouse can actually serve before spending anything on the
             # query. This used to run last, after screening, so a strategy whose data is
@@ -218,7 +246,9 @@ class PostgresPipelineDataSource:
             # mart.dart_financial_asof empty, every fundamental strategy took that path
             # and surfaced as "데이터 조회 시간이 초과되었습니다", which named neither the
             # missing data nor the fact that waiting longer could not help.
-            capability_availability = measure_capabilities(conn)
+            capability_availability = self._timed(
+                timings, "capability_seconds", measure_capabilities, conn
+            )
             unsupported = unsupported_capabilities(query, capability_availability)
             if unsupported:
                 return PipelineDataBundle(
@@ -231,9 +261,12 @@ class PostgresPipelineDataSource:
                         "stopped_before_screening": True,
                         "unsupported_capabilities": unsupported,
                         "capability_probe": capability_availability,
+                        "timings": _rounded_timings(timings, load_started),
                     },
                 )
-            backtest_window = self._resolve_backtest_window(conn)
+            backtest_window = self._timed(
+                timings, "backtest_window_seconds", self._resolve_backtest_window, conn
+            )
             if backtest_window is None:
                 raise PipelineDataUnavailableError(
                     "pit_calendar_unavailable",
@@ -250,11 +283,37 @@ class PostgresPipelineDataSource:
             ticker_resolution = "screening"
             already_screened = _query_requests_screening(query)
             screening_mode = already_screened
+            pit_market: tuple[
+                list[str],
+                dict[str, Any],
+                Mapping[str, Mapping[str, Any]],
+                list[dict[str, Any]],
+                int,
+            ] | None = None
+            parallel_screening_backtest = False
             if already_screened:
-                screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
+                # The screen and the PIT market read nothing from each other: membership
+                # is fixed by date, and today's picks are filtered against it afterwards
+                # either way. So they run at the same time, on separate connections. The
+                # capability and calendar gates above still run first, so a query the
+                # warehouse cannot serve never pays for either read.
+                parallel_screening_backtest = True
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    screening = executor.submit(self._screen_on_its_own_connection, query)
+                    pit_market = self._load_pit_market(
+                        conn, backtest_window, query, indicator_families, timings
+                    )
+                    (
+                        screening_candidates,
+                        screening_relaxation,
+                        screening_timings,
+                    ) = screening.result()
+                timings.update(screening_timings)
             single_ticker: str | None = None
             if not screening_candidates:
-                single_ticker = self._resolve_ticker(conn, query)
+                single_ticker = self._timed(
+                    timings, "ticker_resolution_seconds", self._resolve_ticker, conn, query
+                )
                 if single_ticker is None:
                     screening_mode = True
                     # Ambiguous query (no explicit ticker, no name match): screen as a
@@ -268,8 +327,8 @@ class PostgresPipelineDataSource:
                     # for a screen that legitimately matched nothing today it doubled the
                     # cost of the request and pushed it into a statement timeout.
                     if not already_screened:
-                        screening_candidates, screening_relaxation = self._screen_with_relaxation(
-                            conn, query
+                        screening_candidates, screening_relaxation = self._timed(
+                            timings, "screening_seconds", self._screen_with_relaxation, conn, query
                         )
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
@@ -279,33 +338,55 @@ class PostgresPipelineDataSource:
                 else:
                     ticker_resolution = "explicit_or_name_match"
             if screening_mode:
+                if pit_market is None:
+                    pit_market = self._load_pit_market(
+                        conn, backtest_window, query, indicator_families, timings
+                    )
+                (
+                    tickers,
+                    universe_descriptor,
+                    symbol_info_by_ticker,
+                    price_rows,
+                    effective_lookback_days,
+                ) = pit_market
                 # Current recommendations are output only. PIT membership is fixed by
                 # date and cannot be widened by a present-day screen.
                 recommended = _backtest_ticker_pool(
                     screening_candidates, self.config.backtest_max_tickers
                 )
-                tickers, universe_descriptor = self._fetch_backtest_universe(
-                    conn, backtest_window
+                # Current candidates are context only: the backtest trades its own
+                # PIT universe, so a candidate outside it must not become the traded
+                # ticker either. Record how many were excluded for report disclosure.
+                pit_set = set(tickers)
+                excluded_screening_candidate_count = sum(
+                    1 for item in recommended if item not in pit_set
                 )
-                if not tickers:
-                    raise PipelineDataUnavailableError(
-                        "pit_universe_empty",
-                        "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
-                    )
-                ticker = recommended[0] if recommended else tickers[0]
-                symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
+                # Current candidates are context only. The traded ticker comes from
+                # the historical PIT universe, never from today's screen, so past
+                # performance can never be attributed to a current pick.
+                recommended = [item for item in recommended if item in pit_set]
+                ticker = tickers[0]
+                universe_descriptor["excluded_screening_candidate_count"] = (
+                    excluded_screening_candidate_count
+                )
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
-                self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
-                price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, symbol_info_by_ticker, query, backtest_window, indicator_families
-                )
-                self._set_statement_timeout(conn)
             elif single_ticker:
                 ticker = single_ticker
                 tickers = [ticker]
-                symbol_info = self._fetch_symbol_info(conn, ticker)
-                price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, {ticker: symbol_info}, query, backtest_window, indicator_families
+                symbol_info = self._timed(
+                    timings, "symbol_info_seconds", self._fetch_symbol_info, conn, ticker
+                )
+                price_rows, effective_lookback_days = self._timed(
+                    timings,
+                    "price_rows_seconds",
+                    self._fetch_price_rows,
+                    conn,
+                    tickers,
+                    {ticker: symbol_info},
+                    query,
+                    backtest_window,
+                    indicator_families,
+                    timings=timings,
                 )
             else:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
@@ -326,27 +407,74 @@ class PostgresPipelineDataSource:
             pit_members_without_price_rows = sorted(
                 set(tickers) - {str(row.get("ticker") or "").zfill(6) for row in price_rows}
             )
-            l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
-            macro_status = self._fetch_macro_status(conn)
-            macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
+            # Analyst evidence has to be about the name the report is about. `ticker` is
+            # the traded PIT member, which in screening mode is the universe's lowest
+            # symbol code and is unrelated to what the reader is shown; the recommended
+            # name is what the report discusses. Outside screening mode the two are the
+            # same name anyway.
+            recommendation_ticker = recommended[0] if recommended else None
+            l4_evidence_ticker = recommendation_ticker or ticker
+            l4_evidence = self._timed(
+                timings,
+                "l4_evidence_seconds",
+                self._fetch_l4_evidence,
+                conn,
+                l4_evidence_ticker,
+                trace_id,
+            )
+            macro_status = self._timed(
+                timings, "macro_status_seconds", self._fetch_macro_status, conn
+            )
+            macro_snapshot = self._timed(
+                timings, "macro_snapshot_seconds", self._fetch_macro_snapshot, conn, price_rows
+            )
+            official_benchmark = self._timed(
+                timings,
+                "official_benchmark_seconds",
+                self._fetch_official_benchmark,
+                conn,
+                backtest_window,
+            )
             # Capabilities were probed up front; nothing since then can change them.
 
+        source_manifest = build_source_manifest(
+            source="postgres",
+            as_of=backtest_window["end"],
+            freshness="unknown",
+            lineage_refs=[
+                KIS_ADJUSTED_OHLCV_TABLE,
+                PIT_UNIVERSE_VIEW,
+                SYMBOL_LISTING_HISTORY_TABLE,
+                *[INDICATOR_TABLES[family] for family in indicator_families],
+                # Listed only when they actually served this load, so the manifest does
+                # not claim provenance for a benchmark that was never computed.
+                *(
+                    [OFFICIAL_BENCHMARK_TR_VIEW, OFFICIAL_BENCHMARK_WEIGHT_VIEW]
+                    if official_benchmark.get("available")
+                    else []
+                ),
+            ],
+            source_version=BACKTEST_WINDOW_POLICY_ID,
+        )
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
             macro_snapshot=macro_snapshot,
+            official_benchmark=official_benchmark,
             data_availability=_data_availability_for_query(
                 query, source="postgres", available=capability_availability
             ),
             metadata={
                 "source": "postgres",
+                "source_manifest": source_manifest.model_dump(mode="json"),
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
                 "recommended_tickers": recommended,
-                "recommendation_ticker": recommended[0] if recommended else None,
+                "recommendation_ticker": recommendation_ticker,
                 "backtest_universe": universe_descriptor,
+                "parallel_screening_backtest": parallel_screening_backtest,
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [
@@ -376,12 +504,109 @@ class PostgresPipelineDataSource:
                 "raw_price_capabilities": raw_price_capabilities,
                 "dart_date_only_effective_policy": "next_krx_session_v1",
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
+                "l4_evidence_ticker": l4_evidence_ticker,
                 "l4_evidence_rows": len(l4_evidence),
+                "official_benchmark": _official_benchmark_status(official_benchmark),
                 "universe_source": universe_descriptor["source"],
                 "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
                 "macro_status": macro_status,
+                "timings": _rounded_timings(timings, load_started),
             },
+        )
+
+    @staticmethod
+    def _timed(
+        timings: dict[str, float],
+        name: str,
+        call: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run `call`, accumulating its wall-clock under `name`."""
+
+        started = perf_counter()
+        try:
+            return call(*args, **kwargs)
+        finally:
+            timings[name] = timings.get(name, 0.0) + perf_counter() - started
+
+    def _screen_on_its_own_connection(
+        self, query: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, float]]:
+        """Screen on a second connection so it can overlap the PIT market load.
+
+        Its timings come back with the result rather than being written into the
+        caller's dict, which the calling thread is still updating.
+        """
+
+        connect_started = perf_counter()
+        with self._connect() as conn:
+            connect_seconds = perf_counter() - connect_started
+            self._set_statement_timeout(conn)
+            screening_started = perf_counter()
+            candidates, relaxation = self._screen_with_relaxation(conn, query)
+            screening_seconds = perf_counter() - screening_started
+        return (
+            candidates,
+            relaxation,
+            {
+                "screening_connect_seconds": connect_seconds,
+                "screening_seconds": screening_seconds,
+            },
+        )
+
+    def _load_pit_market(
+        self,
+        conn: Any,
+        window: Mapping[str, Any],
+        query: str,
+        indicator_families: Sequence[str],
+        timings: dict[str, float],
+    ) -> tuple[
+        list[str],
+        dict[str, Any],
+        Mapping[str, Mapping[str, Any]],
+        list[dict[str, Any]],
+        int,
+    ]:
+        """The PIT universe and its price rows - reads nothing from today's screen."""
+
+        tickers, universe_descriptor = self._timed(
+            timings, "universe_seconds", self._fetch_backtest_universe, conn, window
+        )
+        if not tickers:
+            raise PipelineDataUnavailableError(
+                "pit_universe_empty",
+                "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
+            )
+        symbol_info_by_ticker = self._timed(
+            timings, "symbol_info_seconds", self._fetch_symbol_info_map, conn, tickers
+        )
+        # Widen the statement timeout for the universe price/indicator/financial scan -
+        # it is far heavier than the screening SELECTs and the tight default is not
+        # enough once the universe is the whole PIT membership.
+        self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
+        price_rows, effective_lookback_days = self._timed(
+            timings,
+            "price_rows_seconds",
+            self._fetch_price_rows,
+            conn,
+            tickers,
+            symbol_info_by_ticker,
+            query,
+            window,
+            indicator_families,
+            timings=timings,
+        )
+        self._set_statement_timeout(conn)
+        return (
+            tickers,
+            universe_descriptor,
+            symbol_info_by_ticker,
+            price_rows,
+            effective_lookback_days,
         )
 
     def _fetch_backtest_universe(
@@ -734,9 +959,13 @@ class PostgresPipelineDataSource:
         query: str,
         window: Mapping[str, Any],
         indicator_families: Sequence[str] | None = None,
+        *,
+        timings: dict[str, float] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         del query
+        timings = {} if timings is None else timings
         ticker_list = list(tickers)
+        ohlcv_started = perf_counter()
         rows = conn.execute(
             f"""
             SELECT
@@ -750,20 +979,22 @@ class PostgresPipelineDataSource:
                 raw.close AS raw_close, raw.volume AS raw_volume,
                 NULL::numeric AS raw_notional
             FROM {KIS_ADJUSTED_OHLCV_TABLE} p
-            JOIN {PIT_UNIVERSE_VIEW} u
-              ON u.as_of_date = p.time AND u.symbol = p.ticker
+            JOIN core.symbol_master sm
+              ON sm.symbol = p.ticker
             LEFT JOIN core.ohlcv_daily raw
-              ON raw.symbol_id = u.symbol_id AND raw.trade_date = p.time
+              ON raw.symbol_id = sm.symbol_id AND raw.trade_date = p.time
             WHERE p.ticker = ANY(%s)
               AND p.time BETWEEN %s::date AND %s::date
             ORDER BY p.ticker, p.time
             """,
             [ticker_list, window["start"], window["end"]],
         ).fetchall()
+        timings["price_ohlcv_query_seconds"] = perf_counter() - ohlcv_started
         earliest_priced_date = min((_date_value(row["as_of_date"]) for row in rows), default=None)
         families = indicator_families or tuple(INDICATOR_TABLES)
         indicators_by_family: dict[str, dict[str, dict[date, Mapping[str, Any]]]] = {}
         unavailable_families: list[str] = []
+        indicators_started = perf_counter()
         for family in families:
             try:
                 indicators_by_family[family] = self._fetch_indicator_values_by_date(
@@ -775,7 +1006,11 @@ class PostgresPipelineDataSource:
                 self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
                 unavailable_families.append(family)
         self.unavailable_indicator_families = tuple(unavailable_families)
+        timings["price_indicator_seconds"] = perf_counter() - indicators_started
+        financials_started = perf_counter()
         financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
+        timings["price_financial_seconds"] = perf_counter() - financials_started
+        conversion_started = perf_counter()
         price_rows = [
             _price_row_from_feature_frame_record(
                 _feature_frame_row_from_sources(
@@ -787,7 +1022,10 @@ class PostgresPipelineDataSource:
             )
             for row in rows
         ]
+        timings["price_row_conversion_seconds"] = perf_counter() - conversion_started
+        attach_started = perf_counter()
         _attach_pointintime_financials(price_rows, financials_by_ticker)
+        timings["price_financial_attach_seconds"] = perf_counter() - attach_started
         return price_rows, int(window["session_count"])
 
     def _fetch_financial_timeline(
@@ -1126,6 +1364,131 @@ class PostgresPipelineDataSource:
             )
         return snapshot or None
 
+    def _fetch_official_benchmark(
+        self, conn: Any, window: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Official KRX TR levels and the monthly KOSPI/KOSDAQ split for the window.
+
+        Contract: ai/docs/official-krx-tr-benchmark-contract.md. A warehouse that has
+        not loaded these tables is a normal state, not an error, so every failure path
+        returns `available=False` with the sentence the report has to print. Raising here
+        would take down loads whose strategy never needed the primary benchmark.
+
+        Monthly weights are read from one month before the window: the backtest rebalances
+        each month on the previous month's published split, so the first traded month
+        needs the row that precedes it.
+        """
+
+        descriptor: dict[str, Any] = {
+            "available": False,
+            "unavailable_reason": None,
+            "level_source": OFFICIAL_BENCHMARK_TR_VIEW,
+            "weight_source": OFFICIAL_BENCHMARK_WEIGHT_VIEW,
+            "index_codes": dict(OFFICIAL_BENCHMARK_INDEX_CODES),
+            "window_start": window["start"].isoformat(),
+            "window_end": window["end"].isoformat(),
+            "weight_lag_months": 1,
+            "kospi_tr": {},
+            "kosdaq_tr": {},
+            "monthly_weights": {},
+        }
+        try:
+            level_rows = conn.execute(
+                f"""
+                SELECT index_code, trade_date, tr_value
+                FROM {OFFICIAL_BENCHMARK_TR_VIEW}
+                WHERE index_code = ANY(%s)
+                  AND trade_date BETWEEN %s::date AND %s::date
+                ORDER BY trade_date
+                """,
+                [
+                    [
+                        OFFICIAL_BENCHMARK_INDEX_CODES["kospi_tr"],
+                        OFFICIAL_BENCHMARK_INDEX_CODES["kosdaq_tr"],
+                    ],
+                    window["start"],
+                    window["end"],
+                ],
+            ).fetchall()
+        except Exception as error:
+            # A failed statement leaves the shared transaction in INERROR and discards
+            # the transaction-local statement_timeout, exactly like an indicator family
+            # that could not be loaded.
+            self._rollback_quietly(conn)
+            self._set_statement_timeout(conn)
+            descriptor["unavailable_reason"] = (
+                f"{OFFICIAL_BENCHMARK_TR_VIEW} could not be read ({_short_error_reason(error)})"
+            )
+            return descriptor
+
+        levels: dict[str, dict[str, float]] = {"kospi_tr": {}, "kosdaq_tr": {}}
+        code_to_key = {code: key for key, code in OFFICIAL_BENCHMARK_INDEX_CODES.items()}
+        for row in level_rows or ():
+            key = code_to_key.get(str(row.get("index_code") or ""))
+            trade_date = _optional_date_value(row.get("trade_date"))
+            value = _finite_float_value(row.get("tr_value"))
+            # A non-positive level cannot be a total-return index; dropping it costs the
+            # session its coverage instead of producing a negative benchmark unit.
+            if key is None or trade_date is None or value is None or value <= 0.0:
+                continue
+            levels[key][trade_date.isoformat()] = value
+        missing_series = [
+            OFFICIAL_BENCHMARK_INDEX_CODES[key] for key in ("kospi_tr", "kosdaq_tr")
+            if not levels[key]
+        ]
+        if missing_series:
+            descriptor["unavailable_reason"] = (
+                f"{OFFICIAL_BENCHMARK_TR_VIEW} has no usable rows for "
+                f"{', '.join(missing_series)} between {descriptor['window_start']} and "
+                f"{descriptor['window_end']}"
+            )
+            return descriptor
+
+        try:
+            weight_rows = conn.execute(
+                f"""
+                SELECT month, kospi_weight, kosdaq_weight
+                FROM {OFFICIAL_BENCHMARK_WEIGHT_VIEW}
+                WHERE month >= (date_trunc('month', %s::date) - INTERVAL '1 month')::date
+                  AND month <= date_trunc('month', %s::date)::date
+                ORDER BY month
+                """,
+                [window["start"], window["end"]],
+            ).fetchall()
+        except Exception as error:
+            self._rollback_quietly(conn)
+            self._set_statement_timeout(conn)
+            descriptor["unavailable_reason"] = (
+                f"{OFFICIAL_BENCHMARK_WEIGHT_VIEW} could not be read "
+                f"({_short_error_reason(error)})"
+            )
+            return descriptor
+
+        monthly_weights: dict[str, list[float]] = {}
+        for row in weight_rows or ():
+            month = _optional_date_value(row.get("month"))
+            kospi_weight = _finite_float_value(row.get("kospi_weight"))
+            kosdaq_weight = _finite_float_value(row.get("kosdaq_weight"))
+            if month is None or kospi_weight is None or kosdaq_weight is None:
+                continue
+            monthly_weights[month.isoformat()[:7]] = [kospi_weight, kosdaq_weight]
+        if not monthly_weights:
+            descriptor["unavailable_reason"] = (
+                f"{OFFICIAL_BENCHMARK_WEIGHT_VIEW} has no monthly weights covering "
+                f"{descriptor['window_start']}..{descriptor['window_end']}"
+            )
+            return descriptor
+
+        descriptor.update(
+            {
+                "available": True,
+                "kospi_tr": levels["kospi_tr"],
+                "kosdaq_tr": levels["kosdaq_tr"],
+                "monthly_weights": monthly_weights,
+            }
+        )
+        return descriptor
+
     def _fetch_macro_status(self, conn: Any) -> dict[str, Any]:
         row = conn.execute(
             """
@@ -1144,6 +1507,15 @@ class PostgresPipelineDataSource:
 
 
 
+def _rounded_timings(timings: Mapping[str, float], load_started: float) -> dict[str, float]:
+    """Phase timings plus the elapsed total, rounded for the report payload."""
+
+    return {
+        **{name: round(seconds, 6) for name, seconds in timings.items()},
+        "total_seconds": round(perf_counter() - load_started, 6),
+    }
+
+
 def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -1160,6 +1532,13 @@ def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
         data_availability=_data_availability_for_query(query, source="fixture"),
         metadata={
             "source": "fixture",
+            "source_manifest": build_source_manifest(
+                source="fixture",
+                as_of=datetime.now(UTC).date(),
+                freshness="unknown",
+                lineage_refs=[reason, query],
+                source_version="local-fixture",
+            ).model_dump(mode="json"),
             "reason": reason,
             "production_eligible": False,
             "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),
@@ -1203,6 +1582,7 @@ class ScreeningThresholds(BaseModel):
     relative_strength_60d_min: float = Field(default=0.0, ge=-1.0, le=1.0)
     rsi_max: float = Field(default=35.0, ge=5.0, le=70.0)
     rsi_cross_floor: float = Field(default=30.0, ge=5.0, le=70.0)
+    rsi_min: float = Field(default=70.0, ge=30.0, le=95.0)
     sma20_band: float = Field(default=0.04, ge=0.005, le=0.50)
     bb_width_max: float = Field(default=0.18, ge=0.02, le=1.0)
     bb_upper_ratio: float = Field(default=0.995, ge=0.50, le=1.0)
@@ -1217,11 +1597,18 @@ def _clamped(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> ScreeningThresholds:
+def _relaxed_thresholds(
+    base: ScreeningThresholds, round_index: int, *, profile: str = "rsi_rebound"
+) -> ScreeningThresholds:
     """Deterministic widening ladder, used when no live LLM is configured and as the
     fallback whenever an LLM relaxation proposal is unusable."""
 
     step = round_index + 1
+    rsi_update = (
+        {"rsi_min": _clamped(base.rsi_min - 5.0 * step, RSI_OVERBOUGHT_MIN, 95.0)}
+        if profile == "rsi_overbought"
+        else {"rsi_max": _clamped(base.rsi_max + 5.0 * step, 5.0, 70.0)}
+    )
     return base.model_copy(
         update={
             "high_252_ratio": _clamped(base.high_252_ratio - 0.02 * step, 0.50, 1.0),
@@ -1235,7 +1622,6 @@ def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> Screenin
             "relative_strength_60d_min": _clamped(
                 base.relative_strength_60d_min - 0.05 * step, -1.0, 1.0
             ),
-            "rsi_max": _clamped(base.rsi_max + 5.0 * step, 5.0, 70.0),
             "sma20_band": _clamped(base.sma20_band + 0.02 * step, 0.005, 0.50),
             "bb_width_max": _clamped(base.bb_width_max + 0.06 * step, 0.02, 1.0),
             "bb_upper_ratio": _clamped(base.bb_upper_ratio - 0.02 * step, 0.50, 1.0),
@@ -1245,6 +1631,7 @@ def _relaxed_thresholds(base: ScreeningThresholds, round_index: int) -> Screenin
                 base.operating_margin_min - 0.02 * step, -1.0, 1.0
             ),
             "revenue_growth_min": _clamped(base.revenue_growth_min - 0.03 * step, -1.0, 10.0),
+            **rsi_update,
         }
     )
 
@@ -1301,6 +1688,10 @@ def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
         previous = _numeric(row.get("prev_rsi"))
         return previous is not None and previous < thresholds.rsi_cross_floor <= rsi
 
+    def rsi_overbought(row: Mapping[str, Any]) -> bool:
+        rsi = _numeric(row.get("rsi"))
+        return rsi is not None and rsi >= thresholds.rsi_min
+
     def pullback_trend(row: Mapping[str, Any]) -> bool:
         close = _numeric(row.get("close"))
         sma20 = _numeric(row.get("sma20"))
@@ -1343,6 +1734,7 @@ def _screening_matcher(profile: str, thresholds: ScreeningThresholds) -> Any:
     return {
         "breakout_volume": breakout_volume,
         "rsi_rebound": rsi_rebound,
+        "rsi_overbought": rsi_overbought,
         "pullback_trend": pullback_trend,
         "bollinger_squeeze": bollinger_squeeze,
         "relative_strength": relative_strength,
@@ -1448,7 +1840,7 @@ def _propose_relaxed_thresholds(
 ) -> ScreeningThresholds:
     """Ask the LLM to loosen the screen, falling back to the deterministic ladder."""
 
-    deterministic = _relaxed_thresholds(thresholds, round_index)
+    deterministic = _relaxed_thresholds(thresholds, round_index, profile=profile)
     try:
         # Imported lazily: ai_graph.llm pulls in the provider stack, which must stay
         # optional for fixture-only runs of this module.
@@ -1489,7 +1881,11 @@ def _screening_profile(query: str) -> str:
     if _mentions_fundamentals(query, ("매출 성장", "매출성장", "성장률", "성장주")):
         return "growth_momentum"
     if "rsi" in lowered or "과매도" in query or "반등" in query:
-        return "rsi_rebound"
+        return (
+            "rsi_overbought"
+            if rsi_trade_rules(query).entry_side == "overbought"
+            else "rsi_rebound"
+        )
     if "볼린저" in query or "밴드" in query or "변동성" in query:
         return "bollinger_squeeze"
     if "200일" in query or "눌림목" in query or "20일선" in query:
@@ -1520,6 +1916,7 @@ _PROFILE_DATA_FAMILIES: dict[str, tuple[str, ...]] = {
     "quality_growth": ("ohlcv_ta", "fundamentals"),
     "growth_momentum": ("ohlcv_ta", "fundamentals"),
     "rsi_rebound": ("ohlcv_ta",),
+    "rsi_overbought": ("ohlcv_ta",),
     "bollinger_squeeze": ("ohlcv_ta",),
     "pullback_trend": ("ohlcv_ta",),
     "relative_strength": ("ohlcv_ta",),
@@ -1632,6 +2029,7 @@ PATH_RETURNS = "returns"
 _PROFILE_PATH_NEEDS: dict[str, frozenset[str]] = {
     "breakout_volume": frozenset({PATH_HIGH_252, PATH_VOLUME_RATIO, PATH_RETURNS}),
     "rsi_rebound": frozenset(),
+    "rsi_overbought": frozenset(),
     "pullback_trend": frozenset(),
     "bollinger_squeeze": frozenset(),
     "relative_strength": frozenset({PATH_RETURNS}),
@@ -1750,6 +2148,7 @@ _FAMILY_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
 _PROFILE_INDICATOR_METRICS: dict[str, tuple[str, ...]] = {
     "breakout_volume": ("sma20",),
     "rsi_rebound": ("rsi",),
+    "rsi_overbought": ("rsi",),
     "pullback_trend": ("sma20", "sma200"),
     "bollinger_squeeze": ("bb_upper", "bb_width"),
     "relative_strength": (),
@@ -2110,9 +2509,16 @@ def _matched_screening_rules(row: Mapping[str, Any], profile: str) -> list[str]:
         rules.append("20일 상대강도 양호")
     rsi = _optional_float_value(row.get("rsi"))
     prev_rsi = _optional_float_value(row.get("prev_rsi"))
-    if rsi is not None and rsi <= RSI_OVERSOLD_MAX:
+    if profile == "rsi_overbought" and rsi is not None and rsi >= RSI_OVERBOUGHT_MIN:
+        rules.append(f"RSI {rsi:.0f} 과매수권")
+    elif rsi is not None and rsi <= RSI_OVERSOLD_MAX:
         rules.append(f"RSI {rsi:.0f} 과매도권")
-    if prev_rsi is not None and rsi is not None and prev_rsi < 30 <= rsi:
+    if (
+        profile == "rsi_rebound"
+        and prev_rsi is not None
+        and rsi is not None
+        and prev_rsi < 30 <= rsi
+    ):
         rules.append("RSI 30 상향 돌파")
     if profile == "bollinger_squeeze" and _compare(row.get("bb_upper"), close):
         rules.append("볼린저 상단 근접/돌파")
@@ -2546,7 +2952,11 @@ def _find_metric_value(
 
 def _query_requires_rsi_oversold(query: str) -> bool:
     lowered = query.lower()
-    return "rsi" in lowered and ("30" in lowered or "과매도" in query)
+    return (
+        "rsi" in lowered
+        and ("30" in lowered or "과매도" in query)
+        and rsi_trade_rules(query).entry_side == "oversold"
+    )
 
 
 def _has_rsi_oversold_entry(price_rows: list[dict[str, Any]]) -> bool:
@@ -2568,6 +2978,50 @@ def _date_value(value: Any) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def _optional_date_value(value: Any) -> date | None:
+    """`_date_value` for columns a malformed row may leave unparseable."""
+    if value is None:
+        return None
+    try:
+        return _date_value(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _finite_float_value(value: Any) -> float | None:
+    parsed = _optional_float_value(value)
+    if parsed is None or not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _short_error_reason(error: BaseException) -> str:
+    """A one-line, length-capped rendering of a driver error for a user-facing reason."""
+    text = " ".join(str(error).split())
+    return f"{type(error).__name__}: {text[:200]}" if text else type(error).__name__
+
+
+def _official_benchmark_status(descriptor: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The counts and provenance of the benchmark load, without the series itself.
+
+    `metadata` is republished verbatim in the response envelope, so the per-session
+    levels stay on the bundle's own field and only their shape is summarised here.
+    """
+    if not isinstance(descriptor, Mapping):
+        return {"available": False, "unavailable_reason": "benchmark load was not attempted"}
+    return {
+        "available": bool(descriptor.get("available")),
+        "unavailable_reason": descriptor.get("unavailable_reason"),
+        "level_source": descriptor.get("level_source"),
+        "weight_source": descriptor.get("weight_source"),
+        "index_codes": descriptor.get("index_codes"),
+        "weight_lag_months": descriptor.get("weight_lag_months"),
+        "kospi_tr_sessions": len(descriptor.get("kospi_tr") or {}),
+        "kosdaq_tr_sessions": len(descriptor.get("kosdaq_tr") or {}),
+        "monthly_weight_months": len(descriptor.get("monthly_weights") or {}),
+    }
 
 
 def _datetime_value(value: Any) -> datetime | None:

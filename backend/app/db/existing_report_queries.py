@@ -16,6 +16,20 @@ REPORT_LIST_MAX_LIMIT = 100
 REPORT_STORE_COMPONENT = "reports"
 RUN_STORE_COMPONENT = "analysis_runs"
 REPORT_CONTENT_SCHEMA_VERSION = 1
+_READER_EVIDENCE_SECTION_IDS = frozenset({"reproduction_contract", "metric_registry"})
+_REPRODUCTION_CONTRACT_FIELDS = (
+    ("contract_version", "재현 계약 버전"),
+    ("input_hash", "입력 해시"),
+    ("output_hash", "출력 해시"),
+    ("data_fingerprint", "데이터 지문"),
+    ("strategy_fingerprint", "전략 지문"),
+    ("candidate_fingerprint", "후보 지문"),
+    ("engine_version", "엔진 버전"),
+    ("feature_version", "피처 버전"),
+    ("metric_formula_version", "지표 수식 버전"),
+    ("as_of_date", "기준일"),
+    ("selected_candidate_id", "선정 후보 ID"),
+)
 KOREAN_WEEKDAY_LABELS = {
     "monday": "월요일",
     "tuesday": "화요일",
@@ -527,6 +541,98 @@ def _report_performance_payload(row: dict[str, Any]) -> dict[str, Any]:
     return {"metrics": metrics, "disclaimer": disclaimer}
 
 
+def _reader_safe_text(value: Any, *, limit: int = 512) -> str | None:
+    """Return bounded, display-safe scalar text; never stringify nested payloads."""
+
+    if not isinstance(value, (str, int, float, bool)):
+        return None
+    text = str(value).strip()
+    if not text or len(text) > limit:
+        return None
+    return text
+
+
+def _reader_safe_list(value: Any, *, limit: int = 12, item_limit: int = 120) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value[:limit]:
+        text = _reader_safe_text(item, limit=item_limit)
+        if text is not None:
+            items.append(text)
+    return items
+
+
+def _reader_evidence_sections(value: Any) -> list[dict[str, Any]]:
+    """Project only the two vetted, non-sensitive verification sections.
+
+    The persisted report document also contains an execution snapshot and other
+    AI-generated sections. Those are intentionally not part of the report
+    detail API contract: this projection is an allowlist, not a JSON passthrough.
+    """
+
+    document = _json_object(value)
+    published: list[dict[str, Any]] = []
+    for raw_section in _json_array(document.get("sections")):
+        section = _json_object(raw_section)
+        section_id = _optional_text(section.get("id"))
+        if section_id not in _READER_EVIDENCE_SECTION_IDS:
+            continue
+        items = _json_object(section.get("items"))
+
+        if section_id == "reproduction_contract":
+            entries = [
+                {"label": label, "value": text, "depth": 1}
+                for field, label in _REPRODUCTION_CONTRACT_FIELDS
+                if (text := _reader_safe_text(items.get(field))) is not None
+            ]
+            if entries:
+                published.append(
+                    {
+                        "id": section_id,
+                        "title": "검증 재현 계약",
+                        "entries": entries,
+                    }
+                )
+            continue
+
+        formula_version = _reader_safe_text(items.get("formula_version"), limit=128)
+        metric_entries: list[dict[str, Any]] = []
+        for raw_metric in _json_array(items.get("metrics"))[:30]:
+            metric = _json_object(raw_metric)
+            label = _reader_safe_text(metric.get("label"), limit=128)
+            formula = _reader_safe_text(metric.get("formula"), limit=512)
+            if label is None or formula is None:
+                continue
+            context: list[str] = []
+            inputs = _reader_safe_list(metric.get("inputs"))
+            if inputs:
+                context.append(f"입력: {', '.join(inputs)}")
+            for field, display_name in (
+                ("input_window", "관찰 구간"),
+                ("as_of_policy", "기준 시점"),
+                ("null_policy", "결측 처리"),
+                ("implementation_ref", "구현 기준"),
+                ("implementation_hash", "구현 해시"),
+            ):
+                if (text := _reader_safe_text(metric.get(field))) is not None:
+                    context.append(f"{display_name}: {text}")
+            entry: dict[str, Any] = {"label": label, "value": formula, "depth": 1}
+            if context:
+                entry["description"] = " · ".join(context)
+            metric_entries.append(entry)
+        if metric_entries:
+            projected: dict[str, Any] = {
+                "id": section_id,
+                "title": "퀀트 지표 산출 계약",
+                "entries": metric_entries,
+            }
+            if formula_version is not None:
+                projected["note"] = f"수식 레지스트리 버전: {formula_version}"
+            published.append(projected)
+    return published
+
+
 def _report_summary_item(row: dict[str, Any]) -> dict[str, Any]:
     run_config = _json_object(row.get("run_config_jsonb"))
     sort_at = _first_non_empty(row.get("sort_at"), row.get("sent_at"), row.get("created_at"))
@@ -726,6 +832,7 @@ async def get_report(engine: AsyncEngine, report_id: str, *, user_id: str | None
             report.signal_axes_jsonb,
             report.performance_jsonb,
             report.cost_notes,
+            report.content_html,
             run.run_id AS run_id,
             run.strategy_id AS run_strategy_id,
             run.config_jsonb AS run_config_jsonb,
@@ -845,6 +952,7 @@ async def get_report(engine: AsyncEngine, report_id: str, *, user_id: str | None
         "conclusion": _text(_first_non_empty(row.get("conclusion"), row.get("summary"), row.get("market_brief"))),
         "warningNote": _optional_text(row.get("warning_note")),
         "performance": _report_performance_payload(row),
+        "contentSections": _reader_evidence_sections(row.get("content_html")),
         "costNotes": [str(value) for value in _json_array(row.get("cost_notes")) if _optional_text(value)],
         "createdAt": _as_iso(row.get("created_at")),
         "updatedAt": _as_iso(row.get("updated_at")),

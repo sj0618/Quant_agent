@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import re
 from typing import Any, Literal
 
 import numpy as np
-
 
 StrategyRequestMode = Literal["standard", "automatic", "user_defined"]
 AutomaticRiskStyle = Literal["aggressive", "balanced", "defensive"]
@@ -46,6 +45,91 @@ AUTOMATIC_TOURNAMENT_PROFILES = (
     "risk_adjusted_momentum_rotation",
     "trend_leader_rotation",
 )
+
+
+RsiOperator = Literal["lt", "lte", "gt", "gte"]
+RsiEntrySide = Literal["oversold", "overbought"]
+
+
+@dataclass(frozen=True)
+class RsiTradeRules:
+    entry_side: RsiEntrySide
+    entry_threshold: float
+    entry_operator: RsiOperator
+    exit_threshold: float
+    exit_operator: RsiOperator
+
+
+_RSI_THRESHOLD_RE = re.compile(r"(?<!\d)(30|70)(?!\d)")
+_RSI_ACTIONS = {
+    "buy": ("매수", "매입", "구매", "사고", "사다", "buy"),
+    "sell": ("매도", "매각", "팔고", "팔다", "sell"),
+}
+
+
+def _rsi_threshold_contexts(query: str) -> dict[int, str]:
+    normalized = re.sub(r"\s+", "", (query or "").casefold())
+    matches = list(_RSI_THRESHOLD_RE.finditer(normalized))
+    contexts: dict[int, str] = {}
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        contexts[int(match.group(1))] = normalized[max(0, match.start() - 12) : next_start]
+    return contexts
+
+
+def _rsi_action(context: str) -> str | None:
+    found = {
+        action
+        for action, tokens in _RSI_ACTIONS.items()
+        if any(token in context for token in tokens)
+    }
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _rsi_operator(context: str, threshold: int) -> RsiOperator:
+    threshold_text = str(threshold)
+    position = context.rfind(threshold_text)
+    before = context[max(0, position - 8) : position]
+    after = context[position + len(threshold_text) : position + len(threshold_text) + 12]
+    if "<=" in before or "<=" in after or "이하" in after:
+        return "lte"
+    if ">=" in before or ">=" in after or "이상" in after:
+        return "gte"
+    if "<" in before or "<" in after or "미만" in after:
+        return "lt"
+    if ">" in before or ">" in after or "초과" in after:
+        return "gt"
+    return "lte" if threshold == 30 else "gte"
+
+
+def rsi_trade_rules(query: str) -> RsiTradeRules:
+    """Keep explicit RSI buy/sell direction consistent across every pipeline stage."""
+
+    contexts = _rsi_threshold_contexts(query)
+    low_context = contexts.get(30, "")
+    high_context = contexts.get(70, "")
+    low_action = _rsi_action(low_context)
+    high_action = _rsi_action(high_context)
+    entry_side: RsiEntrySide = (
+        "overbought"
+        if high_action == "buy" or low_action == "sell"
+        else "oversold"
+    )
+    if entry_side == "overbought":
+        return RsiTradeRules(
+            entry_side=entry_side,
+            entry_threshold=70.0,
+            entry_operator=_rsi_operator(high_context, 70),
+            exit_threshold=30.0,
+            exit_operator=_rsi_operator(low_context, 30),
+        )
+    return RsiTradeRules(
+        entry_side=entry_side,
+        entry_threshold=30.0,
+        entry_operator=_rsi_operator(low_context, 30),
+        exit_threshold=70.0,
+        exit_operator=_rsi_operator(high_context, 70),
+    )
 
 _AUTOMATIC_TERMS = (
     "auto",

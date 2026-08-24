@@ -1,7 +1,11 @@
 import json
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import pytest
+
+if TYPE_CHECKING:
+    from offline_test_environment import OfflineTestEnvironment
 
 from ai_graph.audit import RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
@@ -14,6 +18,29 @@ from ai_graph.graph import (
 )
 from ai_graph.jobs import InMemoryAnalysisJobStore
 from ai_graph.schemas import AmbiguityCode, EnvelopeStatus
+
+pytest_plugins = ("offline_test_environment",)
+pytestmark = pytest.mark.usefixtures("offline_test_environment")
+
+
+def test_offline_environment_rebinds_imported_consumers_and_tripwires_boundaries(
+    offline_test_environment: "OfflineTestEnvironment",
+) -> None:
+    isolated = offline_test_environment
+
+    assert isolated.database_env_names == ("AI_DATABASE_DSN", "QUANT_DB_DSN", "DATABASE_URL")
+    assert isolated.provider_credential_names
+    assert isolated.cache_dir.parent.exists()
+    assert isolated.graph_module.load_pipeline_data_from_env is isolated.offline_loader
+    assert (
+        isolated.api_module.create_app.__kwdefaults__["analysis_runner"]
+        is isolated.graph_module.run_analysis
+    )
+
+    with pytest.raises(AssertionError, match="database boundary reached"):
+        isolated.data_source_module.PostgresPipelineDataSource.load(object(), "query", "trace")
+    with pytest.raises(AssertionError, match="provider boundary reached"):
+        isolated.aoai_module.AOAIResponsesClient.generate_json(object(), object())
 
 
 def test_rsi_strategy_runs_ready_e2e_without_external_keys() -> None:
@@ -35,6 +62,7 @@ def test_rsi_strategy_runs_ready_e2e_without_external_keys() -> None:
     internal = DEBUG_STORE.get(envelope.debug_ref)
     assert internal is not None
     assert internal.validation["node_sequence"] == list(NODE_SEQUENCE)
+    assert internal.validation["pipeline_data_source"]["source"] == "fixture"
     assert set(internal.model_dump()) == {
         "trace_id",
         "node_outputs",
@@ -88,23 +116,54 @@ def test_ready_analysis_connects_trace_nodes_model_calls_and_full_prompts() -> N
     )
 
 
-def test_out_of_scope_route_logs_only_nodes_that_really_execute() -> None:
+def test_unsupported_scope_is_rejected_before_audit_or_graph_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sink = RecordingAuditSink()
+    query = "옵션 양매도 전략 만들어줘"
+    monkeypatch.setattr(
+        "ai_graph.graph.build_graph",
+        lambda *_args, **_kwargs: pytest.fail("unsupported request must not build a graph"),
+    )
 
     envelope = run_analysis(
-        "옵션 양매도 전략 만들어줘",
+        query,
         trace_id="trace-logging-rejected",
         audit_sink=_create_test_audit_sink(sink),
     )
 
-    assert envelope.status == "rejected"
-    assert [record.agent_name for record in sink.sessions[0].agent_executions] == [
-        "Supervisor",
-        "Ambiguity Classifier",
-        "Data",
-        "Envelope",
-    ]
-    assert sink.sessions[0].model_calls == ()
+    assert envelope.status == EnvelopeStatus.REJECTED
+    assert envelope.user_payload.headline == "현재 지원 범위 밖의 요청입니다."
+    assert query not in envelope.model_dump_json()
+    assert sink.sessions == ()
+
+
+def test_personalized_request_is_rejected_before_audit_or_graph_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = RecordingAuditSink()
+    query = "내 보유 종목을 지금 팔아줘"
+    monkeypatch.setattr(
+        "ai_graph.graph.build_graph",
+        lambda *_args, **_kwargs: pytest.fail("personalized request must not build a graph"),
+    )
+
+    envelope = run_analysis(
+        query,
+        trace_id="trace-personalized-refusal",
+        audit_sink=_create_test_audit_sink(sink),
+    )
+
+    assert envelope.status == EnvelopeStatus.REJECTED
+    assert envelope.retryable is False
+    assert envelope.strategy_spec is None
+    assert envelope.data_requirements == []
+    assert envelope.source_usage == []
+    assert envelope.user_payload.candidate_cards == []
+    assert envelope.user_payload.performance is None
+    assert envelope.user_payload.report is None
+    assert query not in envelope.model_dump_json()
+    assert sink.sessions == ()
 
 
 def test_underspecified_request_is_answered_instead_of_questioned() -> None:
@@ -290,7 +349,7 @@ def test_work_agent_failure_stops_downstream_and_keeps_one_correlated_error(monk
 
     with pytest.raises(RejectMarkerError, match="private backtest failure"):
         run_analysis(
-            "RSI가 30 이하로 떨어진 종목을 사고 70 이상이면 팔아줘",
+            "RSI가 30 이하로 떨어진 종목을 매수하고 70 이상이면 매도",
             trace_id="trace-work-agent-failure",
             audit_sink=_create_test_audit_sink(sink),
         )
@@ -317,7 +376,7 @@ def test_work_agent_failure_stops_downstream_and_keeps_one_correlated_error(monk
 def test_analysis_job_polling_contract_runs_sync() -> None:
     store = InMemoryAnalysisJobStore()
     job = store.create("RSI가 30 이하인 KOSPI200")
-    assert [stage.status for stage in job.stages][0] == "queued"
+    assert next(stage.status for stage in job.stages) == "queued"
 
     completed = store.run_sync(job.job_id, lambda query, trace_id: run_analysis(query, trace_id))
 

@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 # pyright: reportUnannotatedClassAttribute=false, reportUnusedFunction=false
-
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from os import environ
-from typing import Callable, ClassVar, Literal
+from typing import ClassVar, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ai_graph.audit import (
@@ -23,12 +22,6 @@ from ai_graph.audit import (
 )
 from ai_graph.audit_postgres import resolve_audit_sink
 from ai_graph.auth import RequireAuthenticatedUser, SessionResolver
-from ai_graph.token_auth import (
-    AccountTokenQuota,
-    AccountTokenResolver,
-    RequireUserIdentity,
-    RequireUserIdentityWithinQuota,
-)
 from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
     BOK_MACRO_VIEW,
@@ -37,6 +30,9 @@ from ai_graph.data_sources.db import (
     resolve_database_dsn_from_env,
 )
 from ai_graph.graph import run_analysis
+from ai_graph.job_events import JobEventBuffer
+from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
+from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.jobs import (
     AI_JOB_STORE_ENV,
     AnalysisJob,
@@ -44,20 +40,47 @@ from ai_graph.jobs import (
     AnalysisRunner,
     CancellationRegistry,
     JobStoreRuntime,
+    PERSISTENT_JOB_STORE_MODE,
     create_analysis_job_store_from_env,
     run_job_sync,
 )
-from ai_graph.job_events import JobEventBuffer
-from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
-from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.llm.role_calls import generate_strategy_description
-from ai_graph.nodes.daily_digest import MAX_DIGEST_STRATEGIES, build_daily_digest
+from ai_graph.llm.factory import live_provider_configuration_ready
+from ai_graph.preflight import (
+    SCOPE_REFUSAL_REASON,
+    UNSUPPORTED_SCOPE_REASON,
+    ResearchRequestPreflight,
+    classify_research_request,
+)
 from ai_graph.quant_performance import sanitize_public_backtest_performance
-from ai_graph.schemas import SCHEMA_VERSION
-from ai_graph.schemas import APIEnvelope, DailyDigestReport, DailyDigestStrategyInput, EnvelopeStatus, UserPayload
-
-ReportResolver = Callable[[str], APIEnvelope | None]
-
+from ai_graph.research_contract import (
+    CanonicalRuleV1,
+    DraftConflictV1,
+    DraftTokenValidationError,
+    InMemoryDraftNonceRegistry,
+    ParseReviewV1,
+    ResearchJobAcceptedV1,
+    ResearchResultV1,
+    RuleDraftSigner,
+    ScopeRefusalV1,
+    UnsupportedScopeV1,
+    build_rule_draft,
+    canonical_rule_execution_query,
+    unavailable_result_for_unverified_job,
+)
+from ai_graph.schemas import (
+    SCHEMA_VERSION,
+    APIEnvelope,
+    EnvelopeStatus,
+    UserPayload,
+)
+from ai_graph.token_auth import (
+    AccountTokenQuota,
+    AccountTokenResolver,
+    RequirePreflightIdentityReadOnly,
+    RequireUserIdentity,
+    RequireUserIdentityWithinQuota,
+)
 
 API_TITLE = "QuantAgent AI API"
 API_VERSION = "0.1.0"
@@ -65,6 +88,7 @@ API_DESCRIPTION = "Local MVP API surface for QuantAgent analysis jobs."
 DOCS_URL = "/docs"
 OPENAPI_URL = "/openapi.json"
 HEALTH_PATH = "/health"
+READINESS_PATH = "/readiness"
 API_STATUS_PATH = "/api-status"
 ANALYSIS_JOBS_PATH = "/analysis-jobs"
 ANALYSIS_JOB_DETAIL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}"
@@ -75,6 +99,8 @@ ANALYSIS_EVENT_POLL_SECONDS = 0.25
 # Idle gap after which a comment line is sent so intermediaries keep the stream open.
 ANALYSIS_EVENT_KEEPALIVE_SECONDS = 15.0
 SPEC_STRATEGY_PARSE_PATH = "/api/strategies/parse"
+RESEARCH_JOB_CREATE_PATH = "/api/research/jobs"
+RESEARCH_JOB_RESULT_PATH = f"{RESEARCH_JOB_CREATE_PATH}/{{job_id}}/result"
 STRATEGY_DESCRIPTIONS_PATH = "/api/strategies/descriptions"
 SPEC_ANALYSIS_JOB_DETAIL_PATH = "/api/analysis-jobs/{job_id}"
 SPEC_BACKTEST_DETAIL_PATH = "/api/backtests/{strategy_id}"
@@ -83,6 +109,10 @@ DAILY_DIGEST_PATH = "/ai/daily-digest"
 AI_CORS_ALLOW_ORIGINS_ENV = "AI_CORS_ALLOW_ORIGINS"
 CORS_ALLOW_METHODS = ["GET", "POST", "OPTIONS"]
 CORS_ALLOW_HEADERS = ["Authorization", "Content-Type"]
+RESEARCH_EXECUTION_ENABLED_ENV = "AI_RESEARCH_EXECUTION_ENABLED"
+READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
+REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
+ANALYSIS_JOBS_MIGRATION_REVISION = "021_ai_analysis_jobs"
 
 
 class CreateAnalysisJobRequest(BaseModel):
@@ -92,8 +122,8 @@ class CreateAnalysisJobRequest(BaseModel):
             "examples": [
                 {
                     "query": (
-                        "RSI가 30 이하로 떨어진 상장 종목을 사고, "
-                        "70 이상이면 팔고 싶어"
+                        "KRX 상장 종목 중 RSI가 30 이하이고 거래량이 "
+                        "20일 평균보다 큰 조건을 검토해 주세요."
                     )
                 }
             ]
@@ -101,6 +131,15 @@ class CreateAnalysisJobRequest(BaseModel):
     )
 
     query: str = Field(min_length=1)
+
+
+class ConfirmedResearchExecutionRequest(BaseModel):
+    """A signed canonical rule; raw natural-language input is never accepted here."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    canonical_rule: CanonicalRuleV1
+    draft_token: str = Field(min_length=32)
 
 
 class ParseStrategyRequest(BaseModel):
@@ -115,7 +154,7 @@ class ParseStrategyRequest(BaseModel):
     client_request_id: str | None = None
 
     @model_validator(mode="after")
-    def require_query_text(self) -> "ParseStrategyRequest":
+    def require_query_text(self) -> ParseStrategyRequest:
         if not self.request_text:
             raise ValueError("natural_language or query is required")
         return self
@@ -125,12 +164,52 @@ class ParseStrategyRequest(BaseModel):
         return (self.natural_language or self.query or "").strip()
 
 
-class CreateDailyDigestRequest(BaseModel):
-    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+PreflightRejectionResponse = ScopeRefusalV1 | UnsupportedScopeV1
 
-    user_name: str = Field(min_length=1)
-    report_date: str = Field(min_length=1)
-    strategies: list[DailyDigestStrategyInput] = Field(min_length=1, max_length=MAX_DIGEST_STRATEGIES)
+
+def _preflight_rejection_response(
+    decision: ResearchRequestPreflight,
+) -> JSONResponse | None:
+    if decision.allowed:
+        return None
+    if decision.reason_code == UNSUPPORTED_SCOPE_REASON:
+        response: PreflightRejectionResponse = UnsupportedScopeV1(
+            reason_code=UNSUPPORTED_SCOPE_REASON,
+            explanation=decision.public_message,
+            general_example=decision.public_example,
+            guidance=decision.public_guidance,
+        )
+    else:
+        response = ScopeRefusalV1(
+            reason_code=SCOPE_REFUSAL_REASON,
+            explanation=decision.public_message,
+            general_example=decision.public_example,
+            guidance=decision.public_guidance,
+        )
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content=response.model_dump(),
+    )
+
+
+def _draft_conflict_response(code: str) -> JSONResponse:
+    allowed_codes = {
+        "draft_invalid",
+        "draft_expired",
+        "draft_user_mismatch",
+        "draft_rule_mismatch",
+        "draft_replayed",
+    }
+    reason_code = code if code in allowed_codes else "draft_invalid"
+    response = DraftConflictV1(
+        reason_code=reason_code,
+        explanation="검토한 규칙 초안이 변경되었거나 더 이상 유효하지 않습니다.",
+        guidance="규칙을 다시 검토한 뒤 새 초안으로 실행해 주세요.",
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(),
+    )
 
 
 class StrategyDescriptionInput(BaseModel):
@@ -173,12 +252,40 @@ class HealthResponse(BaseModel):
     schema_version: str
 
 
+class ReadinessCheck(BaseModel):
+    """One non-secret release dependency result."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    name: Literal[
+        "durable_job_store",
+        "migration_revision",
+        "ai_contract_version",
+        "rule_draft_signer",
+        "provider_config",
+    ]
+    ready: bool
+    reason: str | None = None
+
+
+class ReadinessResponse(BaseModel):
+    """Fail-closed admission status for a deployable AI release."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    status: Literal["ready", "unavailable"]
+    contract_version: str = READINESS_CONTRACT_VERSION
+    migration_revision: str = ANALYSIS_JOBS_MIGRATION_REVISION
+    ai_contract_version: str
+    checks: list[ReadinessCheck]
+
+
 class EndpointStatus(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
     method: Literal["GET", "POST"]
     path: str
-    state: Literal["available", "local_sync", "job_store"]
+    state: Literal["available", "local_sync", "job_store", "readiness", "retired"]
     summary: str
 
 
@@ -356,10 +463,13 @@ def create_app(
     analysis_runner: AnalysisRunner = run_analysis,
     job_store_runtime: JobStoreRuntime | None = None,
     audit_sink: AuditSink | None = None,
-    report_resolver: ReportResolver | None = None,
     session_resolver: SessionResolver | None = None,
     account_token_resolver: AccountTokenResolver | None = None,
     account_token_quota: AccountTokenQuota | None = None,
+    rule_draft_signer: RuleDraftSigner | None = None,
+    draft_nonce_registry: InMemoryDraftNonceRegistry | None = None,
+    research_execution_enabled: bool | None = None,
+    readiness_migration_probe: Callable[[], bool] | None = None,
 ) -> FastAPI:
     runtime = job_store_runtime or _job_store_runtime(job_store)
     store = runtime.store
@@ -373,6 +483,11 @@ def create_app(
     )
     require_user_within_quota = RequireUserIdentityWithinQuota(
         require_user, quota=account_token_quota
+    )
+    require_preflight_user = RequirePreflightIdentityReadOnly(
+        session_requirement=RequireAuthenticatedUser(session_resolver),
+        token_resolver=account_token_resolver,
+        quota=account_token_quota,
     )
     app = FastAPI(
         title=API_TITLE,
@@ -395,11 +510,34 @@ def create_app(
     app.state.job_events = JobEventBuffer()
     app.state.job_cancellations = CancellationRegistry()
     app.state.audit_sink = resolve_audit_sink(audit_sink)
-    app.state.report_resolver = report_resolver
+    app.state.rule_draft_signer = rule_draft_signer or RuleDraftSigner.from_env()
+    app.state.draft_nonce_registry = draft_nonce_registry or InMemoryDraftNonceRegistry()
+    app.state.research_execution_enabled = (
+        research_execution_enabled
+        if research_execution_enabled is not None
+        else _research_execution_enabled()
+    )
+    migration_probe = readiness_migration_probe or _analysis_jobs_migration_is_current
 
     @app.get(HEALTH_PATH, response_model=HealthResponse, tags=["System"])
     def health() -> HealthResponse:
         return HealthResponse(status="ok", schema_version=SCHEMA_VERSION)
+
+    @app.get(
+        READINESS_PATH,
+        response_model=ReadinessResponse,
+        responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ReadinessResponse}},
+        tags=["System"],
+    )
+    def readiness(response: Response) -> ReadinessResponse:
+        result = _release_readiness(
+            runtime,
+            migration_probe=migration_probe,
+            rule_draft_signer=app.state.rule_draft_signer,
+        )
+        if result.status == "unavailable":
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return result
 
     @app.get(API_STATUS_PATH, response_model=APIStatusResponse, tags=["System"])
     def api_status() -> APIStatusResponse:
@@ -418,12 +556,14 @@ def create_app(
         response_model=AnalysisJob,
         status_code=status.HTTP_201_CREATED,
         tags=["Analysis Jobs"],
+        responses={status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": PreflightRejectionResponse}},
     )
-    def create_analysis_job(
+    async def create_analysis_job(
         request: CreateAnalysisJobRequest,
         background_tasks: BackgroundTasks,
-        user_id: str = Depends(require_user_within_quota),
-    ) -> AnalysisJob:
+        http_request: Request,
+        user_id: str = Depends(require_preflight_user),
+    ) -> AnalysisJob | JSONResponse:
         """Queue the analysis and return the job immediately.
 
         Against a live provider the graph runs for minutes - far past any reverse
@@ -433,6 +573,10 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
+        scope_response = _preflight_rejection_response(classify_research_request(request.query))
+        if scope_response is not None:
+            return scope_response
+        await require_preflight_user.consume_quota_after_preflight(http_request)
         job = store.create_job(request.query, user_id=user_id)
         background_tasks.add_task(
             run_job_sync,
@@ -557,34 +701,99 @@ def create_app(
 
     @app.post(
         SPEC_STRATEGY_PARSE_PATH,
-        response_model=AnalysisJob,
-        status_code=status.HTTP_201_CREATED,
-        tags=["Spec Compatibility"],
+        response_model=ParseReviewV1,
+        status_code=status.HTTP_200_OK,
+        tags=["Research Rule Review"],
+        responses={status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": PreflightRejectionResponse}},
     )
-    def parse_strategy(
+    async def parse_strategy(
         request: ParseStrategyRequest,
-        user_id: str = Depends(require_user_within_quota),
-    ) -> AnalysisJob:
-        job = store.create_job(
-            request.request_text,
+        user_id: str = Depends(require_preflight_user),
+    ) -> ParseReviewV1 | JSONResponse:
+        scope_response = _preflight_rejection_response(classify_research_request(request.request_text))
+        if scope_response is not None:
+            return scope_response
+        signer = app.state.rule_draft_signer
+        if signer is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Research rule review is temporarily unavailable.",
+            )
+        return build_rule_draft(
+            query=request.request_text,
             user_id=user_id,
-            strategy_id=request.strategy_id,
-            run_id=request.client_request_id,
+            signer=signer,
         )
-        return _public_job(run_job_sync(
+
+    @app.post(
+        RESEARCH_JOB_CREATE_PATH,
+        response_model=ResearchJobAcceptedV1,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Research Execution"],
+        responses={
+            status.HTTP_409_CONFLICT: {"model": DraftConflictV1},
+        },
+    )
+    async def create_confirmed_research_job(
+        request: ConfirmedResearchExecutionRequest,
+        background_tasks: BackgroundTasks,
+        http_request: Request,
+        user_id: str = Depends(require_preflight_user),
+    ) -> ResearchJobAcceptedV1 | JSONResponse:
+        signer = app.state.rule_draft_signer
+        if signer is None or not app.state.research_execution_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Research execution is not activated until operational evidence is available.",
+            )
+        if not request.canonical_rule.is_executable:
+            return _draft_conflict_response("draft_rule_mismatch")
+        try:
+            nonce = signer.verify(
+                token=request.draft_token,
+                rule=request.canonical_rule,
+                user_id=user_id,
+            )
+        except DraftTokenValidationError as exc:
+            return _draft_conflict_response(exc.code)
+        if not app.state.draft_nonce_registry.consume(user_id=user_id, nonce=nonce):
+            return _draft_conflict_response("draft_replayed")
+        await require_preflight_user.consume_quota_after_preflight(http_request)
+        job = store.create_job(
+            canonical_rule_execution_query(request.canonical_rule),
+            user_id=user_id,
+        )
+        background_tasks.add_task(
+            run_job_sync,
             store,
             job.job_id,
             _build_analysis_runner_with_audit(
                 analysis_runner,
                 audit_sink=app.state.audit_sink,
                 trace_id=job.trace_id,
-                entrypoint="api.strategy_parse",
-                feature="strategy_parse",
-                strategy_id=request.strategy_id,
-                client_request_id=request.client_request_id,
+                entrypoint="api.research_jobs",
+                feature="research_job",
                 user_id=user_id,
             ),
-        ))
+            events=app.state.job_events,
+            cancellations=app.state.job_cancellations,
+        )
+        return ResearchJobAcceptedV1(job_id=job.job_id)
+
+    @app.get(
+        RESEARCH_JOB_RESULT_PATH,
+        response_model=ResearchResultV1,
+        tags=["Research Execution"],
+    )
+    def get_research_job_result(
+        job_id: str,
+        user_id: str = Depends(require_user),
+    ) -> ResearchResultV1:
+        if _owned_job(store, job_id, user_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research job not found")
+        # This remains unavailable until result/lifecycle owners attach a durable result
+        # identity and verified PostgreSQL EOD provenance to the completed job.
+        return unavailable_result_for_unverified_job(job_id=job_id)
 
     @app.post(
         STRATEGY_DESCRIPTIONS_PATH,
@@ -688,81 +897,32 @@ def create_app(
 
     @app.get(
         SPEC_REPORT_DETAIL_PATH,
-        response_model=APIEnvelope,
-        tags=["Spec Compatibility"],
+        tags=["Retired"],
     )
-    def get_report(report_id: str, user_id: str = Depends(require_user)) -> APIEnvelope:
-        job = (
-            _owned_job(store, report_id, user_id)
-            or _find_job_by_report_id(store, report_id, user_id)
-            or _find_job_by_trace_or_debug_ref(store, report_id, user_id)
-        )
-        result = _public_envelope(job.result) if job and job.result else None
-        if result and result.user_payload.report is not None:
-            return result
-        resolver = app.state.report_resolver
-        if resolver is not None:
-            resolved = _public_envelope(resolver(report_id))
-            if resolved is not None and resolved.user_payload.report is not None:
-                return resolved
-        return _not_found_envelope(
-            resource_type="report",
-            resource_id=report_id,
-            message="No completed analysis job with report projection was found.",
+    def get_report(report_id: str) -> None:
+        """Keep public report delivery on the backend-owned immutable snapshot path."""
+
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail={
+                "code": "mutable_ai_report_projection_retired",
+                "message": "요청형 리포트는 보관된 읽기 전용 스냅샷에서만 제공합니다.",
+                "read_only_alternative": "/api/v1/reports",
+            },
         )
 
     @app.post(
         DAILY_DIGEST_PATH,
-        response_model=DailyDigestReport,
-        status_code=status.HTTP_201_CREATED,
-        tags=["Daily Digest"],
+        tags=["Retired"],
     )
-    def create_daily_digest(request: CreateDailyDigestRequest) -> DailyDigestReport:
-        session = _open_request_audit_session(
-            app.state.audit_sink,
-            trace_id=None,
-            entrypoint="api.daily_digest",
-            feature="daily_digest",
+    def create_daily_digest() -> None:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail={
+                "code": "daily_digest_retired",
+                "message": "정기 다이제스트 생성은 현재 제공하지 않습니다.",
+            },
         )
-        _record_step(session, "daily_digest_started", message=f"strategy_count={len(request.strategies)}")
-        try:
-            with bind_audit_context(session):
-                report = build_daily_digest(
-                    request.strategies,
-                    user_name=request.user_name,
-                    report_date=request.report_date,
-                )
-        except ValueError as exc:
-            _record_error(
-                session,
-                "daily_digest_validation",
-                error_type="ValueError",
-                message="ValueError raised during daily digest generation",
-            )
-            _record_finalization(session, "failed", message="daily digest generation failed")
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
-        except Exception as exc:
-            _record_error(
-                session,
-                "daily_digest_generation",
-                error_type=type(exc).__name__,
-                message=f"{type(exc).__name__} raised during daily digest generation",
-            )
-            _record_finalization(session, "failed", message="daily digest generation failed")
-            raise
-        for card in report.strategy_cards:
-            _record_step(
-                session,
-                "daily_digest_card_ready",
-                message=f"strategy_id={card.strategy_id} today_signal={card.today_signal}",
-            )
-        _record_step(
-            session,
-            "daily_digest_market_brief",
-            message=f"fallback_used={'true' if report.market_brief.fallback_reasons else 'false'}",
-        )
-        _record_finalization(session, "completed", message=f"generated daily digest for {len(report.strategy_cards)} strategies")
-        return report
 
     return app
 
@@ -774,6 +934,12 @@ def _endpoint_statuses() -> list[EndpointStatus]:
             path=HEALTH_PATH,
             state="available",
             summary="Service health and schema version.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=READINESS_PATH,
+            state="readiness",
+            summary="Fail-closed durable store, migration, and AI contract admission.",
         ),
         EndpointStatus(
             method="GET",
@@ -802,8 +968,20 @@ def _endpoint_statuses() -> list[EndpointStatus]:
         EndpointStatus(
             method="POST",
             path=SPEC_STRATEGY_PARSE_PATH,
+            state="available",
+            summary="Deterministic research-rule review; it never creates an analysis job.",
+        ),
+        EndpointStatus(
+            method="POST",
+            path=RESEARCH_JOB_CREATE_PATH,
             state="local_sync",
-            summary="Compatibility adapter for POST /api/strategies/parse.",
+            summary="Create a job only from a signed research rule when activation is explicitly enabled.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=RESEARCH_JOB_RESULT_PATH,
+            state="job_store",
+            summary="Read the safe ResearchResultV1 projection for an owned research job.",
         ),
         EndpointStatus(
             method="POST",
@@ -826,14 +1004,14 @@ def _endpoint_statuses() -> list[EndpointStatus]:
         EndpointStatus(
             method="GET",
             path=SPEC_REPORT_DETAIL_PATH,
-            state="job_store",
-            summary="MVP adapter returning the latest matching job envelope with report projection.",
+            state="retired",
+            summary="Retired mutable report projection; use backend-owned read-only report snapshots.",
         ),
         EndpointStatus(
             method="POST",
             path=DAILY_DIGEST_PATH,
-            state="local_sync",
-            summary="Compose the up-to-3-strategy daily email digest (comparison table, cards, AI comment, market brief).",
+            state="retired",
+            summary="Retired daily digest endpoint; no audit, LLM, or subscription work is available.",
         ),
     ]
 
@@ -841,6 +1019,11 @@ def _endpoint_statuses() -> list[EndpointStatus]:
 def _cors_allow_origins() -> list[str]:
     raw_origins = environ.get(AI_CORS_ALLOW_ORIGINS_ENV, "")
     return [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+
+
+def _research_execution_enabled() -> bool:
+    raw = (environ.get(RESEARCH_EXECUTION_ENABLED_ENV) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _data_source_status() -> DataSourceStatus:
@@ -855,6 +1038,100 @@ def _data_source_status() -> DataSourceStatus:
         macro_usable=False,
         fallback_when_unset="fixture",
     )
+
+
+def _release_readiness(
+    runtime: JobStoreRuntime,
+    *,
+    migration_probe: Callable[[], bool],
+    rule_draft_signer: RuleDraftSigner | None,
+) -> ReadinessResponse:
+    durable_store_ready = (
+        runtime.requested_mode == PERSISTENT_JOB_STORE_MODE
+        and runtime.active_mode == PERSISTENT_JOB_STORE_MODE
+        and not runtime.fallback
+        and runtime.dsn_configured
+    )
+    migration_ready = False
+    if durable_store_ready:
+        try:
+            migration_ready = bool(migration_probe())
+        except Exception:  # noqa: BLE001 - readiness must not leak dependency internals.
+            migration_ready = False
+    contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
+    rule_draft_signer_ready = rule_draft_signer is not None
+    provider_config_ready, provider_reason = live_provider_configuration_ready(environ)
+    checks = [
+        ReadinessCheck(
+            name="durable_job_store",
+            ready=durable_store_ready,
+            reason=None if durable_store_ready else "durable_job_store_required",
+        ),
+        ReadinessCheck(
+            name="migration_revision",
+            ready=migration_ready,
+            reason=None if migration_ready else "migration_revision_required",
+        ),
+        ReadinessCheck(
+            name="ai_contract_version",
+            ready=contract_ready,
+            reason=None if contract_ready else "ai_contract_version_mismatch",
+        ),
+        ReadinessCheck(
+            name="rule_draft_signer",
+            ready=rule_draft_signer_ready,
+            reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
+        ),
+        ReadinessCheck(
+            name="provider_config",
+            ready=provider_config_ready,
+            reason=provider_reason,
+        ),
+    ]
+    return ReadinessResponse(
+        status="ready" if all(check.ready for check in checks) else "unavailable",
+        ai_contract_version=SCHEMA_VERSION,
+        checks=checks,
+    )
+
+
+def _analysis_jobs_migration_is_current() -> bool:
+    """Check the durable-job schema signature without returning connection details."""
+
+    dsn, _ = resolve_database_dsn_from_env()
+    if dsn is None:
+        return False
+    try:
+        import psycopg
+
+        with psycopg.connect(dsn, connect_timeout=3) as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    to_regclass('app.ai_analysis_job') IS NOT NULL,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'app'
+                          AND table_name = 'ai_analysis_job'
+                          AND column_name = 'execution_manifest_schema_version'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conname = 'ai_analysis_job_execution_manifest_v1_check'
+                          AND conrelid = 'app.ai_analysis_job'::regclass
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_class
+                        WHERE relname = 'idx_ai_analysis_job_execution_manifest_schema'
+                    )
+                """
+            ).fetchone()
+    except Exception:  # noqa: BLE001 - readiness intentionally exposes only a bounded reason.
+        return False
+    return bool(row and all(row))
 
 
 def _job_store_runtime(job_store: AnalysisJobStore | None) -> JobStoreRuntime:

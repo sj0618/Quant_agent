@@ -10,7 +10,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from quant_agent.data.indicators.catalog import INDICATOR_CATALOG, IndicatorDefinition, validate_catalog_counts
+from quant_agent.data.indicators.catalog import (
+    INDICATOR_CATALOG,
+    IndicatorDefinition,
+    validate_catalog_counts,
+)
 
 
 class MissingTalibError(RuntimeError):
@@ -51,7 +55,7 @@ def compute_symbol_indicator_rows(
         "real0": frame["high"].to_numpy(dtype=float),
         "real1": frame["low"].to_numpy(dtype=float),
     }
-    requested = definitions or INDICATOR_CATALOG
+    requested = INDICATOR_CATALOG if definitions is None else definitions
     values_by_category_date: dict[str, dict[date, dict[str, Any]]] = defaultdict(lambda: defaultdict(dict))
     errors_by_category_date: dict[str, dict[date, list[str]]] = defaultdict(lambda: defaultdict(list))
 
