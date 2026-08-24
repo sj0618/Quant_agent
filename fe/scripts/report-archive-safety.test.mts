@@ -8,7 +8,10 @@ import type { ArchivedReportDetail } from "../src/types/quantagent.ts";
 
 type ReportDetailModule = typeof import("../src/features/reports/ReportDetail.tsx");
 
-const archivedReport = (contentSections: ArchivedReportDetail["contentSections"]): ArchivedReportDetail => ({
+const archivedReport = (
+  contentSections: ArchivedReportDetail["contentSections"],
+  overrides: Partial<ArchivedReportDetail> = {},
+): ArchivedReportDetail => ({
   id: "archive-001",
   date: "2026.08.24",
   weekday: "월요일",
@@ -16,6 +19,7 @@ const archivedReport = (contentSections: ArchivedReportDetail["contentSections"]
   status: "delivered",
   createdAt: "2026-08-24T07:05:00Z",
   contentSections,
+  ...overrides,
 });
 
 async function renderArchive(report: ArchivedReportDetail) {
@@ -107,4 +111,23 @@ test("an archived result explains that minimum-input sufficiency cannot be reval
   assert.match(markup, /제공하지 않음/);
   assert.match(markup, /href="\/reports"/);
   assert.doesNotMatch(markup, /<dd>(?:BUY|SELL|HOLD|매수|매도)<\/dd>/u);
+});
+
+test("archive readers show only the explicit record timestamp and disclose an unverified absence", async () => {
+  const explicitTimestampMarkup = await renderArchive(archivedReport([], {
+    createdAt: "2026-08-24T07:05:00Z",
+    sentAt: "2026-08-24T07:06:00Z",
+    publishedAt: "2026-08-24T07:07:00Z",
+    updatedAt: "2026-08-24T07:08:00Z",
+  }));
+  const unknownTimestampMarkup = await renderArchive(archivedReport([], {
+    createdAt: undefined,
+    sentAt: "2026-08-24T07:06:00Z",
+    publishedAt: "2026-08-24T07:07:00Z",
+    updatedAt: "2026-08-24T07:08:00Z",
+  }));
+
+  assert.match(explicitTimestampMarkup, /<dt>보관 기록 시각<\/dt><dd>2026-08-24T07:05:00Z<\/dd>/u);
+  assert.match(unknownTimestampMarkup, /<dt>보관 기록 시각<\/dt><dd>보관 기록 시각 미확인<\/dd>/u);
+  assert.doesNotMatch(unknownTimestampMarkup, /<dt>보관 기록 시각<\/dt><dd>2026-08-24T07:0[678]:00Z<\/dd>/u);
 });

@@ -1,5 +1,5 @@
 import { ROUTES } from "../config/routes";
-import { backendRequest } from "./backendClient";
+import { archiveTimestamp } from "../features/reports/reportArchive";
 import type { ArchivedReportDetail, ArchivedReportSummary, PerformanceSummary } from "../types/quantagent";
 import { downloadTextFile, toCsvValue } from "../utils/download";
 
@@ -8,7 +8,7 @@ export function downloadReportsCsv(reports: ArchivedReportSummary[]) {
   const rows = reports.map((report) => [
     report.id,
     report.date,
-    report.createdAt ?? report.publishedAt ?? report.sentAt,
+    archiveTimestamp(report),
     report.status,
   ]);
   const csv = [header, ...rows].map((row) => row.map(toCsvValue).join(",")).join("\n");
@@ -30,12 +30,6 @@ export async function copyReportShareLink(reportId: string) {
   const url = `${window.location.origin}${ROUTES.reportDetail(reportId)}`;
   await window.navigator.clipboard.writeText(url);
   return url;
-}
-
-export async function resendReportEmail(reportId: string) {
-  await backendRequest<void>(`/reports/${encodeURIComponent(reportId)}/resend`, {
-    method: "POST",
-  });
 }
 
 export function buildReportPrintTitle(report: ArchivedReportDetail | ArchivedReportSummary) {

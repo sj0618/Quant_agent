@@ -3,11 +3,11 @@ import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
 
-test("browser exposes rule-reviewed research without reviving the legacy analysis client", async () => {
-  const [clientSource, appSource, activitySource] = await Promise.all([
+test("browser exposes rule-reviewed research without retaining legacy job/run or SSE sources", async () => {
+  const [clientSource, appSource, configSource] = await Promise.all([
     readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/api/analysisActivity.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/config/appConfig.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(clientSource, /backendRequest/);
@@ -19,7 +19,14 @@ test("browser exposes rule-reviewed research without reviving the legacy analysi
   assert.match(appSource, /ResearchWorkspace/);
   assert.doesNotMatch(appSource, /매수|매도|보유|추천|BUY|SELL|HOLD/);
   assert.doesNotMatch(appSource, /StrategyInputPanel|useAnalysisActivity|analysis-jobs/);
-  assert.match(activitySource, /analysisJobEvents/);
+  assert.match(configSource, /researchRuleReview: "\/api\/strategies\/parse"/);
+  assert.match(configSource, /researchJobs: "\/api\/research\/jobs"/);
+  assert.match(configSource, /researchJobResult: \(id: string\) => `\/api\/research\/jobs\/\$\{encodeURIComponent\(id\)\}\/result`/);
+  assert.doesNotMatch(configSource, /analysis-jobs|analysis-runs|analysisJob|strategyDescriptions/);
+  await Promise.all([
+    assert.rejects(access(new URL("../src/api/analysisActivity.ts", import.meta.url))),
+    assert.rejects(access(new URL("../src/features/app/DebateActivityPanel.tsx", import.meta.url))),
+  ]);
 });
 
 test("retained legacy preview cannot create analysis jobs or runs", async () => {

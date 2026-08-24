@@ -33,7 +33,7 @@ function parseDate(value: string) {
 }
 
 function getReportDate(report: ArchivedReportSummary) {
-  return parseDate(report.date) ?? parseDate(report.publishedAt ?? "") ?? parseDate(report.createdAt ?? "") ?? parseDate(report.sentAt ?? "");
+  return parseDate(report.createdAt ?? "");
 }
 
 function diffDays(from: Date, to: Date) {
@@ -65,10 +65,13 @@ export function applyReportFilters(reports: ArchivedReportSummary[], filters: Re
 
   return reports.filter((report) => {
     const reportDate = getReportDate(report);
-    if (!reportDate) return false;
-    if (latestDate && filters.range !== "all" && diffDays(reportDate, latestDate) >= Number(filters.range)) return false;
-    if (startDate && reportDate < startDate) return false;
-    if (endDate && reportDate > endDate) return false;
+    const hasDateConstraint = filters.range !== "all" || startDate !== null || endDate !== null;
+    if (!reportDate && hasDateConstraint) return false;
+    if (reportDate) {
+      if (latestDate && filters.range !== "all" && diffDays(reportDate, latestDate) >= Number(filters.range)) return false;
+      if (startDate && reportDate < startDate) return false;
+      if (endDate && reportDate > endDate) return false;
+    }
     return true;
   });
 }

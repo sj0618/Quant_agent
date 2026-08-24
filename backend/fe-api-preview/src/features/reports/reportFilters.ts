@@ -28,7 +28,7 @@ function parseDate(value: string) {
 }
 
 function getReportDate(report: ReportSummary) {
-  return parseDate(report.id);
+  return parseDate(report.createdAt ?? "");
 }
 
 function diffDays(from: Date, to: Date) {
@@ -76,10 +76,13 @@ export function applyReportFilters(reports: ReportSummary[], filters: ReportFilt
 
   return reports.filter((report) => {
     const reportDate = getReportDate(report);
-    if (!reportDate) return false;
-    if (latestDate && filters.range !== "all" && diffDays(reportDate, latestDate) >= Number(filters.range)) return false;
-    if (startDate && reportDate < startDate) return false;
-    if (endDate && reportDate > endDate) return false;
+    const hasDateConstraint = filters.range !== "all" || startDate !== null || endDate !== null;
+    if (!reportDate && hasDateConstraint) return false;
+    if (reportDate) {
+      if (latestDate && filters.range !== "all" && diffDays(reportDate, latestDate) >= Number(filters.range)) return false;
+      if (startDate && reportDate < startDate) return false;
+      if (endDate && reportDate > endDate) return false;
+    }
     if (filters.strategyName !== "all" && report.strategyName !== filters.strategyName) return false;
     if (Number(report.recommendationScore) < filters.minScore) return false;
     if (!SIGNALS.some((signal) => filters.signals[signal] && report.signals[signal] > 0)) return false;

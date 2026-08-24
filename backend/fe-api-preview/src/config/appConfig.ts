@@ -4,10 +4,6 @@ export const AUTH_ENDPOINTS = {
   logout: "/auth/logout",
 } as const;
 
-export const REPORT_ACTION_ENDPOINTS = {
-  resend: (id: string) => `/reports/${encodeURIComponent(id)}/resend`,
-} as const;
-
 function trimTrailingSlash(value: string | undefined) {
   return value ? value.replace(/\/+$/, "") : "";
 }
@@ -27,5 +23,4 @@ function authApiBaseUrl() {
 export const appConfig = {
   backendApiBaseUrl: backendApiBaseUrl(),
   authApiBaseUrl: authApiBaseUrl(),
-  reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL) || backendApiBaseUrl(),
 } as const;

@@ -4,6 +4,7 @@ import { PublicClaimDisclosure } from "../../components/common/PublicClaimDisclo
 import { ResultTrustLinks } from "../../components/common/ResultTrustLinks";
 import { ROUTES } from "../../config/routes";
 import type { ArchivedReportDetail, PersistedReportEntry, PersistedReportSection } from "../../types/quantagent";
+import { archiveTimestamp } from "./reportArchive";
 
 interface ReportDetailProps {
   report: ArchivedReportDetail;
@@ -103,6 +104,7 @@ function hasUnsafeEvidenceText(value: string | null | undefined) {
  */
 export function ReportDetail({ report }: ReportDetailProps) {
   const { sections: evidenceSections, hasUnavailableEvidence } = readerEvidenceSections(report);
+  const archivedAt = archiveTimestamp(report);
   const version = report.updatedAt ?? report.publishedAt ?? report.createdAt ?? null;
 
   return (
@@ -116,7 +118,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
           <h3>결과 보관 기록</h3>
           <dl>
             <div><dt>결과 ID</dt><dd>{report.id}</dd></div>
-            <div><dt>생성 시각</dt><dd>{report.createdAt ?? report.publishedAt ?? report.sentAt ?? "미확인"}</dd></div>
+            <div><dt>보관 기록 시각</dt><dd>{archivedAt}</dd></div>
             <div><dt>상태</dt><dd>{statusLabel(report.status)}</dd></div>
           </dl>
         </Card>

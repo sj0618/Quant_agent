@@ -34,7 +34,6 @@ Figma MCP에서 확인한 순수 `HI-FI ·` 프레임 기준의 React + TypeScri
 |---|---|
 | `VITE_AI_API_BASE_URL` | production 빌드에서만 적용되는 AI API base URL (`/ai-api`는 dev에서 고정)
 | `VITE_AUTH_API_BASE_URL` | Google OAuth 시작/콜백/로그아웃 API base URL |
-| `VITE_REPORT_ACTION_API_BASE_URL` | 리포트 이메일 재발송 API base URL |
 | `VITE_STRATEGY_API_BASE_URL` | 전략 저장/분석 실행 API base URL |
 
 ## FE 설치

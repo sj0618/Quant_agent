@@ -3,6 +3,7 @@ import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
 import { ROUTES } from "../../config/routes";
 import type { ArchivedReportSummary } from "../../types/quantagent";
+import { archiveTimestamp } from "./reportArchive";
 import { DEFAULT_REPORT_FILTERS, type ReportFilters, type ReportRange } from "./reportFilters";
 
 interface ReportListProps {
@@ -71,7 +72,7 @@ export function ReportList({ filters, onApplyFilters, onResetFilters, reports }:
             <a className="report-row" href={ROUTES.reportDetail(report.id)} key={report.id}>
               <div className="report-row__date">
                 <strong>{report.date || "기준일 미확인"}</strong>
-                <span>{report.sentAt || report.createdAt || "생성 시각 미확인"}</span>
+                <span>보관 기록 시각: {archiveTimestamp(report)}</span>
               </div>
               <div className="report-row__content">
                 <strong>읽기 전용 결과 스냅샷</strong>

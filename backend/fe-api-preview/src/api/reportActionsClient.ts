@@ -1,29 +1,31 @@
-import { REPORT_ACTION_ENDPOINTS, appConfig } from "../config/appConfig";
 import { ROUTES } from "../config/routes";
 import type { PerformanceSummary, ReportDetail, ReportSummary } from "../types/quantagent";
-import { recordDataSource } from "./dataSourceClient";
 import { downloadTextFile, toCsvValue } from "../utils/download";
 
-function assertOk(response: Response) {
-  if (!response.ok) {
-    throw new Error(`리포트 액션 서버 응답 실패: ${response.status}`);
-  }
+export const ARCHIVE_TIMESTAMP_UNKNOWN = "보관 기록 시각 미확인";
+
+/**
+ * This retained preview may show only the explicit record timestamp as the
+ * archive timestamp. Delivery, business, publication, and update times are
+ * not substitutes for an absent archive record.
+ */
+export function archiveTimestamp(report: Pick<ReportSummary, "createdAt">) {
+  return report.createdAt ?? ARCHIVE_TIMESTAMP_UNKNOWN;
 }
 
-export function downloadReportsCsv(reports: ReportSummary[]) {
-  const header = ["id", "date", "strategy", "score", "buy", "hold", "drop", "summary"];
+export function buildReportsCsv(reports: ReportSummary[]) {
+  const header = ["result_id", "archived_date", "created_at", "status"];
   const rows = reports.map((report) => [
     report.id,
     report.date,
-    report.strategyName,
-    report.recommendationScore,
-    report.signals.BUY,
-    report.signals.HOLD,
-    report.signals.DROP,
-    report.summary,
+    archiveTimestamp(report),
+    report.status,
   ]);
-  const csv = [header, ...rows].map((row) => row.map(toCsvValue).join(",")).join("\n");
-  downloadTextFile("quantagent-reports.csv", csv, "text/csv;charset=utf-8");
+  return [header, ...rows].map((row) => row.map(toCsvValue).join(",")).join("\n");
+}
+
+export function downloadReportsCsv(reports: ReportSummary[]) {
+  downloadTextFile("quantagent-reports.csv", buildReportsCsv(reports), "text/csv;charset=utf-8");
 }
 
 export function downloadPerformanceCsv(performance: PerformanceSummary) {
@@ -41,19 +43,6 @@ export async function copyReportShareLink(reportId: string) {
   const url = `${window.location.origin}${ROUTES.reportDetail(reportId)}`;
   await window.navigator.clipboard.writeText(url);
   return url;
-}
-
-export async function resendReportEmail(reportId: string) {
-  if (!appConfig.reportActionApiBaseUrl) {
-    throw new Error("VITE_REPORT_ACTION_API_BASE_URL 설정이 필요합니다.");
-  }
-
-  const response = await fetch(`${appConfig.reportActionApiBaseUrl}${REPORT_ACTION_ENDPOINTS.resend(reportId)}`, {
-    method: "POST",
-    credentials: "include",
-  });
-  assertOk(response);
-  recordDataSource({ key: "reportResend", path: REPORT_ACTION_ENDPOINTS.resend(reportId), source: "server", status: response.status });
 }
 
 export function buildReportPrintTitle(report: ReportDetail | ReportSummary) {
