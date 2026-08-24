@@ -7,6 +7,8 @@ import os
 import time
 from types import SimpleNamespace
 
+import math
+
 import pytest
 
 from ai_graph.nodes import backtest as backtest_node
@@ -124,8 +126,16 @@ def test_generic_rolling_features_are_prior_only_and_ignore_missing_values() -> 
     maximum = store._rolling_metric("factor", 2, "max")
     last = store._rolling_metric("factor", 2, "last")
 
-    assert list(average[1:]) == [1.0, 1.0, 3.0]
-    assert list(maximum[1:]) == [1.0, 1.0, 3.0]
+    # Bar 1 has one prior bar against a two-bar window, so the window has not elapsed
+    # and the aggregates do not exist yet - QV-WRM-01. They used to report the single
+    # prior value under the two-bar name. From bar 2 the window has elapsed and the
+    # missing `factor` inside it is still ignored rather than poisoning the result,
+    # which is what this test was written to protect.
+    assert math.isnan(average[1])
+    assert list(average[2:]) == [1.0, 3.0]
+    assert math.isnan(maximum[1])
+    assert list(maximum[2:]) == [1.0, 3.0]
+    # `last` is a lookback, not a windowed aggregate: one prior bar is all it needs.
     assert list(last[1:]) == [1.0, 1.0, 3.0]
 
 

@@ -1897,7 +1897,17 @@ class PreparedFeatureStore:
                 for local_index, global_index in enumerate(indices):
                     start = max(0, local_index - window)
                     count = int(counts[local_index] - counts[start])
-                    if count:
+                    # A window is only itself once `window` prior bars have passed.
+                    # This said `if count:`, so one prior bar was enough: a 20-day
+                    # average reported the previous close under its own name on bar two,
+                    # and a rule written against it fired on a number nobody measured.
+                    #
+                    # The gate counts bars, not finite values, so a window that has
+                    # elapsed but carries a gap still averages what it does have. Those
+                    # are different failures: too little history is a warm-up problem,
+                    # a hole in elapsed history is a data problem, and only the first
+                    # one means the indicator does not exist yet.
+                    if local_index >= window and count:
                         total = float(totals[local_index] - totals[start])
                         output[global_index] = (
                             total / count if normalized_aggregate == "avg" else total
@@ -1919,6 +1929,14 @@ class PreparedFeatureStore:
                 while candidates and candidates[0] < oldest:
                     candidates.popleft()
                 if not candidates:
+                    continue
+                # `max` and `min` are windowed extremes and need the full window, or a
+                # breakout fires on bar two against a one-day "high". `last` is a
+                # lookback, not an aggregate - it reads the most recent prior value and
+                # the window only bounds how stale that may be - so warm-up does not
+                # apply to it. The deque is maintained above the guard so the window
+                # stays correct for the bars that follow.
+                if normalized_aggregate != "last" and local_index < window:
                     continue
                 selected = candidates[-1] if normalized_aggregate == "last" else candidates[0]
                 output[global_index] = float(values[selected])
