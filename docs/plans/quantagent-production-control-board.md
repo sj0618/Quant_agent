@@ -92,11 +92,11 @@
 
 ## 차단·재발 기록
 
-| Blocker ID | 영향 작업 | 발견 근거 | Owner | 다음 확인 | 재발 횟수 | 마지막 검토자 | 해제 증적 | Release disposition |
-|---|---|---|---|---|---:|---|---|---|
-| BL-PLAN-001 | PM-GOAL-00, PM-GOAL-01, PM-BOARD-01 | legacy evaluator의 7 gate/84 P0 failure | 윤서준 | 2026-08-25 10:00 KST | 1 | Codex local verifier (not independent approval) | 같은 SHA의 evaluator PASS + 독립 APPROVE | blocked |
-| BL-DATA-001 | QA-DATA-AUDIT-01~04 | pandas TA import collection failure | 윤민호 | 2026-08-25 10:00 KST | 1 | Codex local verifier (not independent approval) | executable audit + PostgreSQL manifest bundle | blocked |
-| BL-METRIC-001 | MR-REG-01, MR-PF-01, MR-ALL-01 | profit-factor formula/implementation disagreement | 윤민호 | 2026-08-25 10:00 KST | 1 | Codex local verifier (not independent approval) | approved definition + engine/registry/API test | blocked |
+| Blocker ID | Git SHA | 영향 작업 | 발견 근거 | Owner | 다음 확인 | 재발 횟수 | 마지막 검토자 | 해제 증적 URI | Release disposition |
+|---|---|---|---|---|---:|---|---|---|---|
+| BL-PLAN-001 | `f026728` | PM-GOAL-00, PM-GOAL-01, PM-BOARD-01 | legacy evaluator의 7 gate/84 P0 failure | 윤서준 | 2026-08-25 10:00 KST | 1 | Codex local verifier (not independent approval) | `repo:docs/plans/quantagent-production-qa-local-evidence-contract-20260824.md@f02672878f10ee038133b917a18d333e061187bc` | blocked |
+| BL-DATA-001 | `f026728` | QA-DATA-AUDIT-01~04 | pandas TA import collection failure | 윤민호 | 2026-08-25 10:00 KST | 1 | Codex local verifier (not independent approval) | `repo:DE/docs/point-in-time-universe-evidence-contract.md@f02672878f10ee038133b917a18d333e061187bc` | blocked |
+| BL-METRIC-001 | `f026728` | MR-REG-01, MR-PF-01, MR-ALL-01 | profit-factor formula/implementation disagreement | 윤민호 | 2026-08-25 10:00 KST | 1 | Codex local verifier (not independent approval) | `repo:ai/ai_graph/quant_explanations.py@f02672878f10ee038133b917a18d333e061187bc` | blocked |
 
 ## 사용 규칙
 

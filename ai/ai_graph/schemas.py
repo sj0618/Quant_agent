@@ -24,6 +24,7 @@ FailureCategory = Literal[
     "unknown_failure",
 ]
 FailureSubcause = Literal[
+    "db_connection_unavailable",
     "db_connect_timeout",
     "db_statement_timeout",
     # The warehouse ran out of lock-table slots ("out of shared memory"), which a query

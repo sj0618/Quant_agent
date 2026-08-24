@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ai_graph.api import create_app
@@ -10,6 +11,7 @@ from ai_graph.jobs import (
     PROCESS_INCARNATION,
     AnalysisJobStatus,
     InMemoryAnalysisJobStore,
+    InterruptedJobReconciliationError,
     Stage,
     reap_interrupted_jobs,
 )
@@ -84,7 +86,7 @@ def test_a_job_with_no_recorded_incarnation_is_reaped() -> None:
     assert reap_interrupted_jobs(store, incarnation=PROCESS_INCARNATION) == [job_id]
 
 
-def test_one_unreapable_job_does_not_abort_the_sweep() -> None:
+def test_one_unreapable_job_fails_the_reconciliation() -> None:
     store, first = _store_with_running_job()
     second = store.create_job("두 번째 전략")
     store.update_job_status(second.job_id, AnalysisJobStatus.RUNNING, Stage.INTERPRETING)
@@ -98,7 +100,11 @@ def test_one_unreapable_job_does_not_abort_the_sweep() -> None:
 
     store.fail_job = fail_once_then_work  # type: ignore[method-assign]
 
-    assert reap_interrupted_jobs(store, incarnation=OTHER_PROCESS) == [second.job_id]
+    with pytest.raises(InterruptedJobReconciliationError):
+        reap_interrupted_jobs(store, incarnation=OTHER_PROCESS)
+    # The first row remains ambiguous, so serving job endpoints would be unsafe even
+    # though a later row happened to settle.
+    assert store.get_job(first).status is AnalysisJobStatus.RUNNING
 
 
 def test_startup_sweeps_the_store_before_serving() -> None:
@@ -115,8 +121,8 @@ def test_startup_sweeps_the_store_before_serving() -> None:
         assert job.status is AnalysisJobStatus.FAILED
 
 
-def test_startup_still_serves_when_the_sweep_fails() -> None:
-    """A store that cannot be swept leaves stale rows; a refused startup leaves no service."""
+def test_startup_refuses_to_serve_when_the_sweep_fails() -> None:
+    """A store that cannot reconcile stale rows must fail closed before /health."""
 
     store, _ = _store_with_running_job()
 
@@ -125,8 +131,9 @@ def test_startup_still_serves_when_the_sweep_fails() -> None:
 
     store.list_jobs = exploding_list  # type: ignore[method-assign]
 
-    with TestClient(create_app(store)) as client:
-        assert client.get("/health").status_code == 200
+    with pytest.raises(InterruptedJobReconciliationError):
+        with TestClient(create_app(store)):
+            pass
 
 
 def _ready_envelope(trace_id: str):

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from time import perf_counter
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -17,6 +21,7 @@ from ai_graph.source_manifest import build_pipeline_extract_snapshot, build_sour
 from .sectors import extract_sector_from_query, get_known_sectors
 
 _logger = logging.getLogger(__name__)
+KST = ZoneInfo("Asia/Seoul")
 
 
 AI_DATABASE_DSN_ENV = "AI_DATABASE_DSN"
@@ -82,6 +87,18 @@ SYMBOL_LISTING_HISTORY_TABLE = "core.symbol_listing_history"
 SYMBOL_MASTER_TABLE = "core.symbol_master"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
+# Official KRX total-return index levels and the published KOSPI/KOSDAQ split. The
+# primary benchmark must be explicitly unavailable when these optional views are absent;
+# it must never silently substitute the price-only universe proxy.
+OFFICIAL_BENCHMARK_TR_VIEW = "mart.krx_index_total_return_daily"
+OFFICIAL_BENCHMARK_WEIGHT_VIEW = "mart.krx_benchmark_monthly_weights"
+OFFICIAL_BENCHMARK_INDEX_CODES = {"kospi_tr": "KOSPI_TR", "kosdaq_tr": "KOSDAQ_TR"}
+# These codes may cross into report/metric contracts.  They intentionally contain no
+# database driver text, SQL, host, or credential material.
+OFFICIAL_BENCHMARK_LEVELS_UNAVAILABLE = "official_benchmark_levels_unavailable"
+OFFICIAL_BENCHMARK_WEIGHTS_UNAVAILABLE = "official_benchmark_weights_unavailable"
+OFFICIAL_BENCHMARK_LEVELS_MISSING = "official_benchmark_levels_missing"
+OFFICIAL_BENCHMARK_WEIGHTS_MISSING = "official_benchmark_weights_missing"
 # BOK ECOS daily 원/달러 rate. The only macro series the risk rules can be fed from
 # directly; there is no equity index and no volatility index in this warehouse.
 USD_KRW_SERIES_ID = "731Y003:0000003"
@@ -198,6 +215,9 @@ class PipelineDataBundle(BaseModel):
     # Carries the measured values plus the label saying what the equity leg was
     # measured against, so a report can never call a universe proxy "the KOSPI".
     macro_snapshot: dict[str, Any] | None = None
+    # This high-cardinality series must not be folded into metadata because metadata is
+    # republished in public provenance. Backtest code receives it as a separate input.
+    official_benchmark: dict[str, Any] | None = None
     data_availability: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -269,6 +289,8 @@ class PostgresPipelineDataSource:
         self.unavailable_indicator_families: tuple[str, ...] = ()
 
     def load(self, query: str, trace_id: str) -> PipelineDataBundle:
+        load_started = perf_counter()
+        timings: dict[str, float] = {}
         with self._connect() as conn:
             self._set_statement_timeout(conn)
             # Ask what the warehouse can actually serve before spending anything on the
@@ -311,8 +333,30 @@ class PostgresPipelineDataSource:
             ticker_resolution = "screening"
             already_screened = _query_requests_screening(query)
             screening_mode = already_screened
+            pit_market: tuple[
+                list[str],
+                dict[str, Any],
+                Mapping[str, Mapping[str, Any]],
+                list[dict[str, Any]],
+                int,
+            ] | None = None
+            parallel_screening_backtest = False
             if already_screened:
-                screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
+                # Today's screen affects presentation only; it does not affect the
+                # historical PIT universe or price load.  Run the independent reads
+                # concurrently on separate connections to avoid serial timeout debt.
+                parallel_screening_backtest = True
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    screening = executor.submit(self._screen_on_its_own_connection, query)
+                    pit_market = self._load_pit_market(
+                        conn, backtest_window, query, indicator_families, timings
+                    )
+                    (
+                        screening_candidates,
+                        screening_relaxation,
+                        screening_timings,
+                    ) = screening.result()
+                timings.update(screening_timings)
             single_ticker: str | None = None
             if not screening_candidates:
                 single_ticker = self._resolve_ticker(conn, query)
@@ -340,34 +384,48 @@ class PostgresPipelineDataSource:
                 else:
                     ticker_resolution = "explicit_or_name_match"
             if screening_mode:
-                # Current recommendations are output only. PIT membership is fixed by
-                # date and cannot be widened by a present-day screen.
-                recommended = _backtest_ticker_pool(
+                if pit_market is None:
+                    pit_market = self._load_pit_market(
+                        conn, backtest_window, query, indicator_families, timings
+                    )
+                (
+                    tickers,
+                    universe_descriptor,
+                    symbol_info_by_ticker,
+                    price_rows,
+                    effective_lookback_days,
+                ) = pit_market
+                # Current candidates are recommendation context only.  Filter them
+                # against the historical universe, but always trade the PIT member.
+                # This prevents a present-day screen from entering historical results.
+                candidates = _backtest_ticker_pool(
                     screening_candidates, self.config.backtest_max_tickers
                 )
-                tickers, universe_descriptor = self._fetch_backtest_universe(
-                    conn, backtest_window
+                pit_set = set(tickers)
+                excluded_screening_candidate_count = sum(
+                    1 for item in candidates if item not in pit_set
                 )
-                if not tickers:
-                    raise PipelineDataUnavailableError(
-                        "pit_universe_empty",
-                        "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
-                    )
-                ticker = recommended[0] if recommended else tickers[0]
-                symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
+                recommended = [item for item in candidates if item in pit_set]
+                ticker = tickers[0]
+                universe_descriptor["excluded_screening_candidate_count"] = (
+                    excluded_screening_candidate_count
+                )
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
-                self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
-                price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, symbol_info_by_ticker, query, backtest_window, indicator_families
-                )
-                self._set_statement_timeout(conn)
             elif single_ticker:
                 ticker = single_ticker
                 tickers = [ticker]
                 symbol_info = self._fetch_symbol_info(conn, ticker)
+                price_rows_started = perf_counter()
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, {ticker: symbol_info}, query, backtest_window, indicator_families
+                    conn,
+                    tickers,
+                    {ticker: symbol_info},
+                    query,
+                    backtest_window,
+                    indicator_families,
+                    timings=timings,
                 )
+                timings["price_rows_seconds"] = perf_counter() - price_rows_started
             else:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
                 # silently substitute config.default_ticker, since that produces a
@@ -387,9 +445,12 @@ class PostgresPipelineDataSource:
             pit_members_without_price_rows = sorted(
                 set(tickers) - {str(row.get("ticker") or "").zfill(6) for row in price_rows}
             )
-            l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
+            recommendation_ticker = recommended[0] if recommended else None
+            l4_evidence_ticker = recommendation_ticker or ticker
+            l4_evidence = self._fetch_l4_evidence(conn, l4_evidence_ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
+            official_benchmark = self._fetch_official_benchmark(conn, backtest_window)
             # Capabilities were probed up front; nothing since then can change them.
 
         research_as_of = backtest_window["end"].isoformat()
@@ -430,6 +491,11 @@ class PostgresPipelineDataSource:
                 PIT_UNIVERSE_VIEW,
                 SYMBOL_LISTING_HISTORY_TABLE,
                 *[INDICATOR_TABLES[family] for family in indicator_families],
+                *(
+                    [OFFICIAL_BENCHMARK_TR_VIEW, OFFICIAL_BENCHMARK_WEIGHT_VIEW]
+                    if official_benchmark["available"]
+                    else []
+                ),
             ],
             source_version=BACKTEST_WINDOW_POLICY_ID,
             extract_snapshot=extract_snapshot,
@@ -440,6 +506,7 @@ class PostgresPipelineDataSource:
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
             macro_snapshot=macro_snapshot,
+            official_benchmark=official_benchmark,
             data_availability=data_availability,
             metadata={
                 "source": "postgres",
@@ -453,6 +520,7 @@ class PostgresPipelineDataSource:
                 "recommended_tickers": recommended,
                 "recommendation_ticker": recommended[0] if recommended else None,
                 "backtest_universe": universe_descriptor,
+                "parallel_screening_backtest": parallel_screening_backtest,
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [
@@ -482,7 +550,9 @@ class PostgresPipelineDataSource:
                 "raw_price_capabilities": raw_price_capabilities,
                 "dart_date_only_effective_policy": "next_krx_session_v1",
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
+                "l4_evidence_ticker": l4_evidence_ticker,
                 "l4_evidence_rows": len(l4_evidence),
+                "official_benchmark": _official_benchmark_status(official_benchmark),
                 "universe_source": universe_descriptor["source"],
                 "symbol": symbol_info,
                 "macro_source": BOK_MACRO_VIEW,
@@ -497,7 +567,77 @@ class PostgresPipelineDataSource:
                 "research_available_families": sorted(available_families),
                 "research_snapshot_id": trace_id,
                 "research_measurement_complete": research_measurement_complete,
+                "timings": {
+                    **{name: round(seconds, 6) for name, seconds in timings.items()},
+                    "total_seconds": round(perf_counter() - load_started, 6),
+                },
             },
+        )
+
+    def _screen_on_its_own_connection(
+        self, query: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, float]]:
+        """Run the independent current screen without sharing the PIT load connection."""
+
+        connect_started = perf_counter()
+        with self._connect() as conn:
+            connect_seconds = perf_counter() - connect_started
+            self._set_statement_timeout(conn)
+            screening_started = perf_counter()
+            candidates, relaxation = self._screen_with_relaxation(conn, query)
+        return candidates, relaxation, {
+            "screening_connect_seconds": connect_seconds,
+            "screening_seconds": perf_counter() - screening_started,
+        }
+
+    def _load_pit_market(
+        self,
+        conn: Any,
+        window: Mapping[str, Any],
+        query: str,
+        indicator_families: Sequence[str],
+        timings: dict[str, float],
+    ) -> tuple[
+        list[str],
+        dict[str, Any],
+        Mapping[str, Mapping[str, Any]],
+        list[dict[str, Any]],
+        int,
+    ]:
+        """Load the fixed historical universe and price rows independently of screening."""
+
+        started = perf_counter()
+        tickers, universe_descriptor = self._fetch_backtest_universe(conn, window)
+        timings["universe_seconds"] = perf_counter() - started
+        if not tickers:
+            raise PipelineDataUnavailableError(
+                "pit_universe_empty",
+                "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
+            )
+        started = perf_counter()
+        symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
+        timings["symbol_info_seconds"] = perf_counter() - started
+        self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
+        started = perf_counter()
+        try:
+            price_rows, effective_lookback_days = self._fetch_price_rows(
+                conn,
+                tickers,
+                symbol_info_by_ticker,
+                query,
+                window,
+                indicator_families,
+                timings=timings,
+            )
+        finally:
+            self._set_statement_timeout(conn)
+        timings["price_rows_seconds"] = perf_counter() - started
+        return (
+            tickers,
+            universe_descriptor,
+            symbol_info_by_ticker,
+            price_rows,
+            effective_lookback_days,
         )
 
     def _fetch_backtest_universe(
@@ -757,14 +897,16 @@ class PostgresPipelineDataSource:
         before the screen has read a row.
         """
 
-        floor = date.today() - timedelta(days=SCREENING_DATE_LOOKBACK_DAYS)
+        ceiling = _kst_today()
+        floor = ceiling - timedelta(days=SCREENING_DATE_LOOKBACK_DAYS)
         row = conn.execute(
             f"""
             SELECT max(time) AS as_of_date
             FROM {KIS_ADJUSTED_OHLCV_TABLE}
             WHERE time >= %(floor)s::date
+              AND time < %(ceiling)s::date
             """,
-            {"floor": floor},
+            {"floor": floor, "ceiling": ceiling},
         ).fetchone()
         value = row.get("as_of_date") if row else None
         return _date_value(value) if value is not None else None
@@ -850,9 +992,13 @@ class PostgresPipelineDataSource:
         query: str,
         window: Mapping[str, Any],
         indicator_families: Sequence[str] | None = None,
+        *,
+        timings: dict[str, float] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         del query
+        timings = {} if timings is None else timings
         ticker_list = list(tickers)
+        ohlcv_started = perf_counter()
         rows = conn.execute(
             f"""
             SELECT
@@ -876,10 +1022,12 @@ class PostgresPipelineDataSource:
             """,
             [ticker_list, window["start"], window["end"]],
         ).fetchall()
+        timings["price_ohlcv_query_seconds"] = perf_counter() - ohlcv_started
         earliest_priced_date = min((_date_value(row["as_of_date"]) for row in rows), default=None)
         families = indicator_families or tuple(INDICATOR_TABLES)
         indicators_by_family: dict[str, dict[str, dict[date, Mapping[str, Any]]]] = {}
         unavailable_families: list[str] = []
+        indicators_started = perf_counter()
         for family in families:
             try:
                 indicators_by_family[family] = self._fetch_indicator_values_by_date(
@@ -891,7 +1039,11 @@ class PostgresPipelineDataSource:
                 self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
                 unavailable_families.append(family)
         self.unavailable_indicator_families = tuple(unavailable_families)
+        timings["price_indicator_seconds"] = perf_counter() - indicators_started
+        financials_started = perf_counter()
         financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
+        timings["price_financial_seconds"] = perf_counter() - financials_started
+        conversion_started = perf_counter()
         price_rows = [
             _price_row_from_feature_frame_record(
                 _feature_frame_row_from_sources(
@@ -903,7 +1055,10 @@ class PostgresPipelineDataSource:
             )
             for row in rows
         ]
+        timings["price_row_conversion_seconds"] = perf_counter() - conversion_started
+        attach_started = perf_counter()
         _attach_pointintime_financials(price_rows, financials_by_ticker)
+        timings["price_financial_attach_seconds"] = perf_counter() - attach_started
         return price_rows, int(window["session_count"])
 
     def _fetch_financial_timeline(
@@ -990,14 +1145,14 @@ class PostgresPipelineDataSource:
         return timelines
 
     def _resolve_backtest_window(self, conn: Any) -> dict[str, Any] | None:
-        """Resolve the exact five-calendar-year KST-KRX session window once."""
+        """Resolve the five-year window ending on the last completed KST session."""
         row = conn.execute(
             """
             WITH cutoff AS (
                 SELECT max(trade_date) AS session_end
                 FROM core.trading_calendar
                 WHERE is_open
-                  AND trade_date <= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
+                  AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
             ), sessions AS (
                 SELECT c.trade_date
                 FROM core.trading_calendar c
@@ -1241,6 +1396,96 @@ class PostgresPipelineDataSource:
                 "loaded universe mean daily return (no index series in the warehouse)"
             )
         return snapshot or None
+
+    def _fetch_official_benchmark(
+        self, conn: Any, window: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Read official KRX TR inputs, or expose one safe unavailable descriptor.
+
+        The optional warehouse views must never make an otherwise valid analysis fail.
+        A failed read can leave the transaction aborted, so reset it and restore the
+        transaction-local statement timeout before returning the unavailable descriptor.
+        """
+
+        descriptor: dict[str, Any] = {
+            "available": False,
+            "unavailable_reason": None,
+            "level_source": OFFICIAL_BENCHMARK_TR_VIEW,
+            "weight_source": OFFICIAL_BENCHMARK_WEIGHT_VIEW,
+            "index_codes": dict(OFFICIAL_BENCHMARK_INDEX_CODES),
+            "window_start": window["start"].isoformat(),
+            "window_end": window["end"].isoformat(),
+            "weight_lag_months": 1,
+            "kospi_tr": {},
+            "kosdaq_tr": {},
+            "monthly_weights": {},
+        }
+        try:
+            level_rows = conn.execute(
+                f"""
+                SELECT index_code, trade_date, tr_value
+                FROM {OFFICIAL_BENCHMARK_TR_VIEW}
+                WHERE index_code = ANY(%s)
+                  AND trade_date BETWEEN %s::date AND %s::date
+                ORDER BY trade_date
+                """,
+                [list(OFFICIAL_BENCHMARK_INDEX_CODES.values()), window["start"], window["end"]],
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - report a safe unavailable state.
+            self._rollback_quietly(conn)
+            self._set_statement_timeout(conn)
+            descriptor["unavailable_reason"] = OFFICIAL_BENCHMARK_LEVELS_UNAVAILABLE
+            return descriptor
+
+        levels: dict[str, dict[str, float]] = {"kospi_tr": {}, "kosdaq_tr": {}}
+        code_to_key = {code: key for key, code in OFFICIAL_BENCHMARK_INDEX_CODES.items()}
+        for row in level_rows or ():
+            key = code_to_key.get(str(row.get("index_code") or ""))
+            trade_date = _optional_date_value(row.get("trade_date"))
+            value = _finite_float_value(row.get("tr_value"))
+            if key is not None and trade_date is not None and value is not None and value > 0.0:
+                levels[key][trade_date.isoformat()] = value
+        if any(not levels[key] for key in ("kospi_tr", "kosdaq_tr")):
+            descriptor["unavailable_reason"] = OFFICIAL_BENCHMARK_LEVELS_MISSING
+            return descriptor
+
+        try:
+            weight_rows = conn.execute(
+                f"""
+                SELECT month, kospi_weight, kosdaq_weight
+                FROM {OFFICIAL_BENCHMARK_WEIGHT_VIEW}
+                WHERE month >= (date_trunc('month', %s::date) - INTERVAL '1 month')::date
+                  AND month <= date_trunc('month', %s::date)::date
+                ORDER BY month
+                """,
+                [window["start"], window["end"]],
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - report a safe unavailable state.
+            self._rollback_quietly(conn)
+            self._set_statement_timeout(conn)
+            descriptor["unavailable_reason"] = OFFICIAL_BENCHMARK_WEIGHTS_UNAVAILABLE
+            return descriptor
+
+        monthly_weights: dict[str, list[float]] = {}
+        for row in weight_rows or ():
+            month = _optional_date_value(row.get("month"))
+            kospi_weight = _finite_float_value(row.get("kospi_weight"))
+            kosdaq_weight = _finite_float_value(row.get("kosdaq_weight"))
+            if month is not None and kospi_weight is not None and kosdaq_weight is not None:
+                monthly_weights[month.isoformat()[:7]] = [kospi_weight, kosdaq_weight]
+        if not monthly_weights:
+            descriptor["unavailable_reason"] = OFFICIAL_BENCHMARK_WEIGHTS_MISSING
+            return descriptor
+
+        descriptor.update(
+            {
+                "available": True,
+                "kospi_tr": levels["kospi_tr"],
+                "kosdaq_tr": levels["kosdaq_tr"],
+                "monthly_weights": monthly_weights,
+            }
+        )
+        return descriptor
 
     def _fetch_macro_status(self, conn: Any) -> dict[str, Any]:
         row = conn.execute(
@@ -2744,12 +2989,50 @@ def _metric_key(value: str) -> str:
     return value.strip().lower().replace(" ", "_")
 
 
+def _kst_today() -> date:
+    """Today in the market's timezone rather than the host's timezone."""
+
+    return datetime.now(KST).date()
+
+
 def _date_value(value: Any) -> date:
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def _optional_date_value(value: Any) -> date | None:
+    if value is None:
+        return None
+    try:
+        return _date_value(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _finite_float_value(value: Any) -> float | None:
+    parsed = _optional_float_value(value)
+    return parsed if parsed is not None and math.isfinite(parsed) else None
+
+
+def _official_benchmark_status(descriptor: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Summarize benchmark provenance without copying per-session levels into metadata."""
+
+    if not isinstance(descriptor, Mapping):
+        return {"available": False, "unavailable_reason": "benchmark load was not attempted"}
+    return {
+        "available": bool(descriptor.get("available")),
+        "unavailable_reason": descriptor.get("unavailable_reason"),
+        "level_source": descriptor.get("level_source"),
+        "weight_source": descriptor.get("weight_source"),
+        "index_codes": descriptor.get("index_codes"),
+        "weight_lag_months": descriptor.get("weight_lag_months"),
+        "kospi_tr_sessions": len(descriptor.get("kospi_tr") or {}),
+        "kosdaq_tr_sessions": len(descriptor.get("kosdaq_tr") or {}),
+        "monthly_weight_months": len(descriptor.get("monthly_weights") or {}),
+    }
 
 
 def _datetime_value(value: Any) -> datetime | None:

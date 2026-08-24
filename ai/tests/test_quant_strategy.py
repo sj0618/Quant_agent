@@ -27,6 +27,7 @@ from ai_graph.quant_strategy import (
     infer_automatic_strategy_preferences,
     rsi_trade_rules,
 )
+from ai_graph.research_eligibility import PerformanceAvailable, PerformanceUnavailable
 from ai_graph.schemas import CandidateParameters, StrategyIR
 
 
@@ -111,27 +112,40 @@ def test_vague_request_runs_the_full_automatic_pipeline() -> None:
     assert envelope.strategy_spec.strategy_id.startswith("automatic_performance_momentum")
     assert envelope.rule_provenance is not None
     assert envelope.rule_provenance.substituted is False
-    assert envelope.user_payload.performance is not None
-    public_explanation = envelope.user_payload.performance.strategy_explanation
-    assert public_explanation is not None
-    assert len(public_explanation.generated_strategies) == 3
+    performance = envelope.user_payload.performance
+    assert performance is not None
+    # The default local fixture has only four sessions.  The public contract must
+    # therefore fail closed instead of exposing a strategy performance document as
+    # though it were measured evidence; automatic selection itself still completes.
+    if isinstance(performance, PerformanceUnavailable):
+        assert performance.reason_code == "insufficient_reliability"
+        assert performance.safe_facts["source"] == "fixture"
+        return
+
+    assert isinstance(performance, PerformanceAvailable)
+    public_explanation = performance.performance["strategy_explanation"]
+    assert isinstance(public_explanation, dict)
+    assert len(public_explanation["generated_strategies"]) == 3
     assert len(
-        {item["execution_signature"] for item in public_explanation.generated_strategies}
+        {item["execution_signature"] for item in public_explanation["generated_strategies"]}
     ) == 3
-    assert all(item["profile"] == "compiled_conditions" for item in public_explanation.generated_strategies)
+    assert all(
+        item["profile"] == "compiled_conditions"
+        for item in public_explanation["generated_strategies"]
+    )
     selected_blueprint_id = envelope.rule_provenance.evaluated_rule.removeprefix(
         "automatic_blueprint:"
     )
     selected_blueprint = next(
         item
-        for item in public_explanation.generated_strategies
+        for item in public_explanation["generated_strategies"]
         if item["blueprint_id"] == selected_blueprint_id
     )
-    assert public_explanation.title == selected_blueprint["title"]
-    assert public_explanation.indicators
+    assert public_explanation["title"] == selected_blueprint["title"]
+    assert public_explanation["indicators"]
     assert all(
-        item.formula and item.derivation and item.why_used
-        for item in public_explanation.indicators
+        item["formula"] and item["derivation"] and item["why_used"]
+        for item in public_explanation["indicators"]
     )
 
 
