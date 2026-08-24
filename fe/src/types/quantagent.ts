@@ -429,6 +429,13 @@ export interface BacktestMetric {
   whyUsed?: string;
   caution?: string;
   sourceRefs?: string[];
+  /** Provenance fields are optional for retired mock-only views, but required before a
+   * live value can be presented as a current operational metric. */
+  source?: "fixture" | "postgres" | "unknown";
+  asOf?: string | null;
+  freshness?: "eod_current" | "stale" | "unknown";
+  availability?: "available" | "unavailable";
+  unavailableReason?: string | null;
 }
 
 export interface EquityPoint {

@@ -1,19 +1,29 @@
 import { Badge } from "../../components/common/Badge";
 import type { BacktestMetric } from "../../types/quantagent";
+import { isFiniteMetricValue, metricDisplay } from "./metricAvailability";
 
 interface MetricCardProps {
   metric: BacktestMetric;
 }
 
 export function MetricCard({ metric }: MetricCardProps) {
+  const display = metricDisplay(metric);
+
   return (
-    <article className="metric-card">
+    <article className={display.isUnavailable ? "metric-card metric-card--unavailable" : "metric-card"}>
       <div>
         <span>{metric.label}</span>
-        {metric.delta ? <Badge variant={metric.tone}>{metric.delta}</Badge> : null}
+        {!display.isUnavailable && isFiniteMetricValue(metric.delta) ? <Badge variant={metric.tone}>{metric.delta}</Badge> : null}
       </div>
-      <strong>{metric.value}</strong>
-      <p>{metric.caption}</p>
+      <strong>{display.value}</strong>
+      <p>{display.isUnavailable ? display.reason : metric.caption}</p>
+      {display.isUnavailable ? (
+        <dl className="metric-card__provenance">
+          <div><dt>검증 사유</dt><dd>{display.reason}</dd></div>
+          <div><dt>기준일</dt><dd>{display.asOf}</dd></div>
+          <div><dt>출처</dt><dd>{display.source}</dd></div>
+        </dl>
+      ) : null}
       {metric.whyUsed || metric.caution || metric.sourceRefs?.length ? (
         <details className="metric-card__explanation">
           <summary>왜 이 지표를 보나요?</summary>
