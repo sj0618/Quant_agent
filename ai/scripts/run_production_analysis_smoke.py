@@ -6,7 +6,7 @@ import time
 from uuid import uuid4
 
 from ai_graph.graph import run_analysis
-
+from ai_graph.research_eligibility import PerformanceAvailable, PerformanceUnavailable
 
 DEFAULT_QUERY = (
     "KOSPI200 종목 중 RSI가 30 이하이면 매수하고 70 이상이면 매도하는 "
@@ -38,17 +38,25 @@ def main() -> int:
             if envelope.strategy_spec is not None
             else None
         ),
+        "performance_availability": performance.availability if performance is not None else None,
         "selected_candidate_id": (
-            performance.selected_candidate_id if performance is not None else None
+            performance.performance.get("selected_candidate_id")
+            if isinstance(performance, PerformanceAvailable)
+            else None
         ),
         "metrics": (
-            performance.metrics.model_dump(mode="json")
-            if performance is not None and performance.metrics is not None
+            performance.performance.get("metrics")
+            if isinstance(performance, PerformanceAvailable)
             else None
         ),
         "trade_count": (
-            performance.engine_summary.get("trade_count")
-            if performance is not None
+            performance.method_manifest.trades
+            if isinstance(performance, PerformanceAvailable)
+            else None
+        ),
+        "performance_unavailable_reason": (
+            performance.reason_code
+            if isinstance(performance, PerformanceUnavailable)
             else None
         ),
         "recommendation_validated": (
@@ -64,7 +72,7 @@ def main() -> int:
     }
     print(json.dumps(output, ensure_ascii=False, sort_keys=True))
 
-    if performance is None:
+    if not isinstance(performance, PerformanceAvailable):
         return 1
     if wall_seconds > args.max_wall_seconds:
         return 2

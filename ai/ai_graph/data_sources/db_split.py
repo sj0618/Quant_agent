@@ -3,18 +3,15 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any, Literal
-from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.quant_strategy import rsi_trade_rules
-from ai_graph.freshness import classify_source_freshness
-from ai_graph.immutable_snapshot import build_snapshot_bundle
-from ai_graph.source_manifest import build_source_manifest
+from ai_graph.source_manifest import build_pipeline_extract_snapshot, build_source_manifest
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -39,7 +36,6 @@ AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 AI_DATA_SOURCE_LOAD_MODE_ENV = "AI_DATA_SOURCE_LOAD_MODE"
 
 DEFAULT_BACKTEST_TICKER = "005930"
-KST = ZoneInfo("Asia/Seoul")
 TRADING_DAYS_PER_YEAR = 252
 # Ten years, which is what the warehouse holds (2016-05-20 onwards). Briefly cut to
 # five while the real cause of the statement timeout was still unknown; that was the
@@ -220,6 +216,106 @@ class PipelineDataBundle(BaseModel):
     macro_snapshot: dict[str, Any] | None = None
     data_availability: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+def _latest_loaded_price_date(price_rows: Sequence[Mapping[str, Any]]) -> date:
+    """Return the newest concrete price date; never manufacture one from wall-clock time."""
+
+    dates: list[date] = []
+    for row in price_rows:
+        row_date = _loaded_price_row_date(row)
+        if row_date is not None:
+            dates.append(row_date)
+    if not dates:
+        raise PipelineDataUnavailableError(
+            "source_snapshot_date_missing",
+            "loaded price rows did not contain a usable source snapshot date",
+        )
+    return max(dates)
+
+
+def _loaded_price_row_date(row: Mapping[str, Any]) -> date | None:
+    raw = row.get("date") or row.get("time") or row.get("as_of_date")
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if raw is None:
+        return None
+    try:
+        return date.fromisoformat(str(raw))
+    except ValueError:
+        return None
+
+
+def _source_snapshot_freshness(
+    *,
+    source_snapshot_as_of: date,
+    latest_available_session: date | None,
+    price_rows: Sequence[Mapping[str, Any]],
+    required_tickers: Collection[str],
+) -> str:
+    """Classify freshness from warehouse metadata and every required ticker's coverage."""
+
+    if latest_available_session is None or not required_tickers:
+        return "unknown"
+    if source_snapshot_as_of != latest_available_session:
+        return "stale"
+    latest_by_ticker: dict[str, date] = {}
+    for row in price_rows:
+        ticker = str(row.get("ticker") or "").zfill(6)
+        row_date = _loaded_price_row_date(row)
+        if ticker and row_date is not None:
+            latest_by_ticker[ticker] = max(latest_by_ticker.get(ticker, row_date), row_date)
+    normalized_required = {str(ticker).zfill(6) for ticker in required_tickers}
+    return (
+        "eod_current"
+        if all(latest_by_ticker.get(ticker) == latest_available_session for ticker in normalized_required)
+        else "stale"
+    )
+
+
+def _build_backtest_source_manifest(
+    *,
+    price_rows: Sequence[Mapping[str, Any]],
+    screening_candidates: Sequence[Mapping[str, Any]],
+    l4_evidence: Sequence[Mapping[str, Any]],
+    macro_snapshot: Mapping[str, Any] | None,
+    data_availability: Mapping[str, Any],
+    indicator_families: Collection[str],
+    required_tickers: Collection[str],
+    latest_available_session: date | None,
+):
+    """Bind the split adapter's concrete extract to its warehouse freshness facts."""
+
+    source_snapshot_as_of = _latest_loaded_price_date(price_rows)
+    source_freshness = _source_snapshot_freshness(
+        source_snapshot_as_of=source_snapshot_as_of,
+        latest_available_session=latest_available_session,
+        price_rows=price_rows,
+        required_tickers=required_tickers,
+    )
+    extract_snapshot = build_pipeline_extract_snapshot(
+        price_rows=price_rows,
+        screening_candidates=screening_candidates,
+        l4_evidence=l4_evidence,
+        macro_snapshot=macro_snapshot,
+        data_availability=data_availability,
+        required_tickers=required_tickers,
+    )
+    manifest = build_source_manifest(
+        source="postgres",
+        as_of=source_snapshot_as_of,
+        freshness=source_freshness,
+        lineage_refs=[
+            KIS_ADJUSTED_OHLCV_TABLE,
+            UNIVERSE_VIEW,
+            *[INDICATOR_TABLES[family] for family in indicator_families],
+        ],
+        source_version="split-pipeline-v1",
+        extract_snapshot=extract_snapshot,
+    )
+    return manifest, source_snapshot_as_of, source_freshness
 
 
 class PostgresPipelineDataSource:
@@ -446,67 +542,40 @@ class PostgresPipelineDataSource:
                     "no_price_rows",
                     f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}",
                 )
+            # This is intentionally queried after the extract has been read from the
+            # same connection.  The manifest can call the extract current only when
+            # its newest concrete bar reaches the warehouse's measured latest session.
+            latest_available_session = self._resolve_screening_date(conn)
             l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
-            settled_session = self._fetch_settled_session(conn)
             # Capabilities were probed up front; nothing since then can change them.
 
-        data_as_of = _max_price_row_date(price_rows)
-        snapshot_as_of = data_as_of or datetime.now(UTC).date()
-        freshness_status, freshness_reason = classify_source_freshness(
-            data_as_of=data_as_of,
-            settled_session=settled_session,
+        data_availability = _data_availability_for_query(
+            query, source="postgres", available=capability_availability
         )
-        snapshot_bundle = build_snapshot_bundle(
-            as_of=snapshot_as_of,
-            source="postgres",
-            pit_universe={
-                "members": sorted(tickers),
-                "selection": "split-pipeline-backtest-universe",
-                "member_count": len(tickers),
-            },
-            delisting={
-                "policy_version": "official-event-then-final-close-v1",
-                "provenance": UNIVERSE_VIEW,
-            },
-            indicator_input={
-                "families": list(indicator_families),
-                "sources": [INDICATOR_TABLES[family] for family in indicator_families],
-                "lookback_days": effective_lookback_days,
-                "query": query,
-            },
-            lineage_refs=[
-                UNIVERSE_VIEW,
-                KIS_ADJUSTED_OHLCV_TABLE,
-                *[INDICATOR_TABLES[family] for family in indicator_families],
-            ],
-        )
-        source_manifest = build_source_manifest(
-            source="postgres",
-            as_of=snapshot_as_of,
-            freshness=freshness_status,
-            lineage_refs=[
-                KIS_ADJUSTED_OHLCV_TABLE,
-                UNIVERSE_VIEW,
-                *[INDICATOR_TABLES[family] for family in indicator_families],
-            ],
-            source_version="split-pipeline-v1",
+        source_manifest, source_manifest_as_of, source_freshness = _build_backtest_source_manifest(
+            price_rows=price_rows,
+            screening_candidates=screening_candidates,
+            l4_evidence=l4_evidence,
+            macro_snapshot=macro_snapshot,
+            data_availability=data_availability,
+            indicator_families=indicator_families,
+            required_tickers=tickers,
+            latest_available_session=latest_available_session,
         )
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
             macro_snapshot=macro_snapshot,
-            data_availability=_data_availability_for_query(
-                query, source="postgres", available=capability_availability
-            ),
+            data_availability=data_availability,
             metadata={
                 "source": "postgres",
-                "immutable_snapshot_bundle": snapshot_bundle.model_dump(mode="json"),
                 "source_manifest": source_manifest.model_dump(mode="json"),
-                "freshness_as_of": data_as_of.isoformat() if data_as_of else None,
-                "freshness_reason": freshness_reason,
+                "source_snapshot_as_of": source_manifest_as_of.isoformat(),
+                "source_snapshot_freshness": source_freshness,
+                "source_snapshot_version": "split-pipeline-v1",
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
@@ -795,17 +864,12 @@ class PostgresPipelineDataSource:
         pruning.
         """
 
-        # The screen decides what gets recommended, so it stops where the backtest does:
-        # at the last closed session. The ceiling is a bound parameter rather than an
-        # inline `CURRENT_DATE`, which is STABLE and would defeat partition pruning.
         row = conn.execute(
             f"""
             SELECT max(time) AS as_of_date
             FROM {KIS_ADJUSTED_OHLCV_TABLE}
             WHERE time >= CURRENT_DATE - INTERVAL '90 days'
-              AND time < %(ceiling)s::date
-            """,
-            {"ceiling": _kst_today()},
+            """
         ).fetchone()
         value = row.get("as_of_date") if row else None
         return _date_value(value) if value is not None else None
@@ -942,13 +1006,9 @@ class PostgresPipelineDataSource:
             FROM feature.kis_adjusted_ohlcv_daily
             WHERE ticker = ANY(%s)
               AND time >= %s::date
-              -- Today's bar is still moving until the close, so the strategy acts on
-              -- the last settled session instead. Bound as a parameter, not an inline
-              -- STABLE expression, so partition pruning still happens at plan time.
-              AND time < %s::date
             ORDER BY ticker, time
             """,
-            [ticker_list, date_floor, _kst_today()],
+            [ticker_list, date_floor],
         ).fetchall()
         # Indicators are only ever read for dates that have a price bar, and the price
         # query above already capped itself at `lookback_days` rows per ticker. Asking
@@ -1328,25 +1388,6 @@ class PostgresPipelineDataSource:
             )
         return snapshot or None
 
-    def _fetch_settled_session(self, conn: Any) -> date | None:
-        """The last KRX session that has already closed, in KST.
-
-        Today is excluded on purpose: EOD rows for a session land after its close, so
-        an intraday run must be measured against the previous session or every morning
-        would read as stale.
-        """
-
-        row = conn.execute(
-            """
-            SELECT max(trade_date) AS settled_end
-            FROM core.trading_calendar
-            WHERE is_open
-              AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
-            """
-        ).fetchone()
-        settled = row.get("settled_end") if row else None
-        return _date_value(settled) if settled is not None else None
-
     def _fetch_macro_status(self, conn: Any) -> dict[str, Any]:
         row = conn.execute(
             """
@@ -1375,25 +1416,30 @@ def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle
 
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
+    fixture_as_of = datetime.now(UTC).date()
+    data_availability = _data_availability_for_query(query, source="fixture")
+    extract_snapshot = build_pipeline_extract_snapshot(
+        price_rows=[],
+        screening_candidates=[],
+        l4_evidence=[],
+        macro_snapshot=None,
+        data_availability=data_availability,
+    )
     return PipelineDataBundle(
-        data_availability=_data_availability_for_query(query, source="fixture"),
+        data_availability=data_availability,
         metadata={
             "source": "fixture",
-            "immutable_snapshot_bundle": build_snapshot_bundle(
-                as_of=datetime.now(UTC).date(),
-                source="fixture",
-                pit_universe={"members": [], "policy": "fixture"},
-                delisting={"events": [], "policy": "fixture"},
-                indicator_input={"families": [], "query": query},
-                lineage_refs=[reason, query],
-            ).model_dump(mode="json"),
             "source_manifest": build_source_manifest(
                 source="fixture",
-                as_of=datetime.now(UTC).date(),
+                as_of=fixture_as_of,
                 freshness="unknown",
                 lineage_refs=[reason, query],
                 source_version="local-fixture",
+                extract_snapshot=extract_snapshot,
             ).model_dump(mode="json"),
+            "source_snapshot_as_of": fixture_as_of.isoformat(),
+            "source_snapshot_freshness": "unknown",
+            "source_snapshot_version": "local-fixture",
             "reason": reason,
             "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),
             "available_db_objects": [
@@ -2689,27 +2735,6 @@ def _has_rsi_oversold_entry(price_rows: list[dict[str, Any]]) -> bool:
 
 def _metric_key(value: str) -> str:
     return value.strip().lower().replace(" ", "_")
-
-
-def _max_price_row_date(price_rows: Sequence[Mapping[str, Any]]) -> date | None:
-    """The newest trade date the loaded rows actually carry."""
-
-    dates: list[date] = []
-    for row in price_rows:
-        raw = row.get("date")
-        if raw is None:
-            continue
-        try:
-            dates.append(_date_value(raw))
-        except (TypeError, ValueError):
-            continue
-    return max(dates) if dates else None
-
-
-def _kst_today() -> date:
-    """Today in the market's own timezone, not the host's."""
-
-    return datetime.now(KST).date()
 
 
 def _date_value(value: Any) -> date:

@@ -89,6 +89,10 @@ function AppRoutes() {
     return <LegalPage kind="disclaimer" />;
   }
 
+  if (path === ROUTES.trust) {
+    return <LegalPage kind="trust" />;
+  }
+
   if (path === ROUTES.unsubscribe) {
     return <UnsubscribePage />;
   }

@@ -3,13 +3,6 @@
 This module intentionally has no graph, provider, data-source, job-store, audit, or
 runtime-configuration dependency.  The API and graph entrypoints can therefore use it
 before they create state that could retain a prohibited personalized request.
-
-That dependency-free property is why the verdict here is always fail-closed, including
-for the requests it cannot resolve on wording alone.  A verb like "추천해" does not say
-what is being recommended: "종목을 추천해줘" is out of scope, "퀀트 전략을 추천해줘" is
-the product's own entry point.  Those refusals are marked `adjudicable` so a caller that
-has an LLM available can ask what the object was - see `scope_review`.  Nothing in this
-module performs that call, and a caller that skips it keeps the refusal.
 """
 
 from __future__ import annotations
@@ -28,11 +21,6 @@ class ResearchRequestPreflight:
 
     allowed: bool
     reason_code: str | None = None
-    # True only for a refusal caused by a recommendation verb with no stated object.
-    # Personal context, explicit buy/sell instructions, requests that name 종목/stock as
-    # the object, and unsupported asset families are never adjudicable: their wording
-    # already settles the question, so no second opinion is asked for.
-    adjudicable: bool = False
 
     @property
     def kind(self) -> str:
@@ -78,8 +66,6 @@ _PERSONAL_CONTEXT_TERMS = (
     "formyriskprofile",
 )
 
-# Wording that settles the question on its own: an instruction to trade, or a request
-# whose object is explicitly a stock. These never reach adjudication.
 _ACTION_IMPERATIVE_TERMS = (
     "사줘",
     "사야",
@@ -92,10 +78,13 @@ _ACTION_IMPERATIVE_TERMS = (
     "매도해",
     "매도해야",
     "보유해",
+    "추천해",
+    "추천해줘",
     "추천종목",
     "종목추천",
     "매수추천",
     "매도추천",
+    "골라줘",
     "무엇을사",
     "뭘사",
     "돈되는",
@@ -108,17 +97,6 @@ _ACTION_IMPERATIVE_TERMS = (
     "sellforme",
     "recommendstock",
     "stockrecommendation",
-)
-
-# A recommendation verb with no stated object. Refused by default, but a caller with an
-# LLM can ask whether the object was a strategy or a stock. Keep this list to verbs that
-# genuinely leave the object open - anything naming 종목/stock belongs above.
-_AMBIGUOUS_RECOMMENDATION_TERMS = (
-    "추천해",
-    "추천좀",
-    "추천부탁",
-    "골라줘",
-    "골라주세",
 )
 
 _PERSONAL_ACTION_TERMS = (
@@ -178,8 +156,6 @@ def classify_research_request(query: str) -> ResearchRequestPreflight:
         return ResearchRequestPreflight(False, SCOPE_REFUSAL_REASON)
     if any(term in compact for term in _UNSUPPORTED_ASSET_TERMS):
         return ResearchRequestPreflight(False, UNSUPPORTED_SCOPE_REASON)
-    if any(term in compact for term in _AMBIGUOUS_RECOMMENDATION_TERMS):
-        return ResearchRequestPreflight(False, SCOPE_REFUSAL_REASON, adjudicable=True)
     return ResearchRequestPreflight(allowed=True)
 
 

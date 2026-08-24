@@ -5,13 +5,14 @@ import csv
 import gzip
 import json
 import math
-from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
-import numpy as np
-from functools import lru_cache
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Literal, Mapping, Sequence
+
+import numpy as np
 
 from .models import (
     Condition,

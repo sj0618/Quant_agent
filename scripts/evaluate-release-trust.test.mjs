@@ -22,6 +22,7 @@ test("offline environment removes live settings and forces local test modes", ()
     AI_LLM_DIGEST_API_KEY: "role-secret-must-not-propagate",
     AUTH_ENABLED: "1",
     AI_LLM_PROVIDER: "aoai",
+    AI_BACKTEST_CACHE_DIR: "/stale/other-revision-cache",
     KEEP_ME: "yes",
   });
 
@@ -30,6 +31,8 @@ test("offline environment removes live settings and forces local test modes", ()
   assert.equal(environment.AI_LLM_DIGEST_API_KEY, undefined);
   assert.equal(environment.AUTH_ENABLED, "0");
   assert.equal(environment.AI_LLM_PROVIDER, "mock");
+  assert.match(environment.AI_BACKTEST_CACHE_DIR, /quantagent-release-trust-/u);
+  assert.notEqual(environment.AI_BACKTEST_CACHE_DIR, "/stale/other-revision-cache");
   assert.equal(environment.KEEP_ME, "yes");
 });
 
@@ -77,16 +80,32 @@ test("release trust includes API, screen, metric, and backend contract gates", (
   assert.deepEqual(checks.map(({ name }) => name), [
     "ai-api-and-research-contracts",
     "backtest-metric-contracts",
+    "release-failure-mode-contracts",
     "backend-auth-report-and-deploy-contracts",
     "frontend-production-build-and-contracts",
   ]);
   assert.ok(checks[0].args.includes("ai/tests/test_research_request_preflight.py"));
   assert.ok(checks[1].args.includes("backtest_module/tests/test_backtest.py"));
-  assert.ok(checks[2].args.includes("backend/tests/unit/test_auth_routes.py"));
-  assert.ok(checks[2].args.includes("backend/tests/unit/test_fe_contract_routes.py"));
-  assert.ok(checks[2].args.includes("backend/tests/unit/test_track_c_store.py"));
-  assert.ok(checks[2].args.includes("backend/tests/unit/test_runtime_perf.py"));
-  assert.equal(checks[3].cwd, "/repo/fe");
+  assert.ok(checks[3].args.includes("backend/tests/unit/test_auth_routes.py"));
+  assert.ok(
+    checks[2].args.includes(
+      "ai/tests/test_db_data_source.py::test_configured_database_failure_is_not_replaced_with_fixture"
+    )
+  );
+  assert.ok(
+    checks[2].args.includes(
+      "ai/tests/test_source_manifest.py::test_release_profile_fails_before_fixture_analysis_can_return_a_result"
+    )
+  );
+  assert.ok(
+    checks[2].args.includes(
+      "ai/tests/test_api.py::test_release_readiness_requires_durable_job_store_before_other_dependencies"
+    )
+  );
+  assert.ok(checks[3].args.includes("backend/tests/unit/test_fe_contract_routes.py"));
+  assert.ok(checks[3].args.includes("backend/tests/unit/test_track_c_store.py"));
+  assert.ok(checks[3].args.includes("backend/tests/unit/test_runtime_perf.py"));
+  assert.equal(checks[4].cwd, "/repo/fe");
 });
 
 test("pull-request CI invokes the fixed offline release-trust command", async () => {

@@ -117,13 +117,37 @@ export interface AIBacktestPerformance {
   engine_summary?: Record<string, unknown>;
 }
 
+export interface AIPerformanceMethodManifest {
+  evaluated_rule: string;
+  rule_version: string;
+  market: string;
+  universe: string;
+  start_date: string;
+  end_date: string;
+}
+
+export interface AIAvailablePerformance {
+  availability: "available";
+  performance: AIBacktestPerformance;
+  method_manifest: AIPerformanceMethodManifest;
+  limitations: string[];
+}
+
+export interface AIUnavailablePerformance {
+  availability: "unavailable";
+  reason_code: string;
+  safe_facts: Record<string, string | number | boolean | null>;
+}
+
+export type AIPublicPerformance = AIAvailablePerformance | AIUnavailablePerformance;
+
 export interface AIUserPayload {
   headline: string;
   message: string;
   next_actions: string[];
   candidate_cards: StrategyCandidateCard[];
   report: AIReportBundle | null;
-  performance?: AIBacktestPerformance | null;
+  performance?: AIPublicPerformance | null;
   question?: string | null;
   options?: AIClarificationOption[];
   recommended?: number | null;

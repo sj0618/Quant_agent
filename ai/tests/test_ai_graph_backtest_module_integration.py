@@ -2,12 +2,12 @@ from datetime import date, timedelta
 from types import SimpleNamespace
 
 import pytest
+from backtest_module.performance import QUANTSTATS_REQUIRED_MESSAGE
 
 from ai_graph.nodes import backtest as backtest_node
 from ai_graph.nodes.backtest import run_candidate_backtest
 from ai_graph.nodes.backtest_code import Loop3Request, generate_loop3_candidates
 from ai_graph.schemas import CodeCandidate, Condition, ConditionOperator, StrategySpec
-from backtest_module.performance import QUANTSTATS_REQUIRED_MESSAGE
 
 
 def make_strategy(strategy_id: str, name: str) -> StrategySpec:

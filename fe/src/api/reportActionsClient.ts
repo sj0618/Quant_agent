@@ -1,18 +1,15 @@
 import { ROUTES } from "../config/routes";
-import type { PerformanceSummary, ReportDetail, ReportSummary } from "../types/quantagent";
+import { backendRequest } from "./backendClient";
+import type { ArchivedReportDetail, ArchivedReportSummary, PerformanceSummary } from "../types/quantagent";
 import { downloadTextFile, toCsvValue } from "../utils/download";
 
-export function downloadReportsCsv(reports: ReportSummary[]) {
-  const header = ["id", "date", "strategy", "score", "buy", "hold", "drop", "summary"];
+export function downloadReportsCsv(reports: ArchivedReportSummary[]) {
+  const header = ["result_id", "archived_date", "created_at", "status"];
   const rows = reports.map((report) => [
     report.id,
     report.date,
-    report.strategyName,
-    report.recommendationScore,
-    report.signals.BUY,
-    report.signals.HOLD,
-    report.signals.DROP,
-    report.summary,
+    report.createdAt ?? report.publishedAt ?? report.sentAt,
+    report.status,
   ]);
   const csv = [header, ...rows].map((row) => row.map(toCsvValue).join(",")).join("\n");
   downloadTextFile("quantagent-reports.csv", csv, "text/csv;charset=utf-8");
@@ -35,6 +32,12 @@ export async function copyReportShareLink(reportId: string) {
   return url;
 }
 
-export function buildReportPrintTitle(report: ReportDetail | ReportSummary) {
-  return `${report.date} ${report.title}`;
+export async function resendReportEmail(reportId: string) {
+  await backendRequest<void>(`/reports/${encodeURIComponent(reportId)}/resend`, {
+    method: "POST",
+  });
+}
+
+export function buildReportPrintTitle(report: ArchivedReportDetail | ArchivedReportSummary) {
+  return `QuantAgent 결과 스냅샷 ${report.id}`;
 }

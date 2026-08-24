@@ -25,5 +25,4 @@ END;
 $$;
 DROP FUNCTION IF EXISTS app.reject_analysis_result_mutation();
 DROP TABLE IF EXISTS app.analysis_result;
-
 COMMIT;

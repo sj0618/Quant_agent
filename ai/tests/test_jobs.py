@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-from hashlib import sha256
-
 from collections.abc import Sequence
+from hashlib import sha256
 
 import pytest
 
+from ai_graph.graph import DEBUG_STORE
 from ai_graph.job_repository_postgres import _job_document
 from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.jobs import (
@@ -16,12 +16,14 @@ from ai_graph.jobs import (
     JobStoreConfigurationError,
     create_analysis_job_store_from_env,
 )
+from ai_graph.research_eligibility import PerformanceAvailable, PerformanceMethodManifest
 from ai_graph.schemas import (
     APIEnvelope,
     BacktestEquityPoint,
     BacktestMetrics,
     BacktestPerformance,
     EnvelopeStatus,
+    InternalPayload,
     Stage,
     UserPayload,
 )
@@ -44,7 +46,7 @@ def _ready_envelope(trace_id: str) -> APIEnvelope:
 
 def _completed_backtest_envelope(trace_id: str) -> APIEnvelope:
     envelope = _ready_envelope(trace_id)
-    performance = BacktestPerformance.model_construct(
+    internal_performance = BacktestPerformance.model_construct(
         selected_candidate_id="candidate-1",
         metrics=BacktestMetrics(
             sharpe_ratio=0.5,
@@ -70,7 +72,7 @@ def _completed_backtest_envelope(trace_id: str) -> APIEnvelope:
         reliability=None,
         benchmark=None,
     )
-    audit = performance.engine_summary["execution_audit"]["recent_events"]
+    audit = internal_performance.engine_summary["execution_audit"]["recent_events"]
     ledger = {
         "signals": [audit[0]], "order_audit": audit, "fills": [audit[1]],
         "positions": [{"date": "2026-01-03", "ticker": "005930", "quantity": 8, "fill_quantity": 8, "side": "buy", "reason": "next_open_fill"}],
@@ -89,7 +91,25 @@ def _completed_backtest_envelope(trace_id: str) -> APIEnvelope:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
-    performance.engine_summary["_storage_execution_ledger"] = ledger
+    internal_performance.engine_summary["_storage_execution_ledger"] = ledger
+    DEBUG_STORE.put(
+        envelope.debug_ref,
+        InternalPayload(
+            trace_id=trace_id,
+            backtest_artifacts={"engine_summary": internal_performance.engine_summary},
+        ),
+    )
+    performance = PerformanceAvailable(
+        performance={"selected_candidate_id": "candidate-1", "metrics": {}},
+        method_manifest=PerformanceMethodManifest(
+            evaluated_rule="rsi", rule_version="v1", substituted=False,
+            market="KRX", universe="test", start_date="2026-01-01", end_date="2026-01-03",
+            eod_basis="test", initial_capital=1_000_000, rebalance_timing="weekly",
+            fill_timing="next_open", corporate_action_method="none", cost_tax_slippage_liquidity="test",
+            observations=3, trades=1, data_version="test", result_version="test", execution_version="test",
+            historical_simulation_warning="test",
+        ),
+    )
     return envelope.model_copy(update={"user_payload": envelope.user_payload.model_copy(update={"performance": performance})})
 
 

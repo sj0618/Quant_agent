@@ -1423,6 +1423,27 @@ async def list_reports_from_db(
     return result
 
 
+async def list_reader_reports_from_db(
+    engine: Any,
+    *,
+    user_id: str,
+    limit: int = 20,
+    cursor: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+) -> dict[str, Any]:
+    """Browser archive projection; internal callers retain ``list_reports_from_db``."""
+
+    return await existing_report_queries.list_reader_reports(
+        engine,
+        user_id=user_id,
+        limit=limit,
+        cursor=cursor,
+        status=status,
+        q=q,
+    )
+
+
 async def get_report_from_db(engine: Any, report_id: str, *, user_id: str) -> dict[str, Any] | None:
     report = await existing_report_queries.get_report(engine, report_id, user_id=user_id)
     if report is None:
@@ -1435,6 +1456,12 @@ async def get_report_from_db(engine: Any, report_id: str, *, user_id: str) -> di
     if analysis_result_id is not None:
         report["analysisResultId"] = analysis_result_id
     return report
+
+
+async def get_reader_report_from_db(engine: Any, report_id: str, *, user_id: str) -> dict[str, Any] | None:
+    """Browser archive projection; internal callers retain ``get_report_from_db``."""
+
+    return await existing_report_queries.get_reader_report(engine, report_id, user_id=user_id)
 
 
 async def _persist_server_report(

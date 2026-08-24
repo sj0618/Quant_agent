@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from hashlib import sha256
-import math
 import logging
+import math
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from hashlib import sha256
 from time import perf_counter
 from typing import Any, Literal
 from uuid import UUID
+
+from pydantic import ValidationError
 
 from ai_graph.audit import (
     AuditSession,
@@ -25,8 +27,6 @@ from ai_graph.data_sources import (
     screening_data_families,
 )
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
-from pydantic import ValidationError
-
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.freshness import (
     build_freshness_evidence,
@@ -37,14 +37,15 @@ from ai_graph.llm.role_calls import (
     generate_strategy_conditions,
     resolve_strategy_intent,
 )
+from ai_graph.memory import AnalysisMemory
 from ai_graph.nodes.backtest import (
     BENCHMARK_LABEL,
     BENCHMARK_METHOD,
     BENCHMARK_WARNING,
     MAX_OBJECTIVE_DRAWDOWN,
+    METRIC_ROUND_DIGITS,
     MIN_OBJECTIVE_SHARPE,
     MIN_OBJECTIVE_TRADES,
-    METRIC_ROUND_DIGITS,
     _annualized_return,
     _benchmark_objective_reasons,
     _calmar_ratio,
@@ -56,7 +57,11 @@ from ai_graph.nodes.backtest import (
     _summary_float_default,
     backtest_node,
 )
-from ai_graph.memory import AnalysisMemory
+from ai_graph.nodes.backtest_code import backtest_code_node
+from ai_graph.nodes.report import report_node
+from ai_graph.nodes.risk_manager import risk_manager_node
+from ai_graph.nodes.signal import signal_node
+from ai_graph.preflight import classify_research_request
 from ai_graph.progress import raise_if_cancelled, report_activity, report_node_stage
 from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_strategy import (
@@ -65,21 +70,16 @@ from ai_graph.quant_strategy import (
     robust_strategy_source_refs,
     rsi_trade_rules,
 )
-from ai_graph.nodes.backtest_code import backtest_code_node
-from ai_graph.nodes.report import report_node
-from ai_graph.nodes.risk_manager import risk_manager_node
-from ai_graph.nodes.signal import signal_node
-from ai_graph.preflight import classify_research_request
-from ai_graph.scope_review import review_research_scope
+from ai_graph.research_eligibility import PerformanceAvailable
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
     BacktestBenchmark,
+    BacktestEquityPoint,
+    BacktestMetrics,
     BacktestPerformance,
     BacktestReliability,
-    BacktestEquityPoint,
     CandidateBacktestResult,
-    BacktestMetrics,
     ClarificationOption,
     Condition,
     DataRequirement,
@@ -87,16 +87,20 @@ from ai_graph.schemas import (
     EvidenceRef,
     InternalPayload,
     PublicMetricDetail,
+    RecommendationGate,
     ScreeningMatch,
     SemanticSlots,
     SourceUsage,
-    RecommendationGate,
     StrategyCandidateCard,
-    TickerAction,
     StrategySpec,
+    TickerAction,
     UserPayload,
 )
-from ai_graph.source_manifest import is_release_profile, validate_release_metadata
+from ai_graph.source_manifest import (
+    build_pipeline_extract_snapshot,
+    is_release_profile,
+    validate_release_metadata,
+)
 from ai_graph.state import QuantAgentState
 
 _logger = logging.getLogger(__name__)
@@ -232,7 +236,7 @@ def run_analysis(
 ) -> APIEnvelope:
     query = _normalize_user_query(user_query)
     resolved_trace_id = trace_id or (_trace_id(query) if query else None)
-    scope_decision = review_research_scope(query, classify_research_request(query))
+    scope_decision = classify_research_request(query)
     if not scope_decision.allowed:
         # This guard intentionally precedes audit-session construction and graph setup.
         # A refused personalized request must not persist a job/audit record, consume a
@@ -414,15 +418,6 @@ def _safe_state_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
         candidate = value.get(key)
         if isinstance(candidate, (str, int, float, bool)):
             metadata[key] = str(candidate)[:128]
-    data = value.get("data")
-    pipeline = data.get("pipeline_data_source") if isinstance(data, Mapping) else None
-    timings = pipeline.get("timings") if isinstance(pipeline, Mapping) else None
-    if isinstance(timings, Mapping):
-        metadata["timings"] = {
-            str(key): seconds
-            for key, seconds in timings.items()
-            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
-        }
     return metadata
 
 
@@ -674,7 +669,23 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
     )
     pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
     if is_release_profile():
-        manifest_errors = validate_release_metadata(pipeline_data.metadata)
+        raw_required_tickers = pipeline_data.metadata.get("tickers", ())
+        required_tickers = (
+            raw_required_tickers
+            if isinstance(raw_required_tickers, Sequence) and not isinstance(raw_required_tickers, str)
+            else ()
+        )
+        manifest_errors = validate_release_metadata(
+            pipeline_data.metadata,
+            extract_snapshot=build_pipeline_extract_snapshot(
+                price_rows=pipeline_data.price_rows,
+                screening_candidates=pipeline_data.screening_candidates,
+                l4_evidence=pipeline_data.l4_evidence,
+                macro_snapshot=pipeline_data.macro_snapshot,
+                data_availability=pipeline_data.data_availability,
+                required_tickers=required_tickers,
+            ),
+        )
         if manifest_errors:
             raise PipelineDataUnavailableError(
                 "release_source_manifest_invalid",
@@ -698,7 +709,9 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         "source_usage": [usage.model_dump() for usage in source_usage],
         "evidence_refs": [evidence.model_dump() for evidence in evidence_refs],
         "freshness_status": _aggregate_freshness_status(source_usage),
-        "freshness_evidence": build_freshness_evidence(pipeline_data.metadata).model_dump(),
+        "freshness_evidence": build_freshness_evidence(
+            pipeline_data.metadata
+        ).model_dump(),
         "proxy_disclosure": _proxy_disclosure(data_requirements),
         "data": {
             "candidate_cards": [card.model_dump() for card in cards],
@@ -714,8 +727,6 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         output["l4_evidence"] = pipeline_data.l4_evidence
     if pipeline_data.macro_snapshot:
         output["macro_snapshot"] = pipeline_data.macro_snapshot
-    if pipeline_data.official_benchmark:
-        output["official_benchmark"] = pipeline_data.official_benchmark
 
     # Stop rather than screen on whatever data happens to exist. Conditions we cannot
     # evaluate used to fall through to a price-only profile, so a flow or short-interest
@@ -871,7 +882,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             ],
             "candidate_cards": cards,
             "report": report,
-            "performance": build_public_backtest_performance(
+            "performance": project_public_performance(
                 state.get("backtest"),
                 price_rows=state.get("price_rows"),
                 pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
@@ -958,21 +969,18 @@ def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
 
 
 def _universe_split_disclosure(state: QuantAgentState) -> list[str]:
-    """Why a recommended name can be absent from the backtest, said before it is asked.
-
-    Only emitted for loads that carry a point-in-time universe descriptor; a run with no
-    historical membership excluded nothing, and describing the split there would state a
-    separation that did not happen.
-    """
+    """Explain any point-in-time universe split between testing and screening."""
 
     pipeline = state.get("data", {}).get("pipeline_data_source") or {}
     descriptor = pipeline.get("backtest_universe") if isinstance(pipeline, Mapping) else None
     if not isinstance(descriptor, Mapping):
         return []
     lines = [
-        "백테스트는 과거 시점(PIT) 기준 유니버스로 규칙 자체를 검증하고, "
-        "아래 종목은 같은 규칙을 오늘 데이터에 적용한 결과입니다. "
-        "두 목록이 서로 다른 것은 정상입니다."
+        (
+            "백테스트는 과거 시점(PIT) 기준 유니버스로 규칙 자체를 검증하고, "
+            "아래 종목은 같은 규칙을 오늘 데이터에 적용한 결과입니다. "
+            "두 목록이 서로 다른 것은 정상입니다."
+        )
     ]
     excluded = descriptor.get("excluded_screening_candidate_count")
     if isinstance(excluded, int) and not isinstance(excluded, bool) and excluded > 0:
@@ -999,16 +1007,14 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
     relaxation = pipeline.get("screening_relaxation") or {}
     availability = data.get("data_availability") or {}
     performance = (
-        build_public_backtest_performance(
+        project_public_performance(
             state.get("backtest"),
             price_rows=state.get("price_rows"),
             pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
         )
         or {}
     )
-    payload = (
-        performance.model_dump() if isinstance(performance, BacktestPerformance) else performance
-    )
+    payload = performance.performance if isinstance(performance, PerformanceAvailable) else None
     metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
 
     try:
@@ -3187,13 +3193,6 @@ def _ticker_actions(
     other hand, hands the user a specific list and that list needs a verdict for every
     row - otherwise a name silently disappearing reads as "sell". So screened names with
     no action from the backtest come back as WATCH, explicitly.
-
-    The WATCH sentence only ever states something the run already recorded: whether the
-    name was inside the traded universe at all, and whether the book was full on the last
-    session. Nothing here re-evaluates the entry conditions - a second evaluator would be
-    free to disagree with the one the performance numbers came from, and "did not meet the
-    entry condition" was exactly that: a cause asserted about names the backtest had never
-    priced.
     """
 
     freshness = state.get("freshness_evidence") or {}
@@ -3206,8 +3205,6 @@ def _ticker_actions(
     ]
     decided = {action.ticker for action in actions}
     as_of = actions[0].as_of_date if actions else None
-    traded = _traded_universe(backtest)
-    slots_full_reason = _slots_full_reason(backtest)
     for card in cards:
         for match in card.matches:
             if match.ticker in decided:
@@ -3218,73 +3215,13 @@ def _ticker_actions(
                     ticker=match.ticker,
                     name=match.name or match.ticker,
                     action="WATCH",
-                    reason=_watch_reason(
-                        match.ticker, traded=traded, slots_full_reason=slots_full_reason
-                    ),
+                    reason="스크리닝에는 걸렸으나 전략의 진입 조건은 아직 충족하지 않았습니다.",
                     as_of_date=as_of or match.as_of_date,
                     close=match.close,
                 )
             )
     order = {"SELL": 0, "BUY": 1, "HOLD": 2, "WATCH": 3}
     return sorted(actions, key=lambda a: (order[a.action], a.ticker))
-
-
-_WATCH_OUTSIDE_UNIVERSE = (
-    "백테스트가 거래한 과거 시점(PIT) 유니버스에 없는 종목이라 백테스트가 판정한 적이 "
-    "없습니다. 오늘 스크리닝 조건에는 부합합니다."
-)
-_WATCH_NO_INSTRUCTION = (
-    "백테스트 마지막 거래일에 이 종목에 대한 신규 진입·청산 지시가 없었습니다."
-)
-
-
-def _watch_reason(
-    ticker: str, *, traded: set[str] | None, slots_full_reason: str | None
-) -> str:
-    if traded is not None and str(ticker).zfill(6) not in traded:
-        return _WATCH_OUTSIDE_UNIVERSE
-    if slots_full_reason is not None:
-        return slots_full_reason
-    return _WATCH_NO_INSTRUCTION
-
-
-def _traded_universe(backtest: Mapping[str, Any]) -> set[str] | None:
-    """The tickers the backtest priced, or None when the run did not record them.
-
-    Both sides zero-pad to six digits at their source; padding again here keeps an
-    unpadded code from being reported as a name the backtest never looked at.
-    """
-
-    payload = backtest.get("backtest_payload")
-    tickers = payload.get("tickers") if isinstance(payload, Mapping) else None
-    if not isinstance(tickers, list) or not tickers:
-        return None
-    return {str(ticker).zfill(6) for ticker in tickers}
-
-
-def _slots_full_reason(backtest: Mapping[str, Any]) -> str | None:
-    """Whether the book was full on the last session, from the engine's own position list.
-
-    Only stated when both halves are recorded. The rolling-policy path builds its own
-    summary and carries neither, so it falls through rather than guessing at a cause.
-    """
-
-    summary = backtest.get("engine_summary")
-    if not isinstance(summary, Mapping):
-        return None
-    held = summary.get("open_position_tickers")
-    if not isinstance(held, list):
-        return None
-    context = summary.get("ai_backtest_context")
-    limit = context.get("applied_max_positions") if isinstance(context, Mapping) else None
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-        return None
-    if len(held) < limit:
-        return None
-    return (
-        f"백테스트 마지막 거래일에 전략 보유 슬롯 {len(held)}/{limit}이 모두 차 있어 "
-        "신규 진입이 제한된 상태였습니다."
-    )
 
 
 def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
@@ -3295,15 +3232,6 @@ def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
     objective floor, so a strategy that failed history is not dressed up as a buy list.
     """
 
-    freshness = state.get("freshness_evidence") or {}
-    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
-        return RecommendationGate(
-            validated=False,
-            reason=str(
-                freshness.get("reason")
-                or "freshness 한계를 확인할 수 없어 추천을 생성하지 않습니다."
-            ),
-        )
     if state.get("backtest") is None:
         return None
     validated = bool(state.get("strategy_validated"))
@@ -3456,9 +3384,8 @@ def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
     )
 
 
-# Emitted by the "could not be computed" branches of _objective_gate_reasons and
-# _benchmark_objective_reasons. Those describe an input that never arrived, not a number
-# that came in under a threshold, and the two must not share one sentence.
+# These messages describe inputs that did not arrive, not an observed metric below its
+# threshold. They must remain distinct from a measured strategy shortfall.
 _DATA_GAP_REASON_MARKERS = ("is unavailable", "계산할 수 없음", "비교 구간이 없습니다")
 
 
@@ -3467,14 +3394,6 @@ def _is_data_gap_reason(reason: str) -> bool:
 
 
 def _benchmark_input_gaps(backtest: CandidateBacktestResult) -> list[str]:
-    """The official benchmark series the automatic acceptance rule needs and may not have.
-
-    _objective_gate_reasons never looks at the primary benchmark's availability, so a run
-    blocked purely on the series not being loaded yet used to reach the reader as
-    "objective 조건 미충족" - a claim that the strategy underperformed, about a comparison
-    that was never made.
-    """
-
     if backtest.strategy_a.selection_mode != "automatic":
         return []
     payload = backtest.backtest_payload
@@ -3487,8 +3406,10 @@ def _benchmark_input_gaps(backtest: CandidateBacktestResult) -> list[str]:
         stated = str(primary.get("unavailable_reason") or "").strip()
         detail = f" ({stated})" if stated else ""
     return [
-        "공식 KOSPI/KOSDAQ TR 벤치마크 시계열이 아직 적재되지 않아 "
-        f"벤치마크 대비 검증을 완료하지 못했습니다{detail}"
+        (
+            "공식 KOSPI/KOSDAQ TR 벤치마크 시계열이 아직 적재되지 않아 "
+            f"벤치마크 대비 검증을 완료하지 못했습니다{detail}"
+        )
     ]
 
 
@@ -3559,16 +3480,14 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
     relaxation = pipeline.get("screening_relaxation") or {}
     availability = data.get("data_availability") or {}
     performance = (
-        build_public_backtest_performance(
+        project_public_performance(
             state.get("backtest"),
             price_rows=state.get("price_rows"),
             pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
         )
         or {}
     )
-    payload = (
-        performance.model_dump() if isinstance(performance, BacktestPerformance) else performance
-    )
+    payload = performance.performance if isinstance(performance, PerformanceAvailable) else None
     metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
 
     try:
@@ -3782,4 +3701,7 @@ def _sortino_ratio(total_return: float, returns: Sequence[float]) -> float | Non
 
 
 # Public performance helpers are sourced from quant_performance for a stable behavior contract.
-from ai_graph.quant_performance import build_public_backtest_performance  # noqa: E402, F811
+from ai_graph.quant_performance import (  # noqa: E402, F401, F811
+    build_public_backtest_performance,
+    project_public_performance,
+)

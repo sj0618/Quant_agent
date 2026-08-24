@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ai_graph.research_eligibility import PublicPerformance
+
 SCHEMA_VERSION = "ai-mvp.v1"
 
 
@@ -147,7 +149,7 @@ class SourceUsage(BaseModel):
 
 
 class FreshnessEvidence(BaseModel):
-    """The freshness decision shared by the API envelope and report projections."""
+    """The bounded freshness decision carried by a public envelope."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -686,20 +688,11 @@ class ReportBundle(BaseModel):
 
 
 class BacktestEvaluationBasis(BaseModel):
-    """Which slice of the history the public performance numbers were measured on.
-
-    A cumulative return with no stated basis is read as "what the strategy made". These
-    figures come from the part of the history selection never saw, and which part that is
-    differs per run - one hold-out tail, or the rolling policy's evaluation sessions. The
-    basis therefore travels with the numbers instead of being restated as a caption each
-    client writes for itself and gets wrong when the run takes the other path.
-    """
+    """Reader-facing statement of the historical slice used for performance."""
 
     model_config = ConfigDict(extra="forbid")
 
     basis: Literal["hold_out", "walk_forward_policy"]
-    # Ready-to-render sentence built from the fields below, so a client never has to
-    # reconstruct which period the number covers.
     caption: str = Field(min_length=1)
     hold_out_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
     window_start: str | None = None
@@ -707,19 +700,11 @@ class BacktestEvaluationBasis(BaseModel):
     window_policy_id: str | None = None
     evaluation_session_count: int | None = Field(default=None, ge=0)
     fold_count: int | None = Field(default=None, ge=0)
-    # Only true when the engine summary or the walk-forward fills show costs charged;
-    # "거래비용 반영" is a claim about the run, not a house style.
     cost_model_applied: bool = False
 
 
 class BacktestUniversePolicy(BaseModel):
-    """How the universe the backtest traded relates to the names shown for today.
-
-    The backtest trades the point-in-time membership of its fixed window; today's screen
-    is the same rule evaluated on today's data. A reader who is never told this reads a
-    recommended name that is absent from the backtest as a defect, and there is no way
-    for them to tell the two lists apart from the numbers alone.
-    """
+    """Reader-facing distinction between a PIT backtest universe and today's screen."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -729,8 +714,6 @@ class BacktestUniversePolicy(BaseModel):
     window_end: str | None = None
     traded_ticker_count: int | None = Field(default=None, ge=0)
     excluded_screening_candidate_count: int = Field(default=0, ge=0)
-    # Present only when at least one of today's candidates fell outside the window's
-    # membership, so an empty exclusion never prints a notice about nothing.
     excluded_notice: str | None = None
 
 
@@ -738,9 +721,7 @@ class BacktestPerformance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     selected_candidate_id: str = Field(min_length=1)
-    # A result can be retained for its reliability diagnostics even when there is not
-    # enough warm-up/history to publish performance.  `None` is deliberately different
-    # from a zero-valued metric: zero is a measured result, while None is unavailable.
+    # ``None`` is unavailable data, never a measured zero return.
     metrics: BacktestMetrics | None = None
     equity_curve: list[BacktestEquityPoint] = Field(default_factory=list)
     engine_summary: dict[str, Any] = Field(default_factory=dict)
@@ -779,11 +760,9 @@ class RecommendationGate(BaseModel):
 
     validated: bool
     reason: str = Field(min_length=1)
-    # A strategy that missed a measured threshold and a strategy whose acceptance rule
-    # could not be evaluated at all are two different answers. Collapsing both into
-    # "did not clear the floor" tells a reader their rule underperformed when in fact
-    # nothing was measured, so the two lists stay separate and the second one also
-    # flips verification_complete rather than hiding inside the reason sentence.
+    # A measured threshold miss and an acceptance rule that could not be evaluated are
+    # distinct outcomes. Keep them separate so unavailable inputs are never presented
+    # as strategy underperformance.
     verification_complete: bool = True
     unmet_objective_criteria: list[str] = Field(default_factory=list)
     unmet_data_requirements: list[str] = Field(default_factory=list)
@@ -820,7 +799,10 @@ class UserPayload(BaseModel):
     next_actions: list[str] = Field(default_factory=list)
     candidate_cards: list[StrategyCandidateCard] = Field(default_factory=list)
     report: ReportBundle | None = None
-    performance: BacktestPerformance | None = None
+    # Internal backtest objects retain their richer audit fields.  The HTTP/job
+    # envelope deliberately exposes only the discriminated projection so consumers
+    # cannot mistake a partial calculation for a publishable performance result.
+    performance: PublicPerformance | None = None
     recommendation_gate: RecommendationGate | None = None
     ticker_actions: list[TickerAction] = Field(default_factory=list)
     question: str | None = None

@@ -159,5 +159,4 @@ COMMENT ON COLUMN app.backtest_run.analysis_result_id IS
     'Immutable result identity produced by this run.';
 COMMENT ON COLUMN app.strategy_email_report.analysis_result_id IS
     'Immutable result identity used by report detail and download projections.';
-
 COMMIT;

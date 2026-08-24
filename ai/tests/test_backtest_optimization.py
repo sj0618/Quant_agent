@@ -342,6 +342,38 @@ def test_fresh_and_disk_cache_results_are_identical(monkeypatch, tmp_path) -> No
     assert fresh_payload == cached_payload
 
 
+def test_disk_cache_discards_stale_dependency_failures(monkeypatch, tmp_path) -> None:
+    """A cache made without quantstats must not poison a repaired worker process."""
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "cache"))
+    cache = backtest_node._DiskEvaluationCache()
+    candidate = CodeCandidate(
+        candidate_id="stale-quantstats-failure",
+        variant="A",
+        code="def build_signals(prices):\n    return []\n",
+        validation_ok=True,
+    )
+    key = "stale-quantstats-failure"
+    path = cache.root / f"{key}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": backtest_node.BACKTEST_CACHE_SCHEMA_VERSION,
+                "candidate": candidate.model_dump(mode="json"),
+                "engine_summary": None,
+                "equity_curve": [],
+                "objective_score": None,
+                "quantstats_dependency_error": True,
+                "diagnostics": {"error_type": "ModuleNotFoundError"},
+                "ticker_actions": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert cache.load(key, candidate) is None
+    assert not path.exists()
+
+
 def test_prepared_market_cache_skips_repeated_engine_conversion(monkeypatch) -> None:
     strategy = _strategy()
     rows = _rows(days=12, tickers=3)

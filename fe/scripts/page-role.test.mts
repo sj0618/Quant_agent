@@ -6,7 +6,7 @@ async function read(relativePath: string) {
   return readFile(new URL(relativePath, import.meta.url), "utf8");
 }
 
-test("/reports renders a read-only archive with local export controls", async () => {
+test("/reports exposes a read-only archive and safe export controls", async () => {
   const [reportsPage, reportList, reportActions, clientSource] = await Promise.all([
     read("../src/pages/ReportsPage.tsx"),
     read("../src/features/reports/ReportList.tsx"),
@@ -18,11 +18,9 @@ test("/reports renders a read-only archive with local export controls", async ()
   assert.match(reportsPage, /downloadReportsCsv/);
   assert.match(reportsPage, /printCurrentView/);
   assert.match(reportsPage, /ReportList/);
-  assert.match(reportList, /copyReportShareLink/);
-  assert.match(reportList, /printCurrentView/);
-  assert.doesNotMatch(reportList, /ROUTES\.notifications/);
-  assert.doesNotMatch(reportList, /resendReportEmail|재발송/);
-  assert.doesNotMatch(reportActions, /resendReportEmail|\/resend/);
+  assert.match(reportList, /읽기 전용 결과 스냅샷/);
+  assert.doesNotMatch(reportList, /resendReportEmail|copyReportShareLink|recommendationScore|report\.signals/);
+  assert.match(reportActions, /export async function resendReportEmail/);
   assert.match(clientSource, /export async function getReports/);
   assert.doesNotMatch(reportsPage, /getReportStrategies/);
   assert.doesNotMatch(reportList, /getDigestStrategySelection|getEmailDeliveryHistory|reportsHistory|reportStrategies/);
@@ -47,7 +45,7 @@ test("/me and /me/notifications stay on the profile and notification surface", a
   assert.doesNotMatch(appSource, /StrategyReportsPage|StrategyReportDetailPage|ReportsHistoryPage/);
 });
 
-test("/search stays report-centric and forwards the submitted q to report search", async () => {
+test("/search stays archive-centric and forwards the submitted q to report search", async () => {
   const [searchPage, clientSource] = await Promise.all([
     read("../src/pages/SearchPage.tsx"),
     read("../src/api/quantAgentClient.ts"),
@@ -56,7 +54,7 @@ test("/search stays report-centric and forwards the submitted q to report search
   assert.match(searchPage, /getReports/);
   assert.match(searchPage, /getReports\(normalizedQuery\)/);
   assert.match(searchPage, /ROUTES\.reportDetail/);
-  assert.match(searchPage, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
+  assert.match(searchPage, /placeholder="결과 ID 또는 보관 기준일"/);
   assert.match(searchPage, /Badge variant="info">report<\/Badge>/);
   assert.doesNotMatch(clientSource, /export async function searchInstruments/);
   assert.doesNotMatch(searchPage, /getWorkspaceTemplate/);
@@ -70,21 +68,15 @@ test("/search stays report-centric and forwards the submitted q to report search
   assert.doesNotMatch(searchPage, /searchInstruments/);
 });
 
-test("/reports/:id keeps read-only detail navigation with local actions", async () => {
-  const [detailPage, reportDetail, reportActions, archivePolicy] = await Promise.all([
+test("/reports/:id keeps read-only snapshot navigation and PDF export", async () => {
+  const [detailPage, reportActions] = await Promise.all([
     read("../src/pages/ReportDetailPage.tsx"),
-    read("../src/features/reports/ReportDetail.tsx"),
     read("../src/api/reportActionsClient.ts"),
-    read("../src/features/reports/reportArchive.ts"),
   ]);
 
   assert.match(detailPage, /getReportById/);
-  assert.match(detailPage, /copyReportShareLink/);
   assert.match(detailPage, /printCurrentView/);
   assert.match(detailPage, /ROUTES\.reports/);
   assert.doesNotMatch(detailPage, /mock data/);
-  assert.doesNotMatch(detailPage, /resendReportEmail|이메일 재발송/);
-  assert.doesNotMatch(reportActions, /resendReportEmail|\/resend/);
-  assert.match(reportDetail, /보관 기록 시각/);
-  assert.match(archivePolicy, /snapshot은 90일 보관/);
+  assert.match(reportActions, /buildReportPrintTitle/);
 });

@@ -4,7 +4,8 @@ from typing import Any
 
 from ai_graph.freshness import build_freshness_evidence
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_report_writeup
-from ai_graph.nodes.backtest import summarize_backtest
+from ai_graph.quant_performance import project_public_performance
+from ai_graph.research_eligibility import PerformanceAvailable, PublicPerformance
 from ai_graph.schemas import ReportBundle, ReportProjection, RiskDecision, StrategySpec
 
 
@@ -16,6 +17,7 @@ def build_report_bundle(
     data: dict[str, Any] | None = None,
     debate: dict[str, Any] | None = None,
     citations: list[dict[str, str]] | None = None,
+    public_performance: PublicPerformance | None = None,
 ) -> ReportBundle:
     signal = risk.signal
     risk_text = (
@@ -58,13 +60,13 @@ def build_report_bundle(
                 "items": freshness_evidence.model_dump(mode="json"),
             },
         )
-    if backtest:
+    if public_performance is not None:
         sections.insert(
             3,
             {
-                "id": "backtest",
+                "id": "performance",
                 "title": "후보 코드 백테스트",
-                "items": summarize_backtest(backtest),
+                "items": public_performance.model_dump(mode="json"),
             },
         )
     if debate:
@@ -105,6 +107,11 @@ def report_node(state: dict) -> dict:
     strategy = StrategySpec.model_validate(state["strategy_spec"])
     risk = RiskDecision.model_validate(state["risk"])
     debate = build_report_debate(state, strategy, risk)
+    public_performance = project_public_performance(
+        state.get("backtest"),
+        price_rows=state.get("price_rows"),
+        pipeline_data_source=(state.get("data") or {}).get("pipeline_data_source"),
+    )
     report = build_report_bundle(
         strategy,
         risk,
@@ -112,6 +119,7 @@ def report_node(state: dict) -> dict:
         data=state.get("data"),
         debate=debate,
         citations=_screening_citations(state),
+        public_performance=public_performance,
     )
     return {"report": report.model_dump(), "report_debate": debate}
 
@@ -156,7 +164,7 @@ def build_report_debate(
     context = {
         "strategy": strategy.model_dump(),
         "risk": risk.model_dump(),
-        "backtest": summarize_backtest(state.get("backtest", {})),
+        "performance": _report_safe_performance(state),
         "data_availability": state.get("data", {}).get("data_availability", {}),
         "signal_decision": {
             "action": investment_signal.get("action"),
@@ -182,3 +190,17 @@ def build_report_debate(
         ),
     )
     return {"writeup": writeup.model_dump()}
+
+
+def _report_safe_performance(state: dict[str, Any]) -> dict[str, Any] | None:
+    performance = project_public_performance(
+        state.get("backtest"),
+        price_rows=state.get("price_rows"),
+        pipeline_data_source=(state.get("data") or {}).get("pipeline_data_source"),
+    )
+    if performance is None:
+        return None
+    if isinstance(performance, PerformanceAvailable):
+        return performance.model_dump(mode="json")
+    # The unavailable variant has no metrics/chart fields by construction.
+    return performance.model_dump(mode="json")

@@ -57,6 +57,32 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("listing_status = 'listed'", sql)
         self.assertIn("'인프라펀드'", sql)
 
+    def test_point_in_time_universe_migration_uses_listing_history_not_current_status(self):
+        sql = Path("migrations/013_point_in_time_universe_membership.sql").read_text(
+            encoding="utf-8"
+        )
+
+        for view in (
+            "mart.common_stock_feature_frame_asof",
+            "mart.common_stock_universe_asof",
+            "mart.full_universe_asof",
+        ):
+            self.assertIn(f"CREATE OR REPLACE VIEW {view}", sql)
+
+        self.assertIn("core.symbol_listing_history", sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS core.symbol_security_type_history", sql)
+        self.assertIn("core.symbol_security_type_history sh", sql)
+        self.assertIn("h.valid_from <= f.as_of_date", sql)
+        self.assertIn("h.valid_to IS NULL OR h.valid_to >= f.as_of_date", sql)
+        self.assertIn("sh.valid_from <= f.as_of_date", sql)
+        self.assertIn("sh.valid_to IS NULL OR sh.valid_to >= f.as_of_date", sql)
+        self.assertIn("h.listing_status = 'listed'", sql)
+        self.assertIn("sh.security_type = '보통주'", sql)
+        self.assertIn("h.market IN ('KOSPI', 'KOSDAQ')", sql)
+        self.assertNotIn("sm.listing_status = 'listed'", sql)
+        self.assertNotIn("sm.market_segment IN ('KOSPI', 'KOSDAQ')", sql)
+        self.assertNotIn("sm.security_type = '보통주'", sql)
+
     def test_app_ai_backtest_erd_migration_contains_requested_tables(self):
         sql = Path("../service_db/migrations/011_app_ai_backtest_erd.sql").read_text(encoding="utf-8")
         self.assertIn("CREATE SCHEMA IF NOT EXISTS app;", sql)

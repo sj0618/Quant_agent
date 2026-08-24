@@ -1,56 +1,109 @@
-# QuantAgent Production Control Board
+# QuantAgent production control board
 
-이 문서는 상태 전이와 blocker를 증적으로 관리하는 내부 control board다.
-진행률에는 증적 URI가 없는 작업을 포함하지 않는다.
+이 보드는 WBS 자체가 아니라, 상태 전이와 차단 사유를 같은 SHA에 묶어
+추적하기 위한 보조 증적이다. 구조 검사는 `node scripts/check-production-plan.mjs`로
+실행한다. 이 파일의 PASS는 문서 구조의 PASS일 뿐, 운영·실데이터·배포 완료가 아니다.
 
-## 필수 열 계약
+<!-- control-board:v1
+{
+  "schemaVersion": "quantagent-control-board.v1",
+  "snapshot": {
+    "gitSha": "f02672878f10ee038133b917a18d333e061187bc",
+    "localOnly": true,
+    "limitation": "This board is a local planning snapshot. It cannot establish production, live-data, deployment, or human-approval completion.",
+    "scope": "PM-GOAL-00, PM-GOAL-01, PM-BOARD-01 planning preflight and current QA evidence blockers"
+  },
+  "transitions": [
+    {
+      "id": "TR-PLAN-001",
+      "taskId": "PM-GOAL-00",
+      "from": "not_started",
+      "to": "in_progress",
+      "at": "2026-08-24 10:00 KST",
+      "gitSha": "f02672878f10ee038133b917a18d333e061187bc",
+      "evidence": ["repo:scripts/check-production-plan.mjs@f02672878f10ee038133b917a18d333e061187bc", "repo:scripts/check-production-plan.test.mjs@f02672878f10ee038133b917a18d333e061187bc"],
+      "owner": "윤서준",
+      "reviewer": "pending-independent-reviewer",
+      "limitation": "A structural PASS creates a reproducible planning preflight only. No human independent review has occurred, and the WBS row remains subject to its own evidence and reviewer requirements."
+    },
+    {
+      "id": "TR-PLAN-002",
+      "taskId": "PM-GOAL-01",
+      "from": "not_started",
+      "to": "in_progress",
+      "at": "2026-08-24 10:00 KST",
+      "gitSha": "f02672878f10ee038133b917a18d333e061187bc",
+      "evidence": ["repo:docs/plans/quantagent-production-qa-local-evidence-contract-20260824.md@f02672878f10ee038133b917a18d333e061187bc", "repo:scripts/check-production-plan.test.mjs@f02672878f10ee038133b917a18d333e061187bc"],
+      "owner": "윤서준",
+      "reviewer": "pending-independent-reviewer",
+      "limitation": "The PASS/FAIL behavior is tested locally. No human independent review has occurred; independent review and same-SHA immutable execution evidence are still required before any terminal WBS status."
+    }
+  ],
+  "blockers": [
+    {
+      "id": "BL-PLAN-001",
+      "owner": "윤서준",
+      "reason": "The legacy production-readiness evaluator reports seven QA gates not PASS and 84 P0 rows without completed immutable evidence.",
+      "impactedTaskIds": ["PM-GOAL-00", "PM-GOAL-01", "PM-BOARD-01"],
+      "openedAt": "2026-08-24 10:00 KST",
+      "nextReviewAt": "2026-08-25 10:00 KST",
+      "recurrenceCount": 1,
+      "lastReviewer": "Codex local verifier (not independent approval)",
+      "evidence": ["repo:docs/plans/quantagent-production-qa-local-evidence-contract-20260824.md@f02672878f10ee038133b917a18d333e061187bc", "repo:scripts/check-production-plan.mjs@f02672878f10ee038133b917a18d333e061187bc"],
+      "releaseDisposition": "blocked",
+      "limitation": "This is a legacy-goal blocker. The requested 8/31 research MVP is a separate scope and does not inherit production completion."
+    },
+    {
+      "id": "BL-DATA-001",
+      "owner": "윤민호",
+      "reason": "The four QA-DATA audit commands stop at collection because neither pandas_ta_classic nor pandas_ta is installed in the selected local test environment.",
+      "impactedTaskIds": ["QA-DATA-AUDIT-01", "QA-DATA-AUDIT-02", "QA-DATA-AUDIT-03", "QA-DATA-AUDIT-04"],
+      "openedAt": "2026-08-24 10:00 KST",
+      "nextReviewAt": "2026-08-25 10:00 KST",
+      "recurrenceCount": 1,
+      "lastReviewer": "Codex local verifier (not independent approval)",
+      "evidence": ["repo:DE/docs/point-in-time-universe-evidence-contract.md@f02672878f10ee038133b917a18d333e061187bc", "repo:docs/plans/quantagent-production-qa-local-evidence-contract-20260824.md@f02672878f10ee038133b917a18d333e061187bc"],
+      "releaseDisposition": "blocked",
+      "limitation": "Installing an optional local dependency alone cannot substitute for a PostgreSQL source/as-of/freshness/lineage evidence run."
+    },
+    {
+      "id": "BL-METRIC-001",
+      "owner": "윤민호",
+      "reason": "Profit-factor prose describes gross-profit/gross-loss period returns, while the current engine computes a bounded ratio from win rate; the registry contract therefore cannot be approved.",
+      "impactedTaskIds": ["MR-REG-01", "MR-PF-01", "MR-ALL-01"],
+      "openedAt": "2026-08-24 10:00 KST",
+      "nextReviewAt": "2026-08-25 10:00 KST",
+      "recurrenceCount": 1,
+      "lastReviewer": "Codex local verifier (not independent approval)",
+      "evidence": ["repo:ai/ai_graph/quant_explanations.py@f02672878f10ee038133b917a18d333e061187bc", "repo:ai/ai_graph/nodes/backtest.py@f02672878f10ee038133b917a18d333e061187bc", "repo:docs/plans/quantagent-profit-factor-contract.md@f02672878f10ee038133b917a18d333e061187bc"],
+      "releaseDisposition": "blocked",
+      "limitation": "Local serialization tests can prove shape consistency but cannot choose the business definition or approve a repaired formula."
+    }
+  ]
+}
+-->
 
-### 상태 전이
+## 상태 전이 기록
 
-`transition_id`, `work_item_id`, `previous_status`, `new_status`, `revision`,
-`occurred_at`, `evidence_uri`, `actor`, `reason`
-
-### Blocker
-
-`blocker_id`, `status`, `discovered_at`, `discovery_evidence_uri`, `affected_work`,
-`next_check_at`, `owner`, `recurrence_count`, `last_reviewer`,
-`resolution_evidence_uri`
-
-`recurrence_count`는 최초 발견을 제외한 재발 횟수다. 해제되지 않은 blocker도 현재 상태와 다음 확인 시점을 기록하며, 해제 증적 칸에는 해당 상태를 입증하는 board 증적 URI를 남긴다.
-
-## 집계
-
-| metric | value | definition |
-|---|---:|---|
-| state_transition_count | 1 | 상태 전이 행 수 |
-| state_transition_evidence_uri_count | 1 | 유효한 상태 전이 증적 URI 수 |
-| blocker_count | 2 | blocker 행 수 |
-| blocker_evidence_uri_count | 4 | 발견·해제 증적 URI 수 |
-| blocker_recurrence_total | 14 | 모든 blocker의 재발 횟수 합계 |
-| recurring_blocker_count | 2 | 재발 횟수가 1 이상인 blocker 수 |
-| max_blocker_recurrence_count | 12 | 단일 blocker의 최대 재발 횟수 |
-
-## 상태 전이 증적
-
-| transition_id | work_item_id | previous_status | new_status | revision | occurred_at | evidence_uri | actor | reason |
+| Record ID | 대상 ID | 이전 → 현재 | 시각 | Git SHA | 증적 URI | Owner | Independent reviewer | 한계 |
 |---|---|---|---|---|---|---|---|---|
-| ST-PM-BOARD-01-001 | PM-BOARD-01 | planned | implemented | branch:feat/control-board-evidence | 2026-08-21T00:00:00+09:00 | evidence://PM-BOARD-01-transition-001 | automation | 상태 전이·증적·재발 집계 계약 구현 |
+| TR-PLAN-001 | PM-GOAL-00 | not_started → in_progress | 2026-08-24 10:00 KST | `f026728` | `repo:scripts/check-production-plan.mjs@f026728` | 윤서준 | pending-independent-reviewer | 구조 검증만 수행했으며 사람 검토는 아직 없다. |
+| TR-PLAN-002 | PM-GOAL-01 | not_started → in_progress | 2026-08-24 10:00 KST | `f026728` | `repo:docs/plans/quantagent-production-qa-local-evidence-contract-20260824.md@f026728` | 윤서준 | pending-independent-reviewer | local PASS/FAIL 계약만 기록했으며 사람 검토는 아직 없다. |
 
-## Blocker 원장
+## 차단·재발 기록
 
-| blocker_id | status | discovered_at | discovery_evidence_uri | affected_work | next_check_at | owner | recurrence_count | last_reviewer | resolution_evidence_uri |
-|---|---|---|---|---|---|---|---:|---|---|
-| BLK-PM-BOARD-001 | open | 2026-08-21T00:00:00+09:00 | evidence://BLK-PM-BOARD-001-discovered | PM-BOARD-01 | 2026-08-22T00:00:00+09:00 | schedule-evidence-manager | 2 | independent-reviewer | evidence://BLK-PM-BOARD-001-current-state |
-| BLK-DEPLOY-SSH-001 | open | 2026-08-13T11:11:50+09:00 | https://github.com/sj0618/Qaunt_agent/actions/runs/31660077571 | RMP-ENV-01, P0-REL-01, P1-CI-01, P1-OBS-01, P2-OPS-01 | 2026-08-24T09:00:00+09:00 | server-operations | 12 | pending-independent-review | evidence://BLK-DEPLOY-SSH-001-current-state |
+| Blocker ID | 영향 작업 | 발견 근거 | Owner | 다음 확인 | 재발 횟수 | 마지막 검토자 | 해제 증적 | Release disposition |
+|---|---|---|---|---|---:|---|---|---|
+| BL-PLAN-001 | PM-GOAL-00, PM-GOAL-01, PM-BOARD-01 | legacy evaluator의 7 gate/84 P0 failure | 윤서준 | 2026-08-25 10:00 KST | 1 | Codex local verifier (not independent approval) | 같은 SHA의 evaluator PASS + 독립 APPROVE | blocked |
+| BL-DATA-001 | QA-DATA-AUDIT-01~04 | pandas TA import collection failure | 윤민호 | 2026-08-25 10:00 KST | 1 | Codex local verifier (not independent approval) | executable audit + PostgreSQL manifest bundle | blocked |
+| BL-METRIC-001 | MR-REG-01, MR-PF-01, MR-ALL-01 | profit-factor formula/implementation disagreement | 윤민호 | 2026-08-25 10:00 KST | 1 | Codex local verifier (not independent approval) | approved definition + engine/registry/API test | blocked |
 
-`BLK-DEPLOY-SSH-001`은 배포 대상 서버(`quant-agent.kro.kr:30233`)가 TCP 연결은 받지만 SSH 배너를 보내지 않고 끊는 상태다. `Deploy to SSH Server`와 `Server health check`가 모두 `ssh-keyscan` 단계에서 실패하며, 2026-08-13T10:31+09:00 성공 이후 13회 연속 실패했다(최초 발견 제외 재발 12회). 진단 근거와 영향 범위는 [고준영 담당 WBS 증적 2026-08-23](gojunyong-wbs-evidence-20260823.md)에 있다. `owner`와 `last_reviewer`는 아직 배정되지 않은 역할 자리표시자이며, 사람이 배정되기 전까지 승인 증적으로 쓰지 않는다.
+## 사용 규칙
 
-## 검증
-
-```powershell
-cd ai
-python -m pytest -q tests/test_control_board.py
-python scripts/validate_control_board.py --board ../docs/plans/quantagent-production-control-board.md
-```
-
-검증기는 필수 열 누락, 빈 증적 URI, 음수·비정수 재발 횟수, board에 표시된 집계와 원장 재계산 결과의 불일치를 실패로 처리한다.
+1. 새 상태 전이는 JSON marker와 표를 함께 갱신한다. `Git SHA`, 증적 URI, owner,
+   독립 reviewer, limitation이 하나라도 비면 preflight는 FAIL이다.
+2. 한 validation bundle 안의 전이와 증적은 모두 `snapshot.gitSha`와 같아야 한다.
+   새 SHA를 검증할 때는 새 snapshot을 만들고 이전 보드를 덮어쓰지 않는다.
+3. `localOnly: true` 상태에서는 `complete`나 운영 완료를 선언하지 않는다. 서버의
+   PostgreSQL source/as-of/freshness/lineage, 배포 artifact, 독립 승인까지 갖춘
+   immutable bundle만 그 제한을 바꿀 수 있다.

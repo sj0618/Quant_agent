@@ -39,7 +39,7 @@ test("canonical product surface excludes retired history and strategy routes", a
   assert.match(searchSource, /getReports\(normalizedQuery\)/);
   assert.match(searchSource, /ROUTES\.reportDetail/);
   assert.match(searchSource, /Badge variant="info">report<\/Badge>/);
-  assert.match(searchSource, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
+  assert.match(searchSource, /placeholder="결과 ID 또는 보관 기준일"/);
   assert.doesNotMatch(searchSource, /getAppOverview/);
   assert.doesNotMatch(searchSource, /getWorkspaceTemplate/);
   assert.doesNotMatch(searchSource, /refreshLatestAnalysisJob/);
@@ -78,6 +78,7 @@ test("public navigation and bundle sources contain no development preview, fake 
   assert.doesNotMatch(routesSource, /emailTemplatePreview|dev\/email-template/);
   assert.doesNotMatch(landingSource, /reportDetail\("2026-04-18"\)|KRX LIVE|Sharpe 1\.42/);
   assert.match(landingSource, /로그인 후 읽기 전용 리포트 보관함으로 이동합니다/);
+  assert.match(landingSource, /새 분석은 지원하지 않습니다/);
   assert.doesNotMatch(landingSource, /매수|매도|보유|추천|BUY|SELL|HOLD/);
   assert.doesNotMatch(await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"), /landing\.mock|getLandingSample|LandingSample/);
   assert.doesNotMatch(landingSource, /RELEASE VALIDATION|VALIDATION PRINCIPLES|READ-ONLY ARCHIVE|CURRENT SCOPE/);

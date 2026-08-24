@@ -542,6 +542,23 @@ export interface ReportSummary {
   marketSnapshot: Array<{ label: string; value: string; tone?: Tone }>;
 }
 
+/**
+ * Browser contract for the read-only report archive.  This is intentionally
+ * separate from ReportSummary because the archive API must not transfer report
+ * narratives, market snapshots, rankings, action signals, or performance data.
+ */
+export interface ArchivedReportSummary {
+  id: string;
+  runId?: string;
+  date: string;
+  weekday: string;
+  sentAt: string;
+  status: ReportDeliveryStatus;
+  createdAt?: string;
+  updatedAt?: string;
+  publishedAt?: string;
+}
+
 export interface PersistedReportSection {
   id?: string;
   title?: string;
@@ -658,6 +675,11 @@ export interface ReportDetail extends ReportSummary {
   warningNote?: string | null;
   performance: Pick<PerformanceSummary, "metrics" | "disclaimer">;
   costNotes: string[];
+}
+
+/** Reader-safe detail: immutable archive metadata plus allow-listed evidence. */
+export interface ArchivedReportDetail extends ArchivedReportSummary {
+  contentSections: PersistedReportSection[];
 }
 
 export type EmailDeliveryStatus = "sent" | "resent" | "failed" | "draft";

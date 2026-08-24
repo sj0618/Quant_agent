@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
+from ai_graph.research_eligibility import PerformanceAvailable, PublicPerformance
 from nodes.backtest import BacktestResult
 from risk_manager import RiskDecision
 
@@ -18,6 +19,9 @@ class ReportRequest(BaseModel):
     risk: RiskDecision
     trace_id: str = Field(min_length=1)
     debug_ref: str = Field(min_length=1)
+    # The legacy standalone report can still receive its internal engine object for
+    # audit, but it may publish performance only through this projection.
+    public_performance: PublicPerformance | None = None
     internal_payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -26,7 +30,8 @@ class ReportResponse(BaseModel):
 
     summary: str = Field(min_length=1)
     recommendation: str = Field(pattern="^(APPROVE|REVIEW|REJECT)$")
-    metrics: dict[str, float | int]
+    performance_availability: str = Field(pattern="^(available|unavailable)$")
+    metrics: dict[str, float | int] | None = None
     risk_checks: list[dict[str, Any]]
     trace_id: str = Field(min_length=1)
     debug_ref: str = Field(min_length=1)
@@ -36,26 +41,39 @@ class ReportResponse(BaseModel):
     def serialize_public(self) -> dict[str, Any]:
         """기본 직렬화에서 internal_payload를 노출하지 않는다."""
 
-        return {
+        payload = {
             "summary": self.summary,
             "recommendation": self.recommendation,
-            "metrics": self.metrics,
+            "performance_availability": self.performance_availability,
             "risk_checks": self.risk_checks,
             "trace_id": self.trace_id,
             "debug_ref": self.debug_ref,
         }
+        if self.metrics is not None:
+            payload["metrics"] = self.metrics
+        return payload
 
 
 def build_report(request: ReportRequest) -> ReportResponse:
     recommendation = "APPROVE" if request.risk.approved else "REJECT"
-    metrics = request.backtest.metrics.model_dump()
-    summary = (
-        f"{request.strategy_summary}: return {metrics['total_return_pct']}%, "
-        f"drawdown {metrics['max_drawdown_pct']}%, risk {recommendation.lower()}."
-    )
+    performance = request.public_performance
+    if isinstance(performance, PerformanceAvailable):
+        raw_metrics = performance.performance.get("metrics")
+        metrics = (
+            {key: value for key, value in raw_metrics.items() if isinstance(value, (float, int))}
+            if isinstance(raw_metrics, dict)
+            else None
+        )
+        summary = f"{request.strategy_summary}: published performance is available; risk {recommendation.lower()}."
+        availability = "available"
+    else:
+        metrics = None
+        summary = f"{request.strategy_summary}: performance is unavailable; risk {recommendation.lower()}."
+        availability = "unavailable"
     return ReportResponse(
         summary=summary,
         recommendation=recommendation,
+        performance_availability=availability,
         metrics=metrics,
         risk_checks=[check.model_dump() for check in request.risk.checks],
         trace_id=request.trace_id,

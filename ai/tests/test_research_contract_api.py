@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
+import ai_graph.api as api_module
 from ai_graph.api import (
+    DATA_EVIDENCE_PROBE_PATH,
+    DATA_EVIDENCE_PROBE_TOKEN_ENV,
     RESEARCH_JOB_CREATE_PATH,
     RESEARCH_JOB_RESULT_PATH,
     SPEC_STRATEGY_PARSE_PATH,
@@ -11,7 +15,9 @@ from ai_graph.api import (
 from ai_graph.auth import DisabledSessionResolver
 from ai_graph.jobs import InMemoryAnalysisJobStore
 from ai_graph.research_contract import RuleDraftSigner
+from ai_graph.research_eligibility import ResearchRuntimeFacts
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
+from ai_graph.token_auth import ResolvedAccountToken
 
 
 def _ready_envelope(trace_id: str) -> APIEnvelope:
@@ -65,6 +71,33 @@ def test_parse_returns_rule_review_without_job_quota_or_runner_side_effects() ->
     assert "매수" not in serialized
     assert "매도" not in serialized
     assert "RSI가 30 이하이고" not in serialized
+
+
+def test_data_evidence_probe_is_hidden_token_gated_and_has_no_job_side_effects(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setenv(DATA_EVIDENCE_PROBE_TOKEN_ENV, "operator-only")
+    monkeypatch.setattr(
+        api_module,
+        "measure_research_runtime_facts_from_env",
+        lambda *_args: ResearchRuntimeFacts(
+            dsn_configured=True,
+            source="postgres",
+            production_eligible=False,
+        ),
+    )
+    client, store = _client(execution_enabled=True, calls=calls)
+
+    assert client.get(DATA_EVIDENCE_PROBE_PATH).status_code == 404
+    response = client.get(
+        DATA_EVIDENCE_PROBE_PATH,
+        headers={"X-AI-Evidence-Probe": "operator-only"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["decision"] == "ineligible"
+    assert response.json()["reason_code"] == "not_production_eligible"
+    assert store.jobs == {}
+    assert calls == []
 
 
 def test_confirmed_rule_executes_only_when_activation_is_explicit_and_then_projects_unavailable() -> None:
@@ -125,4 +158,79 @@ def test_scope_refusal_stays_before_signing_or_execution() -> None:
     assert response.json()["kind"] == "scope_refusal"
     assert "내 보유" not in response.text
     assert store.jobs == {}
+    assert calls == []
+
+
+class _ReadOnlyTokenResolver:
+    """Records the one identity read the preflight boundary is allowed to perform."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def resolve(self, raw_token: str) -> ResolvedAccountToken | None:
+        self.calls += 1
+        return ResolvedAccountToken(
+            token_id="preflight-token",
+            user_id="preflight-user",
+            quota_limit=1,
+            quota_window_seconds=60,
+        )
+
+
+class _QuotaSpy:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def check_and_consume(self, token: ResolvedAccountToken) -> None:
+        self.calls += 1
+
+
+def test_scope_refusal_transport_performs_only_identity_read_before_all_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A public 422 must be returned before every signer/job/audit/runner boundary.
+
+    The token lookup is deliberately the lone permitted call: it is read-only and keeps
+    refusal responses scoped to an authenticated caller without spending quota.
+    """
+
+    import ai_graph.api as api_module
+
+    calls: list[str] = []
+    store = InMemoryAnalysisJobStore()
+    token_resolver = _ReadOnlyTokenResolver()
+    quota = _QuotaSpy()
+
+    def forbidden(name: str):
+        def fail(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"refused request reached {name}")
+
+        return fail
+
+    monkeypatch.setattr(store, "create_job", forbidden("job_store"))
+    monkeypatch.setattr(api_module, "build_rule_draft", forbidden("signer"))
+    monkeypatch.setattr(api_module, "_build_analysis_runner_with_audit", forbidden("audit_runner"))
+
+    app = create_app(
+        store,
+        analysis_runner=forbidden("runner"),
+        session_resolver=DisabledSessionResolver(),
+        account_token_resolver=token_resolver,
+        account_token_quota=quota,
+        rule_draft_signer=RuleDraftSigner("research-contract-test-secret", key_version="test-v1"),
+        research_execution_enabled=True,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": "내 계좌에 맞는 종목을 골라줘"},
+        headers={"Authorization": "Bearer read-only-token"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["kind"] == "scope_refusal"
+    assert token_resolver.calls == 1
+    assert quota.calls == 0
     assert calls == []

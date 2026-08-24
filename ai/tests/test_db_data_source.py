@@ -28,6 +28,8 @@ from ai_graph.data_sources.db import (
     _relative_strength,
     _screening_matcher,
     load_pipeline_data_from_env,
+    classify_research_runtime_failure,
+    research_runtime_facts_from_bundle,
     resolve_database_dsn_from_env,
     screening_profile,
 )
@@ -216,6 +218,30 @@ def test_pipeline_data_source_without_dsn_uses_explicit_nonproduction_fixture(mo
 
     assert bundle.metadata["source"] == "fixture"
     assert bundle.metadata["production_eligible"] is False
+
+
+def test_runtime_facts_keep_fixture_runs_explicitly_local_only(monkeypatch) -> None:
+    monkeypatch.delenv(AI_DATABASE_DSN_ENV, raising=False)
+    monkeypatch.delenv(QUANT_DB_DSN_ENV, raising=False)
+    monkeypatch.delenv(DATABASE_URL_ENV, raising=False)
+
+    facts = research_runtime_facts_from_bundle(
+        load_pipeline_data_from_env("RSI 조건", "contract-fixture"),
+        dsn_configured=False,
+        trace_id="contract-fixture",
+    )
+
+    assert facts.source == "fixture"
+    assert facts.production_eligible is False
+    assert facts.dsn_configured is False
+
+
+def test_runtime_facts_classify_database_failure_without_error_details() -> None:
+    facts = classify_research_runtime_failure(dsn_configured=True)
+
+    assert facts.load_state == "database_error"
+    assert facts.dsn_configured is True
+    assert facts.source is None
 
 
 def test_configured_database_failure_is_not_replaced_with_fixture(monkeypatch) -> None:
@@ -593,7 +619,9 @@ def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     assert any(row.get("rsi", 100) <= RSI_OVERSOLD_THRESHOLD for row in bundle.price_rows)
 
 
-def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -> None:
+def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A screen that matched nothing must not block or repeat the backtest load.
 
     The baseline screen scans every ticker in feature.kis_adjusted_ohlcv_daily with six
@@ -702,6 +730,16 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
         def _fetch_macro_status(self, _conn: object) -> dict[str, object]:
             return {}
 
+    provider_calls: list[object] = []
+
+    def _provider_must_not_run(*args: object, **kwargs: object) -> dict[str, object]:
+        provider_calls.append((args, kwargs))
+        raise AssertionError("empty-screen relaxation must not invoke a provider")
+
+    monkeypatch.setattr(
+        "ai_graph.llm.role_calls.generate_relaxed_screening_thresholds",
+        _provider_must_not_run,
+    )
     connection = CountingConnection()
     source = EmptyScreenDataSource(
         DataSourceConfig(database_dsn="postgresql://fake/fake")
@@ -717,6 +755,7 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe() -
     assert bundle.metadata["tickers"] == ["000660"]
     assert bundle.metadata["parallel_screening_backtest"] is True
     assert bundle.price_rows[0]["ticker"] == "000660"
+    assert provider_calls == []
 
 
 def test_indicator_reads_are_anchored_by_bind_parameter_not_a_subquery() -> None:

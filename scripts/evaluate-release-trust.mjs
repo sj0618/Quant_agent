@@ -2,7 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { constants } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -48,6 +48,11 @@ export function createOfflineTestEnvironment(source = process.env) {
       delete environment[key];
     }
   }
+  // Backtest evaluations persist candidate outcomes. A stale local failure must not
+  // make this release gate fail after its dependency is restored, nor may a caller
+  // choose a cache populated by a different revision. The OS temp directory is
+  // deliberately unique to this evaluator invocation and is never deployment data.
+  environment.AI_BACKTEST_CACHE_DIR = join(tmpdir(), `quantagent-release-trust-${process.pid}`);
   return environment;
 }
 
@@ -107,6 +112,26 @@ export function buildReleaseTrustChecks({
         "-q",
         "backtest_module/tests/test_backtest.py",
         "ai/tests/test_ai_graph_backtest_module_integration.py",
+      ],
+      cwd: repositoryRoot,
+      environment: aiTestEnvironment,
+    },
+    {
+      name: "release-failure-mode-contracts",
+      command: python,
+      args: [
+        "-m",
+        "pytest",
+        "-q",
+        "ai/tests/test_research_eligibility.py::test_ineligible_reasons_have_fixed_precedence",
+        "ai/tests/test_source_manifest.py::test_release_profile_fails_before_fixture_analysis_can_return_a_result",
+        "ai/tests/test_db_data_source.py::test_runtime_facts_classify_database_failure_without_error_details",
+        "ai/tests/test_db_data_source.py::test_configured_database_failure_is_not_replaced_with_fixture",
+        "ai/tests/test_llm_aoai.py::test_aoai_provider_failures_keep_their_cause_for_job_classification[timeout]",
+        "ai/tests/test_live_provider_fail_closed.py::test_aoai_backtest_schema_failure_is_not_replaced_with_generated_code",
+        "ai/tests/test_screening_pipeline_failure_classifier.py::test_empty_screen_is_a_data_gap_answer_not_an_unknown_crash",
+        "ai/tests/test_signal.py::test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence",
+        "ai/tests/test_api.py::test_release_readiness_requires_durable_job_store_before_other_dependencies",
       ],
       cwd: repositoryRoot,
       environment: aiTestEnvironment,

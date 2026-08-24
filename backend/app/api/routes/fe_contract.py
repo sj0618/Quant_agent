@@ -10,9 +10,22 @@ from app.api.contract_policy import api_status_endpoints, fe_live_allowlist
 from app.api.routes import email_reports
 from app.api.routes.auth import get_session_cookie, get_session_store
 from app.core.errors import AppError
-from app.core.runtime_perf import measure_span, report_database_phase, set_report_metadata
-from app.core.security import csrf_token_required, require_csrf_token, validate_unsafe_request_origin
-from app.dependencies import get_db_engine, get_runtime_settings, get_trading_data_engine
+from app.core.runtime_perf import (
+    measure_span,
+    report_database_phase,
+    set_report_metadata,
+)
+from app.core.security import (
+    csrf_token_required,
+    require_csrf_token,
+    validate_unsafe_request_origin,
+)
+from app.dependencies import (
+    get_db_engine,
+    get_runtime_settings,
+    get_trading_data_engine,
+)
+from app.schemas.report_archive import ArchivedReportDetail, ArchivedReportListResponse
 from app.services import fe_contract_store
 
 router = APIRouter(prefix="/api/v1", tags=["track-c"])
@@ -207,7 +220,7 @@ async def complete_analysis_run(request: Request, run_id: str, payload: TrackCRu
         email_settings=get_runtime_settings(request),
     )
 
-@router.get("/reports")
+@router.get("/reports", response_model=ArchivedReportListResponse, response_model_exclude_none=True)
 async def list_reports(
     request: Request,
     limit: int = Query(default=20, ge=1, le=100),
@@ -218,7 +231,7 @@ async def list_reports(
     user_id = await _require_current_user_id(request)
     engine = get_trading_data_engine(request)
     with report_database_phase():
-        result = await fe_contract_store.list_reports_from_db(
+        result = await fe_contract_store.list_reader_reports_from_db(
             engine,
             user_id=user_id,
             limit=limit,
@@ -235,12 +248,12 @@ async def list_reports(
     return result
 
 
-@router.get("/reports/{report_id}")
+@router.get("/reports/{report_id}", response_model=ArchivedReportDetail, response_model_exclude_none=True)
 async def get_report(request: Request, report_id: str) -> dict[str, Any]:
     user_id = await _require_current_user_id(request)
     engine = get_trading_data_engine(request)
     with report_database_phase():
-        report = await fe_contract_store.get_report_from_db(engine, report_id, user_id=user_id)
+        report = await fe_contract_store.get_reader_report_from_db(engine, report_id, user_id=user_id)
     if report is None:
         set_report_metadata(row_count=0)
         raise AppError(

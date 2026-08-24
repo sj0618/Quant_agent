@@ -3,16 +3,25 @@ from __future__ import annotations
 # pyright: reportUnannotatedClassAttribute=false, reportUnusedFunction=false
 import asyncio
 import json
-import logging
+import secrets
+import uuid
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
 from os import environ
 from typing import ClassVar, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ai_graph.audit import (
@@ -30,6 +39,7 @@ from ai_graph.data_sources.db import (
     BOK_MACRO_VIEW,
     KIS_ADJUSTED_OHLCV_TABLE,
     SYMBOL_MASTER_TABLE,
+    measure_research_runtime_facts_from_env,
     resolve_database_dsn_from_env,
 )
 from ai_graph.graph import run_analysis
@@ -38,27 +48,23 @@ from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
 from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.jobs import (
     AI_JOB_STORE_ENV,
+    PERSISTENT_JOB_STORE_MODE,
     AnalysisJob,
     AnalysisJobStore,
     AnalysisRunner,
     CancellationRegistry,
     JobStoreRuntime,
-    PERSISTENT_JOB_STORE_MODE,
     create_analysis_job_store_from_env,
-    reap_interrupted_jobs,
     run_job_sync,
 )
 from ai_graph.llm.role_calls import generate_strategy_description
-from ai_graph.llm.factory import live_provider_configuration_ready
 from ai_graph.preflight import (
     SCOPE_REFUSAL_REASON,
     UNSUPPORTED_SCOPE_REASON,
     ResearchRequestPreflight,
     classify_research_request,
 )
-from ai_graph.quant_performance import sanitize_public_backtest_performance
-from ai_graph.scope_review import review_research_scope
-from ai_graph.single_process import enforce_single_process
+from ai_graph.quant_performance import sanitize_public_performance
 from ai_graph.research_contract import (
     CanonicalRuleV1,
     DraftConflictV1,
@@ -74,6 +80,11 @@ from ai_graph.research_contract import (
     canonical_rule_execution_query,
     unavailable_result_for_unverified_job,
 )
+from ai_graph.research_eligibility import (
+    EligiblePostgresEod,
+    ResearchRuntimeFacts,
+    evaluate_research_eligibility,
+)
 from ai_graph.schemas import (
     SCHEMA_VERSION,
     APIEnvelope,
@@ -87,8 +98,6 @@ from ai_graph.token_auth import (
     RequireUserIdentity,
     RequireUserIdentityWithinQuota,
 )
-
-_logger = logging.getLogger(__name__)
 
 API_TITLE = "QuantAgent AI API"
 API_VERSION = "0.1.0"
@@ -118,9 +127,17 @@ AI_CORS_ALLOW_ORIGINS_ENV = "AI_CORS_ALLOW_ORIGINS"
 CORS_ALLOW_METHODS = ["GET", "POST", "OPTIONS"]
 CORS_ALLOW_HEADERS = ["Authorization", "Content-Type"]
 RESEARCH_EXECUTION_ENABLED_ENV = "AI_RESEARCH_EXECUTION_ENABLED"
+DATA_EVIDENCE_PROBE_TOKEN_ENV = "AI_DATA_EVIDENCE_PROBE_TOKEN"
+DATA_EVIDENCE_PROBE_PATH = "/_operator/research-data-evidence"
+DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
 READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
 REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
 ANALYSIS_JOBS_MIGRATION_REVISION = "021_ai_analysis_jobs"
+IMMUTABLE_RESULTS_MIGRATION_REVISION = "022_immutable_analysis_results"
+AI_LLM_PROVIDER_ENV = "AI_LLM_PROVIDER"
+AI_AOAI_RESPONSES_URL_ENV = "AI_AOAI_RESPONSES_URL"
+AI_AOAI_API_KEY_ENV = "AI_AOAI_API_KEY"
+AI_AOAI_MODEL_ENV = "AI_AOAI_MODEL"
 
 
 class CreateAnalysisJobRequest(BaseModel):
@@ -172,21 +189,18 @@ class ParseStrategyRequest(BaseModel):
         return (self.natural_language or self.query or "").strip()
 
 
+class DataEvidenceProbeResponse(BaseModel):
+    """Non-public, secret-free read-only measurement response for release evidence."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    decision: Literal["eligible", "ineligible"]
+    reason_code: str | None = None
+    facts: ResearchRuntimeFacts
+    deployment_revision: str | None = None
+
+
 PreflightRejectionResponse = ScopeRefusalV1 | UnsupportedScopeV1
-
-
-async def _scope_decision(query: str) -> ResearchRequestPreflight:
-    """The deterministic verdict, with a second opinion only where wording is ambiguous.
-
-    Requests the guard settles on its own never reach a provider, so an ordinary or an
-    unambiguously prohibited request still costs nothing here. The adjudication call is
-    blocking, so the ambiguous branch runs off the event loop.
-    """
-
-    decision = classify_research_request(query)
-    if decision.allowed or not decision.adjudicable:
-        return decision
-    return await run_in_threadpool(review_research_scope, query, decision)
 
 
 def _preflight_rejection_response(
@@ -282,9 +296,9 @@ class ReadinessCheck(BaseModel):
     name: Literal[
         "durable_job_store",
         "migration_revision",
+        "live_provider_configuration",
         "ai_contract_version",
         "rule_draft_signer",
-        "provider_config",
     ]
     ready: bool
     reason: str | None = None
@@ -297,7 +311,7 @@ class ReadinessResponse(BaseModel):
 
     status: Literal["ready", "unavailable"]
     contract_version: str = READINESS_CONTRACT_VERSION
-    migration_revision: str = ANALYSIS_JOBS_MIGRATION_REVISION
+    migration_revision: str = IMMUTABLE_RESULTS_MIGRATION_REVISION
     ai_contract_version: str
     checks: list[ReadinessCheck]
 
@@ -511,42 +525,12 @@ def create_app(
         token_resolver=account_token_resolver,
         quota=account_token_quota,
     )
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        """Reap what the previous process left running before serving anything.
-
-        Deploys stop uvicorn and start it again, so in-flight jobs become rows that say
-        RUNNING with nothing behind them. Doing this at startup means a client polling
-        across a deploy gets a failure it can retry instead of a spinner that never ends.
-
-        A store that cannot be swept does not stop the app from serving: a failed sweep
-        leaves stale rows, while a failed startup leaves no service at all.
-        """
-
-        # Deliberately outside the try below: a second worker is a configuration error
-        # the operator has to see, and the reaper's own correctness depends on this
-        # process being the only one that owns in-flight jobs.
-        enforce_single_process()
-        try:
-            reaped = await run_in_threadpool(reap_interrupted_jobs, store)
-        except Exception:
-            _logger.exception("interrupted-job sweep failed at startup")
-        else:
-            if reaped:
-                _logger.warning(
-                    "failed %d analysis job(s) left running by a previous process: %s",
-                    len(reaped),
-                    ", ".join(reaped),
-                )
-        yield
-
     app = FastAPI(
         title=API_TITLE,
         version=API_VERSION,
         description=API_DESCRIPTION,
         docs_url=DOCS_URL,
         openapi_url=OPENAPI_URL,
-        lifespan=lifespan,
     )
     cors_allow_origins = _cors_allow_origins()
     if cors_allow_origins:
@@ -569,7 +553,44 @@ def create_app(
         if research_execution_enabled is not None
         else _research_execution_enabled()
     )
+    # Deployed services accept only the signed RuleDraft flow.  The raw endpoint is
+    # retained for local compatibility harnesses, never as a production escape hatch.
+    app.state.legacy_analysis_jobs_enabled = not _production_runtime()
     migration_probe = readiness_migration_probe or _analysis_jobs_migration_is_current
+
+    probe_token = (environ.get(DATA_EVIDENCE_PROBE_TOKEN_ENV) or "").strip()
+    if probe_token:
+        @app.get(
+            DATA_EVIDENCE_PROBE_PATH,
+            response_model=DataEvidenceProbeResponse,
+            include_in_schema=False,
+        )
+        def research_data_evidence_probe(
+            x_ai_evidence_probe: str | None = Header(default=None),
+        ) -> DataEvidenceProbeResponse:
+            """Execute only the bounded DB adapter and policy; never create a job.
+
+            The route is absent unless a separate operator secret is configured. It
+            deliberately bypasses normal token/session resolvers because those can
+            update usage/cache state; the probe must remain read-only end-to-end.
+            """
+
+            if not x_ai_evidence_probe or not secrets.compare_digest(
+                x_ai_evidence_probe, probe_token
+            ):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            trace_id = f"evidence-{uuid.uuid4()}"
+            facts = measure_research_runtime_facts_from_env(
+                "KRX 상장 종목의 RSI 조건을 검토",
+                trace_id,
+            )
+            decision = evaluate_research_eligibility(facts)
+            return DataEvidenceProbeResponse(
+                decision=decision.kind,
+                reason_code=None if isinstance(decision, EligiblePostgresEod) else decision.reason_code,
+                facts=facts,
+                deployment_revision=(environ.get(DEPLOYMENT_REVISION_ENV) or "").strip() or None,
+            )
 
     @app.get(HEALTH_PATH, response_model=HealthResponse, tags=["System"])
     def health() -> HealthResponse:
@@ -586,6 +607,7 @@ def create_app(
             runtime,
             migration_probe=migration_probe,
             rule_draft_signer=app.state.rule_draft_signer,
+            provider_ready=_live_provider_configuration_is_ready(),
         )
         if result.status == "unavailable":
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -625,7 +647,16 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
-        scope_response = _preflight_rejection_response(await _scope_decision(request.query))
+        if not app.state.legacy_analysis_jobs_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail={
+                    "code": "legacy_raw_analysis_job_retired",
+                    "message": "원문 요청 실행은 지원하지 않습니다. 규칙 검토 후 확인된 연구 작업만 실행할 수 있습니다.",
+                    "alternative": RESEARCH_JOB_CREATE_PATH,
+                },
+            )
+        scope_response = _preflight_rejection_response(classify_research_request(request.query))
         if scope_response is not None:
             return scope_response
         await require_preflight_user.consume_quota_after_preflight(http_request)
@@ -762,7 +793,7 @@ def create_app(
         request: ParseStrategyRequest,
         user_id: str = Depends(require_preflight_user),
     ) -> ParseReviewV1 | JSONResponse:
-        scope_response = _preflight_rejection_response(await _scope_decision(request.request_text))
+        scope_response = _preflight_rejection_response(classify_research_request(request.request_text))
         if scope_response is not None:
             return scope_response
         signer = app.state.rule_draft_signer
@@ -1078,6 +1109,10 @@ def _research_execution_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _production_runtime() -> bool:
+    return (environ.get("APP_ENV") or "").strip().lower() in {"production", "prod"}
+
+
 def _data_source_status() -> DataSourceStatus:
     dsn_value, dsn_env = resolve_database_dsn_from_env()
     return DataSourceStatus(
@@ -1097,6 +1132,7 @@ def _release_readiness(
     *,
     migration_probe: Callable[[], bool],
     rule_draft_signer: RuleDraftSigner | None,
+    provider_ready: bool,
 ) -> ReadinessResponse:
     durable_store_ready = (
         runtime.requested_mode == PERSISTENT_JOB_STORE_MODE
@@ -1112,7 +1148,6 @@ def _release_readiness(
             migration_ready = False
     contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
     rule_draft_signer_ready = rule_draft_signer is not None
-    provider_config_ready, provider_reason = live_provider_configuration_ready(environ)
     checks = [
         ReadinessCheck(
             name="durable_job_store",
@@ -1125,6 +1160,11 @@ def _release_readiness(
             reason=None if migration_ready else "migration_revision_required",
         ),
         ReadinessCheck(
+            name="live_provider_configuration",
+            ready=provider_ready,
+            reason=None if provider_ready else "live_provider_configuration_required",
+        ),
+        ReadinessCheck(
             name="ai_contract_version",
             ready=contract_ready,
             reason=None if contract_ready else "ai_contract_version_mismatch",
@@ -1134,16 +1174,33 @@ def _release_readiness(
             ready=rule_draft_signer_ready,
             reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
         ),
-        ReadinessCheck(
-            name="provider_config",
-            ready=provider_config_ready,
-            reason=provider_reason,
-        ),
     ]
     return ReadinessResponse(
         status="ready" if all(check.ready for check in checks) else "unavailable",
         ai_contract_version=SCHEMA_VERSION,
         checks=checks,
+    )
+
+
+def _live_provider_configuration_is_ready() -> bool:
+    """Check only the presence of the production AOAI configuration.
+
+    Readiness must not instantiate an HTTP client or expose a credential.  The graph's
+    live provider factory requires this global fallback trio whenever a role does not
+    have a dedicated override, so requiring all three protects every role from silently
+    falling back to the local mock provider in a release profile.
+    """
+
+    provider = (environ.get(AI_LLM_PROVIDER_ENV) or "mock").strip().lower()
+    if provider != "aoai":
+        return False
+    return all(
+        bool((environ.get(key) or "").strip())
+        for key in (
+            AI_AOAI_RESPONSES_URL_ENV,
+            AI_AOAI_API_KEY_ENV,
+            AI_AOAI_MODEL_ENV,
+        )
     )
 
 
@@ -1178,6 +1235,20 @@ def _analysis_jobs_migration_is_current() -> bool:
                         SELECT 1
                         FROM pg_class
                         WHERE relname = 'idx_ai_analysis_job_execution_manifest_schema'
+                    ),
+                    to_regclass('app.analysis_result') IS NOT NULL,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'app'
+                          AND table_name = 'ai_analysis_job'
+                          AND column_name = 'analysis_result_id'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_trigger
+                        WHERE tgname = 'trg_analysis_result_immutable'
+                          AND tgrelid = 'app.analysis_result'::regclass
                     )
                 """
             ).fetchone()
@@ -1223,12 +1294,12 @@ def _owned_job(store: AnalysisJobStore, job_id: str, user_id: str) -> AnalysisJo
 
 
 def _public_envelope(envelope: APIEnvelope | None) -> APIEnvelope | None:
-    """Apply the public performance contract to an already stored envelope."""
+    """Return a response-safe copy without rewriting the persisted result."""
 
     if envelope is None:
         return None
     performance = envelope.user_payload.performance
-    public_performance = sanitize_public_backtest_performance(performance)
+    public_performance = sanitize_public_performance(performance)
     if public_performance is performance:
         return envelope
     payload = envelope.user_payload.model_copy(
@@ -1238,8 +1309,6 @@ def _public_envelope(envelope: APIEnvelope | None) -> APIEnvelope | None:
 
 
 def _public_job(job: AnalysisJob) -> AnalysisJob:
-    """Return a response-safe copy without mutating the stored execution result."""
-
     result = _public_envelope(job.result)
     if result is job.result:
         return job

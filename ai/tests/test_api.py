@@ -25,17 +25,10 @@ from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import InMemoryAnalysisJobStore, JobStoreConfigurationError, JobStoreRuntime
 from ai_graph.research_contract import RuleDraftSigner
+from ai_graph.research_eligibility import PerformanceAvailable
 from ai_graph.schemas import (
     APIEnvelope,
-    BacktestBenchmark,
-    BacktestEquityPoint,
-    BacktestMetrics,
-    BacktestPerformance,
-    BacktestReliability,
-    Condition,
     EnvelopeStatus,
-    PublicMetricDetail,
-    StrategySpec,
     UserPayload,
 )
 
@@ -56,17 +49,6 @@ DATA_SOURCE_ENV_KEYS = (
 MOCK_PROVIDER_CREDENTIAL_ENV = "AI_AOAI_API_KEY"
 MOCK_PROVIDER_CREDENTIAL_SENTINEL = "qa-mock-provider-sentinel-key"
 MOCK_PROVIDER_STAGES = ["interpreting", "code_generation", "backtest", "debate", "finalizing"]
-LIVE_PROVIDER_ENV = {
-    "AI_LLM_PROVIDER": "aoai",
-    "AI_AOAI_RESPONSES_URL": "https://example.test/openai/responses?api-version=2025-04-01-preview",
-    "AI_AOAI_API_KEY": "test-api-key",
-    "AI_AOAI_MODEL": "test-model",
-}
-
-
-def _configure_live_provider(monkeypatch) -> None:
-    for key, value in LIVE_PROVIDER_ENV.items():
-        monkeypatch.setenv(key, value)
 
 
 def _poll_job(client, job_id: str) -> dict:
@@ -131,6 +113,13 @@ def _persistent_job_store_runtime() -> JobStoreRuntime:
     )
 
 
+def _configure_live_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AI_LLM_PROVIDER", "aoai")
+    monkeypatch.setenv("AI_AOAI_RESPONSES_URL", "https://example.test/openai/v1/responses")
+    monkeypatch.setenv("AI_AOAI_API_KEY", "test-readiness-key")
+    monkeypatch.setenv("AI_AOAI_MODEL", "test-readiness-model")
+
+
 def test_release_readiness_requires_durable_job_store_before_other_dependencies() -> None:
     migration_calls = 0
 
@@ -185,52 +174,6 @@ def test_release_readiness_rejects_missing_migration_and_contract_drift(monkeypa
         "ready": False,
         "reason": "ai_contract_version_mismatch",
     }
-    assert checks["provider_config"] == {
-        "name": "provider_config",
-        "ready": True,
-        "reason": None,
-    }
-
-
-def test_release_readiness_rejects_mock_provider_configuration() -> None:
-    response = TestClient(
-        create_app(
-            job_store_runtime=_persistent_job_store_runtime(),
-            readiness_migration_probe=lambda: True,
-            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
-        )
-    ).get(READINESS_PATH)
-
-    assert response.status_code == 503
-    checks = {check["name"]: check for check in response.json()["checks"]}
-    assert checks["provider_config"] == {
-        "name": "provider_config",
-        "ready": False,
-        "reason": "live_provider_required",
-    }
-
-
-def test_release_readiness_rejects_role_specific_provider_configuration_drift(monkeypatch) -> None:
-    _configure_live_provider(monkeypatch)
-    monkeypatch.setenv("AI_LLM_REPORT_WRITER_RESPONSES_URL", "not-a-url")
-
-    response = TestClient(
-        create_app(
-            job_store_runtime=_persistent_job_store_runtime(),
-            readiness_migration_probe=lambda: True,
-            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
-        )
-    ).get(READINESS_PATH)
-
-    assert response.status_code == 503
-    checks = {check["name"]: check for check in response.json()["checks"]}
-    assert checks["provider_config"] == {
-        "name": "provider_config",
-        "ready": False,
-        "reason": "provider_config_invalid",
-    }
-    assert "test-api-key" not in response.text
-    assert "not-a-url" not in response.text
 
 
 def test_release_readiness_requires_a_rule_draft_signer() -> None:
@@ -248,6 +191,38 @@ def test_release_readiness_requires_a_rule_draft_signer() -> None:
         "ready": False,
         "reason": "rule_draft_signer_required",
     }
+
+
+def test_release_readiness_requires_live_aoai_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
+    client = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    )
+
+    mock_provider = client.get(READINESS_PATH)
+    assert mock_provider.status_code == 503
+    checks = {check["name"]: check for check in mock_provider.json()["checks"]}
+    assert checks["live_provider_configuration"] == {
+        "name": "live_provider_configuration",
+        "ready": False,
+        "reason": "live_provider_configuration_required",
+    }
+
+    monkeypatch.setenv("AI_LLM_PROVIDER", "aoai")
+    monkeypatch.setenv("AI_AOAI_RESPONSES_URL", "https://example.test/openai/v1/responses")
+    monkeypatch.setenv("AI_AOAI_API_KEY", "test-readiness-key")
+    monkeypatch.delenv("AI_AOAI_MODEL", raising=False)
+    incomplete_provider = client.get(READINESS_PATH)
+    assert incomplete_provider.status_code == 503
+    checks = {check["name"]: check for check in incomplete_provider.json()["checks"]}
+    assert checks["live_provider_configuration"]["reason"] == "live_provider_configuration_required"
+
+    _configure_live_provider(monkeypatch)
+    assert client.get(READINESS_PATH).status_code == 200
 
 
 def test_api_status_exposes_data_source_without_dsn_value(monkeypatch) -> None:
@@ -341,13 +316,95 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert [stage["stage"] for stage in polled_job["stages"]] == MOCK_PROVIDER_STAGES
     assert all(stage["status"] == "succeeded" for stage in polled_job["stages"])
     performance = polled_job["result"]["user_payload"]["performance"]
-    assert performance["selected_candidate_id"]
-    assert "metrics_by_variant" not in performance
-    assert "selected_variant" not in performance
-    assert performance["is_available"] is False
-    assert performance["metrics"] is None
-    assert performance["equity_curve"] == []
-    assert all(detail["is_available"] is False for detail in performance["metric_details"])
+    assert performance["availability"] == "unavailable"
+    assert performance["reason_code"] == "insufficient_reliability"
+    assert "performance" not in performance
+    assert "metrics" not in performance
+    assert "equity_curve" not in performance
+
+
+def test_production_retires_raw_analysis_jobs_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    store = InMemoryAnalysisJobStore()
+    sink = RecordingAuditSink()
+    runner_calls = 0
+
+    def runner(_query: str, _trace_id: str) -> APIEnvelope:
+        nonlocal runner_calls
+        runner_calls += 1
+        raise AssertionError("retired raw endpoint reached the analysis runner")
+
+    client = TestClient(
+        create_app(
+            store,
+            analysis_runner=runner,
+            audit_sink=_create_test_audit_sink(sink),
+        )
+    )
+
+    response = client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
+
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "legacy_raw_analysis_job_retired"
+    assert store.list_jobs() == []
+    assert runner_calls == 0
+    assert sink.sessions == ()
+
+
+def test_backtest_api_redacts_legacy_insufficient_performance_before_serialization() -> None:
+    legacy_available = PerformanceAvailable.model_construct(
+        availability="available",
+        performance={
+            "metrics": {"total_return": 0.12, "sharpe_ratio": 0.3},
+            "equity_curve": [{"date": "2026-01-01", "cumulative_return": 0.12}],
+            "reliability": {
+                "source": "fixture",
+                "status": "insufficient",
+                "row_count": 4,
+                "ticker_count": 1,
+                "trading_days": 4,
+                "trade_count": 7,
+            },
+        },
+        method_manifest=None,
+        limitations=[],
+    )
+    envelope = APIEnvelope.model_construct(
+        status=EnvelopeStatus.READY,
+        trace_id="legacy-warmup-trace",
+        user_payload=UserPayload.model_construct(
+            headline="ready",
+            message="analysis completed",
+            next_actions=[],
+            performance=legacy_available,
+        ),
+        strategy_spec=None,
+        debug_ref="debug:legacy-warmup",
+        retryable=False,
+    )
+    store = InMemoryAnalysisJobStore()
+    job = store.create_job("legacy warm-up RSI 전략", user_id="local-dev-user")
+    store.complete_job(job.job_id, envelope)
+    client = TestClient(create_app(store))
+    response = client.get(f"{ANALYSIS_JOBS_PATH}/{job.job_id}")
+
+    assert response.status_code == 200
+    public_performance = response.json()["result"]["user_payload"]["performance"]
+    assert public_performance["availability"] == "unavailable"
+    assert public_performance["reason_code"] == "insufficient_reliability"
+    assert public_performance["safe_facts"] == {
+        "source": "fixture",
+        "row_count": 4,
+        "ticker_count": 1,
+        "trading_days": 4,
+        "trade_count": 7,
+        "history_start": None,
+        "history_end": None,
+    }
+    assert "metrics" not in public_performance
+    assert "equity_curve" not in public_performance
 
 
 def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> None:
@@ -367,9 +424,10 @@ def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> Non
         "automatic_performance_momentum"
     )
     assert result["rule_provenance"]["substituted"] is False
-    explanation = result["user_payload"]["performance"]["strategy_explanation"]
-    assert explanation["selection_mode"] == "automatic"
-    assert explanation["source_refs"]
+    projection = result["user_payload"]["performance"]
+    assert projection["availability"] == "unavailable"
+    assert projection["reason_code"] == "insufficient_reliability"
+    assert "performance" not in projection
 
 
 def test_analysis_job_api_lists_only_authenticated_users_jobs_newest_first() -> None:
@@ -450,13 +508,11 @@ def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monk
     assert report["web_projection"]
     assert report["email_projection"]
     performance = created_result["user_payload"]["performance"]
-    assert performance["selected_candidate_id"]
-    assert "metrics_by_variant" not in performance
-    assert "selected_variant" not in performance
-    assert performance["is_available"] is False
-    assert performance["metrics"] is None
-    assert performance["equity_curve"] == []
-    assert all(detail["is_available"] is False for detail in performance["metric_details"])
+    assert performance["availability"] == "unavailable"
+    assert performance["reason_code"] == "insufficient_reliability"
+    assert "performance" not in performance
+    assert "metrics" not in performance
+    assert "equity_curve" not in performance
 
     poll_response = client.get(f"{ANALYSIS_JOBS_PATH}/{created_job['job_id']}")
     assert poll_response.status_code == 200
@@ -511,100 +567,6 @@ def test_spec_strategy_parse_returns_a_signed_rule_review_without_creating_a_job
     assert "최근 52주 신고가" not in create_response.text
     assert store.jobs == {}
     assert sink.sessions == ()
-
-
-def test_backtest_api_redacts_legacy_insufficient_performance_before_serialization() -> None:
-    strategy = StrategySpec(
-        strategy_id="legacy-warmup",
-        name="legacy warm-up fixture",
-        market="KRX",
-        timeframe="daily",
-        entry_conditions=[Condition(left="rsi", operator="lte", right=30)],
-        confidence=0.8,
-    )
-    detail = PublicMetricDetail(
-        key="total_return",
-        label="Total return",
-        value=0.12,
-        unit="percent",
-        is_available=True,
-        plain_explanation="fixture metric",
-        why_used="fixture check",
-        caution="not for trading",
-    )
-    performance = BacktestPerformance(
-        selected_candidate_id="fixture-candidate",
-        metrics=BacktestMetrics(
-            sharpe_ratio=0.3,
-            max_drawdown=-0.1,
-            win_rate=0.5,
-            total_return=0.12,
-            in_sample_sharpe=0.3,
-            out_sample_sharpe=None,
-            degradation=0.0,
-        ),
-        equity_curve=[BacktestEquityPoint(date="2026-01-01", cumulative_return=0.12)],
-        engine_summary={
-            "effective_trade_count": 7,
-            "total_return": 0.12,
-            "sharpe_ratio": 0.3,
-        },
-        reliability=BacktestReliability(
-            source="fixture",
-            status="insufficient",
-            row_count=4,
-            ticker_count=1,
-            trading_days=4,
-            trade_count=7,
-            reasons=["warm-up history is insufficient"],
-        ),
-        benchmark=BacktestBenchmark(
-            label="fixture benchmark",
-            method="fixture",
-            total_return=0.04,
-            cumulative_curve=[
-                BacktestEquityPoint(date="2026-01-01", cumulative_return=0.04)
-            ],
-            is_available=True,
-        ),
-        metric_details=[detail],
-    )
-    envelope = APIEnvelope(
-        status=EnvelopeStatus.READY,
-        trace_id="legacy-warmup-trace",
-        user_payload=UserPayload(
-            headline="ready",
-            message="analysis completed",
-            next_actions=[],
-            performance=performance,
-        ),
-        strategy_spec=strategy,
-        debug_ref="debug:legacy-warmup",
-        retryable=False,
-    )
-    client = TestClient(
-        create_app(
-            InMemoryAnalysisJobStore(),
-            analysis_runner=lambda _query, _trace_id: envelope,
-        )
-    )
-
-    # /api/strategies/parse no longer creates a job (it returns a rule review), so the
-    # stored envelope this test is about is seeded through the live job path instead.
-    response = client.post(ANALYSIS_JOBS_PATH, json={"query": "legacy warm-up RSI 전략"})
-    assert response.status_code == 201
-
-    backtest_response = client.get("/api/backtests/legacy-warmup")
-    assert backtest_response.status_code == 200
-    public_performance = backtest_response.json()["user_payload"]["performance"]
-    assert public_performance["is_available"] is False
-    assert public_performance["metrics"] is None
-    assert public_performance["equity_curve"] == []
-    assert public_performance["engine_summary"] == {"effective_trade_count": 7}
-    assert public_performance["benchmark"]["is_available"] is False
-    assert public_performance["benchmark"]["total_return"] is None
-    assert public_performance["benchmark"]["cumulative_curve"] == []
-    assert all(detail["is_available"] is False for detail in public_performance["metric_details"])
 
 
 def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:

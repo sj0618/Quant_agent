@@ -6,7 +6,7 @@ async function read(relativePath: string) {
   return readFile(new URL(relativePath, import.meta.url), "utf8");
 }
 
-test("reports page keeps the archive read-only while retaining local export actions", async () => {
+test("reports page exposes a safe read-only archive and export", async () => {
   const [reportsPage, reportList, reportActions] = await Promise.all([
     read("../src/pages/ReportsPage.tsx"),
     read("../src/features/reports/ReportList.tsx"),
@@ -17,9 +17,9 @@ test("reports page keeps the archive read-only while retaining local export acti
   assert.match(reportsPage, /downloadReportsCsv/);
   assert.match(reportsPage, /printCurrentView/);
   assert.match(reportsPage, /ReportList/);
-  assert.match(reportList, /copyReportShareLink/);
-  assert.doesNotMatch(reportList, /resendReportEmail|재발송/);
-  assert.doesNotMatch(reportActions, /resendReportEmail|\/resend/);
+  assert.match(reportList, /읽기 전용 결과 스냅샷/);
+  assert.doesNotMatch(reportList, /resendReportEmail|copyReportShareLink|recommendationScore|report\.signals/);
+  assert.match(reportActions, /result_id/);
   assert.doesNotMatch(reportsPage, /getReportStrategies/);
   assert.doesNotMatch(reportList, /getDigestStrategySelection|getEmailDeliveryHistory|reportsHistory|reportStrategies/);
 });
@@ -33,7 +33,7 @@ test("search is report-centric and sends q to the live report endpoint", async (
   assert.match(searchPage, /getReports/);
   assert.match(searchPage, /getReports\(normalizedQuery\)/);
   assert.match(searchPage, /ROUTES\.reportDetail/);
-  assert.match(searchPage, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
+  assert.match(searchPage, /placeholder="결과 ID 또는 보관 기준일"/);
   assert.match(searchPage, /Badge variant="info">report<\/Badge>/);
   assert.doesNotMatch(clientSource, /export async function searchInstruments/);
   assert.doesNotMatch(searchPage, /getWorkspaceTemplate/);
@@ -60,21 +60,13 @@ test("canonical routes exclude retired history and strategy pages", async () => 
   assert.match(profilePage, /EmailHistoryTimeline/);
 });
 
-test("report detail keeps only local export/share actions", async () => {
-  const [detailPage, reportDetail, reportActions, archivePolicy] = await Promise.all([
+test("report detail keeps a read-only PDF export action", async () => {
+  const [detailPage, reportActions] = await Promise.all([
     read("../src/pages/ReportDetailPage.tsx"),
-    read("../src/features/reports/ReportDetail.tsx"),
     read("../src/api/reportActionsClient.ts"),
-    read("../src/features/reports/reportArchive.ts"),
   ]);
 
   assert.match(detailPage, /getReportById/);
-  assert.match(detailPage, /copyReportShareLink/);
   assert.match(detailPage, /printCurrentView/);
-  assert.doesNotMatch(detailPage, /resendReportEmail|이메일 재발송/);
-  assert.doesNotMatch(reportActions, /resendReportEmail|\/resend/);
-  assert.match(reportDetail, /보관 기록 시각/);
-  assert.match(archivePolicy, /snapshot은 90일 보관/);
-  assert.match(archivePolicy, /최소 권한 원칙/);
-  assert.match(archivePolicy, /재발송·수정·새 분석 실행은 지원하지 않습니다/);
+  assert.match(reportActions, /buildReportPrintTitle/);
 });

@@ -494,6 +494,10 @@ h6 { font-size: 0.67em; }
 .archive-disclosure strong { color: var(--ink); }
 .report-paper h2 { font-size: 18px; display: flex; gap: 8px; align-items: baseline; margin-bottom: 16px; }
 .report-paper h2 span { color: var(--subdued); font-size: 10px; }
+.public-claim-disclosure { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 16px; }
+.public-claim-disclosure div { border: 1px solid var(--line); border-radius: 8px; background: var(--soft); padding: 10px 12px; min-width: 0; }
+.public-claim-disclosure dt { color: var(--subdued); font-size: 10px; }
+.public-claim-disclosure dd { margin: 4px 0 0; color: var(--ink); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .news-list { padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; list-style: none; }
 .news-list li { display: grid; grid-template-columns: 24px 1fr auto; gap: 10px; align-items: center; border-bottom: 1px solid var(--line); padding-bottom: 10px; font-size: 12px; }
 .report-content-sections { display: flex; flex-direction: column; gap: 16px; }
@@ -698,7 +702,7 @@ h6 { font-size: 0.67em; }
   .source-strip a { margin-left: 0; }
 
   /* One metric per row turns four numbers into four screens of scrolling; two fit. */
-  .metric-grid, .summary-grid, .report-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-grid, .summary-grid, .report-metrics, .public-claim-disclosure { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metric-card p { font-size: 11px; }
 
   /* space-between on a 375px row squeezes the title into the control beside it. */

@@ -627,9 +627,27 @@ async def test_track_c_component_integration_store_wrappers_forward_to_query_lay
         observed["report"] = (_engine, report_id, user_id)
         return {"id": report_id}
 
+    async def fake_list_reader_reports(
+        _engine,
+        *,
+        user_id: str,
+        limit: int = 20,
+        cursor: str | None = None,
+        status: str | None = None,
+        q: str | None = None,
+    ):
+        observed["reader_list_reports"] = (_engine, user_id, limit, cursor, status, q)
+        return {"items": [], "meta": {"limit": limit, "hasMore": False, "nextCursor": None}}
+
+    async def fake_get_reader_report(_engine, report_id: str, *, user_id: str | None = None):
+        observed["reader_report"] = (_engine, report_id, user_id)
+        return {"id": report_id}
+
     monkeypatch.setattr(existing_report_queries, "get_analysis_run", fake_get_analysis_run)
     monkeypatch.setattr(existing_report_queries, "list_reports", fake_list_reports)
     monkeypatch.setattr(existing_report_queries, "get_report", fake_get_report)
+    monkeypatch.setattr(existing_report_queries, "list_reader_reports", fake_list_reader_reports)
+    monkeypatch.setattr(existing_report_queries, "get_reader_report", fake_get_reader_report)
 
     assert await fe_contract_store.get_analysis_run_from_db(engine, "run-1", user_id="42") == {"id": "run-1"}
     assert await fe_contract_store.list_reports_from_db(engine, user_id="42", limit=5, cursor="cursor", status="sent", q="삼성전자") == {
@@ -637,9 +655,16 @@ async def test_track_c_component_integration_store_wrappers_forward_to_query_lay
         "meta": {"limit": 5, "hasMore": False, "nextCursor": None},
     }
     assert await fe_contract_store.get_report_from_db(engine, "report-1", user_id="42") == {"id": "report-1"}
+    assert await fe_contract_store.list_reader_reports_from_db(engine, user_id="42", limit=5, cursor="cursor", status="sent", q="report-1") == {
+        "items": [],
+        "meta": {"limit": 5, "hasMore": False, "nextCursor": None},
+    }
+    assert await fe_contract_store.get_reader_report_from_db(engine, "report-1", user_id="42") == {"id": "report-1"}
     assert observed["analysis_run"] == (engine, "run-1", "42")
     assert observed["list_reports"] == (engine, "42", 5, "cursor", "sent", "삼성전자")
     assert observed["report"] == (engine, "report-1", "42")
+    assert observed["reader_list_reports"] == (engine, "42", 5, "cursor", "sent", "report-1")
+    assert observed["reader_report"] == (engine, "report-1", "42")
 
 
 def test_track_c_generated_strategy_id_is_stable_user_scoped_and_not_run_id():

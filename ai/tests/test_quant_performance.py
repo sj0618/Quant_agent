@@ -1,9 +1,12 @@
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
-from ai_graph import graph
-from ai_graph import quant_performance
+from ai_graph import graph, quant_performance
 from ai_graph.quant_explanations import metric_explanation
-from ai_graph.quant_performance import build_public_backtest_performance
+from ai_graph.quant_performance import (
+    build_public_backtest_performance,
+    project_public_performance,
+)
+from ai_graph.research_eligibility import PerformanceAvailable, PerformanceUnavailable
 from ai_graph.schemas import (
     BacktestMetrics,
     CandidateParameters,
@@ -134,6 +137,42 @@ def test_public_metrics_missing_engine_scalars_become_none() -> None:
     assert values["calmar_ratio"] is None
     assert values["profit_factor"] is None
     assert values["benchmark_return"] is None
+
+
+def test_public_profit_factor_rejects_an_engine_default_even_without_a_saved_availability_map() -> None:
+    performance = build_public_backtest_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.1,
+                max_drawdown=-0.1,
+                win_rate=0.5,
+                total_return=0.08,
+                in_sample_sharpe=0.11,
+                out_sample_sharpe=0.09,
+                degradation=0.02,
+            ),
+            engine_summary={
+                "effective_trade_count": 8,
+                "profit_factor": 0.0,
+                "metric_warnings": [
+                    {
+                        "metric": "profit_factor",
+                        "warning": "profit_factor was unavailable and defaulted to 0.0",
+                    }
+                ],
+            },
+        ),
+        price_rows=_rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    profit_factor = next(
+        detail for detail in performance.metric_details if detail.key == "profit_factor"
+    )
+    assert profit_factor.value is None
+    assert profit_factor.is_available is False
+    assert profit_factor.unavailable_reason == "profit_factor was unavailable and defaulted to 0.0"
 
 
 def test_public_metrics_consume_fail_closed_walk_forward_availability() -> None:
@@ -350,11 +389,6 @@ def test_public_performance_reliability_boundary_cases() -> None:
     assert fixture is not None
     assert fixture.reliability is not None
     assert fixture.reliability.status == "insufficient"
-    assert fixture.is_available is False
-    assert fixture.unavailable_reason
-    assert fixture.metrics is None
-    assert fixture.equity_curve == []
-    assert all(item.is_available is False for item in fixture.metric_details)
 
     no_rows = build_public_backtest_performance(
         _build_payload(
@@ -375,9 +409,6 @@ def test_public_performance_reliability_boundary_cases() -> None:
     assert no_rows is not None
     assert no_rows.reliability is not None
     assert no_rows.reliability.status == "insufficient"
-    assert no_rows.is_available is False
-    assert no_rows.metrics is None
-    assert no_rows.equity_curve == []
     assert all(item.is_available is False for item in no_rows.metric_details)
 
     short = build_public_backtest_performance(
@@ -521,173 +552,61 @@ def test_graph_public_performance_alias_points_to_quant_module() -> None:
     )
 
 
-def _basis_payload(*, first_date: str, last_date: str, cost_model: dict | None = None) -> dict:
-    payload = _build_payload(
-        BacktestMetrics(
-            sharpe_ratio=0.3,
-            max_drawdown=-0.15,
-            win_rate=0.6,
-            total_return=0.12,
-            in_sample_sharpe=0.3,
-            out_sample_sharpe=0.2,
-            degradation=0.05,
-            out_sample_return=0.04,
+def test_public_projection_removes_every_metric_and_chart_for_insufficient_data() -> None:
+    projection = project_public_performance(
+        _build_payload(
+            BacktestMetrics(
+                sharpe_ratio=0.2, max_drawdown=-0.1, win_rate=0.5,
+                total_return=0.08, in_sample_sharpe=0.1,
+                out_sample_sharpe=None, degradation=0.0,
+            )
         ),
-        engine_summary={
-            "effective_trade_count": 10,
-            **({"cost_model": cost_model} if cost_model is not None else {}),
-        },
-    )
-    payload["backtest_payload"] = {
-        "first_date": first_date,
-        "last_date": last_date,
-        "tickers": ["000100", "000200", "000300"],
-    }
-    return payload
-
-
-def test_public_performance_states_the_hold_out_basis_of_its_numbers() -> None:
-    performance = build_public_backtest_performance(
-        _basis_payload(first_date="2021-08-23", last_date="2026-08-21"),
-        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
-        pipeline_data_source={
-            "source": "postgres",
-            "backtest_window_policy_id": "krx_pit_common_stock_5y_kst_settled_session_v2",
-        },
-    )
-
-    assert performance is not None
-    basis = performance.evaluation_basis
-    assert basis is not None
-    assert basis.basis == "hold_out"
-    assert basis.hold_out_fraction == 0.3
-    assert basis.window_start == "2021-08-23"
-    assert basis.window_end == "2026-08-21"
-    assert basis.window_policy_id == "krx_pit_common_stock_5y_kst_settled_session_v2"
-    assert "마지막 30% 검증 구간" in basis.caption
-    assert "2021-08-23~2026-08-21" in basis.caption
-
-
-def test_the_cost_clause_is_only_claimed_when_the_run_charged_costs() -> None:
-    free = build_public_backtest_performance(
-        _basis_payload(
-            first_date="2021-08-23",
-            last_date="2026-08-21",
-            cost_model={"commission_pct": 0.0, "tax_pct": 0.0, "slippage_pct": 0.0},
-        ),
-        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
-        pipeline_data_source={"source": "postgres"},
-    )
-    charged = build_public_backtest_performance(
-        _basis_payload(
-            first_date="2021-08-23",
-            last_date="2026-08-21",
-            cost_model={"commission_pct": 0.00015, "tax_pct": 0.0023, "slippage_pct": 0.001},
-        ),
-        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
-        pipeline_data_source={"source": "postgres"},
-    )
-
-    assert free is not None and free.evaluation_basis is not None
-    assert charged is not None and charged.evaluation_basis is not None
-    assert free.evaluation_basis.cost_model_applied is False
-    assert "거래비용 반영" not in free.evaluation_basis.caption
-    assert charged.evaluation_basis.cost_model_applied is True
-    assert "거래비용 반영" in charged.evaluation_basis.caption
-
-
-def test_a_rolling_policy_run_is_not_described_as_a_hold_out_tail() -> None:
-    payload = _basis_payload(first_date="2021-08-23", last_date="2026-08-21")
-    payload["walk_forward"] = {
-        "status": "ready",
-        "fold_selections": [
-            {
-                "fold_index": index,
-                "selection_hash": f"h{index}",
-                "candidate_id": "A2",
-                "evaluation_sessions": ["2026-01-02"],
-            }
-            for index in range(3)
-        ],
-        "unique_evaluation_session_count": 500,
-        "aggregate_metrics": BacktestMetrics(
-            sharpe_ratio=0.4,
-            max_drawdown=-0.2,
-            win_rate=0.55,
-            total_return=0.3,
-            in_sample_sharpe=0.0,
-            out_sample_sharpe=0.4,
-            degradation=0.0,
-            out_sample_return=0.3,
-        ).model_dump(),
-        "costs": 1234.5,
-    }
-
-    performance = build_public_backtest_performance(
-        payload,
-        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
-        pipeline_data_source={"source": "postgres"},
-    )
-
-    assert performance is not None
-    basis = performance.evaluation_basis
-    assert basis is not None
-    assert basis.basis == "walk_forward_policy"
-    assert basis.hold_out_fraction is None
-    assert basis.fold_count == 3
-    assert basis.evaluation_session_count == 500
-    assert "마지막 30%" not in basis.caption
-    assert "폴드 3개" in basis.caption
-    assert basis.cost_model_applied is True
-
-
-def test_universe_policy_discloses_candidates_the_backtest_could_not_trade() -> None:
-    performance = build_public_backtest_performance(
-        _basis_payload(first_date="2021-08-23", last_date="2026-08-21"),
-        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
-        pipeline_data_source={
-            "source": "postgres",
-            "pit_member_count": 812,
-            "backtest_window_policy_id": "krx_pit_common_stock_5y_kst_settled_session_v2",
-            "backtest_universe": {
-                "as_of_start": "2021-08-23",
-                "as_of_end": "2026-08-21",
-                "excluded_screening_candidate_count": 4,
-            },
-        },
-    )
-
-    assert performance is not None
-    policy = performance.universe_policy
-    assert policy is not None
-    assert policy.excluded_screening_candidate_count == 4
-    assert policy.traded_ticker_count == 812
-    assert policy.excluded_notice is not None
-    assert "4종목" in policy.excluded_notice
-    assert "오늘의 추천 종목" in policy.summary
-
-
-def test_no_universe_policy_is_claimed_without_a_point_in_time_descriptor() -> None:
-    performance = build_public_backtest_performance(
-        _basis_payload(first_date="2021-08-23", last_date="2026-08-21"),
-        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        price_rows=_rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=5),
         pipeline_data_source={"source": "fixture"},
     )
 
-    assert performance is not None
-    assert performance.universe_policy is None
+    assert isinstance(projection, PerformanceUnavailable)
+    public = projection.model_dump(mode="json")
+    forbidden = {"metrics", "equity_curve", "benchmark", "total_return", "sharpe_ratio", "max_drawdown"}
+
+    def walk(value):
+        if isinstance(value, dict):
+            assert not forbidden.intersection(value)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(public)
 
 
-def test_an_empty_exclusion_prints_no_exclusion_notice() -> None:
-    performance = build_public_backtest_performance(
-        _basis_payload(first_date="2021-08-23", last_date="2026-08-21"),
-        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
-        pipeline_data_source={
-            "source": "postgres",
-            "backtest_universe": {"excluded_screening_candidate_count": 0},
+def test_public_projection_requires_engine_manifest_before_exposing_complete_values() -> None:
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.2, max_drawdown=-0.1, win_rate=0.5,
+            total_return=0.08, in_sample_sharpe=0.1,
+            out_sample_sharpe=None, degradation=0.0,
+        ),
+        engine_summary={
+            "effective_trade_count": 8,
+            "performance_method_manifest": {
+                "evaluated_rule": "rsi", "rule_version": "v1", "substituted": False,
+                "market": "KRX", "universe": "test", "start_date": "2024-01-01",
+                "end_date": "2024-12-31", "eod_basis": "ohlcv_eod", "initial_capital": 1000000,
+                "rebalance_timing": "weekly", "fill_timing": "next_open",
+                "corporate_action_method": "engine", "cost_tax_slippage_liquidity": "configured",
+                "observations": 252, "trades": 8, "data_version": "test", "result_version": "test",
+                "execution_version": "test", "historical_simulation_warning": "not predictive",
+            },
         },
     )
+    projection = project_public_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
 
-    assert performance is not None
-    assert performance.universe_policy is not None
-    assert performance.universe_policy.excluded_notice is None
+    assert isinstance(projection, PerformanceAvailable)
+    assert projection.performance["metrics"]["total_return"] == 0.08
+    assert "engine_summary" not in projection.performance

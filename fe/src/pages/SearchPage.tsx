@@ -7,7 +7,7 @@ import { AppLayout } from "../components/layout/AppLayout";
 import { getReports } from "../api/quantAgentClient";
 import { ROUTES } from "../config/routes";
 import { useAsyncData } from "../hooks/useAsyncData";
-import type { ReportSummary } from "../types/quantagent";
+import type { ArchivedReportSummary } from "../types/quantagent";
 
 export function SearchPage() {
   const params = new URLSearchParams(window.location.search);
@@ -16,7 +16,7 @@ export function SearchPage() {
   const [submittedQuery, setSubmittedQuery] = useState(initialQuery.trim());
   const normalizedQuery = submittedQuery.trim();
   const reportsState = useAsyncData(
-    () => (normalizedQuery ? getReports(normalizedQuery) : Promise.resolve([] as ReportSummary[])),
+    () => (normalizedQuery ? getReports(normalizedQuery) : Promise.resolve([] as ArchivedReportSummary[])),
     [normalizedQuery],
   );
 
@@ -52,7 +52,7 @@ export function SearchPage() {
             <input
               autoFocus
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="리포트 제목, 전략명, 후보명, 티커"
+              placeholder="결과 ID 또는 보관 기준일"
               value={query}
             />
           </label>
@@ -70,7 +70,7 @@ export function SearchPage() {
           {normalizedQuery && reports.length === 0 ? (
             <Card>
               <strong>검색 결과가 없습니다</strong>
-              <p>리포트 제목, 요약, 전략명, 후보명, 티커를 다시 확인해보세요.</p>
+              <p>결과 ID 또는 보관 기준일을 다시 확인해보세요.</p>
             </Card>
           ) : null}
 
@@ -78,10 +78,10 @@ export function SearchPage() {
             <a className="search-result-row" href={ROUTES.reportDetail(report.id)} key={report.id}>
               <Badge variant="info">report</Badge>
               <span>
-                <strong>{report.title}</strong>
-                <small>{report.summary}</small>
+                <strong>읽기 전용 결과 스냅샷</strong>
+                <small>결과 ID {report.id}</small>
               </span>
-              <em>{`${report.date} · ${report.recommendationScore}`}</em>
+              <em>{report.date}</em>
             </a>
           ))}
         </section>
