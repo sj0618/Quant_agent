@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
-import { copyReportShareLink, printCurrentView, resendReportEmail } from "../../api/reportActionsClient";
+import { archiveTimestamp, copyReportShareLink, printCurrentView } from "../../api/reportActionsClient";
 import { ROUTES } from "../../config/routes";
 import type { ReportSummary, SignalType } from "../../types/quantagent";
 import { DEFAULT_REPORT_FILTERS, type ReportFilters, type ReportRange } from "./reportFilters";
@@ -32,7 +32,7 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
     setDraftFilters((current) => ({ ...current, signals: { ...current.signals, [signal]: checked } }));
   };
 
-  const handleReportAction = async (action: "print" | "share" | "resend", report: ReportSummary) => {
+  const handleReportAction = async (action: "print" | "share", report: ReportSummary) => {
     setStatus(null);
     try {
       if (action === "print") {
@@ -43,11 +43,6 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
       if (action === "share") {
         const url = await copyReportShareLink(report.id);
         setStatus(`공유 링크를 복사했습니다: ${url}`);
-      }
-
-      if (action === "resend") {
-        await resendReportEmail(report.id);
-        setStatus(`${report.date} 리포트를 이메일로 재발송했습니다.`);
       }
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "리포트 액션 처리에 실패했습니다.");
@@ -153,6 +148,7 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
               <div className="report-row__date">
                 <strong>{report.date}</strong>
                 <span>{report.weekday}</span>
+                <span>보관 기록 시각: {archiveTimestamp(report)}</span>
               </div>
               <div className="report-row__content">
                 <strong>{report.title}</strong>
@@ -203,7 +199,7 @@ function FeaturedReport({
   onAction,
   report,
 }: {
-  onAction: (action: "print" | "share" | "resend", report: ReportSummary) => void;
+  onAction: (action: "print" | "share", report: ReportSummary) => void;
   report: ReportSummary;
 }) {
   return (
@@ -212,7 +208,7 @@ function FeaturedReport({
         <div>
           <Badge variant="dark">TODAY</Badge>
           <strong>2026년 4월 18일 (목)</strong>
-          <span>· {report.sentAt}</span>
+          <span>· 보관 기록 시각: {archiveTimestamp(report)}</span>
         </div>
         <Badge variant="dark">권장도 {report.recommendationScore} / 10</Badge>
       </div>
@@ -238,7 +234,6 @@ function FeaturedReport({
       <div className="featured-report__actions">
         <button onClick={() => onAction("print", report)} type="button">↓ PDF</button>
         <button onClick={() => onAction("share", report)} type="button">공유</button>
-        <button onClick={() => onAction("resend", report)} type="button">재발송</button>
         <a href={ROUTES.reportDetail(report.id)}>리포트 열기 →</a>
       </div>
     </Card>

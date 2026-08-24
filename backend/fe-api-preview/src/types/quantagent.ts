@@ -305,6 +305,8 @@ export interface LandingSample {
 
 export interface ReportSummary {
   id: string;
+  /** Explicit immutable archive-record timestamp; no delivery-time fallback. */
+  createdAt?: string;
   date: string;
   weekday: string;
   sentAt: string;

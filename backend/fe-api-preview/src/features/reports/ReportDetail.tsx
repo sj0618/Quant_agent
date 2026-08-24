@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { archiveTimestamp } from "../../api/reportActionsClient";
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
 import { ROUTES } from "../../config/routes";
@@ -17,8 +18,8 @@ export function ReportDetail({ report }: ReportDetailProps) {
       <aside className="report-detail-side">
         <Card>
           <div className="side-badge-line">
-            <Badge variant="dark">TODAY</Badge>
-            <span>오전 8:00 발송</span>
+            <Badge variant="dark">ARCHIVED REPORT</Badge>
+            <span>보관 기록 시각: {archiveTimestamp(report)}</span>
           </div>
           <h3>{report.date}</h3>
           <strong>권장도 {report.recommendationScore} / 10</strong>
@@ -46,7 +47,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
         <section className="report-paper__section report-paper__hero">
           <div className="report-paper__meta">
             <span>
-              <Badge variant="dark">DAILY REPORT</Badge> {report.date} · {report.sentAt}
+              <Badge variant="dark">ARCHIVED REPORT</Badge> {report.date} · 보관 기록 시각: {archiveTimestamp(report)}
             </span>
             <span>{report.recipient}</span>
           </div>

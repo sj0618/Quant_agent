@@ -7,9 +7,10 @@ async function read(relativePath: string) {
 }
 
 test("/reports exposes a read-only archive and safe export controls", async () => {
-  const [reportsPage, reportList, reportActions, clientSource] = await Promise.all([
+  const [reportsPage, reportList, reportDetail, reportActions, clientSource] = await Promise.all([
     read("../src/pages/ReportsPage.tsx"),
     read("../src/features/reports/ReportList.tsx"),
+    read("../src/features/reports/ReportDetail.tsx"),
     read("../src/api/reportActionsClient.ts"),
     read("../src/api/quantAgentClient.ts"),
   ]);
@@ -19,8 +20,11 @@ test("/reports exposes a read-only archive and safe export controls", async () =
   assert.match(reportsPage, /printCurrentView/);
   assert.match(reportsPage, /ReportList/);
   assert.match(reportList, /읽기 전용 결과 스냅샷/);
+  assert.match(reportList, /archiveTimestamp\(report\)/);
+  assert.match(reportDetail, /archiveTimestamp\(report\)/);
   assert.doesNotMatch(reportList, /resendReportEmail|copyReportShareLink|recommendationScore|report\.signals/);
-  assert.match(reportActions, /export async function resendReportEmail/);
+  assert.doesNotMatch(`${reportList}\n${reportDetail}\n${reportActions}`, /resendReportEmail|\/resend/);
+  assert.doesNotMatch(reportActions, /backendRequest/);
   assert.match(clientSource, /export async function getReports/);
   assert.doesNotMatch(reportsPage, /getReportStrategies/);
   assert.doesNotMatch(reportList, /getDigestStrategySelection|getEmailDeliveryHistory|reportsHistory|reportStrategies/);
