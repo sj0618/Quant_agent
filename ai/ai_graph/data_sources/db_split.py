@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.quant_strategy import rsi_trade_rules
+from ai_graph.freshness import classify_source_freshness
 from ai_graph.immutable_snapshot import build_snapshot_bundle
 from ai_graph.source_manifest import build_source_manifest
 
@@ -446,11 +447,14 @@ class PostgresPipelineDataSource:
             l4_evidence = self._fetch_l4_evidence(conn, ticker, trace_id)
             macro_status = self._fetch_macro_status(conn)
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
+            settled_session = self._fetch_settled_session(conn)
             # Capabilities were probed up front; nothing since then can change them.
 
-        snapshot_as_of = max(
-            (date.fromisoformat(str(row["date"])) for row in price_rows if row.get("date")),
-            default=datetime.now(UTC).date(),
+        data_as_of = _max_price_row_date(price_rows)
+        snapshot_as_of = data_as_of or datetime.now(UTC).date()
+        freshness_status, freshness_reason = classify_source_freshness(
+            data_as_of=data_as_of,
+            settled_session=settled_session,
         )
         snapshot_bundle = build_snapshot_bundle(
             as_of=snapshot_as_of,
@@ -479,7 +483,7 @@ class PostgresPipelineDataSource:
         source_manifest = build_source_manifest(
             source="postgres",
             as_of=snapshot_as_of,
-            freshness="unknown",
+            freshness=freshness_status,
             lineage_refs=[
                 KIS_ADJUSTED_OHLCV_TABLE,
                 UNIVERSE_VIEW,
@@ -499,6 +503,8 @@ class PostgresPipelineDataSource:
                 "source": "postgres",
                 "immutable_snapshot_bundle": snapshot_bundle.model_dump(mode="json"),
                 "source_manifest": source_manifest.model_dump(mode="json"),
+                "freshness_as_of": data_as_of.isoformat() if data_as_of else None,
+                "freshness_reason": freshness_reason,
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
@@ -929,6 +935,9 @@ class PostgresPipelineDataSource:
             FROM feature.kis_adjusted_ohlcv_daily
             WHERE ticker = ANY(%s)
               AND time >= %s::date
+              -- Today's bar is still moving until the close, so the strategy acts on
+              -- the last settled session instead.
+              AND time < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
             ORDER BY ticker, time
             """,
             [ticker_list, date_floor],
@@ -1310,6 +1319,25 @@ class PostgresPipelineDataSource:
                 "loaded universe mean daily return (no index series in the warehouse)"
             )
         return snapshot or None
+
+    def _fetch_settled_session(self, conn: Any) -> date | None:
+        """The last KRX session that has already closed, in KST.
+
+        Today is excluded on purpose: EOD rows for a session land after its close, so
+        an intraday run must be measured against the previous session or every morning
+        would read as stale.
+        """
+
+        row = conn.execute(
+            """
+            SELECT max(trade_date) AS settled_end
+            FROM core.trading_calendar
+            WHERE is_open
+              AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
+            """
+        ).fetchone()
+        settled = row.get("settled_end") if row else None
+        return _date_value(settled) if settled is not None else None
 
     def _fetch_macro_status(self, conn: Any) -> dict[str, Any]:
         row = conn.execute(
@@ -2653,6 +2681,21 @@ def _has_rsi_oversold_entry(price_rows: list[dict[str, Any]]) -> bool:
 
 def _metric_key(value: str) -> str:
     return value.strip().lower().replace(" ", "_")
+
+
+def _max_price_row_date(price_rows: Sequence[Mapping[str, Any]]) -> date | None:
+    """The newest trade date the loaded rows actually carry."""
+
+    dates: list[date] = []
+    for row in price_rows:
+        raw = row.get("date")
+        if raw is None:
+            continue
+        try:
+            dates.append(_date_value(raw))
+        except (TypeError, ValueError):
+            continue
+    return max(dates) if dates else None
 
 
 def _date_value(value: Any) -> date:

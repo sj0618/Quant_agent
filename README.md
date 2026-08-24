@@ -63,6 +63,37 @@ AI/FE 상세 절차는 각각 `ai/README_AI.md`, `fe/README.md`에 두고, 여�
   - `AI_AUDIT_SINK=noop`
   - data-source 계열 env는 제거 (`AI_DATABASE_DSN`, `QUANT_DB_DSN`, `DATABASE_URL`, `AI_DEFAULT_TICKER`, `AI_BACKTEST_LOOKBACK_DAYS`, `AI_L4_EVIDENCE_LIMIT`, `AI_DB_CONNECT_TIMEOUT_SECONDS`, `AI_DB_STATEMENT_TIMEOUT_MS`, `AI_SECTOR_CACHE_TTL_SECONDS`, `BE_JOB_STORE_MODE`, `REDIS_URL`, `AUTH_SESSION_COOKIE_NAME`, `AI_CORS_ALLOW_ORIGINS`)
 
+## 테스트 실행: 가상환경 기준
+
+테스트는 **항상 가상환경 안에서** 실행한다. 시스템 인터프리터로 돌린 결과는 근거로 인정하지
+않는다. 전역 site-packages는 프로젝트가 고정한 버전과 어긋나기 마련이고, 실제로 그 드리프트가
+`quantstats` 경로에서 pandas/pyarrow 조합 segfault로 나타나 테스트 실패가 아니라 프로세스
+사망으로 끝난 적이 있다. 실패를 읽을 수 없는 실행은 실행하지 않은 것과 같다.
+
+venv는 [로컬 결정론 프로필](#로컬-결정론-프로필-저장소-외부-venv--fixture-env) 규약대로
+**저장소 경로 밖**에 만든다.
+
+```bash
+python3 -m venv ~/.venvs/quantagent
+~/.venvs/quantagent/bin/python -m pip install -e ./backtest_module -e ./ai -e "./backend[test]" pytest ruff
+```
+
+설치 목록은 CI(`.github/workflows/code-check.yml`)와 같게 유지한다. 여기에 없는 패키지를
+넣으면 로컬만 통과하거나 로컬만 깨지는 상태가 된다.
+
+```bash
+AUTH_ENABLED=0 AI_LLM_PROVIDER=mock AI_JOB_STORE=memory AI_AUDIT_SINK=noop ~/.venvs/quantagent/bin/python -m pytest -q ai/tests
+```
+
+위 네 env는 `ai/tests` 전용이다. `backend/tests`에 같이 넘기면 프로덕션 보안 설정을 검증하는
+테스트가 완화된 값을 읽고 실패하므로, 백엔드 테스트는 env 없이 돌린다.
+
+### 로컬에서 끝나지 않는 것
+
+이 애플리케이션은 배포 서버에서 실행된다. 로컬에서 띄워 눌러보는 것은 실사용 검증이 아니다.
+런타임 동작의 근거는 서버(배포 로그, server-health 워크플로, 서버에서 수행한 실행)에서 가져온다.
+로컬 가상환경이 답할 수 있는 것은 단위·계약·lint·컴파일까지다.
+
 ## 운영 실데이터 프로필
 
 - `AI_LLM_PROVIDER=aoai`
