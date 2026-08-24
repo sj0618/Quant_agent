@@ -900,7 +900,12 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             "report": report,
             "performance": performance,
             "recommendation_gate": gate,
-            "ticker_actions": _ticker_actions(state, cards),
+            "ticker_actions": _ticker_actions(
+                state,
+                cards,
+                performance=performance,
+                recommendation_gate=gate,
+            ),
         }
     elif state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
         clarification = _clarification_from_ambiguity(state["ambiguity"])
@@ -3196,7 +3201,11 @@ def build_public_backtest_performance(  # noqa: F811
 
 
 def _ticker_actions(
-    state: QuantAgentState, cards: list[StrategyCandidateCard]
+    state: QuantAgentState,
+    cards: list[StrategyCandidateCard],
+    *,
+    performance: PerformanceAvailable | PerformanceUnavailable | None = None,
+    recommendation_gate: RecommendationGate | None = None,
 ) -> list[TickerAction]:
     """Per-stock BUY/SELL/HOLD, plus WATCH for screened names the rule is not acting on.
 
@@ -3211,6 +3220,10 @@ def _ticker_actions(
 
     freshness = state.get("freshness_evidence") or {}
     if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        return []
+    if isinstance(performance, PerformanceUnavailable):
+        return []
+    if recommendation_gate is not None and recommendation_gate.unmet_data_requirements:
         return []
 
     backtest = state.get("backtest") or {}

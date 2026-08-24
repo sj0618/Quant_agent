@@ -1,14 +1,15 @@
+import json
 from datetime import datetime, timedelta
 
 import pytest
 
-from ai_graph.graph import _recommendation_gate, build_public_backtest_performance
+from ai_graph.graph import _recommendation_gate, build_public_backtest_performance, envelope_node
 from ai_graph.nodes.backtest import (
     BENCHMARK_METHOD,
     BENCHMARK_WARNING,
     _equal_weight_benchmark_curve,
 )
-from ai_graph.nodes.report import build_report_bundle
+from ai_graph.nodes.report import build_report_bundle, report_node
 from ai_graph.nodes.risk_manager import (
     MacroSnapshot,
     _average_pairwise_correlation,
@@ -575,6 +576,99 @@ def test_recommendation_gate_withholds_when_inputs_miss_the_minimum_data_rule() 
     # Same backtest, no unavailable projection: the objective floor still decides. This
     # is what proves the new branch is what withheld the recommendation above.
     assert _recommendation_gate(_passing_gate_state()).validated is True
+
+
+def test_ready_envelope_withholds_ticker_actions_when_inputs_miss_minimum_data_rule() -> None:
+    """A non-actionable performance result cannot carry an actionable ticker card."""
+
+    state = {
+        "status": "ready",
+        "trace_id": "insufficient-data-trace",
+        "debug_ref": "debug:insufficient-data",
+        "data": {"candidate_cards": [], "pipeline_data_source": {"source": "postgres"}},
+        "price_rows": _fixture_rows(),
+        "backtest": {
+            **_performance_payload(
+                BacktestMetrics(
+                    sharpe_ratio=1.2,
+                    max_drawdown=-0.3,
+                    win_rate=0.6,
+                    total_return=0.5,
+                    in_sample_sharpe=0.6,
+                    out_sample_sharpe=0.5,
+                    degradation=0.1,
+                )
+            ),
+            "ticker_actions": [
+                {
+                    "ticker": "005930",
+                    "name": "삼성전자",
+                    "action": "BUY",
+                    "reason": "진입 조건 충족",
+                    "as_of_date": "2026-01-05",
+                    "close": 103.0,
+                }
+            ],
+        },
+    }
+
+    envelope = envelope_node(state)["envelope"]
+    payload = envelope["user_payload"]
+
+    assert payload["performance"]["availability"] == "unavailable"
+    assert payload["performance"]["reason_code"] == "insufficient_reliability"
+    assert payload["recommendation_gate"]["validated"] is False
+    assert payload["recommendation_gate"]["unmet_data_requirements"]
+    assert payload["ticker_actions"] == []
+
+
+def test_report_withholds_every_trade_instruction_when_inputs_miss_minimum_data_rule(
+    monkeypatch,
+) -> None:
+    """The report must not publish the pre-gate BUY signal on insufficient input."""
+
+    def _report_writer_must_not_run(**_kwargs: object) -> object:
+        raise AssertionError("provider boundary reached")
+
+    monkeypatch.setattr(
+        "ai_graph.nodes.report.generate_report_writeup", _report_writer_must_not_run
+    )
+    state = {
+        "strategy_spec": make_strategy().model_dump(),
+        "risk": {
+            "signal": make_signal().model_dump(),
+            "adjustments": [],
+        },
+        "data": {"pipeline_data_source": {"source": "postgres"}},
+        "price_rows": _fixture_rows(),
+        "backtest": _performance_payload(
+            BacktestMetrics(
+                sharpe_ratio=1.2,
+                max_drawdown=-0.3,
+                win_rate=0.6,
+                total_return=0.5,
+                in_sample_sharpe=0.6,
+                out_sample_sharpe=0.5,
+                degradation=0.1,
+            )
+        ),
+    }
+
+    report = report_node(state)["report"]
+    web_sections = {section["id"]: section["items"] for section in report["web_projection"]["sections"]}
+    rendered = json.dumps(report, ensure_ascii=False)
+
+    assert report["web_projection"]["summary"].startswith("NO_RECOMMENDATION")
+    assert "NO_RECOMMENDATION" in report["email_projection"]["summary"]
+    assert web_sections["signal"]["action"] == "NO_RECOMMENDATION"
+    assert web_sections["signal"]["confidence"] == 0.0
+    assert web_sections["performance"]["reason_code"] == "insufficient_reliability"
+    assert web_sections["risk"] == []
+    assert report["risk_adjustments"] == []
+    assert report["web_projection"]["sections"][-1]["items"]["writeup"]["recommendation"] == "NO_RECOMMENDATION"
+    assert "BUY" not in rendered
+    assert "SELL" not in rendered
+    assert "HOLD" not in rendered
 
 
 def _automatic_strategy() -> StrategySpec:
