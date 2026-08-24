@@ -738,14 +738,19 @@ class BacktestPerformance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     selected_candidate_id: str = Field(min_length=1)
-    metrics: BacktestMetrics
-    equity_curve: list[BacktestEquityPoint]
+    # A result can be retained for its reliability diagnostics even when there is not
+    # enough warm-up/history to publish performance.  `None` is deliberately different
+    # from a zero-valued metric: zero is a measured result, while None is unavailable.
+    metrics: BacktestMetrics | None = None
+    equity_curve: list[BacktestEquityPoint] = Field(default_factory=list)
     engine_summary: dict[str, Any] = Field(default_factory=dict)
     reliability: BacktestReliability | None = None
     data_quality: list[str] = Field(default_factory=list)
     benchmark: BacktestBenchmark | None = None
     metric_details: list[PublicMetricDetail] = Field(default_factory=list)
     strategy_explanation: PublicStrategyExplanation | None = None
+    is_available: bool = True
+    unavailable_reason: str | None = None
     evaluation_basis: BacktestEvaluationBasis | None = None
     universe_policy: BacktestUniversePolicy | None = None
 

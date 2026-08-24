@@ -193,6 +193,12 @@ public `performance` summary to `backtest_runs`/`backtest_metrics`, and final
 signal/rationale to `trade_signals`. This AI task does not create or mutate
 those DB tables.
 
+When `user_payload.performance.reliability.status` is `insufficient`, the public
+performance projection is explicitly unavailable: `is_available` is `false`,
+`metrics` and `equity_curve` are empty/unset, and every published metric detail has
+`is_available=false`. Positive values from an older stored result are removed at the
+API response boundary as well.
+
 ## StrategySpec
 
 Canonical fields: `strategy_id`, `name`, `market`, `timeframe`,
