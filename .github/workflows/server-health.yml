@@ -23,7 +23,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_run' ||
       github.event.workflow_run.conclusion == 'success'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}

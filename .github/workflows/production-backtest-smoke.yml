@@ -28,7 +28,7 @@ concurrency:
 jobs:
   backtest:
     name: Run deployed full analysis
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
