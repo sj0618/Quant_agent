@@ -41,7 +41,9 @@ def test_track_ac_contract_metadata_updates_classified_openapi_operations():
     assert schema["paths"]["/api/v1/unsubscribe"]["post"]["x-quantagent-auth-required"] is False
     assert schema["paths"]["/api/v1/reports"]["get"]["x-quantagent-auth-required"] is True
     assert schema["paths"]["/api/v1/reports/{report_id}"]["get"]["x-quantagent-production-ready"] is True
-    assert "x-quantagent-owner" not in schema["paths"]["/ai/backtests/generate-and-run"]["post"]
+    # `/ai/backtests/generate-and-run` is gone: it duplicated the AI graph's own public
+    # surface. Assert its absence so re-registering it has to be a deliberate act.
+    assert "/ai/backtests/generate-and-run" not in schema["paths"]
 
 
 def test_track_c_contract_lookup_and_guard_rails():
