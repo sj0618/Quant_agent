@@ -704,3 +704,63 @@ def test_a_run_without_execution_assumptions_is_unverifiable_not_publishable() -
     assert isinstance(published, PerformanceAvailable)
     assert published.method_manifest.fill_timing == "next_open"
     assert "commission_pct" in published.method_manifest.cost_tax_slippage_liquidity
+
+
+def test_stale_source_hides_public_performance_numbers_with_freshness_facts() -> None:
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.2,
+            max_drawdown=-0.1,
+            win_rate=0.5,
+            total_return=0.08,
+            in_sample_sharpe=0.1,
+            out_sample_sharpe=None,
+            degradation=0.0,
+        ),
+        engine_summary={
+            "effective_trade_count": 8,
+            "performance_method_manifest": {
+                "evaluated_rule": "rsi",
+                "rule_version": "v1",
+                "substituted": False,
+                "market": "KRX",
+                "universe": "test",
+                "start_date": "2024-01-01",
+                "end_date": "2024-12-31",
+                "eod_basis": "ohlcv_eod",
+                "initial_capital": 1000000,
+                "rebalance_timing": "weekly",
+                "fill_timing": "next_open",
+                "corporate_action_method": "engine",
+                "cost_tax_slippage_liquidity": "configured",
+                "observations": 252,
+                "trades": 8,
+                "data_version": "test",
+                "result_version": "test",
+                "execution_version": "test",
+                "historical_simulation_warning": "not predictive",
+            },
+        },
+    )
+
+    projection = project_public_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=252),
+        pipeline_data_source={
+            "source": "postgres",
+            "freshness_as_of": "2026-08-18",
+            "freshness_reason": "price source exceeded the configured freshness window",
+            "source_manifest": {
+                "source": "postgres",
+                "as_of": "2026-08-20",
+                "freshness": "stale",
+            },
+        },
+    )
+
+    assert isinstance(projection, PerformanceUnavailable)
+    assert projection.reason_code == "stale_source"
+    assert projection.safe_facts["freshness_status"] == "stale"
+    assert projection.safe_facts["freshness_as_of"] == "2026-08-18"
+    assert projection.safe_facts["freshness_reason"] == "price source exceeded the configured freshness window"
+    assert "performance" not in projection.model_dump(mode="json")

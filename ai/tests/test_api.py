@@ -1,3 +1,4 @@
+from datetime import date
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -37,6 +38,9 @@ from ai_graph.research_eligibility import PerformanceAvailable
 from ai_graph.schemas import (
     APIEnvelope,
     EnvelopeStatus,
+    FreshnessEvidence,
+    ReportBundle,
+    ReportProjection,
     UserPayload,
 )
 
@@ -486,6 +490,142 @@ def test_backtest_api_redacts_legacy_insufficient_performance_before_serializati
     }
     assert "metrics" not in public_performance
     assert "equity_curve" not in public_performance
+
+
+def test_job_api_redacts_legacy_available_performance_when_source_is_stale() -> None:
+    legacy_available = PerformanceAvailable.model_construct(
+        availability="available",
+        performance={
+            "metrics": {"total_return": 0.12, "sharpe_ratio": 0.3},
+            "equity_curve": [{"date": "2026-01-01", "cumulative_return": 0.12}],
+            "reliability": {
+                "source": "postgres",
+                "status": "sufficient",
+                "row_count": 1_260,
+                "ticker_count": 5,
+                "trading_days": 252,
+                "trade_count": 8,
+            },
+        },
+        method_manifest=None,
+        limitations=[],
+    )
+    envelope = APIEnvelope.model_construct(
+        status=EnvelopeStatus.READY,
+        trace_id="legacy-stale-trace",
+        user_payload=UserPayload.model_construct(
+            headline="ready",
+            message="analysis completed",
+            next_actions=[],
+            performance=legacy_available,
+            report=ReportBundle(
+                web_projection=ReportProjection(
+                    title="legacy report",
+                    summary="legacy stale result",
+                    sections=[
+                        {
+                            "id": "performance",
+                            "title": "후보 코드 백테스트",
+                            "items": legacy_available.model_dump(mode="json"),
+                        }
+                    ],
+                ),
+                email_projection=ReportProjection(
+                    title="legacy report",
+                    summary="legacy stale result",
+                    sections=[],
+                ),
+                risk_adjustments=[],
+            ),
+        ),
+        strategy_spec=None,
+        debug_ref="debug:legacy-stale",
+        retryable=False,
+        freshness_evidence=FreshnessEvidence(
+            status="stale",
+            as_of=date(2026, 8, 18),
+            reason="price source exceeded the configured freshness window",
+            source="postgres",
+            no_recommendation=True,
+        ),
+    )
+    store = InMemoryAnalysisJobStore()
+    job = store.create_job("legacy stale RSI 전략", user_id="local-dev-user")
+    store.complete_job(job.job_id, envelope)
+    client = TestClient(create_app(store))
+
+    response = client.get(f"{ANALYSIS_JOBS_PATH}/{job.job_id}")
+
+    assert response.status_code == 200
+    public_performance = response.json()["result"]["user_payload"]["performance"]
+    assert public_performance == {
+        "availability": "unavailable",
+        "reason_code": "stale_source",
+        "safe_facts": {
+            "source": "postgres",
+            "row_count": 1_260,
+            "ticker_count": 5,
+            "trading_days": 252,
+            "trade_count": 8,
+            "history_start": None,
+            "history_end": None,
+            "freshness_status": "stale",
+            "freshness_as_of": "2026-08-18",
+            "freshness_reason": "price source exceeded the configured freshness window",
+        },
+    }
+    report_performance = next(
+        section
+        for section in response.json()["result"]["user_payload"]["report"]["web_projection"][
+            "sections"
+        ]
+        if section["id"] == "performance"
+    )
+    assert report_performance["items"] == public_performance
+
+    status_only_job = store.create_job("legacy stale status-only RSI 전략", user_id="local-dev-user")
+    store.complete_job(
+        status_only_job.job_id,
+        envelope.model_copy(
+            update={"freshness_evidence": None, "freshness_status": "stale"}
+        ),
+    )
+    status_only_response = client.get(f"{ANALYSIS_JOBS_PATH}/{status_only_job.job_id}")
+
+    assert status_only_response.status_code == 200
+    status_only_performance = status_only_response.json()["result"]["user_payload"][
+        "performance"
+    ]
+    assert status_only_performance["availability"] == "unavailable"
+    assert status_only_performance["reason_code"] == "stale_source"
+    assert status_only_performance["safe_facts"]["freshness_status"] == "stale"
+    assert "performance" not in status_only_performance
+
+    report_only_job = store.create_job("legacy stale report-only RSI 전략", user_id="local-dev-user")
+    store.complete_job(
+        report_only_job.job_id,
+        envelope.model_copy(
+            update={
+                "user_payload": envelope.user_payload.model_copy(update={"performance": None})
+            }
+        ),
+    )
+    report_only_response = client.get(f"{ANALYSIS_JOBS_PATH}/{report_only_job.job_id}")
+
+    assert report_only_response.status_code == 200
+    report_only_performance = report_only_response.json()["result"]["user_payload"][
+        "performance"
+    ]
+    assert report_only_performance["availability"] == "unavailable"
+    assert report_only_performance["reason_code"] == "stale_source"
+    report_only_section = next(
+        section
+        for section in report_only_response.json()["result"]["user_payload"]["report"][
+            "web_projection"
+        ]["sections"]
+        if section["id"] == "performance"
+    )
+    assert report_only_section["items"] == report_only_performance
 
 
 def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> None:
