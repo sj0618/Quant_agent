@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ai_graph.quant_strategy import rsi_trade_rules
 from ai_graph.source_manifest import build_pipeline_extract_snapshot, build_source_manifest
 
+from .db import is_release_profile
 from .sectors import extract_sector_from_query, get_known_sectors
 
 _logger = logging.getLogger(__name__)
@@ -203,6 +204,21 @@ class PipelineDataUnavailableError(ValueError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+class FixtureModeForbiddenError(PipelineDataUnavailableError):
+    """FT-FIX-08 for the split variant. See `db.FixtureModeForbiddenError`.
+
+    Subclasses this module's own error class, not `db`'s: the two are distinct class
+    objects and this variant's callers check against the local one.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            "fixture_mode_forbidden_in_release",
+            "운영 환경에서는 로컬 fixture 데이터로 분석할 수 없습니다. "
+            f"데이터 소스를 설정한 뒤 다시 시도해 주세요. ({detail})",
+        )
 
 
 class PipelineDataBundle(BaseModel):
@@ -1416,6 +1432,8 @@ def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle
 
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
+    if is_release_profile():
+        raise FixtureModeForbiddenError(reason)
     fixture_as_of = datetime.now(UTC).date()
     data_availability = _data_availability_for_query(query, source="fixture")
     extract_snapshot = build_pipeline_extract_snapshot(
@@ -1441,6 +1459,9 @@ def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
             "source_snapshot_freshness": "unknown",
             "source_snapshot_version": "local-fixture",
             "reason": reason,
+            # `db.py`'s fixture bundle has always carried this; this copy did not, so a
+            # fixture run on the split variant advertised no ineligibility at all.
+            "production_eligible": False,
             "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),
             "available_db_objects": [
                 KIS_FEATURE_FRAME_VIEW,

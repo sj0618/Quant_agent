@@ -76,7 +76,7 @@ from ai_graph.quant_strategy import (
     robust_strategy_source_refs,
     rsi_trade_rules,
 )
-from ai_graph.research_eligibility import PerformanceAvailable
+from ai_graph.research_eligibility import PerformanceAvailable, PerformanceUnavailable
 from ai_graph.schemas import (
     AmbiguityCode,
     APIEnvelope,
@@ -875,7 +875,12 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         for card in state.get("data", {}).get("candidate_cards", [])
     ]
     if status == EnvelopeStatus.READY:
-        gate = _recommendation_gate(state)
+        performance = project_public_performance(
+            state.get("backtest"),
+            price_rows=state.get("price_rows"),
+            pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
+        )
+        gate = _recommendation_gate(state, performance=performance)
         validated = gate is None or gate.validated
         payload = {
             "headline": (
@@ -893,11 +898,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             ],
             "candidate_cards": cards,
             "report": report,
-            "performance": project_public_performance(
-                state.get("backtest"),
-                price_rows=state.get("price_rows"),
-                pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
-            ),
+            "performance": performance,
             "recommendation_gate": gate,
             "ticker_actions": _ticker_actions(state, cards),
         }
@@ -3400,7 +3401,42 @@ def build_public_backtest_performance(  # noqa: F811
     )
 
 
-def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
+def _minimum_input_gaps(performance: PerformanceUnavailable) -> list[str]:
+    """Name the minimum-input rule and what the run actually had, as data not prose."""
+
+    facts = performance.safe_facts
+    gaps = [f"performance_unavailable:{performance.reason_code}"]
+    for observed_key, required_key in (
+        ("trading_days", "minimum_trading_days"),
+        ("ticker_count", "minimum_tickers"),
+    ):
+        observed = facts.get(observed_key)
+        required = facts.get(required_key)
+        if isinstance(observed, int) and isinstance(required, int) and observed < required:
+            gaps.append(f"{observed_key}:{observed} < {required_key}:{required}")
+    return gaps
+
+
+def _insufficient_input_reason(performance: PerformanceUnavailable) -> str:
+    if performance.reason_code == "insufficient_reliability":
+        return (
+            "입력 기간·유니버스가 최소 기준에 미달해 추천을 생성하지 않습니다. "
+            f"(거래일 {performance.safe_facts.get('trading_days')}일 / 최소 "
+            f"{performance.safe_facts.get('minimum_trading_days')}일, "
+            f"종목 {performance.safe_facts.get('ticker_count')}개 / 최소 "
+            f"{performance.safe_facts.get('minimum_tickers')}개)"
+        )
+    return (
+        "공개 가능한 백테스트 성과가 없어 추천 규칙 통과 여부를 판단할 수 없습니다. "
+        f"({performance.reason_code})"
+    )
+
+
+def _recommendation_gate(
+    state: QuantAgentState,
+    *,
+    performance: PerformanceAvailable | PerformanceUnavailable | None = None,
+) -> RecommendationGate | None:
     freshness = state.get("freshness_evidence") or {}
     if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
         return RecommendationGate(
@@ -3409,6 +3445,18 @@ def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
                 freshness.get("reason")
                 or "freshness 한계를 확인할 수 없어 추천을 생성하지 않습니다."
             ),
+        )
+    if isinstance(performance, PerformanceUnavailable):
+        # The picks are validated by the backtest of the same rule. When that backtest
+        # could not be published - the input period or universe fell under the minimum
+        # data rule, or its method manifest was incomplete - there is nothing to
+        # validate against, and a metric threshold that was computed over too little
+        # history must not be reported as if the strategy had passed.
+        return RecommendationGate(
+            validated=False,
+            reason=_insufficient_input_reason(performance),
+            verification_complete=False,
+            unmet_data_requirements=_minimum_input_gaps(performance),
         )
     backtest_payload = state.get("backtest")
     if backtest_payload is None:

@@ -1,0 +1,39 @@
+{
+  "wbs_id": "QV-BIAS-01",
+  "method": "end_truncation_differential",
+  "generated_at": "2026-08-24T12:35:21.944774+00:00",
+  "git_sha": "29eaef2295d2e2c04c63bbfdd705cbf2d90ce61a",
+  "input": {
+    "grade": "fixture",
+    "release_eligible": false,
+    "series": "deterministic_synthetic.v1: close *= 1.01 on two of every three sessions, *= 0.985 otherwise; rsi = 25 every fifth session else 60",
+    "tickers": [
+      "000660",
+      "005930",
+      "035420"
+    ],
+    "sessions_per_ticker": 90
+  },
+  "evaluated_rule": {
+    "path": "compiled_conditions",
+    "entry": "rsi <= 30",
+    "exit": "rsi >= 55"
+  },
+  "result": {
+    "cutoff_date": "2026-02-15",
+    "baseline_rows": 270,
+    "truncated_rows": 129,
+    "covered_rows": 129,
+    "covered_dates": 43,
+    "covered_signals": 50,
+    "silent_rows": 79,
+    "differing_rows": 0,
+    "findings": [],
+    "limitations": [
+      "검사 대상 129행 중 79행은 어떤 신호도 내지 않았다. 발화하지 않은 분기는 비교할 결정이 없으므로 look-ahead 여부를 판정하지 않았다.",
+      "이 검사는 구조화(compiled_conditions) 평가 경로만 실행한다. 생성 코드(backtest_code) 경로는 별도 실행이 필요하다.",
+      "warm-up 부족은 여기서 드러나지 않는다. 두 실행이 같은 시작점을 공유하므로 창 길이 미만 구간의 부분 윈도우 값은 양쪽에서 동일하게 나타난다. 이는 look-ahead와 다른 편향이며 QV-WRM-01에서 따로 다룬다.",
+      "절단 지점 1개는 슬라이스 1개다. 다른 날짜에서만 드러나는 누출은 그 날짜로 다시 실행해야 관측된다."
+    ]
+  }
+}

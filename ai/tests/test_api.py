@@ -1,3 +1,4 @@
+from datetime import date
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -10,6 +11,7 @@ if TYPE_CHECKING:
 
 from ai_graph.api import (
     AI_CORS_ALLOW_ORIGINS_ENV,
+    ANALYSIS_JOB_CANCEL_PATH,
     ANALYSIS_JOB_DETAIL_PATH,
     ANALYSIS_JOBS_PATH,
     API_STATUS_PATH,
@@ -24,12 +26,23 @@ from ai_graph.api import (
 )
 from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
-from ai_graph.jobs import InMemoryAnalysisJobStore, JobStoreConfigurationError, JobStoreRuntime
+from ai_graph.jobs import (
+    AnalysisHistoryReadOnlyError,
+    AnalysisJobStatus,
+    InMemoryAnalysisJobStore,
+    JobStoreConfigurationError,
+    JobStoreRuntime,
+    ReadOnlyAnalysisJobStore,
+    RestartReconciliationStore,
+)
 from ai_graph.research_contract import RuleDraftSigner
 from ai_graph.research_eligibility import PerformanceAvailable
 from ai_graph.schemas import (
     APIEnvelope,
     EnvelopeStatus,
+    FreshnessEvidence,
+    ReportBundle,
+    ReportProjection,
     UserPayload,
 )
 
@@ -354,6 +367,79 @@ def test_production_retires_raw_analysis_jobs_before_side_effects(
     assert sink.sessions == ()
 
 
+def test_analysis_history_is_read_only_while_no_surface_may_create_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With both creating routes retired, the store itself stops accepting new rows.
+
+    The routes already refuse, so this is the structural half of the same guarantee: a
+    consumer added later cannot start extending the history just by calling the store.
+    Past results stay readable and stay put - nothing here removes one.
+    """
+
+    monkeypatch.setenv("APP_ENV", "production")
+    store = InMemoryAnalysisJobStore()
+    existing = store.create_job("과거에 실행된 분석", user_id="local-dev-user")
+
+    client = TestClient(create_app(store, research_execution_enabled=False))
+    read_only = client.app.state.job_store
+
+    assert isinstance(read_only, ReadOnlyAnalysisJobStore)
+
+    with pytest.raises(AnalysisHistoryReadOnlyError):
+        read_only.create_job("새 분석", user_id="local-dev-user")
+
+    # The history is still there, still readable, over HTTP and through the store.
+    response = client.get(f"{ANALYSIS_JOBS_PATH}/{existing.job_id}")
+    assert response.status_code == 200
+    assert response.json()["job_id"] == existing.job_id
+    assert [job.job_id for job in read_only.list_jobs()] == [existing.job_id]
+
+
+def test_activating_research_execution_restores_the_write_surface() -> None:
+    """The read-only wrapper follows the enabled surfaces, not the deploy environment.
+
+    Otherwise the day research execution is activated in production it would be blocked
+    by a rule that was only ever about the retired legacy flow.
+    """
+
+    client = TestClient(
+        create_app(InMemoryAnalysisJobStore(), research_execution_enabled=True)
+    )
+
+    assert not isinstance(client.app.state.job_store, ReadOnlyAnalysisJobStore)
+
+
+def test_read_only_history_still_lets_a_restart_finish_interrupted_jobs() -> None:
+    """Reconciliation finishes existing history; it does not open new history.
+
+    Startup fails a job a dead process left RUNNING. Blocking that along with creation
+    would leave those rows spinning forever and make readiness fail closed for a reason
+    that has nothing to do with the retired flow.
+    """
+
+    class ReconcilableStore(InMemoryAnalysisJobStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.force_failed: list[str] = []
+
+        def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list:
+            return []
+
+        def force_fail_undecodable_job(
+            self, job_id: str, *, error_message: str, reason: str
+        ) -> bool:
+            self.force_failed.append(job_id)
+            return True
+
+    inner = ReconcilableStore()
+    read_only = ReadOnlyAnalysisJobStore(inner)
+
+    assert isinstance(read_only, RestartReconciliationStore)
+    assert read_only.force_fail_undecodable_job("j-1", error_message="e", reason="r") is True
+    assert inner.force_failed == ["j-1"]
+
+
 def test_backtest_api_redacts_legacy_insufficient_performance_before_serialization() -> None:
     legacy_available = PerformanceAvailable.model_construct(
         availability="available",
@@ -406,6 +492,142 @@ def test_backtest_api_redacts_legacy_insufficient_performance_before_serializati
     }
     assert "metrics" not in public_performance
     assert "equity_curve" not in public_performance
+
+
+def test_job_api_redacts_legacy_available_performance_when_source_is_stale() -> None:
+    legacy_available = PerformanceAvailable.model_construct(
+        availability="available",
+        performance={
+            "metrics": {"total_return": 0.12, "sharpe_ratio": 0.3},
+            "equity_curve": [{"date": "2026-01-01", "cumulative_return": 0.12}],
+            "reliability": {
+                "source": "postgres",
+                "status": "sufficient",
+                "row_count": 1_260,
+                "ticker_count": 5,
+                "trading_days": 252,
+                "trade_count": 8,
+            },
+        },
+        method_manifest=None,
+        limitations=[],
+    )
+    envelope = APIEnvelope.model_construct(
+        status=EnvelopeStatus.READY,
+        trace_id="legacy-stale-trace",
+        user_payload=UserPayload.model_construct(
+            headline="ready",
+            message="analysis completed",
+            next_actions=[],
+            performance=legacy_available,
+            report=ReportBundle(
+                web_projection=ReportProjection(
+                    title="legacy report",
+                    summary="legacy stale result",
+                    sections=[
+                        {
+                            "id": "performance",
+                            "title": "후보 코드 백테스트",
+                            "items": legacy_available.model_dump(mode="json"),
+                        }
+                    ],
+                ),
+                email_projection=ReportProjection(
+                    title="legacy report",
+                    summary="legacy stale result",
+                    sections=[],
+                ),
+                risk_adjustments=[],
+            ),
+        ),
+        strategy_spec=None,
+        debug_ref="debug:legacy-stale",
+        retryable=False,
+        freshness_evidence=FreshnessEvidence(
+            status="stale",
+            as_of=date(2026, 8, 18),
+            reason="price source exceeded the configured freshness window",
+            source="postgres",
+            no_recommendation=True,
+        ),
+    )
+    store = InMemoryAnalysisJobStore()
+    job = store.create_job("legacy stale RSI 전략", user_id="local-dev-user")
+    store.complete_job(job.job_id, envelope)
+    client = TestClient(create_app(store))
+
+    response = client.get(f"{ANALYSIS_JOBS_PATH}/{job.job_id}")
+
+    assert response.status_code == 200
+    public_performance = response.json()["result"]["user_payload"]["performance"]
+    assert public_performance == {
+        "availability": "unavailable",
+        "reason_code": "stale_source",
+        "safe_facts": {
+            "source": "postgres",
+            "row_count": 1_260,
+            "ticker_count": 5,
+            "trading_days": 252,
+            "trade_count": 8,
+            "history_start": None,
+            "history_end": None,
+            "freshness_status": "stale",
+            "freshness_as_of": "2026-08-18",
+            "freshness_reason": "price source exceeded the configured freshness window",
+        },
+    }
+    report_performance = next(
+        section
+        for section in response.json()["result"]["user_payload"]["report"]["web_projection"][
+            "sections"
+        ]
+        if section["id"] == "performance"
+    )
+    assert report_performance["items"] == public_performance
+
+    status_only_job = store.create_job("legacy stale status-only RSI 전략", user_id="local-dev-user")
+    store.complete_job(
+        status_only_job.job_id,
+        envelope.model_copy(
+            update={"freshness_evidence": None, "freshness_status": "stale"}
+        ),
+    )
+    status_only_response = client.get(f"{ANALYSIS_JOBS_PATH}/{status_only_job.job_id}")
+
+    assert status_only_response.status_code == 200
+    status_only_performance = status_only_response.json()["result"]["user_payload"][
+        "performance"
+    ]
+    assert status_only_performance["availability"] == "unavailable"
+    assert status_only_performance["reason_code"] == "stale_source"
+    assert status_only_performance["safe_facts"]["freshness_status"] == "stale"
+    assert "performance" not in status_only_performance
+
+    report_only_job = store.create_job("legacy stale report-only RSI 전략", user_id="local-dev-user")
+    store.complete_job(
+        report_only_job.job_id,
+        envelope.model_copy(
+            update={
+                "user_payload": envelope.user_payload.model_copy(update={"performance": None})
+            }
+        ),
+    )
+    report_only_response = client.get(f"{ANALYSIS_JOBS_PATH}/{report_only_job.job_id}")
+
+    assert report_only_response.status_code == 200
+    report_only_performance = report_only_response.json()["result"]["user_payload"][
+        "performance"
+    ]
+    assert report_only_performance["availability"] == "unavailable"
+    assert report_only_performance["reason_code"] == "stale_source"
+    report_only_section = next(
+        section
+        for section in report_only_response.json()["result"]["user_payload"]["report"][
+            "web_projection"
+        ]["sections"]
+        if section["id"] == "performance"
+    )
+    assert report_only_section["items"] == report_only_performance
 
 
 def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> None:
@@ -991,3 +1213,59 @@ def test_unknown_analysis_job_returns_404() -> None:
 
     assert response.status_code == 404
     assert response.json() == {"detail": "analysis job not found"}
+
+
+def _other_users_job(store: InMemoryAnalysisJobStore):
+    """A job belonging to someone other than the authenticated caller."""
+
+    return store.create_job("다른 사용자의 RSI 전략", user_id="someone-else")
+
+
+def test_another_users_analysis_job_is_not_readable() -> None:
+    """RMP-JOB-01: reads are owner-only, and a stranger cannot even confirm it exists.
+
+    404 rather than 403 on purpose. 403 would answer "this job exists but is not yours",
+    which turns job ids into an enumerable directory of other people's activity.
+    """
+
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store))
+    job = _other_users_job(store)
+
+    response = client.get(ANALYSIS_JOB_DETAIL_PATH.format(job_id=job.job_id))
+
+    assert response.status_code == 404
+    assert "someone-else" not in response.text
+
+
+def test_another_users_analysis_job_cannot_be_cancelled() -> None:
+    """Cancel is a write, so owner-only matters more here than on the read path.
+
+    Checking the status afterwards is the part that counts: a 404 that still signalled
+    the cancellation would stop a stranger's run while reporting that nothing happened.
+    """
+
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store))
+    job = _other_users_job(store)
+
+    response = client.post(ANALYSIS_JOB_CANCEL_PATH.format(job_id=job.job_id))
+
+    assert response.status_code == 404
+    still_there = store.get_job(job.job_id)
+    assert still_there is not None
+    assert still_there.status is not AnalysisJobStatus.FAILED
+
+
+def test_a_job_id_that_does_not_exist_is_indistinguishable_from_someone_elses() -> None:
+    """The two must answer identically, or the difference itself is the disclosure."""
+
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store))
+    owned_by_other = _other_users_job(store)
+
+    missing = client.get(ANALYSIS_JOB_DETAIL_PATH.format(job_id="no-such-job"))
+    foreign = client.get(ANALYSIS_JOB_DETAIL_PATH.format(job_id=owned_by_other.job_id))
+
+    assert missing.status_code == foreign.status_code == 404
+    assert missing.json() == foreign.json()

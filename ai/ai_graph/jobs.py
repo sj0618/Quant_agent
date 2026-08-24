@@ -259,6 +259,37 @@ AnalysisRunner = Callable[[str, str], APIEnvelope]
 PersistentStoreFactory = Callable[[object], AnalysisJobStore]
 
 
+class AnalysisHistoryReadOnlyError(RuntimeError):
+    """Raised when a retired surface tried to add a row to the analysis history."""
+
+
+class ReadOnlyAnalysisJobStore:
+    """Keeps the analysis history readable while no surface may add to it.
+
+    The legacy raw-analysis route and the confirmed-research route are the only two
+    callers that create jobs, and both already refuse before they get here. This wrapper
+    exists so that the guarantee is structural rather than a property of route review:
+    a new consumer added later cannot quietly start writing history again.
+
+    Only creation is refused. Reads pass through, and so does restart reconciliation,
+    which moves rows a dead process left RUNNING into a terminal state. Blocking that
+    would leave those rows spinning forever and make readiness fail, and it would be a
+    different thing from what is being retired: reconciliation finishes existing history,
+    it does not open new history. Nothing here deletes a stored result.
+    """
+
+    def __init__(self, store: AnalysisJobStore) -> None:
+        self._store = store
+
+    def create_job(self, *_args: Any, **_kwargs: Any) -> AnalysisJob:
+        raise AnalysisHistoryReadOnlyError(
+            "analysis history is read-only: no enabled surface may create an analysis job"
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+
 class JobStoreConfigurationError(RuntimeError):
     """Raised when a requested job store mode cannot be configured safely."""
 

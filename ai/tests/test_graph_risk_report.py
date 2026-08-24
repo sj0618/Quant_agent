@@ -2,8 +2,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from ai_graph.graph import _recommendation_gate
-from ai_graph.graph import build_public_backtest_performance
+from ai_graph.graph import _recommendation_gate, build_public_backtest_performance
 from ai_graph.nodes.backtest import (
     BENCHMARK_METHOD,
     BENCHMARK_WARNING,
@@ -15,6 +14,8 @@ from ai_graph.nodes.risk_manager import (
     _average_pairwise_correlation,
     apply_risk_rules,
 )
+from ai_graph.quant_performance import MINIMUM_DATA_RULE
+from ai_graph.research_eligibility import PerformanceUnavailable
 from ai_graph.schemas import (
     BacktestMetrics,
     CodeCandidate,
@@ -507,6 +508,73 @@ def test_recommendation_gate_accepts_valid_objective() -> None:
     assert gate is not None
     assert gate.validated is True
     assert "objective gate를 모두 통과" in gate.reason
+
+
+def _passing_gate_state() -> dict:
+    """A backtest whose metrics clear the objective floor on their own."""
+
+    candidate = CodeCandidate(
+        candidate_id="A2",
+        variant="A",
+        code="pass",
+        validation_ok=True,
+        metrics=BacktestMetrics(
+            sharpe_ratio=1.2,
+            max_drawdown=-0.3,
+            win_rate=0.6,
+            total_return=0.5,
+            in_sample_sharpe=0.6,
+            out_sample_sharpe=0.5,
+            degradation=0.1,
+        ),
+    )
+    return {
+        "backtest": {
+            "strategy_a": make_strategy().model_dump(),
+            "candidates": [candidate.model_dump()],
+            "selected_candidate": candidate.model_dump(),
+            "equity_curve": [],
+            "engine_summary": {"effective_trade_count": 10},
+        }
+    }
+
+
+def test_recommendation_gate_withholds_when_inputs_miss_the_minimum_data_rule() -> None:
+    """Metrics that clear the floor still cannot validate picks over too little data.
+
+    A ratio computed across four sessions of one ticker is arithmetic, not evidence.
+    The public projection already refuses to publish it; the gate has to reach the same
+    answer, or the envelope says "성과 없음" and "검증됨" in the same breath.
+    """
+
+    unavailable = PerformanceUnavailable(
+        reason_code="insufficient_reliability",
+        safe_facts={
+            **MINIMUM_DATA_RULE,
+            "source": "postgres",
+            "reliability": "insufficient",
+            "row_count": 4,
+            "trading_days": 4,
+            "ticker_count": 1,
+            "trade_count": 1,
+        },
+    )
+
+    gate = _recommendation_gate(_passing_gate_state(), performance=unavailable)
+
+    assert gate is not None
+    assert gate.validated is False
+    assert gate.verification_complete is False
+    assert gate.unmet_objective_criteria == []
+    assert "performance_unavailable:insufficient_reliability" in gate.unmet_data_requirements
+    assert "trading_days:4 < minimum_trading_days:30" in gate.unmet_data_requirements
+    assert "ticker_count:1 < minimum_tickers:5" in gate.unmet_data_requirements
+    # The reason states the rule that was applied, not a bare "부족" label.
+    assert "최소" in gate.reason and "30" in gate.reason and "5" in gate.reason
+
+    # Same backtest, no unavailable projection: the objective floor still decides. This
+    # is what proves the new branch is what withheld the recommendation above.
+    assert _recommendation_gate(_passing_gate_state()).validated is True
 
 
 def _automatic_strategy() -> StrategySpec:

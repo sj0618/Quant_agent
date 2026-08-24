@@ -1603,3 +1603,80 @@ def test_raw_capability_requires_every_execution_row_not_any_row() -> None:
         "date": "2026-01-05", "ticker": "000001",
         "missing_fields": ["raw_open", "raw_high", "raw_low", "raw_close", "raw_volume"],
     }]
+
+
+def test_release_profile_refuses_to_serve_the_local_fixture_bundle(monkeypatch) -> None:
+    """FT-FIX-08: production must not fall through to fixtures when no DSN is set.
+
+    Before this guard, a release deployment with no database produced a complete
+    analysis - `status: ready`, a report, metrics - from local fixture rows, carrying
+    only a `production_eligible: false` label. A label is not a gate; a reader who does
+    not look at provenance sees a finished result either way.
+    """
+
+    from ai_graph.data_sources.db import FixtureModeForbiddenError
+
+    monkeypatch.delenv(AI_DATABASE_DSN_ENV, raising=False)
+    monkeypatch.delenv(QUANT_DB_DSN_ENV, raising=False)
+    monkeypatch.delenv(DATABASE_URL_ENV, raising=False)
+    monkeypatch.setenv("APP_ENV", "production")
+
+    with pytest.raises(FixtureModeForbiddenError) as caught:
+        load_pipeline_data_from_env("RSI가 30 이하인 KOSPI200", "trace-release-fixture")
+
+    # The job layer turns the reason code into an answerable failure rather than a crash.
+    assert caught.value.reason == "fixture_mode_forbidden_in_release"
+
+
+def test_development_still_gets_the_fixture_bundle_with_its_badge(monkeypatch) -> None:
+    """The guard must isolate fixtures to development, not remove them.
+
+    Development keeps the fixture path, and keeps the provenance that says what it is:
+    the source, the ineligibility, and the reason a real source was not used.
+    """
+
+    monkeypatch.delenv(AI_DATABASE_DSN_ENV, raising=False)
+    monkeypatch.delenv(QUANT_DB_DSN_ENV, raising=False)
+    monkeypatch.delenv(DATABASE_URL_ENV, raising=False)
+    monkeypatch.delenv("APP_ENV", raising=False)
+
+    bundle = load_pipeline_data_from_env("RSI가 30 이하인 KOSPI200", "trace-dev-fixture")
+
+    assert bundle.metadata["source"] == "fixture"
+    assert bundle.metadata["production_eligible"] is False
+    assert bundle.metadata["reason"]
+
+
+def test_the_split_variant_carries_the_same_guard_and_badge(monkeypatch) -> None:
+    """`db_split` keeps its own copies of both, so both have to be checked separately.
+
+    Its fixture bundle was missing `production_eligible` entirely, which meant a fixture
+    run on that variant advertised no ineligibility at all.
+    """
+
+    from ai_graph.data_sources import db_split
+
+    monkeypatch.delenv(AI_DATABASE_DSN_ENV, raising=False)
+    monkeypatch.delenv(QUANT_DB_DSN_ENV, raising=False)
+    monkeypatch.delenv(DATABASE_URL_ENV, raising=False)
+
+    monkeypatch.delenv("APP_ENV", raising=False)
+    bundle = db_split.load_pipeline_data_from_env("RSI 조건", "trace-split-dev")
+    assert bundle.metadata["source"] == "fixture"
+    assert bundle.metadata["production_eligible"] is False
+
+    monkeypatch.setenv("APP_ENV", "prod")
+    with pytest.raises(db_split.FixtureModeForbiddenError):
+        db_split.load_pipeline_data_from_env("RSI 조건", "trace-split-release")
+
+
+def test_the_api_and_the_data_layer_share_one_release_profile_definition(monkeypatch) -> None:
+    """Two copies of this predicate is how the guard gets disabled on the host it protects."""
+
+    from ai_graph.api import _production_runtime
+    from ai_graph.data_sources.db import is_release_profile
+
+    for value, expected in [("production", True), ("prod", True), ("staging", False), ("", False)]:
+        monkeypatch.setenv("APP_ENV", value)
+        assert is_release_profile() is expected
+        assert _production_runtime() is expected

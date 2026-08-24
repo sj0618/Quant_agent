@@ -42,6 +42,7 @@ from ai_graph.data_sources.db import (
     BOK_MACRO_VIEW,
     KIS_ADJUSTED_OHLCV_TABLE,
     SYMBOL_MASTER_TABLE,
+    is_release_profile,
     measure_research_runtime_facts_from_env,
     resolve_database_dsn_from_env,
 )
@@ -57,6 +58,7 @@ from ai_graph.jobs import (
     AnalysisRunner,
     CancellationRegistry,
     JobStoreRuntime,
+    ReadOnlyAnalysisJobStore,
     create_analysis_job_store_from_env,
     reap_interrupted_jobs,
     run_job_sync,
@@ -93,6 +95,7 @@ from ai_graph.schemas import (
     SCHEMA_VERSION,
     APIEnvelope,
     EnvelopeStatus,
+    ReportBundle,
     UserPayload,
 )
 from ai_graph.scope_review import review_research_scope
@@ -591,6 +594,12 @@ def create_app(
     # Deployed services accept only the signed RuleDraft flow.  The raw endpoint is
     # retained for local compatibility harnesses, never as a production escape hatch.
     app.state.legacy_analysis_jobs_enabled = not _production_runtime()
+    # With both creating surfaces retired there is no caller left that may extend the
+    # analysis history, so the store stops accepting new rows instead of relying on
+    # every route staying correct. Reads and restart reconciliation are unaffected.
+    if not app.state.legacy_analysis_jobs_enabled and not app.state.research_execution_enabled:
+        store = ReadOnlyAnalysisJobStore(store)
+        app.state.job_store = store
     migration_probe = readiness_migration_probe or _analysis_jobs_migration_is_current
 
     probe_token = (environ.get(DATA_EVIDENCE_PROBE_TOKEN_ENV) or "").strip()
@@ -1149,7 +1158,9 @@ def _research_execution_enabled() -> bool:
 
 
 def _production_runtime() -> bool:
-    return (environ.get("APP_ENV") or "").strip().lower() in {"production", "prod"}
+    # Delegates so the API layer and the data layer cannot disagree about what a
+    # release profile is; the fixture guard in `data_sources.db` reads the same answer.
+    return is_release_profile()
 
 
 def _data_source_status() -> DataSourceStatus:
@@ -1338,13 +1349,59 @@ def _public_envelope(envelope: APIEnvelope | None) -> APIEnvelope | None:
     if envelope is None:
         return None
     performance = envelope.user_payload.performance
-    public_performance = sanitize_public_performance(performance)
-    if public_performance is performance:
+    public_performance = sanitize_public_performance(
+        performance,
+        freshness_evidence=envelope.freshness_evidence,
+        freshness_status=envelope.freshness_status,
+    )
+    public_report = _public_report_performance(
+        envelope.user_payload.report,
+        performance=public_performance,
+    )
+    if public_performance is performance and public_report is envelope.user_payload.report:
         return envelope
     payload = envelope.user_payload.model_copy(
-        update={"performance": public_performance}
+        update={"performance": public_performance, "report": public_report}
     )
     return envelope.model_copy(update={"user_payload": payload})
+
+
+def _public_report_performance(
+    report: ReportBundle | None,
+    *,
+    performance: BaseModel | None,
+) -> ReportBundle | None:
+    """Keep legacy report sections aligned with the response-safe performance variant."""
+
+    if report is None or performance is None:
+        return report
+    safe_items = performance.model_dump(mode="json")
+
+    def sanitize_sections(sections: list[dict[str, object]]) -> list[dict[str, object]]:
+        return [
+            {**section, "items": safe_items}
+            if section.get("id") == "performance"
+            else section
+            for section in sections
+        ]
+
+    web_sections = sanitize_sections(report.web_projection.sections)
+    email_sections = sanitize_sections(report.email_projection.sections)
+    if (
+        web_sections == report.web_projection.sections
+        and email_sections == report.email_projection.sections
+    ):
+        return report
+    return report.model_copy(
+        update={
+            "web_projection": report.web_projection.model_copy(
+                update={"sections": web_sections}
+            ),
+            "email_projection": report.email_projection.model_copy(
+                update={"sections": email_sections}
+            ),
+        }
+    )
 
 
 def _public_job(job: AnalysisJob) -> AnalysisJob:

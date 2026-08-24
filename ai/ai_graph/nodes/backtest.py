@@ -35,6 +35,7 @@ from ai_graph.progress import (
     report_activity,
 )
 from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
+from ai_graph.research_eligibility import MISSING_EXECUTION_ASSUMPTION
 from ai_graph.schemas import (
     BacktestEquityPoint,
     BacktestMetrics,
@@ -307,7 +308,9 @@ def _performance_method_manifest(
             if parameters is not None
             else "engine_default"
         ),
-        "fill_timing": str(engine_summary.get("execution_timing") or "unavailable"),
+        "fill_timing": str(
+            engine_summary.get("execution_timing") or MISSING_EXECUTION_ASSUMPTION
+        ),
         "corporate_action_method": "engine_corporate_action_event_policy",
         "cost_tax_slippage_liquidity": (
             "cost_model=" + json.dumps(costs, sort_keys=True, separators=(",", ":"))

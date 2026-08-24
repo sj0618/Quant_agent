@@ -147,3 +147,57 @@ def _ready_envelope(trace_id: str):
         debug_ref=f"debug:{trace_id}",
         retryable=False,
     )
+
+
+# A sibling worker that is alive and mid-run. The distinction the reaper cannot draw is
+# between this and OTHER_PROCESS above: both are "not my incarnation".
+LIVE_SIBLING_PROCESS = "8888:alivecafe0001"
+
+
+def test_the_reaper_would_take_a_live_sibling_workers_job() -> None:
+    """RMP-JOB-01's 2-worker claim, asserted as it actually behaves today.
+
+    The claim rule is `owner_incarnation != mine`. Under one worker that means "a dead
+    process", which is correct. Under two it also matches a sibling that is alive and
+    mid-analysis, and this sweep would fail work in flight - the client sees a run that
+    was progressing turn into `interrupted_by_restart` for no reason it can observe.
+
+    There is no lease behind the rule: no heartbeat, no expiry, nothing the owner
+    refreshes while it works. So the reaper has no way to tell a dead owner from a busy
+    one, and the safety comes entirely from the startup guard below rather than from the
+    claim itself.
+
+    This asserts the unsafe behaviour on purpose. It is not a description of what should
+    happen under two workers - it is the tripwire that makes anyone lifting the worker
+    limit come here and build the lease first.
+    """
+
+    store, job_id = _store_with_running_job()
+    store.jobs[job_id] = store.jobs[job_id].model_copy(
+        update={"owner_incarnation": LIVE_SIBLING_PROCESS}
+    )
+
+    assert reap_interrupted_jobs(store, incarnation=PROCESS_INCARNATION) == [job_id]
+    assert store.get_job(job_id).status is AnalysisJobStatus.FAILED
+
+
+def test_the_startup_guard_the_claim_rule_depends_on_is_in_force() -> None:
+    """The claim rule above is only sound while a second worker cannot start.
+
+    Paired with the test above deliberately: together they say "the reaper is unsafe
+    under N workers, and N workers cannot happen". Either one alone reads as a
+    complete story and is not.
+    """
+
+    from ai_graph.single_process import (
+        WEB_CONCURRENCY_ENV,
+        MultiProcessStartupError,
+        enforce_single_process,
+    )
+
+    with pytest.raises(MultiProcessStartupError):
+        enforce_single_process(argv=["uvicorn", "combined_main:app", "--workers", "2"], environ={})
+    with pytest.raises(MultiProcessStartupError):
+        enforce_single_process(
+            argv=["uvicorn", "combined_main:app"], environ={WEB_CONCURRENCY_ENV: "2"}
+        )

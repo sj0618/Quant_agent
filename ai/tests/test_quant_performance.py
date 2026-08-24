@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from ai_graph import graph, quant_performance
+from ai_graph.nodes.backtest import _performance_method_manifest
 from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_performance import (
     build_public_backtest_performance,
@@ -649,3 +650,117 @@ def test_public_projection_requires_engine_manifest_before_exposing_complete_val
     assert isinstance(projection, PerformanceAvailable)
     assert projection.performance["metrics"]["total_return"] == 0.08
     assert "engine_summary" not in projection.performance
+
+
+def test_a_run_without_execution_assumptions_is_unverifiable_not_publishable() -> None:
+    """A backtest that never stated its fill timing or costs must not publish numbers.
+
+    The engine always reports `execution_timing` and `cost_model`; a summary missing
+    either did not come from a real engine invocation. Publishing its return would
+    advertise a figure that cannot be reproduced, so the projection ends `unavailable`.
+    """
+
+    metrics = BacktestMetrics(
+        sharpe_ratio=0.2, max_drawdown=-0.1, win_rate=0.5,
+        total_return=0.08, in_sample_sharpe=0.1,
+        out_sample_sharpe=None, degradation=0.0,
+    )
+    rows = _rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=252)
+    strategy = _make_strategy()
+    candidate = CodeCandidate(
+        candidate_id="A2", variant="A", code="pass", validation_ok=True, metrics=metrics
+    )
+    stated = {
+        "effective_trade_count": 8,
+        "initial_capital": 1_000_000,
+        "execution_timing": "next_open",
+        "cost_model": {"commission_pct": 0.00015, "tax_pct": 0.0023, "slippage_pct": 0.001},
+    }
+
+    for dropped in ("execution_timing", "cost_model"):
+        summary = {key: value for key, value in stated.items() if key != dropped}
+        manifest = _performance_method_manifest(strategy, candidate, rows, summary)
+        projection = project_public_performance(
+            _build_payload(metrics, engine_summary={**summary, "performance_method_manifest": manifest}),
+            price_rows=rows,
+            pipeline_data_source={"source": "postgres"},
+        )
+
+        assert isinstance(projection, PerformanceUnavailable), dropped
+        assert projection.reason_code == "incomplete_method_manifest", dropped
+        public = projection.model_dump(mode="json")
+        assert "performance" not in public
+        assert "metrics" not in public
+
+    # The same payload with both assumptions stated still publishes, so the gate is
+    # rejecting the missing assumption rather than the shape of the manifest.
+    manifest = _performance_method_manifest(strategy, candidate, rows, stated)
+    published = project_public_performance(
+        _build_payload(metrics, engine_summary={**stated, "performance_method_manifest": manifest}),
+        price_rows=rows,
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert isinstance(published, PerformanceAvailable)
+    assert published.method_manifest.fill_timing == "next_open"
+    assert "commission_pct" in published.method_manifest.cost_tax_slippage_liquidity
+
+
+def test_stale_source_hides_public_performance_numbers_with_freshness_facts() -> None:
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.2,
+            max_drawdown=-0.1,
+            win_rate=0.5,
+            total_return=0.08,
+            in_sample_sharpe=0.1,
+            out_sample_sharpe=None,
+            degradation=0.0,
+        ),
+        engine_summary={
+            "effective_trade_count": 8,
+            "performance_method_manifest": {
+                "evaluated_rule": "rsi",
+                "rule_version": "v1",
+                "substituted": False,
+                "market": "KRX",
+                "universe": "test",
+                "start_date": "2024-01-01",
+                "end_date": "2024-12-31",
+                "eod_basis": "ohlcv_eod",
+                "initial_capital": 1000000,
+                "rebalance_timing": "weekly",
+                "fill_timing": "next_open",
+                "corporate_action_method": "engine",
+                "cost_tax_slippage_liquidity": "configured",
+                "observations": 252,
+                "trades": 8,
+                "data_version": "test",
+                "result_version": "test",
+                "execution_version": "test",
+                "historical_simulation_warning": "not predictive",
+            },
+        },
+    )
+
+    projection = project_public_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=252),
+        pipeline_data_source={
+            "source": "postgres",
+            "freshness_as_of": "2026-08-18",
+            "freshness_reason": "price source exceeded the configured freshness window",
+            "source_manifest": {
+                "source": "postgres",
+                "as_of": "2026-08-20",
+                "freshness": "stale",
+            },
+        },
+    )
+
+    assert isinstance(projection, PerformanceUnavailable)
+    assert projection.reason_code == "stale_source"
+    assert projection.safe_facts["freshness_status"] == "stale"
+    assert projection.safe_facts["freshness_as_of"] == "2026-08-18"
+    assert projection.safe_facts["freshness_reason"] == "price source exceeded the configured freshness window"
+    assert "performance" not in projection.model_dump(mode="json")
