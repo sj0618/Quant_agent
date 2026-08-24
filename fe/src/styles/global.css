@@ -288,6 +288,12 @@ h6 { font-size: 0.67em; }
 .source-strip { display: flex; gap: 8px; align-items: center; color: var(--subdued); font-size: 12px; }
 .source-strip a { margin-left: auto; color: var(--blue); font-weight: 800; }
 .metric-card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+.metric-card--unavailable { border-color: color-mix(in srgb, var(--hold) 54%, var(--line)); }
+.metric-card--unavailable > strong { font-size: 20px; }
+.metric-card__provenance { display: grid; gap: 6px; margin: 12px 0 0; padding-top: 12px; border-top: 1px solid var(--line); }
+.metric-card__provenance div { display: grid; grid-template-columns: minmax(62px, auto) minmax(0, 1fr); gap: 8px; }
+.metric-card__provenance dt { color: var(--subdued); font-size: 12px; }
+.metric-card__provenance dd { min-width: 0; margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .metric-card__explanation { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 12px; }
 .metric-card__explanation summary { cursor: pointer; color: var(--ink); font-size: 11px; font-weight: 800; }
 .metric-card__explanation p { display: grid; gap: 3px; }
