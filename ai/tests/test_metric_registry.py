@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from ai_graph import graph
 from ai_graph.nodes.backtest import _profit_factor, _undefined_metric_availability
 from ai_graph.quant_explanations import (
     PUBLIC_METRIC_KEYS,
     metric_explanation,
+    metric_registry_provenance,
     public_metric_registry,
 )
 
@@ -47,3 +49,12 @@ def test_public_metric_registry_is_complete_and_profit_factor_contract_is_explic
     assert "승률 기반 프록시" in profit_factor["clip_policy"]
     assert "분모가 0" in profit_factor["null_policy"]
     assert "실현손익" in profit_factor["plain_explanation"]
+
+
+def test_graph_metric_detail_carries_the_same_registry_provenance() -> None:
+    detail = graph._metric_detail("sharpe_ratio", 1.25)
+    registry = metric_registry_provenance("sharpe_ratio")
+
+    assert detail.registry_version == registry["registry_version"]
+    assert detail.provenance.implementation_path == registry["implementation_path"]
+    assert detail.provenance.implementation_hash == registry["implementation_hash"]

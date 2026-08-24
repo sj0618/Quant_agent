@@ -69,7 +69,7 @@ from ai_graph.progress import (
     report_activity,
     report_node_stage,
 )
-from ai_graph.quant_explanations import metric_explanation
+from ai_graph.quant_explanations import metric_explanation, metric_registry_provenance
 from ai_graph.quant_strategy import (
     classify_strategy_request,
     infer_automatic_strategy_preferences,
@@ -93,6 +93,7 @@ from ai_graph.schemas import (
     EvidenceRef,
     InternalPayload,
     PublicMetricDetail,
+    PublicMetricProvenance,
     RecommendationGate,
     ScreeningMatch,
     SemanticSlots,
@@ -3773,6 +3774,7 @@ def _build_public_metric_details(
 
 def _metric_detail(key: str, value: float | None) -> PublicMetricDetail:
     explanation = metric_explanation(key)
+    registry = metric_registry_provenance(key)
     is_available = _is_numeric_metric(value)
     return PublicMetricDetail(
         key=key,
@@ -3784,6 +3786,12 @@ def _metric_detail(key: str, value: float | None) -> PublicMetricDetail:
         plain_explanation=explanation["plain_explanation"],
         why_used=explanation["why_used"],
         caution=explanation["caution"],
+        source_refs=list(explanation.get("source_refs", [])),
+        registry_version=registry["registry_version"],
+        provenance=PublicMetricProvenance(
+            implementation_path=registry["implementation_path"],
+            implementation_hash=registry["implementation_hash"],
+        ),
     )
 
 

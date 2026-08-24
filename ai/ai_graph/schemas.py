@@ -430,6 +430,15 @@ class WalkForwardPolicyResult(BaseModel):
     deduped_session_count: int = Field(default=0, ge=0)
 
 
+class PublicMetricProvenance(BaseModel):
+    """Immutable registry reference for one public metric definition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    implementation_path: str = Field(min_length=1)
+    implementation_hash: str = Field(min_length=64, max_length=64)
+
+
 class PublicMetricDetail(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -443,6 +452,8 @@ class PublicMetricDetail(BaseModel):
     why_used: str = Field(min_length=1)
     caution: str = Field(min_length=1)
     source_refs: list[str] = Field(default_factory=list)
+    registry_version: str = Field(min_length=1)
+    provenance: PublicMetricProvenance
 
 
 class PublicIndicatorExplanation(BaseModel):

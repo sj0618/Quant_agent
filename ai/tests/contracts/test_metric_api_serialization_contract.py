@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from ai_graph.quant_explanations import metric_explanation
+from ai_graph.quant_explanations import metric_explanation, metric_registry_provenance
 from ai_graph.quant_performance import build_public_backtest_performance
 from ai_graph.schemas import (
     BacktestMetrics,
@@ -8,7 +8,6 @@ from ai_graph.schemas import (
     Condition,
     StrategySpec,
 )
-
 
 METRIC_DETAIL_FIELDS = {
     "key",
@@ -21,6 +20,8 @@ METRIC_DETAIL_FIELDS = {
     "why_used",
     "caution",
     "source_refs",
+    "registry_version",
+    "provenance",
 }
 
 
@@ -102,6 +103,12 @@ def test_metric_api_serialization_matches_the_registry_field_by_field() -> None:
         assert detail["why_used"] == explanation["why_used"]
         assert detail["caution"] == explanation["caution"]
         assert detail["source_refs"] == explanation["source_refs"]
+        registry = metric_registry_provenance(key)
+        assert detail["registry_version"] == registry["registry_version"]
+        assert detail["provenance"] == {
+            "implementation_path": registry["implementation_path"],
+            "implementation_hash": registry["implementation_hash"],
+        }
         if detail["is_available"]:
             assert detail["value"] is not None
             assert detail["unavailable_reason"] is None

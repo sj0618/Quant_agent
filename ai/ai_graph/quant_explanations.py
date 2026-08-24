@@ -395,6 +395,17 @@ def metric_registry_entry(key: str) -> dict[str, Any]:
     }
 
 
+def metric_registry_provenance(key: str) -> dict[str, str]:
+    """Return the versioned implementation reference for a public metric."""
+
+    entry = metric_registry_entry(key)
+    return {
+        "registry_version": entry["formula_version"],
+        "implementation_path": entry["implementation_path"],
+        "implementation_hash": entry["implementation_hash"],
+    }
+
+
 def public_metric_registry() -> list[dict[str, Any]]:
     """Ordered whitelist and semantic registry for all public metric cards."""
 

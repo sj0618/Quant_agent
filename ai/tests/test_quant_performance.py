@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from ai_graph import graph, quant_performance
 from ai_graph.nodes.backtest import _performance_method_manifest
-from ai_graph.quant_explanations import metric_explanation
+from ai_graph.quant_explanations import metric_explanation, metric_registry_provenance
 from ai_graph.quant_performance import (
     build_public_backtest_performance,
     project_public_performance,
@@ -450,6 +450,11 @@ def test_public_performance_reliability_boundary_cases() -> None:
     assert no_rows.reliability is not None
     assert no_rows.reliability.status == "insufficient"
     assert all(item.is_available is False for item in no_rows.metric_details)
+    for detail in no_rows.metric_details:
+        registry = metric_registry_provenance(detail.key)
+        assert detail.registry_version == registry["registry_version"]
+        assert detail.provenance.implementation_path == registry["implementation_path"]
+        assert detail.provenance.implementation_hash == registry["implementation_hash"]
 
     short = build_public_backtest_performance(
         _build_payload(
