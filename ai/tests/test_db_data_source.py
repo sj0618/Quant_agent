@@ -1680,3 +1680,40 @@ def test_the_api_and_the_data_layer_share_one_release_profile_definition(monkeyp
         monkeypatch.setenv("APP_ENV", value)
         assert is_release_profile() is expected
         assert _production_runtime() is expected
+
+
+def test_every_data_source_variant_raises_the_error_the_job_layer_narrows_on() -> None:
+    """A copy of an exception class is a different class, and `isinstance` knows it.
+
+    `jobs.classify_failure` narrows on `PipelineDataUnavailableError` imported from
+    `data_sources.db`. `db_split` used to declare its own class with the same name and
+    the same body, so a "조건에 맞는 종목이 없습니다" raised on that variant fell past
+    the check and reached the user as an unknown crash - the exact failure the class was
+    introduced to remove, restored for one variant by duplication alone.
+
+    Checked by identity rather than by name, because name equality is what made the two
+    look interchangeable in the first place.
+    """
+
+    from ai_graph.data_sources import db, db_split, db_test, profile_aware
+    from ai_graph.jobs import PipelineDataUnavailableError as narrowed_by_the_job_layer
+
+    for variant in (db, db_test, db_split, profile_aware):
+        assert variant.PipelineDataUnavailableError is narrowed_by_the_job_layer, (
+            f"{variant.__name__} raises a class the job layer cannot narrow on"
+        )
+        assert variant.FixtureModeForbiddenError is db.FixtureModeForbiddenError
+
+
+def test_a_split_variant_failure_is_classified_rather_than_reported_as_a_crash() -> None:
+    """The consequence the identity check exists to prevent, asserted end to end."""
+
+    from ai_graph.data_sources import db_split
+    from ai_graph.jobs import PipelineDataUnavailableError
+
+    error = db_split.PipelineDataUnavailableError(
+        "no_screening_matches", "조건에 맞는 종목이 없습니다"
+    )
+
+    assert isinstance(error, PipelineDataUnavailableError)
+    assert error.reason == "no_screening_matches"
