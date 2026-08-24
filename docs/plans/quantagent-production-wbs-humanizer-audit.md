@@ -30,3 +30,44 @@
 - "개선", "고도화", "정리"처럼 판정할 수 없는 말은 쓰지 않는다.
 - 과장·홍보 문구와 em/en dash는 없다.
 - 71개 행은 기준 원장에서 XLSX로 직접 전사한다. 행마다 ID, 작업명, 정확한 commit 제목, 검증 명령, 근거 ID가 같은지 구조 검사한다.
+
+## 2026-08-25 현재 계획본 독립 재검사
+
+대상은 SHA-256
+`92311cc787929b94963f77a180343185f859bfe7e27e0af048de77398ec2fa6b`의
+`outputs/quantagent-production-wbs-20260813/QuantAgent_프로덕션_신뢰성_WBS_계획본.xlsx`다.
+원본 XLSX의 셀, 수식, 서식은 수정하지 않았다.
+
+### 한국어 문체와 원자 행
+
+- `2_WBS!E8:H97`의 원자 행 90개 모두에 ID, 작업명, intended commit이 있다.
+- 작업명에서 `개선`, `고도화`, `정리`, em dash, en dash는 0건이다.
+- 작업명은 관찰 가능한 동작을 적고, 기술 식별자·API path·검증 명령은 바꾸지 않았다.
+
+### 가독성 있는 렌더 증거
+
+같은 SHA의 셀 값만을 별도 스냅샷 시트에 투영해, 전체 행이 한 장의 축소된
+개요 이미지로 뭉개지지 않도록 다음 PNG를 만들었다. 이 PNG는 데이터·수식을
+대체하지 않으며 읽기성 검사 전용이다.
+
+| 원본 범위 | 읽기성 PNG |
+|---|---|
+| `1_RnR!A1:G9` | `readable-render-audit/1_RnR-readable.png` |
+| `2_WBS!A1:S32` | `readable-render-audit/2_WBS-001-032.png` |
+| `2_WBS!A33:S64` | `readable-render-audit/2_WBS-033-064.png` |
+| `2_WBS!A65:S97` | `readable-render-audit/2_WBS-065-097.png` |
+| `3_Members!A1:G8` | `readable-render-audit/3_Members-readable.png` |
+
+각 PNG에서 한글 제목·작업명·담당·상태·scope/검증 원장이 잘리지 않고
+표시되는지 독립 확인했다. 기존 LibreOffice의 A4 기본 인쇄 100쪽 분절은
+workbook 내용 오류로 승격하지 않으며, 인쇄용 레이아웃을 승인한 증거도 아니다.
+
+### 수식 검사
+
+Artifact Tool regex 검사 결과는
+`readable-render-audit/readable-render-formula-scan.ndjson`에 남겼고,
+`#REF!`, `#DIV/0!`, `#VALUE!`, `#NAME?`, `#N/A` 일치 0건이다. OOXML의
+namespace-qualified 실제 셀 수식은 `2_WBS` 331개, 나머지 두 시트 0개다.
+
+이 검사는 S 등급 workbook 검사다. 현재 계획본을 배포·실데이터·사람 승인
+증적으로 바꾸지 않으며, live WBS의 승인 상태는 별도 증거에 따라 유지한다.
