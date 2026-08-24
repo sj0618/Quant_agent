@@ -19,6 +19,9 @@ export const AI_ENDPOINTS = {
   analysisJobEvents: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/events`,
   analysisJobCancel: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/cancel`,
   strategyDescriptions: "/api/strategies/descriptions",
+  researchRuleReview: "/api/strategies/parse",
+  researchJobs: "/api/research/jobs",
+  researchJobResult: (id: string) => `/api/research/jobs/${encodeURIComponent(id)}/result`,
 } as const;
 
 function trimTrailingSlash(value: string | undefined) {

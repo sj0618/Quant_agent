@@ -30,6 +30,7 @@ FIXED_MIGRATIONS = (
     "019_ai_prompt_response_summary.sql",
     "020_ai_account_tokens.sql",
     "021_ai_analysis_jobs.sql",
+    "022_immutable_analysis_results.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 PG17_MIN_VERSION_NUM = 170000
@@ -57,7 +58,7 @@ OWNED_RELATIONS = {
         "strategy_email_report_candidate", "email_digest_subscription",
         "email_delivery_history", "ai_backtest_request",
         "ai_backtest_replacement_approval", "email_delivery_outbox",
-        "ai_account_token", "ai_analysis_job",
+        "ai_account_token", "ai_analysis_job", "analysis_result",
     ),
     "i": (
         "idx_users_email", "idx_users_provider_user_id", "idx_strategy_user_created",
@@ -98,7 +99,10 @@ OWNED_RELATIONS = {
         "idx_email_delivery_outbox_due", "idx_email_delivery_outbox_claim_expiry",
         "idx_email_delivery_outbox_user_created", "idx_email_delivery_outbox_report",
         "idx_ai_account_token_user_created", "idx_ai_account_token_status",
-        "idx_ai_analysis_job_user_updated",
+        "idx_ai_analysis_job_user_updated", "uq_analysis_result_owner_manifest_hash",
+        "idx_analysis_result_owner_created", "idx_ai_analysis_job_analysis_result",
+        "idx_backtest_run_analysis_result", "idx_ai_backtest_report_analysis_result",
+        "idx_strategy_email_report_analysis_result",
     ),
     "v": ("strategy_report_summary_v", "email_digest_history_v"),
 }
@@ -117,6 +121,10 @@ OWNED_COLUMNS = (
     ("users", "action_emails"),
     ("users", "marketing_email"),
     ("users", "delivery_hour"),
+    ("ai_analysis_job", "analysis_result_id"),
+    ("backtest_run", "analysis_result_id"),
+    ("ai_backtest_report", "analysis_result_id"),
+    ("strategy_email_report", "analysis_result_id"),
 )
 OWNED_CONSTRAINTS = (
     "fk_ai_model_call_log_execution",
@@ -131,8 +139,22 @@ OWNED_CONSTRAINTS = (
     "email_delivery_outbox_status_check",
     "email_delivery_outbox_attempt_count_check",
     "email_delivery_outbox_payload_object_check",
+    "fk_analysis_result_user",
+    "ck_analysis_result_schema_v1",
+    "ck_analysis_result_hash_sha256",
+    "ck_analysis_result_manifest_objects",
+    "ck_analysis_result_public_snapshot_object",
+    "uq_analysis_result_owner_manifest_hash",
+    "fk_ai_analysis_job_analysis_result",
+    "fk_backtest_run_analysis_result",
+    "fk_ai_backtest_report_analysis_result",
+    "fk_strategy_email_report_analysis_result",
 )
-OWNED_TRIGGERS = ("trg_email_digest_subscription_limit",)
+OWNED_TRIGGERS = (
+    "trg_email_digest_subscription_limit",
+    "trg_analysis_result_immutable",
+    "trg_analysis_result_no_truncate",
+)
 
 
 

@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.quant_strategy import rsi_trade_rules
 from ai_graph.immutable_snapshot import build_snapshot_bundle
+from ai_graph.source_manifest import build_source_manifest
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -475,6 +476,17 @@ class PostgresPipelineDataSource:
                 *[INDICATOR_TABLES[family] for family in indicator_families],
             ],
         )
+        source_manifest = build_source_manifest(
+            source="postgres",
+            as_of=snapshot_as_of,
+            freshness="unknown",
+            lineage_refs=[
+                KIS_ADJUSTED_OHLCV_TABLE,
+                UNIVERSE_VIEW,
+                *[INDICATOR_TABLES[family] for family in indicator_families],
+            ],
+            source_version="split-pipeline-v1",
+        )
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
@@ -486,6 +498,7 @@ class PostgresPipelineDataSource:
             metadata={
                 "source": "postgres",
                 "immutable_snapshot_bundle": snapshot_bundle.model_dump(mode="json"),
+                "source_manifest": source_manifest.model_dump(mode="json"),
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
@@ -1337,6 +1350,13 @@ def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
                 delisting={"events": [], "policy": "fixture"},
                 indicator_input={"families": [], "query": query},
                 lineage_refs=[reason, query],
+            ).model_dump(mode="json"),
+            "source_manifest": build_source_manifest(
+                source="fixture",
+                as_of=datetime.now(UTC).date(),
+                freshness="unknown",
+                lineage_refs=[reason, query],
+                source_version="local-fixture",
             ).model_dump(mode="json"),
             "reason": reason,
             "dsn_env_candidates": list(DATABASE_DSN_ENV_CANDIDATES),

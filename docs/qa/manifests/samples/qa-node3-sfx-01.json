@@ -1,0 +1,130 @@
+{
+  "document_status": "DRAFT FOR REVIEW",
+  "approval": "PENDING",
+  "wbs_id": "QA-NODE3-SFX-01",
+  "quantqa_version": "QuantQA:v1",
+  "full_git_sha": null,
+  "required_tier": "T4",
+  "required_classes": ["S", "R", "O", "C"],
+  "observed_classes": [],
+  "status": "BLOCKED",
+  "requirement_origin": {
+    "required_classes": "GOOGLE_SHEET_DIRECT",
+    "tier_label": "QUANTQA_V1_IMPLEMENTATION_DEFINITION"
+  },
+  "wbs_contract_ref": {
+    "spreadsheet_id": "1V7SnG_x-cLIFbrSurDIadtx5GCY9HfL9jRqdyAl70Ks",
+    "gid": 2030261433,
+    "sheet": "2_WBS",
+    "wbs_id": "QA-NODE3-SFX-01",
+    "row_number": 55,
+    "observed_at": "2026-08-22T09:38:24.3061987+09:00"
+  },
+  "roles": {
+    "owner": "조은채",
+    "executor": null,
+    "reviewer": null,
+    "approver": "윤민호",
+    "reviewer_approver_same_allowed_v1": true
+  },
+  "execution_boundary": {
+    "scope": "NOT_EXECUTED",
+    "uses_mock": null,
+    "uses_memory": null,
+    "uses_noop": null,
+    "configuration_environment_values_recorded": false,
+    "secret_values_recorded": false,
+    "production_node3_pve_load_performed": false,
+    "effective_classes": []
+  },
+  "evidence": [
+    {
+      "evidence_id": "QA-NODE3-SFX-01-S-PENDING",
+      "evidence_class": "S",
+      "scenario": "Review the impact register and QA gates for API, SSE, cancel, lease, migration, cgroup, PIT, and audit side effects.",
+      "pass_criteria": "All declared impacts have traceable acceptance criteria and no unapproved impact remains.",
+      "actual_result": "Not executed; no artifact is available.",
+      "validation_method": "WBS row sampling and static contract review",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "UNVERIFIED",
+      "limitations": ["No impact-register artifact or same-revision manifest is available."]
+    },
+    {
+      "evidence_id": "QA-NODE3-SFX-01-R-PENDING",
+      "evidence_class": "R",
+      "scenario": "Exercise API/SSE/cancel behavior in an isolated non-mock runtime.",
+      "pass_criteria": "API/SSE/cancel scenarios satisfy the WBS gate without fallback, mock, memory, or noop substitution.",
+      "actual_result": "Not executed; no artifact is available.",
+      "validation_method": "Isolated staging API/worker runtime validation",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "BLOCKED",
+      "limitations": ["This implementation task did not authorize isolated staging execution."]
+    },
+    {
+      "evidence_id": "QA-NODE3-SFX-01-O-PENDING",
+      "evidence_class": "O",
+      "scenario": "Validate DB migration, lease lifecycle, cgroup behavior, PIT, secret handling, and audit behavior in isolated staging.",
+      "pass_criteria": "Migration/lease/cgroup/PIT/secret/audit operational checks pass with no configuration, environment, or secret values recorded.",
+      "actual_result": "Not executed; no artifact is available.",
+      "validation_method": "Isolated staging DB migration/lease and cgroup operational tests",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "BLOCKED",
+      "limitations": ["No isolated staging or operational environment was accessed."]
+    },
+    {
+      "evidence_id": "QA-NODE3-SFX-01-C-PENDING",
+      "evidence_class": "C",
+      "scenario": "Inject faults across two API/worker processes and exercise retry/fencing, migration race, and cgroup blast-radius containment.",
+      "pass_criteria": "Cross-process race and fault scenarios remain fenced and contained, with no unapproved impact.",
+      "actual_result": "Not executed; no artifact is available.",
+      "validation_method": "Isolated staging two-process fault injection",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "BLOCKED",
+      "limitations": ["No cross-process or fault-injection workload was run."]
+    }
+  ],
+  "limitations": [
+    "The Google Sheet directly requires S+R+O+C; the T4 label and class meanings are QuantQA:v1 implementation definitions.",
+    "Production, node3, and PVE were not accessed, and configuration/environment actual values and secrets were not read."
+  ],
+  "blockers": [
+    "An authorized isolated staging environment and executor are required for the R/O/C scenarios.",
+    "A same-revision manifest, artifact URIs, SHA-256 values, and independent reviewer record are absent."
+  ]
+}

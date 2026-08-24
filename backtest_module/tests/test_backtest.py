@@ -20,6 +20,7 @@ from backtest_module.backtest import (
     TalibIndicatorConfig,
     build_sample_spec,
     build_sample_talib_spec,
+    prepare_market_data,
     required_metric_names,
     run_backtest,
     talib_function_catalog,
@@ -773,3 +774,94 @@ def test_cost_half_up_uses_decimal_at_half_boundary():
     buy = next(event for event in result.order_audit if event.side == "buy" and event.status == "executed")
     assert buy.commission_cost_text == "5"
     assert result.summary["commission_cost_exact"] == "5"
+
+
+def slot_contention_bars():
+    """Two names signal BUY on the same session, and only one slot is open."""
+
+    rows = []
+    for ticker in ("000010", "000990"):
+        rows.extend(
+            [
+                OhlcvBar(date=date(2026, 1, 2), ticker=ticker, open=100, high=105, low=95, close=100, volume=1_000),
+                OhlcvBar(date=date(2026, 1, 5), ticker=ticker, open=100, high=105, low=95, close=100, volume=1_000),
+                OhlcvBar(date=date(2026, 1, 6), ticker=ticker, open=100, high=105, low=95, close=100, volume=1_000),
+            ]
+        )
+    return rows
+
+
+def slot_contention_spec() -> StrategySpec:
+    return StrategySpec(
+        strategy_id="slot_contention",
+        strategy_name="Slot Contention",
+        entry_rules=[
+            Condition(left="generated_signal", operator=ConditionOperator.EQ, right=1.0, description="generated BUY")
+        ],
+        exit_rules=[
+            Condition(left="generated_signal", operator=ConditionOperator.EQ, right=-1.0, description="generated SELL")
+        ],
+        position_sizing=PositionSizing(max_positions=1),
+        risk_controls=RiskControls(max_single_position_pct=1.0, stop_loss_pct=0.5, take_profit_pct=None),
+        backtest={
+            "cost_model": CostModel(commission_pct=0, tax_pct=0, slippage_pct=0).model_dump(),
+            "execution_capacity": {"enabled": False},
+        },
+    )
+
+
+def run_slot_contention(scores):
+    spec = slot_contention_spec()
+    rows = slot_contention_bars()
+    config = BacktestRunConfig(
+        initial_capital=1_000_000,
+        write_outputs=False,
+        talib=TalibIndicatorConfig(enabled=False, mode="none"),
+    )
+    prepared = prepare_market_data(spec, ohlcv_rows=rows, config=config)
+    actions = [
+        1 if row.date == date(2026, 1, 2) else 0 for row in prepared.ohlcv_rows
+    ]
+    result = run_backtest(
+        spec,
+        config=config,
+        prepared_market_data=prepared,
+        generated_actions=actions,
+        generated_scores=scores(prepared) if scores is not None else None,
+    )
+    return [
+        event.ticker
+        for event in result.order_audit
+        if event.side == "buy" and event.status == "executed"
+    ]
+
+
+def test_scarce_slot_goes_to_the_strongest_signal_not_the_lowest_ticker():
+    filled = run_slot_contention(
+        lambda prepared: [
+            2.0 if row.ticker == "000990" else 1.0 for row in prepared.ohlcv_rows
+        ]
+    )
+
+    assert filled == ["000990"]
+
+
+def test_scarce_slot_falls_back_to_ticker_order_without_scores():
+    assert run_slot_contention(None) == ["000010"]
+
+
+def test_tied_scores_break_on_ticker_order():
+    filled = run_slot_contention(lambda prepared: [3.0] * len(prepared.ohlcv_rows))
+
+    assert filled == ["000010"]
+
+
+def test_unscored_buy_never_outranks_a_measured_one():
+    filled = run_slot_contention(
+        lambda prepared: [
+            float("nan") if row.ticker == "000010" else -5.0
+            for row in prepared.ohlcv_rows
+        ]
+    )
+
+    assert filled == ["000990"]
