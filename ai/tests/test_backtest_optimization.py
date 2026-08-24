@@ -494,7 +494,7 @@ def test_selection_score_rewards_training_return_when_risk_is_equal() -> None:
     ) > backtest_node._objective_score(lower_return, summary, rows)
 
 
-def test_temporary_relaxed_objective_floor_boundaries() -> None:
+def test_temporary_relaxed_objective_floor_boundaries(enforced_objective_floor: None) -> None:
     metrics = BacktestMetrics(
         sharpe_ratio=0.0,
         max_drawdown=-0.50,
@@ -533,7 +533,9 @@ def test_fixed_period_benchmark_rule_allows_large_regime_wins() -> None:
     assert stats.loss_rate == 0.25
 
 
-def test_automatic_benchmark_gate_treats_exactly_half_losing_periods_as_defeat() -> None:
+def test_automatic_benchmark_gate_treats_exactly_half_losing_periods_as_defeat(
+    enforced_objective_floor: None,
+) -> None:
     metrics = BacktestMetrics(
         sharpe_ratio=0.9,
         max_drawdown=-0.25,

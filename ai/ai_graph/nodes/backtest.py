@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import pickle
@@ -44,6 +45,9 @@ from ai_graph.schemas import (
 )
 from ai_graph.schemas import StrategySpec as AIStrategySpec
 from ai_graph.security.ast_validator import validate_backtest_code
+from ai_graph.validation_gates import objective_floor_is_enforced, validation_gate_mode
+
+_logger = logging.getLogger(__name__)
 
 BACKTEST_MODULE_SOURCE_ROOT = Path(__file__).resolve().parents[3] / "backtest_module"
 DEFAULT_FIXTURE_TICKER = "005930"
@@ -2210,9 +2214,17 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         )
     # The recommendation gate downstream needs to know whether this strategy's backtest
     # actually cleared the objective floor, not just what its metrics were.
+    floor_reasons = objective_floor_reasons(result)
     return {
         "backtest": result.model_dump(),
         "strategy_validated": _passes_objective_floor(result),
+        # Published whether or not the floor is enforcing, so the reader can see what the
+        # acceptance check actually concluded rather than only its effect.
+        "objective_floor": {
+            "mode": validation_gate_mode(),
+            "cleared": not floor_reasons,
+            "reasons": floor_reasons,
+        },
     }
 
 
@@ -3441,33 +3453,78 @@ def _selection_signal_action_count(
     )
 
 
-def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
+def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
+    """Every acceptance-floor check this result did not clear.
+
+    Evaluated whatever the gate mode is. A check that only runs when it blocks is a check
+    nobody can audit while it is switched off, and the verdict is published either way.
+    """
+
     metrics = _candidate_metrics(result.selected_candidate)
     trade_count = _summary_float_default(result.engine_summary, "effective_trade_count", 0.0)
-    passes_basic_floor = (
-        trade_count >= MIN_OBJECTIVE_TRADES
-        # This gate is a report/acceptance check, so it uses the untouched hold-out.
-        and metrics.out_sample_sharpe is not None
-        and metrics.out_sample_sharpe >= MIN_OBJECTIVE_SHARPE
-        and metrics.max_drawdown >= MAX_OBJECTIVE_DRAWDOWN
-        # A winner picked from N tries has to beat what N tries of nothing would have
-        # produced. Without this the gate passes on search width alone: six candidates
-        # trading at random cleared a +16.2% best-of-six against a -3.7% average.
-        # `candidates_evaluated` is 1 until the correction is applied, which leaves this
-        # term at in_sample_sharpe and changes no single-candidate behaviour.
-        and metrics.selection_adjusted_sharpe >= MIN_SELECTION_ADJUSTED_SHARPE
-    )
-    if not passes_basic_floor:
-        return False
+    reasons: list[str] = []
+    if trade_count < MIN_OBJECTIVE_TRADES:
+        reasons.append(
+            f"거래 수 {trade_count:g}건이 최소 {MIN_OBJECTIVE_TRADES}건에 미달합니다"
+        )
+    # This gate is a report/acceptance check, so it uses the untouched hold-out.
+    if metrics.out_sample_sharpe is None:
+        reasons.append("미사용 구간 Sharpe 를 계산하지 못했습니다")
+    elif metrics.out_sample_sharpe < MIN_OBJECTIVE_SHARPE:
+        reasons.append(
+            f"미사용 구간 Sharpe {metrics.out_sample_sharpe:.2f} 가 "
+            f"기준 {MIN_OBJECTIVE_SHARPE:g} 에 미달합니다"
+        )
+    if metrics.max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
+        reasons.append(
+            f"최대 낙폭 {metrics.max_drawdown:.1%} 가 한도 {MAX_OBJECTIVE_DRAWDOWN:.0%} 를 넘습니다"
+        )
+    # A winner picked from N tries has to beat what N tries of nothing would have
+    # produced. Without this the floor passes on search width alone: six candidates
+    # trading at random cleared a +16.2% best-of-six against a -3.7% average.
+    # `candidates_evaluated` is 1 until the correction is applied, which leaves this
+    # term at in_sample_sharpe and changes no single-candidate behaviour.
+    if metrics.selection_adjusted_sharpe is None:
+        reasons.append("탐색 폭 보정 Sharpe 를 계산하지 못했습니다")
+    elif metrics.selection_adjusted_sharpe < MIN_SELECTION_ADJUSTED_SHARPE:
+        reasons.append(
+            f"탐색 폭 보정 Sharpe {metrics.selection_adjusted_sharpe:.2f} 가 "
+            f"기준 {MIN_SELECTION_ADJUSTED_SHARPE:g} 에 미달합니다"
+        )
+
     strategy = getattr(result, "strategy_a", None)
     if getattr(strategy, "selection_mode", "standard") != "automatic":
-        return True
+        return reasons
     payload = getattr(result, "backtest_payload", {}) or {}
     benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
     primary = benchmark.get("primary") if isinstance(benchmark, Mapping) else None
     if not isinstance(primary, Mapping) or not primary.get("available"):
+        reasons.append("공식 KOSPI/KOSDAQ TR 벤치마크를 확보하지 못했습니다")
+        return reasons
+    reasons.extend(
+        _benchmark_objective_reasons(metrics, benchmark_return=primary.get("return"))
+    )
+    return reasons
+
+
+def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
+    """Whether the floor lets this strategy through, given the current gate mode.
+
+    In report-only mode the reasons are computed, logged, and published, but they do not
+    withhold validation. See `ai_graph.validation_gates` for why the switch exists and
+    what it deliberately does not cover.
+    """
+
+    reasons = objective_floor_reasons(result)
+    if not reasons:
+        return True
+    if objective_floor_is_enforced():
         return False
-    return not _benchmark_objective_reasons(metrics, benchmark_return=primary.get("return"))
+    _logger.info(
+        "acceptance floor not enforced; publishing as validated despite: %s",
+        "; ".join(reasons),
+    )
+    return True
 
 
 
