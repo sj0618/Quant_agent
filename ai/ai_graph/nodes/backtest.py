@@ -3025,6 +3025,15 @@ def _walk_forward_metadata(
             "unique_evaluation_months": WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS,
         },
         "status": sample.status,
+        # QV-OOS-01 asks for the seed behind candidate selection. There is none to
+        # report: no path in `ai_graph` or `backtest_module` draws from an RNG, so a
+        # run is reproducible from its inputs alone and `slot_priority` - score first,
+        # ticker only as a tie-break - fixes the order whenever scores collide.
+        # Emitting a number here would name a knob that does not exist, which is worse
+        # than saying so; a reader checking reproducibility needs the basis, not a digit.
+        "selection_seed": None,
+        "selection_determinism": "deterministic_no_rng",
+        "selection_tie_break": "slot_priority:(-score, ticker)",
         "aggregate_oos_available": sample.status == READY_WALK_FORWARD,
         "benchmark_comparison_available": False,
         "selection_scope": "train_validation_only",

@@ -857,6 +857,82 @@ def test_missing_strategy_sizing_is_fail_closed_not_default_ten() -> None:
         backtest_node._requested_max_positions(strategy)
 
 
+def test_out_of_sample_artifact_discloses_period_seed_candidates_and_result() -> None:
+    """QV-OOS-01: all four disclosures a reader needs travel with the OOS artifact.
+
+    Period, seed, candidate count and the out-of-sample result. Asserting them together
+    is the point - three out of four leaves the reader unable to reproduce the run and
+    unaware of which piece is missing.
+    """
+
+    rows = _monthly_sessions(40, sessions_per_month=20)
+    policy = backtest_node._walk_forward_split_policy(rows)
+    metadata = backtest_node._walk_forward_metadata(
+        backtest_node._walk_forward_sample(rows), policy
+    )
+
+    # Period: which sessions were evaluated, and which were held back entirely.
+    assert metadata["session_count"] > 0
+    assert metadata["fold_evaluation_months"]
+    assert metadata["final_lockbox_sessions"]
+    assert metadata["selection_scope"] == "train_validation_only"
+    assert metadata["final_lockbox_excluded_from_selection"] is True
+
+    # Seed: stated as absent with the basis that replaces it, not as a fabricated number.
+    assert metadata["selection_seed"] is None
+    assert metadata["selection_determinism"] == "deterministic_no_rng"
+    assert metadata["selection_tie_break"] == "slot_priority:(-score, ticker)"
+
+    # Out-of-sample result: available only when the sample clears the stated minimums.
+    assert metadata["status"] == backtest_node.READY_WALK_FORWARD
+    assert metadata["aggregate_oos_available"] is True
+
+    # Candidate count: how wide the search behind the headline was.
+    headline = backtest_node._headline_metrics({"candidates_evaluated": 7})
+    assert headline["candidates_evaluated"] == 7
+    assert headline["basis"] == "hold_out"
+
+
+def test_no_rng_backs_the_deterministic_selection_claim() -> None:
+    """The `deterministic_no_rng` disclosure has to stay true, not just stay written.
+
+    If a future change draws from an RNG without seeding and disclosing it, the artifact
+    would keep claiming reproducibility it no longer has. This is the check that breaks
+    first.
+    """
+
+    import ast
+    from pathlib import Path
+
+    # Scoped to the code that picks and scores candidates. `ai_graph/api.py` imports
+    # `secrets` for token generation, which has nothing to do with selection.
+    banned = {"random", "numpy.random", "secrets"}
+    offenders: list[str] = []
+    roots = [
+        Path(backtest_node.__file__).parent,  # ai/ai_graph/nodes
+        Path(__file__).resolve().parents[2] / "backtest_module",
+    ]
+    for root in roots:
+        for source in root.rglob("*.py"):
+            if "test" in source.parts or source.name.startswith("test_"):
+                continue
+            tree = ast.parse(source.read_text(), filename=str(source))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    names = [node.module or ""]
+                else:
+                    continue
+                if any(name in banned or name.startswith("random.") for name in names):
+                    offenders.append(f"{source}:{node.lineno}")
+
+    assert offenders == [], (
+        "selection_determinism claims deterministic_no_rng, but these modules import an "
+        f"RNG: {offenders}. Either remove the draw or disclose a real seed."
+    )
+
+
 def test_short_history_hides_aggregate_oos_and_benchmark_claims() -> None:
     metadata = backtest_node._walk_forward_metadata(backtest_node._walk_forward_sample(_rows(days=79)))
 
