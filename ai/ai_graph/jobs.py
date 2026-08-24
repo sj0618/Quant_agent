@@ -1123,19 +1123,43 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
     # 않은 오류" with no indication that the screen simply matched nothing, and the run
     # looked indistinguishable from one that had hung.
     if isinstance(exc, PipelineDataUnavailableError):
-        no_matches = exc.reason == "no_screening_matches"
+        # `reason` is a source-layer string, while `FailureDiagnostic.subcause` is a
+        # deliberately closed public contract. Never copy it through blindly: a new
+        # source reason would otherwise turn an expected unavailable-data response
+        # into a Pydantic validation error. Known reasons get their precise public
+        # diagnosis; everything else stays fail-closed as the existing data-required
+        # outcome without exposing the source exception text.
+        if exc.reason == "fixture_mode_forbidden_in_release":
+            return FailureDiagnostic(
+                category="infrastructure_failure",
+                subcause="fixture_mode_forbidden_in_release",
+                failure_stage=Stage.INTERPRETING.value,
+                owner="data_source_config",
+                retryable=False,
+                safe_message=(
+                    "운영 분석에는 검증 가능한 데이터 소스가 필요합니다. "
+                    "데이터 소스가 준비된 뒤 다시 시도해 주세요."
+                ),
+                evidence_refs=["failure:fixture_mode_forbidden_in_release"],
+            )
+
+        if exc.reason == "no_screening_matches":
+            subcause = "no_screening_matches"
+            safe_message = "조건에 맞는 종목을 찾지 못했습니다. 조건을 완화해 다시 시도해 주세요."
+        elif exc.reason == "no_price_rows":
+            subcause = "no_price_rows"
+            safe_message = "선정된 종목의 가격 데이터가 적재되어 있지 않아 백테스트를 진행할 수 없습니다."
+        else:
+            subcause = "data_required"
+            safe_message = "분석에 필요한 시장 데이터가 준비되지 않아 결과를 만들 수 없습니다."
         return FailureDiagnostic(
             category="data_gap",
-            subcause=exc.reason,
+            subcause=subcause,
             failure_stage=Stage.INTERPRETING.value,
             owner="data_source_config",
             retryable=False,
-            safe_message=(
-                "조건에 맞는 종목을 찾지 못했습니다. 조건을 완화해 다시 시도해 주세요."
-                if no_matches
-                else "선정된 종목의 가격 데이터가 적재되어 있지 않아 백테스트를 진행할 수 없습니다."
-            ),
-            evidence_refs=[f"failure:{exc.reason}"],
+            safe_message=safe_message,
+            evidence_refs=[f"failure:{subcause}"],
         )
     if any(_is_postgres_connection_failure(error) for error in exception_chain):
         return FailureDiagnostic(

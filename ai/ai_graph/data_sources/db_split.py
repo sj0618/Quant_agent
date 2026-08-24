@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ai_graph.quant_strategy import rsi_trade_rules
 from ai_graph.source_manifest import build_pipeline_extract_snapshot, build_source_manifest
 
-from .db import is_release_profile
+from .db import FixtureModeForbiddenError, PipelineDataUnavailableError, is_release_profile
 from .sectors import extract_sector_from_query, get_known_sectors
 
 _logger = logging.getLogger(__name__)
@@ -186,41 +186,11 @@ class DataSourceConfig(BaseModel):
         )
 
 
-class PipelineDataUnavailableError(ValueError):
-    """The warehouse is healthy but has nothing to run this strategy on.
-
-    Subclasses ValueError because that is what these two conditions were raised as
-    before, so anything already catching them keeps working - the point of the class is
-    the `reason` code, not a new place in the hierarchy.
-
-    Distinct from an infrastructure error on purpose. Both used to be raised as bare
-    ValueErrors, so `classify_failure` sorted "no stock matches your condition today"
-    into `unknown_failure` - a message that tells the user nothing and reads as a
-    crash, which is what left runs looking like they had stalled until the client's
-    wall-clock timeout gave up on them. Carrying the reason as a code lets the job
-    layer turn it into an answer ("조건에 맞는 종목이 없습니다") instead.
-    """
-
-    def __init__(self, reason: str, message: str) -> None:
-        super().__init__(message)
-        self.reason = reason
-
-
-class FixtureModeForbiddenError(PipelineDataUnavailableError):
-    """FT-FIX-08 for the split variant. See `db.FixtureModeForbiddenError`.
-
-    Subclasses this module's own error class, not `db`'s: the two are distinct class
-    objects and this variant's callers check against the local one.
-    """
-
-    def __init__(self, detail: str) -> None:
-        super().__init__(
-            "fixture_mode_forbidden_in_release",
-            "운영 환경에서는 로컬 fixture 데이터로 분석할 수 없습니다. "
-            f"데이터 소스를 설정한 뒤 다시 시도해 주세요. ({detail})",
-        )
-
-
+# `PipelineDataUnavailableError` and `FixtureModeForbiddenError` are imported from
+# `.db` rather than declared here. This module used to carry its own copies, and a copy
+# of an exception class is a different class object: `jobs.classify_failure` narrows on
+# the `db` one, so anything this variant raised fell past that check and was reported as
+# an unknown crash instead of the answer its `reason` code already carried.
 class PipelineDataBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

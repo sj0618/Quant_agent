@@ -61,6 +61,10 @@ FailureSubcause = Literal[
     "parser_low_confidence",
     "source_conflict",
     "data_required",
+    # A release deployment must never substitute local fixture rows for an absent
+    # operational data source. This is a stable configuration-safety diagnosis, not
+    # an arbitrary exception string carried into the public contract.
+    "fixture_mode_forbidden_in_release",
     # The screen ran and matched nothing, or the matched names have no price history.
     # Separate from the generic gaps above so the user is told the condition was too
     # tight rather than that something broke.

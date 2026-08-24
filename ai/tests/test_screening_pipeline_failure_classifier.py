@@ -53,6 +53,23 @@ def test_missing_price_history_is_reported_separately_from_an_empty_screen() -> 
     assert "005930" not in diagnostic.safe_message
 
 
+def test_split_release_fixture_guard_is_a_safe_classified_failure() -> None:
+    """A split-source release guard must not degrade into a schema-validation 500."""
+
+    from ai_graph.data_sources import db_split
+
+    diagnostic = classify_failure(
+        db_split.FixtureModeForbiddenError("must-not-leak"),
+        stage="data_loading",
+    )
+
+    assert diagnostic.category == "infrastructure_failure"
+    assert diagnostic.subcause == "fixture_mode_forbidden_in_release"
+    assert diagnostic.owner == "data_source_config"
+    assert diagnostic.retryable is False
+    assert "must-not-leak" not in diagnostic.safe_message
+
+
 def test_run_job_sync_reports_an_empty_screen_as_a_finished_failed_job() -> None:
     """The job must reach a terminal state, not stay RUNNING.
 
