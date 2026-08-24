@@ -26,6 +26,6 @@ test("archived reports declare stale-state limits before rendering allow-listed 
   assert.match(detail, /보관 기준일/);
   assert.match(detail, /보관 리포트 목록으로 돌아가기/);
   assert.match(detail, /PublicClaimDisclosure claimKey="archivedSnapshot"/);
-  assert.match(detail, /READER_EVIDENCE_SECTION_IDS/);
+  assert.match(detail, /READER_EVIDENCE_SECTION_TITLES/);
   assert.doesNotMatch(detail, /report\.performance|recommendationScore|report\.signals|report\.candidates/);
 });

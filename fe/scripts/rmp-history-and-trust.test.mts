@@ -13,7 +13,7 @@ test("immutable archive list, detail, and export keep unsafe report fields out o
   ]);
 
   assert.match(list, /읽기 전용 결과 스냅샷/);
-  assert.match(detail, /READER_EVIDENCE_SECTION_IDS/);
+  assert.match(detail, /READER_EVIDENCE_SECTION_TITLES/);
   assert.match(actions, /\["result_id", "archived_date", "created_at", "status"\]/);
   assert.doesNotMatch(`${list}\n${detail}\n${actions}\n${client}`, /raw prompt|내부 추론|debug_ref|trace_id/i);
   assert.doesNotMatch(`${list}\n${detail}\n${actions}\n${client}`, /report\.candidates|report\.signals|recommendationScore|report\.performance/);
