@@ -110,14 +110,26 @@ def _performance_method_manifest(
         return None
 
 
+# The minimum-input rule applied above, restated as data. A consumer that has to
+# explain *why* a report is short must not re-derive these numbers from its own copy
+# of the thresholds, or the explanation drifts from the rule that was enforced.
+MINIMUM_DATA_RULE: dict[str, str | int | bool | None] = {
+    "minimum_trading_days": _RELIABILITY_SHORT_TERM_DAYS,
+    "minimum_tickers": MIN_RELIABLE_TICKERS,
+    "sufficient_trading_days": _RELIABILITY_MIN_DAYS,
+    "minimum_trades": MIN_OBJECTIVE_TRADES,
+}
+
+
 def _safe_performance_facts(
     reliability: BacktestReliability | None,
     pipeline_data_source: Mapping[str, Any] | None,
 ) -> dict[str, str | int | bool | None]:
     source = _pipeline_source(pipeline_data_source)
     if reliability is None:
-        return {"source": source}
+        return {"source": source, **MINIMUM_DATA_RULE}
     return {
+        **MINIMUM_DATA_RULE,
         "source": reliability.source,
         "reliability": reliability.status,
         "row_count": reliability.row_count,
