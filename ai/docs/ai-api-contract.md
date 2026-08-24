@@ -62,6 +62,21 @@ configured endpoint is the Azure preview REST path:
 moves to an `/openai/v1/responses`-compatible surface, this client can be
 replaced by an SDK-backed implementation behind the same `LLMClient` interface.
 
+## Canonical backtest surface
+
+백테스트를 요청하는 공개 경로는 **`POST /analysis-jobs` 하나**다. FE 가 부르는 것도
+이것이고(`fe/src/config/appConfig.ts`), 결과는 같은 잡을 폴링해 받는다.
+
+한때 backend 에 `POST /ai/backtests/generate-and-run` 이 같이 등록돼 있었다. 같은
+능력에 대한 두 번째 공개 표면이었고, 인증 모델(세션 + HMAC 스코프)과 영속화와 실행
+모델이 이쪽과 달랐는데 어느 쪽이 canonical 인지는 코드 어디에도 없었다. 저장소 안에
+호출부가 없었으므로 그 라우터는 제거했다.
+
+**서비스 계층은 남아 있다.** `backend/app/services/ai_backtest_*` 가 격리 subprocess
+실행기(임시 디렉터리 · 프로세스 그룹 · rlimit · timeout)를 소유한다. AI 그래프가 생성
+코드를 in-process `exec` 로 돌리는 대신 호출해야 하는 것이 그 실행기이고, 그 전환은
+아직 되지 않았다 - 지금은 `ai/ai_graph/nodes/backtest.py` 가 `exec` 를 쓴다.
+
 ## Analysis Job
 
 `POST /analysis-jobs`

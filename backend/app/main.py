@@ -10,7 +10,6 @@ from fastapi.staticfiles import StaticFiles
 from app.api.contract_policy import apply_contract_openapi_metadata
 from app.api.routes import (
     ai_account_tokens,
-    ai_backtest,
     auth,
     fe_contract,
     health,
@@ -139,7 +138,12 @@ def create_app() -> FastAPI:
     # Preserve direct legacy paths without duplicating them in OpenAPI.
     app.include_router(auth.router, include_in_schema=False)
 
-    app.include_router(ai_backtest.router)
+    # `/ai/backtests/generate-and-run` was a second public surface for the same
+    # capability the AI graph already serves at `/analysis-jobs`, with a different auth
+    # model and a different execution model, and nothing said which was canonical. The
+    # graph's path is the one the product uses, so this one is gone. Its service layer
+    # stays: `app.services.ai_backtest_*` owns the fenced subprocess executor, which is
+    # what the graph is meant to call instead of running generated code in-process.
     app.include_router(ai_account_tokens.router)
     app.include_router(reports_pdf_temp.router)
     app.include_router(fe_contract.router)
