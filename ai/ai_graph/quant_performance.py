@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from ai_graph.freshness import build_freshness_evidence
 from ai_graph.nodes.backtest import (
     BENCHMARK_LABEL,
     BENCHMARK_METHOD,
@@ -33,6 +34,7 @@ from ai_graph.schemas import (
     BacktestPerformance,
     BacktestReliability,
     CandidateBacktestResult,
+    FreshnessEvidence,
     PublicMetricDetail,
 )
 
@@ -67,10 +69,22 @@ def project_public_performance(
         return None
 
     reliability = internal.reliability
-    safe_facts = _safe_performance_facts(reliability, pipeline_data_source)
+    freshness = build_freshness_evidence(pipeline_data_source)
+    safe_facts = _safe_performance_facts(
+        reliability,
+        pipeline_data_source,
+        freshness_status=freshness.status,
+        freshness_as_of=freshness.as_of.isoformat() if freshness.as_of is not None else None,
+        freshness_reason=freshness.reason,
+    )
     if reliability is None or reliability.status == "insufficient":
         return PerformanceUnavailable(
             reason_code="insufficient_reliability",
+            safe_facts=safe_facts,
+        )
+    if freshness.status == "stale":
+        return PerformanceUnavailable(
+            reason_code="stale_source",
             safe_facts=safe_facts,
         )
 
@@ -124,21 +138,38 @@ MINIMUM_DATA_RULE: dict[str, str | int | bool | None] = {
 def _safe_performance_facts(
     reliability: BacktestReliability | None,
     pipeline_data_source: Mapping[str, Any] | None,
+    *,
+    freshness_status: str,
+    freshness_as_of: str | None,
+    freshness_reason: str,
 ) -> dict[str, str | int | bool | None]:
     source = _pipeline_source(pipeline_data_source)
     if reliability is None:
-        return {"source": source, **MINIMUM_DATA_RULE}
-    return {
-        **MINIMUM_DATA_RULE,
-        "source": reliability.source,
-        "reliability": reliability.status,
-        "row_count": reliability.row_count,
-        "ticker_count": reliability.ticker_count,
-        "trading_days": reliability.trading_days,
-        "trade_count": reliability.trade_count,
-        "history_start": reliability.history_start,
-        "history_end": reliability.history_end,
-    }
+        facts: dict[str, str | int | bool | None] = {
+            "source": source,
+            **MINIMUM_DATA_RULE,
+        }
+    else:
+        facts = {
+            **MINIMUM_DATA_RULE,
+            "source": reliability.source,
+            "reliability": reliability.status,
+            "row_count": reliability.row_count,
+            "ticker_count": reliability.ticker_count,
+            "trading_days": reliability.trading_days,
+            "trade_count": reliability.trade_count,
+            "history_start": reliability.history_start,
+            "history_end": reliability.history_end,
+        }
+    if freshness_status == "stale":
+        facts.update(
+            {
+                "freshness_status": freshness_status,
+                "freshness_as_of": freshness_as_of,
+                "freshness_reason": freshness_reason,
+            }
+        )
+    return facts
 
 
 def build_public_backtest_performance(
@@ -246,22 +277,58 @@ def sanitize_public_backtest_performance(
     )
 
 
-def sanitize_public_performance(performance: PublicPerformance | None) -> PublicPerformance | None:
-    """Fail closed when a legacy public envelope claims availability without reliability.
+def sanitize_public_performance(
+    performance: PublicPerformance | None,
+    *,
+    freshness_evidence: FreshnessEvidence | None = None,
+    freshness_status: str | None = None,
+) -> PublicPerformance | None:
+    """Fail closed when a legacy public envelope claims availability without valid data.
 
     New envelopes are built through :func:`project_public_performance`, but a stored
     payload from before that boundary can still carry an available variant whose nested
-    performance document says the warm-up/history was insufficient.  Readers must
-    downgrade that object before it reaches any API response.
+    performance document says the warm-up/history was insufficient, or whose envelope
+    records a stale source. Readers must downgrade that object before it reaches any API
+    response.
     """
 
+    if performance is None:
+        if freshness_evidence is not None and freshness_evidence.status == "stale":
+            return _stale_public_performance(
+                freshness_evidence=freshness_evidence,
+            )
+        if freshness_status == "stale":
+            return _stale_public_performance(freshness_status=freshness_status)
+        return None
     if not isinstance(performance, PerformanceAvailable):
         return performance
     payload = performance.performance
     reliability = payload.get("reliability") if isinstance(payload, Mapping) else None
+    if freshness_evidence is not None and freshness_evidence.status == "stale":
+        return _stale_public_performance(
+            reliability=reliability,
+            freshness_evidence=freshness_evidence,
+        )
+    if freshness_status == "stale":
+        return _stale_public_performance(
+            reliability=reliability,
+            freshness_status=freshness_status,
+        )
+    safe_facts = _legacy_performance_safe_facts(reliability)
     if not isinstance(reliability, Mapping) or reliability.get("status") != "insufficient":
         return performance
-    safe_facts = {
+    return PerformanceUnavailable(
+        reason_code="insufficient_reliability",
+        safe_facts=safe_facts,
+    )
+
+
+def _legacy_performance_safe_facts(
+    reliability: Mapping[str, Any] | None,
+) -> dict[str, str | int | bool | None]:
+    if not isinstance(reliability, Mapping):
+        return {}
+    return {
         key: reliability.get(key)
         for key in (
             "source",
@@ -274,8 +341,32 @@ def sanitize_public_performance(performance: PublicPerformance | None) -> Public
         )
         if isinstance(reliability.get(key), (str, int, bool)) or reliability.get(key) is None
     }
+
+
+def _stale_public_performance(
+    *,
+    reliability: Mapping[str, Any] | None = None,
+    freshness_evidence: FreshnessEvidence | None = None,
+    freshness_status: str | None = None,
+) -> PerformanceUnavailable:
+    safe_facts = _legacy_performance_safe_facts(reliability)
+    if freshness_evidence is not None:
+        safe_facts.update(
+            {
+                "source": freshness_evidence.source,
+                "freshness_status": freshness_evidence.status,
+                "freshness_as_of": (
+                    freshness_evidence.as_of.isoformat()
+                    if freshness_evidence.as_of is not None
+                    else None
+                ),
+                "freshness_reason": freshness_evidence.reason,
+            }
+        )
+    elif freshness_status == "stale":
+        safe_facts["freshness_status"] = freshness_status
     return PerformanceUnavailable(
-        reason_code="insufficient_reliability",
+        reason_code="stale_source",
         safe_facts=safe_facts,
     )
 

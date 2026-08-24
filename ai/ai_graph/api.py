@@ -94,6 +94,7 @@ from ai_graph.schemas import (
     SCHEMA_VERSION,
     APIEnvelope,
     EnvelopeStatus,
+    ReportBundle,
     UserPayload,
 )
 from ai_graph.scope_review import review_research_scope
@@ -1345,13 +1346,59 @@ def _public_envelope(envelope: APIEnvelope | None) -> APIEnvelope | None:
     if envelope is None:
         return None
     performance = envelope.user_payload.performance
-    public_performance = sanitize_public_performance(performance)
-    if public_performance is performance:
+    public_performance = sanitize_public_performance(
+        performance,
+        freshness_evidence=envelope.freshness_evidence,
+        freshness_status=envelope.freshness_status,
+    )
+    public_report = _public_report_performance(
+        envelope.user_payload.report,
+        performance=public_performance,
+    )
+    if public_performance is performance and public_report is envelope.user_payload.report:
         return envelope
     payload = envelope.user_payload.model_copy(
-        update={"performance": public_performance}
+        update={"performance": public_performance, "report": public_report}
     )
     return envelope.model_copy(update={"user_payload": payload})
+
+
+def _public_report_performance(
+    report: ReportBundle | None,
+    *,
+    performance: BaseModel | None,
+) -> ReportBundle | None:
+    """Keep legacy report sections aligned with the response-safe performance variant."""
+
+    if report is None or performance is None:
+        return report
+    safe_items = performance.model_dump(mode="json")
+
+    def sanitize_sections(sections: list[dict[str, object]]) -> list[dict[str, object]]:
+        return [
+            {**section, "items": safe_items}
+            if section.get("id") == "performance"
+            else section
+            for section in sections
+        ]
+
+    web_sections = sanitize_sections(report.web_projection.sections)
+    email_sections = sanitize_sections(report.email_projection.sections)
+    if (
+        web_sections == report.web_projection.sections
+        and email_sections == report.email_projection.sections
+    ):
+        return report
+    return report.model_copy(
+        update={
+            "web_projection": report.web_projection.model_copy(
+                update={"sections": web_sections}
+            ),
+            "email_projection": report.email_projection.model_copy(
+                update={"sections": email_sections}
+            ),
+        }
+    )
 
 
 def _public_job(job: AnalysisJob) -> AnalysisJob:
