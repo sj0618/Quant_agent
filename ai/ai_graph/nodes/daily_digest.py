@@ -15,10 +15,14 @@ from ai_graph.schemas import (
     MarketBrief,
 )
 
-
 MAX_DIGEST_STRATEGIES = 3
 
-_STATUS_BY_SIGNAL: dict[str, str] = {"BUY": "주목", "HOLD": "유지", "DROP": "관망"}
+_STATUS_BY_SIGNAL: dict[str, str] = {
+    "BUY": "주목",
+    "HOLD": "유지",
+    "DROP": "관망",
+    "NO_RECOMMENDATION": "근거 부족",
+}
 
 
 def build_daily_digest(
@@ -84,6 +88,9 @@ def build_overall_summary(
     buy_count = sum(1 for row in comparison_rows if row.today_signal == "BUY")
     hold_count = sum(1 for row in comparison_rows if row.today_signal == "HOLD")
     drop_count = sum(1 for row in comparison_rows if row.today_signal == "DROP")
+    unavailable_count = sum(
+        1 for row in comparison_rows if row.today_signal == "NO_RECOMMENDATION"
+    )
     avg_return = sum(row.total_return for row in comparison_rows) / total
     avg_mdd = sum(row.max_drawdown for row in comparison_rows) / total
 
@@ -92,6 +99,8 @@ def build_overall_summary(
         summary.append(f"{hold_count}개 전략은 HOLD 상태입니다.")
     if drop_count:
         summary.append(f"{drop_count}개 전략은 DROP(비중 축소) 상태입니다.")
+    if unavailable_count:
+        summary.append(f"{unavailable_count}개 전략은 L4 근거 부족으로 추천을 생성하지 않았습니다.")
     summary.append(f"최근 백테스트 기준 평균 수익률은 {avg_return * 100:.1f}%, 평균 MDD는 {avg_mdd * 100:.1f}%입니다.")
     if avg_mdd <= -0.10:
         summary.append("변동성이 확대된 전략은 리스크 관리가 필요합니다.")
@@ -103,6 +112,19 @@ def build_strategy_cards(strategies: list[DailyDigestStrategyInput]) -> list[Dai
 
 
 def _build_strategy_card(strategy: DailyDigestStrategyInput) -> DailyDigestStrategyCard:
+    if strategy.today_signal == "NO_RECOMMENDATION":
+        return DailyDigestStrategyCard(
+            strategy_id=strategy.strategy_id,
+            title=strategy.name,
+            today_signal=strategy.today_signal,
+            targets=strategy.targets,
+            metrics=strategy.metrics,
+            win_rate=strategy.win_rate,
+            trade_count=strategy.trade_count,
+            ai_interpretation=_fallback_strategy_summary(strategy),
+            caution=_fallback_strategy_concerns(strategy)[0],
+        )
+
     context = {
         "strategy_name": strategy.name,
         "timeframe": strategy.timeframe,
@@ -122,19 +144,18 @@ def _build_strategy_card(strategy: DailyDigestStrategyInput) -> DailyDigestStrat
             "the strategy's indicator looks at, (2) says why today's signal came out, and "
             "(3) states what the reader should actually do. As the first 'concerns' item, write "
             "the risk and the concrete precaution to take, also in plain Korean. "
+            "When today_signal is NO_RECOMMENDATION, state that supporting L4 evidence is absent "
+            "and do not imply BUY, SELL, HOLD, or another trading instruction. "
             "Wrap the few most important phrases in **double asterisks** for bold emphasis; "
             "use no other markup."
         ),
         context=context,
         fallback=RoleDebatePayload(
             role="DIGEST_STRATEGY_CARD",
-            summary=(
-                f"{strategy.name} 전략은 오늘 **{strategy.today_signal}** 신호를 유지하고 있습니다. "
-                f"최근 승률 {strategy.win_rate * 100:.1f}%, 거래 {strategy.trade_count}건을 기준으로 판단했습니다."
-            ),
-            concerns=["**손절 기준을 미리 정해두고**, 거래량이 함께 늘고 있는지 확인하세요."],
+            summary=_fallback_strategy_summary(strategy),
+            concerns=_fallback_strategy_concerns(strategy),
             recommendation=strategy.today_signal,
-            confidence=0.5,
+            confidence=0.0 if strategy.today_signal == "NO_RECOMMENDATION" else 0.5,
         ),
     )
     caution = payload.concerns[0] if payload.concerns else "손절 기준을 명확히 설정하고 거래량 변화를 함께 확인하세요."
@@ -149,3 +170,18 @@ def _build_strategy_card(strategy: DailyDigestStrategyInput) -> DailyDigestStrat
         ai_interpretation=payload.summary,
         caution=caution,
     )
+
+
+def _fallback_strategy_summary(strategy: DailyDigestStrategyInput) -> str:
+    if strategy.today_signal == "NO_RECOMMENDATION":
+        return f"{strategy.name} 전략은 L4 근거가 없어 오늘 추천을 생성하지 않았습니다."
+    return (
+        f"{strategy.name} 전략은 오늘 **{strategy.today_signal}** 신호를 유지하고 있습니다. "
+        f"최근 승률 {strategy.win_rate * 100:.1f}%, 거래 {strategy.trade_count}건을 기준으로 판단했습니다."
+    )
+
+
+def _fallback_strategy_concerns(strategy: DailyDigestStrategyInput) -> list[str]:
+    if strategy.today_signal == "NO_RECOMMENDATION":
+        return ["**L4 근거가 확인될 때까지** 매매 지시로 해석하지 마세요."]
+    return ["**손절 기준을 미리 정해두고**, 거래량이 함께 늘고 있는지 확인하세요."]

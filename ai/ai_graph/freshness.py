@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import date
 from typing import Any
 
@@ -47,8 +47,10 @@ def classify_source_freshness(
         )
     return (
         "stale",
-        f"가격 데이터가 {data_as_of.isoformat()}까지만 적재돼 직전 개장일"
-        f"({settled_session.isoformat()})에 {(settled_session - data_as_of).days}일 뒤처져 있습니다.",
+        (
+            f"가격 데이터가 {data_as_of.isoformat()}까지만 적재돼 직전 개장일"
+            f"({settled_session.isoformat()})에 {(settled_session - data_as_of).days}일 뒤처져 있습니다."
+        ),
     )
 
 
@@ -106,6 +108,23 @@ def build_freshness_evidence(
         reason=reason,
         source=source,
         no_recommendation=no_recommendation,
+    )
+
+
+def withhold_recommendations_without_l4_evidence(
+    evidence: FreshnessEvidence,
+    *,
+    l4_evidence: Sequence[Mapping[str, Any]] | None,
+) -> FreshnessEvidence:
+    """Keep a fresh source honest when it has no L4 support for a recommendation."""
+
+    if l4_evidence:
+        return evidence
+    return evidence.model_copy(
+        update={
+            "no_recommendation": True,
+            "reason": "L4 근거가 없어 추천을 생성하지 않습니다.",
+        }
     )
 
 

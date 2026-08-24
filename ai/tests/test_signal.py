@@ -1,10 +1,16 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
 
 from ai_graph.nodes.backtest import summarize_backtest
-from ai_graph.nodes.signal import SignalCondition, build_investment_signal, generate_signal, signal_node
+from ai_graph.nodes.risk_manager import risk_manager_node
+from ai_graph.nodes.signal import (
+    SignalCondition,
+    build_investment_signal,
+    generate_signal,
+    signal_node,
+)
 
 
 def make_strategy():
@@ -22,7 +28,7 @@ def make_strategy():
 def make_market(ticker="005930", rsi=28):
     return {
         "ticker": ticker,
-        "timestamp": datetime(2026, 5, 19, 9, 5),
+        "timestamp": datetime(2026, 5, 19, 9, 5, tzinfo=UTC),
         "metrics": {"rsi": rsi},
     }
 
@@ -62,14 +68,31 @@ def test_signal_node_public_contract_excludes_raw_internal_payload():
     assert "internal_payload" not in output["signal"]
 
 
-def test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence():
+@pytest.mark.parametrize("l4_evidence", [None, []])
+def test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence(l4_evidence) -> None:
     decision = build_investment_signal(
         {"selected_candidate": {"metrics": {"sharpe_ratio": 1.4, "max_drawdown": -0.03}}},
         trace_id="trace-empty-evidence",
-        l4_evidence=[],
+        l4_evidence=l4_evidence,
     )
 
     assert decision.l4_evidence == []
+    signal = signal_node(
+        {
+            "trace_id": "trace-missing-l4",
+            "strategy_spec": make_strategy(),
+            "backtest": {
+                "selected_candidate": {
+                    "metrics": {"sharpe_ratio": 1.4, "max_drawdown": -0.03}
+                }
+            },
+            "l4_evidence": l4_evidence,
+        }
+    )["investment_signal"]
+    risk = risk_manager_node({"investment_signal": signal})["risk"]
+
+    assert signal["action"] == "NO_RECOMMENDATION"
+    assert risk["signal"]["action"] == "NO_RECOMMENDATION"
 
 
 def test_backtest_summary_excludes_generated_candidate_payloads():

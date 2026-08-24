@@ -1,7 +1,44 @@
 import pytest
 
-from ai_graph.nodes.daily_digest import MAX_DIGEST_STRATEGIES, build_daily_digest
-from ai_graph.schemas import BacktestMetrics, DailyDigestStrategyInput
+from ai_graph.llm import role_calls
+from ai_graph.nodes import daily_digest
+from ai_graph.nodes.daily_digest import (
+    MAX_DIGEST_STRATEGIES,
+    build_comparison_rows,
+    build_daily_digest,
+    build_overall_summary,
+)
+from ai_graph.schemas import (
+    BacktestMetrics,
+    DailyDigestComparisonRow,
+    DailyDigestStrategyInput,
+    MarketBrief,
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_daily_digest_llm(monkeypatch) -> None:
+    """Keep digest unit tests independent of inherited live-provider settings."""
+
+    monkeypatch.setattr(
+        daily_digest,
+        "generate_role_debate",
+        lambda **kwargs: kwargs["fallback"],
+    )
+    monkeypatch.setattr(
+        daily_digest,
+        "generate_daily_digest_overall_comment",
+        lambda *_args: "deterministic test summary",
+    )
+    monkeypatch.setattr(
+        daily_digest,
+        "generate_market_brief",
+        lambda **_kwargs: MarketBrief(
+            headline="test market brief",
+            items=[],
+            fallback_reasons=["test_stub"],
+        ),
+    )
 
 
 def make_strategy(
@@ -60,6 +97,59 @@ def test_build_daily_digest_falls_back_to_disclosed_empty_market_brief_in_mock_m
 
     assert report.market_brief.items == []
     assert report.market_brief.fallback_reasons
+
+
+def test_daily_digest_marks_no_recommendation_as_missing_evidence() -> None:
+    strategies = [make_strategy("rsi", "RSI 전략", "NO_RECOMMENDATION")]
+
+    rows = build_comparison_rows(strategies)
+    summary = build_overall_summary(strategies, rows)
+    report = build_daily_digest(strategies, user_name="홍길동", report_date="2026-06-29")
+
+    assert rows[0].today_signal == "NO_RECOMMENDATION"
+    assert rows[0].status == "근거 부족"
+    assert any("추천을 생성하지 않았습니다" in item for item in summary)
+    assert report.comparison_rows[0].status == "근거 부족"
+    assert "추천을 생성하지 않았습니다" in report.strategy_cards[0].ai_interpretation
+
+
+def test_no_recommendation_card_never_calls_the_role_provider(monkeypatch) -> None:
+    strategy = make_strategy("rsi", "RSI 전략", "NO_RECOMMENDATION")
+
+    def provider_boundary_reached(**_kwargs):
+        raise AssertionError("role provider boundary reached")
+
+    monkeypatch.setattr(daily_digest, "generate_role_debate", provider_boundary_reached)
+
+    card = daily_digest._build_strategy_card(strategy)
+
+    assert "추천을 생성하지 않았습니다" in card.ai_interpretation
+    assert "매매 지시" in card.caution
+
+
+def test_no_recommendation_overall_comment_never_calls_the_role_provider(monkeypatch) -> None:
+    strategy = make_strategy("rsi", "RSI 전략", "NO_RECOMMENDATION")
+    rows = [
+        DailyDigestComparisonRow(
+            strategy_id=strategy.strategy_id,
+            name=strategy.name,
+            today_signal=strategy.today_signal,
+            total_return=strategy.metrics.total_return,
+            max_drawdown=strategy.metrics.max_drawdown,
+            sharpe_ratio=strategy.metrics.sharpe_ratio,
+            status="근거 부족",
+        )
+    ]
+
+    def provider_boundary_reached(**_kwargs):
+        raise AssertionError("role provider boundary reached")
+
+    monkeypatch.setattr(role_calls, "generate_role_debate", provider_boundary_reached)
+
+    comment = role_calls.generate_daily_digest_overall_comment([strategy], rows)
+
+    assert "L4 근거 부족" in comment
+    assert "추천을 생성하지 않았습니다" in comment
 
 
 def test_build_daily_digest_rejects_more_than_max_strategies() -> None:
