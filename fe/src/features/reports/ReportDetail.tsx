@@ -4,6 +4,13 @@ import { Card } from "../../components/common/Card";
 import { ROUTES } from "../../config/routes";
 import type { ReportDetail as ReportDetailType, SignalType } from "../../types/quantagent";
 import { SignalCard } from "../app/SignalCard";
+import {
+  ARCHIVE_ACCESS_NOTICE,
+  ARCHIVE_AUDIT_NOTICE,
+  ARCHIVE_READ_ONLY_NOTICE,
+  ARCHIVE_RETENTION_NOTICE,
+  archiveTimestamp,
+} from "./reportArchive";
 
 interface ReportDetailProps {
   report: ReportDetailType;
@@ -29,7 +36,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
         <Card>
           <div className="side-badge-line">
             <Badge variant="dark">ARCHIVE</Badge>
-            <span>{report.sentAt || "발송 시각 미확인"}</span>
+            <span>{archiveTimestamp(report)}</span>
           </div>
           <h3>{report.date}</h3>
           <strong>권장도 {report.recommendationScore} / 10</strong>
@@ -57,7 +64,7 @@ export function ReportDetail({ report }: ReportDetailProps) {
         <section className="report-paper__section report-paper__hero">
           <div className="report-paper__meta">
             <span>
-              <Badge variant="dark">ARCHIVED REPORT</Badge> {report.date} · {report.sentAt || "발송 시각 미확인"}
+              <Badge variant="dark">ARCHIVED REPORT</Badge> {report.date} · 보관 기록 {archiveTimestamp(report)}
             </span>
             <span>{report.recipient}</span>
           </div>
@@ -70,6 +77,14 @@ export function ReportDetail({ report }: ReportDetailProps) {
                 <strong>{item.value}</strong>
               </span>
             ))}
+          </div>
+          <div className="archive-disclosure" aria-label="보관 리포트 정책">
+            <strong>읽기 전용 보관 리포트</strong>
+            <span>보관 기록 시각: {archiveTimestamp(report)}</span>
+            <span>{ARCHIVE_RETENTION_NOTICE}</span>
+            <span>{ARCHIVE_ACCESS_NOTICE}</span>
+            <span>{ARCHIVE_READ_ONLY_NOTICE}</span>
+            <span>{ARCHIVE_AUDIT_NOTICE}</span>
           </div>
         </section>
 
