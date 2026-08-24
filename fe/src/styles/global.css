@@ -245,6 +245,11 @@ h6 { font-size: 0.67em; }
 .signal-card__score { text-align: right; }
 .signal-card__score strong { font-size: 18px; }
 .signal-card > p { border-top: 1px solid var(--line); padding: 12px 16px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.signal-card__verdict { display: flex; align-items: flex-start; gap: 8px; }
+.signal-card__verdict span { flex: 1; }
+.candidate-table__policy { padding: 12px 20px; border-top: 1px solid var(--line); background: var(--surface-muted, #fafafa); }
+.candidate-table__policy p { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.candidate-table__policy-notice { margin-top: 6px; color: var(--ink); font-weight: 700; }
 .signal-card__meta { display: flex; justify-content: flex-end; gap: 10px; padding: 0 16px 12px; color: var(--muted); font-size: 11px; }
 .signal-card__meta em { font-style: normal; margin-left: 4px; font-weight: 700; }
 .is-positive { color: var(--buy); font-style: normal; font-weight: 800; }

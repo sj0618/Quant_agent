@@ -27,6 +27,10 @@ class QuantAgentState(TypedDict, total=False):
     price_rows: list[dict[str, Any]]
     l4_evidence: list[dict[str, Any]]
     macro_snapshot: dict[str, Any]
+    # Official KOSPI/KOSDAQ total-return levels and monthly index weights. Kept out of
+    # `data` because it is one value per session per index and `data` is republished in
+    # the response envelope.
+    official_benchmark: dict[str, Any]
     backtest_code: dict[str, Any]
     backtest: dict[str, Any]
     signal: dict[str, Any]

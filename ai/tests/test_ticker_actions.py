@@ -127,6 +127,80 @@ def test_screened_names_the_strategy_is_not_acting_on_come_back_as_watch():
     assert by_ticker == {"000100": "BUY", "000900": "WATCH"}
 
 
+def _watch_card(tickers):
+    return StrategyCandidateCard(
+        strategy_id="s1",
+        title="t",
+        summary="s",
+        key_conditions=["c"],
+        confidence=0.5,
+        matches=[
+            ScreeningMatch(
+                ticker=ticker,
+                name=f"NAME{ticker}",
+                market="KOSPI",
+                as_of_date="2026-08-04",
+                close=1000.0,
+            )
+            for ticker in tickers
+        ],
+    )
+
+
+def test_a_screened_name_outside_the_traded_universe_says_it_was_never_judged():
+    """The backtest never priced it, so 'did not meet the entry condition' is invented."""
+    state = {
+        "backtest": {
+            "ticker_actions": [],
+            "backtest_payload": {"tickers": ["000100", "000200"]},
+        }
+    }
+    action = payload_ticker_actions(state, [_watch_card(["000900"])])[0]
+    assert action.action == "WATCH"
+    assert "유니버스에 없는 종목" in action.reason
+    assert "진입 조건" not in action.reason
+
+
+def test_a_full_book_on_the_last_session_is_named_as_the_limit():
+    state = {
+        "backtest": {
+            "ticker_actions": [],
+            "backtest_payload": {"tickers": ["000100", "000200", "000900"]},
+            "engine_summary": {
+                "open_position_tickers": ["000100", "000200"],
+                "ai_backtest_context": {"applied_max_positions": 2},
+            },
+        }
+    }
+    action = payload_ticker_actions(state, [_watch_card(["000900"])])[0]
+    assert action.action == "WATCH"
+    assert "슬롯 2/2" in action.reason
+
+
+def test_a_book_with_room_left_claims_no_slot_limit():
+    state = {
+        "backtest": {
+            "ticker_actions": [],
+            "backtest_payload": {"tickers": ["000100", "000900"]},
+            "engine_summary": {
+                "open_position_tickers": ["000100"],
+                "ai_backtest_context": {"applied_max_positions": 5},
+            },
+        }
+    }
+    action = payload_ticker_actions(state, [_watch_card(["000900"])])[0]
+    assert "슬롯" not in action.reason
+    assert "지시가 없었습니다" in action.reason
+
+
+def test_a_run_that_recorded_no_positions_states_no_cause_it_cannot_see():
+    """The rolling-policy path builds its own summary and carries neither half."""
+    state = {"backtest": {"ticker_actions": [], "engine_summary": {}}}
+    action = payload_ticker_actions(state, [_watch_card(["000900"])])[0]
+    assert action.reason == (
+        "백테스트 마지막 거래일에 이 종목에 대한 신규 진입·청산 지시가 없었습니다."
+    )
+
 def test_actions_are_ordered_sell_buy_hold_watch():
     state = {
         "backtest": {

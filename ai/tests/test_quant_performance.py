@@ -511,3 +511,175 @@ def test_graph_public_performance_alias_points_to_quant_module() -> None:
         graph.build_public_backtest_performance
         is quant_performance.build_public_backtest_performance
     )
+
+
+def _basis_payload(*, first_date: str, last_date: str, cost_model: dict | None = None) -> dict:
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.3,
+            max_drawdown=-0.15,
+            win_rate=0.6,
+            total_return=0.12,
+            in_sample_sharpe=0.3,
+            out_sample_sharpe=0.2,
+            degradation=0.05,
+            out_sample_return=0.04,
+        ),
+        engine_summary={
+            "effective_trade_count": 10,
+            **({"cost_model": cost_model} if cost_model is not None else {}),
+        },
+    )
+    payload["backtest_payload"] = {
+        "first_date": first_date,
+        "last_date": last_date,
+        "tickers": ["000100", "000200", "000300"],
+    }
+    return payload
+
+
+def test_public_performance_states_the_hold_out_basis_of_its_numbers() -> None:
+    performance = build_public_backtest_performance(
+        _basis_payload(first_date="2021-08-23", last_date="2026-08-21"),
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        pipeline_data_source={
+            "source": "postgres",
+            "backtest_window_policy_id": "krx_pit_common_stock_5y_kst_session_v1",
+        },
+    )
+
+    assert performance is not None
+    basis = performance.evaluation_basis
+    assert basis is not None
+    assert basis.basis == "hold_out"
+    assert basis.hold_out_fraction == 0.3
+    assert basis.window_start == "2021-08-23"
+    assert basis.window_end == "2026-08-21"
+    assert basis.window_policy_id == "krx_pit_common_stock_5y_kst_session_v1"
+    assert "마지막 30% 검증 구간" in basis.caption
+    assert "2021-08-23~2026-08-21" in basis.caption
+
+
+def test_the_cost_clause_is_only_claimed_when_the_run_charged_costs() -> None:
+    free = build_public_backtest_performance(
+        _basis_payload(
+            first_date="2021-08-23",
+            last_date="2026-08-21",
+            cost_model={"commission_pct": 0.0, "tax_pct": 0.0, "slippage_pct": 0.0},
+        ),
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        pipeline_data_source={"source": "postgres"},
+    )
+    charged = build_public_backtest_performance(
+        _basis_payload(
+            first_date="2021-08-23",
+            last_date="2026-08-21",
+            cost_model={"commission_pct": 0.00015, "tax_pct": 0.0023, "slippage_pct": 0.001},
+        ),
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert free is not None and free.evaluation_basis is not None
+    assert charged is not None and charged.evaluation_basis is not None
+    assert free.evaluation_basis.cost_model_applied is False
+    assert "거래비용 반영" not in free.evaluation_basis.caption
+    assert charged.evaluation_basis.cost_model_applied is True
+    assert "거래비용 반영" in charged.evaluation_basis.caption
+
+
+def test_a_rolling_policy_run_is_not_described_as_a_hold_out_tail() -> None:
+    payload = _basis_payload(first_date="2021-08-23", last_date="2026-08-21")
+    payload["walk_forward"] = {
+        "status": "ready",
+        "fold_selections": [
+            {
+                "fold_index": index,
+                "selection_hash": f"h{index}",
+                "candidate_id": "A2",
+                "evaluation_sessions": ["2026-01-02"],
+            }
+            for index in range(3)
+        ],
+        "unique_evaluation_session_count": 500,
+        "aggregate_metrics": BacktestMetrics(
+            sharpe_ratio=0.4,
+            max_drawdown=-0.2,
+            win_rate=0.55,
+            total_return=0.3,
+            in_sample_sharpe=0.0,
+            out_sample_sharpe=0.4,
+            degradation=0.0,
+            out_sample_return=0.3,
+        ).model_dump(),
+        "costs": 1234.5,
+    }
+
+    performance = build_public_backtest_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    basis = performance.evaluation_basis
+    assert basis is not None
+    assert basis.basis == "walk_forward_policy"
+    assert basis.hold_out_fraction is None
+    assert basis.fold_count == 3
+    assert basis.evaluation_session_count == 500
+    assert "마지막 30%" not in basis.caption
+    assert "폴드 3개" in basis.caption
+    assert basis.cost_model_applied is True
+
+
+def test_universe_policy_discloses_candidates_the_backtest_could_not_trade() -> None:
+    performance = build_public_backtest_performance(
+        _basis_payload(first_date="2021-08-23", last_date="2026-08-21"),
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        pipeline_data_source={
+            "source": "postgres",
+            "pit_member_count": 812,
+            "backtest_window_policy_id": "krx_pit_common_stock_5y_kst_session_v1",
+            "backtest_universe": {
+                "as_of_start": "2021-08-23",
+                "as_of_end": "2026-08-21",
+                "excluded_screening_candidate_count": 4,
+            },
+        },
+    )
+
+    assert performance is not None
+    policy = performance.universe_policy
+    assert policy is not None
+    assert policy.excluded_screening_candidate_count == 4
+    assert policy.traded_ticker_count == 812
+    assert policy.excluded_notice is not None
+    assert "4종목" in policy.excluded_notice
+    assert "오늘의 추천 종목" in policy.summary
+
+
+def test_no_universe_policy_is_claimed_without_a_point_in_time_descriptor() -> None:
+    performance = build_public_backtest_performance(
+        _basis_payload(first_date="2021-08-23", last_date="2026-08-21"),
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        pipeline_data_source={"source": "fixture"},
+    )
+
+    assert performance is not None
+    assert performance.universe_policy is None
+
+
+def test_an_empty_exclusion_prints_no_exclusion_notice() -> None:
+    performance = build_public_backtest_performance(
+        _basis_payload(first_date="2021-08-23", last_date="2026-08-21"),
+        price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
+        pipeline_data_source={
+            "source": "postgres",
+            "backtest_universe": {"excluded_screening_candidate_count": 0},
+        },
+    )
+
+    assert performance is not None
+    assert performance.universe_policy is not None
+    assert performance.universe_policy.excluded_notice is None
