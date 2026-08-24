@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -38,6 +39,7 @@ AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 AI_DATA_SOURCE_LOAD_MODE_ENV = "AI_DATA_SOURCE_LOAD_MODE"
 
 DEFAULT_BACKTEST_TICKER = "005930"
+KST = ZoneInfo("Asia/Seoul")
 TRADING_DAYS_PER_YEAR = 252
 # Ten years, which is what the warehouse holds (2016-05-20 onwards). Briefly cut to
 # five while the real cause of the statement timeout was still unknown; that was the
@@ -793,12 +795,17 @@ class PostgresPipelineDataSource:
         pruning.
         """
 
+        # The screen decides what gets recommended, so it stops where the backtest does:
+        # at the last closed session. The ceiling is a bound parameter rather than an
+        # inline `CURRENT_DATE`, which is STABLE and would defeat partition pruning.
         row = conn.execute(
             f"""
             SELECT max(time) AS as_of_date
             FROM {KIS_ADJUSTED_OHLCV_TABLE}
             WHERE time >= CURRENT_DATE - INTERVAL '90 days'
-            """
+              AND time < %(ceiling)s::date
+            """,
+            {"ceiling": _kst_today()},
         ).fetchone()
         value = row.get("as_of_date") if row else None
         return _date_value(value) if value is not None else None
@@ -936,11 +943,12 @@ class PostgresPipelineDataSource:
             WHERE ticker = ANY(%s)
               AND time >= %s::date
               -- Today's bar is still moving until the close, so the strategy acts on
-              -- the last settled session instead.
-              AND time < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
+              -- the last settled session instead. Bound as a parameter, not an inline
+              -- STABLE expression, so partition pruning still happens at plan time.
+              AND time < %s::date
             ORDER BY ticker, time
             """,
-            [ticker_list, date_floor],
+            [ticker_list, date_floor, _kst_today()],
         ).fetchall()
         # Indicators are only ever read for dates that have a price bar, and the price
         # query above already capped itself at `lookback_days` rows per ticker. Asking
@@ -2696,6 +2704,12 @@ def _max_price_row_date(price_rows: Sequence[Mapping[str, Any]]) -> date | None:
         except (TypeError, ValueError):
             continue
     return max(dates) if dates else None
+
+
+def _kst_today() -> date:
+    """Today in the market's own timezone, not the host's."""
+
+    return datetime.now(KST).date()
 
 
 def _date_value(value: Any) -> date:

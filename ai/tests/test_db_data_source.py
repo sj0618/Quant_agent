@@ -1,8 +1,9 @@
 import os
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from threading import Event
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -1369,6 +1370,13 @@ def test_screening_date_bound_is_a_plan_time_constant() -> None:
     assert "CURRENT_DATE" not in query
     assert "%(floor)s::date" in query
     assert isinstance(params["floor"], date)
+    # The screen stops at the last closed session, and its ceiling is bound rather than
+    # written inline for the same plan-time reason as the floor.
+    assert "%(ceiling)s::date" in query
+    assert "CURRENT_TIMESTAMP" not in query
+    assert params["ceiling"] == datetime.now(ZoneInfo("Asia/Seoul")).date()
+
+
 def test_fixed_window_uses_kst_calendar_sessions_and_manifest_values() -> None:
     class Connection:
         def __init__(self) -> None:
