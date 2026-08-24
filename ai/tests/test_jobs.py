@@ -176,6 +176,10 @@ def test_persistent_job_document_round_trips_storage_only_fields() -> None:
     assert restored.completed_at == completed.completed_at
     assert restored.result == completed.result
     assert restored.execution_manifest == completed.execution_manifest
+    # Load-bearing for the restart reaper: if this does not survive the round trip it
+    # cannot tell a job this process owns from one a dead process left behind.
+    assert restored.owner_incarnation == completed.owner_incarnation
+    assert restored.owner_incarnation is not None
     assert _job_document(restored) == _job_document(completed)
     assert "execution_manifest" not in completed.model_dump(mode="json")
 

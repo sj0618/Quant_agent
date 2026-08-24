@@ -3,7 +3,9 @@ from __future__ import annotations
 # pyright: reportUnannotatedClassAttribute=false, reportUnusedFunction=false
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from os import environ
 from typing import ClassVar, Literal
 
@@ -43,6 +45,7 @@ from ai_graph.jobs import (
     JobStoreRuntime,
     PERSISTENT_JOB_STORE_MODE,
     create_analysis_job_store_from_env,
+    reap_interrupted_jobs,
     run_job_sync,
 )
 from ai_graph.llm.role_calls import generate_strategy_description
@@ -83,6 +86,8 @@ from ai_graph.token_auth import (
     RequireUserIdentity,
     RequireUserIdentityWithinQuota,
 )
+
+_logger = logging.getLogger(__name__)
 
 API_TITLE = "QuantAgent AI API"
 API_VERSION = "0.1.0"
@@ -505,12 +510,38 @@ def create_app(
         token_resolver=account_token_resolver,
         quota=account_token_quota,
     )
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Reap what the previous process left running before serving anything.
+
+        Deploys stop uvicorn and start it again, so in-flight jobs become rows that say
+        RUNNING with nothing behind them. Doing this at startup means a client polling
+        across a deploy gets a failure it can retry instead of a spinner that never ends.
+
+        A store that cannot be swept does not stop the app from serving: a failed sweep
+        leaves stale rows, while a failed startup leaves no service at all.
+        """
+
+        try:
+            reaped = await run_in_threadpool(reap_interrupted_jobs, store)
+        except Exception:
+            _logger.exception("interrupted-job sweep failed at startup")
+        else:
+            if reaped:
+                _logger.warning(
+                    "failed %d analysis job(s) left running by a previous process: %s",
+                    len(reaped),
+                    ", ".join(reaped),
+                )
+        yield
+
     app = FastAPI(
         title=API_TITLE,
         version=API_VERSION,
         description=API_DESCRIPTION,
         docs_url=DOCS_URL,
         openapi_url=OPENAPI_URL,
+        lifespan=lifespan,
     )
     cors_allow_origins = _cors_allow_origins()
     if cors_allow_origins:
