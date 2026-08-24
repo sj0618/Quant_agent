@@ -58,6 +58,7 @@ from ai_graph.preflight import (
 )
 from ai_graph.quant_performance import sanitize_public_backtest_performance
 from ai_graph.scope_review import review_research_scope
+from ai_graph.single_process import enforce_single_process
 from ai_graph.research_contract import (
     CanonicalRuleV1,
     DraftConflictV1,
@@ -522,6 +523,10 @@ def create_app(
         leaves stale rows, while a failed startup leaves no service at all.
         """
 
+        # Deliberately outside the try below: a second worker is a configuration error
+        # the operator has to see, and the reaper's own correctness depends on this
+        # process being the only one that owns in-flight jobs.
+        enforce_single_process()
         try:
             reaped = await run_in_threadpool(reap_interrupted_jobs, store)
         except Exception:
