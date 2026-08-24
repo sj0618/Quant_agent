@@ -1840,7 +1840,7 @@ def run_candidate_backtest(
             diagnostics_by_candidate[selected.candidate_id] = detailed.diagnostics
 
     try:
-        return CandidateBacktestResult(
+        result = CandidateBacktestResult(
             strategy_a=strategy_a,
             candidates=enriched_candidates,
             selected_candidate=selected,
@@ -1861,6 +1861,7 @@ def run_candidate_backtest(
                 "candidates": diagnostics_by_candidate,
             },
         )
+        return _attach_walk_forward_artifact(result, len(candidates))
     finally:
         if owns_session:
             session.close()
@@ -1951,7 +1952,18 @@ def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: l
     if any(candidate.representation != "structured" for candidate in candidates):
         result = run_candidate_backtest(strategy, candidates, price_rows=rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons, _walk_forward_enabled=False)
         masked = result.selected_candidate.model_copy(update={"metrics": _mask_unavailable_walk_forward_metrics(result.selected_candidate.metrics, UNSAFE_WALK_FORWARD_CANDIDATE)})
-        return result.model_copy(update={"selected_candidate": masked, "walk_forward": WalkForwardPolicyResult(status="unsafe_candidate", unavailable_reason=UNSAFE_WALK_FORWARD_CANDIDATE)})
+        return _attach_walk_forward_artifact(
+            result.model_copy(
+                update={
+                    "selected_candidate": masked,
+                    "walk_forward": WalkForwardPolicyResult(
+                        status="unsafe_candidate",
+                        unavailable_reason=UNSAFE_WALK_FORWARD_CANDIDATE,
+                    ),
+                }
+            ),
+            len(candidates),
+        )
 
     claimed: set[str] = set()
     returns_by_session: dict[str, float] = {}
@@ -2023,12 +2035,15 @@ def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: l
         )
         for fill in fills
     )
+    aggregate_metrics = (
+        _walk_forward_aggregate_metrics(list(daily_returns.values())) if ready else None
+    )
     engine_summary = {
         "walk_forward_sample": _walk_forward_metadata(_walk_forward_sample(rows), policy),
         "walk_forward_policy": "rolling_selection_policy",
         "_storage_execution_ledger": _merge_storage_execution_ledgers(evaluation_ledgers),
     }
-    return CandidateBacktestResult(
+    result = CandidateBacktestResult(
         strategy_a=strategy,
         candidates=candidates,
         selected_candidate=selected,
@@ -2051,17 +2066,14 @@ def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: l
             fold_selections=selections,
             unique_evaluation_session_count=len(daily_returns),
             daily_returns=daily_returns,
-            aggregate_metrics=(
-                _walk_forward_aggregate_metrics(list(daily_returns.values()))
-                if ready
-                else None
-            ),
+            aggregate_metrics=aggregate_metrics,
             equity_curve=curve,
             fills=fills if ready else [],
             costs=costs if ready else 0.0,
             deduped_session_count=deduped,
         ),
     )
+    return _attach_walk_forward_artifact(result, len(candidates))
 
 
 def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -3034,7 +3046,20 @@ def _walk_forward_metadata(
         "selection_seed": None,
         "selection_determinism": "deterministic_no_rng",
         "selection_tie_break": "slot_priority:(-score, ticker)",
-        "aggregate_oos_available": sample.status == READY_WALK_FORWARD,
+        # Eligibility says the session boundary is large enough to calculate OOS
+        # statistics. It is deliberately separate from availability: a real result
+        # has not been calculated until the rolling evaluation engine supplies it.
+        "aggregate_oos_eligible": sample.status == READY_WALK_FORWARD,
+        "aggregate_oos_available": False,
+        "aggregate_oos_result": {
+            "availability": "unavailable",
+            "reason": (
+                "aggregate_oos_not_computed"
+                if sample.status == READY_WALK_FORWARD
+                else sample.status
+            ),
+        },
+        "candidates_evaluated": None,
         "benchmark_comparison_available": False,
         "selection_scope": "train_validation_only",
         "final_lockbox_excluded_from_selection": True,
@@ -3043,6 +3068,71 @@ def _walk_forward_metadata(
             fold.evaluation_month for fold in (policy.folds if policy else ())
         ],
         "final_lockbox_sessions": list(policy.final_lockbox_sessions) if policy else [],
+    }
+
+
+def _walk_forward_oos_result(
+    walk_forward: WalkForwardPolicyResult | None,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Expose the result of rolling evaluation, or one stable reason it is absent."""
+
+    if walk_forward is not None and walk_forward.aggregate_metrics is not None:
+        metrics = walk_forward.aggregate_metrics
+        return {
+            "availability": "available",
+            "total_return": metrics.out_sample_return,
+            "sharpe_ratio": metrics.out_sample_sharpe,
+            "max_drawdown": metrics.max_drawdown,
+            "evaluation_session_count": walk_forward.unique_evaluation_session_count,
+        }
+
+    reason = (
+        walk_forward.unavailable_reason
+        if walk_forward is not None
+        else metadata.get("unavailable_reason")
+    )
+    return {
+        "availability": "unavailable",
+        "reason": str(reason or "aggregate_oos_not_computed"),
+    }
+
+
+def _attach_walk_forward_artifact(
+    result: CandidateBacktestResult,
+    candidate_count: int,
+) -> CandidateBacktestResult:
+    """Bind search width and the actual OOS result to the same output artifact."""
+
+    engine_summary = dict(result.engine_summary)
+    existing = engine_summary.get("walk_forward_sample")
+    if not isinstance(existing, Mapping):
+        return result
+
+    artifact = _walk_forward_artifact(existing, candidate_count, result.walk_forward)
+    backtest_payload = dict(result.backtest_payload)
+    backtest_payload["walk_forward_sample"] = artifact
+    return result.model_copy(
+        update={
+            "engine_summary": {**engine_summary, "walk_forward_sample": artifact},
+            "backtest_payload": backtest_payload,
+        }
+    )
+
+
+def _walk_forward_artifact(
+    metadata: Mapping[str, Any],
+    candidate_count: int,
+    walk_forward: WalkForwardPolicyResult | None,
+) -> dict[str, Any]:
+    """Return one OOS artifact containing boundaries, search width, and result."""
+
+    oos_result = _walk_forward_oos_result(walk_forward, metadata)
+    return {
+        **metadata,
+        "candidates_evaluated": max(1, candidate_count),
+        "aggregate_oos_available": oos_result["availability"] == "available",
+        "aggregate_oos_result": oos_result,
     }
 
 def _benchmark_daily_returns(
