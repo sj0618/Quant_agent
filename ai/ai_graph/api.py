@@ -42,6 +42,7 @@ from ai_graph.data_sources.db import (
     BOK_MACRO_VIEW,
     KIS_ADJUSTED_OHLCV_TABLE,
     SYMBOL_MASTER_TABLE,
+    is_release_profile,
     measure_research_runtime_facts_from_env,
     resolve_database_dsn_from_env,
 )
@@ -1149,7 +1150,9 @@ def _research_execution_enabled() -> bool:
 
 
 def _production_runtime() -> bool:
-    return (environ.get("APP_ENV") or "").strip().lower() in {"production", "prod"}
+    # Delegates so the API layer and the data layer cannot disagree about what a
+    # release profile is; the fixture guard in `data_sources.db` reads the same answer.
+    return is_release_profile()
 
 
 def _data_source_status() -> DataSourceStatus:
