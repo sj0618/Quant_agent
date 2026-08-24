@@ -160,3 +160,33 @@ def test_a_store_that_cannot_be_read_still_raises():
         assert "connection refused" in str(e)
     else:
         raise AssertionError("a store outage must not look like an empty list")
+
+
+def test_the_settle_statement_casts_every_parameter() -> None:
+    """Postgres cannot infer a bare placeholder inside jsonb_build_object.
+
+    Without an explicit cast the statement dies with IndeterminateDatatype at runtime -
+    which, on the startup path, means the deploy never comes up. Nothing local exercises
+    real Postgres, so the cast is pinned here.
+    """
+
+    captured: dict[str, object] = {}
+
+    class _Recording(_Connection):
+        def execute(self, query, params=None):
+            captured["query"] = query
+            captured["params"] = params
+            return _Rows([])
+
+    repo = PostgresAnalysisJobRepository.__new__(PostgresAnalysisJobRepository)
+    repo._dsn = "postgresql://example"
+    repo._connector = lambda *a, **k: _Recording([])
+
+    repo.force_fail_undecodable_job("job_legacy01", error_message="중단됨", reason="restart")
+
+    query = str(captured["query"])
+    assert "%s::text" in query
+    # No placeholder may be left uncast.
+    assert "%s," not in query.replace("%s::text,", "")
+    assert "job_id = %s::text" in query
+    assert captured["params"] == ("중단됨", "restart", "job_legacy01")

@@ -209,13 +209,16 @@ class PostgresAnalysisJobRepository:
                 SET job_jsonb = job_jsonb
                         || jsonb_build_object(
                             'status', 'failed',
-                            'error_message', %s,
+                            -- Every parameter is cast: inside jsonb_build_object the
+                            -- planner has no column to infer a bare placeholder from and
+                            -- fails with IndeterminateDatatype.
+                            'error_message', %s::text,
                             'completed_at', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
                             'fallback_reasons',
                             COALESCE(job_jsonb -> 'fallback_reasons', '[]'::jsonb) || to_jsonb(%s::text)
                         ),
                     updated_at = now()
-                WHERE job_id = %s
+                WHERE job_id = %s::text
                   AND job_jsonb ->> 'status' IN ('queued', 'running')
                 """,
                 (error_message, reason, job_id),
