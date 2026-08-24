@@ -104,7 +104,12 @@ test("release trust includes API, screen, metric, and backend contract gates", (
   );
   assert.ok(
     checks[2].args.includes(
-      "ai/tests/test_legacy_job_rows.py::test_active_legacy_row_refuses_application_startup"
+      "ai/tests/test_legacy_job_rows.py::test_startup_settles_an_undecodable_active_row_instead_of_refusing"
+    )
+  );
+  assert.ok(
+    checks[2].args.includes(
+      "ai/tests/test_legacy_job_rows.py::test_startup_still_refuses_when_an_undecodable_row_cannot_be_settled"
     )
   );
   assert.ok(

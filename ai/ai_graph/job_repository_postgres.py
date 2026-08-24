@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import psycopg
@@ -17,6 +18,14 @@ _logger = logging.getLogger(__name__)
 
 class PersistedJobReconciliationError(RuntimeError):
     """An active persisted job cannot be reconciled safely after a restart."""
+
+
+@dataclass(frozen=True)
+class ReconciliationBatch:
+    """Active rows this build can load, and the ones it can only settle by id."""
+
+    jobs: list[AnalysisJob]
+    undecodable_job_ids: list[str]
 
 
 def _job_document(job: AnalysisJob) -> dict[str, Any]:
@@ -147,7 +156,7 @@ class PostgresAnalysisJobRepository:
             ).fetchall()
         return self._decode_rows(rows)
 
-    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list[AnalysisJob]:
+    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> ReconciliationBatch:
         """Read every active job that startup must either settle or reject.
 
         The ordinary history view is deliberately best-effort so one pre-contract
@@ -175,7 +184,63 @@ class PostgresAnalysisJobRepository:
             raise PersistedJobReconciliationError(
                 "active persisted analysis jobs exceed the restart reconciliation limit"
             )
-        return self._decode_rows(rows, strict=True)
+        decoded, undecodable = self._decode_rows_reporting_failures(rows)
+        return ReconciliationBatch(jobs=decoded, undecodable_job_ids=undecodable)
+
+    def force_fail_undecodable_job(self, job_id: str, *, error_message: str, reason: str) -> bool:
+        """Settle an active row that cannot be loaded as an `AnalysisJob`.
+
+        Rows written before `execution_manifest` and the performance `availability` tag
+        existed cannot be validated, so `fail_job` - which has to read the job first -
+        cannot touch them. Refusing startup over them is not an option either: they are
+        already in the database, so that policy is an outage with no way out. This writes
+        the terminal state straight onto the stored document instead.
+
+        Deliberately narrow: it only moves `queued`/`running` to `failed`, and only sets
+        the fields a reader needs to stop waiting. It does not try to reconstruct the
+        envelope the current schema would have produced - inventing one from a document
+        this build cannot parse would be a guess presented as a record.
+        """
+
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE app.ai_analysis_job
+                SET job_jsonb = job_jsonb
+                        || jsonb_build_object(
+                            'status', 'failed',
+                            'error_message', %s,
+                            'completed_at', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                            'fallback_reasons',
+                            COALESCE(job_jsonb -> 'fallback_reasons', '[]'::jsonb) || to_jsonb(%s::text)
+                        ),
+                    updated_at = now()
+                WHERE job_id = %s
+                  AND job_jsonb ->> 'status' IN ('queued', 'running')
+                """,
+                (error_message, reason, job_id),
+            )
+        return getattr(result, "rowcount", 0) > 0
+
+    def _decode_rows_reporting_failures(
+        self, rows: Sequence[Any]
+    ) -> tuple[list[AnalysisJob], list[str]]:
+        decoded: list[AnalysisJob] = []
+        undecodable: list[str] = []
+        for row in rows:
+            document = row["job_jsonb"]
+            try:
+                decoded.append(AnalysisJob.model_validate(document))
+            except ValidationError:
+                job_id = None
+                if isinstance(document, dict):
+                    job_id = document.get("job_id")
+                if not job_id:
+                    raise PersistedJobReconciliationError(
+                        "an active persisted analysis job has no id to settle it by"
+                    ) from None
+                undecodable.append(str(job_id))
+        return decoded, undecodable
 
     def _decode_rows(self, rows: Sequence[Any], *, strict: bool = False) -> list[AnalysisJob]:
         """Decode what this table can still be read as, and say what it cannot.
