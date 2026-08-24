@@ -144,9 +144,6 @@ jobs:
             chmod 600 "$incoming"
 
             if [ -f "$env_file" ]; then
-              backup_file="$APP_DIR/.env.backup.$(date -u +%Y%m%dT%H%M%SZ)"
-              cp -p "$env_file" "$backup_file"
-              chmod 600 "$backup_file"
               grep -Ev '^(APP_ENV|AUTH_ENABLED|GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|GOOGLE_REDIRECT_URI|AUTH_PUBLIC_BACKEND_ORIGIN|AUTH_ALLOWED_ORIGINS|AUTH_ALLOWED_HOSTS|AUTH_TRUSTED_PROXY_HEADERS|AUTH_TRUSTED_PROXY_HOSTS|AUTH_COOKIE_SECURE|AUTH_COOKIE_SAMESITE)=' \
                 "$env_file" > "$next_file" || true
             fi
