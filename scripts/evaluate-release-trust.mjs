@@ -132,6 +132,8 @@ export function buildReleaseTrustChecks({
         "ai/tests/test_screening_pipeline_failure_classifier.py::test_empty_screen_is_a_data_gap_answer_not_an_unknown_crash",
         "ai/tests/test_signal.py::test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence",
         "ai/tests/test_api.py::test_release_readiness_requires_durable_job_store_before_other_dependencies",
+        "ai/tests/test_legacy_job_rows.py::test_active_legacy_row_refuses_application_startup",
+        "ai/tests/test_legacy_job_rows.py::test_active_rows_over_reconciliation_limit_refuse_startup",
       ],
       cwd: repositoryRoot,
       environment: aiTestEnvironment,

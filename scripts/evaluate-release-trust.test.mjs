@@ -102,6 +102,16 @@ test("release trust includes API, screen, metric, and backend contract gates", (
       "ai/tests/test_api.py::test_release_readiness_requires_durable_job_store_before_other_dependencies"
     )
   );
+  assert.ok(
+    checks[2].args.includes(
+      "ai/tests/test_legacy_job_rows.py::test_active_legacy_row_refuses_application_startup"
+    )
+  );
+  assert.ok(
+    checks[2].args.includes(
+      "ai/tests/test_legacy_job_rows.py::test_active_rows_over_reconciliation_limit_refuse_startup"
+    )
+  );
   assert.ok(checks[3].args.includes("backend/tests/unit/test_fe_contract_routes.py"));
   assert.ok(checks[3].args.includes("backend/tests/unit/test_track_c_store.py"));
   assert.ok(checks[3].args.includes("backend/tests/unit/test_runtime_perf.py"));

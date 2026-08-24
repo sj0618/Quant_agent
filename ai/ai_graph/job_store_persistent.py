@@ -3,13 +3,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+from ai_graph.schemas import APIEnvelope, Stage
+
 from .jobs import (
     PERSISTENT_JOB_STORE_MODE,
     AnalysisJob,
     AnalysisJobStatus,
     JobStoreConfigurationError,
 )
-from ai_graph.schemas import APIEnvelope, Stage
 
 
 @runtime_checkable
@@ -60,6 +61,14 @@ class AnalysisJobRepository(Protocol):
         ...
 
     def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
+        ...
+
+
+@runtime_checkable
+class RestartReconciliationRepository(Protocol):
+    """Persistent repositories need a strict active-row startup read."""
+
+    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list[AnalysisJob]:
         ...
 
 
@@ -145,3 +154,12 @@ class PersistentAnalysisJobStore:
 
     def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
         return self._repository.list_jobs(limit=limit)
+
+    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list[AnalysisJob]:
+        """Do not let compatibility history reads weaken restart recovery."""
+
+        if not isinstance(self._repository, RestartReconciliationRepository):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires strict restart reconciliation support."
+            )
+        return self._repository.list_jobs_for_reconciliation(limit=limit)
