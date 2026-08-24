@@ -44,17 +44,26 @@ jobs:
           APP_DIR="$1"
           test -x "$APP_DIR/ai/.venv/bin/python"
 
+          nginx_dump=""
           if sudo -n true 2>/dev/null; then
-            nginx_dump="$(sudo -n nginx -T 2>&1)"
-            printf '%s\n' 'nginx_sudo=available'
-          else
-            nginx_dump="$(nginx -T 2>&1)"
+            if nginx_dump="$(sudo -n nginx -T 2>&1)"; then
+              printf '%s\n' 'nginx_sudo=available'
+            else
+              printf '%s\n' 'nginx_config=unavailable (sudo nginx -T failed)'
+              nginx_dump=""
+            fi
+          elif nginx_dump="$(nginx -T 2>&1)"; then
             printf '%s\n' 'nginx_sudo=unavailable (nginx -T read permission was used)'
+          else
+            printf '%s\n' 'nginx_config=unavailable (no read permission)'
+            nginx_dump=""
           fi
 
-          printf '%s\n' "$nginx_dump" \
-            | grep -nE 'configuration file |server_name[[:space:]]+qt-agent\.kro\.kr|location[[:space:]]+/ai-api/|proxy_pass[[:space:]]+http://127\.0\.0\.1:(18000|18001)' \
-            || true
+          if [ -n "$nginx_dump" ]; then
+            printf '%s\n' "$nginx_dump" \
+              | grep -nE 'configuration file |server_name[[:space:]]+qt-agent\.kro\.kr|location[[:space:]]+/ai-api/|proxy_pass[[:space:]]+http://127\.0\.0\.1:(18000|18001)' \
+              || true
+          fi
 
           "$APP_DIR/ai/.venv/bin/python" - <<'PY'
           import json
