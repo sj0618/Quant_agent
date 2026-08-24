@@ -3790,6 +3790,7 @@ def _metric_detail(key: str, value: float | None) -> PublicMetricDetail:
         registry_version=registry["registry_version"],
         provenance=PublicMetricProvenance(
             implementation_path=registry["implementation_path"],
+            implementation_ref=registry["implementation_ref"],
             implementation_hash=registry["implementation_hash"],
         ),
     )

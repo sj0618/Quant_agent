@@ -440,6 +440,7 @@ class PublicMetricProvenance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     implementation_path: str = Field(min_length=1)
+    implementation_ref: str = Field(min_length=1)
     implementation_hash: str = Field(min_length=64, max_length=64)
 
 

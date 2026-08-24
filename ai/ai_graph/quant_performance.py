@@ -683,6 +683,7 @@ def _metric_detail(
         registry_version=registry["registry_version"],
         provenance=PublicMetricProvenance(
             implementation_path=registry["implementation_path"],
+            implementation_ref=registry["implementation_ref"],
             implementation_hash=registry["implementation_hash"],
         ),
     )
