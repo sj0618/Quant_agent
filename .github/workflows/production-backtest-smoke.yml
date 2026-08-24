@@ -14,6 +14,7 @@ on:
           - live-full-analysis
           - live-audit
           - server-diagnostics
+          - analysis-job-inventory
           - trace-diagnostic
 
 permissions:
@@ -84,6 +85,101 @@ jobs:
           free -h
           df -h /tmp
           ps -eo pid,ppid,etime,pcpu,pmem,rss,stat,comm,args --sort=-pcpu | sed -n '1,30p'
+          REMOTE
+
+      - name: Inventory analysis job rows against the decodability contract
+        if: ${{ inputs.mode == 'analysis-job-inventory' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="$1"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          test -s "$PID_FILE"
+          PID="$(cat "$PID_FILE")"
+          [[ "$PID" =~ ^[1-9][0-9]*$ ]]
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) export "$entry" ;;
+            esac
+          done < "/proc/$PID/environ"
+          cd "$APP_DIR/ai"
+          "$APP_DIR/ai/.venv/bin/python" -u <<'PY'
+          # Read-only. Reports what migration 023 did and whether the live table now
+          # satisfies the decodability contract it was supposed to close.
+          import json
+          import psycopg
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+
+          DECODABLE = """(
+              COALESCE(jsonb_typeof(job_jsonb -> 'execution_manifest'), 'absent') = 'object'
+              AND job_jsonb #>> '{execution_manifest,schema_version}' = '1'
+              AND job_jsonb #>> '{execution_manifest,contract_hash}' ~ '^[0-9a-f]{64}$'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,run_identity}'), 'absent') = 'object'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,policy_hashes}'), 'absent') = 'object'
+              AND job_jsonb #> '{execution_manifest,policy_hashes}' <> '{}'::jsonb
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,session}'), 'absent') = 'object'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,capabilities}'), 'absent') = 'object'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,signals}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,orders}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,fills}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,positions}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,trades}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,equity}'), 'absent') = 'array'
+              AND (
+                  COALESCE(jsonb_typeof(job_jsonb #> '{result,performance}'), 'absent') <> 'object'
+                  OR job_jsonb #>> '{result,performance,availability}' IN ('available', 'unavailable')
+              )
+          ) IS TRUE"""
+
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is not configured")
+          with psycopg.connect(dsn) as conn:
+              live = conn.execute(
+                  "SELECT job_jsonb ->> 'status',"
+                  " COALESCE(jsonb_typeof(job_jsonb -> 'execution_manifest'), 'absent'),"
+                  " count(*), min(created_at)::date::text, max(created_at)::date::text"
+                  " FROM app.ai_analysis_job GROUP BY 1, 2 ORDER BY 3 DESC"
+              ).fetchall()
+              undecodable_left = conn.execute(
+                  f"SELECT count(*) FROM app.ai_analysis_job WHERE NOT {DECODABLE}"
+              ).fetchone()[0]
+              archived = conn.execute(
+                  "SELECT archive_reason, count(*), min(created_at)::date::text,"
+                  " max(created_at)::date::text, max(archived_at)::date::text"
+                  " FROM app.ai_analysis_job_legacy GROUP BY 1 ORDER BY 2 DESC"
+              ).fetchall()
+              constraints = conn.execute(
+                  "SELECT conname, convalidated FROM pg_constraint"
+                  " WHERE conrelid = 'app.ai_analysis_job'::regclass AND contype = 'c'"
+                  " ORDER BY conname"
+              ).fetchall()
+
+          print(json.dumps({
+              "live_rows": [
+                  {"status": row[0], "manifest": row[1], "count": row[2],
+                   "oldest": row[3], "newest": row[4]}
+                  for row in live
+              ],
+              "live_total": sum(row[2] for row in live),
+              "undecodable_still_live": undecodable_left,
+              "archived": [
+                  {"reason": row[0], "count": row[1], "oldest": row[2],
+                   "newest": row[3], "archived_at": row[4]}
+                  for row in archived
+              ],
+              "archived_total": sum(row[1] for row in archived),
+              "check_constraints": {name: validated for name, validated in constraints},
+          }, ensure_ascii=False, sort_keys=True))
+          PY
           REMOTE
 
       - name: Run live AOAI and branch backtest benchmarks

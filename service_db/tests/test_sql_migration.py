@@ -319,6 +319,38 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         self.assertIn(") IS NOT TRUE", sql)
         self.assertIn(") IS TRUE);", sql)
 
+    def test_production_inventory_measures_the_predicate_the_migration_enforces(self):
+        """The server-side inventory has to ask the same question the CHECK answers.
+
+        It reports how many live rows would still fail the decodability contract, which is
+        only meaningful evidence if its predicate is the constraint's predicate.
+        """
+
+        import textwrap
+
+        workflow = (
+            SERVICE_DB_ROOT.parents[0] / ".github/workflows/production-backtest-smoke.yml"
+        ).read_text(encoding="utf-8")
+        block = workflow[workflow.index("Inventory analysis job rows") :]
+        start = block.index("<<'PY'\n") + len("<<'PY'\n")
+        script = textwrap.dedent(block[start : block.index("\n          PY\n", start)])
+        namespace: dict = {}
+        header = script.split("dsn, _ =")[0]
+        for import_line in (
+            "import psycopg\n",
+            "from ai_graph.data_sources.db import resolve_database_dsn_from_env\n",
+        ):
+            header = header.replace(import_line, "")
+        exec(header, namespace)  # noqa: S102 - the fragment under test is a literal in this repo
+
+        sql = (SERVICE_DB_ROOT / "migrations" / ARCHIVE_MIGRATION).read_text(encoding="utf-8")
+        opening = "ADD CONSTRAINT ai_analysis_job_decodable_document_check CHECK (("
+        body = _between(sql, opening, ") IS TRUE);")
+        self.assertEqual(
+            _normalized(namespace["DECODABLE"]),
+            "( " + _normalized(body) + " ) IS TRUE",
+        )
+
     def test_archive_migration_is_registered_everywhere_it_has_to_run(self):
         verifier = load_replay_verifier()
         self.assertIn(ARCHIVE_MIGRATION, verifier.FIXED_MIGRATIONS)
