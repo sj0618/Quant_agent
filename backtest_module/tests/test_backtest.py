@@ -865,3 +865,48 @@ def test_unscored_buy_never_outranks_a_measured_one():
     )
 
     assert filled == ["000990"]
+
+
+def losing_bars(ticker="005930"):
+    """Same signal shape as `bars()`, but the exit fills below the entry."""
+    return [
+        OhlcvBar(date=date(2026, 1, 2), ticker=ticker, open=100, high=105, low=95, close=104, volume=1000),
+        OhlcvBar(date=date(2026, 1, 5), ticker=ticker, open=110, high=112, low=104, close=106, volume=1000),
+        OhlcvBar(date=date(2026, 1, 6), ticker=ticker, open=105, high=107, low=96, close=98, volume=1000),
+        OhlcvBar(date=date(2026, 1, 7), ticker=ticker, open=90, high=92, low=88, close=91, volume=1000),
+    ]
+
+
+def test_profit_factor_is_measured_from_realized_trade_pnl():
+    """Gross trade profit over gross trade loss, and undefined when there is no loss.
+
+    The AI layer used to publish `win_rate / (1 - win_rate)` capped at 3.0 under this
+    name, so the figure moved with the hit rate and not with what the trades earned.
+    """
+
+    winning = run_backtest(
+        rsi_spec(),
+        ohlcv_rows=bars(),
+        metric_rows=rsi_metrics(),
+        config=BacktestRunConfig(initial_capital=1000, write_outputs=False),
+    )
+
+    assert winning.summary["trade_count"] == 1
+    assert winning.summary["gross_trade_profit"] == pytest.approx(winning.trades[0].net_pnl)
+    assert winning.summary["gross_trade_loss"] == 0.0
+    # No losing trade to divide by: undefined, not a capped stand-in.
+    assert winning.summary["trade_profit_factor"] is None
+
+    losing = run_backtest(
+        rsi_spec(),
+        ohlcv_rows=losing_bars(),
+        metric_rows=rsi_metrics(),
+        config=BacktestRunConfig(initial_capital=1000, write_outputs=False),
+    )
+
+    assert losing.summary["trade_count"] == 1
+    assert losing.trades[0].net_pnl < 0
+    assert losing.summary["gross_trade_profit"] == 0.0
+    assert losing.summary["gross_trade_loss"] == pytest.approx(-losing.trades[0].net_pnl)
+    # Zero profit against a real loss is a measured 0.0, not an unavailable metric.
+    assert losing.summary["trade_profit_factor"] == 0.0
