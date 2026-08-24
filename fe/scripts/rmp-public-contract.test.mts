@@ -16,7 +16,7 @@ test("archived report readers expose only immutable identifiers and allow-listed
   assert.match(list, /읽기 전용 결과 스냅샷/);
   assert.match(list, /결과 ID \{report\.id\}/);
   assert.doesNotMatch(list, /recommendationScore|report\.signals|resendReportEmail|copyReportShareLink/);
-  assert.match(detail, /READER_EVIDENCE_SECTION_IDS/);
+  assert.match(detail, /READER_EVIDENCE_SECTION_TITLES/);
   assert.match(detail, /reproduction_contract/);
   assert.match(detail, /metric_registry/);
   assert.match(detail, /ResultTrustLinks/);

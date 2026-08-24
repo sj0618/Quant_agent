@@ -11,7 +11,7 @@ test("read-only reports never fall back to demo numbers or expose legacy perform
   ]);
 
   assert.match(adapter, /backendRequest/);
-  assert.match(reportDetail, /READER_EVIDENCE_SECTION_IDS/);
+  assert.match(reportDetail, /READER_EVIDENCE_SECTION_TITLES/);
   assert.doesNotMatch(adapter, /BASELINE_RETURN_PERCENT/);
   assert.doesNotMatch(adapter, /\+92\.4/);
   assert.doesNotMatch(reportDetail, /\+92\.4|Sharpe 1\.42/);

@@ -3,21 +3,96 @@ import { Card } from "../../components/common/Card";
 import { PublicClaimDisclosure } from "../../components/common/PublicClaimDisclosure";
 import { ResultTrustLinks } from "../../components/common/ResultTrustLinks";
 import { ROUTES } from "../../config/routes";
-import type { ArchivedReportDetail, PersistedReportSection } from "../../types/quantagent";
+import type { ArchivedReportDetail, PersistedReportEntry, PersistedReportSection } from "../../types/quantagent";
 
 interface ReportDetailProps {
   report: ArchivedReportDetail;
 }
 
-const READER_EVIDENCE_SECTION_IDS = new Set(["reproduction_contract", "metric_registry"]);
+const READER_EVIDENCE_SECTION_TITLES = {
+  reproduction_contract: "검증 재현 계약",
+  metric_registry: "퀀트 지표 산출 계약",
+} as const;
+const REPRODUCTION_CONTRACT_LABELS = new Set([
+  "재현 계약 버전",
+  "입력 해시",
+  "출력 해시",
+  "데이터 지문",
+  "전략 지문",
+  "후보 지문",
+  "엔진 버전",
+  "피처 버전",
+  "지표 수식 버전",
+  "기준일",
+  "선정 후보 ID",
+]);
+const NON_FINITE_EVIDENCE_TEXT = /(?:^|[^\p{L}\p{N}])(?:nan|[+-]?(?:infinity|inf)|[+-]?∞)(?=$|[^\p{L}\p{N}])/iu;
+const ENGLISH_ACTION_EVIDENCE_TEXT = /(?:^|[^\p{L}\p{N}])(?:buy|sell|hold|drop|recommend(?:ation)?)(?=$|[^\p{L}\p{N}])/iu;
+const KOREAN_ACTION_EVIDENCE_TEXT = /매수|매도|추천|관망/u;
+
+type ReaderEvidenceSectionId = keyof typeof READER_EVIDENCE_SECTION_TITLES;
 
 function readerEvidenceSections(report: ArchivedReportDetail) {
-  return (report.contentSections ?? []).filter((section) => (
-    typeof section.id === "string"
-    && READER_EVIDENCE_SECTION_IDS.has(section.id)
-    && Array.isArray(section.entries)
-    && section.entries.length > 0
-  ));
+  let hasUnavailableEvidence = false;
+  const sections = (report.contentSections ?? []).flatMap((section) => {
+    const sectionId = section.id;
+    if (
+      typeof sectionId !== "string"
+      || !isReaderEvidenceSectionId(sectionId)
+      || !Array.isArray(section.entries)
+      || section.entries.length === 0
+    ) {
+      return [];
+    }
+
+    const entries = section.entries.map((entry) => {
+      if (isReaderEvidenceEntry(sectionId, entry)) {
+        return {
+          ...entry,
+          label: sectionId === "metric_registry" ? "지표 산출식" : entry.label,
+        };
+      }
+      hasUnavailableEvidence = true;
+      return {
+        ...entry,
+        label: "검증 계약 값",
+        value: "검증 불가",
+        description: "보관된 계약 값이 안전하게 표시될 수 없어 숨겼습니다.",
+      };
+    });
+    const note = readerEvidenceNote(sectionId, section.note);
+    if (note !== section.note) hasUnavailableEvidence = true;
+    return [{ id: sectionId, title: READER_EVIDENCE_SECTION_TITLES[sectionId], note, entries }];
+  });
+  return { sections, hasUnavailableEvidence };
+}
+
+function isReaderEvidenceSectionId(value: string): value is ReaderEvidenceSectionId {
+  return Object.hasOwn(READER_EVIDENCE_SECTION_TITLES, value);
+}
+
+function isReaderEvidenceEntry(sectionId: ReaderEvidenceSectionId, entry: PersistedReportEntry) {
+  if (sectionId === "reproduction_contract" && !REPRODUCTION_CONTRACT_LABELS.has(entry.label ?? "")) {
+    return false;
+  }
+  return ![entry.label, entry.value, entry.description].some(hasUnsafeEvidenceText);
+}
+
+function readerEvidenceNote(sectionId: ReaderEvidenceSectionId, value: string | null | undefined) {
+  return sectionId === "metric_registry"
+    && typeof value === "string"
+    && /^수식 레지스트리 버전: quant-metric-registry\.v\d+$/.test(value)
+    && !hasUnsafeEvidenceText(value)
+    ? value
+    : undefined;
+}
+
+function hasUnsafeEvidenceText(value: string | null | undefined) {
+  return typeof value === "string" && (
+    NON_FINITE_EVIDENCE_TEXT.test(value)
+    || ENGLISH_ACTION_EVIDENCE_TEXT.test(value)
+    || KOREAN_ACTION_EVIDENCE_TEXT.test(value)
+  );
 }
 
 /**
@@ -27,7 +102,7 @@ function readerEvidenceSections(report: ArchivedReportDetail) {
  * a legacy score, action signal, candidate ranking, or generated narrative.
  */
 export function ReportDetail({ report }: ReportDetailProps) {
-  const evidenceSections = readerEvidenceSections(report);
+  const { sections: evidenceSections, hasUnavailableEvidence } = readerEvidenceSections(report);
   const version = report.updatedAt ?? report.publishedAt ?? report.createdAt ?? null;
 
   return (
@@ -76,8 +151,13 @@ export function ReportDetail({ report }: ReportDetailProps) {
             <div><dt>현재 검증 상태</dt><dd>현재 검증할 수 없음</dd></div>
             <div><dt>보관 기준일</dt><dd>{report.date || "기준일 미확인"}</dd></div>
             <div><dt>표시 출처</dt><dd>보관된 검증 재현·지표 계약</dd></div>
+            <div><dt>최소 입력 충족 여부</dt><dd>보관된 계약만으로는 확인할 수 없음</dd></div>
+            <div><dt>행동 판단</dt><dd>제공하지 않음</dd></div>
             <div><dt>다음 행동</dt><dd><a href={ROUTES.reports}>보관 리포트 목록으로 돌아가기</a></dd></div>
           </dl>
+          {hasUnavailableEvidence ? (
+            <p role="status">보관된 지표 계약 중 유한하지 않거나 행동 판단으로 해석될 수 있는 값이 있어 숫자를 표시하지 않았습니다.</p>
+          ) : null}
           <PublicClaimDisclosure claimKey="archivedSnapshot" asOf={report.date || undefined} />
         </section>
 
