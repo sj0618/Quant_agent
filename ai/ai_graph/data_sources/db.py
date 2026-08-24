@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.quant_strategy import rsi_trade_rules
+from ai_graph.freshness import classify_source_freshness
 from ai_graph.immutable_snapshot import build_snapshot_bundle
 from ai_graph.source_manifest import build_source_manifest
 
@@ -44,7 +45,9 @@ TRADING_DAYS_PER_YEAR = 252
 # number of bars: the manifest records the resolved sessions for reproducibility.
 BACKTEST_EVALUATION_YEARS = 5
 DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * BACKTEST_EVALUATION_YEARS
-BACKTEST_WINDOW_POLICY_ID = "krx_pit_common_stock_5y_kst_session_v1"
+# v2 ends the window on the last closed session; v1 ended it on today's, so a
+# result carrying either id is not comparable to one carrying the other.
+BACKTEST_WINDOW_POLICY_ID = "krx_pit_common_stock_5y_kst_settled_session_v2"
 DEFAULT_L4_EVIDENCE_LIMIT = 5
 # A broad screen can match many names, but recommendations never define historical
 # membership. They are presentation output only.
@@ -464,10 +467,15 @@ class PostgresPipelineDataSource:
                 *[INDICATOR_TABLES[family] for family in indicator_families],
             ],
         )
+        data_as_of = _max_price_row_date(price_rows)
+        freshness_status, freshness_reason = classify_source_freshness(
+            data_as_of=data_as_of,
+            settled_session=backtest_window["end"],
+        )
         source_manifest = build_source_manifest(
             source="postgres",
             as_of=backtest_window["end"],
-            freshness="unknown",
+            freshness=freshness_status,
             lineage_refs=[
                 KIS_ADJUSTED_OHLCV_TABLE,
                 PIT_UNIVERSE_VIEW,
@@ -496,6 +504,10 @@ class PostgresPipelineDataSource:
                 "source": "postgres",
                 "immutable_snapshot_bundle": snapshot_bundle.model_dump(mode="json"),
                 "source_manifest": source_manifest.model_dump(mode="json"),
+                # The manifest's as_of is the window this load targeted; these two say
+                # how far the data behind it actually reaches, and why that is fresh.
+                "freshness_as_of": data_as_of.isoformat() if data_as_of else None,
+                "freshness_reason": freshness_reason,
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
@@ -1140,14 +1152,21 @@ class PostgresPipelineDataSource:
         return timelines
 
     def _resolve_backtest_window(self, conn: Any) -> dict[str, Any] | None:
-        """Resolve the exact five-calendar-year KST-KRX session window once."""
+        """The five-calendar-year KST-KRX window ending on the last *closed* session.
+
+        Today is excluded on purpose. A session's close only exists once it has
+        happened, so a run started while the market is open would otherwise backtest
+        and recommend against a bar that is still moving. Ending on the previous
+        session means the last close the strategy acts on is a settled one, and it
+        also makes the freshness reference and the backtest end the same date.
+        """
         row = conn.execute(
             """
             WITH cutoff AS (
                 SELECT max(trade_date) AS session_end
                 FROM core.trading_calendar
                 WHERE is_open
-                  AND trade_date <= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
+                  AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
             ), sessions AS (
                 SELECT c.trade_date
                 FROM core.trading_calendar c
@@ -3014,6 +3033,17 @@ def _date_value(value: Any) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def _max_price_row_date(price_rows: Sequence[Mapping[str, Any]]) -> date | None:
+    """The newest trade date the loaded rows actually carry."""
+
+    dates = [
+        parsed
+        for row in price_rows
+        if (parsed := _optional_date_value(row.get("date"))) is not None
+    ]
+    return max(dates) if dates else None
 
 
 def _optional_date_value(value: Any) -> date | None:

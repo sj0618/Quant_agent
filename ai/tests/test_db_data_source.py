@@ -588,7 +588,7 @@ def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     assert bundle.metadata["price_source"] == "feature.kis_adjusted_ohlcv_daily"
     assert "feature.ta_momentum_ticker_daily" in bundle.metadata["indicator_sources"]
     assert bundle.metadata["l4_evidence_source"] == "raw.analyst_report_summary"
-    assert bundle.metadata["backtest_window_policy_id"] == "krx_pit_common_stock_5y_kst_session_v1"
+    assert bundle.metadata["backtest_window_policy_id"] == "krx_pit_common_stock_5y_kst_settled_session_v2"
     assert any(row.get("rsi", 100) <= RSI_OVERSOLD_THRESHOLD for row in bundle.price_rows)
 
 
@@ -1390,6 +1390,30 @@ def test_fixed_window_uses_kst_calendar_sessions_and_manifest_values() -> None:
     assert "Asia/Seoul" in connection.query
     assert "INTERVAL '5 years'" in connection.query
     assert "feature.kis_adjusted_ohlcv_daily" not in connection.query
+
+
+def test_window_ends_on_the_last_closed_session_not_todays() -> None:
+    """Today's bar is still moving, so it is not something to backtest or recommend on."""
+
+    class Connection:
+        def __init__(self) -> None:
+            self.query = ""
+
+        def execute(self, query: str) -> FakeResult:
+            self.query = query
+            return FakeResult(row={
+                "session_start": date(2021, 8, 12),
+                "session_end": date(2026, 8, 11),
+                "session_count": 1_229,
+            })
+
+    connection = Connection()
+    source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+    source._resolve_backtest_window(connection)
+
+    cutoff = connection.query.split("), sessions AS")[0]
+    assert "trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date" in cutoff
+    assert "trade_date <= (CURRENT_TIMESTAMP" not in cutoff
 
 
 

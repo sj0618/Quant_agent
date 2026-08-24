@@ -23,6 +23,35 @@ def _parse_as_of(value: Any) -> date | None:
     return None
 
 
+def classify_source_freshness(
+    *,
+    data_as_of: date | None,
+    settled_session: date | None,
+) -> tuple[FreshnessStatus, str]:
+    """Decide freshness against the last trading session that has already closed.
+
+    The reference is the previous session rather than today's, because KRX EOD rows
+    only land after the close: a run started while the market is still open is not
+    stale merely because today's bar does not exist yet. Anything at or past that
+    session is fresh, so a load that already carries today's bar stays fresh too.
+    """
+
+    if settled_session is None:
+        return "unknown", "직전 개장일을 확인할 수 없어 freshness를 판정하지 못했습니다."
+    if data_as_of is None:
+        return "unknown", "적재된 가격 데이터의 기준일을 확인할 수 없습니다."
+    if data_as_of >= settled_session:
+        return (
+            "fresh",
+            f"가격 데이터가 직전 개장일({settled_session.isoformat()})까지 적재돼 있습니다.",
+        )
+    return (
+        "stale",
+        f"가격 데이터가 {data_as_of.isoformat()}까지만 적재돼 직전 개장일"
+        f"({settled_session.isoformat()})에 {(settled_session - data_as_of).days}일 뒤처져 있습니다.",
+    )
+
+
 def build_freshness_evidence(
     pipeline_metadata: Mapping[str, Any] | None,
 ) -> FreshnessEvidence:
@@ -50,7 +79,11 @@ def build_freshness_evidence(
         raw_status if raw_status in KNOWN_FRESHNESS_STATUSES else "unknown"
     )  # type: ignore[assignment]
     source = str(manifest.get("source") or "unknown")
-    as_of = _parse_as_of(manifest.get("as_of"))
+    as_of = _parse_as_of(
+        pipeline_metadata.get("freshness_as_of")
+        if pipeline_metadata.get("freshness_as_of") is not None
+        else manifest.get("as_of")
+    )
     configured_reason = pipeline_metadata.get("freshness_reason")
     if isinstance(configured_reason, str) and configured_reason.strip():
         reason = configured_reason.strip()

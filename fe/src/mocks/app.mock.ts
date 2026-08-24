@@ -212,21 +212,21 @@ export const tradingCandidates: TradingCandidate[] = [
 
 // Shaped exactly like `BacktestPerformance.evaluation_basis`, so the demo cannot describe
 // a period the backend would never report. The fixed five-year window matches the loader's
-// krx_pit_common_stock_5y_kst_session_v1 policy.
+// krx_pit_common_stock_5y_kst_settled_session_v2 policy.
 export const evaluationBasis: AIBacktestEvaluationBasis = {
   basis: "hold_out",
   caption: "2021-08-23~2026-08-21 구간 중 마지막 30% 검증 구간 누적 · 거래비용 반영",
   hold_out_fraction: 0.3,
   window_start: "2021-08-23",
   window_end: "2026-08-21",
-  window_policy_id: "krx_pit_common_stock_5y_kst_session_v1",
+  window_policy_id: "krx_pit_common_stock_5y_kst_settled_session_v2",
   cost_model_applied: true,
 };
 
 export const universePolicy: AIBacktestUniversePolicy = {
   summary:
     "백테스트는 과거 시점(PIT) 기준으로 그 시점에 상장돼 있던 종목만 거래해 규칙 자체를 검증하고, 오늘의 추천 종목은 같은 규칙을 오늘 데이터에 적용한 결과입니다. 두 목록이 서로 다른 것은 정상입니다.",
-  policy_id: "krx_pit_common_stock_5y_kst_session_v1",
+  policy_id: "krx_pit_common_stock_5y_kst_settled_session_v2",
   window_start: "2021-08-23",
   window_end: "2026-08-21",
   traded_ticker_count: 812,

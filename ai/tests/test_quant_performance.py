@@ -552,7 +552,7 @@ def test_public_performance_states_the_hold_out_basis_of_its_numbers() -> None:
         price_rows=_rows(datetime(2024, 1, 1), 252, ticker_count=5),
         pipeline_data_source={
             "source": "postgres",
-            "backtest_window_policy_id": "krx_pit_common_stock_5y_kst_session_v1",
+            "backtest_window_policy_id": "krx_pit_common_stock_5y_kst_settled_session_v2",
         },
     )
 
@@ -563,7 +563,7 @@ def test_public_performance_states_the_hold_out_basis_of_its_numbers() -> None:
     assert basis.hold_out_fraction == 0.3
     assert basis.window_start == "2021-08-23"
     assert basis.window_end == "2026-08-21"
-    assert basis.window_policy_id == "krx_pit_common_stock_5y_kst_session_v1"
+    assert basis.window_policy_id == "krx_pit_common_stock_5y_kst_settled_session_v2"
     assert "마지막 30% 검증 구간" in basis.caption
     assert "2021-08-23~2026-08-21" in basis.caption
 
@@ -648,7 +648,7 @@ def test_universe_policy_discloses_candidates_the_backtest_could_not_trade() -> 
         pipeline_data_source={
             "source": "postgres",
             "pit_member_count": 812,
-            "backtest_window_policy_id": "krx_pit_common_stock_5y_kst_session_v1",
+            "backtest_window_policy_id": "krx_pit_common_stock_5y_kst_settled_session_v2",
             "backtest_universe": {
                 "as_of_start": "2021-08-23",
                 "as_of_end": "2026-08-21",

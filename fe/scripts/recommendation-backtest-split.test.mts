@@ -53,7 +53,7 @@ test("the demo fixture never claims a period or a benchmark the backend does not
 
   assert.match(mock, /evaluationBasis: AIBacktestEvaluationBasis/);
   assert.match(mock, /basis: "hold_out"/);
-  assert.match(mock, /krx_pit_common_stock_5y_kst_session_v1/);
+  assert.match(mock, /krx_pit_common_stock_5y_kst_settled_session_v2/);
   assert.match(mock, /universePolicy: AIBacktestUniversePolicy/);
   assert.match(mock, /verification_complete: false/);
   // Copy for validations this engine has never run, and a ten-year window the
