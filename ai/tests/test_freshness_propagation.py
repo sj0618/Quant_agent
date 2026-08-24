@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from datetime import date
 
-from ai_graph.freshness import build_freshness_evidence, classify_source_freshness
-from ai_graph.graph import _recommendation_gate, _ticker_actions
+import pytest
+
+from ai_graph.data_sources import PipelineDataBundle
+from ai_graph.freshness import (
+    build_freshness_evidence,
+    classify_source_freshness,
+    withhold_recommendations_without_l4_evidence,
+)
+from ai_graph.graph import _recommendation_gate, _ticker_actions, data_node
 from ai_graph.nodes.report import build_report_bundle
 from ai_graph.schemas import (
     Condition,
@@ -168,6 +175,69 @@ def test_stale_load_still_withholds_recommendations() -> None:
     }
 
     assert _ticker_actions(state, []) == []
+
+
+@pytest.mark.parametrize("l4_evidence", [None, []])
+def test_missing_l4_evidence_withholds_recommendations_even_when_price_data_is_fresh(
+    l4_evidence: list[dict[str, object]] | None,
+) -> None:
+    evidence = withhold_recommendations_without_l4_evidence(
+        build_freshness_evidence(
+            _pipeline_metadata("fresh", reason="가격 데이터가 직전 개장일까지 적재돼 있습니다.")
+        ),
+        l4_evidence=l4_evidence,
+    )
+
+    assert evidence.status == "fresh"
+    assert evidence.no_recommendation is True
+    assert "L4" in evidence.reason
+    gate = _recommendation_gate({"freshness_evidence": evidence.model_dump()})
+    assert gate is not None
+    assert gate.validated is False
+    assert gate.reason == evidence.reason
+    assert _ticker_actions(
+        {
+            "freshness_evidence": evidence.model_dump(),
+            "backtest": {"ticker_actions": [_ticker_action()]},
+        },
+        [],
+    ) == []
+
+    report = build_report_bundle(
+        make_strategy(),
+        RiskDecision(
+            signal=SignalDecision(
+                action="NO_RECOMMENDATION",
+                confidence=0.0,
+                judge_reason=evidence.reason,
+            )
+        ),
+        data={"pipeline_data_source": _pipeline_metadata("fresh")},
+        l4_evidence=l4_evidence,
+    )
+    assert "NO_RECOMMENDATION" in report.web_projection.summary
+    assert "NO_RECOMMENDATION" in report.email_projection.summary
+
+
+@pytest.mark.parametrize("l4_evidence", [None, []])
+def test_data_node_withholds_recommendations_when_fresh_postgres_has_no_l4_evidence(
+    monkeypatch,
+    l4_evidence: list[dict[str, object]] | None,
+) -> None:
+    bundle = PipelineDataBundle(
+        l4_evidence=[] if l4_evidence is None else l4_evidence,
+        data_availability={},
+        metadata=_pipeline_metadata("fresh", reason="가격 데이터가 직전 개장일까지 적재돼 있습니다."),
+    )
+    monkeypatch.setattr("ai_graph.graph.load_pipeline_data_from_env", lambda *_: bundle)
+
+    data = data_node({"user_query": "RSI가 30 이하인 KOSPI200", "trace_id": "l4-absent"})
+
+    assert data["freshness_evidence"]["status"] == "fresh"
+    assert data["freshness_evidence"]["no_recommendation"] is True
+    assert "L4" in data["freshness_evidence"]["reason"]
+    assert "l4_evidence" in data
+    assert data["l4_evidence"] == []
 
 
 def test_evidence_reports_the_date_the_data_actually_reaches() -> None:

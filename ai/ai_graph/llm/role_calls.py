@@ -18,7 +18,6 @@ from ai_graph.schemas import (
     MarketBriefItem,
 )
 
-
 _logger = logging.getLogger(__name__)
 
 ROLE_DEBATE_SCHEMA_NAME = "quantagent.role_debate.v1"
@@ -253,14 +252,22 @@ def generate_daily_digest_overall_comment(
         "comparison_rows": [row.model_dump() for row in comparison_rows],
     }
     fallback_summary = " ".join(
-        f"{row.name}은(는) 오늘 {row.today_signal} 신호이며 {row.status} 상태입니다."
+        (
+            f"{row.name}은(는) L4 근거 부족으로 오늘 추천을 생성하지 않았습니다."
+            if row.today_signal == "NO_RECOMMENDATION"
+            else f"{row.name}은(는) 오늘 {row.today_signal} 신호이며 {row.status} 상태입니다."
+        )
         for row in comparison_rows
     )
+    if any(row.today_signal == "NO_RECOMMENDATION" for row in comparison_rows):
+        return fallback_summary
     payload = generate_role_debate(
         role="DIGEST_JUDGE",
         task=(
             "Compare the subscribed strategies for today and recommend how the user "
-            "should react across all of them together, in 2-4 Korean sentences."
+            "should react across all of them together, in 2-4 Korean sentences. If a strategy "
+            "has today_signal NO_RECOMMENDATION, state that its supporting L4 evidence is absent "
+            "and do not infer a trading instruction for it."
         ),
         context=context,
         fallback=RoleDebatePayload(
@@ -907,7 +914,7 @@ def generate_screening_sql(
 
 
 def _clean_structured_conditions(
-    conditions: list["_LiveStructuredCondition"],
+    conditions: list[_LiveStructuredCondition],
 ) -> list[dict[str, Any]]:
     cleaned: list[dict[str, Any]] = []
     for condition in conditions:

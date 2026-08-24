@@ -7,7 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ai_graph.schemas import L4Evidence, SignalDecision as InvestmentSignalDecision
+from ai_graph.schemas import L4Evidence
+from ai_graph.schemas import SignalDecision as InvestmentSignalDecision
 
 SignalAction = Literal["BUY", "SELL", "HOLD", "WATCH"]
 
@@ -31,7 +32,7 @@ class SignalCondition(BaseModel):
     description: str | None = None
 
     @model_validator(mode="after")
-    def validate_right_shape(self) -> "SignalCondition":
+    def validate_right_shape(self) -> SignalCondition:
         if self.operator == ConditionOperator.BETWEEN:
             if not isinstance(self.right, list) or len(self.right) != 2:
                 raise ValueError("between requires two numeric bounds")
@@ -174,6 +175,16 @@ def build_investment_signal(
     l4_evidence: list[dict[str, Any]] | None = None,
     debate: dict[str, Any] | None = None,
 ) -> InvestmentSignalDecision:
+    evidence = [L4Evidence.model_validate(item) for item in l4_evidence or []]
+    if not evidence:
+        return InvestmentSignalDecision(
+            action="NO_RECOMMENDATION",
+            confidence=0.0,
+            bear_case=["추천을 뒷받침할 L4 근거가 없습니다."],
+            judge_reason="L4 근거가 없어 추천을 생성하지 않습니다.",
+            l4_evidence=[],
+        )
+
     selected = backtest.get("selected_candidate") or {}
     metrics = selected.get("metrics") or {}
     sharpe = float(metrics.get("sharpe_ratio", 0.0))
@@ -206,8 +217,6 @@ def build_investment_signal(
         action = "HOLD"
         confidence = 0.68
         judge_reason = "Evidence is usable but not strong enough for BUY."
-    evidence_items = default_l4_evidence(trace_id or "trace") if l4_evidence is None else l4_evidence
-    evidence = [L4Evidence.model_validate(item) for item in evidence_items]
     return InvestmentSignalDecision(
         action=action,
         confidence=confidence,
@@ -216,24 +225,6 @@ def build_investment_signal(
         judge_reason=judge_reason,
         l4_evidence=evidence,
     )
-
-
-def default_l4_evidence(trace_id: str) -> list[dict[str, Any]]:
-    published = datetime(2026, 5, 19, 9, 0, 0)
-    retrieved = datetime(2026, 5, 19, 9, 1, 0)
-    return [
-        {
-            "publisher": "QuantAgent fixture",
-            "published_at": published,
-            "retrieved_at": retrieved,
-            "freshness_days": 0,
-            "dedupe_group": f"{trace_id}:fixture:l4",
-            "access_status": "fixture",
-            "quality_note": "MVP fixture evidence until production adapters are connected.",
-        }
-    ]
-
-
 def _matching_rules(
     rules: list[SignalCondition], logic: str, metrics: dict[str, float]
 ) -> list[str]:
