@@ -21,7 +21,11 @@ from ai_graph.nodes.backtest import (
     _summary_warning_list,
     _undefined_metric_availability,
 )
-from ai_graph.quant_explanations import PUBLIC_METRIC_KEYS, metric_explanation
+from ai_graph.quant_explanations import (
+    PUBLIC_METRIC_KEYS,
+    metric_explanation,
+    metric_registry_provenance,
+)
 from ai_graph.quant_strategy import build_strategy_explanation
 from ai_graph.research_eligibility import (
     PerformanceAvailable,
@@ -36,6 +40,7 @@ from ai_graph.schemas import (
     CandidateBacktestResult,
     FreshnessEvidence,
     PublicMetricDetail,
+    PublicMetricProvenance,
 )
 
 _RELIABILITY_SHORT_TERM_DAYS = 30
@@ -660,6 +665,7 @@ def _metric_detail(
     unavailable_reason: str | None = None,
 ) -> PublicMetricDetail:
     explanation = metric_explanation(key)
+    registry = metric_registry_provenance(key)
     is_available = _is_numeric_metric(value)
     return PublicMetricDetail(
         key=key,
@@ -674,6 +680,11 @@ def _metric_detail(
         why_used=explanation["why_used"],
         caution=explanation["caution"],
         source_refs=list(explanation.get("source_refs", [])),
+        registry_version=registry["registry_version"],
+        provenance=PublicMetricProvenance(
+            implementation_path=registry["implementation_path"],
+            implementation_hash=registry["implementation_hash"],
+        ),
     )
 
 
