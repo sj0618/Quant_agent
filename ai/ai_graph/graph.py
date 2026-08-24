@@ -62,7 +62,12 @@ from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
 from ai_graph.preflight import classify_research_request
-from ai_graph.progress import raise_if_cancelled, report_activity, report_node_stage
+from ai_graph.progress import (
+    raise_if_cancelled,
+    raise_if_past_deadline,
+    report_activity,
+    report_node_stage,
+)
 from ai_graph.quant_explanations import metric_explanation
 from ai_graph.quant_strategy import (
     classify_strategy_request,
@@ -328,9 +333,10 @@ def instrument_node(
     node: Callable[[QuantAgentState], QuantAgentState | dict[str, Any]],
 ) -> Callable[[QuantAgentState], QuantAgentState | dict[str, Any]]:
     def wrapped(state: QuantAgentState) -> QuantAgentState | dict[str, Any]:
-        # Node boundaries are the checkpoints: a cancelled run stops here rather than
-        # paying for the remaining nodes.
+        # Node boundaries are the checkpoints: a cancelled run, or one that has spent
+        # its whole time budget, stops here rather than paying for the remaining nodes.
         raise_if_cancelled()
+        raise_if_past_deadline()
         # Announce the stage before the node runs so a polling client sees the work
         # it is actually waiting on, not the stage it already finished.
         report_node_stage(name)

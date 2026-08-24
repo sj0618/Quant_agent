@@ -28,7 +28,11 @@ from ai_graph.nodes.position_sizing import (
 from ai_graph.nodes.position_sizing import (
     required_max_position_pct,
 )
-from ai_graph.progress import report_activity
+from ai_graph.progress import (
+    deadline_remaining_seconds,
+    raise_if_past_deadline,
+    report_activity,
+)
 from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
 from ai_graph.schemas import (
     BacktestEquityPoint,
@@ -1153,7 +1157,14 @@ class _CandidateBacktestSession:
         # out. One timeout window is allowed for each worker wave so queued candidates
         # still receive a full execution budget.
         wave_count = max(1, math.ceil(len(futures) / max(1, worker_count)))
-        deadline = time.perf_counter() + timeout * wave_count
+        # `timeout * wave_count` grows with the candidate count, so on its own this is not
+        # a bound at all. Whatever the request has left is the real ceiling; without the
+        # clamp a single wide round can outlast the whole request budget.
+        wave_budget = timeout * wave_count
+        request_remaining = deadline_remaining_seconds()
+        if request_remaining is not None:
+            wave_budget = min(wave_budget, max(0.0, request_remaining))
+        deadline = time.perf_counter() + wave_budget
         evaluations: list[_CandidateTaskResult | None] = [None] * len(futures)
         future_indexes: dict[Future[_CandidateTaskResult], int] = {
             future: index for index, future in enumerate(futures)
@@ -2108,6 +2119,10 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
             else MAX_SELF_IMPROVEMENT_ROUNDS
         )
         for iteration in range(1, self_improvement_rounds + 1):
+            # The request-wide ceiling is checked here too, not only at node boundaries:
+            # a self-improvement round can run for minutes, and stopping between rounds
+            # keeps the candidates already evaluated instead of losing the node's work.
+            raise_if_past_deadline()
             if time.perf_counter() - node_started >= _wall_budget_seconds():
                 fallback_reasons.append(
                     f"self-improvement stopped after exceeding {_wall_budget_seconds():g}s wall budget"

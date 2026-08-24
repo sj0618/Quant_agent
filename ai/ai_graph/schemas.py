@@ -21,6 +21,9 @@ FailureCategory = Literal[
     "clarification_failure",
     "ui_failure",
     "debug_failure",
+    # The run stopped because someone or something stopped it, not because it broke:
+    # a user cancellation, or a request that used up its total time budget.
+    "cancelled",
     "unknown_failure",
 ]
 FailureSubcause = Literal[
@@ -64,6 +67,11 @@ FailureSubcause = Literal[
     "no_screening_matches",
     "no_price_rows",
     "empty_analysis_result",
+    # Emitted when the user cancels a running analysis.
+    "user_cancelled",
+    # The request as a whole outlived `AI_JOB_DEADLINE_SECONDS`. Distinct from the
+    # provider and statement timeouts above: nothing individually timed out, the sum did.
+    "job_deadline_exceeded",
     "outside_owner",
     "product_data_gap",
     "unknown",
@@ -169,7 +177,15 @@ class FailureDiagnostic(BaseModel):
     subcause: FailureSubcause
     failure_stage: str = Field(min_length=1)
     owner: Literal[
-        "ai_graph", "data_source_config", "fe_state", "outside_owner", "product_data_gap", "unknown"
+        "ai_graph",
+        "data_source_config",
+        "fe_state",
+        "outside_owner",
+        "product_data_gap",
+        # Nobody's defect: the run stopped because the user asked it to. Reporting this
+        # as "unknown" would send an operator looking for a fault that is not there.
+        "user",
+        "unknown",
     ]
     retryable: bool
     safe_message: str = Field(min_length=1)

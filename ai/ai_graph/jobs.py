@@ -27,6 +27,8 @@ from ai_graph.analysis_capacity import (
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.progress import (
     AnalysisCancelled,
+    AnalysisDeadlineExceeded,
+    analysis_deadline,
     activity_reporter,
     cancellation_check,
     stage_reporter,
@@ -48,6 +50,15 @@ _logger = logging.getLogger(__name__)
 # This is the ordinary case rather than an exotic one: every deploy stops uvicorn and
 # starts it again, so every deploy strands whatever was in flight.
 PROCESS_INCARNATION = f"{getpid()}:{uuid4().hex[:12]}"
+
+AI_JOB_DEADLINE_SECONDS_ENV = "AI_JOB_DEADLINE_SECONDS"
+# Generous on purpose. The backtest node alone is budgeted at 540s and a healthy run has
+# been observed past 600s, so this is a ceiling for runs that are not coming back rather
+# than a target: its job is to release the analysis slot a stuck run is holding.
+DEFAULT_JOB_DEADLINE_SECONDS = 1_800.0
+JOB_DEADLINE_MESSAGE = (
+    "분석이 허용된 시간을 넘겨 중단되었습니다. 조건을 좁혀 다시 시도해 주세요."
+)
 
 INTERRUPTED_BY_RESTART_REASON = "interrupted_by_restart"
 INTERRUPTED_BY_RESTART_MESSAGE = (
@@ -530,7 +541,31 @@ def _run_analysis_job(
                 scope.enter_context(
                     cancellation_check(lambda: cancellations.is_cancelled(job_id))
                 )
+            scope.enter_context(analysis_deadline(job_deadline_seconds()))
             result = _require_analysis_envelope(runner(job.query, job.trace_id))
+    except AnalysisDeadlineExceeded:
+        _logger.warning(
+            "analysis job exceeded its total time budget: job_id=%s budget=%ss",
+            job_id,
+            job_deadline_seconds(),
+        )
+        return store.fail_job(
+            job_id,
+            JOB_DEADLINE_MESSAGE,
+            result_envelope=_failure_envelope(
+                job,
+                JOB_DEADLINE_MESSAGE,
+                failure_cause=FailureDiagnostic(
+                    category="cancelled",
+                    subcause="job_deadline_exceeded",
+                    failure_stage=Stage.FINALIZING.value,
+                    owner="ai_graph",
+                    retryable=True,
+                    safe_message=JOB_DEADLINE_MESSAGE,
+                    evidence_refs=["failure:job_deadline"],
+                ),
+            ),
+        )
     except AnalysisCancelled:
         _logger.info("analysis job cancelled: job_id=%s", job_id)
         message = "사용자가 분석을 중단했습니다."
@@ -1132,6 +1167,31 @@ def _failure_envelope(
         retryable=diagnostic.retryable,
         failure_cause=diagnostic,
     )
+
+
+def job_deadline_seconds(environ_map: Mapping[str, str] | None = None) -> float | None:
+    """The ceiling for one whole request, or None when it is not bounded.
+
+    An explicit `0` disables the ceiling, which is what the per-phase budgets alone did.
+    An unparseable value falls back to the default rather than removing the ceiling: a
+    typo should not be the thing that lets a run hold an analysis slot indefinitely.
+    """
+
+    resolved = environ if environ_map is None else environ_map
+    raw = str(resolved.get(AI_JOB_DEADLINE_SECONDS_ENV, "")).strip()
+    if not raw:
+        return DEFAULT_JOB_DEADLINE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning(
+            "%s=%r is not a number; using %s",
+            AI_JOB_DEADLINE_SECONDS_ENV,
+            raw,
+            DEFAULT_JOB_DEADLINE_SECONDS,
+        )
+        return DEFAULT_JOB_DEADLINE_SECONDS
+    return value if value > 0 else None
 
 
 _REAPABLE_STATUSES = frozenset({AnalysisJobStatus.QUEUED, AnalysisJobStatus.RUNNING})
