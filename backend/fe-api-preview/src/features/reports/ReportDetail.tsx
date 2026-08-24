@@ -119,8 +119,8 @@ export function ReportDetail({ report }: ReportDetailProps) {
             <span>환율 변동성이 확대되는 구간입니다. 추가 매수는 분할 진입을 권장합니다.</span>
           </div>
           <div className="report-cta-row">
-            <a href={ROUTES.app}>워크스페이스에서 상세 보기 →</a>
-            <a href={ROUTES.app}>채팅으로 전략 수정</a>
+            <a href={ROUTES.reports}>리포트 보관함으로 돌아가기</a>
+            <a href={ROUTES.reports}>다른 보관 리포트 보기</a>
           </div>
         </Section>
 

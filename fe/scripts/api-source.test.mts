@@ -22,6 +22,23 @@ test("browser exposes rule-reviewed research without reviving the legacy analysi
   assert.match(activitySource, /analysisJobEvents/);
 });
 
+test("retained legacy preview cannot create analysis jobs or runs", async () => {
+  const [legacyClientSource, legacyAppSource, legacyConfigSource, legacyReportDetailSource] = await Promise.all([
+    readFile(new URL("../../backend/fe-api-preview/src/api/quantAgentClient.ts", import.meta.url), "utf8"),
+    readFile(new URL("../../backend/fe-api-preview/src/pages/AppPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../../backend/fe-api-preview/src/config/appConfig.ts", import.meta.url), "utf8"),
+    readFile(new URL("../../backend/fe-api-preview/src/features/reports/ReportDetail.tsx", import.meta.url), "utf8"),
+  ]);
+
+  assert.doesNotMatch(legacyClientSource, /createAnalysisJob|cancelAnalysisJob|createAnalysisRun|completeAnalysisRun/);
+  assert.doesNotMatch(legacyClientSource, /analysis-jobs|\/runs\b/);
+  assert.doesNotMatch(legacyConfigSource, /analysis-jobs|analysis-runs|\/runs\b/);
+  assert.doesNotMatch(legacyAppSource, /StrategyInputPanel|useAnalysisActivity|createAnalysisJob|analysis-jobs|progressbar/);
+  assert.match(legacyAppSource, /ROUTES\.reports/);
+  assert.doesNotMatch(legacyReportDetailSource, /워크스페이스에서 상세 보기|채팅으로 전략 수정|href=\{ROUTES\.app\}/);
+  assert.match(legacyReportDetailSource, /ROUTES\.reports/);
+});
+
 test("canonical product surface excludes retired history and strategy routes", async () => {
   const [appSource, routesSource, profileSource, searchSource] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
