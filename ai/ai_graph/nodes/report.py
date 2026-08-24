@@ -8,8 +8,18 @@ from ai_graph.freshness import (
 )
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_report_writeup
 from ai_graph.quant_performance import project_public_performance
-from ai_graph.research_eligibility import PerformanceAvailable, PublicPerformance
-from ai_graph.schemas import ReportBundle, ReportProjection, RiskDecision, StrategySpec
+from ai_graph.research_eligibility import (
+    PerformanceAvailable,
+    PerformanceUnavailable,
+    PublicPerformance,
+)
+from ai_graph.schemas import (
+    ReportBundle,
+    ReportProjection,
+    RiskDecision,
+    SignalDecision,
+    StrategySpec,
+)
 
 
 def build_report_bundle(
@@ -127,15 +137,16 @@ def build_report_bundle(
 def report_node(state: dict) -> dict:
     strategy = StrategySpec.model_validate(state["strategy_spec"])
     risk = RiskDecision.model_validate(state["risk"])
-    debate = build_report_debate(state, strategy, risk)
     public_performance = project_public_performance(
         state.get("backtest"),
         price_rows=state.get("price_rows"),
         pipeline_data_source=(state.get("data") or {}).get("pipeline_data_source"),
     )
+    public_risk = _risk_for_public_report(risk, public_performance)
+    debate = build_report_debate(state, strategy, public_risk)
     report = build_report_bundle(
         strategy,
-        risk,
+        public_risk,
         state.get("backtest"),
         data=state.get("data"),
         debate=debate,
@@ -145,6 +156,38 @@ def report_node(state: dict) -> dict:
         objective_floor=state.get("objective_floor"),
     )
     return {"report": report.model_dump(), "report_debate": debate}
+
+
+def _risk_for_public_report(
+    risk: RiskDecision,
+    public_performance: PublicPerformance | None,
+) -> RiskDecision:
+    """Withhold every report recommendation when public performance is unavailable.
+
+    A raw RiskDecision is useful internal context, but it can be derived from an
+    undersized backtest.  Do not let its BUY/HOLD/DROP text outrun the public
+    performance contract: web, email, and the report writer must all see the same
+    no-recommendation decision.
+    """
+
+    if not isinstance(public_performance, PerformanceUnavailable):
+        return risk
+
+    reason = (
+        "입력 기간·유니버스가 최소 데이터 기준에 미달해 매매 추천을 생성하지 않습니다."
+        if public_performance.reason_code == "insufficient_reliability"
+        else "공개 가능한 백테스트 성과가 없어 매매 추천을 생성하지 않습니다."
+    )
+    return RiskDecision(
+        signal=SignalDecision(
+            action="NO_RECOMMENDATION",
+            confidence=0.0,
+            bear_case=[reason],
+            judge_reason=reason,
+        ),
+        adjustments=[],
+        portfolio_risk=risk.portfolio_risk,
+    )
 
 
 def _screening_citations(state: dict[str, Any]) -> list[dict[str, str]]:
@@ -180,6 +223,20 @@ def build_report_debate(
     risk.signal.action - for three provider calls. The opposing views are now taken
     from the debates that already ran and handed to a single writing call.
     """
+
+    if risk.signal.action == "NO_RECOMMENDATION":
+        reason = risk.signal.judge_reason
+        return {
+            "writeup": RoleDebatePayload(
+                role="REPORT_WRITER",
+                summary="데이터 검증 범위가 부족해 이번 결과에서는 매매 추천을 생성하지 않습니다.",
+                evidence=[reason],
+                concerns=["데이터 기준을 충족한 뒤 다시 분석해야 합니다."],
+                recommendation="NO_RECOMMENDATION",
+                confidence=0.0,
+                validation_results={"recommendation_withheld": "pass"},
+            ).model_dump()
+        }
 
     # The signal is now derived from the backtest by rule (no debate), so the opposing
     # material comes from that decision's own bull/bear case rather than three LLM calls.

@@ -335,6 +335,7 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert "performance" not in performance
     assert "metrics" not in performance
     assert "equity_curve" not in performance
+    assert polled_job["result"]["user_payload"]["ticker_actions"] == []
 
 
 def test_production_retires_raw_analysis_jobs_before_side_effects(
