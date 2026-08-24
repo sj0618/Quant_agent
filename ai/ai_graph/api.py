@@ -57,6 +57,7 @@ from ai_graph.jobs import (
     AnalysisRunner,
     CancellationRegistry,
     JobStoreRuntime,
+    ReadOnlyAnalysisJobStore,
     create_analysis_job_store_from_env,
     reap_interrupted_jobs,
     run_job_sync,
@@ -591,6 +592,12 @@ def create_app(
     # Deployed services accept only the signed RuleDraft flow.  The raw endpoint is
     # retained for local compatibility harnesses, never as a production escape hatch.
     app.state.legacy_analysis_jobs_enabled = not _production_runtime()
+    # With both creating surfaces retired there is no caller left that may extend the
+    # analysis history, so the store stops accepting new rows instead of relying on
+    # every route staying correct. Reads and restart reconciliation are unaffected.
+    if not app.state.legacy_analysis_jobs_enabled and not app.state.research_execution_enabled:
+        store = ReadOnlyAnalysisJobStore(store)
+        app.state.job_store = store
     migration_probe = readiness_migration_probe or _analysis_jobs_migration_is_current
 
     probe_token = (environ.get(DATA_EVIDENCE_PROBE_TOKEN_ENV) or "").strip()
