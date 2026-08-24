@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd ai && grep -rn \\\"410\\\\|feature_disabled\\\\|analysis_job_creation\\\\|daily_digest_retired\\\" ai_graph/api.py | head -30\",\"description\":\"Find 410 retirement routes\"}",
+  "error": "Exit code 1\n(eval):cd:1: no such file or directory: ai",
+  "timestamp": "2026-08-24T12:08:01.269Z",
+  "retry_count": 1
+}
