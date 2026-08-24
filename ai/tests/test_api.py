@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 from ai_graph.api import (
     AI_CORS_ALLOW_ORIGINS_ENV,
+    ANALYSIS_JOB_CANCEL_PATH,
     ANALYSIS_JOB_DETAIL_PATH,
     ANALYSIS_JOBS_PATH,
     API_STATUS_PATH,
@@ -27,6 +28,7 @@ from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import (
     AnalysisHistoryReadOnlyError,
+    AnalysisJobStatus,
     InMemoryAnalysisJobStore,
     JobStoreConfigurationError,
     JobStoreRuntime,
@@ -1211,3 +1213,59 @@ def test_unknown_analysis_job_returns_404() -> None:
 
     assert response.status_code == 404
     assert response.json() == {"detail": "analysis job not found"}
+
+
+def _other_users_job(store: InMemoryAnalysisJobStore):
+    """A job belonging to someone other than the authenticated caller."""
+
+    return store.create_job("다른 사용자의 RSI 전략", user_id="someone-else")
+
+
+def test_another_users_analysis_job_is_not_readable() -> None:
+    """RMP-JOB-01: reads are owner-only, and a stranger cannot even confirm it exists.
+
+    404 rather than 403 on purpose. 403 would answer "this job exists but is not yours",
+    which turns job ids into an enumerable directory of other people's activity.
+    """
+
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store))
+    job = _other_users_job(store)
+
+    response = client.get(ANALYSIS_JOB_DETAIL_PATH.format(job_id=job.job_id))
+
+    assert response.status_code == 404
+    assert "someone-else" not in response.text
+
+
+def test_another_users_analysis_job_cannot_be_cancelled() -> None:
+    """Cancel is a write, so owner-only matters more here than on the read path.
+
+    Checking the status afterwards is the part that counts: a 404 that still signalled
+    the cancellation would stop a stranger's run while reporting that nothing happened.
+    """
+
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store))
+    job = _other_users_job(store)
+
+    response = client.post(ANALYSIS_JOB_CANCEL_PATH.format(job_id=job.job_id))
+
+    assert response.status_code == 404
+    still_there = store.get_job(job.job_id)
+    assert still_there is not None
+    assert still_there.status is not AnalysisJobStatus.FAILED
+
+
+def test_a_job_id_that_does_not_exist_is_indistinguishable_from_someone_elses() -> None:
+    """The two must answer identically, or the difference itself is the disclosure."""
+
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store))
+    owned_by_other = _other_users_job(store)
+
+    missing = client.get(ANALYSIS_JOB_DETAIL_PATH.format(job_id="no-such-job"))
+    foreign = client.get(ANALYSIS_JOB_DETAIL_PATH.format(job_id=owned_by_other.job_id))
+
+    assert missing.status_code == foreign.status_code == 404
+    assert missing.json() == foreign.json()
