@@ -1295,3 +1295,63 @@ def test_a_job_id_that_does_not_exist_is_indistinguishable_from_someone_elses() 
 
     assert missing.status_code == foreign.status_code == 404
     assert missing.json() == foreign.json()
+
+
+def _analysis_job_create_status(client: TestClient) -> str:
+    inventory = client.get(API_STATUS_PATH).json()["endpoints"]
+    entry = next(
+        item
+        for item in inventory
+        if item["method"] == "POST" and item["path"] == ANALYSIS_JOBS_PATH
+    )
+    return entry["state"]
+
+
+def test_the_endpoint_inventory_agrees_with_what_the_route_actually_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OD-API-01: the inventory has to be checked against behaviour, not against itself.
+
+    `POST /analysis-jobs` was advertised as `local_sync` - "Create and run an analysis
+    job" - while the handler returned 410. The list is hand-maintained and the
+    retirement changed the handler without changing the sentence describing it, so the
+    one endpoint that exists to tell a consumer why its calls stopped working was the
+    one saying they still worked.
+
+    Asserting the word alone would not have caught it, because the word was a plausible
+    word. This asserts the word and the response together.
+    """
+
+    monkeypatch.setenv("APP_ENV", "production")
+    retired_client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    assert _analysis_job_create_status(retired_client) == "retired"
+    response = retired_client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
+    assert response.status_code == 410
+
+    monkeypatch.delenv("APP_ENV", raising=False)
+    live_client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    assert _analysis_job_create_status(live_client) == "local_sync"
+    assert live_client.post(
+        ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"}
+    ).status_code != 410
+
+
+def test_the_inventory_summary_stops_advertising_a_retired_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The state word is machine-readable; the summary is what a person reads."""
+
+    monkeypatch.setenv("APP_ENV", "production")
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    inventory = client.get(API_STATUS_PATH).json()["endpoints"]
+    entry = next(
+        item
+        for item in inventory
+        if item["method"] == "POST" and item["path"] == ANALYSIS_JOBS_PATH
+    )
+
+    assert "Retired" in entry["summary"]
+    assert "Create and run" not in entry["summary"]

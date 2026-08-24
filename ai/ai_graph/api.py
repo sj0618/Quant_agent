@@ -670,7 +670,9 @@ def create_app(
             openapi_url=OPENAPI_URL,
             data_source=_data_source_status(),
             job_store=_job_store_status(runtime),
-            endpoints=_endpoint_statuses(),
+            endpoints=_endpoint_statuses(
+                legacy_analysis_jobs_enabled=app.state.legacy_analysis_jobs_enabled,
+            ),
         )
 
     @app.post(
@@ -1058,7 +1060,20 @@ def create_app(
     return app
 
 
-def _endpoint_statuses() -> list[EndpointStatus]:
+def _endpoint_statuses(*, legacy_analysis_jobs_enabled: bool) -> list[EndpointStatus]:
+    """The public inventory of what each route currently does.
+
+    The `POST /analysis-jobs` entry takes the live flag rather than a fixed word. It
+    said `local_sync` and "Create and run an analysis job" for as long as the route has
+    been returning 410, because this list is hand-maintained and the retirement changed
+    the handler without changing the description of it. The two retired routes below it
+    are correct, which is what made the wrong one easy to miss.
+
+    That mismatch is the risk the retirement work names directly - a consumer that
+    cannot tell why its calls stopped working - reintroduced through the endpoint that
+    exists to answer exactly that question.
+    """
+
     return [
         EndpointStatus(
             method="GET",
@@ -1081,8 +1096,12 @@ def _endpoint_statuses() -> list[EndpointStatus]:
         EndpointStatus(
             method="POST",
             path=ANALYSIS_JOBS_PATH,
-            state="local_sync",
-            summary="Create and run an analysis job through the local graph.",
+            state="local_sync" if legacy_analysis_jobs_enabled else "retired",
+            summary=(
+                "Create and run an analysis job through the local graph."
+                if legacy_analysis_jobs_enabled
+                else "Retired raw analysis job creation; use the research rule flow instead."
+            ),
         ),
         EndpointStatus(
             method="GET",
