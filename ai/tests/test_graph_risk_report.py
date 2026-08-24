@@ -2,20 +2,19 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from ai_graph.graph import _recommendation_gate
-from ai_graph.graph import build_public_backtest_performance
+from ai_graph.graph import _recommendation_gate, build_public_backtest_performance
 from ai_graph.nodes.backtest import (
     BENCHMARK_METHOD,
     BENCHMARK_WARNING,
     _equal_weight_benchmark_curve,
 )
 from ai_graph.nodes.report import build_report_bundle
-from ai_graph.quant_performance import MINIMUM_DATA_RULE
 from ai_graph.nodes.risk_manager import (
     MacroSnapshot,
     _average_pairwise_correlation,
     apply_risk_rules,
 )
+from ai_graph.quant_performance import MINIMUM_DATA_RULE
 from ai_graph.research_eligibility import PerformanceUnavailable
 from ai_graph.schemas import (
     BacktestMetrics,
