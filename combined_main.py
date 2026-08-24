@@ -52,9 +52,12 @@ class LegacyAiPrefixCompatibilityMiddleware:
 
     @staticmethod
     def _is_stripped_ai_path(path: str) -> bool:
-        return path in {"/analysis-jobs", "/api/strategies/parse", "/api/research/jobs"} or path.startswith(
-            ("/analysis-jobs/", "/api/research/jobs/")
-        )
+        return path in {
+            "/api-status",
+            "/analysis-jobs",
+            "/api/strategies/parse",
+            "/api/research/jobs",
+        } or path.startswith(("/analysis-jobs/", "/api/research/jobs/"))
 
 
 @asynccontextmanager
