@@ -9,7 +9,7 @@ permissions:
 jobs:
   diagnose:
     name: Inspect AI API proxy routing
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 10
     env:
       SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
