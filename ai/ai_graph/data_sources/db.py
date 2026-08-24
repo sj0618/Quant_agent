@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from time import perf_counter
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -48,6 +49,7 @@ DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * BACKTEST_EVALUATION_YEA
 # v2 ends the window on the last closed session; v1 ended it on today's, so a
 # result carrying either id is not comparable to one carrying the other.
 BACKTEST_WINDOW_POLICY_ID = "krx_pit_common_stock_5y_kst_settled_session_v2"
+KST = ZoneInfo("Asia/Seoul")
 DEFAULT_L4_EVIDENCE_LIMIT = 5
 # A broad screen can match many names, but recommendations never define historical
 # membership. They are presentation output only.
@@ -907,13 +909,19 @@ class PostgresPipelineDataSource:
         """
 
         floor = date.today() - timedelta(days=SCREENING_DATE_LOOKBACK_DAYS)
+        # The screen decides what gets recommended, so it stops where the backtest does:
+        # at the last closed session. Today's bar is still moving. The ceiling is bound
+        # as a parameter for the same reason `floor` is - `CURRENT_DATE` is STABLE, not a
+        # plan-time constant, so writing it inline would lock every chunk again.
+        ceiling = _kst_today()
         row = conn.execute(
             f"""
             SELECT max(time) AS as_of_date
             FROM {KIS_ADJUSTED_OHLCV_TABLE}
             WHERE time >= %(floor)s::date
+              AND time < %(ceiling)s::date
             """,
-            {"floor": floor},
+            {"floor": floor, "ceiling": ceiling},
         ).fetchone()
         value = row.get("as_of_date") if row else None
         return _date_value(value) if value is not None else None
@@ -3025,6 +3033,12 @@ def _has_rsi_oversold_entry(price_rows: list[dict[str, Any]]) -> bool:
 
 def _metric_key(value: str) -> str:
     return value.strip().lower().replace(" ", "_")
+
+
+def _kst_today() -> date:
+    """Today in the market's own timezone, not the host's."""
+
+    return datetime.now(KST).date()
 
 
 def _date_value(value: Any) -> date:
