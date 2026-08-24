@@ -173,6 +173,14 @@ def _nonempty(value: str | None) -> bool:
     return bool(value and value.strip())
 
 
+# What the manifest producer writes when the engine did not state the assumption. A
+# manifest carrying it is missing an execution assumption, not documenting one.
+MISSING_EXECUTION_ASSUMPTION = "unavailable"
+# `cost_tax_slippage_liquidity` serializes the engine's cost model; an empty object
+# means no cost model reached the manifest at all.
+_EMPTY_COST_MODEL = "cost_model={}"
+
+
 class PerformanceMethodManifest(BaseModel):
     """Required provenance before a performance payload may become public."""
 
@@ -198,6 +206,22 @@ class PerformanceMethodManifest(BaseModel):
     result_version: str = Field(min_length=1)
     execution_version: str = Field(min_length=1)
     historical_simulation_warning: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def execution_assumptions_are_stated(self) -> PerformanceMethodManifest:
+        """Fail closed when the run never said how it filled or what it charged.
+
+        Fill timing, commission, tax and slippage are what make a return reproducible.
+        A run that omits them has not produced a cheaper result, it has produced an
+        unverifiable one, so the manifest refuses to validate and the public projection
+        publishes `unavailable` rather than a number nobody can check.
+        """
+
+        if self.fill_timing == MISSING_EXECUTION_ASSUMPTION:
+            raise ValueError("fill_timing must state the engine's execution timing")
+        if self.cost_tax_slippage_liquidity in {MISSING_EXECUTION_ASSUMPTION, _EMPTY_COST_MODEL}:
+            raise ValueError("cost_tax_slippage_liquidity must state the engine's cost model")
+        return self
 
 
 class PerformanceUnavailable(BaseModel):
