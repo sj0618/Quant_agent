@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.scripts.tsbuildinfo",
+    "types": ["node", "vite/client"],
+    "allowImportingTsExtensions": true
+  },
+  "include": ["scripts/**/*.mts"]
+}
