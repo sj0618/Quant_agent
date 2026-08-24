@@ -11,25 +11,25 @@ from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha256
 from os import environ, getpid
-from typing import Any, ClassVar, Literal, Protocol
+from typing import Any, ClassVar, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
 from ai_graph.analysis_capacity import (
     ANALYSIS_CAPACITY,
     CAPACITY_TIMEOUT_MESSAGE,
     AnalysisCapacityGate,
     AnalysisCapacityTimeout,
 )
+from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.progress import (
     AnalysisCancelled,
     AnalysisDeadlineExceeded,
-    analysis_deadline,
     activity_reporter,
+    analysis_deadline,
     cancellation_check,
     stage_reporter,
 )
@@ -241,6 +241,14 @@ class AnalysisJobStore(Protocol):
         ...
 
     def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
+        ...
+
+
+@runtime_checkable
+class RestartReconciliationStore(Protocol):
+    """Optional strict active-job read used only during process startup."""
+
+    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list[AnalysisJob]:
         ...
 
 
@@ -1218,7 +1226,12 @@ def reap_interrupted_jobs(
     """
 
     try:
-        jobs = store.list_jobs(limit=limit)
+        reconciliation_store = store if isinstance(store, RestartReconciliationStore) else None
+        jobs = (
+            reconciliation_store.list_jobs_for_reconciliation(limit=limit)
+            if reconciliation_store is not None
+            else store.list_jobs(limit=limit)
+        )
     except Exception as error:
         raise InterruptedJobReconciliationError(
             "analysis job restart reconciliation could not inspect the job store"

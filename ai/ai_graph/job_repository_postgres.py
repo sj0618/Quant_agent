@@ -7,11 +7,16 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from pydantic import ValidationError
 
 from ai_graph.jobs import AnalysisJob, AnalysisJobStatus, InMemoryAnalysisJobStore
 from ai_graph.schemas import APIEnvelope, Stage
 
 _logger = logging.getLogger(__name__)
+
+
+class PersistedJobReconciliationError(RuntimeError):
+    """An active persisted job cannot be reconciled safely after a restart."""
 
 
 def _job_document(job: AnalysisJob) -> dict[str, Any]:
@@ -142,7 +147,37 @@ class PostgresAnalysisJobRepository:
             ).fetchall()
         return self._decode_rows(rows)
 
-    def _decode_rows(self, rows: Sequence[Any]) -> list[AnalysisJob]:
+    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list[AnalysisJob]:
+        """Read every active job that startup must either settle or reject.
+
+        The ordinary history view is deliberately best-effort so one pre-contract
+        terminal row cannot hide all later results.  Startup is a different boundary:
+        a queued or running row omitted from this read would remain visibly in-flight
+        forever after its owning process has stopped.  Read one extra row so a bounded
+        sweep never silently leaves active work behind, then decode the active subset
+        strictly.
+        """
+
+        if limit < 1:
+            raise ValueError("reconciliation job limit must be positive")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT job_jsonb
+                FROM app.ai_analysis_job
+                WHERE job_jsonb ->> 'status' IN ('queued', 'running')
+                ORDER BY updated_at ASC
+                LIMIT %s
+                """,
+                (limit + 1,),
+            ).fetchall()
+        if len(rows) > limit:
+            raise PersistedJobReconciliationError(
+                "active persisted analysis jobs exceed the restart reconciliation limit"
+            )
+        return self._decode_rows(rows, strict=True)
+
+    def _decode_rows(self, rows: Sequence[Any], *, strict: bool = False) -> list[AnalysisJob]:
         """Decode what this table can still be read as, and say what it cannot.
 
         Fields have been added to the job document without a backfill - `execution_manifest`,
@@ -152,11 +187,10 @@ class PostgresAnalysisJobRepository:
         contained one, and once startup began reconciling interrupted jobs it stopped the
         deploy outright.
 
-        A list that is already limit-truncated is the wrong place to be all-or-nothing, so
-        undecodable rows are dropped from the result. They are not dropped quietly: each is
-        logged with its job id, because a row that cannot be decoded is also a row the
-        restart reaper cannot transition, and one stuck in `running` will spin forever
-        until someone acts on it.
+        A history list that is already limit-truncated is the wrong place to be
+        all-or-nothing, so its undecodable rows are dropped with an operator warning.
+        Reconciliation passes ``strict=True`` after selecting only active rows: it must
+        refuse startup instead of hiding a queued/running row that it cannot settle.
         """
 
         decoded: list[AnalysisJob] = []
@@ -165,7 +199,7 @@ class PostgresAnalysisJobRepository:
             document = row["job_jsonb"]
             try:
                 decoded.append(AnalysisJob.model_validate(document))
-            except Exception:
+            except ValidationError:
                 job_id = "unknown"
                 if isinstance(document, dict):
                     job_id = str(document.get("job_id") or "unknown")
@@ -173,6 +207,10 @@ class PostgresAnalysisJobRepository:
                     job_id = f"{job_id}(status={status})"
                 undecodable.append(job_id)
         if undecodable:
+            if strict:
+                raise PersistedJobReconciliationError(
+                    "an active persisted analysis job could not be decoded for restart reconciliation"
+                )
             _logger.warning(
                 "skipped %d analysis job row(s) written by an older build: %s",
                 len(undecodable),

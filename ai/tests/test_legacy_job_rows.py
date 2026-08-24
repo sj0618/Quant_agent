@@ -1,10 +1,19 @@
-"""A job row from an older build must not take down the list or the startup sweep."""
+"""Legacy job rows stay readable in history but cannot weaken startup recovery."""
 from __future__ import annotations
 
 import logging
 
-from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository, _job_document
-from ai_graph.jobs import InMemoryAnalysisJobStore
+import pytest
+from fastapi.testclient import TestClient
+
+from ai_graph.api import create_app
+from ai_graph.job_repository_postgres import (
+    PersistedJobReconciliationError,
+    PostgresAnalysisJobRepository,
+    _job_document,
+)
+from ai_graph.job_store_persistent import PersistentAnalysisJobStore
+from ai_graph.jobs import InMemoryAnalysisJobStore, InterruptedJobReconciliationError
 
 
 class _Rows:
@@ -51,6 +60,46 @@ def test_a_legacy_row_does_not_take_the_whole_list_down(caplog):
     # Dropped, but not quietly: the id and its status have to reach the operator.
     assert "job_legacy01" in caplog.text
     assert "status=running" in caplog.text
+
+
+def test_active_legacy_row_refuses_restart_reconciliation() -> None:
+    """A restart must not hide an active row that cannot be transitioned terminal."""
+
+    repo = PostgresAnalysisJobRepository.__new__(PostgresAnalysisJobRepository)
+    repo._dsn = "postgresql://example"
+    repo._connector = lambda *a, **k: _Connection([{"job_jsonb": _legacy_document()}])
+
+    with pytest.raises(PersistedJobReconciliationError):
+        repo.list_jobs_for_reconciliation()
+
+
+def test_active_legacy_row_refuses_application_startup() -> None:
+    """The strict persistent read reaches the lifespan before any route can serve."""
+
+    repo = PostgresAnalysisJobRepository.__new__(PostgresAnalysisJobRepository)
+    repo._dsn = "postgresql://example"
+    repo._connector = lambda *a, **k: _Connection([{"job_jsonb": _legacy_document()}])
+
+    with pytest.raises(InterruptedJobReconciliationError), TestClient(
+        create_app(PersistentAnalysisJobStore(repo))
+    ):
+        pass
+
+
+def test_active_rows_over_reconciliation_limit_refuse_startup() -> None:
+    """A bounded sweep must fail closed rather than strand the extra active job."""
+
+    source = InMemoryAnalysisJobStore()
+    first = source.create_job("첫 번째 재시작 검토 잡")
+    second = source.create_job("두 번째 재시작 검토 잡")
+    repo = PostgresAnalysisJobRepository.__new__(PostgresAnalysisJobRepository)
+    repo._dsn = "postgresql://example"
+    repo._connector = lambda *a, **k: _Connection(
+        [{"job_jsonb": _job_document(first)}, {"job_jsonb": _job_document(second)}]
+    )
+
+    with pytest.raises(PersistedJobReconciliationError, match="exceed"):
+        repo.list_jobs_for_reconciliation(limit=1)
 
 
 def test_a_store_that_cannot_be_read_still_raises():
