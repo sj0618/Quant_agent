@@ -1,7 +1,17 @@
+import re
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEPLOY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "deploy.yml"
+SERVICE_DB_REPLAY = REPOSITORY_ROOT / "service_db" / "scripts" / "verify_fixed_migration_replay.py"
+
+
+def _canonical_fixed_migrations() -> list[str]:
+    """The ordered migration set the service DB replay contract pins as canonical."""
+
+    source = SERVICE_DB_REPLAY.read_text(encoding="utf-8")
+    block = source.split("FIXED_MIGRATIONS = (", maxsplit=1)[1].split(")", maxsplit=1)[0]
+    return re.findall(r'"([^"]+\.sql)"', block)
 
 
 def test_deploy_uses_the_backtest_dependency_graph_and_verifies_imports():
@@ -42,3 +52,23 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert "npm run preview" not in workflow
     assert "AI_RULE_DRAFT_HMAC_SECRET" in workflow
     assert "ai-rule-draft-hmac.secret" in workflow
+
+
+def test_deploy_ai_audit_replay_applies_every_canonical_migration_in_order():
+    """The deploy AI-audit replay must apply the full canonical migration set, in order.
+
+    Dropping any of them (this is how 015-018 were silently omitted, so freshly
+    provisioned databases were missing the notification-settings columns and the
+    email-delivery outbox that reachable production endpoints query) must fail here.
+    """
+
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    canonical = _canonical_fixed_migrations()
+    assert len(canonical) >= 12, "canonical FIXED_MIGRATIONS could not be parsed"
+
+    positions: list[int] = []
+    for name in canonical:
+        marker = f'"{name}"'
+        assert marker in workflow, f"deploy workflow is missing migration {name}"
+        positions.append(workflow.index(marker))
+    assert positions == sorted(positions), "deploy workflow applies migrations out of canonical order"
