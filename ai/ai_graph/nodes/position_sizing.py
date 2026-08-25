@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+
+DEFAULT_MAX_POSITIONS = 10
+DEFAULT_FIXTURE_TICKER = "005930"
+
+
+def requested_max_positions(max_position_pct: float | None) -> int:
+    if max_position_pct is None:
+        return DEFAULT_MAX_POSITIONS
+    return max(1, math.ceil(1.0 / max_position_pct))
+
+
+def applied_max_positions(
+    max_position_pct: float | None, available_ticker_count: int | None = None
+) -> int:
+    """How many positions may be held at once.
+
+    Driven by the strategy's own max_position_pct (10% -> 10 names), capped by how many
+    names are actually available. The backtest now runs over a wide liquidity universe,
+    so "최대 보유 2종목" - the symptom that motivated removing this cap - is gone at its
+    source: it came from backtesting only the two names the screen matched today, not
+    from the cap itself. Holding every one of a 120-name universe at once is not a
+    portfolio, so the cap stays.
+    """
+
+    requested = requested_max_positions(max_position_pct)
+    if available_ticker_count is None or available_ticker_count <= 0:
+        return requested
+    return max(1, min(requested, available_ticker_count))
+
+
+def available_ticker_count(price_rows: Sequence[Mapping[str, Any]]) -> int:
+    tickers = {
+        str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
+        for row in price_rows
+        if row.get("date") is not None
+    }
+    return max(1, len(tickers))
+
+
+def max_position_pct_from_risk_constraints(risk_constraints: Mapping[str, Any]) -> float | None:
+    """Best-effort, non-raising parse of `max_position_pct` for code generation.
+
+    Unlike backtest.py's strict `_optional_positive_float` (which raises on bad
+    input), candidate-code generation should degrade to the default max
+    positions instead of failing outright on a malformed strategy spec.
+    """
+    value = risk_constraints.get("max_position_pct")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0 or parsed > 1.0:
+        return None
+    return parsed
+
+
+def required_max_position_pct(risk_constraints: Mapping[str, Any]) -> float:
+    """Resolve the canonical backtest sizing contract without a portfolio default."""
+    if "max_position_pct" not in risk_constraints:
+        raise ValueError(
+            "canonical analysis backtest requires strategy risk_constraints.max_position_pct"
+        )
+    value = risk_constraints["max_position_pct"]
+    if isinstance(value, bool):
+        raise ValueError("max_position_pct must be numeric")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_position_pct must be numeric") from exc
+    if not math.isfinite(parsed) or parsed <= 0.0 or parsed > 1.0:
+        raise ValueError("max_position_pct must be finite and in (0, 1]")
+    return parsed

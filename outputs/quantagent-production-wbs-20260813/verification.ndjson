@@ -1,0 +1,7 @@
+{"kind":"verification","artifact":"QuantAgent_프로덕션_신뢰성_WBS_계획본.xlsx","source_sha256":"92311cc787929b94963f77a180343185f859bfe7e27e0af048de77398ec2fa6b","byte_length":2059497,"task_count":90,"artifact_tool_formula_request":"2_WBS!A1:S218","formula_xml_entries":["xl/worksheets/sheet2.xml","xl/worksheets/sheet3.xml","xl/worksheets/sheet1.xml"],"artifact_tool_formula_count":221,"ooxml_formula_count":331,"ooxml_error_token_counts":{"#REF!":0,"#DIV/0!":0,"#VALUE!":0,"#NAME?":0,"#N/A":0}}
+{"kind":"workbook","id":"wb/6a7oyi","sheets":3,"tables":3}
+{"kind":"sheet","id":"ws/gas4r9","name":"1_RnR","index":0,"range":"A1:G9","address":"A1:G9","tables":1}
+{"kind":"sheet","id":"ws/4lgceh","name":"2_WBS","index":1,"range":"A1:S97","address":"A1:S97","tables":1}
+{"kind":"sheet","id":"ws/xcj8mb","name":"3_Members","index":2,"range":"A1:G8","address":"A1:G8","tables":1}
+{"kind":"notice","message":"Cell search matched 0 entries."}
+{"kind":"render","sheet":"2_WBS","path":"2_WBS.png","scale":0.1,"note":"Full-sheet overview only; at scale 0.5 the renderer cannot allocate the 850x16765 bitmap."}

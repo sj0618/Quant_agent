@@ -1,0 +1,142 @@
+name: Server health check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_run:
+    workflows:
+      - Deploy to SSH Server
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-health-check
+  cancel-in-progress: true
+
+jobs:
+  health:
+    name: Verify deployed server
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT || '30233' }}
+      SERVER_USER: ${{ secrets.SERVER_USER || 'etluser' }}
+      SERVER_APP_DIR: ${{ secrets.SERVER_APP_DIR || '/home/etluser/mvp_sp1/quant-proj' }}
+      COMBINED_PORT: "18001"
+      FE_PORT: "18000"
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    steps:
+      - name: Validate required secret
+        run: test -n "$SSH_PRIVATE_KEY"
+
+      - name: Configure SSH
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Check remote processes and endpoints
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" "$COMBINED_PORT" "$FE_PORT" <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$1"
+          COMBINED_PORT="$2"
+          FE_PORT="$3"
+          RUN_DIR="$APP_DIR/.run"
+
+          test -d "$APP_DIR"
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          test -s "$RUN_DIR/combined.pid"
+          test -s "$RUN_DIR/fe.pid"
+
+          check_pid() {
+            local label="$1"
+            local pid_file="$2"
+            local pid
+            pid="$(cat "$pid_file")"
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]]
+            kill -0 "$pid"
+            printf '%s process is alive: pid=%s\n' "$label" "$pid"
+          }
+
+          check_listener() {
+            local label="$1"
+            local port="$2"
+            local rows
+            rows="$(ss -H -ltn "sport = :$port")"
+            test -n "$rows"
+            printf '%s listener is present on port %s\n' "$label" "$port"
+          }
+
+          check_http() {
+            local label="$1"
+            local url="$2"
+            local body
+            body="$(mktemp)"
+            trap 'rm -f "$body"' RETURN
+            curl -q --fail --silent --show-error \
+              --connect-timeout 5 --max-time 15 \
+              -o "$body" "$url"
+            test -s "$body"
+            printf '%s endpoint is healthy: %s\n' "$label" "$url"
+          }
+
+          check_pid "Combined" "$RUN_DIR/combined.pid"
+          check_pid "FE" "$RUN_DIR/fe.pid"
+          check_listener "Combined" "$COMBINED_PORT"
+          check_listener "FE" "$FE_PORT"
+          check_http "Combined" "http://127.0.0.1:$COMBINED_PORT/combined-health"
+          check_http "General backend" "http://127.0.0.1:$COMBINED_PORT/health"
+          check_http "AI API" "http://127.0.0.1:$COMBINED_PORT/ai-api/health"
+          curl -q --fail --silent --show-error \
+            --connect-timeout 5 --max-time 15 \
+            "http://127.0.0.1:$COMBINED_PORT/ai-api/api-status" \
+            | "$APP_DIR/ai/.venv/bin/python" -c \
+              'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
+          check_http "FE" "http://127.0.0.1:$FE_PORT/"
+          frontend_html="$(mktemp)"
+          if ! curl -q --fail --silent --show-error \
+            --connect-timeout 5 --max-time 15 \
+            -o "$frontend_html" "http://127.0.0.1:$FE_PORT/"; then
+            rm -f "$frontend_html"
+            exit 1
+          fi
+          if grep -Eq '(/@vite/client|/src/[^"[:space:]]+\.(tsx?|jsx?))' "$frontend_html"; then
+            rm -f "$frontend_html"
+            echo "Frontend bundle contains Vite development assets"
+            exit 1
+          fi
+          rm -f "$frontend_html"
+
+          unknown_route_html="$(mktemp)"
+          unknown_route_status="$(curl -q --silent --show-error \
+            --connect-timeout 5 --max-time 15 \
+            -o "$unknown_route_html" -w '%{http_code}' \
+            "http://127.0.0.1:$FE_PORT/retired-internal-route")"
+          test "$unknown_route_status" = "404"
+          test -s "$unknown_route_html"
+          rm -f "$unknown_route_html"
+          check_http "Frontend public route" "http://127.0.0.1:$FE_PORT/trust"
+
+          if command -v git >/dev/null 2>&1 && git -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            printf 'deployed revision: %s\n' "$(git -C "$APP_DIR" rev-parse --short HEAD)"
+          fi
+          REMOTE

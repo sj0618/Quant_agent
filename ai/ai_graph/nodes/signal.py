@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from hashlib import sha256
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from ai_graph.schemas import L4Evidence
+from ai_graph.schemas import SignalDecision as InvestmentSignalDecision
+
+SignalAction = Literal["BUY", "SELL", "HOLD", "WATCH"]
+
+
+class ConditionOperator(str, Enum):
+    LT = "lt"
+    LTE = "lte"
+    GT = "gt"
+    GTE = "gte"
+    EQ = "eq"
+    NE = "ne"
+    BETWEEN = "between"
+
+
+class SignalCondition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    left: str
+    operator: ConditionOperator
+    right: float | list[float]
+    description: str | None = None
+
+    @model_validator(mode="after")
+    def validate_right_shape(self) -> SignalCondition:
+        if self.operator == ConditionOperator.BETWEEN:
+            if not isinstance(self.right, list) or len(self.right) != 2:
+                raise ValueError("between requires two numeric bounds")
+            if float(self.right[0]) > float(self.right[1]):
+                raise ValueError("between lower bound must be <= upper bound")
+        elif not isinstance(self.right, (int, float)):
+            raise ValueError("scalar operators require numeric right")
+        return self
+
+
+class SignalStrategy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    entry_rules: list[SignalCondition]
+    exit_rules: list[SignalCondition] = Field(default_factory=list)
+    entry_logic: Literal["all", "any"] = "all"
+    exit_logic: Literal["all", "any"] = "any"
+
+
+class MarketSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: str
+    timestamp: datetime
+    metrics: dict[str, float]
+
+
+class SignalResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    trace_id: str
+    debug_ref: str
+    strategy_id: str
+    ticker: str
+    action: SignalAction
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasons: list[str] = Field(default_factory=list)
+    matching_entry_rules: list[str] = Field(default_factory=list)
+    matching_exit_rules: list[str] = Field(default_factory=list)
+
+
+def generate_signal(
+    strategy: SignalStrategy | dict[str, Any],
+    market: MarketSnapshot | dict[str, Any],
+    *,
+    has_position: bool = False,
+    trace_id: str | None = None,
+) -> SignalResult:
+    spec = (
+        strategy
+        if isinstance(strategy, SignalStrategy)
+        else SignalStrategy.model_validate(strategy)
+    )
+    market_snapshot = (
+        market
+        if isinstance(market, MarketSnapshot)
+        else MarketSnapshot.model_validate(market)
+    )
+    trace = trace_id or _trace_id(
+        f"{spec.strategy_id}:{market_snapshot.ticker}:{market_snapshot.timestamp.isoformat()}"
+    )
+
+    entry_matches = _matching_rules(
+        spec.entry_rules, spec.entry_logic, market_snapshot.metrics
+    )
+    exit_matches = _matching_rules(
+        spec.exit_rules, spec.exit_logic, market_snapshot.metrics
+    )
+    if has_position and exit_matches:
+        return _result(
+            trace,
+            spec.strategy_id,
+            market_snapshot.ticker,
+            "SELL",
+            ["exit condition matched"],
+            matching_exit_rules=exit_matches,
+        )
+    if not has_position and entry_matches:
+        return _result(
+            trace,
+            spec.strategy_id,
+            market_snapshot.ticker,
+            "BUY",
+            ["entry condition matched"],
+            matching_entry_rules=entry_matches,
+        )
+    return _result(
+        trace,
+        spec.strategy_id,
+        market_snapshot.ticker,
+        "HOLD" if has_position else "WATCH",
+        ["no actionable rule matched"],
+    )
+
+
+def signal_node(state: dict[str, Any]) -> dict[str, Any]:
+    """Turn the backtest into a BUY/HOLD/DROP signal - by rule, not by debate.
+
+    This used to run a three-way bull/bear/judge LLM debate whose verdict never changed
+    the decision: the signal is a function of the backtest's Sharpe and drawdown, and the
+    debate only appended commentary. Anything the debate flagged that a rule cannot -
+    a tiny universe, say - is already surfaced by the backtest's own sample-size warning.
+    So the LLM calls are gone; build_investment_signal derives the signal from the
+    backtest, and the Report node does the interpreting for the reader.
+    """
+
+    if "market_snapshot" in state:
+        result = generate_signal(
+            state["strategy_spec"],
+            state["market_snapshot"],
+            has_position=bool(state.get("has_position", False)),
+            trace_id=state.get("trace_id"),
+        )
+    else:
+        result = _result(
+            state.get("trace_id", _trace_id(str(state))),
+            state["strategy_spec"]["strategy_id"],
+            "KRX",
+            "WATCH",
+            ["no single-ticker market snapshot supplied"],
+        )
+    investment_signal = build_investment_signal(
+        state.get("backtest", {}),
+        trace_id=state.get("trace_id"),
+        l4_evidence=state.get("l4_evidence"),
+    )
+    return {
+        "signal": result.model_dump(),
+        "investment_signal": investment_signal.model_dump(),
+        "trace_id": result.trace_id,
+        "debug_ref": result.debug_ref,
+    }
+
+
+def build_investment_signal(
+    backtest: dict[str, Any],
+    *,
+    trace_id: str | None = None,
+    l4_evidence: list[dict[str, Any]] | None = None,
+    debate: dict[str, Any] | None = None,
+) -> InvestmentSignalDecision:
+    evidence = [L4Evidence.model_validate(item) for item in l4_evidence or []]
+    if not evidence:
+        return InvestmentSignalDecision(
+            action="NO_RECOMMENDATION",
+            confidence=0.0,
+            bear_case=["추천을 뒷받침할 L4 근거가 없습니다."],
+            judge_reason="L4 근거가 없어 추천을 생성하지 않습니다.",
+            l4_evidence=[],
+        )
+
+    selected = backtest.get("selected_candidate") or {}
+    metrics = selected.get("metrics") or {}
+    sharpe = float(metrics.get("sharpe_ratio", 0.0))
+    drawdown = float(metrics.get("max_drawdown", 0.0))
+    bull_case = [
+        "Candidate-code backtest selected the best objective-score candidate.",
+        f"Selected Sharpe ratio is {sharpe:.2f}.",
+    ]
+    bear_case = [
+        "Hankyung consensus buy-opinion decrease is a required production adapter.",
+        "KIS foreign net-selling N-day cumulative flow is a required production adapter.",
+        "English IB report search is optional in MVP and disabled by default.",
+    ]
+    if debate:
+        bull_summary = debate.get("bull", {}).get("summary")
+        bear_summary = debate.get("bear", {}).get("summary")
+        if bull_summary:
+            bull_case.append(str(bull_summary))
+        if bear_summary:
+            bear_case.append(str(bear_summary))
+    if drawdown < -0.12:
+        action = "DROP"
+        confidence = 0.64
+        judge_reason = "Bear case dominates because drawdown is beyond the MVP tolerance."
+    elif sharpe >= 1.2:
+        action = "BUY"
+        confidence = 0.82
+        judge_reason = "Bull case dominates after candidate-code backtest."
+    else:
+        action = "HOLD"
+        confidence = 0.68
+        judge_reason = "Evidence is usable but not strong enough for BUY."
+    return InvestmentSignalDecision(
+        action=action,
+        confidence=confidence,
+        bull_case=bull_case,
+        bear_case=bear_case,
+        judge_reason=judge_reason,
+        l4_evidence=evidence,
+    )
+def _matching_rules(
+    rules: list[SignalCondition], logic: str, metrics: dict[str, float]
+) -> list[str]:
+    if not rules:
+        return []
+    matches = [
+        rule.description or _describe(rule) for rule in rules if _matches(rule, metrics)
+    ]
+    if logic == "all" and len(matches) != len(rules):
+        return []
+    return matches
+
+
+def _matches(rule: SignalCondition, metrics: dict[str, float]) -> bool:
+    if rule.left not in metrics:
+        return False
+    left = float(metrics[rule.left])
+    if rule.operator == ConditionOperator.BETWEEN:
+        low, high = rule.right  # type: ignore[misc]
+        return float(low) <= left <= float(high)
+    right = float(rule.right)
+    if rule.operator == ConditionOperator.LT:
+        return left < right
+    if rule.operator == ConditionOperator.LTE:
+        return left <= right
+    if rule.operator == ConditionOperator.GT:
+        return left > right
+    if rule.operator == ConditionOperator.GTE:
+        return left >= right
+    if rule.operator == ConditionOperator.EQ:
+        return left == right
+    if rule.operator == ConditionOperator.NE:
+        return left != right
+    raise ValueError(f"unsupported operator: {rule.operator}")
+
+
+def _result(
+    trace_id: str,
+    strategy_id: str,
+    ticker: str,
+    action: SignalAction,
+    reasons: list[str],
+    *,
+    matching_entry_rules: list[str] | None = None,
+    matching_exit_rules: list[str] | None = None,
+) -> SignalResult:
+    return SignalResult(
+        trace_id=trace_id,
+        debug_ref=f"signal:{trace_id}",
+        strategy_id=strategy_id,
+        ticker=ticker,
+        action=action,
+        confidence=1.0,
+        reasons=reasons,
+        matching_entry_rules=matching_entry_rules or [],
+        matching_exit_rules=matching_exit_rules or [],
+    )
+
+
+def _describe(rule: SignalCondition) -> str:
+    return f"{rule.left} {rule.operator.value} {rule.right}"
+
+
+def _trace_id(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()[:16]

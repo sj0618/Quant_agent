@@ -1,0 +1,25 @@
+# --- [1. Core quant / data packages] ---
+numpy==2.2.6
+pandas==2.3.2
+pandas-ta-classic==0.6.52
+psycopg[binary]==3.2.13
+requests==2.32.5
+python-dotenv==1.2.2
+tqdm==4.67.3
+
+TA-Lib==0.6.8
+
+# --- [2. LLM / multi-agent stack] ---
+openai==2.29.0
+google-genai==1.68.0
+google-generativeai==0.8.6
+pydantic==2.12.5
+tenacity==9.1.4
+
+# --- [3. Utilities] ---
+slack_sdk==3.41.0
+anyio==4.12.1
+websockets==16.0
+
+# --- [4. Tests] ---
+pytest

@@ -1,0 +1,43 @@
+{
+  "artifact": "QuantAgent_프로덕션_신뢰성_WBS_계획본.xlsx",
+  "source_sha256": "92311cc787929b94963f77a180343185f859bfe7e27e0af048de77398ec2fa6b",
+  "byte_length": 2059497,
+  "sheet_renders": [
+    {
+      "sheet": "1_RnR",
+      "path": "1_RnR.png",
+      "scale": 1
+    },
+    {
+      "sheet": "2_WBS",
+      "path": "2_WBS.png",
+      "scale": 0.1,
+      "note": "Full-sheet overview scale. At scale 0.5 the renderer cannot allocate the 850x16765 bitmap."
+    },
+    {
+      "sheet": "3_Members",
+      "path": "3_Members.png",
+      "scale": 1
+    }
+  ],
+  "inspect_path": "QuantAgent_프로덕션_신뢰성_WBS_계획본.xlsx.inspect.ndjson",
+  "formula_audit_path": "formula-audit.ndjson",
+  "formula_audit": {
+    "ooxml_worksheet_entries": [
+      "xl/worksheets/sheet2.xml",
+      "xl/worksheets/sheet3.xml",
+      "xl/worksheets/sheet1.xml"
+    ],
+    "ooxml_formula_count": 331,
+    "artifact_tool_formula_count": 221,
+    "ooxml_error_token_counts": {
+      "#REF!": 0,
+      "#DIV/0!": 0,
+      "#VALUE!": 0,
+      "#NAME?": 0,
+      "#N/A": 0
+    },
+    "ooxml_error_token_total": 0
+  },
+  "formula_error_scan": "{\"kind\":\"notice\",\"message\":\"Cell search matched 0 entries.\"}"
+}

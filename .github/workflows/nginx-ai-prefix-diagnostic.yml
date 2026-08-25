@@ -1,0 +1,92 @@
+name: Diagnose Nginx AI prefix proxy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: Inspect AI API proxy routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT || '30233' }}
+      SERVER_USER: ${{ secrets.SERVER_USER || 'etluser' }}
+      SERVER_APP_DIR: ${{ secrets.SERVER_APP_DIR || '/home/etluser/mvp_sp1/quant-proj' }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    steps:
+      - name: Validate required secret
+        run: test -n "$SSH_PRIVATE_KEY"
+
+      - name: Configure SSH
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Inspect prefix preservation without changing Nginx
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$1"
+          test -x "$APP_DIR/ai/.venv/bin/python"
+
+          nginx_dump=""
+          if sudo -n true 2>/dev/null; then
+            if nginx_dump="$(sudo -n nginx -T 2>&1)"; then
+              printf '%s\n' 'nginx_sudo=available'
+            else
+              printf '%s\n' 'nginx_config=unavailable (sudo nginx -T failed)'
+              nginx_dump=""
+            fi
+          elif nginx_dump="$(nginx -T 2>&1)"; then
+            printf '%s\n' 'nginx_sudo=unavailable (nginx -T read permission was used)'
+          else
+            printf '%s\n' 'nginx_config=unavailable (no read permission)'
+            nginx_dump=""
+          fi
+
+          if [ -n "$nginx_dump" ]; then
+            printf '%s\n' "$nginx_dump" \
+              | grep -nE 'configuration file |server_name[[:space:]]+qt-agent\.kro\.kr|location[[:space:]]+/ai-api/|proxy_pass[[:space:]]+http://127\.0\.0\.1:(18000|18001)' \
+              || true
+          fi
+
+          "$APP_DIR/ai/.venv/bin/python" - <<'PY'
+          import json
+          from urllib.request import urlopen
+
+          with urlopen("http://127.0.0.1:18001/ai-api/api-status", timeout=10) as response:
+              payload = json.load(response)
+          print(
+              "direct_ai_status="
+              + json.dumps(
+                  {
+                      "job_store_mode": payload["job_store"]["active_mode"],
+                      "endpoint_count": len(payload["endpoints"]),
+                  },
+                  sort_keys=True,
+              )
+          )
+          PY
+          REMOTE
+
+      - name: Compare public single and double prefix routes
+        run: |
+          for path in /ai-api/api-status /ai-api/ai-api/api-status; do
+            code="$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "https://qt-agent.kro.kr${path}")"
+            printf '%s status=%s\n' "$path" "$code"
+          done

@@ -1,0 +1,286 @@
+from __future__ import annotations
+
+from typing import Any
+
+from ai_graph.freshness import (
+    build_freshness_evidence,
+    withhold_recommendations_without_l4_evidence,
+)
+from ai_graph.llm.role_calls import RoleDebatePayload, generate_report_writeup
+from ai_graph.quant_performance import project_public_performance
+from ai_graph.research_eligibility import (
+    PerformanceAvailable,
+    PerformanceUnavailable,
+    PublicPerformance,
+)
+from ai_graph.schemas import (
+    ReportBundle,
+    ReportProjection,
+    RiskDecision,
+    SignalDecision,
+    StrategySpec,
+)
+
+
+def build_report_bundle(
+    strategy: StrategySpec,
+    risk: RiskDecision,
+    backtest: dict[str, Any] | None = None,
+    *,
+    data: dict[str, Any] | None = None,
+    debate: dict[str, Any] | None = None,
+    citations: list[dict[str, str]] | None = None,
+    objective_floor: dict[str, Any] | None = None,
+    public_performance: PublicPerformance | None = None,
+    l4_evidence: list[dict[str, Any]] | None = None,
+) -> ReportBundle:
+    signal = risk.signal
+    risk_text = (
+        "Risk Manager changed the signal."
+        if risk.adjustments
+        else "Risk Manager did not change the signal."
+    )
+    sections: list[dict[str, Any]] = [
+        {"id": "strategy", "title": "StrategySpec", "items": strategy.model_dump()},
+        {"id": "entry_conditions", "title": "진입 조건", "items": [item.model_dump() for item in strategy.entry_conditions]},
+        {"id": "assumptions", "title": "검증 가정", "items": strategy.assumptions},
+        {"id": "signal", "title": "Signal Judge", "items": signal.model_dump()},
+        {"id": "risk", "title": "Risk Manager", "items": [item.model_dump() for item in risk.adjustments]},
+    ]
+    if citations:
+        sections.append({"id": "citations", "title": "출처", "items": citations})
+    if data:
+        freshness_evidence = withhold_recommendations_without_l4_evidence(
+            build_freshness_evidence(data.get("pipeline_data_source")),
+            l4_evidence=l4_evidence,
+        )
+        sections.insert(
+            3,
+            {
+                "id": "screening_candidates",
+                "title": "공용 DB 스크리닝 후보",
+                "items": data.get("screening_candidates", []),
+            },
+        )
+        sections.insert(
+            4,
+            {
+                "id": "data_availability",
+                "title": "데이터 가용성",
+                "items": data.get("data_availability", {}),
+            },
+        )
+        sections.insert(
+            5,
+            {
+                "id": "freshness",
+                "title": "데이터 freshness",
+                "items": freshness_evidence.model_dump(mode="json"),
+            },
+        )
+    if public_performance is not None:
+        sections.insert(
+            3,
+            {
+                "id": "performance",
+                "title": "후보 코드 백테스트",
+                "items": public_performance.model_dump(mode="json"),
+            },
+        )
+    if debate:
+        sections.append({"id": "report_debate", "title": "Report 정반합", "items": debate})
+    if objective_floor:
+        # The acceptance floor's own verdict, printed next to the result rather than only
+        # acting on it. While the floor is report-only a strategy can be labelled
+        # 검증됨 and still be listed here as not having cleared it, and the reader is
+        # entitled to see both.
+        sections.append(
+            {
+                "id": "objective_floor",
+                "title": "수용 기준 판정 (참고)",
+                "items": objective_floor,
+            }
+        )
+    web = ReportProjection(
+        title=f"{strategy.name} 분석 결과",
+        summary=f"{signal.action} / confidence {signal.confidence:.2f}. {risk_text}",
+        sections=sections,
+    )
+    email_sections: list[dict[str, Any]] = [
+        {"id": "summary", "title": "요약", "items": {"confidence": signal.confidence}},
+        {"id": "assumptions", "title": "검증 가정", "items": strategy.assumptions},
+        {"id": "risk", "title": "리스크 변경", "items": [item.model_dump() for item in risk.adjustments]},
+    ]
+    if data:
+        email_sections.append(
+            {
+                "id": "freshness",
+                "title": "데이터 freshness",
+                "items": withhold_recommendations_without_l4_evidence(
+                    build_freshness_evidence(data.get("pipeline_data_source")),
+                    l4_evidence=l4_evidence,
+                ).model_dump(mode="json"),
+            }
+        )
+    email = ReportProjection(
+        title=f"[QuantAgent] {strategy.name}: {signal.action}",
+        summary=f"{strategy.timeframe} 전략 신호는 {signal.action}입니다.",
+        sections=email_sections,
+    )
+    return ReportBundle(
+        web_projection=web,
+        email_projection=email,
+        risk_adjustments=risk.adjustments,
+    )
+
+
+def report_node(state: dict) -> dict:
+    strategy = StrategySpec.model_validate(state["strategy_spec"])
+    risk = RiskDecision.model_validate(state["risk"])
+    public_performance = project_public_performance(
+        state.get("backtest"),
+        price_rows=state.get("price_rows"),
+        pipeline_data_source=(state.get("data") or {}).get("pipeline_data_source"),
+    )
+    public_risk = _risk_for_public_report(risk, public_performance)
+    debate = build_report_debate(state, strategy, public_risk)
+    report = build_report_bundle(
+        strategy,
+        public_risk,
+        state.get("backtest"),
+        data=state.get("data"),
+        debate=debate,
+        citations=_screening_citations(state),
+        public_performance=public_performance,
+        l4_evidence=state.get("l4_evidence"),
+        objective_floor=state.get("objective_floor"),
+    )
+    return {"report": report.model_dump(), "report_debate": debate}
+
+
+def _risk_for_public_report(
+    risk: RiskDecision,
+    public_performance: PublicPerformance | None,
+) -> RiskDecision:
+    """Withhold every report recommendation when public performance is unavailable.
+
+    A raw RiskDecision is useful internal context, but it can be derived from an
+    undersized backtest.  Do not let its BUY/HOLD/DROP text outrun the public
+    performance contract: web, email, and the report writer must all see the same
+    no-recommendation decision.
+    """
+
+    if not isinstance(public_performance, PerformanceUnavailable):
+        return risk
+
+    reason = (
+        "입력 기간·유니버스가 최소 데이터 기준에 미달해 매매 추천을 생성하지 않습니다."
+        if public_performance.reason_code == "insufficient_reliability"
+        else "공개 가능한 백테스트 성과가 없어 매매 추천을 생성하지 않습니다."
+    )
+    return RiskDecision(
+        signal=SignalDecision(
+            action="NO_RECOMMENDATION",
+            confidence=0.0,
+            bear_case=[reason],
+            judge_reason=reason,
+        ),
+        adjustments=[],
+        portfolio_risk=risk.portfolio_risk,
+    )
+
+
+def _screening_citations(state: dict[str, Any]) -> list[dict[str, str]]:
+    """Sources behind the report.
+
+    These used to come from the research debate. That debate is gone, and the sources
+    that actually informed the run are the ones the screening stage consulted while
+    working out what the strategy's terms mean.
+    """
+
+    pipeline = (state.get("data") or {}).get("pipeline_data_source") or {}
+    research = (pipeline.get("screening_relaxation") or {}).get("research") or {}
+    seen: set[str] = set()
+    citations: list[dict[str, str]] = []
+    for citation in research.get("citations") or []:
+        url = citation.get("url")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        citations.append(citation)
+    return citations
+
+
+def build_report_debate(
+    state: dict[str, Any],
+    strategy: StrategySpec,
+    risk: RiskDecision,
+) -> dict[str, Any]:
+    """Write the report's interpretation of an already-decided outcome.
+
+    This used to be a third bull/bear/judge debate, after the ones in research and
+    signal. It re-argued a settled decision - its judge fallback just echoed
+    risk.signal.action - for three provider calls. The opposing views are now taken
+    from the debates that already ran and handed to a single writing call.
+    """
+
+    if risk.signal.action == "NO_RECOMMENDATION":
+        reason = risk.signal.judge_reason
+        return {
+            "writeup": RoleDebatePayload(
+                role="REPORT_WRITER",
+                summary="데이터 검증 범위가 부족해 이번 결과에서는 매매 추천을 생성하지 않습니다.",
+                evidence=[reason],
+                concerns=["데이터 기준을 충족한 뒤 다시 분석해야 합니다."],
+                recommendation="NO_RECOMMENDATION",
+                confidence=0.0,
+                validation_results={"recommendation_withheld": "pass"},
+            ).model_dump()
+        }
+
+    # The signal is now derived from the backtest by rule (no debate), so the opposing
+    # material comes from that decision's own bull/bear case rather than three LLM calls.
+    investment_signal = state.get("investment_signal") or {}
+    context = {
+        "strategy": strategy.model_dump(),
+        "risk": risk.model_dump(),
+        "performance": _report_safe_performance(state),
+        "data_availability": state.get("data", {}).get("data_availability", {}),
+        "signal_decision": {
+            "action": investment_signal.get("action"),
+            "confidence": investment_signal.get("confidence"),
+            "reason": investment_signal.get("judge_reason"),
+        },
+        # Surfaced explicitly so the write-up addresses concentration, not just returns.
+        "portfolio_risk": (risk.portfolio_risk.model_dump() if risk.portfolio_risk else None),
+        "supporting_case": investment_signal.get("bull_case") or [],
+        "objections": investment_signal.get("bear_case") or [],
+        "research_review": state.get("research_review") or {},
+    }
+    writeup = generate_report_writeup(
+        context=context,
+        fallback=RoleDebatePayload(
+            role="REPORT_WRITER",
+            summary="성과 수치와 데이터 가용성을 함께 노출하는 균형 리포트로 확정합니다.",
+            evidence=["Backtest metrics and Risk Manager inputs are available."],
+            concerns=["Report must not imply unavailable data was fully validated."],
+            recommendation=risk.signal.action,
+            confidence=risk.signal.confidence,
+            validation_results={"over_optimism_check": "pass", "proxy_disclosure": "pass"},
+        ),
+    )
+    return {"writeup": writeup.model_dump()}
+
+
+def _report_safe_performance(state: dict[str, Any]) -> dict[str, Any] | None:
+    performance = project_public_performance(
+        state.get("backtest"),
+        price_rows=state.get("price_rows"),
+        pipeline_data_source=(state.get("data") or {}).get("pipeline_data_source"),
+    )
+    if performance is None:
+        return None
+    if isinstance(performance, PerformanceAvailable):
+        return performance.model_dump(mode="json")
+    # The unavailable variant has no metrics/chart fields by construction.
+    return performance.model_dump(mode="json")

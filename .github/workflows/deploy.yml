@@ -1,0 +1,454 @@
+name: Deploy to SSH Server
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: quant-agent-deploy
+  cancel-in-progress: false
+
+jobs:
+  release-trust:
+    name: Offline release-trust gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            ai/pyproject.toml
+            backtest_module/pyproject.toml
+            backend/pyproject.toml
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+          cache: npm
+          cache-dependency-path: fe/package-lock.json
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./backtest_module -e ./ai -e "./backend[test]" pytest
+
+      - name: Install frontend dependencies
+        working-directory: fe
+        run: npm ci
+
+      - name: Verify offline release trust
+        env:
+          RELEASE_TRUST_PYTHON: python
+        run: node scripts/evaluate-release-trust.mjs
+
+  deploy:
+    needs: release-trust
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: fe/package-lock.json
+
+      - name: Install dependencies
+        working-directory: fe
+        run: npm ci
+
+      - name: Build
+        working-directory: fe
+        run: npm run build
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p 30233 quant-agent.kro.kr >> ~/.ssh/known_hosts
+
+      - name: Create deploy directory on server
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            "mkdir -p ~/mvp_sp1/quant-proj"
+
+      - name: Deploy via rsync
+        run: |
+          rsync -rlvvz --delete --stats \
+            --old-args \
+            --omit-dir-times \
+            --no-perms --no-owner --no-group \
+            --exclude='.git/' \
+            --exclude='node_modules/' \
+            --exclude='DE/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='**/__pycache__/' \
+            --exclude='**/*.pyc' \
+            --exclude='**/logs/' \
+            --exclude='**/.pytest_cache/' \
+            --exclude='ai/.venv/' \
+            -e "ssh -v -i ~/.ssh/id_rsa -p 30233" \
+            ./ \
+            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
+
+      - name: Configure production Google auth
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          test -n "$GOOGLE_CLIENT_ID"
+          test -n "$GOOGLE_CLIENT_SECRET"
+
+          auth_env_file="$RUNNER_TEMP/google-auth.env"
+          trap 'rm -f "$auth_env_file"' EXIT
+          umask 077
+          {
+            printf '%s\n' 'APP_ENV=production'
+            printf '%s\n' 'AUTH_ENABLED=true'
+            printf 'GOOGLE_CLIENT_ID=%s\n' "$GOOGLE_CLIENT_ID"
+            printf 'GOOGLE_CLIENT_SECRET=%s\n' "$GOOGLE_CLIENT_SECRET"
+            printf '%s\n' 'GOOGLE_REDIRECT_URI=https://qt-agent.kro.kr/auth/google/callback'
+            printf '%s\n' 'AUTH_PUBLIC_BACKEND_ORIGIN=https://qt-agent.kro.kr'
+            printf '%s\n' 'AUTH_ALLOWED_ORIGINS=https://qt-agent.kro.kr'
+            printf '%s\n' 'AUTH_ALLOWED_HOSTS=qt-agent.kro.kr,localhost,127.0.0.1'
+            printf '%s\n' 'AUTH_TRUSTED_PROXY_HEADERS=true'
+            printf '%s\n' 'AUTH_TRUSTED_PROXY_HOSTS=127.0.0.1,::1'
+            printf '%s\n' 'AUTH_COOKIE_SECURE=true'
+            printf '%s\n' 'AUTH_COOKIE_SAMESITE=lax'
+          } > "$auth_env_file"
+
+          scp -q -i ~/.ssh/id_rsa -P 30233 "$auth_env_file" \
+            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/.env.auth.upload
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+            set -euo pipefail
+            APP_DIR="$HOME/mvp_sp1/quant-proj"
+            env_file="$APP_DIR/.env"
+            incoming="$APP_DIR/.env.auth.upload"
+            next_file="$(mktemp "$APP_DIR/.env.next.XXXXXX")"
+            trap 'rm -f "$incoming" "$next_file"' EXIT
+            chmod 600 "$incoming"
+
+            if [ -f "$env_file" ]; then
+              grep -Ev '^(APP_ENV|AUTH_ENABLED|GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|GOOGLE_REDIRECT_URI|AUTH_PUBLIC_BACKEND_ORIGIN|AUTH_ALLOWED_ORIGINS|AUTH_ALLOWED_HOSTS|AUTH_TRUSTED_PROXY_HEADERS|AUTH_TRUSTED_PROXY_HOSTS|AUTH_COOKIE_SECURE|AUTH_COOKIE_SAMESITE)=' \
+                "$env_file" > "$next_file" || true
+            fi
+            cat "$incoming" >> "$next_file"
+            chmod 600 "$next_file"
+            mv "$next_file" "$env_file"
+            rm -f "$incoming"
+            trap - EXIT
+          REMOTE
+
+      - name: Install and restart development servers
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            bash -s -- "$GITHUB_SHA" <<'REMOTE'
+            set -euo pipefail
+
+            DEPLOYMENT_REVISION="$1"
+            if [ -f "$HOME/.bashrc" ]; then
+              set +u
+              source "$HOME/.bashrc"
+              set -u
+            fi
+
+            APP_DIR="$HOME/mvp_sp1/quant-proj"
+            RUN_DIR="$APP_DIR/.run"
+            mkdir -p "$RUN_DIR"
+            SECRET_DIR="$HOME/.config/quantagent"
+            mkdir -p "$SECRET_DIR"
+            chmod 700 "$SECRET_DIR"
+
+            for auth_var in \
+              AUTH_ENABLED \
+              GOOGLE_CLIENT_ID \
+              GOOGLE_CLIENT_SECRET \
+              GOOGLE_REDIRECT_URI \
+              AUTH_PUBLIC_BACKEND_ORIGIN \
+              AUTH_ALLOWED_ORIGINS \
+              AUTH_ALLOWED_HOSTS \
+              AUTH_TRUSTED_PROXY_HEADERS \
+              AUTH_TRUSTED_PROXY_HOSTS \
+              AUTH_COOKIE_SECURE \
+              AUTH_COOKIE_SAMESITE
+            do
+              unset "$auth_var"
+            done
+            export APP_ENV=production
+
+            python3.11 -m venv "$APP_DIR/ai/.venv"
+            "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
+            "$APP_DIR/ai/.venv/bin/python" -m pip install \
+              -e "$APP_DIR/backtest_module" \
+              -e "$APP_DIR/backend" \
+              -e "$APP_DIR/ai"
+            "$APP_DIR/ai/.venv/bin/python" -c \
+              'import backtest_module, quantstats; print("backtest dependencies ready")'
+            (
+              cd "$APP_DIR"
+              "$APP_DIR/ai/.venv/bin/python" -c \
+                'from app.core.config import load_settings; settings = load_settings(); assert settings.is_production, "APP_ENV must be production"; assert settings.auth_enabled, "AUTH_ENABLED must be true"; assert settings.auth_cookie_secure, "AUTH_COOKIE_SECURE must be true"; assert settings.google_redirect_uri == "https://qt-agent.kro.kr/auth/google/callback", "GOOGLE_REDIRECT_URI mismatch"; assert "https://qt-agent.kro.kr" in settings.allowed_origins, "AUTH_ALLOWED_ORIGINS mismatch"; assert settings.auth_trusted_proxy_headers, "AUTH_TRUSTED_PROXY_HEADERS must be true"; assert set(settings.trusted_proxy_hosts) == {"127.0.0.1", "::1"}, "AUTH_TRUSTED_PROXY_HOSTS mismatch"'
+            )
+
+            "$APP_DIR/ai/.venv/bin/python" - "$APP_DIR" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          import psycopg
+
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+
+          app_dir = Path(sys.argv[1])
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is required for AI audit migrations")
+          with psycopg.connect(dsn, autocommit=True) as conn:
+              for name in (
+                  "011_app_ai_backtest_erd.sql",
+                  "013_ai_runtime_logging.sql",
+                  "014_create_report_email_tables.sql",
+                  "019_ai_prompt_response_summary.sql",
+                  "020_ai_account_tokens.sql",
+                  "021_ai_analysis_jobs.sql",
+                  "022_immutable_analysis_results.sql",
+                  "023_archive_undecodable_analysis_jobs.sql",
+              ):
+                  conn.execute(
+                      (app_dir / "service_db" / "migrations" / name).read_text(
+                          encoding="utf-8"
+                      )
+                  )
+                  print(f"applied {name}")
+          PY
+
+            umask 077
+            AUDIT_SECRET_FILE="$RUN_DIR/ai-audit-admission.secret"
+            if [ ! -s "$AUDIT_SECRET_FILE" ]; then
+              openssl rand -hex 32 > "$AUDIT_SECRET_FILE"
+            fi
+            chmod 600 "$AUDIT_SECRET_FILE"
+            export APP_ENV=production
+            export AI_JOB_STORE=persistent
+            export AI_AUDIT_PRODUCTION_ENABLED=1
+            export AI_AUDIT_SINK=postgres
+            export AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET
+            AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET="$(tr -d '\r\n' < "$AUDIT_SECRET_FILE")"
+            export AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION=server-v1
+            export AI_AUDIT_GATE_B_ADMISSION_AUDIENCE=quantagent.ai.audit
+            export AI_AUDIT_GATE_B_EVIDENCE_ID=production-deployment
+            export AI_AUDIT_GATE_B_DEPLOYMENT_REVISION="$DEPLOYMENT_REVISION"
+            export AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE=active
+            RULE_DRAFT_SECRET_FILE="$SECRET_DIR/ai-rule-draft-hmac.secret"
+            if [ ! -s "$RULE_DRAFT_SECRET_FILE" ]; then
+              openssl rand -hex 32 > "$RULE_DRAFT_SECRET_FILE"
+            fi
+            chmod 600 "$RULE_DRAFT_SECRET_FILE"
+            export AI_RULE_DRAFT_HMAC_SECRET
+            AI_RULE_DRAFT_HMAC_SECRET="$(tr -d '\r\n' < "$RULE_DRAFT_SECRET_FILE")"
+            export AI_RULE_DRAFT_HMAC_KEY_VERSION=server-v1
+            export AI_AUDIT_GATE_B_ADMISSION_TOKEN
+            AI_AUDIT_GATE_B_ADMISSION_TOKEN="$("$APP_DIR/ai/.venv/bin/python" - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import os
+          import time
+
+          def encode(value):
+              raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+              return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+          now = time.time()
+          key_version = os.environ["AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION"]
+          header = {"alg": "HS256", "key_version": key_version}
+          claims = {
+              "audience": os.environ["AI_AUDIT_GATE_B_ADMISSION_AUDIENCE"],
+              "deployment_revision": os.environ[
+                  "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
+              ],
+              "evidence_id": os.environ["AI_AUDIT_GATE_B_EVIDENCE_ID"],
+              "expiry": now + 365 * 24 * 60 * 60,
+              "issued_at": now - 1,
+              "key_version": key_version,
+          }
+          signing_input = f"{encode(header)}.{encode(claims)}"
+          signature = hmac.new(
+              os.environ["AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET"].encode(),
+              signing_input.encode("ascii"),
+              hashlib.sha256,
+          ).digest()
+          print(
+              f"{signing_input}."
+              f"{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}"
+          )
+          PY
+            )"
+
+            "$APP_DIR/ai/.venv/bin/python" - <<'PY'
+          from ai_graph.audit_postgres import AuthorizedAuditSink, create_audit_sink_from_env
+
+          if not isinstance(create_audit_sink_from_env(), AuthorizedAuditSink):
+              raise RuntimeError("production AI audit admission was not authorized")
+          print("production AI audit admission authorized")
+          PY
+
+            cd "$APP_DIR/fe"
+            npm ci
+            VITE_AI_API_BASE_URL="/ai-api" npm run build
+
+            stop_listeners_on_port() {
+              local port="$1"
+
+              find_listener_pids_on_port() {
+                local target_port="$1"
+                ss -H -ltnp "sport = :$target_port" 2>/dev/null \
+                  | grep -oE 'pid=[0-9]+' \
+                  | cut -d= -f2 \
+                  | sort -u \
+                  || true
+              }
+
+              for attempt in $(seq 1 5); do
+                local pids
+                pids="$(find_listener_pids_on_port "$port")"
+
+                if [ -z "$pids" ]; then
+                  echo "No listener found on port $port"
+                  return 0
+                fi
+
+                echo "Stopping listener(s) on port $port, attempt $attempt: $pids"
+                for pid in $pids; do
+                  kill "$pid" 2>/dev/null || true
+                done
+
+                for _ in $(seq 1 5); do
+                  if [ -z "$(find_listener_pids_on_port "$port")" ]; then
+                    return 0
+                  fi
+                  sleep 1
+                done
+
+                pids="$(find_listener_pids_on_port "$port")"
+                echo "Force stopping listener(s) on port $port: $pids"
+                for pid in $pids; do
+                  kill -9 "$pid" 2>/dev/null || true
+                done
+                sleep 1
+              done
+
+              echo "Port $port is still occupied after stop attempts"
+              ss -H -ltnp "sport = :$port" 2>/dev/null || true
+              return 1
+            }
+
+            # A previous development reloader can respawn its listener after the port check.
+            # Stop every managed uvicorn generation before starting the single production process.
+            pkill -TERM -f "$APP_DIR/ai/.venv/bin/python -m uvicorn combined_main:app" 2>/dev/null || true
+            sleep 2
+            pkill -KILL -f "$APP_DIR/ai/.venv/bin/python -m uvicorn combined_main:app" 2>/dev/null || true
+
+            stop_listeners_on_port 18001
+            stop_listeners_on_port 18000
+            rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
+
+            cd "$APP_DIR"
+            nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
+              --host 0.0.0.0 \
+              --port 18001 \
+              --workers 1 \
+              > "$RUN_DIR/combined.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/combined.pid"
+
+            cd "$APP_DIR/fe"
+            nohup env \
+              COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18001" \
+              HOST="127.0.0.1" PORT="18000" node scripts/production-gateway.mjs \
+              > "$RUN_DIR/fe.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/fe.pid"
+
+            wait_for_url() {
+              local name="$1"
+              local url="$2"
+              local log_file="$3"
+              for _ in $(seq 1 30); do
+                if curl -fsS "$url" >/dev/null 2>&1; then
+                  echo "$name is ready: $url"
+                  return 0
+                fi
+                sleep 2
+              done
+              echo "$name did not become ready: $url"
+              tail -n 80 "$log_file" || true
+              return 1
+            }
+
+            wait_for_url "Combined backend" "http://127.0.0.1:18001/combined-health" "$RUN_DIR/combined.log"
+            wait_for_url "General backend" "http://127.0.0.1:18001/health" "$RUN_DIR/combined.log"
+            wait_for_url "Backend readiness" "http://127.0.0.1:18001/readiness" "$RUN_DIR/combined.log"
+            wait_for_url "AI API" "http://127.0.0.1:18001/ai-api/health" "$RUN_DIR/combined.log"
+            curl -fsS 'http://127.0.0.1:18001/readiness' \
+              | "$APP_DIR/ai/.venv/bin/python" -c \
+                'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert {check["name"] for check in payload["checks"]} >= {"auth_runtime", "main_db", "trading_data_db", "redis"}; assert all(check["ready"] for check in payload["checks"])'
+            curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
+              | "$APP_DIR/ai/.venv/bin/python" -c \
+                'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
+            curl -fsS 'http://127.0.0.1:18001/ai-api/readiness' \
+              | "$APP_DIR/ai/.venv/bin/python" -c \
+                'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert payload["migration_revision"] == "022_immutable_analysis_results"; assert payload["ai_contract_version"] == "ai-mvp.v1"; assert all(check["ready"] for check in payload["checks"])'
+            wait_for_url "Frontend gateway" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
+            frontend_html="$(mktemp "$RUN_DIR/frontend-smoke.XXXXXX")"
+            if ! curl -fsS -o "$frontend_html" "http://127.0.0.1:18000/"; then
+              rm -f "$frontend_html"
+              exit 1
+            fi
+            if grep -Eq '(/@vite/client|/src/[^"[:space:]]+\.(tsx?|jsx?))' "$frontend_html"; then
+              echo "Frontend bundle contains Vite development assets"
+              rm -f "$frontend_html"
+              exit 1
+            fi
+            rm -f "$frontend_html"
+
+            unknown_route_html="$(mktemp "$RUN_DIR/frontend-404.XXXXXX")"
+            unknown_route_status="$(curl -sS -o "$unknown_route_html" -w '%{http_code}' "http://127.0.0.1:18000/retired-internal-route")"
+            test "$unknown_route_status" = "404"
+            test -s "$unknown_route_html"
+            rm -f "$unknown_route_html"
+            curl -fsS "http://127.0.0.1:18000/trust" >/dev/null
+
+            auth_headers="$(mktemp "$RUN_DIR/google-auth-smoke.headers.XXXXXX")"
+            auth_body="$(mktemp "$RUN_DIR/google-auth-smoke.body.XXXXXX")"
+            curl -fsS -D "$auth_headers" -o "$auth_body" \
+              'http://127.0.0.1:18000/api/v1/auth/google/start?redirect_uri=https%3A%2F%2Fqt-agent.kro.kr%2Fauth%2Fgoogle%2Fcallback&return_to=%2Fapp'
+            grep -Eqi '^set-cookie: qa_oauth_state=.*Path=/api/v1/auth/google' "$auth_headers"
+            cd "$APP_DIR"
+            "$APP_DIR/ai/.venv/bin/python" - "$auth_body" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          from urllib.parse import parse_qs, urlsplit
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          query = parse_qs(urlsplit(payload["authorizationUrl"]).query)
+          assert query["redirect_uri"] == ["https://qt-agent.kro.kr/auth/google/callback"]
+          assert query["client_id"][0].endswith(".apps.googleusercontent.com")
+          PY
+            rm -f "$auth_headers" "$auth_body"
+          REMOTE

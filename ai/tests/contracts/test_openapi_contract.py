@@ -1,0 +1,70 @@
+from fastapi.testclient import TestClient
+
+from ai_graph.api import (
+    ANALYSIS_JOB_DETAIL_PATH,
+    ANALYSIS_JOBS_PATH,
+    API_STATUS_PATH,
+    DAILY_DIGEST_PATH,
+    HEALTH_PATH,
+    OPENAPI_URL,
+    RESEARCH_JOB_CREATE_PATH,
+    RESEARCH_JOB_RESULT_PATH,
+    SPEC_STRATEGY_PARSE_PATH,
+    STRATEGY_DESCRIPTIONS_PATH,
+    create_app,
+)
+from ai_graph.jobs import InMemoryAnalysisJobStore
+
+
+def test_openapi_contract_keeps_core_routes_and_components() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    response = client.get(OPENAPI_URL)
+
+    assert response.status_code == 200
+    schema = response.json()
+    components = schema["components"]["schemas"]
+
+    assert HEALTH_PATH in schema["paths"]
+    assert API_STATUS_PATH in schema["paths"]
+    assert ANALYSIS_JOBS_PATH in schema["paths"]
+    assert ANALYSIS_JOB_DETAIL_PATH in schema["paths"]
+    assert SPEC_STRATEGY_PARSE_PATH in schema["paths"]
+    assert RESEARCH_JOB_CREATE_PATH in schema["paths"]
+    assert RESEARCH_JOB_RESULT_PATH in schema["paths"]
+    assert STRATEGY_DESCRIPTIONS_PATH in schema["paths"]
+    assert DAILY_DIGEST_PATH in schema["paths"]
+    assert "/api/backtests/{strategy_id}" in schema["paths"]
+    assert "/api/reports/{report_id}" in schema["paths"]
+    assert "APIEnvelope" in components
+    assert "AnalysisJob" in components
+    assert "ReportBundle" in components
+    assert "RuleDraftV1" in components
+    assert "ResearchJobAcceptedV1" in components
+    assert "ResearchDevPreviewV1" in components
+    parse = schema["paths"][SPEC_STRATEGY_PARSE_PATH]["post"]
+    assert "200" in parse["responses"]
+    assert "201" not in parse["responses"]
+
+
+def test_openapi_analysis_job_result_uses_api_envelope_schema() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    components = client.get(OPENAPI_URL).json()["components"]["schemas"]
+    analysis_job = components["AnalysisJob"]
+    result_schema = analysis_job["properties"]["result"]
+
+    assert "APIEnvelope" in str(result_schema)
+
+
+def test_openapi_contract_does_not_expose_ai_logging_surfaces() -> None:
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    paths = client.get(OPENAPI_URL).json()["paths"]
+    forbidden_fragments = ("/logs", "/audit", "/observability", "/metrics", "/admin")
+
+    assert not {
+        path
+        for path in paths
+        if any(fragment in path.lower() for fragment in forbidden_fragments)
+    }

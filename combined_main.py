@@ -1,0 +1,100 @@
+﻿from __future__ import annotations
+
+from contextlib import AsyncExitStack, asynccontextmanager
+from pathlib import Path
+import sys
+
+from fastapi import FastAPI
+
+
+def _ensure_source_path(path: Path) -> None:
+    resolved = str(path)
+    if resolved not in sys.path:
+        sys.path.insert(0, resolved)
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+_ensure_source_path(REPO_ROOT / "backend")
+_ensure_source_path(REPO_ROOT / "ai")
+
+import app.main as general_main  # noqa: E402
+import ai_graph.api as ai_main  # noqa: E402
+
+
+general_app = general_main.app
+ai_app = ai_main.app
+
+
+class LegacyAiPrefixCompatibilityMiddleware:
+    """Restore the known AI paths when the outer proxy strips ``/ai-api``.
+
+    The combined app normally owns the AI surface below ``/ai-api``.  The deployed
+    Nginx location currently forwards ``/ai-api/...`` as ``/...`` instead, so this
+    narrow compatibility layer restores only paths that unambiguously belong to the
+    AI app.  It must not broadly rewrite ``/api`` because that would shadow the
+    general backend's API surface.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            if isinstance(path, str) and self._is_stripped_ai_path(path):
+                rewritten_scope = dict(scope)
+                rewritten_scope["path"] = f"/ai-api{path}"
+                raw_path = scope.get("raw_path")
+                if isinstance(raw_path, bytes):
+                    rewritten_scope["raw_path"] = b"/ai-api" + raw_path
+                scope = rewritten_scope
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    def _is_stripped_ai_path(path: str) -> bool:
+        return path in {
+            "/api-status",
+            "/analysis-jobs",
+            "/api/strategies/parse",
+            "/api/research/jobs",
+        } or path.startswith(("/analysis-jobs/", "/api/research/jobs/"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    stack = AsyncExitStack()
+    try:
+        await stack.enter_async_context(general_app.router.lifespan_context(general_app))
+        await stack.enter_async_context(ai_app.router.lifespan_context(ai_app))
+    except Exception:
+        await stack.aclose()
+        raise
+    try:
+        yield
+    finally:
+        await stack.aclose()
+
+
+def create_app() -> FastAPI:
+    general_app.state.analysis_job_store = getattr(ai_app.state, "job_store", None)
+    app = FastAPI(
+        title="QuantAgent Combined Backend",
+        version="0.1.0",
+        description="Combined local integration wrapper for the General Backend and AI Backend.",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
+
+    @app.get("/combined-health")
+    def combined_health() -> dict[str, str]:
+        return {"status": "ok", "service": "quantagent-combined-backend"}
+
+    app.add_middleware(LegacyAiPrefixCompatibilityMiddleware)
+    app.mount("/ai-api", ai_app)
+    app.mount("/", general_app)
+    return app
+
+
+app = create_app()
