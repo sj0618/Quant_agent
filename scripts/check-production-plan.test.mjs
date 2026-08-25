@@ -7,7 +7,11 @@ import test from "node:test";
 
 import { checkProductionPlan, validateControlBoard } from "./check-production-plan.mjs";
 
-const SHA = "c3a5bc46822e0fa7f34d39060302d279293613f1";
+// Resolved at run time, not pinned. The preflight requires every evidence SHA to be an
+// ancestor of HEAD, so a hard-coded historical commit stops being reachable the moment
+// the repository is re-based onto a new root — which is exactly what happened when this
+// project moved to an orphan snapshot.
+const SHA = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
 
 function validBoard() {
   return {
