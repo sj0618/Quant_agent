@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_BOARD = "docs/plans/quantagent-production-control-board.md";
 const BOARD_MARKER = /<!--\s*control-board:v1\s*\n([\s\S]*?)\n\s*-->/u;
@@ -155,7 +156,7 @@ function parseArgs(argv) {
   fail("usage: node scripts/check-production-plan.mjs [--board <path>]");
 }
 
-if (import.meta.url === new URL(process.argv[1], "file:").href) {
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   try {
     process.stdout.write(JSON.stringify(checkProductionPlan(parseArgs(process.argv.slice(2))), null, 2) + "\n");
   } catch (error) {
