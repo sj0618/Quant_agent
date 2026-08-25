@@ -1071,7 +1071,7 @@ def test_no_rng_backs_the_deterministic_selection_claim() -> None:
         for source in root.rglob("*.py"):
             if "test" in source.parts or source.name.startswith("test_"):
                 continue
-            tree = ast.parse(source.read_text(), filename=str(source))
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     names = [alias.name for alias in node.names]
