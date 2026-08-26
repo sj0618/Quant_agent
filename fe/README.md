@@ -92,14 +92,14 @@ console.assert(evidence.origin==="http://127.0.0.1:18000"&&evidence.values.every
 - Google OAuth 성공, page reload, AI process restart 뒤 복원은 이 MVP 범위 밖이다.
 
 ## 데이터/API 경계
-`src/api/quantAgentClient.ts`는 backend API를 통해 읽기 전용 리포트를 조회한다. `src/api/researchClient.ts`만 `appConfig.aiApiBaseUrl`를 사용하며, `import.meta.env.DEV`에서는 `/ai-api`로 고정되고 production 빌드에서만 `VITE_AI_API_BASE_URL`이 적용된다.
+`src/api/quantAgentClient.ts`는 backend API의 읽기 전용 리포트와 AI API의 자연어 전략 analysis job을 함께 사용한다. 결과는 browser cache가 아니라 server job을 polling해 받는다. `import.meta.env.DEV`에서는 AI base URL이 `/ai-api`로 고정되고 production 빌드에서만 `VITE_AI_API_BASE_URL`이 적용된다.
 - **정적 샘플**: 랜딩 페이지의 제품 소개용 `landingSample`만 정적 콘텐츠다. 제품 워크스페이스나 리포트 데이터로 사용하지 않는다.
 - **리포트 보관 API**: `quantAgentClient.ts`는 읽기 전용 `GET /reports`와 `GET /reports/:id`만 사용한다. 보관 시각은 명시적 `createdAt`만 표시하며, 없는 값은 미확인으로 처리한다.
 - **리서치 API**: `researchClient.ts`의 `POST /api/strategies/parse`와 `POST /api/research/jobs`는 비개인화 리서치 계약 검토·결과 조회 흐름이다. 과거 분석 job/run 생성·polling·SSE를 대체하거나 현재 투자 결과를 보장하지 않는다.
-- **보관 화면**: 새 분석, 재발송, 과거 job 캐시 fallback은 제공하지 않는다. 결과가 없거나 근거가 부족하면 안전한 빈 상태와 보관함 이동만 표시한다.
+- **보관 화면**: 재발송과 과거 job 캐시 fallback은 제공하지 않는다. 새 분석은 `/app` 전략 검증 워크스페이스에서 server job으로 시작한다. 결과가 없거나 근거가 부족하면 성과 수치 대신 안전한 unavailable 상태를 표시한다.
 - **사용자 격리**: 보호 route 진입 전에 backend `/auth/me`로 Redis session을 검증한다. 로그아웃·사용자 변경 시 사용자 범위 캐시를 함께 삭제하고, 보호된 조회의 `401`/`403`/`404`는 캐시 fallback 없이 오류로 처리한다.
 
-보관된 결과에 없는 종목 후보, 신호 축, 수신자, 매크로 이벤트는 채워 넣지 않고 화면에 미제공 상태를 표시한다. 랜딩 CTA는 로그인 뒤 읽기 전용 보관함으로만 연결된다.
+보관된 결과에 없는 종목 후보, 신호 축, 수신자, 매크로 이벤트는 채워 넣지 않고 화면에 미제공 상태를 표시한다. 랜딩 CTA는 로그인 뒤 `/app` 전략 검증 워크스페이스로 연결된다.
 
 ## 검증
 

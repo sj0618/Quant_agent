@@ -290,7 +290,7 @@ export function StrategyInputPanel({
             className="min-w-0 flex-1 bg-transparent text-xs text-[#edeff4] outline-none placeholder:text-subdued disabled:text-subdued"
             disabled={inputDisabled}
             onChange={(event) => setDraft(event.target.value)}
-            placeholder={running ? "분석이 진행 중입니다" : "전략을 자연어로 입력하세요"}
+            placeholder={running ? "분석이 진행 중입니다" : "예: RSI 30 이하 진입, 70 이상 청산 전략을 최근 1년으로 검증해줘"}
             required
             value={draft}
           />

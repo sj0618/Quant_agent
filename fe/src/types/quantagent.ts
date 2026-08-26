@@ -323,6 +323,32 @@ export interface AIBacktestPerformance {
   universe_policy?: AIBacktestUniversePolicy | null;
 }
 
+/** Public result variants mirror the API discriminator. A missing/unsafe performance
+ * payload must never be rendered as a zero-value backtest in the workspace. */
+export interface AIPerformanceUnavailable {
+  availability: "unavailable";
+  reason_code: string;
+  safe_facts: Record<string, string | number | boolean | null>;
+}
+
+export interface AIPerformanceMethodManifest {
+  start_date: string;
+  end_date: string;
+  data_version: string;
+  result_version: string;
+  execution_version: string;
+  historical_simulation_warning: string;
+}
+
+export interface AIPerformanceAvailable {
+  availability: "available";
+  performance: AIBacktestPerformance;
+  method_manifest: AIPerformanceMethodManifest;
+  limitations: string[];
+}
+
+export type AIPublicPerformance = AIPerformanceAvailable | AIPerformanceUnavailable;
+
 export interface AIRecommendationGate {
   validated: boolean;
   reason: string;
@@ -355,7 +381,7 @@ export interface AIUserPayload {
   next_actions: string[];
   candidate_cards: StrategyCandidateCard[];
   report: AIReportBundle | null;
-  performance?: AIBacktestPerformance | null;
+  performance?: AIPublicPerformance | null;
   recommendation_gate?: AIRecommendationGate | null;
   ticker_actions?: AITickerAction[];
   question?: string | null;

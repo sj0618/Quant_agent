@@ -3,30 +3,33 @@ import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
 
-test("browser exposes rule-reviewed research without retaining legacy job/run or SSE sources", async () => {
-  const [clientSource, appSource, configSource] = await Promise.all([
+test("browser exposes the durable natural-language strategy workspace without browser result fallbacks", async () => {
+  const [clientSource, appSource, configSource, workspaceSource, mapperSource] = await Promise.all([
     readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/config/appConfig.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/features/app/StrategyWorkspace.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/features/app/strategyWorkspaceMapper.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(clientSource, /backendRequest/);
   assert.match(clientSource, /export async function getReports\(q\?: string\)/);
   assert.match(clientSource, /new URLSearchParams\(\{ q: normalizedQuery \}\)/);
   assert.match(clientSource, /export async function getReportById/);
-  assert.doesNotMatch(clientSource, /createAnalysisJob|cancelAnalysisJob|createAnalysisRun|completeAnalysisRun/);
-  assert.doesNotMatch(clientSource, /analysis-jobs|strategyDescriptions|fetchAI/);
-  assert.match(appSource, /ResearchWorkspace/);
-  assert.doesNotMatch(appSource, /매수|매도|보유|추천|BUY|SELL|HOLD/);
-  assert.doesNotMatch(appSource, /StrategyInputPanel|useAnalysisActivity|analysis-jobs/);
-  assert.match(configSource, /researchRuleReview: "\/api\/strategies\/parse"/);
-  assert.match(configSource, /researchJobs: "\/api\/research\/jobs"/);
-  assert.match(configSource, /researchJobResult: \(id: string\) => `\/api\/research\/jobs\/\$\{encodeURIComponent\(id\)\}\/result`/);
-  assert.doesNotMatch(configSource, /analysis-jobs|analysis-runs|analysisJob|strategyDescriptions/);
-  await Promise.all([
-    assert.rejects(access(new URL("../src/api/analysisActivity.ts", import.meta.url))),
-    assert.rejects(access(new URL("../src/features/app/DebateActivityPanel.tsx", import.meta.url))),
-  ]);
+  assert.match(clientSource, /export async function createAnalysisJob/);
+  assert.match(clientSource, /export async function getAnalysisJob/);
+  assert.match(clientSource, /export async function cancelAnalysisJob/);
+  assert.doesNotMatch(clientSource, /createAnalysisRun|completeAnalysisRun|localStorage/);
+  assert.match(appSource, /StrategyWorkspace/);
+  assert.match(workspaceSource, /StrategyInputPanel/);
+  assert.match(workspaceSource, /createAnalysisJob/);
+  assert.match(workspaceSource, /getAnalysisJob/);
+  assert.match(workspaceSource, /natural-language strategy/);
+  assert.match(mapperSource, /reliability\?\.source === "postgres"/);
+  assert.match(mapperSource, /fixture·출처 미확인·표본 부족 결과는 성과 수치와 차트로 대체하지 않습니다/);
+  assert.match(configSource, /analysisJobs: "\/analysis-jobs"/);
+  assert.match(configSource, /analysisJobCancel/);
+  assert.doesNotMatch(configSource, /analysis-runs|\/runs\b/);
 });
 
 test("retained legacy preview cannot create analysis jobs or runs", async () => {
@@ -81,7 +84,7 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   assert.match(authSource, /AUTH_ENDPOINTS\.me/);
   assert.match(authSource, /finally \{\s+clearCurrentSession\(\)/);
   assert.match(appSource, /validateCurrentSession\(\)/);
-  assert.doesNotMatch(clientSource, /localStorage|analysis-jobs|fetchAI/);
+  assert.doesNotMatch(clientSource, /localStorage/);
   assert.match(profileSource, /window\.location\.assign\(ROUTES\.home\)/);
   assert.doesNotMatch(authSource, /TEST_AUTH_SESSION/);
   assert.doesNotMatch(authSource, /saveTestSession/);
@@ -90,7 +93,7 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   assert.doesNotMatch(authSource, /AUTH_ENDPOINTS\.testLogin/);
 });
 
-test("public navigation and bundle sources contain no development preview, fake sample report link, or internal 404 copy", async () => {
+test("public navigation describes the core strategy workflow without fake performance or internal preview copy", async () => {
   const [appSource, routesSource, landingSource, globalStyles] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/config/routes.ts", import.meta.url), "utf8"),
@@ -101,9 +104,10 @@ test("public navigation and bundle sources contain no development preview, fake 
   assert.doesNotMatch(appSource, /EmailTemplatePreviewPage|Figma HI-FI/);
   assert.doesNotMatch(routesSource, /emailTemplatePreview|dev\/email-template/);
   assert.doesNotMatch(landingSource, /reportDetail\("2026-04-18"\)|KRX LIVE|Sharpe 1\.42/);
-  assert.match(landingSource, /로그인 후 읽기 전용 리포트 보관함으로 이동합니다/);
-  assert.match(landingSource, /새 분석은 지원하지 않습니다/);
-  assert.doesNotMatch(landingSource, /매수|매도|보유|추천|BUY|SELL|HOLD/);
+  assert.match(landingSource, /자연어 전략 분석 시작/);
+  assert.match(landingSource, /자연어 전략 → 실데이터 백테스트 → 자연어 리포트/);
+  assert.match(landingSource, /개인 보유 종목·계좌·수량·위험성향/);
+  assert.doesNotMatch(landingSource, /새 분석은 지원하지 않습니다|현재 제공하지 않는 기능/);
   assert.doesNotMatch(await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"), /landing\.mock|getLandingSample|LandingSample/);
   assert.doesNotMatch(landingSource, /RELEASE VALIDATION|VALIDATION PRINCIPLES|READ-ONLY ARCHIVE|CURRENT SCOPE/);
   assert.doesNotMatch(globalStyles, /email-template/);

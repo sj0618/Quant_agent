@@ -27,13 +27,10 @@ from ai_graph.api import (
 from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
 from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import (
-    AnalysisHistoryReadOnlyError,
     AnalysisJobStatus,
     InMemoryAnalysisJobStore,
     JobStoreConfigurationError,
     JobStoreRuntime,
-    ReadOnlyAnalysisJobStore,
-    RestartReconciliationStore,
 )
 from ai_graph.research_contract import RuleDraftSigner
 from ai_graph.research_eligibility import PerformanceAvailable
@@ -338,7 +335,7 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert polled_job["result"]["user_payload"]["ticker_actions"] == []
 
 
-def test_production_retires_raw_analysis_jobs_before_side_effects(
+def test_production_refuses_unready_core_execution_before_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APP_ENV", "production")
@@ -349,7 +346,7 @@ def test_production_retires_raw_analysis_jobs_before_side_effects(
     def runner(_query: str, _trace_id: str) -> APIEnvelope:
         nonlocal runner_calls
         runner_calls += 1
-        raise AssertionError("retired raw endpoint reached the analysis runner")
+        raise AssertionError("unready core endpoint reached the analysis runner")
 
     client = TestClient(
         create_app(
@@ -361,90 +358,41 @@ def test_production_retires_raw_analysis_jobs_before_side_effects(
 
     response = client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
 
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "legacy_raw_analysis_job_retired"
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "analysis_execution_unavailable"
+    assert "durable_job_store" in response.json()["detail"]["checks"]
     assert store.list_jobs() == []
     assert runner_calls == 0
     assert sink.sessions == ()
 
 
-def test_analysis_history_is_read_only_while_no_surface_may_create_jobs(
+def test_ready_release_queues_the_core_natural_language_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With both creating routes retired, the store itself stops accepting new rows.
-
-    The routes already refuse, so this is the structural half of the same guarantee: a
-    consumer added later cannot start extending the history just by calling the store.
-    Past results stay readable and stay put - nothing here removes one.
-    """
+    """Release admission enables the core route; it does not require research signing."""
 
     monkeypatch.setenv("APP_ENV", "production")
-    store = InMemoryAnalysisJobStore()
-    existing = store.create_job("과거에 실행된 분석", user_id="local-dev-user")
-
-    client = TestClient(create_app(store, research_execution_enabled=False))
-    read_only = client.app.state.job_store
-
-    assert isinstance(read_only, ReadOnlyAnalysisJobStore)
-
-    with pytest.raises(AnalysisHistoryReadOnlyError):
-        read_only.create_job("새 분석", user_id="local-dev-user")
-
-    # The history is still there, still readable, over HTTP and through the store.
-    response = client.get(f"{ANALYSIS_JOBS_PATH}/{existing.job_id}")
-    assert response.status_code == 200
-    assert response.json()["job_id"] == existing.job_id
-    assert [job.job_id for job in read_only.list_jobs()] == [existing.job_id]
-
-
-def test_activating_research_execution_restores_the_write_surface() -> None:
-    """The read-only wrapper follows the enabled surfaces, not the deploy environment.
-
-    Otherwise the day research execution is activated in production it would be blocked
-    by a rule that was only ever about the retired legacy flow.
-    """
-
+    _configure_live_provider(monkeypatch)
     client = TestClient(
-        create_app(InMemoryAnalysisJobStore(), research_execution_enabled=True)
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            analysis_runner=lambda _query, trace_id: _ready_envelope(trace_id),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=None,
+        )
     )
 
-    assert not isinstance(client.app.state.job_store, ReadOnlyAnalysisJobStore)
+    response = client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 진입, 70 이상 청산 전략"})
+
+    assert response.status_code == 201
+    polled = _poll_job(client, response.json()["job_id"])
+    assert polled["result"]["status"] == "ready"
 
 
-def test_read_only_history_still_lets_a_restart_finish_interrupted_jobs() -> None:
-    """Reconciliation finishes existing history; it does not open new history.
-
-    Startup fails a job a dead process left RUNNING. Blocking that along with creation
-    would leave those rows spinning forever and make readiness fail closed for a reason
-    that has nothing to do with the retired flow.
-    """
-
-    class ReconcilableStore(InMemoryAnalysisJobStore):
-        def __init__(self) -> None:
-            super().__init__()
-            self.force_failed: list[str] = []
-
-        def list_jobs_for_reconciliation(self, *, limit: int = 500) -> list:
-            return []
-
-        def force_fail_undecodable_job(
-            self, job_id: str, *, error_message: str, reason: str
-        ) -> bool:
-            self.force_failed.append(job_id)
-            return True
-
-    inner = ReconcilableStore()
-    read_only = ReadOnlyAnalysisJobStore(inner)
-
-    assert isinstance(read_only, RestartReconciliationStore)
-    assert read_only.force_fail_undecodable_job("j-1", error_message="e", reason="r") is True
-    assert inner.force_failed == ["j-1"]
-
-
-def test_read_only_history_lifespan_reaps_a_prior_process_job(
+def test_core_execution_keeps_restart_reconciliation_for_prior_process_jobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Startup can settle historical work without reopening the create surface."""
+    """The active creation path must not weaken startup reconciliation."""
 
     monkeypatch.setenv("APP_ENV", "production")
     inner = InMemoryAnalysisJobStore()
@@ -452,13 +400,9 @@ def test_read_only_history_lifespan_reaps_a_prior_process_job(
     running = inner.update_job_status(job.job_id, AnalysisJobStatus.RUNNING, "backtest")
     inner.jobs[job.job_id] = running.model_copy(update={"owner_incarnation": "previous-process"})
 
-    app = create_app(inner, research_execution_enabled=False)
+    app = create_app(inner)
     with TestClient(app):
-        read_only = app.state.job_store
-        assert isinstance(read_only, ReadOnlyAnalysisJobStore)
-        assert read_only.store_mode == inner.store_mode
-        with pytest.raises(AnalysisHistoryReadOnlyError):
-            read_only.create_job("새 분석")
+        assert app.state.job_store is inner
 
     settled = inner.get_job(job.job_id)
     assert settled is not None
@@ -1307,38 +1251,27 @@ def _analysis_job_create_status(client: TestClient) -> str:
     return entry["state"]
 
 
-def test_the_endpoint_inventory_agrees_with_what_the_route_actually_does(
+def test_the_endpoint_inventory_advertises_core_execution_and_unready_release_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OD-API-01: the inventory has to be checked against behaviour, not against itself.
-
-    `POST /analysis-jobs` was advertised as `local_sync` - "Create and run an analysis
-    job" - while the handler returned 410. The list is hand-maintained and the
-    retirement changed the handler without changing the sentence describing it, so the
-    one endpoint that exists to tell a consumer why its calls stopped working was the
-    one saying they still worked.
-
-    Asserting the word alone would not have caught it, because the word was a plausible
-    word. This asserts the word and the response together.
-    """
+    """The inventory must describe the core route and its fail-closed release mode."""
 
     monkeypatch.setenv("APP_ENV", "production")
-    retired_client = TestClient(create_app(InMemoryAnalysisJobStore()))
+    release_client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
-    assert _analysis_job_create_status(retired_client) == "retired"
-    response = retired_client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
-    assert response.status_code == 410
+    assert _analysis_job_create_status(release_client) == "job_async"
+    response = release_client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "analysis_execution_unavailable"
 
     monkeypatch.delenv("APP_ENV", raising=False)
     live_client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
-    assert _analysis_job_create_status(live_client) == "local_sync"
-    assert live_client.post(
-        ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"}
-    ).status_code != 410
+    assert _analysis_job_create_status(live_client) == "job_async"
+    assert live_client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"}).status_code == 201
 
 
-def test_the_inventory_summary_stops_advertising_a_retired_route(
+def test_the_inventory_summary_describes_core_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The state word is machine-readable; the summary is what a person reads."""
@@ -1353,5 +1286,5 @@ def test_the_inventory_summary_stops_advertising_a_retired_route(
         if item["method"] == "POST" and item["path"] == ANALYSIS_JOBS_PATH
     )
 
-    assert "Retired" in entry["summary"]
-    assert "Create and run" not in entry["summary"]
+    assert "natural-language strategy analysis" in entry["summary"]
+    assert "fails closed" in entry["summary"]
