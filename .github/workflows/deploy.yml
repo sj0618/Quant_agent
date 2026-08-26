@@ -245,6 +245,7 @@ jobs:
             chmod 600 "$AUDIT_SECRET_FILE"
             export APP_ENV=production
             export AI_JOB_STORE=persistent
+            export QUANTAGENT_DEPLOYMENT_REVISION="$DEPLOYMENT_REVISION"
             export AI_AUDIT_PRODUCTION_ENABLED=1
             export AI_AUDIT_SINK=postgres
             export AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET
@@ -410,6 +411,10 @@ jobs:
             curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
               | "$APP_DIR/ai/.venv/bin/python" -c \
                 'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
+            export EXPECTED_DEPLOYMENT_REVISION="$DEPLOYMENT_REVISION"
+            curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
+              | "$APP_DIR/ai/.venv/bin/python" -c \
+                'import json,os,sys; payload=json.load(sys.stdin); assert payload["deployment_revision"] == os.environ["EXPECTED_DEPLOYMENT_REVISION"]'
             curl -fsS 'http://127.0.0.1:18001/ai-api/readiness' \
               | "$APP_DIR/ai/.venv/bin/python" -c \
                 'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert payload["migration_revision"] == "022_immutable_analysis_results"; assert payload["ai_contract_version"] == "ai-mvp.v1"; assert all(check["ready"] for check in payload["checks"])'

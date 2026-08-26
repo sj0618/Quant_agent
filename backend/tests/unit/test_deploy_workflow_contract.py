@@ -42,3 +42,5 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert "npm run preview" not in workflow
     assert "AI_RULE_DRAFT_HMAC_SECRET" in workflow
     assert "ai-rule-draft-hmac.secret" in workflow
+    assert "QUANTAGENT_DEPLOYMENT_REVISION" in workflow
+    assert 'payload["deployment_revision"] == os.environ["EXPECTED_DEPLOYMENT_REVISION"]' in workflow

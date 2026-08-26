@@ -22,6 +22,7 @@ test("offline environment removes live settings and forces local test modes", ()
     AI_LLM_DIGEST_API_KEY: "role-secret-must-not-propagate",
     AUTH_ENABLED: "1",
     AI_LLM_PROVIDER: "aoai",
+    AI_DATA_SOURCE_VARIANT: "db_split",
     AI_BACKTEST_CACHE_DIR: "/stale/other-revision-cache",
     KEEP_ME: "yes",
   });
@@ -31,6 +32,7 @@ test("offline environment removes live settings and forces local test modes", ()
   assert.equal(environment.AI_LLM_DIGEST_API_KEY, undefined);
   assert.equal(environment.AUTH_ENABLED, "0");
   assert.equal(environment.AI_LLM_PROVIDER, "mock");
+  assert.equal(environment.AI_DATA_SOURCE_VARIANT, "db");
   assert.match(environment.AI_BACKTEST_CACHE_DIR, /quantagent-release-trust-/u);
   assert.notEqual(environment.AI_BACKTEST_CACHE_DIR, "/stale/other-revision-cache");
   assert.equal(environment.KEEP_ME, "yes");
@@ -120,6 +122,9 @@ test("release trust includes API, screen, metric, and backend contract gates", (
   assert.ok(checks[3].args.includes("backend/tests/unit/test_fe_contract_routes.py"));
   assert.ok(checks[3].args.includes("backend/tests/unit/test_track_c_store.py"));
   assert.ok(checks[3].args.includes("backend/tests/unit/test_runtime_perf.py"));
+  assert.ok(
+    checks.slice(0, 4).every(({ environment }) => environment.AI_DATA_SOURCE_VARIANT === "db")
+  );
   assert.equal(checks[4].cwd, "/repo/fe");
 });
 
