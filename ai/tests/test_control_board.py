@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,20 @@ BOARD_PATH = REPOSITORY_ROOT / "docs/plans/quantagent-production-control-board.m
 def _board_text() -> str:
     return BOARD_PATH.read_text(encoding="utf-8")
 
+
+def _marker() -> dict:
+    """Read the board's own JSON marker.
+
+    Mutation fixtures below derive their targets from this rather than quoting one
+    revision's bytes. A literal pinned to a past board silently stops matching when the
+    board is legitimately updated, and a no-op replace makes a "must be rejected" test
+    pass its input unchanged - so the assertion inverts and the suite fails on a valid
+    board instead of catching an invalid one.
+    """
+
+    match = re.search(r"<!--\s*control-board:v1\s*(\{.*?\})\s*-->", _board_text(), re.DOTALL)
+    assert match is not None, "board is missing its control-board:v1 marker"
+    return json.loads(match.group(1))
 
 def test_board_is_valid_and_every_row_carries_its_required_evidence() -> None:
     """The board is a live ledger, so assert invariants rather than today's counts.
@@ -56,11 +71,7 @@ def test_missing_blocker_column_is_rejected() -> None:
 
 
 def test_empty_transition_evidence_uri_is_rejected() -> None:
-    board = _board_text().replace(
-        "repo:scripts/check-production-plan.mjs@f02672878f10ee038133b917a18d333e061187bc",
-        "",
-        1,
-    )
+    board = _board_text().replace(_marker()["transitions"][0]["evidence"][0], "", 1)
 
     result = validate_control_board(board)
 
@@ -69,11 +80,7 @@ def test_empty_transition_evidence_uri_is_rejected() -> None:
 
 
 def test_negative_recurrence_count_is_rejected() -> None:
-    board = _board_text().replace(
-        '"recurrenceCount": 1',
-        '"recurrenceCount": -1',
-        1,
-    )
+    board = re.sub(r'"recurrenceCount": \d+', '"recurrenceCount": -1', _board_text(), count=1)
 
     result = validate_control_board(board)
 
@@ -91,7 +98,8 @@ def test_invalid_machine_marker_is_rejected() -> None:
 
 
 def test_projection_sha_mismatch_is_rejected() -> None:
-    board = _board_text().replace("`f026728`", "`abcdef0`", 1)
+    short_sha = _marker()["snapshot"]["gitSha"][:7]
+    board = _board_text().replace(f"`{short_sha}`", "`abcdef0`", 1)
 
     result = validate_control_board(board)
 
@@ -100,15 +108,14 @@ def test_projection_sha_mismatch_is_rejected() -> None:
 
 
 def test_blocker_projection_reviewer_and_evidence_must_match_marker() -> None:
+    marker = _marker()
+    blocker = marker["blockers"][0]
     reviewer_tampered = _board_text().replace(
-        "| 1 | Codex local verifier (not independent approval) |",
-        "| 1 | wrong reviewer |",
-        1,
+        f"| {blocker['lastReviewer']} |", "| wrong reviewer |", 1
     )
     evidence_tampered = _board_text().replace(
-        "`repo:docs/plans/quantagent-production-qa-local-evidence-contract-20260824.md@"
-        "f02672878f10ee038133b917a18d333e061187bc`",
-        "`repo:wrong-evidence@f02672878f10ee038133b917a18d333e061187bc`",
+        f"`{blocker['evidence'][0]}`",
+        f"`repo:wrong-evidence@{marker['snapshot']['gitSha']}`",
         1,
     )
 

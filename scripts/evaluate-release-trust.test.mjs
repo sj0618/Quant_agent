@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -120,14 +121,14 @@ test("release trust includes API, screen, metric, and backend contract gates", (
   assert.ok(checks[3].args.includes("backend/tests/unit/test_fe_contract_routes.py"));
   assert.ok(checks[3].args.includes("backend/tests/unit/test_track_c_store.py"));
   assert.ok(checks[3].args.includes("backend/tests/unit/test_runtime_perf.py"));
-  assert.equal(checks[4].cwd, "/repo/fe");
+  assert.equal(checks[4].cwd, join("/repo", "fe"));
 });
 
 test("pull-request CI invokes the fixed offline release-trust command", async () => {
   const workflowUrl = new URL("../.github/workflows/code-check.yml", import.meta.url);
   const workflow = await readFile(fileURLToPath(workflowUrl), "utf8");
 
-  assert.match(workflow, /release-trust:\n\s+name: Offline release-trust gate/u);
+  assert.match(workflow, /release-trust:\r?\n\s+name: Offline release-trust gate/u);
   assert.match(workflow, /node --test scripts\/evaluate-release-trust\.test\.mjs/u);
   assert.match(workflow, /node scripts\/evaluate-release-trust\.mjs/u);
 });
