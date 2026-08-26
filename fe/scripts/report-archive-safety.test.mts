@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import test from "node:test";
@@ -7,6 +8,7 @@ import { createServer } from "vite";
 import type { ArchivedReportDetail } from "../src/types/quantagent.ts";
 
 type ReportDetailModule = typeof import("../src/features/reports/ReportDetail.tsx");
+type ReportActionsModule = typeof import("../src/api/reportActionsClient.ts");
 
 const archivedReport = (
   contentSections: ArchivedReportDetail["contentSections"],
@@ -35,6 +37,58 @@ async function renderArchive(report: ArchivedReportDetail) {
     return renderToStaticMarkup(createElement(module.ReportDetail, { report }));
   } finally {
     await vite.close();
+  }
+}
+
+async function captureArchiveCsv(report: ArchivedReportDetail) {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  let capturedBlob: Blob | undefined;
+  let downloadFilename: string | undefined;
+
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      URL: {
+        createObjectURL(blob: Blob) {
+          capturedBlob = blob;
+          return "blob:archive-csv";
+        },
+        revokeObjectURL() {},
+      },
+    },
+  });
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: {
+      createElement() {
+        return {
+          click() {},
+          set download(value: string) { downloadFilename = value; },
+          set href(_value: string) {},
+        };
+      },
+    },
+  });
+
+  const vite = await createServer({
+    configFile: new URL("../vite.config.ts", import.meta.url).pathname,
+    root: new URL("..", import.meta.url).pathname,
+    logLevel: "error",
+    server: { middlewareMode: true, hmr: false },
+    optimizeDeps: { noDiscovery: true },
+  });
+  try {
+    const module = await vite.ssrLoadModule("/src/api/reportActionsClient.ts") as ReportActionsModule;
+    module.downloadReportsCsv([report]);
+    assert.ok(capturedBlob, "the CSV download must create a Blob");
+    return { content: await capturedBlob.text(), filename: downloadFilename };
+  } finally {
+    await vite.close();
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+    if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument);
+    else Reflect.deleteProperty(globalThis, "document");
   }
 }
 
@@ -130,4 +184,31 @@ test("archive readers show only the explicit record timestamp and disclose an un
   assert.match(explicitTimestampMarkup, /<dt>보관 기록 시각<\/dt><dd>2026-08-24T07:05:00Z<\/dd>/u);
   assert.match(unknownTimestampMarkup, /<dt>보관 기록 시각<\/dt><dd>보관 기록 시각 미확인<\/dd>/u);
   assert.doesNotMatch(unknownTimestampMarkup, /<dt>보관 기록 시각<\/dt><dd>2026-08-24T07:0[678]:00Z<\/dd>/u);
+});
+
+test("archive detail and CSV ignore legacy prompt, reasoning, and action fields", async () => {
+  const rawPrompt = "SYSTEM PROMPT: choose BUY immediately";
+  const internalReasoning = "internal chain of thought: confidence 99";
+  const actionSignal = "BUY";
+  const report = archivedReport([{
+    id: "reproduction_contract",
+    entries: [{ label: "재현 계약 버전", value: "rmp.v1", depth: 1 }],
+  }]) as ArchivedReportDetail & Record<string, unknown>;
+  report.rawPrompt = rawPrompt;
+  report.internalReasoning = internalReasoning;
+  report.actionSignal = actionSignal;
+  report.recommendationScore = "99";
+  report.signals = { BUY: 1 };
+
+  const markup = await renderArchive(report);
+  const csv = await captureArchiveCsv(report);
+
+  assert.match(markup, /검증 재현 계약/);
+  assert.match(markup, /rmp\.v1/);
+  for (const forbidden of [rawPrompt, internalReasoning, actionSignal, "99", "signals"]) {
+    assert.equal(markup.includes(forbidden), false, `${forbidden} must not reach the archive reader`);
+    assert.equal(csv.content.includes(forbidden), false, `${forbidden} must not reach the archive export`);
+  }
+  assert.equal(csv.filename, "quantagent-reports.csv");
+  assert.equal(csv.content, "\"result_id\",\"archived_date\",\"created_at\",\"status\"\n\"archive-001\",\"2026.08.24\",\"2026-08-24T07:05:00Z\",\"delivered\"");
 });
