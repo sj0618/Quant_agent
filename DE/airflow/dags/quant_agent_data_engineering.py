@@ -66,6 +66,7 @@ DEFAULT_BACKFILL_SCHEDULE = os.getenv("QUANT_AIRFLOW_BACKFILL_SCHEDULE", None)
 DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE", "2026-01-01T00:00:00")).replace(tzinfo=LOCAL_TZ)
 DEFAULT_TA_WARMUP_DAYS = int(os.getenv("QUANT_AIRFLOW_TA_WARMUP_DAYS", "365"))
 DEFAULT_EXTERNAL_LOOKBACK_DAYS = int(os.getenv("QUANT_AIRFLOW_EXTERNAL_LOOKBACK_DAYS", "7"))
+DEFAULT_OHLCV_REPAIR_LOOKBACK_DAYS = int(os.getenv("QUANT_AIRFLOW_OHLCV_REPAIR_LOOKBACK_DAYS", "7"))
 KIS_ADJUSTED_INGEST_SCRIPT = Path(
     os.getenv("QUANT_AIRFLOW_KIS_ADJUSTED_INGEST_SCRIPT", str(DE_ROOT / "scripts" / "ingest_kis_adjusted_ohlcv.py"))
 )
@@ -146,17 +147,14 @@ if dag and task:  # pragma: no branch
             from quant_agent.data.config import OhlcvIngestionConfig
             from quant_agent.data.ingestion import OhlcvIngestionRequest, OhlcvIngestionService
 
-            target_date = _target_date(
-                logical_date,
-                data_interval_end,
-                include_same_day_trade_date=True,
-            )
+            run_date = _run_reference_date(logical_date, data_interval_end)
+            start_date, end_date = _daily_ohlcv_ingest_window(run_date)
             config = OhlcvIngestionConfig.from_env()
             result = OhlcvIngestionService().ingest_range(
                 OhlcvIngestionRequest(
                     source=config.primary_source,
-                    start_date=target_date,
-                    end_date=target_date,
+                    start_date=start_date,
+                    end_date=end_date,
                     symbols=_symbols_from_env(),
                     dag_id="quant_agent_daily_data_engineering",
                     task_id="ingest_ohlcv_daily",
@@ -280,17 +278,14 @@ if dag and task:  # pragma: no branch
             from quant_agent.data.config import OhlcvIngestionConfig
             from quant_agent.data.ingestion import OhlcvIngestionRequest, OhlcvIngestionService
 
-            target_date = _target_date(
-                logical_date,
-                data_interval_end,
-                include_same_day_trade_date=False,
-            )
+            run_date = _run_reference_date(logical_date, data_interval_end)
+            start_date, end_date = _repair_ohlcv_ingest_window(run_date)
             config = OhlcvIngestionConfig.from_env()
             result = OhlcvIngestionService().ingest_range(
                 OhlcvIngestionRequest(
                     source=config.primary_source,
-                    start_date=target_date,
-                    end_date=target_date,
+                    start_date=start_date,
+                    end_date=end_date,
                     symbols=_symbols_from_env(),
                     dag_id="quant_agent_ohlcv_repair",
                     task_id="ingest_ohlcv_daily",
@@ -437,6 +432,87 @@ def _krx_trade_date_query(run_date: date, *, include_same_day_trade_date: bool) 
                AND is_open = TRUE
                AND trade_date {operator} DATE '{run_date.isoformat()}'
             """
+
+
+def _run_reference_date(logical_date, data_interval_end=None) -> date:
+    """Resolve the run's calendar date (KST) from the Airflow context.
+
+    Unlike ``_target_date`` this never consults ``core.trading_calendar``, so it is
+    safe to use as the *end* anchor of an ingestion window: the OHLCV ingest date must
+    advance with the wall-clock schedule, not with what the pipeline has already
+    stored. (Deriving the ingest date from the calendar - which is written only from
+    bars this pipeline ingested - is what made daily ingestion re-fetch the last
+    backfilled day forever and never reach new KRX sessions.)
+    """
+
+    reference = data_interval_end or logical_date
+    if reference:
+        if isinstance(reference, datetime):
+            return reference.astimezone(LOCAL_TZ).date() if reference.tzinfo else reference.replace(tzinfo=LOCAL_TZ).date()
+        if isinstance(reference, date):
+            return reference
+        if isinstance(reference, str):
+            parsed = datetime.fromisoformat(reference)
+            return parsed.astimezone(LOCAL_TZ).date() if parsed.tzinfo else parsed.date()
+        if hasattr(reference, "date"):
+            candidate = reference.date()
+            return candidate.astimezone(LOCAL_TZ).date() if isinstance(candidate, datetime) else candidate
+        return date.today()
+
+    try:  # pragma: no cover - Airflow context only exists inside task runtime.
+        from airflow.operators.python import get_current_context
+
+        context = get_current_context()
+        return _run_reference_date(context.get("logical_date"), context.get("data_interval_end"))
+    except (ImportError, KeyError, RuntimeError):
+        return date.today()
+
+
+def _latest_ingested_krx_trade_date() -> date | None:
+    """Most recent KRX open day already stored, or None on a cold warehouse."""
+
+    from quant_agent.data.repository import DataRepository
+
+    rows = DataRepository().executor.fetch_json(
+        """
+        SELECT MAX(trade_date)::text AS trade_date
+          FROM core.trading_calendar
+         WHERE market = 'KRX'
+           AND is_open = TRUE
+        """
+    )
+    raw_latest = rows[0].get("trade_date") if rows else None
+    return date.fromisoformat(str(raw_latest)) if raw_latest else None
+
+
+def _daily_ohlcv_ingest_window(run_date: date) -> tuple[date, date]:
+    """Daily OHLCV ingest window: resume from the high-water mark, end at run_date.
+
+    The window's end is the schedule's own date rather than ``MAX(trading_calendar)``,
+    which is what lets ingestion advance and self-heal any gap since the last
+    successful run. KRX itself decides which days in the window are trading days, so
+    non-trading days in the span are harmless no-ops. A cold warehouse ingests only
+    run_date; large historical loads are the backfill DAG's job.
+    """
+
+    latest = _latest_ingested_krx_trade_date()
+    if latest is None:
+        return run_date, run_date
+    start = min(latest + timedelta(days=1), run_date)
+    return start, run_date
+
+
+def _repair_ohlcv_ingest_window(run_date: date) -> tuple[date, date]:
+    """Morning repair window: re-fetch a trailing span ending at run_date.
+
+    Repair exists to pick up KRX's late-published or corrected sessions, so it
+    re-requests recent days unconditionally (the upsert is idempotent) instead of only
+    filling forward. Anchoring the end to run_date - not ``MAX(trading_calendar)`` -
+    also keeps repair from wedging on the last stored day.
+    """
+
+    start = run_date - timedelta(days=DEFAULT_OHLCV_REPAIR_LOOKBACK_DAYS)
+    return start, run_date
 
 
 def _warmup_start_date(target_date: date) -> date:

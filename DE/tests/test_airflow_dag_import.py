@@ -1,5 +1,5 @@
 import importlib.util
-from datetime import date
+from datetime import date, timedelta
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -134,6 +134,44 @@ class AirflowDagImportTests(unittest.TestCase):
         args = module._symbol_metadata_args(as_of_date=date(2026, 5, 21))
 
         self.assertEqual(args, ["--as-of-date", "2026-05-21"])
+
+    def test_run_reference_date_is_independent_of_the_ingested_calendar(self):
+        module = _load_dag_module("quant_agent_data_engineering_dag_run_reference")
+
+        self.assertEqual(module._run_reference_date("2026-08-26"), date(2026, 8, 26))
+        self.assertEqual(module._run_reference_date(None, date(2026, 8, 26)), date(2026, 8, 26))
+
+    def test_daily_ingest_window_ends_at_run_date_even_when_calendar_is_stale(self):
+        # The regression guard: the daily OHLCV window must advance to the run date
+        # instead of pinning to MAX(core.trading_calendar). A stale calendar (stuck at
+        # the last backfilled day) must not cap the ingest end.
+        module = _load_dag_module("quant_agent_data_engineering_dag_daily_window")
+        run_date = date(2026, 8, 26)
+
+        with patch.object(module, "_latest_ingested_krx_trade_date", return_value=date(2026, 5, 20)):
+            start_date, end_date = module._daily_ohlcv_ingest_window(run_date)
+
+        self.assertEqual(end_date, run_date)
+        self.assertEqual(start_date, date(2026, 5, 21))
+
+    def test_daily_ingest_window_handles_cold_warehouse_and_never_ingests_the_future(self):
+        module = _load_dag_module("quant_agent_data_engineering_dag_daily_window_edges")
+        run_date = date(2026, 8, 26)
+
+        with patch.object(module, "_latest_ingested_krx_trade_date", return_value=None):
+            self.assertEqual(module._daily_ohlcv_ingest_window(run_date), (run_date, run_date))
+
+        with patch.object(module, "_latest_ingested_krx_trade_date", return_value=run_date):
+            self.assertEqual(module._daily_ohlcv_ingest_window(run_date), (run_date, run_date))
+
+    def test_repair_ingest_window_refetches_a_trailing_span_to_run_date(self):
+        module = _load_dag_module("quant_agent_data_engineering_dag_repair_window")
+        run_date = date(2026, 8, 26)
+
+        start_date, end_date = module._repair_ohlcv_ingest_window(run_date)
+
+        self.assertEqual(end_date, run_date)
+        self.assertEqual(start_date, run_date - timedelta(days=module.DEFAULT_OHLCV_REPAIR_LOOKBACK_DAYS))
 
     def test_ai_prompt_retention_dag_is_independent_and_daily(self):
         module = _load_dag_module("quant_agent_data_engineering_dag_prompt_retention")
