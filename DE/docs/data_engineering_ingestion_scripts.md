@@ -128,7 +128,7 @@ DART 수집은 연도 단위로 나눠 재개했고, `feature.dart_financial_qua
 | 항목 | 값/동작 |
 |---|---|
 | DAG ID | `quant_agent_daily_data_engineering` |
-| 기본 스케줄 | `0 4 * * *` |
+| 기본 스케줄 | `0 10 * * *` (다음 영업일 오전 10시 실행, 직전 영업일 기준 적재) |
 | 재시도 | `QUANT_AIRFLOW_RETRIES` 기본값 `3` |
 | retry delay | 5분 |
 | `.env` 매핑 | `QUANT_AIRFLOW_LOAD_DOTENV=true` 기본. `QUANT_AIRFLOW_DOTENV_PATH`로 경로 재정의 가능. |

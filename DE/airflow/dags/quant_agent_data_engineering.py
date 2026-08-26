@@ -53,7 +53,7 @@ _load_airflow_dotenv()
 
 # 2. 한국 타임존 세팅 및 크론식에서 CRON_TZ 문구 제거 (순수 시간만 남김)
 LOCAL_TZ = pendulum.timezone("Asia/Seoul") if pendulum else ZoneInfo("Asia/Seoul")
-DEFAULT_DAILY_SCHEDULE = "0 20 * * *"
+DEFAULT_DAILY_SCHEDULE = "0 10 * * *"
 DEFAULT_OHLCV_REPAIR_SCHEDULE = "0 7 * * *"
 DEFAULT_PROMPT_RETENTION_SCHEDULE = "0 5 * * *"
 PROMPT_RETENTION_DAG_ID = "quant_agent_ai_prompt_retention"
@@ -147,8 +147,12 @@ if dag and task:  # pragma: no branch
             from quant_agent.data.config import OhlcvIngestionConfig
             from quant_agent.data.ingestion import OhlcvIngestionRequest, OhlcvIngestionService
 
-            run_date = _run_reference_date(logical_date, data_interval_end)
-            start_date, end_date = _daily_ohlcv_ingest_window(run_date)
+            target_date = _target_date(
+                logical_date,
+                data_interval_end,
+                include_same_day_trade_date=False,
+            )
+            start_date, end_date = _daily_ohlcv_ingest_window(target_date)
             config = OhlcvIngestionConfig.from_env()
             result = OhlcvIngestionService().ingest_range(
                 OhlcvIngestionRequest(
@@ -167,7 +171,7 @@ if dag and task:  # pragma: no branch
             target_date = _target_date(
                 logical_date,
                 data_interval_end,
-                include_same_day_trade_date=True,
+                include_same_day_trade_date=False,
             )
             start_date = _warmup_start_date(target_date)
             return _run_python_script(
@@ -180,7 +184,7 @@ if dag and task:  # pragma: no branch
             target_date = _target_date(
                 logical_date,
                 data_interval_end,
-                include_same_day_trade_date=True,
+                include_same_day_trade_date=False,
             )
             return _run_python_script(
                 KIS_ADJUSTED_INGEST_SCRIPT,
@@ -192,7 +196,7 @@ if dag and task:  # pragma: no branch
             target_date = _target_date(
                 logical_date,
                 data_interval_end,
-                include_same_day_trade_date=True,
+                include_same_day_trade_date=False,
             )
             return _run_python_script(
                 SYMBOL_METADATA_SCRIPT,
@@ -204,7 +208,7 @@ if dag and task:  # pragma: no branch
             target_date = _target_date(
                 logical_date,
                 data_interval_end,
-                include_same_day_trade_date=True,
+                include_same_day_trade_date=False,
             )
             start_date = _warmup_start_date(target_date)
             return _run_python_script(
@@ -221,7 +225,7 @@ if dag and task:  # pragma: no branch
             target_date = _target_date(
                 logical_date,
                 data_interval_end,
-                include_same_day_trade_date=True,
+                include_same_day_trade_date=False,
             )
             return _run_python_script(
                 DART_BOK_INGEST_SCRIPT,
@@ -238,7 +242,7 @@ if dag and task:  # pragma: no branch
             target_date = _target_date(
                 logical_date,
                 data_interval_end,
-                include_same_day_trade_date=True,
+                include_same_day_trade_date=False,
             )
             return _run_python_script(
                 DART_BOK_INGEST_SCRIPT,
