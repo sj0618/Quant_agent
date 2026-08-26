@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-test("ResearchResultV1 renderer and adapter handle only safe states behind the workspace boundary", async () => {
-  const [adapter, fixtures, renderer, appPage, clientSource, types] = await Promise.all([
+test("ResearchResultV1 renderer and adapter handle only safe states without replacing the core workspace", async () => {
+  const [adapter, fixtures, renderer, appPage, clientSource, configSource, types] = await Promise.all([
     readFile(new URL("../src/features/research-contract/researchResultAdapter.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/features/research-contract/researchResultFixtures.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/features/research-contract/ResearchResultRenderer.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/config/appConfig.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/types/researchContract.ts", import.meta.url), "utf8"),
   ]);
 
@@ -22,7 +23,10 @@ test("ResearchResultV1 renderer and adapter handle only safe states behind the w
   assert.doesNotMatch(adapter, /fetch\(|backendRequest|analysis-jobs|draft_token/);
   assert.match(renderer, /출처 PostgreSQL · 기준일/);
   assert.doesNotMatch(renderer, /매수|매도|보유|추천|BUY|SELL|HOLD|debug_ref|trace_id/);
-  assert.match(appPage, /ResearchWorkspace/);
-  assert.doesNotMatch(appPage, /ResearchResultRenderer|analysis-jobs/);
-  assert.doesNotMatch(clientSource, /createAnalysisJob|createAnalysisRun|analysis-jobs/);
+  assert.match(appPage, /StrategyWorkspace/);
+  assert.doesNotMatch(appPage, /ResearchWorkspace|ResearchResultRenderer/);
+  assert.match(clientSource, /createAnalysisJob/);
+  assert.match(clientSource, /AI_ENDPOINTS\.analysisJobs/);
+  assert.match(configSource, /analysisJobs: "\/analysis-jobs"/);
+  assert.doesNotMatch(clientSource, /createAnalysisRun/);
 });

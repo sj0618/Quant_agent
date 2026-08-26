@@ -57,9 +57,9 @@ test("retained legacy preview archive has no resend write path or obsolete confi
   for (const source of [canonicalConfig, canonicalEnv, previewEnv, readme]) {
     assert.doesNotMatch(source, /VITE_REPORT_ACTION_API_BASE_URL|reportActionApiBaseUrl/);
   }
-  assert.doesNotMatch(readme, /createAnalysisJob|\/analysis-jobs/);
+  assert.match(readme, /createAnalysisJob|analysis job/);
   assert.match(readme, /quantAgentClient\.ts.*읽기 전용 리포트/);
-  assert.match(readme, /researchClient\.ts.*appConfig\.aiApiBaseUrl/);
+  assert.match(readme, /자연어 전략 analysis job/);
   assert.match(actions, /window\.print/);
   assert.match(actions, /navigator\.clipboard\.writeText/);
   assert.match(actions, /downloadTextFile/);

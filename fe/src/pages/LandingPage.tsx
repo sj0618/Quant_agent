@@ -6,6 +6,8 @@ import { ROUTES, withReturnTo } from "../config/routes";
 
 export function LandingPage() {
   const reportsHref = withReturnTo(ROUTES.login, ROUTES.reports);
+  const workspaceHref = withReturnTo(ROUTES.login, ROUTES.app);
+  const workspaceAccessNoteId = "workspace-access-note";
   const archiveAccessNoteId = "archive-access-note";
 
   return (
@@ -17,10 +19,11 @@ export function LandingPage() {
         </a>
         <div>
           <a href="#principles">검증 원칙</a>
+          <a href="#workspace">전략 검증</a>
           <a href="#archive">리포트 보관함</a>
-          <a href="#limits">이용 범위</a>
+          <a href="#limits">안전 기준</a>
         </div>
-        <a aria-describedby={archiveAccessNoteId} className="button button--dark" href={reportsHref}>리포트 로그인</a>
+        <a aria-describedby={workspaceAccessNoteId} className="button button--dark" href={workspaceHref}>전략 분석 시작</a>
       </nav>
 
       <section className="hero" id="service">
@@ -31,14 +34,24 @@ export function LandingPage() {
           검증 근거를 <span>확인</span>합니다
         </h1>
         <p>
-          QuantAgent는 전략 검증 리포트의 데이터 기준 시점, 산출식, 재현 조건과 한계를 함께 기록하는 것을 목표로 합니다.
-          현재 공개 화면은 검증을 통과한 보관 리포트 열람에만 집중합니다.
+          QuantAgent는 자연어 전략을 실데이터 백테스트로 검증하고, 데이터 기준 시점·산출식·재현 조건·한계를 함께 설명하는 것을 목표로 합니다.
+          검증 조건이 부족하면 결과를 꾸며내지 않고 이유를 알려드립니다.
         </p>
         <div className="hero__actions">
-          <a aria-describedby={archiveAccessNoteId} className="button button--primary" href={reportsHref}>리포트 보관함 보기 →</a>
-          <a className="button button--ghost" href="#limits">현재 이용 범위</a>
+          <a aria-describedby={workspaceAccessNoteId} className="button button--primary" href={workspaceHref}>자연어 전략 분석 시작 →</a>
+          <a className="button button--ghost" href="#principles">검증 원칙 보기</a>
         </div>
-        <small id={archiveAccessNoteId}>로그인 후 읽기 전용 리포트 보관함으로 이동합니다. 새 분석은 지원하지 않습니다.</small>
+        <small id={workspaceAccessNoteId}>로그인 후 전략 검증 워크스페이스로 이동합니다. 실데이터 실행 준비가 안 되면 성과 수치 없이 안전하게 안내합니다.</small>
+      </section>
+
+      <section className="landing-section landing-section--soft" id="workspace">
+        <SectionHead eyebrow="전략 검증" title="말로 입력하고, 근거와 한계를 함께 확인하세요" description="전략 조건을 자연어로 입력하면 서버가 검토하고 실데이터 기반 백테스트 job으로 처리합니다." />
+        <Card className="sample-report-card">
+          <div className="sample-report-card__head"><Badge variant="dark">CORE WORKFLOW</Badge></div>
+          <h3>자연어 전략 → 실데이터 백테스트 → 자연어 리포트</h3>
+          <p>기간, 데이터 기준일, 체결·비용 가정, 표본 한계가 확인된 결과만 표시합니다. 준비되지 않은 데이터나 provider 오류는 예시 성과로 바꾸지 않습니다.</p>
+          <a aria-describedby={workspaceAccessNoteId} href={workspaceHref}>전략 검증 시작 →</a>
+        </Card>
       </section>
 
       <section className="landing-section" id="principles">
@@ -63,7 +76,7 @@ export function LandingPage() {
       </section>
 
       <section className="landing-section landing-section--soft" id="archive">
-        <SectionHead eyebrow="읽기 전용 보관함" title="검증된 기록만 보관함에서 확인하세요" description="리포트마다 최신성, 검증 범위, 제한 사항을 확인한 뒤 해석해야 합니다." />
+        <SectionHead eyebrow="읽기 전용 보관함" title="완료된 분석 기록은 보관함에서 다시 확인하세요" description="리포트마다 최신성, 검증 범위, 제한 사항을 확인한 뒤 해석해야 합니다." />
         <Card className="sample-report-card">
           <div className="sample-report-card__head">
             <div>
@@ -71,28 +84,29 @@ export function LandingPage() {
               <small>읽기 전용</small>
             </div>
           </div>
-          <h3>새 분석을 시작하지 않는 리포트 경험</h3>
-          <p>보관 리포트는 과거 기록을 확인하기 위한 화면입니다. 검증 상태가 불충분하거나 출처가 확인되지 않는 기록은 투자 판단으로 연결하지 않습니다.</p>
+          <h3>실행 화면과 분리된 과거 기록</h3>
+          <p>보관 리포트는 과거 결과를 확인하기 위한 읽기 전용 화면입니다. 새 분석은 전략 검증 워크스페이스에서 시작합니다.</p>
           <a aria-describedby={archiveAccessNoteId} href={reportsHref}>로그인 후 리포트 보관함 열기 →</a>
+          <small id={archiveAccessNoteId}>로그인 후 읽기 전용 리포트 보관함으로 이동합니다.</small>
         </Card>
       </section>
 
       <section className="landing-section" id="limits">
-        <SectionHead eyebrow="현재 제공 범위" title="현재 제공하지 않는 기능" />
+        <SectionHead eyebrow="이용 안전 기준" title="전략 분석은 제공하고, 개인화·주문은 제공하지 않습니다" />
         <Card>
           <ul>
-            <li>자연어 전략 입력을 통한 신규 분석과 백테스트 실행</li>
-            <li>개인별 자문이나 자동 주문을 유도하는 기능</li>
+            <li>개인 보유 종목·계좌·수량·위험성향을 전제로 한 맞춤 자문</li>
+            <li>자동 주문이나 직접 거래 실행을 유도하는 기능</li>
             <li>검증 근거가 없는 예시 성과를 실제 성과처럼 제시하는 화면</li>
           </ul>
-          <p>이 제한은 부족한 결과를 정상 결과처럼 보이지 않게 하기 위한 릴리스 안전장치입니다.</p>
+          <p>이 기준은 자연어 전략 분석과 백테스트를 막기 위한 것이 아니라, 준비되지 않은 데이터를 정상 결과처럼 보이지 않게 하기 위한 안전장치입니다.</p>
         </Card>
       </section>
       <section aria-labelledby="public-claim-title" className="landing-section landing-section--soft">
-        <SectionHead eyebrow="공개 문구 기준" title="성과 수치가 아닌, 열람 범위를 공개합니다" />
+        <SectionHead eyebrow="공개 문구 기준" title="성과 수치와 검증 범위를 함께 공개합니다" />
         <Card>
           <h3 id="public-claim-title">보관 리포트의 공개 범위</h3>
-          <p>랜딩에는 sample이나 live 성과 수치를 표시하지 않습니다. 각 보관 리포트에서 기준일과 검증 계약을 확인해 주세요.</p>
+          <p>랜딩에는 예시 성과 수치를 표시하지 않습니다. 전략 검증 결과와 보관 리포트에서 기준일·방법·한계를 확인해 주세요.</p>
           <PublicClaimDisclosure claimKey="landingArchiveScope" />
           <a href={ROUTES.trust}>신뢰센터에서 데이터·표시 원칙 확인 →</a>
         </Card>

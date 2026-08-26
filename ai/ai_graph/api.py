@@ -58,7 +58,6 @@ from ai_graph.jobs import (
     AnalysisRunner,
     CancellationRegistry,
     JobStoreRuntime,
-    ReadOnlyAnalysisJobStore,
     create_analysis_job_store_from_env,
     reap_interrupted_jobs,
     run_job_sync,
@@ -341,7 +340,7 @@ class EndpointStatus(BaseModel):
 
     method: Literal["GET", "POST"]
     path: str
-    state: Literal["available", "local_sync", "job_store", "readiness", "retired"]
+    state: Literal["available", "local_sync", "job_async", "job_store", "readiness", "retired"]
     summary: str
 
 
@@ -591,15 +590,11 @@ def create_app(
         if research_execution_enabled is not None
         else _research_execution_enabled()
     )
-    # Deployed services accept only the signed RuleDraft flow.  The raw endpoint is
-    # retained for local compatibility harnesses, never as a production escape hatch.
-    app.state.legacy_analysis_jobs_enabled = not _production_runtime()
-    # With both creating surfaces retired there is no caller left that may extend the
-    # analysis history, so the store stops accepting new rows instead of relying on
-    # every route staying correct. Reads and restart reconciliation are unaffected.
-    if not app.state.legacy_analysis_jobs_enabled and not app.state.research_execution_enabled:
-        store = ReadOnlyAnalysisJobStore(store)
-        app.state.job_store = store
+    # Natural-language strategy analysis is the product's primary workflow. In a
+    # release profile it is admitted only when durable execution and the configured
+    # provider are ready; an unavailable dependency is a typed failure, not a reason
+    # to delete the feature or substitute a fixture result.
+    app.state.core_analysis_jobs_enabled = True
     migration_probe = readiness_migration_probe or _analysis_jobs_migration_is_current
 
     probe_token = (environ.get(DATA_EVIDENCE_PROBE_TOKEN_ENV) or "").strip()
@@ -670,9 +665,7 @@ def create_app(
             openapi_url=OPENAPI_URL,
             data_source=_data_source_status(),
             job_store=_job_store_status(runtime),
-            endpoints=_endpoint_statuses(
-                legacy_analysis_jobs_enabled=app.state.legacy_analysis_jobs_enabled,
-            ),
+            endpoints=_endpoint_statuses(),
         )
 
     @app.post(
@@ -697,15 +690,21 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
-        if not app.state.legacy_analysis_jobs_enabled:
-            raise HTTPException(
-                status_code=status.HTTP_410_GONE,
-                detail={
-                    "code": "legacy_raw_analysis_job_retired",
-                    "message": "원문 요청 실행은 지원하지 않습니다. 규칙 검토 후 확인된 연구 작업만 실행할 수 있습니다.",
-                    "alternative": RESEARCH_JOB_CREATE_PATH,
-                },
+        if _production_runtime():
+            readiness = _core_execution_readiness(
+                runtime,
+                migration_probe=migration_probe,
+                provider_ready=_live_provider_configuration_is_ready(),
             )
+            if readiness.status != "ready":
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "analysis_execution_unavailable",
+                        "message": "실데이터 전략 분석 실행 준비가 완료되지 않았습니다. 준비가 확인되면 같은 전략을 다시 실행할 수 있습니다.",
+                        "checks": [check.name for check in readiness.checks if not check.ready],
+                    },
+                )
         scope_response = _preflight_rejection_response(await _scope_decision(request.query))
         if scope_response is not None:
             return scope_response
@@ -1060,19 +1059,8 @@ def create_app(
     return app
 
 
-def _endpoint_statuses(*, legacy_analysis_jobs_enabled: bool) -> list[EndpointStatus]:
-    """The public inventory of what each route currently does.
-
-    The `POST /analysis-jobs` entry takes the live flag rather than a fixed word. It
-    said `local_sync` and "Create and run an analysis job" for as long as the route has
-    been returning 410, because this list is hand-maintained and the retirement changed
-    the handler without changing the description of it. The two retired routes below it
-    are correct, which is what made the wrong one easy to miss.
-
-    That mismatch is the risk the retirement work names directly - a consumer that
-    cannot tell why its calls stopped working - reintroduced through the endpoint that
-    exists to answer exactly that question.
-    """
+def _endpoint_statuses() -> list[EndpointStatus]:
+    """The public inventory of core execution and compatibility surfaces."""
 
     return [
         EndpointStatus(
@@ -1096,12 +1084,8 @@ def _endpoint_statuses(*, legacy_analysis_jobs_enabled: bool) -> list[EndpointSt
         EndpointStatus(
             method="POST",
             path=ANALYSIS_JOBS_PATH,
-            state="local_sync" if legacy_analysis_jobs_enabled else "retired",
-            summary=(
-                "Create and run an analysis job through the local graph."
-                if legacy_analysis_jobs_enabled
-                else "Retired raw analysis job creation; use the research rule flow instead."
-            ),
+            state="job_async",
+            summary="Queue a natural-language strategy analysis job; release execution fails closed when real-data dependencies are unavailable.",
         ),
         EndpointStatus(
             method="GET",
@@ -1242,6 +1226,60 @@ def _release_readiness(
             name="rule_draft_signer",
             ready=rule_draft_signer_ready,
             reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
+        ),
+    ]
+    return ReadinessResponse(
+        status="ready" if all(check.ready for check in checks) else "unavailable",
+        ai_contract_version=SCHEMA_VERSION,
+        checks=checks,
+    )
+
+
+def _core_execution_readiness(
+    runtime: JobStoreRuntime,
+    *,
+    migration_probe: Callable[[], bool],
+    provider_ready: bool,
+) -> ReadinessResponse:
+    """Admission checks for the primary natural-language strategy workflow.
+
+    Rule-draft signing is a compatibility feature of the separate research route. It
+    must not prevent the core job endpoint from serving a verified real-data run.
+    """
+
+    durable_store_ready = (
+        runtime.requested_mode == PERSISTENT_JOB_STORE_MODE
+        and runtime.active_mode == PERSISTENT_JOB_STORE_MODE
+        and not runtime.fallback
+        and runtime.dsn_configured
+    )
+    migration_ready = False
+    if durable_store_ready:
+        try:
+            migration_ready = bool(migration_probe())
+        except Exception:  # noqa: BLE001 - public admission must not leak dependency internals.
+            migration_ready = False
+    contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
+    checks = [
+        ReadinessCheck(
+            name="durable_job_store",
+            ready=durable_store_ready,
+            reason=None if durable_store_ready else "durable_job_store_required",
+        ),
+        ReadinessCheck(
+            name="migration_revision",
+            ready=migration_ready,
+            reason=None if migration_ready else "migration_revision_required",
+        ),
+        ReadinessCheck(
+            name="live_provider_configuration",
+            ready=provider_ready,
+            reason=None if provider_ready else "live_provider_configuration_required",
+        ),
+        ReadinessCheck(
+            name="ai_contract_version",
+            ready=contract_ready,
+            reason=None if contract_ready else "ai_contract_version_mismatch",
         ),
     ]
     return ReadinessResponse(

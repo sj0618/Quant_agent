@@ -25,7 +25,7 @@ function archiveLinks(markup: string) {
     }));
 }
 
-test("each rendered archive CTA leads unauthenticated visitors to login and preserves the reports return path", async () => {
+test("archive and strategy-workspace CTAs preserve their distinct login return paths", async () => {
   const browserWindow: BrowserWindow = {
     location: {
       hash: "",
@@ -51,16 +51,19 @@ test("each rendered archive CTA leads unauthenticated visitors to login and pres
     const { default: App } = await vite.ssrLoadModule("/src/App.tsx");
     const landingMarkup = renderToStaticMarkup(createElement(LandingPage));
     const links = archiveLinks(landingMarkup);
+    const workspaceLinks = [...landingMarkup.matchAll(/<a\b(?=[^>]*aria-describedby="workspace-access-note")(?=[^>]*href="([^"]+)")[^>]*>([\s\S]*?)<\/a>/g)]
+      .map(([, href, label]) => ({ href, label: label.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim() }));
     const descriptor = landingMarkup.match(/<small id="archive-access-note">([^<]+)<\/small>/);
 
+    const archiveOnlyLinks = links.filter(({ describedBy }) => describedBy === "archive-access-note");
     assert.deepEqual(
-      links.map(({ label }) => label),
-      ["리포트 로그인", "리포트 보관함 보기 →", "로그인 후 리포트 보관함 열기 →"],
+      archiveOnlyLinks.map(({ label }) => label),
+      ["로그인 후 리포트 보관함 열기 →"],
     );
     assert.ok(descriptor);
     assert.match(descriptor[1], /로그인 후 읽기 전용 리포트 보관함으로 이동합니다\./);
 
-    for (const { describedBy, href } of links) {
+    for (const { describedBy, href } of archiveOnlyLinks) {
       assert.equal(describedBy, "archive-access-note");
       const destination = new URL(href, browserWindow.location.origin);
       assert.equal(destination.pathname, "/login");
@@ -72,6 +75,13 @@ test("each rendered archive CTA leads unauthenticated visitors to login and pres
 
       assert.match(loginMarkup, /<h1>Google 계정으로 시작<\/h1>/);
       assert.ok(loginMarkup.includes("로그인 후 요청하신 화면으로 이동합니다."));
+    }
+
+    assert.deepEqual(workspaceLinks.map(({ label }) => label), ["전략 분석 시작", "자연어 전략 분석 시작 →", "전략 검증 시작 →"]);
+    for (const { href } of workspaceLinks) {
+      const destination = new URL(href, browserWindow.location.origin);
+      assert.equal(destination.pathname, "/login");
+      assert.equal(destination.searchParams.get("returnTo"), "/app");
     }
   } finally {
     await vite.close();

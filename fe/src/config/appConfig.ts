@@ -13,6 +13,9 @@ export const STRATEGY_ENDPOINTS = {
 
 export const AI_ENDPOINTS = {
   apiStatus: "/api-status",
+  analysisJobs: "/analysis-jobs",
+  analysisJob: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}`,
+  analysisJobCancel: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/cancel`,
   researchRuleReview: "/api/strategies/parse",
   researchJobs: "/api/research/jobs",
   researchJobResult: (id: string) => `/api/research/jobs/${encodeURIComponent(id)}/result`,

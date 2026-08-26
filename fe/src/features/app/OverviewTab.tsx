@@ -91,9 +91,9 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
       <section className="summary-grid">
         {[
           validated && !verificationIncomplete
-            ? { label: "오늘의 권장도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "최종 신호 등급 · BUY 8.2 / HOLD 6.8 / DROP 6.4" }
+            ? { label: "전략 신호 신뢰도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "과거 데이터로 검증한 전략 신호입니다. 주문 지시가 아닙니다." }
             : {
-                label: "오늘의 권장도",
+                label: "전략 신호 신뢰도",
                 value: validated ? overview.recommendationScore : "산출 안 함",
                 delta: undefined,
                 // The graph already wrote why - a measured shortfall reads differently
@@ -167,7 +167,7 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
             />
           )) : <p>현재 AI 응답에는 종목별 추천 데이터가 없습니다.</p>}
           <div className="card-foot">
-            {overview.candidates.length ? <>신호는 매일 08:00 자동 갱신됩니다 <a href={`${ROUTES.app}?tab=trading`}>전체 종목 정보 보기 →</a></> : "실데이터 소스 연결 시 종목별 신호가 표시됩니다."}
+            {overview.candidates.length ? <>최신 분석의 실데이터·기간·방법을 확인해 해석하세요. <a href={`${ROUTES.app}?tab=trading`}>전체 종목 정보 보기 →</a></> : "실데이터 검증을 통과한 경우에만 종목별 신호가 표시됩니다."}
           </div>
         </Card>
 

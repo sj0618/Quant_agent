@@ -1,5 +1,64 @@
 import { backendRequest } from "./backendClient";
 import type { ArchivedReportDetail, ArchivedReportSummary, PersistedReportSection } from "../types/quantagent";
+import { AI_ENDPOINTS, appConfig } from "../config/appConfig";
+import type { AnalysisJob } from "../types/quantagent";
+
+const ANALYSIS_REQUEST_TIMEOUT_MS = 30_000;
+
+export class CoreAnalysisApiError extends Error {
+  constructor(readonly status: number) {
+    super(status === 503
+      ? "실데이터 전략 분석 준비가 완료되지 않았습니다. 잠시 뒤 다시 시도해 주세요."
+      : "전략 분석 요청을 처리할 수 없습니다. 잠시 뒤 다시 시도해 주세요.");
+  }
+}
+
+async function requestCoreAnalysis(path: string, init: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), ANALYSIS_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${appConfig.aiApiBaseUrl}${path}`, {
+      ...init,
+      credentials: init.credentials ?? "include",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new CoreAnalysisApiError(response.status);
+    }
+    return response;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("전략 분석 서버의 응답 시간이 초과되었습니다. 잠시 뒤 다시 시도해 주세요.");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+/** Submit the primary natural-language strategy workflow. Browser state is never used as a result fallback. */
+export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
+  const normalizedQuery = query.trim();
+  if (!normalizedQuery) {
+    throw new Error("분석할 자연어 전략을 입력하세요.");
+  }
+  const response = await requestCoreAnalysis(AI_ENDPOINTS.analysisJobs, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: normalizedQuery }),
+  });
+  return response.json() as Promise<AnalysisJob>;
+}
+
+export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
+  const response = await requestCoreAnalysis(AI_ENDPOINTS.analysisJob(jobId));
+  return response.json() as Promise<AnalysisJob>;
+}
+
+export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
+  const response = await requestCoreAnalysis(AI_ENDPOINTS.analysisJobCancel(jobId), { method: "POST" });
+  return response.json() as Promise<AnalysisJob>;
+}
 
 interface LiveReportListResponse {
   items: ArchivedReportSummary[];
