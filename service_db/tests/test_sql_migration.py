@@ -249,9 +249,38 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         self.assertIn("PG17_GOLDEN_SHA256", source)
         self.assertIn("PASS1_COMPLETE", source)
         self.assertIn("PASS2_COMPLETE", source)
+        self.assertIn("ROLLBACK_COMPLETE", source)
+        self.assertIn("RESTORE_COMPLETE", source)
         self.assertIn("final_catalog_union_sha256", source)
+        self.assertIn("rollback_restore_catalog_union_sha256", source)
+        self.assertIn("022_immutable_analysis_results.down.sql", source)
         self.assertIn("catalog union digest parity", source)
         self.assertIn("INTERNAL_TRANSACTION_MIGRATION", source)
+
+    def test_rollback_restore_scripts_are_executed_in_declared_order(self):
+        verifier = load_replay_verifier()
+
+        class RecordingConnection:
+            def __init__(self) -> None:
+                self.executed: list[str] = []
+
+            def execute(self, statement: str) -> None:
+                self.executed.append(statement)
+
+        rollback = SERVICE_DB_ROOT / "rollbacks" / verifier.ROLLBACK_RESTORE_SCRIPT
+        forward = SERVICE_DB_ROOT / "migrations" / verifier.ROLLBACK_RESTORE_MIGRATION
+        connection = RecordingConnection()
+
+        verifier._execute_migration_script(connection, script=rollback)
+        verifier._execute_migration_script(connection, script=forward)
+
+        self.assertEqual(
+            connection.executed,
+            [
+                rollback.read_text(encoding="utf-8"),
+                forward.read_text(encoding="utf-8"),
+            ],
+        )
 
     def test_replay_workflow_has_separate_databases_and_artifact_discard_contract(self):
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
