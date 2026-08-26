@@ -32,7 +32,7 @@ include = ["app*"]
 "app.data" = ["*.json"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", ".."]
 testpaths = ["tests"]
 addopts = "-ra"
 asyncio_mode = "auto"
