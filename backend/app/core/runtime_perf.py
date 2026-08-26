@@ -12,10 +12,9 @@ from uuid import uuid4
 
 from starlette.datastructures import Headers, MutableHeaders
 
-
 logger = logging.getLogger("uvicorn.error.runtime_perf")
 
-_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+_REQUEST_ID_PATTERN = re.compile(r"^trace-[a-f0-9]{12}4[a-f0-9]{3}[89ab][a-f0-9]{15}$")
 _REPORT_DETAIL_PATTERN = re.compile(r"^/api/v1/reports/[^/]+$")
 _SERVER_TIMING_ORDER = (
     "total",
@@ -70,7 +69,7 @@ def _target_route(method: str, path: str) -> str | None:
 def _safe_request_id(candidate: str | None) -> str:
     if candidate and _REQUEST_ID_PATTERN.fullmatch(candidate):
         return candidate
-    return uuid4().hex
+    return f"trace-{uuid4().hex}"
 
 
 def _now() -> float | None:

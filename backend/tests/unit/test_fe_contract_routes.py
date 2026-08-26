@@ -383,11 +383,11 @@ def test_report_diagnostics_preserve_contract_and_record_safe_metadata(monkeypat
     response = client.get(
         "/api/v1/reports",
         cookies={settings.auth_session_cookie_name: session_id},
-        headers={"X-Request-ID": "reports-contract-1"},
+        headers={"X-Request-ID": "trace-0123456789ab4def8123456789abcdef"},
     )
 
     assert response.status_code == 200
     assert response.json()["items"][0]["id"] == "report-1"
-    assert response.headers["X-Request-ID"] == "reports-contract-1"
+    assert response.headers["X-Request-ID"] == "trace-0123456789ab4def8123456789abcdef"
     assert "row_count=1" in caplog.text
     assert "has_more=false" in caplog.text

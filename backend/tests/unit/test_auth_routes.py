@@ -12,7 +12,10 @@ from fastapi.testclient import TestClient
 from app.api.routes import auth
 from app.core.errors import register_exception_handlers
 from app.core.runtime_perf import install_runtime_performance_middleware
-from app.core.security import OAUTH_TRANSACTION_COOKIE_NAME, hash_oauth_transaction_token
+from app.core.security import (
+    OAUTH_TRANSACTION_COOKIE_NAME,
+    hash_oauth_transaction_token,
+)
 from app.main import _install_credentialed_cors_middleware
 from app.services import session_store as session_store_module
 from app.services.google_oauth import GoogleIdentity
@@ -465,19 +468,21 @@ def test_auth_me_diagnostics_preserve_401_and_200_contracts(monkeypatch, caplog)
     monkeypatch.setattr(auth, "load_user_by_id", fake_load)
     caplog.set_level("INFO", logger="uvicorn.error.runtime_perf")
 
-    missing = client.get("/api/v1/auth/me", headers={"X-Request-ID": "auth-missing-1"})
+    missing_trace_id = "trace-0123456789ab4def8123456789abcdef"
+    authenticated_trace_id = "trace-fedcba9876544abc9fedcba987654321"
+    missing = client.get("/api/v1/auth/me", headers={"X-Request-ID": missing_trace_id})
     authenticated = client.get(
         "/api/v1/auth/me",
         cookies={"qa_session": session_id},
-        headers={"X-Request-ID": "auth-present-1"},
+        headers={"X-Request-ID": authenticated_trace_id},
     )
 
     assert missing.status_code == 401
     assert missing.json()["error"]["code"] == "not_authenticated"
-    assert missing.headers["X-Request-ID"] == "auth-missing-1"
+    assert missing.headers["X-Request-ID"] == missing_trace_id
     assert authenticated.status_code == 200
     assert authenticated.json()["user"]["email"] == "user@example.co.kr"
-    assert authenticated.headers["X-Request-ID"] == "auth-present-1"
+    assert authenticated.headers["X-Request-ID"] == authenticated_trace_id
     assert "redis;dur=" in authenticated.headers["Server-Timing"]
     assert "userdb;dur=" in authenticated.headers["Server-Timing"]
     assert "cookie_parse" in caplog.text
@@ -598,13 +603,13 @@ def test_auth_me_diagnostics_attribute_forced_session_touch_to_redis(monkeypatch
     response = client.get(
         "/api/v1/auth/me",
         cookies={"qa_session": session_id},
-        headers={"X-Request-ID": "auth-touch-1"},
+        headers={"X-Request-ID": "trace-0123456789ab4def8123456789abcdef"},
     )
 
     assert response.status_code == 200
     assert response.json()["user"]["email"] == "user@example.co.kr"
     assert response.json()["user"]["provider"] == "google"
-    assert response.headers["X-Request-ID"] == "auth-touch-1"
+    assert response.headers["X-Request-ID"] == "trace-0123456789ab4def8123456789abcdef"
     assert "redis;dur=" in response.headers["Server-Timing"]
     assert redis.calls == {"get": 1, "set": 1, "expire": 1, "delete": 0}
     assert entered_spans.count("redis") == 3

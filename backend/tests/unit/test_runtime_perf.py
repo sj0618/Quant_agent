@@ -5,6 +5,7 @@ import math
 import re
 
 import httpx
+import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -18,7 +19,6 @@ from app.core.runtime_perf import (
 from app.db.session import fetch_all
 from tests.unit.test_auth_config import valid_settings
 
-
 _ALLOWED_SERVER_TIMING = {
     "total",
     "auth",
@@ -30,6 +30,9 @@ _ALLOWED_SERVER_TIMING = {
     "mapping",
     "response",
 }
+_ISSUED_TRACE_ID = "trace-0123456789ab4def8123456789abcdef"
+_SECOND_ISSUED_TRACE_ID = "trace-fedcba9876544abc9fedcba987654321"
+_TRACE_ID_PATTERN = r"trace-[a-f0-9]{12}4[a-f0-9]{3}[89ab][a-f0-9]{15}"
 
 
 def _app(*, enabled: bool) -> FastAPI:
@@ -96,15 +99,15 @@ def test_diagnostics_are_disabled_by_default_and_ignore_non_target_routes(caplog
 def test_enabled_diagnostics_reuse_only_safe_request_ids_and_emit_numeric_allowlisted_metrics():
     client = TestClient(_app(enabled=True))
 
-    safe = client.get("/api/v1/auth/me", headers={"X-Request-ID": "safe.request-1:abc"})
+    safe = client.get("/api/v1/auth/me", headers={"X-Request-ID": _ISSUED_TRACE_ID})
     unsafe = client.get("/api/v1/auth/me", headers={"X-Request-ID": "unsafe request/id"})
     oversized = client.get("/api/v1/auth/me", headers={"X-Request-ID": "x" * 65})
 
-    assert safe.headers["X-Request-ID"] == "safe.request-1:abc"
+    assert safe.headers["X-Request-ID"] == _ISSUED_TRACE_ID
     assert unsafe.headers["X-Request-ID"] != "unsafe request/id"
-    assert re.fullmatch(r"[a-f0-9]{32}", unsafe.headers["X-Request-ID"])
+    assert re.fullmatch(_TRACE_ID_PATTERN, unsafe.headers["X-Request-ID"])
     assert oversized.headers["X-Request-ID"] != "x" * 65
-    assert re.fullmatch(r"[a-f0-9]{32}", oversized.headers["X-Request-ID"])
+    assert re.fullmatch(_TRACE_ID_PATTERN, oversized.headers["X-Request-ID"])
     timings = _parse_server_timing(safe.headers["Server-Timing"])
     assert timings.keys() <= _ALLOWED_SERVER_TIMING
     assert {"total", "auth", "redis", "userdb"} <= timings.keys()
@@ -127,6 +130,32 @@ def test_logs_use_route_templates_and_do_not_expose_path_query_cookie_or_body_va
     assert "private-session-value" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    "unsafe_request_id",
+    [
+        "alice@example.invalid",
+        "AKIA" + "IOSFODNN7EXAMPLE",
+        "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789",
+        "github_pat_" + "abcdefghijklmnopqrstuvwxyz0123456789",
+        "sk-" + "proj-test-only-not-a-real-secret-123456",
+    ],
+)
+def test_runtime_diagnostics_correlation_uses_only_issued_trace_ids_and_redacts_untrusted_headers(caplog, unsafe_request_id):
+    client = TestClient(_app(enabled=True))
+    caplog.set_level("INFO", logger="uvicorn.error.runtime_perf")
+
+    correlated = client.get("/api/v1/auth/me", headers={"X-Request-ID": _ISSUED_TRACE_ID})
+    redacted = client.get("/api/v1/auth/me", headers={"X-Request-ID": unsafe_request_id})
+
+    assert correlated.status_code == 200
+    assert correlated.headers["X-Request-ID"] == _ISSUED_TRACE_ID
+    assert f"request_id={_ISSUED_TRACE_ID} method=GET route=/api/v1/auth/me status=200" in caplog.text
+    assert redacted.status_code == 200
+    assert re.fullmatch(_TRACE_ID_PATTERN, redacted.headers["X-Request-ID"])
+    assert f"request_id={redacted.headers['X-Request-ID']} method=GET route=/api/v1/auth/me status=200" in caplog.text
+    assert unsafe_request_id not in caplog.text
+
+
 def test_instrumentation_failure_does_not_change_business_response(monkeypatch):
     app = _app(enabled=True)
     client = TestClient(app)
@@ -147,11 +176,11 @@ def test_existing_http_exception_contract_is_unchanged():
     async def auth_me_error():
         raise HTTPException(status_code=418, detail="contract-detail")
 
-    response = TestClient(app).get("/api/v1/auth/me", headers={"X-Request-ID": "error-contract-1"})
+    response = TestClient(app).get("/api/v1/auth/me", headers={"X-Request-ID": _ISSUED_TRACE_ID})
 
     assert response.status_code == 418
     assert response.json() == {"detail": "contract-detail"}
-    assert response.headers["X-Request-ID"] == "error-contract-1"
+    assert response.headers["X-Request-ID"] == _ISSUED_TRACE_ID
 
 
 class _FakeMappings:
@@ -213,11 +242,11 @@ def test_concurrent_requests_keep_request_ids_isolated():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="https://api.example.co.kr") as client:
             return await asyncio.gather(
-                client.get("/api/v1/auth/me", headers={"X-Request-ID": "concurrent-a"}),
-                client.get("/api/v1/auth/me", headers={"X-Request-ID": "concurrent-b"}),
+                client.get("/api/v1/auth/me", headers={"X-Request-ID": _ISSUED_TRACE_ID}),
+                client.get("/api/v1/auth/me", headers={"X-Request-ID": _SECOND_ISSUED_TRACE_ID}),
             )
 
     first, second = asyncio.run(run_requests())
 
-    assert first.headers["X-Request-ID"] == "concurrent-a"
-    assert second.headers["X-Request-ID"] == "concurrent-b"
+    assert first.headers["X-Request-ID"] == _ISSUED_TRACE_ID
+    assert second.headers["X-Request-ID"] == _SECOND_ISSUED_TRACE_ID
