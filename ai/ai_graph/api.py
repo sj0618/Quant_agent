@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -141,6 +142,8 @@ RESEARCH_EXECUTION_ENABLED_ENV = "AI_RESEARCH_EXECUTION_ENABLED"
 DATA_EVIDENCE_PROBE_TOKEN_ENV = "AI_DATA_EVIDENCE_PROBE_TOKEN"
 DATA_EVIDENCE_PROBE_PATH = "/_operator/research-data-evidence"
 DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
+PUBLIC_DEPLOYMENT_REVISION_ENV = "QUANTAGENT_DEPLOYMENT_REVISION"
+_PUBLIC_DEPLOYMENT_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
 REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
 ANALYSIS_JOBS_MIGRATION_REVISION = "021_ai_analysis_jobs"
@@ -379,7 +382,15 @@ class APIStatusResponse(BaseModel):
     openapi_url: str
     data_source: DataSourceStatus
     job_store: JobStoreStatus
+    deployment_revision: str | None
     endpoints: list[EndpointStatus]
+
+
+def _public_deployment_revision() -> str | None:
+    """Return the deploy SHA only when it has the expected non-secret format."""
+
+    value = (environ.get(PUBLIC_DEPLOYMENT_REVISION_ENV) or "").strip()
+    return value if _PUBLIC_DEPLOYMENT_REVISION_PATTERN.fullmatch(value) else None
 
 
 def _build_analysis_runner_with_audit(
@@ -670,6 +681,7 @@ def create_app(
             openapi_url=OPENAPI_URL,
             data_source=_data_source_status(),
             job_store=_job_store_status(runtime),
+            deployment_revision=_public_deployment_revision(),
             endpoints=_endpoint_statuses(
                 legacy_analysis_jobs_enabled=app.state.legacy_analysis_jobs_enabled,
             ),

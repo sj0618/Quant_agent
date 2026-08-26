@@ -255,6 +255,18 @@ def test_api_status_exposes_data_source_without_dsn_value(monkeypatch) -> None:
     assert "secret" not in str(response.json()["job_store"])
 
 
+def test_api_status_exposes_only_a_valid_deployment_revision(monkeypatch) -> None:
+    monkeypatch.setenv("QUANTAGENT_DEPLOYMENT_REVISION", "a" * 40)
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    assert client.get(API_STATUS_PATH).json()["deployment_revision"] == "a" * 40
+
+    monkeypatch.setenv("QUANTAGENT_DEPLOYMENT_REVISION", "not-a-git-revision")
+    client = TestClient(create_app(InMemoryAnalysisJobStore()))
+
+    assert client.get(API_STATUS_PATH).json()["deployment_revision"] is None
+
+
 def test_api_status_uses_database_url_alias_for_data_source(monkeypatch) -> None:
     monkeypatch.delenv("AI_DATABASE_DSN", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://secret-user:secret-pass@db/quant_agent")

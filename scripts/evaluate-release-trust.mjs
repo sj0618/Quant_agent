@@ -34,6 +34,7 @@ export function createOfflineTestEnvironment(source = process.env) {
     ...source,
     AUTH_ENABLED: "0",
     AI_AUDIT_SINK: "noop",
+    AI_DATA_SOURCE_VARIANT: "db",
     AI_JOB_STORE: "memory",
     AI_LLM_PROVIDER: "mock",
     AI_AOAI_LIVE_TEST: "0",
