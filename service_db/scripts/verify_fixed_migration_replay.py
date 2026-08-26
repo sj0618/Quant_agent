@@ -34,6 +34,8 @@ FIXED_MIGRATIONS = (
     "023_archive_undecodable_analysis_jobs.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
+ROLLBACK_RESTORE_MIGRATION = "022_immutable_analysis_results.sql"
+ROLLBACK_RESTORE_SCRIPT = "022_immutable_analysis_results.down.sql"
 PG17_MIN_VERSION_NUM = 170000
 PG18_MIN_VERSION_NUM = 180000
 PG17_GOLDEN_LITERAL = "quant-agent/service-db/fixed-replay/pg17"
@@ -372,6 +374,26 @@ def _reset_disposable_schema(conn: Any) -> None:
     conn.commit()
 
 
+def _rollback_restore_paths(
+    *,
+    migrations_dir: Path,
+    rollback_dir: Path,
+) -> tuple[Path, Path]:
+    rollback_script = rollback_dir / ROLLBACK_RESTORE_SCRIPT
+    forward_migration = migrations_dir / ROLLBACK_RESTORE_MIGRATION
+    if not rollback_script.is_file() or not forward_migration.is_file():
+        raise ReplayContractError("rollback/restore migration pair is unavailable")
+    return rollback_script, forward_migration
+
+
+def _execute_migration_script(
+    conn: Any,
+    *,
+    script: Path,
+) -> None:
+    conn.execute(script.read_text(encoding="utf-8"))
+
+
 def _cas(markers: list[dict[str, Any]], expected: str, next_state: str) -> None:
     current = markers[-1]
     if current["state"] != expected:
@@ -418,7 +440,13 @@ def main(argv: list[str] | None = None) -> int:
             expected_database=args.expected_database,
             disposable_marker=args.disposable_marker,
         )
-        migrations = _assert_fixed_migration_files(Path(__file__).resolve().parents[1] / "migrations")
+        service_db_root = Path(__file__).resolve().parents[1]
+        migrations_dir = service_db_root / "migrations"
+        migrations = _assert_fixed_migration_files(migrations_dir)
+        rollback_script, forward_migration = _rollback_restore_paths(
+            migrations_dir=migrations_dir,
+            rollback_dir=service_db_root / "rollbacks",
+        )
         import psycopg
 
         with psycopg.connect(replay_dsn.dsn, autocommit=True) as conn:
@@ -432,9 +460,16 @@ def main(argv: list[str] | None = None) -> int:
             _execute_pass(conn, migrations)
             pass2_fingerprint = _catalog_fingerprint(conn)
             _cas(markers, "PASS2_RUNNING", "PASS2_COMPLETE")
-        if pass1_fingerprint != pass2_fingerprint:
-            raise ReplayContractError("pass1/pass2 final catalog union fingerprints differ")
-        _cas(markers, "PASS2_COMPLETE", "PASS")
+            _cas(markers, "PASS2_COMPLETE", "ROLLBACK_RUNNING")
+            _execute_migration_script(conn, script=rollback_script)
+            _cas(markers, "ROLLBACK_RUNNING", "ROLLBACK_COMPLETE")
+            _cas(markers, "ROLLBACK_COMPLETE", "RESTORE_RUNNING")
+            _execute_migration_script(conn, script=forward_migration)
+            _cas(markers, "RESTORE_RUNNING", "RESTORE_COMPLETE")
+            rollback_restore_fingerprint = _catalog_fingerprint(conn)
+        if pass1_fingerprint != pass2_fingerprint or pass2_fingerprint != rollback_restore_fingerprint:
+            raise ReplayContractError("migration replay catalog fingerprints differ")
+        _cas(markers, "RESTORE_COMPLETE", "PASS")
         write_artifact(
             args.artifact,
             {
@@ -450,7 +485,8 @@ def main(argv: list[str] | None = None) -> int:
                 "markers": markers,
                 "pass1_catalog_union_sha256": pass1_fingerprint,
                 "pass2_catalog_union_sha256": pass2_fingerprint,
-                "final_catalog_union_sha256": pass2_fingerprint,
+                "rollback_restore_catalog_union_sha256": rollback_restore_fingerprint,
+                "final_catalog_union_sha256": rollback_restore_fingerprint,
             },
         )
         return 0
