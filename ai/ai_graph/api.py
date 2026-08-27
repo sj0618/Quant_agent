@@ -105,7 +105,9 @@ from ai_graph.schemas import (
     SCHEMA_VERSION,
     APIEnvelope,
     EnvelopeStatus,
+    FailureDiagnostic,
     ReportBundle,
+    Stage,
     UserPayload,
 )
 from ai_graph.scope_review import review_research_scope
@@ -2076,6 +2078,15 @@ def _not_found_envelope(
         strategy_spec=None,
         debug_ref=f"not_found:{resource_type}:{resource_id}",
         retryable=True,
+        failure_cause=FailureDiagnostic(
+            category="unknown_failure",
+            subcause="unknown",
+            failure_stage=Stage.FINALIZING,
+            owner="unknown",
+            retryable=True,
+            safe_message="요청한 분석 결과를 찾을 수 없습니다. 다시 확인해 주세요.",
+            evidence_refs=["failure:resource_not_found"],
+        ),
     )
 
 

@@ -5,6 +5,7 @@ import logging
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from ai_graph.api import create_app
 from ai_graph.job_repository_postgres import (
@@ -14,6 +15,7 @@ from ai_graph.job_repository_postgres import (
 )
 from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.jobs import InMemoryAnalysisJobStore, InterruptedJobReconciliationError
+from ai_graph.schemas import Stage
 
 
 class _Rows:
@@ -160,6 +162,89 @@ def test_a_store_that_cannot_be_read_still_raises():
         assert "connection refused" in str(e)
     else:
         raise AssertionError("a store outage must not look like an empty list")
+
+
+def _legacy_failed_document(
+    *, missing_diagnostic: bool = False, invalid_failure_stage: bool = True
+) -> dict:
+    source = InMemoryAnalysisJobStore()
+    job = source.create_job("과거 실패 분석")
+    failed = source.fail_job(job.job_id, "past failure")
+    document = _job_document(failed)
+    document.pop("execution_manifest")
+    document.pop("execution_spec_version")
+    document.pop("execution_spec_hash")
+    assert document["result"] is not None
+    if missing_diagnostic:
+        document["result"].pop("failure_cause")
+    elif invalid_failure_stage:
+        document["result"]["failure_cause"]["failure_stage"] = "analyzing"
+    return document
+
+
+def _repository_for_single_document(document: dict) -> PostgresAnalysisJobRepository:
+    repo = PostgresAnalysisJobRepository.__new__(PostgresAnalysisJobRepository)
+    repo._dsn = "postgresql://example"
+    repo._connector = lambda *a, **k: _Connection([{"job_jsonb": document}])
+    return repo
+
+
+def test_legacy_failed_row_with_free_form_stage_is_normalized_only_on_read() -> None:
+    document = _legacy_failed_document()
+
+    decoded = _repository_for_single_document(document).get_job(document["job_id"])
+
+    assert decoded is not None
+    assert decoded.result is not None
+    assert decoded.result.failure_cause is not None
+    assert decoded.result.failure_cause.failure_stage is Stage.FINALIZING
+    assert "failure:legacy_stage_normalized" in decoded.result.failure_cause.evidence_refs
+    assert document["result"]["failure_cause"]["failure_stage"] == "analyzing"
+
+
+def test_legacy_failed_row_without_diagnostic_gets_safe_unknown_diagnostic() -> None:
+    document = _legacy_failed_document(missing_diagnostic=True)
+
+    decoded = _repository_for_single_document(document).get_job(document["job_id"])
+
+    assert decoded is not None
+    assert decoded.result is not None
+    assert decoded.result.failure_cause is not None
+    assert decoded.result.failure_cause.subcause == "unknown"
+    assert decoded.result.failure_cause.failure_stage is Stage.FINALIZING
+    assert decoded.result.failure_cause.evidence_refs == ["failure:legacy_missing_diagnostic"]
+
+
+def test_legacy_failed_row_with_a_valid_typed_diagnostic_remains_readable() -> None:
+    document = _legacy_failed_document(invalid_failure_stage=False)
+
+    decoded = _repository_for_single_document(document).get_job(document["job_id"])
+
+    assert decoded is not None
+    assert decoded.result is not None
+    assert decoded.result.failure_cause is not None
+    assert decoded.result.failure_cause.failure_stage is Stage.FINALIZING
+    assert decoded.execution_manifest.policy_hashes == {
+        "legacy_execution_manifest_unavailable": decoded.execution_manifest.contract_hash
+    }
+
+
+def test_current_contract_row_with_invalid_failure_stage_still_fails_closed() -> None:
+    source = InMemoryAnalysisJobStore()
+    job = source.create_job("현재 계약 실패 분석")
+    failed = source.fail_job(job.job_id, "current failure")
+    document = _job_document(failed)
+    document["execution_spec_version"] = "strategy-execution-spec.v1"
+    document["execution_spec_hash"] = "a" * 64
+    assert document["result"] is not None
+    document["result"]["failure_cause"]["failure_stage"] = "analyzing"
+
+    with pytest.raises(ValidationError) as exc_info:
+        _repository_for_single_document(document).get_job(document["job_id"])
+
+    assert ("result", "failure_cause", "failure_stage") in {
+        tuple(error["loc"]) for error in exc_info.value.errors()
+    }
 
 
 def test_the_settle_statement_casts_every_parameter() -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
@@ -26,6 +28,15 @@ FailureCategory = Literal[
     "cancelled",
     "unknown_failure",
 ]
+
+class Stage(str, Enum):
+    INTERPRETING = "interpreting"
+    CODE_GENERATION = "code_generation"
+    BACKTEST = "backtest"
+    DEBATE = "debate"
+    FINALIZING = "finalizing"
+
+
 FailureSubcause = Literal[
     "db_connection_unavailable",
     "db_connect_timeout",
@@ -179,7 +190,10 @@ class FailureDiagnostic(BaseModel):
 
     category: FailureCategory
     subcause: FailureSubcause
-    failure_stage: str = Field(min_length=1)
+    # This is a public routing field, not arbitrary provider text.  Keeping it
+    # closed prevents an internal exception message from becoming a UI stage and
+    # makes the API/job/FE contract testable across a rolling deploy.
+    failure_stage: Stage
     owner: Literal[
         "ai_graph",
         "data_source_config",
@@ -273,14 +287,6 @@ class EnvelopeStatus(str, Enum):
     NEED_CLARIFICATION = "need_clarification"
     REJECTED = "rejected"
     FAILED = "failed"
-
-
-class Stage(str, Enum):
-    INTERPRETING = "interpreting"
-    CODE_GENERATION = "code_generation"
-    BACKTEST = "backtest"
-    DEBATE = "debate"
-    FINALIZING = "finalizing"
 
 
 class StageStatus(str, Enum):
@@ -388,6 +394,23 @@ class StrategyExecutionSpecV1(BaseModel):
         if any(condition.role != "exit" for condition in self.exit_conditions):
             raise ValueError("exit_conditions must use the exit role")
         return self
+
+
+def canonical_execution_spec_digest(spec: StrategyExecutionSpecV1) -> str:
+    """Return the stable, public digest for a validated execution specification.
+
+    The parse boundary signs the same canonical JSON shape.  Keeping the serializer
+    here lets the envelope validate its own contract without importing the
+    higher-level research/parse module (and creating a dependency cycle).
+    """
+
+    encoded = json.dumps(
+        spec.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class L4Evidence(BaseModel):
@@ -975,7 +998,7 @@ class APIEnvelope(BaseModel):
     # parse-bound analysis carries this separately versioned and hash-addressed
     # execution contract; all three fields are present or absent together.
     execution_spec: StrategyExecutionSpecV1 | None = None
-    execution_spec_version: Literal[STRATEGY_EXECUTION_SPEC_VERSION_V1] | None = None
+    execution_spec_version: Literal["strategy-execution-spec.v1"] | None = None
     execution_spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     debug_ref: str = Field(min_length=1)
     retryable: bool
@@ -1000,6 +1023,12 @@ class APIEnvelope(BaseModel):
             value is not None for value in execution_values
         ):
             raise ValueError("execution spec, version, and hash must be present together")
+        if self.execution_spec is not None:
+            expected_hash = canonical_execution_spec_digest(self.execution_spec)
+            if self.execution_spec_hash != expected_hash:
+                raise ValueError("execution spec hash must match the canonical execution spec")
         if self.failure_cause is not None and self.status != EnvelopeStatus.FAILED:
             raise ValueError("only failed envelopes may expose a failure cause")
+        if self.status == EnvelopeStatus.FAILED and self.failure_cause is None:
+            raise ValueError("failed envelopes require a typed failure cause")
         return self
