@@ -601,7 +601,12 @@ class PostgresPipelineDataSource:
                 "research_freshness": source_freshness,
                 "research_required_families": sorted(required_families),
                 "research_available_families": sorted(available_families),
-                "research_snapshot_id": trace_id,
+                # Eligibility provenance must identify the immutable extract, not the
+                # request correlation id.  A trace id is useful for diagnostics but
+                # can be reused or regenerated without changing the data; the source
+                # manifest snapshot binds this decision to the concrete PostgreSQL
+                # EOD/PIT payload that was loaded.
+                "research_snapshot_id": source_manifest.snapshot_id,
                 "research_measurement_complete": research_measurement_complete,
                 "timings": {
                     **{name: round(seconds, 6) for name, seconds in timings.items()},
