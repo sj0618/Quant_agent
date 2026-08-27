@@ -4,10 +4,13 @@ from pydantic import ValidationError
 
 from ai_graph.api import ANALYSIS_JOBS_PATH, create_app
 from ai_graph.jobs import InMemoryAnalysisJobStore
+from ai_graph.research_contract import CanonicalRuleV1, canonical_rule_digest
 from ai_graph.schemas import (
     APIEnvelope,
+    canonical_execution_spec_digest,
     EnvelopeStatus,
     FailureDiagnostic,
+    Stage,
     StrategyExecutionSpecV1,
     UserPayload,
 )
@@ -167,22 +170,36 @@ def test_public_execution_contract_requires_a_complete_versioned_hash_binding() 
     envelope = _public_envelope(
         execution_spec=spec,
         execution_spec_version="strategy-execution-spec.v1",
-        execution_spec_hash="a" * 64,
+        execution_spec_hash=canonical_execution_spec_digest(spec),
     )
 
     assert envelope.execution_spec == spec
     assert envelope.execution_spec_version == "strategy-execution-spec.v1"
-    assert envelope.execution_spec_hash == "a" * 64
+    assert envelope.execution_spec_hash == canonical_execution_spec_digest(spec)
 
     with pytest.raises(ValidationError, match="execution spec, version, and hash"):
         _public_envelope(execution_spec=spec)
+
+    with pytest.raises(ValidationError, match="canonical execution spec"):
+        _public_envelope(
+            execution_spec=spec,
+            execution_spec_version="strategy-execution-spec.v1",
+            execution_spec_hash="a" * 64,
+        )
+
+
+def test_execution_envelope_hash_matches_the_parse_issued_spec_hash() -> None:
+    spec = _execution_spec()
+    parse_rule = CanonicalRuleV1.model_validate(spec.model_dump(mode="json"))
+
+    assert canonical_execution_spec_digest(spec) == canonical_rule_digest(parse_rule)
 
 
 def test_public_terminal_contract_keeps_typed_failure_on_failed_envelopes_only() -> None:
     diagnostic = FailureDiagnostic(
         category="infrastructure_failure",
         subcause="aoai_response_timeout",
-        failure_stage="interpreting",
+        failure_stage=Stage.INTERPRETING,
         owner="ai_graph",
         retryable=True,
         safe_message="응답 시간이 초과되었습니다.",
@@ -193,3 +210,22 @@ def test_public_terminal_contract_keeps_typed_failure_on_failed_envelopes_only()
 
     with pytest.raises(ValidationError, match="only failed envelopes"):
         _public_envelope(failure_cause=diagnostic)
+
+
+def test_failed_envelope_requires_a_typed_diagnostic() -> None:
+    with pytest.raises(ValidationError, match="failed envelopes require"):
+        _public_envelope(status=EnvelopeStatus.FAILED, retryable=False)
+
+
+def test_failure_stage_is_closed_to_public_pipeline_stages() -> None:
+    with pytest.raises(ValidationError, match="failure_stage"):
+        FailureDiagnostic.model_validate(
+            {
+                "category": "infrastructure_failure",
+                "subcause": "aoai_response_timeout",
+                "failure_stage": "provider stack trace",
+                "owner": "ai_graph",
+                "retryable": True,
+                "safe_message": "응답 시간이 초과되었습니다.",
+            }
+        )

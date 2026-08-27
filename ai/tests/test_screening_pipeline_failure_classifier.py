@@ -1,13 +1,19 @@
+from typing import cast
+
 import pytest
 
 from ai_graph.data_sources import PipelineDataUnavailableError
-from ai_graph.jobs import InMemoryAnalysisJobStore, classify_failure
+from ai_graph.jobs import AnalysisRunner, InMemoryAnalysisJobStore, classify_failure
 from ai_graph.llm import LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
-from ai_graph.schemas import APIEnvelope
+from ai_graph.progress import report_node_stage
+from ai_graph.schemas import APIEnvelope, Stage
 
 
 def test_untyped_connection_message_does_not_claim_a_database_timeout() -> None:
-    diagnostic = classify_failure(ConnectionError("connection timeout expired: secret DSN details"), stage="data_collect")
+    diagnostic = classify_failure(
+        ConnectionError("connection timeout expired: secret DSN details"),
+        stage=Stage.BACKTEST.value,
+    )
 
     assert diagnostic.category == "unknown_failure"
     assert diagnostic.subcause == "unknown"
@@ -30,19 +36,48 @@ def test_untyped_connection_message_does_not_claim_a_database_timeout() -> None:
 def test_typed_provider_failures_preserve_safe_subcause(
     failure: Exception, subcause: str, retryable: bool
 ) -> None:
-    diagnostic = classify_failure(failure, stage="analyzing")
+    diagnostic = classify_failure(failure, stage=Stage.CODE_GENERATION.value)
 
     assert diagnostic.category == "infrastructure_failure"
     assert diagnostic.subcause == subcause
-    assert diagnostic.failure_stage == "analyzing"
+    assert diagnostic.failure_stage == Stage.CODE_GENERATION.value
     assert diagnostic.retryable is retryable
     assert "private" not in diagnostic.safe_message
+
+
+@pytest.mark.parametrize(
+    ("failure", "subcause", "retryable"),
+    [
+        (LLMTimeoutError("private provider detail"), "aoai_response_timeout", True),
+        (LLMConnectionError("private provider detail"), "aoai_connection_error", True),
+        (LLMHTTPStatusError(400), "aoai_http_4xx", False),
+        (LLMHTTPStatusError(503), "aoai_http_5xx", True),
+    ],
+)
+def test_terminal_job_failure_preserves_typed_cause_and_current_stage(
+    failure: Exception, subcause: str, retryable: bool
+) -> None:
+    store = InMemoryAnalysisJobStore()
+    job = store.create("RSI가 30 이하인 KOSPI200")
+
+    def runner(_query: str, _trace_id: str) -> object:
+        report_node_stage("Backtest")
+        raise failure
+
+    failed = store.run_sync(job.job_id, runner)  # type: ignore[arg-type]
+
+    assert failed.result is not None
+    assert failed.result.failure_cause is not None
+    assert failed.result.failure_cause.subcause == subcause
+    assert failed.result.failure_cause.failure_stage == Stage.BACKTEST.value
+    assert failed.result.retryable is retryable
+    assert "private" not in failed.result.user_payload.message
 
 
 def test_runtime_error_with_contract_words_is_not_misclassified_as_a_schema_failure() -> None:
     diagnostic = classify_failure(
         RuntimeError("upstream mentioned validation, schema, and contract in an unrelated message"),
-        stage="analyzing",
+        stage=Stage.CODE_GENERATION.value,
     )
 
     assert diagnostic.category == "unknown_failure"
@@ -63,7 +98,7 @@ def test_empty_screen_is_a_data_gap_answer_not_an_unknown_crash() -> None:
             "no_screening_matches",
             "no screening candidates found in mart.kis_adjusted_feature_frame_asof",
         ),
-        stage="finalizing",
+        stage=Stage.FINALIZING.value,
     )
 
     assert diagnostic.category == "data_gap"
@@ -73,12 +108,13 @@ def test_empty_screen_is_a_data_gap_answer_not_an_unknown_crash() -> None:
     assert "조건" in diagnostic.safe_message
     # Internal table names stay out of the public message.
     assert "mart." not in diagnostic.safe_message
+    assert diagnostic.failure_stage == Stage.FINALIZING.value
 
 
 def test_missing_price_history_is_reported_separately_from_an_empty_screen() -> None:
     diagnostic = classify_failure(
         PipelineDataUnavailableError("no_price_rows", "returned no price rows for 005930"),
-        stage="finalizing",
+        stage=Stage.BACKTEST.value,
     )
 
     assert diagnostic.category == "data_gap"
@@ -93,7 +129,7 @@ def test_split_release_fixture_guard_is_a_safe_classified_failure() -> None:
 
     diagnostic = classify_failure(
         db_split.FixtureModeForbiddenError("must-not-leak"),
-        stage="data_loading",
+        stage=Stage.INTERPRETING.value,
     )
 
     assert diagnostic.category == "infrastructure_failure"
@@ -191,9 +227,9 @@ def test_empty_runner_result_is_not_completed_or_reused_as_an_analysis(
     store = InMemoryAnalysisJobStore()
     job = store.create("RSI가 30 이하인 KOSPI200")
 
-    failed = store.run_sync(  # type: ignore[arg-type]
+    failed = store.run_sync(
         job.job_id,
-        lambda _query, _trace_id: empty_result,
+        cast(AnalysisRunner, lambda _query, _trace_id: empty_result),
     )
 
     assert failed.status == "failed"
@@ -212,22 +248,13 @@ def test_empty_runner_result_is_not_completed_or_reused_as_an_analysis(
     assert "analysis runner" not in failed.result.user_payload.message
 
 
-def test_lock_exhaustion_is_named_not_swallowed_as_unknown() -> None:
-    """`out of shared memory` is a warehouse capacity fault, not a mystery.
+def test_postgres_lock_capacity_is_classified_from_sqlstate_not_message() -> None:
+    """Only typed PostgreSQL metadata may identify lock-table capacity exhaustion."""
 
-    psycopg surfaces the server's lock-table exhaustion as OutOfMemory, whose message
-    carries none of the words the string heuristics look for. A production run died this
-    way in the Data node and was reported as "분류되지 않은 오류", which reads as an AI
-    bug and gave the user no reason to retry - the one thing that would have worked.
-    """
-
-    class OutOfMemory(Exception):
-        """Stands in for psycopg.errors.OutOfMemory, matched by type name."""
-
-    diagnostic = classify_failure(
-        OutOfMemory("out of shared memory\nHINT: You might need to increase max_locks_per_transaction."),
-        stage="data_collect",
-    )
+    error_type = type("DriverError", (Exception,), {"__module__": "psycopg.errors"})
+    error = error_type("private database detail")
+    error.sqlstate = "53200"  # type: ignore[attr-defined]
+    diagnostic = classify_failure(error, stage=Stage.BACKTEST.value)
 
     assert diagnostic.category == "infrastructure_failure"
     assert diagnostic.subcause == "db_lock_capacity_exhausted"
@@ -236,17 +263,13 @@ def test_lock_exhaustion_is_named_not_swallowed_as_unknown() -> None:
     # succeeds once whatever else was holding chunks finishes.
     assert diagnostic.retryable is True
     # The stage the caller reached is preserved rather than replaced with finalizing.
-    assert diagnostic.failure_stage == "data_collect"
-    # Server internals stay out of the public message.
-    assert "shared memory" not in diagnostic.safe_message
-    assert "max_locks" not in diagnostic.safe_message
+    assert diagnostic.failure_stage == Stage.BACKTEST.value
+    assert "private database detail" not in diagnostic.safe_message
 
 
-def test_lock_exhaustion_matches_on_message_when_type_name_differs() -> None:
-    """Drivers other than psycopg raise their own class for the same server error."""
-
+def test_untyped_lock_capacity_message_remains_unknown() -> None:
     diagnostic = classify_failure(
-        RuntimeError("ERROR: out of shared memory"), stage="data_collect"
+        RuntimeError("ERROR: out of shared memory"), stage=Stage.BACKTEST.value
     )
 
-    assert diagnostic.subcause == "db_lock_capacity_exhausted"
+    assert diagnostic.subcause == "unknown"

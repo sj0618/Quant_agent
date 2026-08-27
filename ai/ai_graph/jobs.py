@@ -25,7 +25,8 @@ from ai_graph.analysis_capacity import (
 )
 from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
 from ai_graph.job_events import JobEventBuffer
-from ai_graph.llm import LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
+from ai_graph.llm import LLMClientError, LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
+from ai_graph.llm.concurrency_gate import AOAIGateBusyError
 from ai_graph.progress import (
     AnalysisCancelled,
     AnalysisDeadlineExceeded,
@@ -912,7 +913,7 @@ def _run_analysis_job(
                 failure_cause=FailureDiagnostic(
                     category="cancelled",
                     subcause="job_deadline_exceeded",
-                    failure_stage=Stage.FINALIZING.value,
+                    failure_stage=_current_failure_stage(store, job),
                     owner="ai_graph",
                     retryable=True,
                     safe_message=JOB_DEADLINE_MESSAGE,
@@ -932,7 +933,7 @@ def _run_analysis_job(
                 failure_cause=FailureDiagnostic(
                     category="cancelled",
                     subcause="user_cancelled",
-                    failure_stage=Stage.FINALIZING.value,
+                    failure_stage=_current_failure_stage(store, job),
                     owner="user",
                     retryable=True,
                     safe_message=message,
@@ -1234,11 +1235,12 @@ def _stage_status_for(
 
 
 def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
+    failure_stage = _closed_failure_stage(stage)
     if isinstance(exc, EmptyAnalysisResultError):
         return FailureDiagnostic(
             category="data_gap",
             subcause="empty_analysis_result",
-            failure_stage=stage,
+            failure_stage=failure_stage,
             owner="ai_graph",
             retryable=False,
             safe_message=(
@@ -1247,21 +1249,20 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             ),
             evidence_refs=["failure:empty_analysis_result"],
         )
-    # Matched on the exception type before any of the message heuristics below, and by
-    # name rather than by import so this module stays free of the llm package. A queued
-    # request that never got a provider slot is a capacity problem, not the generic
-    # unknown failure its message would otherwise be sorted into.
-    if type(exc).__name__ == "AOAIGateBusyError":
+    exception_chain = _exception_chain(exc)
+    # Provider and data adapters expose stable typed causes.  Public diagnostics must
+    # use those causes, never arbitrary provider/database text that can both misclassify
+    # a failure and leak operational details.
+    if any(isinstance(error, AOAIGateBusyError) for error in exception_chain):
         return FailureDiagnostic(
             category="infrastructure_failure",
             subcause="aoai_capacity_exhausted",
-            failure_stage=stage,
+            failure_stage=failure_stage,
             owner="ai_graph",
             retryable=True,
             safe_message="현재 AI 분석 요청이 몰려 대기 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:aoai_capacity_exhausted"],
         )
-    exception_chain = _exception_chain(exc)
     typed_provider_failure = next(
         (
             error
@@ -1273,14 +1274,14 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
     if isinstance(typed_provider_failure, LLMTimeoutError):
         return _aoai_failure_diagnostic(
             subcause="aoai_response_timeout",
-            stage=stage,
+            stage=failure_stage,
             retryable=True,
             safe_message="AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요.",
         )
     if isinstance(typed_provider_failure, LLMConnectionError):
         return _aoai_failure_diagnostic(
             subcause="aoai_connection_error",
-            stage=stage,
+            stage=failure_stage,
             retryable=True,
             safe_message="AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
         )
@@ -1294,74 +1295,69 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
         )
         return _aoai_failure_diagnostic(
             subcause=subcause,
-            stage=stage,
+            stage=failure_stage,
             retryable=(
                 typed_provider_failure.status_code >= 500
                 or typed_provider_failure.status_code in {408, 409, 429}
             ),
             safe_message="AI 제공자 응답을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
         )
-    provider_failure = any(
-        type(error).__name__ in {"LLMClientError", "LLMTimeoutError"}
-        for error in exception_chain
-    )
-    if provider_failure:
-        provider_timeout = next(
-            (error for error in exception_chain if isinstance(error, httpx.TimeoutException)),
+    # The provider adapter wraps transport exceptions in its stable base type while
+    # preserving the original exception as an explicit cause.  Accept those typed
+    # causes only under that wrapper; a bare httpx exception elsewhere must remain
+    # unknown rather than being misreported as an AOAI incident.
+    if any(isinstance(error, LLMClientError) for error in exception_chain):
+        typed_transport_failure = next(
+            (
+                error
+                for error in exception_chain
+                if isinstance(error, (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError))
+            ),
             None,
         )
-        if provider_timeout is not None:
+        if isinstance(typed_transport_failure, httpx.TimeoutException):
             return _aoai_failure_diagnostic(
                 subcause="aoai_response_timeout",
-                stage=stage,
+                stage=failure_stage,
                 retryable=True,
-                safe_message=(
-                    "AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요."
-                ),
+                safe_message="AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요.",
             )
-        provider_connection_error = next(
-            (error for error in exception_chain if isinstance(error, httpx.ConnectError)),
-            None,
-        )
-        if provider_connection_error is not None:
-            return _aoai_failure_diagnostic(
-                subcause="aoai_connection_error",
-                stage=stage,
-                retryable=True,
-                safe_message=(
-                    "AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요."
-                ),
+        if isinstance(typed_transport_failure, httpx.HTTPStatusError):
+            status_code = _http_status_code(typed_transport_failure)
+            if status_code is None:
+                return _aoai_failure_diagnostic(
+                    subcause="aoai_http_error",
+                    stage=failure_stage,
+                    retryable=True,
+                    safe_message="AI 제공자 응답을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
+            subcause = (
+                "aoai_http_5xx"
+                if status_code >= 500
+                else "aoai_http_4xx"
+                if status_code >= 400
+                else "aoai_http_error"
             )
-        provider_http_error = next(
-            (error for error in exception_chain if isinstance(error, httpx.HTTPStatusError)),
-            None,
-        )
-        if provider_http_error is not None:
-            status_code = provider_http_error.response.status_code
-            if status_code >= 500:
-                subcause = "aoai_http_5xx"
-            elif status_code >= 400:
-                subcause = "aoai_http_4xx"
-            else:
-                subcause = "aoai_http_error"
             return _aoai_failure_diagnostic(
                 subcause=subcause,
-                stage=stage,
+                stage=failure_stage,
                 retryable=status_code >= 500 or status_code in {408, 409, 429},
                 safe_message="AI 제공자 응답을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
             )
-    # psycopg raises OutOfMemory for the server's "out of shared memory", which here has
-    # only ever meant the lock table filled up: a query touched more partitions than
-    # max_locks_per_transaction x max_connections leaves room for. Matched by type name
-    # rather than message because the message heuristics below never caught it - it
-    # contains none of "timeout", "validation" or "schema", so a run that died this way
-    # was reported as "분류되지 않은 오류", which told the user nothing and hid a
-    # warehouse-side cause behind a message that reads like an AI bug.
-    if type(exc).__name__ == "OutOfMemory" or "out of shared memory" in str(exc).lower():
+        if isinstance(typed_transport_failure, httpx.TransportError):
+            return _aoai_failure_diagnostic(
+                subcause="aoai_connection_error",
+                stage=failure_stage,
+                retryable=True,
+                safe_message="AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+            )
+    # PostgreSQL identifies lock-table exhaustion with SQLSTATE 53200.  Do not inspect
+    # the message: database text is neither a stable contract nor safe public input.
+    if any(_is_postgres_lock_capacity_failure(error) for error in exception_chain):
         return FailureDiagnostic(
             category="infrastructure_failure",
             subcause="db_lock_capacity_exhausted",
-            failure_stage=stage,
+            failure_stage=failure_stage,
             owner="data_source_config",
             retryable=True,
             safe_message=(
@@ -1374,18 +1370,22 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
     # answer for the user, not a crash: sorted into unknown_failure it produced "분류되지
     # 않은 오류" with no indication that the screen simply matched nothing, and the run
     # looked indistinguishable from one that had hung.
-    if isinstance(exc, PipelineDataUnavailableError):
+    typed_data_gap = next(
+        (error for error in exception_chain if isinstance(error, PipelineDataUnavailableError)),
+        None,
+    )
+    if isinstance(typed_data_gap, PipelineDataUnavailableError):
         # `reason` is a source-layer string, while `FailureDiagnostic.subcause` is a
         # deliberately closed public contract. Never copy it through blindly: a new
         # source reason would otherwise turn an expected unavailable-data response
         # into a Pydantic validation error. Known reasons get their precise public
         # diagnosis; everything else stays fail-closed as the existing data-required
         # outcome without exposing the source exception text.
-        if exc.reason == "fixture_mode_forbidden_in_release":
+        if typed_data_gap.reason == "fixture_mode_forbidden_in_release":
             return FailureDiagnostic(
                 category="infrastructure_failure",
                 subcause="fixture_mode_forbidden_in_release",
-                failure_stage=Stage.INTERPRETING.value,
+                failure_stage=failure_stage,
                 owner="data_source_config",
                 retryable=False,
                 safe_message=(
@@ -1395,10 +1395,10 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
                 evidence_refs=["failure:fixture_mode_forbidden_in_release"],
             )
 
-        if exc.reason == "no_screening_matches":
+        if typed_data_gap.reason == "no_screening_matches":
             subcause = "no_screening_matches"
             safe_message = "조건에 맞는 종목을 찾지 못했습니다. 조건을 완화해 다시 시도해 주세요."
-        elif exc.reason == "no_price_rows":
+        elif typed_data_gap.reason == "no_price_rows":
             subcause = "no_price_rows"
             safe_message = "선정된 종목의 가격 데이터가 적재되어 있지 않아 백테스트를 진행할 수 없습니다."
         else:
@@ -1407,7 +1407,7 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
         return FailureDiagnostic(
             category="data_gap",
             subcause=subcause,
-            failure_stage=Stage.INTERPRETING.value,
+            failure_stage=failure_stage,
             owner="data_source_config",
             retryable=False,
             safe_message=safe_message,
@@ -1417,17 +1417,17 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
         return FailureDiagnostic(
             category="infrastructure_failure",
             subcause="db_connection_unavailable",
-            failure_stage=stage,
+            failure_stage=failure_stage,
             owner="data_source_config",
             retryable=True,
             safe_message="운영 데이터 소스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:db_connection_unavailable"],
         )
-    if isinstance(exc, ValidationError):
+    if any(isinstance(error, ValidationError) for error in exception_chain):
         return FailureDiagnostic(
             category="semantic_failure",
             subcause="contract_shape_error",
-            failure_stage=stage,
+            failure_stage=failure_stage,
             owner="ai_graph",
             retryable=False,
             safe_message="AI 파이프라인 계약 검증에 실패했습니다. 지원팀이 추적할 수 있도록 debug_ref를 보존했습니다.",
@@ -1436,7 +1436,7 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
     return FailureDiagnostic(
         category="unknown_failure",
         subcause="unknown",
-        failure_stage=stage,
+        failure_stage=failure_stage,
         owner="unknown",
         retryable=True,
         safe_message="AI 분석 중 분류되지 않은 오류가 발생했습니다. 원문 오류는 공개 응답에 노출하지 않고 debug_ref로 추적합니다.",
@@ -1495,6 +1495,38 @@ def _is_postgres_connection_failure(error: BaseException) -> bool:
     }
 
 
+def _is_postgres_lock_capacity_failure(error: BaseException) -> bool:
+    """Recognize PostgreSQL lock-table exhaustion from typed driver metadata only."""
+
+    return (
+        type(error).__module__.startswith("psycopg")
+        and getattr(error, "sqlstate", None) == "53200"
+    )
+
+
+def _http_status_code(error: BaseException | None) -> int | None:
+    """Read status metadata defensively without treating exception text as evidence."""
+
+    response = getattr(error, "response", None) if error is not None else None
+    status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def _closed_failure_stage(stage: str) -> Stage:
+    """Keep direct callers from leaking arbitrary strings into the public result."""
+
+    try:
+        return Stage(stage)
+    except ValueError:
+        return Stage.INTERPRETING
+
+
+def _current_failure_stage(store: AnalysisJobStore, job: AnalysisJob) -> Stage:
+    """Preserve the last stage the job store observed for terminal cancellation paths."""
+
+    return (store.get_job(job.job_id) or job).polling_stage
+
+
 def _aoai_failure_diagnostic(
     *,
     subcause: Literal[
@@ -1504,7 +1536,7 @@ def _aoai_failure_diagnostic(
         "aoai_http_5xx",
         "aoai_http_error",
     ],
-    stage: str,
+    stage: Stage,
     retryable: bool,
     safe_message: str,
 ) -> FailureDiagnostic:

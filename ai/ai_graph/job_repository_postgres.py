@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
@@ -59,6 +60,97 @@ def _job_document(job: AnalysisJob) -> dict[str, Any]:
         }
     )
     return document
+
+
+_VALID_STAGES = frozenset(stage.value for stage in Stage)
+_LEGACY_FAILURE_SAFE_MESSAGE = (
+    "과거 분석 결과의 상세 실패 원인을 확인할 수 없습니다. "
+    "debug_ref로 추적해 주세요."
+)
+_LEGACY_MANIFEST_HASH = sha256(b"legacy_execution_manifest_unavailable.v1").hexdigest()
+_LEGACY_EMPTY_LEDGER_HASH = sha256(b"{}").hexdigest()
+
+
+def _legacy_execution_manifest(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Represent unavailable old execution evidence without inventing executions."""
+
+    return {
+        "schema_version": "1",
+        # This is intentionally not the current contract hash: the manifest did not
+        # exist when this row was written.
+        "contract_hash": _LEGACY_MANIFEST_HASH,
+        "run_identity": {
+            "job_id": document.get("job_id"),
+            "trace_id": document.get("trace_id"),
+            "strategy_id": document.get("strategy_id"),
+            "run_id": document.get("run_id"),
+        },
+        "policy_hashes": {"legacy_execution_manifest_unavailable": _LEGACY_MANIFEST_HASH},
+        "session": {
+            "requested_at": document.get("created_at"),
+            "started_at": None,
+            "ended_at": document.get("completed_at"),
+        },
+        "capabilities": {
+            "terminal_event_documents": False,
+            "corporate_action_events": False,
+        },
+        "events": {},
+        "ledger_event_count": 0,
+        "ledger_event_hash": _LEGACY_EMPTY_LEDGER_HASH,
+    }
+
+
+def _decode_persisted_job_document(document: Any) -> AnalysisJob:
+    """Read old terminal failures without weakening the current write contract.
+
+    The first durable job format predates both the execution manifest and the
+    parse-bound execution identity. Its failed envelopes can contain a free-form
+    stage or no diagnostic at all, which a current ``APIEnvelope`` correctly rejects.
+    Normalize only that unmistakably pre-contract shape at the storage-read boundary.
+    Rows written by the current format continue through strict model validation.
+    """
+
+    if not isinstance(document, Mapping):
+        return AnalysisJob.model_validate(document)
+    if (
+        document.get("execution_manifest") is not None
+        or document.get("execution_spec_version") is not None
+        or document.get("execution_spec_hash") is not None
+    ):
+        return AnalysisJob.model_validate(document)
+
+    result = document.get("result")
+    if not isinstance(result, Mapping) or result.get("status") != "failed":
+        return AnalysisJob.model_validate(document)
+
+    normalized_document = dict(document)
+    normalized_document["execution_manifest"] = _legacy_execution_manifest(document)
+    normalized_result = dict(result)
+    failure_cause = normalized_result.get("failure_cause")
+    if not isinstance(failure_cause, Mapping):
+        normalized_result["failure_cause"] = {
+            "category": "unknown_failure",
+            "subcause": "unknown",
+            "failure_stage": Stage.FINALIZING.value,
+            "owner": "unknown",
+            "retryable": bool(normalized_result.get("retryable", False)),
+            "safe_message": _LEGACY_FAILURE_SAFE_MESSAGE,
+            "evidence_refs": ["failure:legacy_missing_diagnostic"],
+        }
+    elif failure_cause.get("failure_stage") not in _VALID_STAGES:
+        normalized_cause = dict(failure_cause)
+        normalized_cause["failure_stage"] = Stage.FINALIZING.value
+        evidence_refs = normalized_cause.get("evidence_refs")
+        normalized_cause["evidence_refs"] = (
+            [*evidence_refs, "failure:legacy_stage_normalized"]
+            if isinstance(evidence_refs, list) and all(isinstance(ref, str) for ref in evidence_refs)
+            else ["failure:legacy_stage_normalized"]
+        )
+        normalized_result["failure_cause"] = normalized_cause
+
+    normalized_document["result"] = normalized_result
+    return AnalysisJob.model_validate(normalized_document)
 
 
 class PostgresAnalysisJobRepository:
@@ -154,7 +246,7 @@ class PostgresAnalysisJobRepository:
                 if stored is None:
                     raise ParseBoundAdmissionError("parse_token_unavailable")
                 return ParseBoundJobAdmission(
-                    job=AnalysisJob.model_validate(stored["job_jsonb"]),
+                    job=_decode_persisted_job_document(stored["job_jsonb"]),
                     created=False,
                 )
 
@@ -193,7 +285,7 @@ class PostgresAnalysisJobRepository:
                     ).fetchone()
                     if stored is not None:
                         return ParseBoundJobAdmission(
-                            job=AnalysisJob.model_validate(stored["job_jsonb"]),
+                            job=_decode_persisted_job_document(stored["job_jsonb"]),
                             created=False,
                         )
                 raise ParseBoundAdmissionError("parse_token_unavailable")
@@ -270,7 +362,7 @@ class PostgresAnalysisJobRepository:
             ).fetchone()
             if stored is None:
                 raise ParseBoundAdmissionError("parse_token_unavailable")
-            return AnalysisJob.model_validate(stored["job_jsonb"])
+            return _decode_persisted_job_document(stored["job_jsonb"])
 
     def claim_analysis_job_outbox(self, *, limit: int = 1) -> list[AnalysisJobOutboxMessage]:
         """Lease queued jobs for the single process that is allowed to execute them."""
@@ -356,7 +448,7 @@ class PostgresAnalysisJobRepository:
                 "SELECT job_jsonb FROM app.ai_analysis_job WHERE job_id = %s",
                 (job_id,),
             ).fetchone()
-        return AnalysisJob.model_validate(row["job_jsonb"]) if row else None
+        return _decode_persisted_job_document(row["job_jsonb"]) if row else None
 
     def update_job_status(
         self,
@@ -508,7 +600,7 @@ class PostgresAnalysisJobRepository:
         for row in rows:
             document = row["job_jsonb"]
             try:
-                decoded.append(AnalysisJob.model_validate(document))
+                decoded.append(_decode_persisted_job_document(document))
             except ValidationError:
                 job_id = None
                 if isinstance(document, dict):
@@ -541,7 +633,7 @@ class PostgresAnalysisJobRepository:
         for row in rows:
             document = row["job_jsonb"]
             try:
-                decoded.append(AnalysisJob.model_validate(document))
+                decoded.append(_decode_persisted_job_document(document))
             except ValidationError:
                 job_id = "unknown"
                 if isinstance(document, dict):
