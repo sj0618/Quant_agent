@@ -353,6 +353,43 @@ class StrategySpec(BaseModel):
         return value.strip().lower().replace(" ", "_")
 
 
+STRATEGY_EXECUTION_SPEC_VERSION_V1 = "strategy-execution-spec.v1"
+
+
+class StrategyExecutionConditionV1(BaseModel):
+    """A bounded, non-order condition in the parse-bound execution contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    metric: Literal["rsi"]
+    comparator: Literal["lte", "gte"]
+    value: float = Field(gt=0.0, le=100.0)
+    role: Literal["entry", "exit"]
+
+
+class StrategyExecutionSpecV1(BaseModel):
+    """The public V1 rule shape that may be admitted to a durable analysis job.
+
+    Entry and exit describe a historical research rule only.  They never express an
+    order, position, account, quantity, or personalized recommendation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    market: Literal["KRX"] = "KRX"
+    timeframe: Literal["daily"] = "daily"
+    entry_conditions: list[StrategyExecutionConditionV1] = Field(min_length=1, max_length=3)
+    exit_conditions: list[StrategyExecutionConditionV1] = Field(min_length=1, max_length=3)
+
+    @model_validator(mode="after")
+    def separate_condition_roles(self) -> "StrategyExecutionSpecV1":
+        if any(condition.role != "entry" for condition in self.entry_conditions):
+            raise ValueError("entry_conditions must use the entry role")
+        if any(condition.role != "exit" for condition in self.exit_conditions):
+            raise ValueError("exit_conditions must use the exit role")
+        return self
+
+
 class L4Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -934,6 +971,12 @@ class APIEnvelope(BaseModel):
     schema_version: str = SCHEMA_VERSION
     user_payload: UserPayload
     strategy_spec: StrategySpec | None = None
+    # The legacy ``strategy_spec`` remains readable while callers migrate.  A
+    # parse-bound analysis carries this separately versioned and hash-addressed
+    # execution contract; all three fields are present or absent together.
+    execution_spec: StrategyExecutionSpecV1 | None = None
+    execution_spec_version: Literal[STRATEGY_EXECUTION_SPEC_VERSION_V1] | None = None
+    execution_spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     debug_ref: str = Field(min_length=1)
     retryable: bool
     semantic_slots: SemanticSlots | None = None
@@ -945,3 +988,18 @@ class APIEnvelope(BaseModel):
     failure_cause: FailureDiagnostic | None = None
     evidence_refs: list[EvidenceRef] = Field(default_factory=list)
     rule_provenance: RuleProvenance | None = None
+
+    @model_validator(mode="after")
+    def validate_public_terminal_contract(self) -> "APIEnvelope":
+        execution_values = (
+            self.execution_spec,
+            self.execution_spec_version,
+            self.execution_spec_hash,
+        )
+        if any(value is None for value in execution_values) and any(
+            value is not None for value in execution_values
+        ):
+            raise ValueError("execution spec, version, and hash must be present together")
+        if self.failure_cause is not None and self.status != EnvelopeStatus.FAILED:
+            raise ValueError("only failed envelopes may expose a failure cause")
+        return self
