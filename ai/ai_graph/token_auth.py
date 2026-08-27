@@ -214,14 +214,27 @@ class AccountTokenQuota:
         self._redis = redis_client
         self._key_prefix = key_prefix
 
-    async def check_and_consume(self, token: ResolvedAccountToken) -> None:
+    async def check_and_consume(
+        self,
+        token: ResolvedAccountToken,
+        *,
+        idempotency_key: str | None = None,
+    ) -> None:
         window = max(token.quota_window_seconds, 1)
         bucket = int(time.time() // window)
-        key = f"{self._key_prefix}:{token.token_id}:{bucket}"
+        quota_key = f"{self._key_prefix}:{token.token_id}:{bucket}"
         try:
-            used = await self._redis.incr(key)
-            if used == 1:
-                await self._redis.expire(key, window)
+            if idempotency_key:
+                used = await self._consume_once_per_idempotency_key(
+                    token=token,
+                    idempotency_key=idempotency_key,
+                    quota_key=quota_key,
+                    window=window,
+                )
+            else:
+                used = await self._redis.incr(quota_key)
+                if used == 1:
+                    await self._redis.expire(quota_key, window)
         except Exception:
             # Redis is unavailable, so the counter is unknown. Letting the request through
             # keeps an infrastructure blip from looking like a quota rejection; the
@@ -242,6 +255,56 @@ class AccountTokenQuota:
                 },
                 headers={"Retry-After": str(window)},
             )
+
+    async def _consume_once_per_idempotency_key(
+        self,
+        *,
+        token: ResolvedAccountToken,
+        idempotency_key: str,
+        quota_key: str,
+        window: int,
+    ) -> int:
+        """Atomically reserve one bearer-token quota unit for an admitted retry key.
+
+        The durable job admission owns the definitive idempotency ledger, but quota is
+        intentionally checked before a new Job may reach a provider.  A plain GET/SET
+        check would race across two API processes: both could see no job and increment
+        the counter.  Redis executes this small Lua transaction serially, so one client
+        idempotency key consumes at most one unit in its fixed window without storing
+        the raw key in Redis.
+        """
+
+        fingerprint = hashlib.sha256(
+            f"{token.token_id}\x00{token.user_id}\x00{idempotency_key}".encode("utf-8")
+        ).hexdigest()
+        reservation_key = f"{self._key_prefix}:admission:{fingerprint}"
+        result = await self._redis.eval(
+            """
+            if redis.call('GET', KEYS[2]) then
+                return {0, 0}
+            end
+            local used = redis.call('INCR', KEYS[1])
+            if used == 1 then
+                redis.call('EXPIRE', KEYS[1], ARGV[1])
+            end
+            if used > tonumber(ARGV[2]) then
+                return {2, used}
+            end
+            redis.call('SET', KEYS[2], '1', 'EX', ARGV[1], 'NX')
+            return {1, used}
+            """,
+            2,
+            quota_key,
+            reservation_key,
+            window,
+            token.quota_limit,
+        )
+        decision, used = (int(value) for value in result)
+        if decision == 0:
+            # A concurrent process has already reserved this exact request.  It may
+            # now return the durable job without recharging quota.
+            return 0
+        return used
 
 
 class RequireUserIdentity:
@@ -367,13 +430,18 @@ class RequirePreflightIdentityReadOnly:
         request.state.preflight_account_token = resolved
         return resolved.user_id
 
-    async def consume_quota_after_preflight(self, request: Request) -> None:
+    async def consume_quota_after_preflight(
+        self,
+        request: Request,
+        *,
+        idempotency_key: str | None = None,
+    ) -> None:
         token = getattr(request.state, "preflight_account_token", None)
         if not isinstance(token, ResolvedAccountToken):
             return
         quota = self._resolve_quota(request)
         if quota is not None:
-            await quota.check_and_consume(token)
+            await quota.check_and_consume(token, idempotency_key=idempotency_key)
 
     def _resolve_resolver(self, request: Request) -> AccountTokenResolver | None:
         if self._token_resolver is not None:

@@ -3,14 +3,23 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import ValidationError
 
-from ai_graph.jobs import AnalysisJob, AnalysisJobStatus, InMemoryAnalysisJobStore
+from ai_graph.jobs import (
+    AnalysisJob,
+    AnalysisJobOutboxMessage,
+    AnalysisJobStatus,
+    InMemoryAnalysisJobStore,
+    ParseBoundAdmissionError,
+    ParseBoundJobAdmission,
+)
 from ai_graph.schemas import APIEnvelope, Stage
 
 _logger = logging.getLogger(__name__)
@@ -83,6 +92,263 @@ class PostgresAnalysisJobRepository:
         )
         self._save(job)
         return job
+
+    def register_parse_token(
+        self,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        expires_at: datetime,
+    ) -> None:
+        """Persist only an opaque nonce digest and the canonical spec identity."""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO app.ai_parse_token (
+                    nonce_hash, user_id, spec_version, spec_hash, expires_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (nonce_hash) DO NOTHING
+                """,
+                (nonce_hash, user_id, spec_version, spec_hash, expires_at),
+            )
+
+    def admit_parse_bound_job(
+        self,
+        request_text: str,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> ParseBoundJobAdmission:
+        """Atomically consume one parse nonce, persist the job, and enqueue its outbox row."""
+
+        job = InMemoryAnalysisJobStore().create_job(
+            request_text,
+            user_id=user_id,
+            execution_spec_version=spec_version,
+            execution_spec_hash=spec_hash,
+            client_idempotency_key=client_idempotency_key,
+        )
+        with self._connect() as connection, connection.transaction():
+            existing = connection.execute(
+                """
+                SELECT spec_hash, job_id
+                FROM app.ai_analysis_job_idempotency
+                WHERE user_id = %s AND client_idempotency_key = %s
+                FOR UPDATE
+                """,
+                (user_id, client_idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["spec_hash"] != spec_hash:
+                    raise ParseBoundAdmissionError("idempotency_key_reused")
+                stored = connection.execute(
+                    "SELECT job_jsonb FROM app.ai_analysis_job WHERE job_id = %s",
+                    (existing["job_id"],),
+                ).fetchone()
+                if stored is None:
+                    raise ParseBoundAdmissionError("parse_token_unavailable")
+                return ParseBoundJobAdmission(
+                    job=AnalysisJob.model_validate(stored["job_jsonb"]),
+                    created=False,
+                )
+
+            consumed = connection.execute(
+                """
+                UPDATE app.ai_parse_token
+                SET consumed_at = now()
+                WHERE nonce_hash = %s
+                  AND user_id = %s
+                  AND spec_version = %s
+                  AND spec_hash = %s
+                  AND consumed_at IS NULL
+                  AND expires_at > now()
+                RETURNING nonce_hash
+                """,
+                (nonce_hash, user_id, spec_version, spec_hash),
+            ).fetchone()
+            if consumed is None:
+                # A concurrent identical request can observe no idempotency row before
+                # it waits on the nonce-row update. Re-read after that wait so its
+                # retry returns the winner's job instead of looking like a replay.
+                winner = connection.execute(
+                    """
+                    SELECT spec_hash, job_id
+                    FROM app.ai_analysis_job_idempotency
+                    WHERE user_id = %s AND client_idempotency_key = %s
+                    """,
+                    (user_id, client_idempotency_key),
+                ).fetchone()
+                if winner is not None:
+                    if winner["spec_hash"] != spec_hash:
+                        raise ParseBoundAdmissionError("idempotency_key_reused")
+                    stored = connection.execute(
+                        "SELECT job_jsonb FROM app.ai_analysis_job WHERE job_id = %s",
+                        (winner["job_id"],),
+                    ).fetchone()
+                    if stored is not None:
+                        return ParseBoundJobAdmission(
+                            job=AnalysisJob.model_validate(stored["job_jsonb"]),
+                            created=False,
+                        )
+                raise ParseBoundAdmissionError("parse_token_unavailable")
+
+            outbox_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO app.ai_analysis_job (
+                    job_id, user_id, job_jsonb, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    job.job_id,
+                    job.user_id,
+                    Jsonb(_job_document(job)),
+                    job.created_at,
+                    job.updated_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO app.ai_analysis_job_idempotency (
+                    user_id, client_idempotency_key, spec_hash, job_id
+                ) VALUES (%s, %s, %s, %s)
+                """,
+                (user_id, client_idempotency_key, spec_hash, job.job_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO app.ai_analysis_job_outbox (
+                    outbox_id, job_id, event_type, payload_jsonb
+                ) VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    outbox_id,
+                    job.job_id,
+                    "analysis_job.created.v1",
+                    Jsonb(
+                        {
+                            "job_id": job.job_id,
+                            "spec_hash": spec_hash,
+                            "spec_version": spec_version,
+                        }
+                    ),
+                ),
+            )
+        return ParseBoundJobAdmission(job=job, created=True, outbox_id=outbox_id)
+
+    def find_parse_bound_job(
+        self,
+        *,
+        user_id: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> AnalysisJob | None:
+        """Read an idempotent admission before a retry spends another quota unit."""
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT spec_hash, job_id
+                FROM app.ai_analysis_job_idempotency
+                WHERE user_id = %s AND client_idempotency_key = %s
+                """,
+                (user_id, client_idempotency_key),
+            ).fetchone()
+            if existing is None:
+                return None
+            if existing["spec_hash"] != spec_hash:
+                raise ParseBoundAdmissionError("idempotency_key_reused")
+            stored = connection.execute(
+                "SELECT job_jsonb FROM app.ai_analysis_job WHERE job_id = %s",
+                (existing["job_id"],),
+            ).fetchone()
+            if stored is None:
+                raise ParseBoundAdmissionError("parse_token_unavailable")
+            return AnalysisJob.model_validate(stored["job_jsonb"])
+
+    def claim_analysis_job_outbox(self, *, limit: int = 1) -> list[AnalysisJobOutboxMessage]:
+        """Lease queued jobs for the single process that is allowed to execute them."""
+
+        if limit < 1:
+            return []
+        with self._connect() as connection, connection.transaction():
+            rows = connection.execute(
+                """
+                WITH candidates AS (
+                    SELECT outbox.outbox_id
+                    FROM app.ai_analysis_job_outbox AS outbox
+                    JOIN app.ai_analysis_job AS job ON job.job_id = outbox.job_id
+                    WHERE job.job_jsonb ->> 'status' = 'queued'
+                      AND (
+                        outbox.status = 'pending'
+                        OR (
+                            outbox.status = 'claimed'
+                            AND outbox.claimed_at < now() - interval '5 minutes'
+                        )
+                      )
+                    ORDER BY outbox.created_at
+                    FOR UPDATE OF outbox SKIP LOCKED
+                    LIMIT %s
+                )
+                UPDATE app.ai_analysis_job_outbox AS outbox
+                SET status = 'claimed', claimed_at = now()
+                FROM candidates
+                WHERE outbox.outbox_id = candidates.outbox_id
+                RETURNING outbox.outbox_id::text AS outbox_id, outbox.job_id
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            AnalysisJobOutboxMessage(outbox_id=row["outbox_id"], job_id=row["job_id"])
+            for row in rows
+        ]
+
+    def mark_analysis_job_outbox_delivered(self, outbox_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE app.ai_analysis_job_outbox
+                SET status = 'delivered', delivered_at = now()
+                WHERE outbox_id = %s::uuid AND status = 'claimed'
+                """,
+                (outbox_id,),
+            )
+
+    def release_analysis_job_outbox(self, outbox_id: str) -> None:
+        """Make an unstarted claim retryable after an infrastructure-side failure."""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE app.ai_analysis_job_outbox
+                SET status = 'pending', claimed_at = NULL
+                WHERE outbox_id = %s::uuid AND status = 'claimed'
+                """,
+                (outbox_id,),
+            )
+
+    def has_recoverable_analysis_job_outbox(self, job_id: str) -> bool:
+        """Keep a queued outbox job eligible for startup dispatch after a restart."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM app.ai_analysis_job_outbox
+                    WHERE job_id = %s
+                      AND status IN ('pending', 'claimed')
+                ) AS recoverable
+                """,
+                (job_id,),
+            ).fetchone()
+        return bool(row and row["recoverable"])
 
     def get_job(self, job_id: str) -> AnalysisJob | None:
         with self._connect() as connection:

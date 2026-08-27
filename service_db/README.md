@@ -24,7 +24,9 @@ service_db/
 │   ├── 014_create_report_email_tables.sql
 │   ├── 015_ai_backtest_execution_process_identity.sql
 │   ├── 016_ai_backtest_idempotency.sql
-│   └── 022_immutable_analysis_results.sql
+│   ├── 022_immutable_analysis_results.sql
+│   ├── 023_archive_undecodable_analysis_jobs.sql
+│   └── 024_parse_bound_analysis_job_admission.sql
 ├── rollbacks/
 │   └── 022_immutable_analysis_results.down.sql
 ├── scripts/
@@ -73,6 +75,13 @@ service_db/
 owner별 canonical rule/data/execution/report manifest를 `app.analysis_result`에 immutable snapshot으로 저장한다. 동일 owner와 동일 manifest hash는 하나의 `analysis_result_id`를 재사용하며, AI job·backtest run·AI report·전략 report가 같은 FK를 참조한다. public snapshot은 허용된 report projection만 저장하고 내부 provenance는 노출하지 않는다.
 
 rollback은 `rollbacks/022_immutable_analysis_results.down.sql`을 사용하며, 참조 FK/column을 먼저 제거한 뒤 immutable trigger/function/table을 역순으로 제거한다. 공용 또는 운영 DB에는 사전 승인 없이 forward/rollback을 적용하지 않는다.
+
+### `024_parse_bound_analysis_job_admission.sql`
+
+자연어 parse가 발급한 단발 nonce의 SHA-256, canonical spec version/hash, 사용자별
+idempotency key와 durable dispatch outbox를 함께 저장한다. raw prompt나 parse token은
+저장하지 않는다. Job·idempotency·outbox의 생성과 nonce 소비는 하나의 transaction으로
+처리되어 재시작 뒤에도 queued Job을 안전하게 dispatch할 수 있다.
 
 ## 공용 서버 적용 상태
 

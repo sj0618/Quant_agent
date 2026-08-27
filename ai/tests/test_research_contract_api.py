@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -14,8 +17,9 @@ from ai_graph.api import (
     create_app,
 )
 from ai_graph.auth import DisabledSessionResolver
-from ai_graph.jobs import InMemoryAnalysisJobStore
-from ai_graph.research_contract import RuleDraftSigner
+from ai_graph.job_events import JobEventBuffer
+from ai_graph.jobs import AnalysisJobStatus, CancellationRegistry, InMemoryAnalysisJobStore
+from ai_graph.research_contract import RuleDraftSigner, build_rule_draft
 from ai_graph.research_eligibility import ResearchRuntimeFacts
 from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
 from ai_graph.token_auth import ResolvedAccountToken
@@ -36,12 +40,21 @@ def _ready_envelope(trace_id: str) -> APIEnvelope:
     )
 
 
-def _client(*, execution_enabled: bool, calls: list[str]) -> tuple[TestClient, InMemoryAnalysisJobStore]:
-    store = InMemoryAnalysisJobStore()
+def _client(
+    *,
+    execution_enabled: bool,
+    calls: list[str],
+    store: InMemoryAnalysisJobStore | None = None,
+    account_token_resolver=None,
+    account_token_quota=None,
+) -> tuple[TestClient, InMemoryAnalysisJobStore]:
+    store = store or InMemoryAnalysisJobStore()
     app = create_app(
         store,
         analysis_runner=lambda query, trace_id: (calls.append(query), _ready_envelope(trace_id))[1],
         session_resolver=DisabledSessionResolver(),
+        account_token_resolver=account_token_resolver,
+        account_token_quota=account_token_quota,
         rule_draft_signer=RuleDraftSigner("research-contract-test-secret", key_version="test-v1"),
         research_execution_enabled=execution_enabled,
     )
@@ -159,6 +172,111 @@ def test_primary_parse_bound_job_retry_returns_the_original_job_without_replayin
     assert retry.json()["job_id"] == first.json()["job_id"]
     assert len(store.jobs) == 1
     assert len(calls) == 1
+
+
+def test_primary_parse_bound_retry_after_app_recreation_uses_the_durable_admission_record() -> None:
+    """A new process has no local retry fence, so this exercises the store boundary."""
+
+    calls: list[str] = []
+    client, store = _client(execution_enabled=False, calls=calls)
+    draft = _parse_executable_draft(client)
+    payload = {
+        "parse_token": draft["parse_token"],
+        "client_idempotency_key": "32ecc88e-a50d-4b4d-9c5e-573d817b410a",
+        "spec_version": draft["spec_version"],
+        "spec_hash": draft["spec_hash"],
+        "strategy_execution_spec": draft["strategy_execution_spec"],
+    }
+
+    first = client.post(ANALYSIS_JOBS_PATH, json=payload)
+    recovered_client, _ = _client(
+        execution_enabled=False,
+        calls=calls,
+        store=store,
+    )
+    retry = recovered_client.post(ANALYSIS_JOBS_PATH, json=payload)
+
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert retry.json()["job_id"] == first.json()["job_id"]
+    assert len(store.jobs) == 1
+    assert len(calls) == 1
+    assert {state for _job_id, state, _claimed_at in store._analysis_job_outbox.values()} == {
+        "delivered"
+    }
+
+
+def test_outbox_runner_escape_is_settled_as_a_terminal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dispatch infrastructure bug may not leave a queued job without another request."""
+
+    store = InMemoryAnalysisJobStore()
+    store.register_parse_token(
+        nonce_hash="a" * 64,
+        user_id="local-dev-user",
+        spec_version="strategy-execution-spec.v1",
+        spec_hash="b" * 64,
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    admission = store.admit_parse_bound_job(
+        "market=KRX; timeframe=daily; entry=rsi<=30; exit=rsi>=70",
+        nonce_hash="a" * 64,
+        user_id="local-dev-user",
+        spec_version="strategy-execution-spec.v1",
+        spec_hash="b" * 64,
+        client_idempotency_key="dispatch-escape-key",
+    )
+
+    def escaped_runner(*_args, **_kwargs):
+        raise RuntimeError("injected dispatcher escape")
+
+    monkeypatch.setattr(api_module, "run_job_sync", escaped_runner)
+    asyncio.run(
+        api_module._dispatch_analysis_job_outbox(
+            store,
+            analysis_runner=lambda _query, trace_id: _ready_envelope(trace_id),
+            audit_sink=None,
+            events=JobEventBuffer(),
+            cancellations=CancellationRegistry(),
+        )
+    )
+
+    job = store.get_job(admission.job.job_id)
+    assert job is not None
+    assert job.status is AnalysisJobStatus.FAILED
+    assert {state for _job_id, state, _claimed_at in store._analysis_job_outbox.values()} == {
+        "delivered"
+    }
+
+
+def test_primary_job_refuses_a_signed_parse_token_that_was_not_durably_registered() -> None:
+    """A valid HMAC alone cannot bypass the parse-token admission ledger."""
+
+    calls: list[str] = []
+    client, store = _client(execution_enabled=False, calls=calls)
+    signer = RuleDraftSigner("research-contract-test-secret", key_version="test-v1")
+    draft = build_rule_draft(
+        query="RSI가 30 이하이고 RSI가 70 이상인 일반 조건식을 검토해 주세요.",
+        user_id="local-dev-user",
+        signer=signer,
+    )
+
+    response = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={
+            "parse_token": draft.parse_token,
+            "client_idempotency_key": "32ecc88e-a50d-4b4d-9c5e-573d817b410a",
+            "spec_version": draft.spec_version,
+            "spec_hash": draft.spec_hash,
+            "strategy_execution_spec": draft.strategy_execution_spec.model_dump(),
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["reason_code"] == "draft_replayed"
+    assert store.jobs == {}
+    assert calls == []
 
 
 def test_primary_parse_bound_job_rejects_an_idempotency_key_reused_for_another_spec() -> None:
@@ -290,9 +408,60 @@ class _ReadOnlyTokenResolver:
 class _QuotaSpy:
     def __init__(self) -> None:
         self.calls = 0
+        self.idempotency_keys: list[str | None] = []
 
-    async def check_and_consume(self, token: ResolvedAccountToken) -> None:
+    async def check_and_consume(
+        self,
+        token: ResolvedAccountToken,
+        *,
+        idempotency_key: str | None = None,
+    ) -> None:
         self.calls += 1
+        self.idempotency_keys.append(idempotency_key)
+
+
+def test_durable_idempotent_retry_does_not_consume_bearer_quota_again() -> None:
+    """A retry after process recreation reads admission before charging quota."""
+
+    calls: list[str] = []
+    quota = _QuotaSpy()
+    first_client, store = _client(
+        execution_enabled=False,
+        calls=calls,
+        account_token_resolver=_ReadOnlyTokenResolver(),
+        account_token_quota=quota,
+    )
+    headers = {"Authorization": "Bearer retry-safe-token"}
+    parse = first_client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": "RSI가 30 이하이고 RSI가 70 이상인 일반 조건식을 검토해 주세요."},
+        headers=headers,
+    )
+    assert parse.status_code == 200
+    draft = parse.json()
+    payload = {
+        "parse_token": draft["parse_token"],
+        "client_idempotency_key": "quota-retry-key-123456",
+        "spec_version": draft["spec_version"],
+        "spec_hash": draft["spec_hash"],
+        "strategy_execution_spec": draft["strategy_execution_spec"],
+    }
+
+    first = first_client.post(ANALYSIS_JOBS_PATH, json=payload, headers=headers)
+    retry_client, _ = _client(
+        execution_enabled=False,
+        calls=calls,
+        store=store,
+        account_token_resolver=_ReadOnlyTokenResolver(),
+        account_token_quota=quota,
+    )
+    retry = retry_client.post(ANALYSIS_JOBS_PATH, json=payload, headers=headers)
+
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert retry.json()["job_id"] == first.json()["job_id"]
+    assert quota.calls == 1
+    assert quota.idempotency_keys == ["quota-retry-key-123456"]
 
 
 def test_scope_refusal_transport_performs_only_identity_read_before_all_writes(

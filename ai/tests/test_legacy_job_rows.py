@@ -190,3 +190,163 @@ def test_the_settle_statement_casts_every_parameter() -> None:
     assert "%s," not in query.replace("%s::text,", "")
     assert "job_id = %s::text" in query
     assert captured["params"] == ("중단됨", "restart", "job_legacy01")
+
+
+def test_parse_bound_admission_writes_job_idempotency_and_outbox_in_one_transaction() -> None:
+    """Pin the transaction shape locally; isolated PostgreSQL is still an R/O gate."""
+
+    class _Transaction:
+        def __init__(self, connection) -> None:
+            self.connection = connection
+
+        def __enter__(self):
+            self.connection.transaction_count += 1
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _AdmissionConnection:
+        def __init__(self):
+            self.queries: list[tuple[str, object]] = []
+            self.transaction_count = 0
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return _Transaction(self)
+
+        def execute(self, query, params=None):
+            self.queries.append((str(query), params))
+            if "SELECT spec_hash, job_id" in query:
+                return _Rows([])
+            if "UPDATE app.ai_parse_token" in query:
+                return _Rows([{"nonce_hash": "a" * 64}])
+            return _Rows([])
+
+    connection = _AdmissionConnection()
+    repo = PostgresAnalysisJobRepository(
+        "postgresql://example",
+        connector=lambda *_args, **_kwargs: connection,
+    )
+
+    admission = repo.admit_parse_bound_job(
+        "market=KRX; timeframe=daily; entry=rsi<=30; exit=rsi>=70",
+        nonce_hash="a" * 64,
+        user_id="user-1",
+        spec_version="strategy-execution-spec.v1",
+        spec_hash="b" * 64,
+        client_idempotency_key="retry-key-123456",
+    )
+
+    statements = "\n".join(query for query, _params in connection.queries)
+    assert admission.created is True
+    assert admission.outbox_id is not None
+    assert connection.transaction_count == 1
+    assert "UPDATE app.ai_parse_token" in statements
+    assert "INSERT INTO app.ai_analysis_job" in statements
+    assert "INSERT INTO app.ai_analysis_job_idempotency" in statements
+    assert "INSERT INTO app.ai_analysis_job_outbox" in statements
+    assert "request_text" not in statements
+
+
+def test_outbox_claim_leases_only_queued_jobs_with_skip_locked() -> None:
+    captured: dict[str, object] = {}
+
+    class _Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _ClaimConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return _Transaction()
+
+        def execute(self, query, params=None):
+            captured["query"] = str(query)
+            captured["params"] = params
+            return _Rows([{"outbox_id": "outbox-1", "job_id": "job-1"}])
+
+    repo = PostgresAnalysisJobRepository(
+        "postgresql://example",
+        connector=lambda *_args, **_kwargs: _ClaimConnection(),
+    )
+
+    messages = repo.claim_analysis_job_outbox(limit=3)
+
+    assert [(message.outbox_id, message.job_id) for message in messages] == [("outbox-1", "job-1")]
+    assert captured["params"] == (3,)
+    assert "FOR UPDATE OF outbox SKIP LOCKED" in str(captured["query"])
+    assert "job.job_jsonb ->> 'status' = 'queued'" in str(captured["query"])
+
+
+def test_admission_rereads_idempotency_after_a_concurrent_nonce_consume() -> None:
+    """The losing concurrent retry returns the winner instead of a misleading replay."""
+
+    winner = InMemoryAnalysisJobStore().create_job("canonical execution query", user_id="user-1")
+
+    class _Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _RaceConnection:
+        def __init__(self) -> None:
+            self.idempotency_reads = 0
+            self.queries: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return _Transaction()
+
+        def execute(self, query, _params=None):
+            query = str(query)
+            self.queries.append(query)
+            if "SELECT spec_hash, job_id" in query:
+                self.idempotency_reads += 1
+                if self.idempotency_reads == 1:
+                    return _Rows([])
+                return _Rows([{"spec_hash": "b" * 64, "job_id": winner.job_id}])
+            if "UPDATE app.ai_parse_token" in query:
+                return _Rows([])
+            if "SELECT job_jsonb" in query:
+                return _Rows([{"job_jsonb": _job_document(winner)}])
+            raise AssertionError(f"unexpected write after concurrent winner: {query}")
+
+    connection = _RaceConnection()
+    repo = PostgresAnalysisJobRepository(
+        "postgresql://example",
+        connector=lambda *_args, **_kwargs: connection,
+    )
+
+    admission = repo.admit_parse_bound_job(
+        "canonical execution query",
+        nonce_hash="a" * 64,
+        user_id="user-1",
+        spec_version="strategy-execution-spec.v1",
+        spec_hash="b" * 64,
+        client_idempotency_key="retry-key-123456",
+    )
+
+    assert admission.created is False
+    assert admission.job.job_id == winner.job_id
+    assert connection.idempotency_reads == 2
+    assert not any("INSERT INTO app.ai_analysis_job" in query for query in connection.queries)

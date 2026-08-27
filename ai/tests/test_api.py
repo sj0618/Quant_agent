@@ -174,7 +174,9 @@ def test_release_readiness_rejects_missing_migration_and_contract_drift(monkeypa
             rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
         )
     )
-    assert ready_client.get(READINESS_PATH).status_code == 200
+    ready = ready_client.get(READINESS_PATH)
+    assert ready.status_code == 200
+    assert ready.json()["migration_revision"] == "024_parse_bound_analysis_job_admission"
 
     monkeypatch.setattr("ai_graph.api.SCHEMA_VERSION", "ai-mvp.v0")
     drifted = ready_client.get(READINESS_PATH)

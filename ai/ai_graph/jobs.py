@@ -275,6 +275,89 @@ class AnalysisHistoryReadOnlyError(RuntimeError):
     """Raised when a retired surface tried to add a row to the analysis history."""
 
 
+class ParseBoundAdmissionError(RuntimeError):
+    """A closed failure from the durable parse-token/job admission boundary."""
+
+    def __init__(self, code: Literal["parse_token_unavailable", "idempotency_key_reused"]) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ParseBoundJobAdmission:
+    """The durable job selected for one parse-token/idempotency admission attempt."""
+
+    job: AnalysisJob
+    created: bool
+    outbox_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AnalysisJobOutboxMessage:
+    """One claimed durable dispatch record for a queued analysis job."""
+
+    outbox_id: str
+    job_id: str
+
+
+@runtime_checkable
+class ParseBoundJobAdmissionStore(Protocol):
+    """Contract that binds parse token consumption and job creation to one store."""
+
+    def register_parse_token(
+        self,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        expires_at: datetime,
+    ) -> None:
+        ...
+
+    def admit_parse_bound_job(
+        self,
+        request_text: str,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> ParseBoundJobAdmission:
+        ...
+
+    def find_parse_bound_job(
+        self,
+        *,
+        user_id: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> AnalysisJob | None:
+        """Return an already-admitted retry without consuming its parse token."""
+
+        ...
+
+
+@runtime_checkable
+class AnalysisJobOutboxStore(Protocol):
+    """Transactional-outbox operations used by the single analysis worker process."""
+
+    def claim_analysis_job_outbox(self, *, limit: int = 1) -> list[AnalysisJobOutboxMessage]:
+        ...
+
+    def mark_analysis_job_outbox_delivered(self, outbox_id: str) -> None:
+        ...
+
+    def release_analysis_job_outbox(self, outbox_id: str) -> None:
+        ...
+
+    def has_recoverable_analysis_job_outbox(self, job_id: str) -> bool:
+        """Whether a queued job has a pending or leased durable dispatch record."""
+
+        ...
+
+
 class ReadOnlyAnalysisJobStore:
     """Keeps the analysis history readable while no surface may add to it.
 
@@ -412,6 +495,131 @@ class JobStoreRuntime:
 class InMemoryAnalysisJobStore:
     jobs: dict[str, AnalysisJob] = field(default_factory=dict)
     store_mode: str = MEMORY_JOB_STORE_MODE
+    _parse_tokens: dict[str, tuple[str, str, str, datetime, bool]] = field(default_factory=dict)
+    _parse_idempotency: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    _analysis_job_outbox: dict[str, tuple[str, str, datetime | None]] = field(default_factory=dict)
+    _parse_admission_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def register_parse_token(
+        self,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        expires_at: datetime,
+    ) -> None:
+        with self._parse_admission_lock:
+            self._parse_tokens.setdefault(
+                nonce_hash,
+                (user_id, spec_version, spec_hash, expires_at, False),
+            )
+
+    def admit_parse_bound_job(
+        self,
+        request_text: str,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> ParseBoundJobAdmission:
+        with self._parse_admission_lock:
+            idempotency_key = (user_id, client_idempotency_key)
+            existing = self._parse_idempotency.get(idempotency_key)
+            if existing is not None:
+                existing_hash, existing_job_id = existing
+                if existing_hash != spec_hash:
+                    raise ParseBoundAdmissionError("idempotency_key_reused")
+                job = self.get_job(existing_job_id)
+                if job is None:
+                    raise ParseBoundAdmissionError("parse_token_unavailable")
+                return ParseBoundJobAdmission(job=job, created=False)
+
+            token = self._parse_tokens.get(nonce_hash)
+            now = datetime.now(UTC)
+            if (
+                token is None
+                or token[0] != user_id
+                or token[1] != spec_version
+                or token[2] != spec_hash
+                or token[3] <= now
+                or token[4]
+            ):
+                raise ParseBoundAdmissionError("parse_token_unavailable")
+            self._parse_tokens[nonce_hash] = (*token[:4], True)
+            job = self.create_job(
+                request_text,
+                user_id=user_id,
+                execution_spec_version=spec_version,
+                execution_spec_hash=spec_hash,
+                client_idempotency_key=client_idempotency_key,
+            )
+            self._parse_idempotency[idempotency_key] = (spec_hash, job.job_id)
+            outbox_id = str(uuid4())
+            self._analysis_job_outbox[outbox_id] = (job.job_id, "pending", None)
+            return ParseBoundJobAdmission(job=job, created=True, outbox_id=outbox_id)
+
+    def find_parse_bound_job(
+        self,
+        *,
+        user_id: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> AnalysisJob | None:
+        with self._parse_admission_lock:
+            existing = self._parse_idempotency.get((user_id, client_idempotency_key))
+            if existing is None:
+                return None
+            existing_hash, job_id = existing
+            if existing_hash != spec_hash:
+                raise ParseBoundAdmissionError("idempotency_key_reused")
+            job = self.get_job(job_id)
+            if job is None:
+                raise ParseBoundAdmissionError("parse_token_unavailable")
+            return job
+
+    def claim_analysis_job_outbox(self, *, limit: int = 1) -> list[AnalysisJobOutboxMessage]:
+        """Claim a bounded batch; claimed test messages are lease-recoverable too."""
+
+        if limit < 1:
+            return []
+        now = datetime.now(UTC)
+        lease_cutoff = now.timestamp() - 300
+        claimed: list[AnalysisJobOutboxMessage] = []
+        with self._parse_admission_lock:
+            for outbox_id, (job_id, state, claimed_at) in self._analysis_job_outbox.items():
+                stale_claim = claimed_at is not None and claimed_at.timestamp() < lease_cutoff
+                if state != "pending" and not (state == "claimed" and stale_claim):
+                    continue
+                job = self.get_job(job_id)
+                if job is None or job.status is not AnalysisJobStatus.QUEUED:
+                    continue
+                self._analysis_job_outbox[outbox_id] = (job_id, "claimed", now)
+                claimed.append(AnalysisJobOutboxMessage(outbox_id=outbox_id, job_id=job_id))
+                if len(claimed) >= limit:
+                    break
+        return claimed
+
+    def mark_analysis_job_outbox_delivered(self, outbox_id: str) -> None:
+        with self._parse_admission_lock:
+            record = self._analysis_job_outbox.get(outbox_id)
+            if record is not None and record[1] == "claimed":
+                self._analysis_job_outbox[outbox_id] = (record[0], "delivered", record[2])
+
+    def release_analysis_job_outbox(self, outbox_id: str) -> None:
+        with self._parse_admission_lock:
+            record = self._analysis_job_outbox.get(outbox_id)
+            if record is not None and record[1] == "claimed":
+                self._analysis_job_outbox[outbox_id] = (record[0], "pending", None)
+
+    def has_recoverable_analysis_job_outbox(self, job_id: str) -> bool:
+        with self._parse_admission_lock:
+            return any(
+                candidate_job_id == job_id and state in {"pending", "claimed"}
+                for candidate_job_id, state, _claimed_at in self._analysis_job_outbox.values()
+            )
 
     def create_job(
         self,
@@ -1428,6 +1636,16 @@ def reap_interrupted_jobs(
 
     for job in jobs:
         if job.status not in _REAPABLE_STATUSES or job.owner_incarnation == incarnation:
+            continue
+        # Parse-bound jobs are atomically paired with a durable outbox row.  Unlike a
+        # legacy in-process background task, a QUEUED outbox job has not been lost on
+        # restart: the dispatcher below can still claim it.  Reaping it first would
+        # turn a recoverable request into an irreversible terminal failure.
+        if (
+            job.status is AnalysisJobStatus.QUEUED
+            and isinstance(store, AnalysisJobOutboxStore)
+            and store.has_recoverable_analysis_job_outbox(job.job_id)
+        ):
             continue
         try:
             store.fail_job(

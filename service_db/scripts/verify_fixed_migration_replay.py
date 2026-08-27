@@ -32,6 +32,7 @@ FIXED_MIGRATIONS = (
     "021_ai_analysis_jobs.sql",
     "022_immutable_analysis_results.sql",
     "023_archive_undecodable_analysis_jobs.sql",
+    "024_parse_bound_analysis_job_admission.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 ROLLBACK_RESTORE_MIGRATION = "022_immutable_analysis_results.sql"
@@ -62,7 +63,8 @@ OWNED_RELATIONS = {
         "email_delivery_history", "ai_backtest_request",
         "ai_backtest_replacement_approval", "email_delivery_outbox",
         "ai_account_token", "ai_analysis_job", "ai_analysis_job_legacy",
-        "analysis_result",
+        "analysis_result", "ai_parse_token", "ai_analysis_job_idempotency",
+        "ai_analysis_job_outbox",
     ),
     "i": (
         "idx_users_email", "idx_users_provider_user_id", "idx_strategy_user_created",
@@ -107,6 +109,8 @@ OWNED_RELATIONS = {
         "idx_analysis_result_owner_created", "idx_ai_analysis_job_analysis_result",
         "idx_backtest_run_analysis_result", "idx_ai_backtest_report_analysis_result",
         "idx_strategy_email_report_analysis_result",
+        "idx_ai_parse_token_expiry", "idx_ai_analysis_job_idempotency_job",
+        "idx_ai_analysis_job_outbox_pending", "idx_ai_analysis_job_outbox_claim_lease",
     ),
     "v": ("strategy_report_summary_v", "email_digest_history_v"),
 }
@@ -155,6 +159,18 @@ OWNED_CONSTRAINTS = (
     "fk_strategy_email_report_analysis_result",
     "ai_analysis_job_execution_manifest_v1_check",
     "ai_analysis_job_decodable_document_check",
+    "ck_ai_parse_token_nonce_hash_sha256",
+    "ck_ai_parse_token_spec_hash_sha256",
+    "ck_ai_parse_token_version_not_blank",
+    "ck_ai_parse_token_expiry_after_create",
+    "fk_ai_analysis_job_idempotency_job",
+    "ck_ai_analysis_job_idempotency_spec_hash_sha256",
+    "ck_ai_analysis_job_idempotency_key_not_blank",
+    "fk_ai_analysis_job_outbox_job",
+    "ck_ai_analysis_job_outbox_event_type",
+    "ck_ai_analysis_job_outbox_status",
+    "ck_ai_analysis_job_outbox_payload_object",
+    "uq_ai_analysis_job_outbox_created_event",
 )
 OWNED_TRIGGERS = (
     "trg_email_digest_subscription_limit",

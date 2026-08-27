@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -49,6 +51,23 @@ class FakeRedis:
         if ex is not None:
             self.expirations[key] = ex
 
+    async def eval(self, _script: str, numkeys: int, *args) -> list[int]:
+        """Model the quota script atomically enough to exercise concurrent callers."""
+
+        assert numkeys == 2
+        quota_key, reservation_key, window, quota_limit = args
+        if reservation_key in self.values:
+            return [0, 0]
+        used = self.counters.get(quota_key, 0) + 1
+        self.counters[quota_key] = used
+        if used == 1:
+            self.expirations[quota_key] = int(window)
+        if used > int(quota_limit):
+            return [2, used]
+        self.values[reservation_key] = "1"
+        self.expirations[reservation_key] = int(window)
+        return [1, used]
+
     async def incr(self, key: str) -> int:
         self.counters[key] = self.counters.get(key, 0) + 1
         return self.counters[key]
@@ -68,6 +87,9 @@ class BrokenRedis:
         raise RuntimeError("redis is down")
 
     async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        raise RuntimeError("redis is down")
+
+    async def eval(self, _script: str, numkeys: int, *args) -> list[int]:
         raise RuntimeError("redis is down")
 
 
@@ -174,6 +196,24 @@ def test_requests_over_the_token_quota_are_rejected_with_429() -> None:
     assert third.status_code == 429
     assert third.json()["detail"]["code"] == "account_token_quota_exceeded"
     assert third.headers["Retry-After"] == "60"
+
+
+def test_concurrent_idempotent_bearer_requests_consume_one_quota_unit() -> None:
+    """The Redis reservation makes process-level races charge once, not twice."""
+
+    redis_client = FakeRedis()
+    quota = AccountTokenQuota(redis_client)
+
+    async def consume_once() -> None:
+        await quota.check_and_consume(_token(quota_limit=1), idempotency_key="same-request-key")
+
+    async def consume_concurrently() -> None:
+        await asyncio.gather(consume_once(), consume_once())
+
+    asyncio.run(consume_concurrently())
+
+    assert sum(redis_client.counters.values()) == 1
+    assert len(redis_client.values) == 1
 
 
 @pytest.mark.parametrize(

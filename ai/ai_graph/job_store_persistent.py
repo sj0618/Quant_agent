@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
 from ai_graph.schemas import APIEnvelope, Stage
@@ -8,8 +9,12 @@ from ai_graph.schemas import APIEnvelope, Stage
 from .jobs import (
     PERSISTENT_JOB_STORE_MODE,
     AnalysisJob,
+    AnalysisJobOutboxMessage,
+    AnalysisJobOutboxStore,
     AnalysisJobStatus,
     JobStoreConfigurationError,
+    ParseBoundJobAdmission,
+    ParseBoundJobAdmissionStore,
 )
 
 
@@ -181,6 +186,95 @@ class PersistentAnalysisJobStore:
 
     def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
         return self._repository.list_jobs(limit=limit)
+
+    def register_parse_token(
+        self,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        expires_at: datetime,
+    ) -> None:
+        if not isinstance(self._repository, ParseBoundJobAdmissionStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires parse-bound admission support."
+            )
+        self._repository.register_parse_token(
+            nonce_hash=nonce_hash,
+            user_id=user_id,
+            spec_version=spec_version,
+            spec_hash=spec_hash,
+            expires_at=expires_at,
+        )
+
+    def admit_parse_bound_job(
+        self,
+        request_text: str,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> ParseBoundJobAdmission:
+        if not isinstance(self._repository, ParseBoundJobAdmissionStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires parse-bound admission support."
+            )
+        return self._repository.admit_parse_bound_job(
+            request_text,
+            nonce_hash=nonce_hash,
+            user_id=user_id,
+            spec_version=spec_version,
+            spec_hash=spec_hash,
+            client_idempotency_key=client_idempotency_key,
+        )
+
+    def find_parse_bound_job(
+        self,
+        *,
+        user_id: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> AnalysisJob | None:
+        if not isinstance(self._repository, ParseBoundJobAdmissionStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires parse-bound admission support."
+            )
+        return self._repository.find_parse_bound_job(
+            user_id=user_id,
+            spec_hash=spec_hash,
+            client_idempotency_key=client_idempotency_key,
+        )
+
+    def claim_analysis_job_outbox(self, *, limit: int = 1) -> list[AnalysisJobOutboxMessage]:
+        if not isinstance(self._repository, AnalysisJobOutboxStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires analysis-job outbox support."
+            )
+        return self._repository.claim_analysis_job_outbox(limit=limit)
+
+    def mark_analysis_job_outbox_delivered(self, outbox_id: str) -> None:
+        if not isinstance(self._repository, AnalysisJobOutboxStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires analysis-job outbox support."
+            )
+        self._repository.mark_analysis_job_outbox_delivered(outbox_id)
+
+    def release_analysis_job_outbox(self, outbox_id: str) -> None:
+        if not isinstance(self._repository, AnalysisJobOutboxStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires analysis-job outbox support."
+            )
+        self._repository.release_analysis_job_outbox(outbox_id)
+
+    def has_recoverable_analysis_job_outbox(self, job_id: str) -> bool:
+        if not isinstance(self._repository, AnalysisJobOutboxStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires analysis-job outbox support."
+            )
+        return self._repository.has_recoverable_analysis_job_outbox(job_id)
 
     def list_jobs_for_reconciliation(self, *, limit: int = 500) -> Any:
         """Do not let compatibility history reads weaken restart recovery."""
