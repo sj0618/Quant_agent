@@ -2,9 +2,39 @@ name: Deploy to SSH Server
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+    inputs:
+      evidence_s_ref:
+        description: Immutable GitHub URL for same-SHA S evidence
+        required: true
+        type: string
+      evidence_s_sha:
+        description: Full commit SHA verified by S evidence
+        required: true
+        type: string
+      evidence_r_ref:
+        description: Immutable GitHub URL for same-SHA R evidence
+        required: true
+        type: string
+      evidence_r_sha:
+        description: Full commit SHA verified by R evidence
+        required: true
+        type: string
+      evidence_o_ref:
+        description: Immutable GitHub URL for same-SHA O evidence
+        required: true
+        type: string
+      evidence_o_sha:
+        description: Full commit SHA verified by O evidence
+        required: true
+        type: string
+      evidence_c_ref:
+        description: Immutable GitHub URL for same-SHA C evidence
+        required: true
+        type: string
+      evidence_c_sha:
+        description: Full commit SHA verified by C evidence
+        required: true
+        type: string
 
 concurrency:
   group: quant-agent-deploy
@@ -45,6 +75,20 @@ jobs:
       - name: Install frontend dependencies
         working-directory: fe
         run: npm ci
+
+      - name: Verify same-SHA S/R/O/C release evidence
+        env:
+          RELEASE_TRUST_REVISION: ${{ github.sha }}
+          RELEASE_TRUST_REPOSITORY: ${{ github.repository }}
+          RELEASE_EVIDENCE_S_REF: ${{ inputs.evidence_s_ref }}
+          RELEASE_EVIDENCE_S_SHA: ${{ inputs.evidence_s_sha }}
+          RELEASE_EVIDENCE_R_REF: ${{ inputs.evidence_r_ref }}
+          RELEASE_EVIDENCE_R_SHA: ${{ inputs.evidence_r_sha }}
+          RELEASE_EVIDENCE_O_REF: ${{ inputs.evidence_o_ref }}
+          RELEASE_EVIDENCE_O_SHA: ${{ inputs.evidence_o_sha }}
+          RELEASE_EVIDENCE_C_REF: ${{ inputs.evidence_c_ref }}
+          RELEASE_EVIDENCE_C_SHA: ${{ inputs.evidence_c_sha }}
+        run: node scripts/evaluate-release-trust.mjs --verify-release-evidence
 
       - name: Verify offline release trust
         env:
@@ -232,6 +276,7 @@ jobs:
                   "021_ai_analysis_jobs.sql",
                   "022_immutable_analysis_results.sql",
                   "023_archive_undecodable_analysis_jobs.sql",
+                  "024_parse_bound_analysis_job_admission.sql",
               ):
                   conn.execute(
                       (app_dir / "service_db" / "migrations" / name).read_text(
@@ -416,7 +461,7 @@ jobs:
                 'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
             curl -fsS 'http://127.0.0.1:18001/ai-api/readiness' \
               | "$APP_DIR/ai/.venv/bin/python" -c \
-                'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert payload["migration_revision"] == "022_immutable_analysis_results"; assert payload["ai_contract_version"] == "ai-mvp.v1"; assert all(check["ready"] for check in payload["checks"])'
+                'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert payload["migration_revision"] == "024_parse_bound_analysis_job_admission"; assert payload["ai_contract_version"] == "ai-mvp.v1"; assert all(check["ready"] for check in payload["checks"])'
             wait_for_url "Frontend gateway" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
             frontend_html="$(mktemp "$RUN_DIR/frontend-smoke.XXXXXX")"
             if ! curl -fsS -o "$frontend_html" "http://127.0.0.1:18000/"; then

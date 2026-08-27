@@ -452,6 +452,30 @@ def test_postgres_data_source_broad_screening_uses_screening_candidates() -> Non
     assert frame["as_of_date"] == AS_OF.isoformat()
 
 
+def test_eligibility_provenance_uses_the_immutable_loaded_extract_snapshot() -> None:
+    """A request trace must not stand in for the PostgreSQL EOD/PIT snapshot."""
+
+    class ScreeningDataSource(PostgresPipelineDataSource):
+        def __init__(self, config: DataSourceConfig) -> None:
+            super().__init__(config)
+            self.conn = FakeScreeningConnection()
+
+        def _connect(self) -> FakeScreeningConnection:
+            return self.conn
+
+    source = ScreeningDataSource(DataSourceConfig(database_dsn="postgresql://example"))
+    bundle = source.load("최근 52주 신고가 거래량 150% 종목을 찾아줘", "trace-not-provenance")
+
+    facts = research_runtime_facts_from_bundle(
+        bundle,
+        dsn_configured=True,
+        trace_id="trace-not-provenance",
+    )
+
+    assert facts.snapshot_or_result_id == bundle.metadata["source_manifest"]["snapshot_id"]
+    assert facts.snapshot_or_result_id != "trace-not-provenance"
+
+
 def test_profile_screening_recovers_when_dynamic_sector_view_is_missing(monkeypatch) -> None:
     source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://example"))
     conn = FakeScreeningConnection(sector_view_missing=True)

@@ -1,8 +1,16 @@
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from ai_graph.api import ANALYSIS_JOBS_PATH, create_app
 from ai_graph.jobs import InMemoryAnalysisJobStore
+from ai_graph.schemas import (
+    APIEnvelope,
+    EnvelopeStatus,
+    FailureDiagnostic,
+    StrategyExecutionSpecV1,
+    UserPayload,
+)
 
 pytest_plugins = ("offline_test_environment",)
 pytestmark = pytest.mark.usefixtures("offline_test_environment")
@@ -26,6 +34,9 @@ API_ENVELOPE_FIELDS = {
     "schema_version",
     "user_payload",
     "strategy_spec",
+    "execution_spec",
+    "execution_spec_version",
+    "execution_spec_hash",
     "debug_ref",
     "retryable",
     "semantic_slots",
@@ -122,3 +133,63 @@ def test_public_envelope_keeps_debug_ref_but_excludes_internal_payload() -> None
     assert "internal_payload" not in result
     assert "node_outputs" not in result
     assert "llm_prompts" not in result
+
+
+def _execution_spec() -> StrategyExecutionSpecV1:
+    return StrategyExecutionSpecV1.model_validate(
+        {
+            "market": "KRX",
+            "timeframe": "daily",
+            "entry_conditions": [
+                {"metric": "rsi", "comparator": "lte", "value": 30, "role": "entry"}
+            ],
+            "exit_conditions": [
+                {"metric": "rsi", "comparator": "gte", "value": 70, "role": "exit"}
+            ],
+        }
+    )
+
+
+def _public_envelope(**overrides) -> APIEnvelope:
+    values = {
+        "status": EnvelopeStatus.READY,
+        "trace_id": "contract-trace",
+        "debug_ref": "contract-debug",
+        "retryable": False,
+        "user_payload": UserPayload(headline="완료", message="완료"),
+    }
+    values.update(overrides)
+    return APIEnvelope(**values)
+
+
+def test_public_execution_contract_requires_a_complete_versioned_hash_binding() -> None:
+    spec = _execution_spec()
+    envelope = _public_envelope(
+        execution_spec=spec,
+        execution_spec_version="strategy-execution-spec.v1",
+        execution_spec_hash="a" * 64,
+    )
+
+    assert envelope.execution_spec == spec
+    assert envelope.execution_spec_version == "strategy-execution-spec.v1"
+    assert envelope.execution_spec_hash == "a" * 64
+
+    with pytest.raises(ValidationError, match="execution spec, version, and hash"):
+        _public_envelope(execution_spec=spec)
+
+
+def test_public_terminal_contract_keeps_typed_failure_on_failed_envelopes_only() -> None:
+    diagnostic = FailureDiagnostic(
+        category="infrastructure_failure",
+        subcause="aoai_response_timeout",
+        failure_stage="interpreting",
+        owner="ai_graph",
+        retryable=True,
+        safe_message="응답 시간이 초과되었습니다.",
+    )
+
+    failed = _public_envelope(status=EnvelopeStatus.FAILED, retryable=True, failure_cause=diagnostic)
+    assert failed.failure_cause == diagnostic
+
+    with pytest.raises(ValidationError, match="only failed envelopes"):
+        _public_envelope(failure_cause=diagnostic)

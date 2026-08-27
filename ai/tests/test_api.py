@@ -174,7 +174,9 @@ def test_release_readiness_rejects_missing_migration_and_contract_drift(monkeypa
             rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
         )
     )
-    assert ready_client.get(READINESS_PATH).status_code == 200
+    ready = ready_client.get(READINESS_PATH)
+    assert ready.status_code == 200
+    assert ready.json()["migration_revision"] == "024_parse_bound_analysis_job_admission"
 
     monkeypatch.setattr("ai_graph.api.SCHEMA_VERSION", "ai-mvp.v0")
     drifted = ready_client.get(READINESS_PATH)
@@ -366,27 +368,66 @@ def test_production_refuses_unready_core_execution_before_side_effects(
     assert sink.sessions == ()
 
 
-def test_ready_release_queues_the_core_natural_language_job(
+def test_ready_release_queues_the_parse_bound_core_natural_language_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Release admission enables the core route; it does not require research signing."""
+    """Release admission accepts only a parse-bound natural-language execution spec."""
 
     monkeypatch.setenv("APP_ENV", "production")
     _configure_live_provider(monkeypatch)
+    signer = RuleDraftSigner("test-rule-draft-secret")
     client = TestClient(
         create_app(
             job_store_runtime=_persistent_job_store_runtime(),
             analysis_runner=lambda _query, trace_id: _ready_envelope(trace_id),
             readiness_migration_probe=lambda: True,
-            rule_draft_signer=None,
+            rule_draft_signer=signer,
         )
     )
 
-    response = client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 진입, 70 이상 청산 전략"})
+    parse = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": "RSI 30 이하 진입, RSI 70 이상 청산 전략"},
+    )
+    assert parse.status_code == 200
+    draft = parse.json()
+    response = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={
+            "parse_token": draft["parse_token"],
+            "client_idempotency_key": "32ecc88e-a50d-4b4d-9c5e-573d817b410a",
+            "spec_version": draft["spec_version"],
+            "spec_hash": draft["spec_hash"],
+            "strategy_execution_spec": draft["strategy_execution_spec"],
+        },
+    )
 
     assert response.status_code == 201
     polled = _poll_job(client, response.json()["job_id"])
     assert polled["result"]["status"] == "ready"
+
+
+def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    _configure_live_provider(monkeypatch)
+    client = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    )
+
+    response = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={"query": "RSI 30 이하 진입, RSI 70 이상 청산 전략"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["kind"] == "parse_required"
+    assert response.json()["outcome"]["is_executable"] is True
 
 
 def test_core_execution_keeps_restart_reconciliation_for_prior_process_jobs(

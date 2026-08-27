@@ -45,21 +45,19 @@ class ResearchRequestPreflight:
     def public_guidance(self) -> str:
         if self.reason_code == UNSUPPORTED_SCOPE_REASON:
             return "KRX 상장 종목의 지표·거래량·재무 조건식으로 다시 입력해 주세요."
-        return "보유·계좌·수량·시점·매수·매도 정보 없이 일반적인 조건식으로 다시 입력해 주세요."
+        return "개인 보유·계좌·수량·자동 주문 정보 없이 일반적인 조건식으로 다시 입력해 주세요."
 
 
-_PERSONAL_CONTEXT_TERMS = (
-    "내보유",
-    "내계좌",
-    "내포트폴리오",
-    "나의보유",
-    "나의계좌",
-    "제보유",
-    "제계좌",
-    "나에게맞",
-    "내게맞",
+_PERSONAL_CONTEXT_PATTERNS = (
+    r"(?<![가-힣])내[\s\W_]*(?:보유|계좌|포트폴리오|주식)",
+    r"(?<![가-힣])나의[\s\W_]*(?:보유|계좌|포트폴리오|주식)",
+    r"(?<![가-힣])제[\s\W_]*(?:보유|계좌|포트폴리오|주식)",
+    r"(?<![가-힣])(?:나에게|내게)[\s\W_]*맞",
     "위험성향",
     "투자성향",
+)
+
+_PERSONAL_CONTEXT_TERMS = (
     "myholding",
     "myaccount",
     "myportfolio",
@@ -95,6 +93,13 @@ _ACTION_IMPERATIVE_TERMS = (
     "sellforme",
     "recommendstock",
     "stockrecommendation",
+    "자동주문",
+    "자동매매",
+    "자동거래",
+    "주문실행",
+    "주문넣어",
+    "주문내줘",
+    "거래해줘",
 )
 
 _AMBIGUOUS_RECOMMENDATION_TERMS = (
@@ -151,10 +156,11 @@ def classify_research_request(query: str) -> ResearchRequestPreflight:
     imperative/advisory request or is combined with personal context.
     """
 
-    compact = _compact_query(query)
+    normalized = _normalize_query(query)
+    compact = _compact_query(normalized)
     if not compact:
         return ResearchRequestPreflight(allowed=True)
-    if any(term in compact for term in _PERSONAL_CONTEXT_TERMS):
+    if _contains_personal_context(normalized, compact):
         return ResearchRequestPreflight(False, SCOPE_REFUSAL_REASON)
     if any(term in compact for term in _ACTION_IMPERATIVE_TERMS):
         return ResearchRequestPreflight(False, SCOPE_REFUSAL_REASON)
@@ -168,5 +174,16 @@ def classify_research_request(query: str) -> ResearchRequestPreflight:
 
 
 def _compact_query(query: str) -> str:
-    normalized = unicodedata.normalize("NFKC", str(query)).casefold()
-    return re.sub(r"[\W_]+", "", normalized, flags=re.UNICODE)
+    return re.sub(r"[\W_]+", "", query, flags=re.UNICODE)
+
+
+def _normalize_query(query: str) -> str:
+    return unicodedata.normalize("NFKC", str(query)).casefold()
+
+
+def _contains_personal_context(normalized: str, compact: str) -> bool:
+    """Match personal Korean phrases without treating ``국내 보유`` as ``내 보유``."""
+
+    return any(
+        term in compact for term in _PERSONAL_CONTEXT_TERMS
+    ) or any(re.search(pattern, normalized) for pattern in _PERSONAL_CONTEXT_PATTERNS)

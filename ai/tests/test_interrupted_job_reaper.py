@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -53,6 +55,33 @@ def test_a_queued_job_is_reaped_too() -> None:
     assert job.status is AnalysisJobStatus.QUEUED
 
     assert reap_interrupted_jobs(store, incarnation=OTHER_PROCESS) == [job.job_id]
+
+
+def test_a_queued_parse_bound_outbox_job_survives_restart_reconciliation() -> None:
+    """A durable queued dispatch is recoverable work, not an interrupted worker."""
+
+    store = InMemoryAnalysisJobStore()
+    store.register_parse_token(
+        nonce_hash="a" * 64,
+        user_id="user-1",
+        spec_version="strategy-execution-spec.v1",
+        spec_hash="b" * 64,
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    admission = store.admit_parse_bound_job(
+        "market=KRX; timeframe=daily; entry=rsi<=30; exit=rsi>=70",
+        nonce_hash="a" * 64,
+        user_id="user-1",
+        spec_version="strategy-execution-spec.v1",
+        spec_hash="b" * 64,
+        client_idempotency_key="restart-recovery-key",
+    )
+
+    assert reap_interrupted_jobs(store, incarnation=OTHER_PROCESS) == []
+    recovered = store.get_job(admission.job.job_id)
+    assert recovered is not None
+    assert recovered.status is AnalysisJobStatus.QUEUED
+    assert store.has_recoverable_analysis_job_outbox(admission.job.job_id) is True
 
 
 def test_this_process_does_not_reap_its_own_running_jobs() -> None:

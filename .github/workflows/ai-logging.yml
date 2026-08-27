@@ -60,10 +60,23 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      quota-redis:
+        image: redis:7.2-alpine@sha256:ccd6aa8d45ff3f033d6fa15b8cc1a50579f65c89f38cf9bb607a954c4f2128ed
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
 
     env:
       AI_PROMPT_RETENTION_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5434/ai_prompt_retention_test_ci
       SERVICE_DB_REPLAY_DSN: postgresql://postgres:postgres@127.0.0.1:5433/p0_replay_disposable?application_name=disposable
+      # This test resets only the disposable app schema after the replay artifact is
+      # captured; it is never a deployed or shared data source.
+      AI_PARSE_ADMISSION_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5433/p0_replay_disposable?application_name=parse_admission_ci
+      AI_QUOTA_REDIS_TEST_URL: redis://127.0.0.1:6380/15
       # Admin DSN for the 023 archive replay; the test creates and drops its own
       # scratch database so it never touches the disposable replay database.
       SERVICE_DB_ARCHIVE_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5433/postgres
@@ -121,6 +134,10 @@ jobs:
           path: service_db/artifacts/fixed-migration-replay.json
           if-no-files-found: error
           retention-days: 7
+      - name: Verify parse-bound admission against disposable PostgreSQL
+        run: python -m pytest -q ai/tests/test_parse_bound_postgres_integration.py
+      - name: Verify idempotent bearer quota against disposable Redis
+        run: python -m pytest -q ai/tests/test_token_quota_redis_integration.py
 
       - name: Lint AI logging changes
         run: >-

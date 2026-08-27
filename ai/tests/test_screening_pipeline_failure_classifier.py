@@ -2,18 +2,51 @@ import pytest
 
 from ai_graph.data_sources import PipelineDataUnavailableError
 from ai_graph.jobs import InMemoryAnalysisJobStore, classify_failure
+from ai_graph.llm import LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
 from ai_graph.schemas import APIEnvelope
 
 
-def test_connection_timeout_maps_to_safe_failure_bucket() -> None:
+def test_untyped_connection_message_does_not_claim_a_database_timeout() -> None:
     diagnostic = classify_failure(ConnectionError("connection timeout expired: secret DSN details"), stage="data_collect")
 
-    assert diagnostic.category == "infrastructure_failure"
-    assert diagnostic.subcause == "db_connect_timeout"
-    assert diagnostic.owner == "data_source_config"
+    assert diagnostic.category == "unknown_failure"
+    assert diagnostic.subcause == "unknown"
+    assert diagnostic.owner == "unknown"
     assert diagnostic.retryable is True
     assert "secret" not in diagnostic.safe_message.lower()
     assert "dsn" not in diagnostic.safe_message.lower()
+
+
+@pytest.mark.parametrize(
+    ("failure", "subcause", "retryable"),
+    [
+        (LLMTimeoutError("private provider detail"), "aoai_response_timeout", True),
+        (LLMConnectionError("private provider detail"), "aoai_connection_error", True),
+        (LLMHTTPStatusError(429), "aoai_http_4xx", True),
+        (LLMHTTPStatusError(400), "aoai_http_4xx", False),
+        (LLMHTTPStatusError(503), "aoai_http_5xx", True),
+    ],
+)
+def test_typed_provider_failures_preserve_safe_subcause(
+    failure: Exception, subcause: str, retryable: bool
+) -> None:
+    diagnostic = classify_failure(failure, stage="analyzing")
+
+    assert diagnostic.category == "infrastructure_failure"
+    assert diagnostic.subcause == subcause
+    assert diagnostic.failure_stage == "analyzing"
+    assert diagnostic.retryable is retryable
+    assert "private" not in diagnostic.safe_message
+
+
+def test_runtime_error_with_contract_words_is_not_misclassified_as_a_schema_failure() -> None:
+    diagnostic = classify_failure(
+        RuntimeError("upstream mentioned validation, schema, and contract in an unrelated message"),
+        stage="analyzing",
+    )
+
+    assert diagnostic.category == "unknown_failure"
+    assert diagnostic.subcause == "unknown"
 
 
 def test_empty_screen_is_a_data_gap_answer_not_an_unknown_crash() -> None:
@@ -102,7 +135,10 @@ def test_run_job_sync_uses_safe_failed_envelope_instead_of_raw_exception() -> No
     assert failed.result is not None
     assert failed.result.status == "failed"
     assert failed.result.failure_cause is not None
-    assert failed.result.failure_cause.subcause == "db_connect_timeout"
+    # A raw message is not an admissible data-source diagnostic. The data adapter must
+    # raise its typed cause rather than letting an arbitrary provider string pretend to
+    # be a database timeout.
+    assert failed.result.failure_cause.subcause == "unknown"
     assert "raw host" not in failed.result.user_payload.message
 
 

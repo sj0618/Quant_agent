@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # pyright: reportUnannotatedClassAttribute=false, reportUnusedFunction=false
 import asyncio
+import hashlib
 import json
 import logging
 import secrets
@@ -9,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from os import environ
+from threading import Lock
 from typing import ClassVar, Literal
 
 from fastapi import (
@@ -54,10 +56,15 @@ from ai_graph.jobs import (
     AI_JOB_STORE_ENV,
     PERSISTENT_JOB_STORE_MODE,
     AnalysisJob,
+    AnalysisJobOutboxStore,
     AnalysisJobStore,
+    AnalysisJobStatus,
     AnalysisRunner,
     CancellationRegistry,
+    JobStoreConfigurationError,
     JobStoreRuntime,
+    ParseBoundAdmissionError,
+    ParseBoundJobAdmissionStore,
     create_analysis_job_store_from_env,
     reap_interrupted_jobs,
     run_job_sync,
@@ -79,9 +86,13 @@ from ai_graph.research_contract import (
     ResearchJobAcceptedV1,
     ResearchResultV1,
     RuleDraftSigner,
+    RuleDraftV1,
+    STRATEGY_EXECUTION_SPEC_VERSION,
+    StrategyExecutionSpecV1,
     ScopeRefusalV1,
     UnsupportedScopeV1,
     build_rule_draft,
+    canonical_rule_digest,
     canonical_rule_execution_query,
     unavailable_result_for_unverified_job,
 )
@@ -142,8 +153,7 @@ DATA_EVIDENCE_PROBE_PATH = "/_operator/research-data-evidence"
 DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
 READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
 REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
-ANALYSIS_JOBS_MIGRATION_REVISION = "021_ai_analysis_jobs"
-IMMUTABLE_RESULTS_MIGRATION_REVISION = "022_immutable_analysis_results"
+ANALYSIS_JOBS_MIGRATION_REVISION = "024_parse_bound_analysis_job_admission"
 AI_LLM_PROVIDER_ENV = "AI_LLM_PROVIDER"
 AI_AOAI_RESPONSES_URL_ENV = "AI_AOAI_RESPONSES_URL"
 AI_AOAI_API_KEY_ENV = "AI_AOAI_API_KEY"
@@ -151,21 +161,120 @@ AI_AOAI_MODEL_ENV = "AI_AOAI_MODEL"
 
 
 class CreateAnalysisJobRequest(BaseModel):
+    """Admission request for the primary strategy workflow.
+
+    The ``query`` member is retained temporarily for old web bundles. Current clients
+    must submit the parse-bound execution contract.  The route still runs legacy text
+    through the preflight guard, but production activation will move it to a typed
+    parse-required response once the durable token ledger is deployed.
+    """
+
     model_config: ClassVar[ConfigDict] = ConfigDict(
         extra="forbid",
         json_schema_extra={
             "examples": [
                 {
-                    "query": (
-                        "KRX 상장 종목 중 RSI가 30 이하이고 거래량이 "
-                        "20일 평균보다 큰 조건을 검토해 주세요."
-                    )
+                    "parse_token": "opaque parse token from /api/strategies/parse",
+                    "client_idempotency_key": "7f4253d4-e89f-42c4-9c59-2bc35672de67",
+                    "spec_version": STRATEGY_EXECUTION_SPEC_VERSION,
+                    "spec_hash": "a" * 64,
+                    "strategy_execution_spec": {
+                        "market": "KRX",
+                        "timeframe": "daily",
+                        "entry_conditions": [
+                            {"metric": "rsi", "comparator": "lte", "value": 30, "role": "entry"}
+                        ],
+                        "exit_conditions": [
+                            {"metric": "rsi", "comparator": "gte", "value": 70, "role": "exit"}
+                        ],
+                    },
                 }
             ]
         },
     )
 
-    query: str = Field(min_length=1)
+    query: str | None = Field(default=None, min_length=1)
+    parse_token: str | None = Field(default=None, min_length=32)
+    client_idempotency_key: str | None = Field(default=None, min_length=16, max_length=200)
+    spec_version: Literal[STRATEGY_EXECUTION_SPEC_VERSION] | None = None
+    spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    strategy_execution_spec: StrategyExecutionSpecV1 | None = None
+
+    @model_validator(mode="after")
+    def require_one_admission_shape(self) -> CreateAnalysisJobRequest:
+        parsed_values = (
+            self.parse_token,
+            self.client_idempotency_key,
+            self.spec_version,
+            self.spec_hash,
+            self.strategy_execution_spec,
+        )
+        has_parsed_contract = all(value is not None for value in parsed_values)
+        has_partial_contract = any(value is not None for value in parsed_values)
+        if has_parsed_contract and self.query is None:
+            return self
+        if self.query is not None and not has_partial_contract:
+            return self
+        raise ValueError("provide either query or a complete parse-bound execution contract")
+
+    @property
+    def is_parse_bound(self) -> bool:
+        return self.strategy_execution_spec is not None
+
+
+class CoreJobIdempotencyConflictV1(BaseModel):
+    """Safe response for a client key reused with a different execution spec."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    kind: Literal["idempotency_conflict"] = "idempotency_conflict"
+    reason_code: Literal["idempotency_key_reused", "idempotency_in_progress"]
+    explanation: str = Field(min_length=1)
+
+
+class LegacyParseRequiredV1(BaseModel):
+    """Safe migration response for a raw-query client that needs to call parse first."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    kind: Literal["parse_required"] = "parse_required"
+    explanation: str = Field(min_length=1)
+    outcome: RuleDraftV1
+
+
+class _CoreJobIdempotencyRegistry:
+    """Process-local retry fence for the current single-process job runtime.
+
+    The durable cross-process version is intentionally not faked here: it belongs in
+    the PostgreSQL parse-token/job/outbox transaction.  This fence still prevents the
+    common browser retry from creating a second paid job in this process.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._requests: dict[tuple[str, str], tuple[str, str | None]] = {}
+
+    def begin(self, *, user_id: str, key: str, spec_hash: str) -> tuple[str, str | None]:
+        request_key = (user_id, key)
+        with self._lock:
+            existing = self._requests.get(request_key)
+            if existing is None:
+                self._requests[request_key] = (spec_hash, None)
+                return "new", None
+            existing_hash, job_id = existing
+            if existing_hash != spec_hash:
+                return "conflict", None
+            return ("existing", job_id) if job_id is not None else ("pending", None)
+
+    def complete(self, *, user_id: str, key: str, spec_hash: str, job_id: str) -> None:
+        with self._lock:
+            if self._requests.get((user_id, key)) == (spec_hash, None):
+                self._requests[(user_id, key)] = (spec_hash, job_id)
+
+    def discard(self, *, user_id: str, key: str, spec_hash: str) -> None:
+        with self._lock:
+            if self._requests.get((user_id, key)) == (spec_hash, None):
+                del self._requests[(user_id, key)]
 
 
 class ConfirmedResearchExecutionRequest(BaseModel):
@@ -267,6 +376,40 @@ def _draft_conflict_response(code: str) -> JSONResponse:
     )
 
 
+def _parse_nonce_hash(nonce: str) -> str:
+    """Persist a one-way nonce identifier; never persist the signed parse token itself."""
+
+    return hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+
+
+def _idempotency_conflict_response(
+    code: Literal["idempotency_key_reused", "idempotency_in_progress"],
+) -> JSONResponse:
+    response = CoreJobIdempotencyConflictV1(
+        reason_code=code,
+        explanation=(
+            "같은 요청 키가 다른 전략 명세에 사용되었습니다. 새 요청 키로 다시 시도해 주세요."
+            if code == "idempotency_key_reused"
+            else "동일한 전략 요청이 처리 중입니다. 잠시 후 상태를 다시 확인해 주세요."
+        ),
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(),
+    )
+
+
+def _legacy_parse_required_response(outcome: RuleDraftV1) -> JSONResponse:
+    response = LegacyParseRequiredV1(
+        explanation="전략 해석 결과를 확인한 뒤 실행해 주세요.",
+        outcome=outcome,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(mode="json"),
+    )
+
+
 class StrategyDescriptionInput(BaseModel):
     # Ignore retired keys from older frontends during the rolling deploy.
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
@@ -330,7 +473,7 @@ class ReadinessResponse(BaseModel):
 
     status: Literal["ready", "unavailable"]
     contract_version: str = READINESS_CONTRACT_VERSION
-    migration_revision: str = IMMUTABLE_RESULTS_MIGRATION_REVISION
+    migration_revision: str = ANALYSIS_JOBS_MIGRATION_REVISION
     ai_contract_version: str
     checks: list[ReadinessCheck]
 
@@ -450,6 +593,121 @@ def _build_analysis_runner_with_audit(
     return runner
 
 
+async def _dispatch_analysis_job_outbox(
+    store: AnalysisJobStore,
+    *,
+    analysis_runner: AnalysisRunner,
+    audit_sink: AuditSink | None,
+    events: JobEventBuffer,
+    cancellations: CancellationRegistry,
+    max_messages: int = 32,
+) -> None:
+    """Execute only atomically admitted jobs, then settle their dispatch record.
+
+    A process may die after a row is claimed and before the runner starts. Such a
+    claim is lease-recoverable; startup runs this dispatcher after it reconciles old
+    RUNNING jobs. The database selects only QUEUED rows, so a terminal job can never
+    be silently run a second time merely because an outbox acknowledgement was lost.
+    """
+
+    if not isinstance(store, AnalysisJobOutboxStore):
+        return
+    for _ in range(max_messages):
+        try:
+            messages = await run_in_threadpool(store.claim_analysis_job_outbox, limit=1)
+        except JobStoreConfigurationError:
+            _logger.warning("analysis-job outbox is not configured; dispatch is unavailable")
+            return
+        if not messages:
+            return
+        message = messages[0]
+        job = await run_in_threadpool(store.get_job, message.job_id)
+        if job is None:
+            _logger.error(
+                "claimed analysis-job outbox record has no job: outbox_id=%s", message.outbox_id
+            )
+            await run_in_threadpool(store.release_analysis_job_outbox, message.outbox_id)
+            return
+        try:
+            await run_in_threadpool(
+                run_job_sync,
+                store,
+                job.job_id,
+                _build_analysis_runner_with_audit(
+                    analysis_runner,
+                    audit_sink=audit_sink,
+                    trace_id=job.trace_id,
+                    entrypoint="api.analysis_job_outbox",
+                    feature="analysis_job",
+                    user_id=job.user_id,
+                ),
+                events=events,
+                cancellations=cancellations,
+            )
+        except Exception:  # noqa: BLE001 - settle a safe terminal failure; never strand a queued job.
+            _logger.exception(
+                "analysis-job outbox runner escaped before terminal state: outbox_id=%s job_id=%s",
+                message.outbox_id,
+                message.job_id,
+            )
+            # A runner escaping this outer boundary is not a provider retry.  Leaving
+            # the row pending would require a later request or restart to make progress
+            # and can otherwise leave the user on an infinite queued spinner.  Convert
+            # it to the same safe terminal failure contract as `run_job_sync` does for
+            # ordinary runner exceptions, then acknowledge the outbox record.
+            try:
+                escaped_job = await run_in_threadpool(store.get_job, message.job_id)
+                if escaped_job is None:
+                    raise KeyError(message.job_id)
+                if escaped_job.status not in {
+                    AnalysisJobStatus.COMPLETED,
+                    AnalysisJobStatus.FAILED,
+                }:
+                    await run_in_threadpool(
+                        store.fail_job,
+                        message.job_id,
+                        "분석 실행 중 내부 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+                    )
+                await run_in_threadpool(store.mark_analysis_job_outbox_delivered, message.outbox_id)
+            except Exception:  # noqa: BLE001 - a storage outage still needs lease recovery.
+                _logger.exception(
+                    "could not settle escaped analysis-job outbox runner: outbox_id=%s job_id=%s",
+                    message.outbox_id,
+                    message.job_id,
+                )
+                await run_in_threadpool(store.release_analysis_job_outbox, message.outbox_id)
+            return
+
+        terminal_job = await run_in_threadpool(store.get_job, message.job_id)
+        if terminal_job is None or terminal_job.status not in {
+            AnalysisJobStatus.COMPLETED,
+            AnalysisJobStatus.FAILED,
+        }:
+            _logger.error(
+                "analysis-job outbox runner returned without a terminal job: outbox_id=%s job_id=%s",
+                message.outbox_id,
+                message.job_id,
+            )
+            try:
+                if terminal_job is None:
+                    raise KeyError(message.job_id)
+                await run_in_threadpool(
+                    store.fail_job,
+                    message.job_id,
+                    "분석 실행이 완료 상태를 반환하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
+                await run_in_threadpool(store.mark_analysis_job_outbox_delivered, message.outbox_id)
+            except Exception:  # noqa: BLE001 - keep an unavailable store lease-recoverable.
+                _logger.exception(
+                    "could not settle non-terminal analysis-job outbox runner: outbox_id=%s job_id=%s",
+                    message.outbox_id,
+                    message.job_id,
+                )
+                await run_in_threadpool(store.release_analysis_job_outbox, message.outbox_id)
+            return
+        await run_in_threadpool(store.mark_analysis_job_outbox_delivered, message.outbox_id)
+
+
 def _open_request_audit_session(
     audit_sink: AuditSink | None,
     *,
@@ -559,7 +817,29 @@ def create_app(
                 len(reaped),
                 ", ".join(reaped),
             )
-        yield
+        # Startup recovery is deliberately driven from the durable outbox, not from
+        # any old in-process background-task list.  A task only claims queued jobs;
+        # a RUNNING job is settled by the restart reaper above before it can be seen.
+        outbox_task: asyncio.Task[None] | None = None
+        if isinstance(store, AnalysisJobOutboxStore):
+            outbox_task = asyncio.create_task(
+                _dispatch_analysis_job_outbox(
+                    store,
+                    analysis_runner=analysis_runner,
+                    audit_sink=app.state.audit_sink,
+                    events=app.state.job_events,
+                    cancellations=app.state.job_cancellations,
+                )
+            )
+        try:
+            yield
+        finally:
+            if outbox_task is not None and not outbox_task.done():
+                outbox_task.cancel()
+                try:
+                    await outbox_task
+                except asyncio.CancelledError:
+                    pass
 
     app = FastAPI(
         title=API_TITLE,
@@ -585,6 +865,7 @@ def create_app(
     app.state.audit_sink = resolve_audit_sink(audit_sink)
     app.state.rule_draft_signer = rule_draft_signer or RuleDraftSigner.from_env()
     app.state.draft_nonce_registry = draft_nonce_registry or InMemoryDraftNonceRegistry()
+    app.state.core_job_idempotency_registry = _CoreJobIdempotencyRegistry()
     app.state.research_execution_enabled = (
         research_execution_enabled
         if research_execution_enabled is not None
@@ -690,11 +971,13 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
-        if _production_runtime():
+        production_runtime = _production_runtime()
+        if production_runtime:
             readiness = _core_execution_readiness(
                 runtime,
                 migration_probe=migration_probe,
                 provider_ready=_live_provider_configuration_is_ready(),
+                rule_draft_signer=app.state.rule_draft_signer,
             )
             if readiness.status != "ready":
                 raise HTTPException(
@@ -705,26 +988,227 @@ def create_app(
                         "checks": [check.name for check in readiness.checks if not check.ready],
                     },
                 )
-        scope_response = _preflight_rejection_response(await _scope_decision(request.query))
-        if scope_response is not None:
-            return scope_response
-        await require_preflight_user.consume_quota_after_preflight(http_request)
-        job = store.create_job(request.query, user_id=user_id)
-        background_tasks.add_task(
-            run_job_sync,
-            store,
-            job.job_id,
-            _build_analysis_runner_with_audit(
-                analysis_runner,
-                audit_sink=app.state.audit_sink,
-                trace_id=job.trace_id,
-                entrypoint="api.analysis_jobs",
-                feature="analysis_job",
+        if request.is_parse_bound:
+            signer = app.state.rule_draft_signer
+            spec = request.strategy_execution_spec
+            # ``is_parse_bound`` and the request validator make these non-null. Keep
+            # the defensive branch so a future model change cannot turn a malformed
+            # contract into a job creation attempt.
+            if signer is None or spec is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy parse verification is temporarily unavailable.",
+                )
+            if not spec.is_executable:
+                return _draft_conflict_response("draft_rule_mismatch")
+            idempotency_key = request.client_idempotency_key or ""
+            if not (
+                isinstance(store, ParseBoundJobAdmissionStore)
+                and isinstance(store, AnalysisJobOutboxStore)
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                )
+            idempotency_status, existing_job_id = app.state.core_job_idempotency_registry.begin(
                 user_id=user_id,
-            ),
-            events=app.state.job_events,
-            cancellations=app.state.job_cancellations,
-        )
+                key=idempotency_key,
+                spec_hash=request.spec_hash or "",
+            )
+            if idempotency_status == "conflict":
+                return _idempotency_conflict_response("idempotency_key_reused")
+            if idempotency_status == "pending":
+                return _idempotency_conflict_response("idempotency_in_progress")
+            if idempotency_status == "existing":
+                existing_job = store.get_job(existing_job_id or "")
+                if existing_job is not None:
+                    # Retrying is also a harmless recovery nudge if the first
+                    # response was interrupted before its post-response task started.
+                    background_tasks.add_task(
+                        _dispatch_analysis_job_outbox,
+                        store,
+                        analysis_runner=analysis_runner,
+                        audit_sink=app.state.audit_sink,
+                        events=app.state.job_events,
+                        cancellations=app.state.job_cancellations,
+                    )
+                    return existing_job
+                # A stale local record must not turn a retry into a second paid run.
+                # A fresh process uses the durable admission record below instead.
+                return _idempotency_conflict_response("idempotency_in_progress")
+            if request.spec_hash != canonical_rule_digest(spec):
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=idempotency_key,
+                    spec_hash=request.spec_hash or "",
+                )
+                return _draft_conflict_response("draft_rule_mismatch")
+            try:
+                nonce = signer.verify(
+                    token=request.parse_token or "",
+                    rule=spec,
+                    user_id=user_id,
+                )
+            except DraftTokenValidationError as exc:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=idempotency_key,
+                    spec_hash=request.spec_hash or "",
+                )
+                return _draft_conflict_response(exc.code)
+            request_text = canonical_rule_execution_query(spec)
+            entrypoint = "api.analysis_jobs"
+        else:
+            # Compatibility while old frontend bundles drain. It remains preflighted,
+            # but release callers are never allowed to skip parse → spec → token.
+            if request.query is None:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+            scope_response = _preflight_rejection_response(await _scope_decision(request.query))
+            if scope_response is not None:
+                return scope_response
+            if production_runtime:
+                signer = app.state.rule_draft_signer
+                if signer is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Strategy parse verification is temporarily unavailable.",
+                    )
+                outcome = build_rule_draft(
+                    query=request.query,
+                    user_id=user_id,
+                    signer=signer,
+                )
+                return _legacy_parse_required_response(outcome)
+            request_text = request.query
+            entrypoint = "api.analysis_jobs"
+        if request.is_parse_bound:
+            # This lookup deliberately precedes quota consumption.  A process restart
+            # loses the in-memory retry fence, but the durable admission record still
+            # identifies an already accepted client idempotency key.  Retrying that
+            # request must return its original job without spending another provider
+            # allowance.
+            try:
+                existing_durable_job = store.find_parse_bound_job(
+                    user_id=user_id,
+                    spec_hash=request.spec_hash or "",
+                    client_idempotency_key=request.client_idempotency_key or "",
+                )
+            except ParseBoundAdmissionError as exc:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+                if exc.code == "idempotency_key_reused":
+                    return _idempotency_conflict_response("idempotency_key_reused")
+                return _draft_conflict_response("draft_replayed")
+            except JobStoreConfigurationError:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                ) from None
+            if existing_durable_job is not None:
+                app.state.core_job_idempotency_registry.complete(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                    job_id=existing_durable_job.job_id,
+                )
+                background_tasks.add_task(
+                    _dispatch_analysis_job_outbox,
+                    store,
+                    analysis_runner=analysis_runner,
+                    audit_sink=app.state.audit_sink,
+                    events=app.state.job_events,
+                    cancellations=app.state.job_cancellations,
+                )
+                return existing_durable_job
+        job_created = True
+        try:
+            await require_preflight_user.consume_quota_after_preflight(
+                http_request,
+                idempotency_key=(request.client_idempotency_key if request.is_parse_bound else None),
+            )
+            if request.is_parse_bound:
+                admission = store.admit_parse_bound_job(
+                    request_text,
+                    nonce_hash=_parse_nonce_hash(nonce),
+                    user_id=user_id,
+                    spec_version=request.spec_version or "",
+                    spec_hash=request.spec_hash or "",
+                    client_idempotency_key=request.client_idempotency_key or "",
+                )
+                job = admission.job
+                job_created = admission.created
+            else:
+                job = store.create_job(request_text, user_id=user_id)
+        except ParseBoundAdmissionError as exc:
+            app.state.core_job_idempotency_registry.discard(
+                user_id=user_id,
+                key=request.client_idempotency_key or "",
+                spec_hash=request.spec_hash or "",
+            )
+            if exc.code == "idempotency_key_reused":
+                return _idempotency_conflict_response("idempotency_key_reused")
+            return _draft_conflict_response("draft_replayed")
+        except JobStoreConfigurationError:
+            if request.is_parse_bound:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Strategy execution admission is temporarily unavailable.",
+            ) from None
+        except Exception:
+            if request.is_parse_bound:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+            raise
+        if request.is_parse_bound:
+            app.state.core_job_idempotency_registry.complete(
+                user_id=user_id,
+                key=request.client_idempotency_key or "",
+                spec_hash=request.spec_hash or "",
+                job_id=job.job_id,
+            )
+        if request.is_parse_bound:
+            # The dispatch record was written with the job. A replay after a process
+            # restart can safely call this again: claim leasing selects it at most once.
+            background_tasks.add_task(
+                _dispatch_analysis_job_outbox,
+                store,
+                analysis_runner=analysis_runner,
+                audit_sink=app.state.audit_sink,
+                events=app.state.job_events,
+                cancellations=app.state.job_cancellations,
+            )
+        elif job_created:
+            background_tasks.add_task(
+                run_job_sync,
+                store,
+                job.job_id,
+                _build_analysis_runner_with_audit(
+                    analysis_runner,
+                    audit_sink=app.state.audit_sink,
+                    trace_id=job.trace_id,
+                    entrypoint=entrypoint,
+                    feature="analysis_job",
+                    user_id=user_id,
+                ),
+                events=app.state.job_events,
+                cancellations=app.state.job_cancellations,
+            )
         return job
 
     @app.post(
@@ -851,11 +1335,60 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Research rule review is temporarily unavailable.",
             )
-        return build_rule_draft(
+        outcome = build_rule_draft(
             query=request.request_text,
             user_id=user_id,
             signer=signer,
         )
+        if outcome.is_executable:
+            if _production_runtime():
+                readiness = _core_execution_readiness(
+                    runtime,
+                    migration_probe=migration_probe,
+                    provider_ready=_live_provider_configuration_is_ready(),
+                    rule_draft_signer=signer,
+                )
+                if readiness.status != "ready":
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "code": "analysis_execution_unavailable",
+                            "message": "실데이터 전략 분석 실행 준비가 완료되지 않았습니다. 준비가 확인되면 같은 전략을 다시 실행할 수 있습니다.",
+                            "checks": [
+                                check.name for check in readiness.checks if not check.ready
+                            ],
+                        },
+                    )
+            if not (
+                isinstance(store, ParseBoundJobAdmissionStore)
+                and isinstance(store, AnalysisJobOutboxStore)
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                )
+            spec = outcome.strategy_execution_spec
+            parse_token = outcome.parse_token
+            if spec is None or parse_token is None or outcome.spec_hash is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                )
+            nonce = signer.verify(token=parse_token, rule=spec, user_id=user_id)
+            try:
+                store.register_parse_token(
+                    nonce_hash=_parse_nonce_hash(nonce),
+                    user_id=user_id,
+                    spec_version=outcome.spec_version or "",
+                    spec_hash=outcome.spec_hash,
+                    expires_at=outcome.expires_at,
+                )
+            except JobStoreConfigurationError:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                ) from None
+        return outcome
 
     @app.post(
         RESEARCH_JOB_CREATE_PATH,
@@ -1240,11 +1773,14 @@ def _core_execution_readiness(
     *,
     migration_probe: Callable[[], bool],
     provider_ready: bool,
+    rule_draft_signer: RuleDraftSigner | None,
 ) -> ReadinessResponse:
     """Admission checks for the primary natural-language strategy workflow.
 
-    Rule-draft signing is a compatibility feature of the separate research route. It
-    must not prevent the core job endpoint from serving a verified real-data run.
+    The primary route verifies the parse-bound execution token before it creates a
+    durable job, so a release must have the signer that issued that token. This is not
+    a reason to remove the natural-language workflow: the parse endpoint stays public
+    to authenticated users and reports a typed unavailable state until configured.
     """
 
     durable_store_ready = (
@@ -1260,6 +1796,7 @@ def _core_execution_readiness(
         except Exception:  # noqa: BLE001 - public admission must not leak dependency internals.
             migration_ready = False
     contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
+    rule_draft_signer_ready = rule_draft_signer is not None
     checks = [
         ReadinessCheck(
             name="durable_job_store",
@@ -1280,6 +1817,11 @@ def _core_execution_readiness(
             name="ai_contract_version",
             ready=contract_ready,
             reason=None if contract_ready else "ai_contract_version_mismatch",
+        ),
+        ReadinessCheck(
+            name="rule_draft_signer",
+            ready=rule_draft_signer_ready,
+            reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
         ),
     ]
     return ReadinessResponse(
@@ -1356,6 +1898,19 @@ def _analysis_jobs_migration_is_current() -> bool:
                         FROM pg_trigger
                         WHERE tgname = 'trg_analysis_result_immutable'
                           AND tgrelid = 'app.analysis_result'::regclass
+                    ),
+                    to_regclass('app.ai_parse_token') IS NOT NULL,
+                    to_regclass('app.ai_analysis_job_idempotency') IS NOT NULL,
+                    to_regclass('app.ai_analysis_job_outbox') IS NOT NULL,
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_class
+                        WHERE relname = 'idx_ai_analysis_job_outbox_pending'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_class
+                        WHERE relname = 'idx_ai_analysis_job_outbox_claim_lease'
                     )
                 """
             ).fetchone()

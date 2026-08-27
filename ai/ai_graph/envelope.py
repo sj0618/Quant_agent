@@ -6,8 +6,11 @@ from typing import Any
 from ai_graph.schemas import (
     APIEnvelope,
     EnvelopeStatus,
+    FailureDiagnostic,
     FreshnessEvidence,
     InternalPayload,
+    StrategyExecutionSpecV1,
+    StrategySpec,
     UserPayload,
 )
 
@@ -31,7 +34,10 @@ def build_envelope(
     trace_id: str,
     debug_ref: str,
     user_payload: UserPayload | dict[str, Any],
-    strategy_spec: dict[str, Any] | None,
+    strategy_spec: StrategySpec | dict[str, Any] | None,
+    execution_spec: StrategyExecutionSpecV1 | dict[str, Any] | None = None,
+    execution_spec_version: str | None = None,
+    execution_spec_hash: str | None = None,
     retryable: bool,
     semantic_slots: dict[str, Any] | None = None,
     data_requirements: list[dict[str, Any]] | None = None,
@@ -39,7 +45,7 @@ def build_envelope(
     freshness_status: str | None = None,
     freshness_evidence: FreshnessEvidence | dict[str, Any] | None = None,
     proxy_disclosure: dict[str, str] | None = None,
-    failure_cause: dict[str, Any] | None = None,
+    failure_cause: FailureDiagnostic | dict[str, Any] | None = None,
     evidence_refs: list[dict[str, Any]] | None = None,
     rule_provenance: dict[str, Any] | None = None,
 ) -> APIEnvelope:
@@ -53,6 +59,9 @@ def build_envelope(
         trace_id=trace_id,
         user_payload=payload,
         strategy_spec=strategy_spec,
+        execution_spec=execution_spec,
+        execution_spec_version=execution_spec_version,
+        execution_spec_hash=execution_spec_hash,
         debug_ref=debug_ref,
         retryable=retryable,
         semantic_slots=semantic_slots,

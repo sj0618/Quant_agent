@@ -15,7 +15,7 @@ from typing import Any, ClassVar, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.analysis_capacity import (
     ANALYSIS_CAPACITY,
@@ -25,6 +25,7 @@ from ai_graph.analysis_capacity import (
 )
 from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
 from ai_graph.job_events import JobEventBuffer
+from ai_graph.llm import LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
 from ai_graph.progress import (
     AnalysisCancelled,
     AnalysisDeadlineExceeded,
@@ -174,6 +175,14 @@ class AnalysisJob(BaseModel):
     strategy_id: str | None = Field(default=None, exclude=True)
     run_id: str | None = Field(default=None, exclude=True)
     report_id: str | None = Field(default=None, exclude=True)
+    # Parse-bound execution identity is storage-only. It makes a durable job
+    # reproducible without persisting the user's raw natural-language prompt as the
+    # authoritative strategy contract.
+    execution_spec_version: str | None = Field(default=None, exclude=True)
+    execution_spec_hash: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$", exclude=True
+    )
+    client_idempotency_key: str | None = Field(default=None, exclude=True)
     status: AnalysisJobStatus = Field(exclude=True)
     polling_stage: Stage = Field(exclude=True)
     created_at: datetime
@@ -203,6 +212,9 @@ class AnalysisJobStore(Protocol):
         strategy_id: str | None = None,
         run_id: str | None = None,
         fallback_reasons: Sequence[str] | None = None,
+        execution_spec_version: str | None = None,
+        execution_spec_hash: str | None = None,
+        client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         ...
 
@@ -263,6 +275,89 @@ class AnalysisHistoryReadOnlyError(RuntimeError):
     """Raised when a retired surface tried to add a row to the analysis history."""
 
 
+class ParseBoundAdmissionError(RuntimeError):
+    """A closed failure from the durable parse-token/job admission boundary."""
+
+    def __init__(self, code: Literal["parse_token_unavailable", "idempotency_key_reused"]) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ParseBoundJobAdmission:
+    """The durable job selected for one parse-token/idempotency admission attempt."""
+
+    job: AnalysisJob
+    created: bool
+    outbox_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AnalysisJobOutboxMessage:
+    """One claimed durable dispatch record for a queued analysis job."""
+
+    outbox_id: str
+    job_id: str
+
+
+@runtime_checkable
+class ParseBoundJobAdmissionStore(Protocol):
+    """Contract that binds parse token consumption and job creation to one store."""
+
+    def register_parse_token(
+        self,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        expires_at: datetime,
+    ) -> None:
+        ...
+
+    def admit_parse_bound_job(
+        self,
+        request_text: str,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> ParseBoundJobAdmission:
+        ...
+
+    def find_parse_bound_job(
+        self,
+        *,
+        user_id: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> AnalysisJob | None:
+        """Return an already-admitted retry without consuming its parse token."""
+
+        ...
+
+
+@runtime_checkable
+class AnalysisJobOutboxStore(Protocol):
+    """Transactional-outbox operations used by the single analysis worker process."""
+
+    def claim_analysis_job_outbox(self, *, limit: int = 1) -> list[AnalysisJobOutboxMessage]:
+        ...
+
+    def mark_analysis_job_outbox_delivered(self, outbox_id: str) -> None:
+        ...
+
+    def release_analysis_job_outbox(self, outbox_id: str) -> None:
+        ...
+
+    def has_recoverable_analysis_job_outbox(self, job_id: str) -> bool:
+        """Whether a queued job has a pending or leased durable dispatch record."""
+
+        ...
+
+
 class ReadOnlyAnalysisJobStore:
     """Keeps the analysis history readable while no surface may add to it.
 
@@ -292,6 +387,9 @@ class ReadOnlyAnalysisJobStore:
         strategy_id: str | None = None,
         run_id: str | None = None,
         fallback_reasons: Sequence[str] | None = None,
+        execution_spec_version: str | None = None,
+        execution_spec_hash: str | None = None,
+        client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         raise AnalysisHistoryReadOnlyError(
             "analysis history is read-only: no enabled surface may create an analysis job"
@@ -397,6 +495,131 @@ class JobStoreRuntime:
 class InMemoryAnalysisJobStore:
     jobs: dict[str, AnalysisJob] = field(default_factory=dict)
     store_mode: str = MEMORY_JOB_STORE_MODE
+    _parse_tokens: dict[str, tuple[str, str, str, datetime, bool]] = field(default_factory=dict)
+    _parse_idempotency: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    _analysis_job_outbox: dict[str, tuple[str, str, datetime | None]] = field(default_factory=dict)
+    _parse_admission_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def register_parse_token(
+        self,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        expires_at: datetime,
+    ) -> None:
+        with self._parse_admission_lock:
+            self._parse_tokens.setdefault(
+                nonce_hash,
+                (user_id, spec_version, spec_hash, expires_at, False),
+            )
+
+    def admit_parse_bound_job(
+        self,
+        request_text: str,
+        *,
+        nonce_hash: str,
+        user_id: str,
+        spec_version: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> ParseBoundJobAdmission:
+        with self._parse_admission_lock:
+            idempotency_key = (user_id, client_idempotency_key)
+            existing = self._parse_idempotency.get(idempotency_key)
+            if existing is not None:
+                existing_hash, existing_job_id = existing
+                if existing_hash != spec_hash:
+                    raise ParseBoundAdmissionError("idempotency_key_reused")
+                job = self.get_job(existing_job_id)
+                if job is None:
+                    raise ParseBoundAdmissionError("parse_token_unavailable")
+                return ParseBoundJobAdmission(job=job, created=False)
+
+            token = self._parse_tokens.get(nonce_hash)
+            now = datetime.now(UTC)
+            if (
+                token is None
+                or token[0] != user_id
+                or token[1] != spec_version
+                or token[2] != spec_hash
+                or token[3] <= now
+                or token[4]
+            ):
+                raise ParseBoundAdmissionError("parse_token_unavailable")
+            self._parse_tokens[nonce_hash] = (*token[:4], True)
+            job = self.create_job(
+                request_text,
+                user_id=user_id,
+                execution_spec_version=spec_version,
+                execution_spec_hash=spec_hash,
+                client_idempotency_key=client_idempotency_key,
+            )
+            self._parse_idempotency[idempotency_key] = (spec_hash, job.job_id)
+            outbox_id = str(uuid4())
+            self._analysis_job_outbox[outbox_id] = (job.job_id, "pending", None)
+            return ParseBoundJobAdmission(job=job, created=True, outbox_id=outbox_id)
+
+    def find_parse_bound_job(
+        self,
+        *,
+        user_id: str,
+        spec_hash: str,
+        client_idempotency_key: str,
+    ) -> AnalysisJob | None:
+        with self._parse_admission_lock:
+            existing = self._parse_idempotency.get((user_id, client_idempotency_key))
+            if existing is None:
+                return None
+            existing_hash, job_id = existing
+            if existing_hash != spec_hash:
+                raise ParseBoundAdmissionError("idempotency_key_reused")
+            job = self.get_job(job_id)
+            if job is None:
+                raise ParseBoundAdmissionError("parse_token_unavailable")
+            return job
+
+    def claim_analysis_job_outbox(self, *, limit: int = 1) -> list[AnalysisJobOutboxMessage]:
+        """Claim a bounded batch; claimed test messages are lease-recoverable too."""
+
+        if limit < 1:
+            return []
+        now = datetime.now(UTC)
+        lease_cutoff = now.timestamp() - 300
+        claimed: list[AnalysisJobOutboxMessage] = []
+        with self._parse_admission_lock:
+            for outbox_id, (job_id, state, claimed_at) in self._analysis_job_outbox.items():
+                stale_claim = claimed_at is not None and claimed_at.timestamp() < lease_cutoff
+                if state != "pending" and not (state == "claimed" and stale_claim):
+                    continue
+                job = self.get_job(job_id)
+                if job is None or job.status is not AnalysisJobStatus.QUEUED:
+                    continue
+                self._analysis_job_outbox[outbox_id] = (job_id, "claimed", now)
+                claimed.append(AnalysisJobOutboxMessage(outbox_id=outbox_id, job_id=job_id))
+                if len(claimed) >= limit:
+                    break
+        return claimed
+
+    def mark_analysis_job_outbox_delivered(self, outbox_id: str) -> None:
+        with self._parse_admission_lock:
+            record = self._analysis_job_outbox.get(outbox_id)
+            if record is not None and record[1] == "claimed":
+                self._analysis_job_outbox[outbox_id] = (record[0], "delivered", record[2])
+
+    def release_analysis_job_outbox(self, outbox_id: str) -> None:
+        with self._parse_admission_lock:
+            record = self._analysis_job_outbox.get(outbox_id)
+            if record is not None and record[1] == "claimed":
+                self._analysis_job_outbox[outbox_id] = (record[0], "pending", None)
+
+    def has_recoverable_analysis_job_outbox(self, job_id: str) -> bool:
+        with self._parse_admission_lock:
+            return any(
+                candidate_job_id == job_id and state in {"pending", "claimed"}
+                for candidate_job_id, state, _claimed_at in self._analysis_job_outbox.values()
+            )
 
     def create_job(
         self,
@@ -406,6 +629,9 @@ class InMemoryAnalysisJobStore:
         strategy_id: str | None = None,
         run_id: str | None = None,
         fallback_reasons: Sequence[str] | None = None,
+        execution_spec_version: str | None = None,
+        execution_spec_hash: str | None = None,
+        client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         now = datetime.now(UTC)
         job_id = f"job_{uuid4().hex[:12]}"
@@ -417,6 +643,9 @@ class InMemoryAnalysisJobStore:
             user_id=user_id,
             strategy_id=strategy_id,
             run_id=run_id,
+            execution_spec_version=execution_spec_version,
+            execution_spec_hash=execution_spec_hash,
+            client_idempotency_key=client_idempotency_key,
             status=AnalysisJobStatus.QUEUED,
             polling_stage=Stage.INTERPRETING,
             owner_incarnation=PROCESS_INCARNATION,
@@ -1033,6 +1262,45 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             evidence_refs=["failure:aoai_capacity_exhausted"],
         )
     exception_chain = _exception_chain(exc)
+    typed_provider_failure = next(
+        (
+            error
+            for error in exception_chain
+            if isinstance(error, (LLMTimeoutError, LLMConnectionError, LLMHTTPStatusError))
+        ),
+        None,
+    )
+    if isinstance(typed_provider_failure, LLMTimeoutError):
+        return _aoai_failure_diagnostic(
+            subcause="aoai_response_timeout",
+            stage=stage,
+            retryable=True,
+            safe_message="AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    if isinstance(typed_provider_failure, LLMConnectionError):
+        return _aoai_failure_diagnostic(
+            subcause="aoai_connection_error",
+            stage=stage,
+            retryable=True,
+            safe_message="AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    if isinstance(typed_provider_failure, LLMHTTPStatusError):
+        subcause = (
+            "aoai_http_5xx"
+            if typed_provider_failure.status_code >= 500
+            else "aoai_http_4xx"
+            if typed_provider_failure.status_code >= 400
+            else "aoai_http_error"
+        )
+        return _aoai_failure_diagnostic(
+            subcause=subcause,
+            stage=stage,
+            retryable=(
+                typed_provider_failure.status_code >= 500
+                or typed_provider_failure.status_code in {408, 409, 429}
+            ),
+            safe_message="AI 제공자 응답을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+        )
     provider_failure = any(
         type(error).__name__ in {"LLMClientError", "LLMTimeoutError"}
         for error in exception_chain
@@ -1082,22 +1350,6 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
                 retryable=status_code >= 500 or status_code in {408, 409, 429},
                 safe_message="AI 제공자 응답을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
             )
-    # The provider accepted the request and then stopped producing, so retries burned the
-    # budget without a usable answer. Some callers raise LLMTimeoutError directly, with
-    # no httpx cause to inspect, so retain this compatible fallback after the causal
-    # classification above.
-    if provider_failure and "timed out" in str(exc).lower():
-        return FailureDiagnostic(
-            category="infrastructure_failure",
-            subcause="aoai_response_timeout",
-            failure_stage=stage,
-            owner="ai_graph",
-            retryable=True,
-            safe_message=(
-                "AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요."
-            ),
-            evidence_refs=["failure:aoai_response_timeout"],
-        )
     # psycopg raises OutOfMemory for the server's "out of shared memory", which here has
     # only ever meant the lock table filled up: a query touched more partitions than
     # max_locks_per_transaction x max_connections leaves room for. Matched by type name
@@ -1171,36 +1423,7 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             safe_message="운영 데이터 소스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:db_connection_unavailable"],
         )
-    raw = str(exc).lower()
-    if "connection timeout" in raw or "connect timeout" in raw or "connection timed out" in raw:
-        return FailureDiagnostic(
-            category="infrastructure_failure",
-            subcause="db_connect_timeout",
-            failure_stage=stage,
-            owner="data_source_config",
-            retryable=True,
-            safe_message="데이터 소스 연결 시간이 초과되었습니다. 잠시 후 다시 시도하거나 데이터 소스 설정을 확인해 주세요.",
-            evidence_refs=["failure:db_connect_timeout"],
-        )
-    if "statement timeout" in raw or "query timeout" in raw:
-        return FailureDiagnostic(
-            category="infrastructure_failure",
-            subcause="db_statement_timeout",
-            failure_stage=stage,
-            owner="data_source_config",
-            retryable=True,
-            # Deliberately does not tell the user to narrow their conditions. The
-            # timeout that prompted this was our own backtest history query asking for
-            # twenty years of date partitions per indicator table; no wording of the
-            # user's strategy would have changed it, and the advice sent people editing
-            # a request that was never the problem.
-            safe_message=(
-                "데이터 조회가 제한 시간을 넘겨 중단했습니다. "
-                "일시적인 부하일 수 있으니 잠시 후 다시 시도해 주세요."
-            ),
-            evidence_refs=["failure:db_statement_timeout"],
-        )
-    if "validation" in raw or "contract" in raw or "schema" in raw:
+    if isinstance(exc, ValidationError):
         return FailureDiagnostic(
             category="semantic_failure",
             subcause="contract_shape_error",
@@ -1413,6 +1636,16 @@ def reap_interrupted_jobs(
 
     for job in jobs:
         if job.status not in _REAPABLE_STATUSES or job.owner_incarnation == incarnation:
+            continue
+        # Parse-bound jobs are atomically paired with a durable outbox row.  Unlike a
+        # legacy in-process background task, a QUEUED outbox job has not been lost on
+        # restart: the dispatcher below can still claim it.  Reaping it first would
+        # turn a recoverable request into an irreversible terminal failure.
+        if (
+            job.status is AnalysisJobStatus.QUEUED
+            and isinstance(store, AnalysisJobOutboxStore)
+            and store.has_recoverable_analysis_job_outbox(job.job_id)
+        ):
             continue
         try:
             store.fail_job(
