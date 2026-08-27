@@ -23,6 +23,9 @@ class AnalysisJobRepository(Protocol):
         strategy_id: str | None = None,
         run_id: str | None = None,
         fallback_reasons: Sequence[str] | None = None,
+        execution_spec_version: str | None = None,
+        execution_spec_hash: str | None = None,
+        client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         ...
 
@@ -96,13 +99,34 @@ class PersistentAnalysisJobStore:
         strategy_id: str | None = None,
         run_id: str | None = None,
         fallback_reasons: Sequence[str] | None = None,
+        execution_spec_version: str | None = None,
+        execution_spec_hash: str | None = None,
+        client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
+        kwargs: dict[str, object] = {
+            "user_id": user_id,
+            "strategy_id": strategy_id,
+            "run_id": run_id,
+            "fallback_reasons": fallback_reasons,
+        }
+        if any(
+            value is not None
+            for value in (
+                execution_spec_version,
+                execution_spec_hash,
+                client_idempotency_key,
+            )
+        ):
+            kwargs.update(
+                {
+                    "execution_spec_version": execution_spec_version,
+                    "execution_spec_hash": execution_spec_hash,
+                    "client_idempotency_key": client_idempotency_key,
+                }
+            )
         return self._repository.create_job(
             request_text,
-            user_id=user_id,
-            strategy_id=strategy_id,
-            run_id=run_id,
-            fallback_reasons=fallback_reasons,
+            **kwargs,
         )
 
     def get_job(self, job_id: str) -> AnalysisJob | None:

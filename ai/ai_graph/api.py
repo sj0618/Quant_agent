@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from os import environ
+from threading import Lock
 from typing import ClassVar, Literal
 
 from fastapi import (
@@ -79,9 +80,13 @@ from ai_graph.research_contract import (
     ResearchJobAcceptedV1,
     ResearchResultV1,
     RuleDraftSigner,
+    RuleDraftV1,
+    STRATEGY_EXECUTION_SPEC_VERSION,
+    StrategyExecutionSpecV1,
     ScopeRefusalV1,
     UnsupportedScopeV1,
     build_rule_draft,
+    canonical_rule_digest,
     canonical_rule_execution_query,
     unavailable_result_for_unverified_job,
 )
@@ -151,21 +156,120 @@ AI_AOAI_MODEL_ENV = "AI_AOAI_MODEL"
 
 
 class CreateAnalysisJobRequest(BaseModel):
+    """Admission request for the primary strategy workflow.
+
+    The ``query`` member is retained temporarily for old web bundles. Current clients
+    must submit the parse-bound execution contract.  The route still runs legacy text
+    through the preflight guard, but production activation will move it to a typed
+    parse-required response once the durable token ledger is deployed.
+    """
+
     model_config: ClassVar[ConfigDict] = ConfigDict(
         extra="forbid",
         json_schema_extra={
             "examples": [
                 {
-                    "query": (
-                        "KRX 상장 종목 중 RSI가 30 이하이고 거래량이 "
-                        "20일 평균보다 큰 조건을 검토해 주세요."
-                    )
+                    "parse_token": "opaque parse token from /api/strategies/parse",
+                    "client_idempotency_key": "7f4253d4-e89f-42c4-9c59-2bc35672de67",
+                    "spec_version": STRATEGY_EXECUTION_SPEC_VERSION,
+                    "spec_hash": "a" * 64,
+                    "strategy_execution_spec": {
+                        "market": "KRX",
+                        "timeframe": "daily",
+                        "entry_conditions": [
+                            {"metric": "rsi", "comparator": "lte", "value": 30, "role": "entry"}
+                        ],
+                        "exit_conditions": [
+                            {"metric": "rsi", "comparator": "gte", "value": 70, "role": "exit"}
+                        ],
+                    },
                 }
             ]
         },
     )
 
-    query: str = Field(min_length=1)
+    query: str | None = Field(default=None, min_length=1)
+    parse_token: str | None = Field(default=None, min_length=32)
+    client_idempotency_key: str | None = Field(default=None, min_length=16, max_length=200)
+    spec_version: Literal[STRATEGY_EXECUTION_SPEC_VERSION] | None = None
+    spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    strategy_execution_spec: StrategyExecutionSpecV1 | None = None
+
+    @model_validator(mode="after")
+    def require_one_admission_shape(self) -> CreateAnalysisJobRequest:
+        parsed_values = (
+            self.parse_token,
+            self.client_idempotency_key,
+            self.spec_version,
+            self.spec_hash,
+            self.strategy_execution_spec,
+        )
+        has_parsed_contract = all(value is not None for value in parsed_values)
+        has_partial_contract = any(value is not None for value in parsed_values)
+        if has_parsed_contract and self.query is None:
+            return self
+        if self.query is not None and not has_partial_contract:
+            return self
+        raise ValueError("provide either query or a complete parse-bound execution contract")
+
+    @property
+    def is_parse_bound(self) -> bool:
+        return self.strategy_execution_spec is not None
+
+
+class CoreJobIdempotencyConflictV1(BaseModel):
+    """Safe response for a client key reused with a different execution spec."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    kind: Literal["idempotency_conflict"] = "idempotency_conflict"
+    reason_code: Literal["idempotency_key_reused", "idempotency_in_progress"]
+    explanation: str = Field(min_length=1)
+
+
+class LegacyParseRequiredV1(BaseModel):
+    """Safe migration response for a raw-query client that needs to call parse first."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    kind: Literal["parse_required"] = "parse_required"
+    explanation: str = Field(min_length=1)
+    outcome: RuleDraftV1
+
+
+class _CoreJobIdempotencyRegistry:
+    """Process-local retry fence for the current single-process job runtime.
+
+    The durable cross-process version is intentionally not faked here: it belongs in
+    the PostgreSQL parse-token/job/outbox transaction.  This fence still prevents the
+    common browser retry from creating a second paid job in this process.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._requests: dict[tuple[str, str], tuple[str, str | None]] = {}
+
+    def begin(self, *, user_id: str, key: str, spec_hash: str) -> tuple[str, str | None]:
+        request_key = (user_id, key)
+        with self._lock:
+            existing = self._requests.get(request_key)
+            if existing is None:
+                self._requests[request_key] = (spec_hash, None)
+                return "new", None
+            existing_hash, job_id = existing
+            if existing_hash != spec_hash:
+                return "conflict", None
+            return ("existing", job_id) if job_id is not None else ("pending", None)
+
+    def complete(self, *, user_id: str, key: str, spec_hash: str, job_id: str) -> None:
+        with self._lock:
+            if self._requests.get((user_id, key)) == (spec_hash, None):
+                self._requests[(user_id, key)] = (spec_hash, job_id)
+
+    def discard(self, *, user_id: str, key: str, spec_hash: str) -> None:
+        with self._lock:
+            if self._requests.get((user_id, key)) == (spec_hash, None):
+                del self._requests[(user_id, key)]
 
 
 class ConfirmedResearchExecutionRequest(BaseModel):
@@ -264,6 +368,34 @@ def _draft_conflict_response(code: str) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
         content=response.model_dump(),
+    )
+
+
+def _idempotency_conflict_response(
+    code: Literal["idempotency_key_reused", "idempotency_in_progress"],
+) -> JSONResponse:
+    response = CoreJobIdempotencyConflictV1(
+        reason_code=code,
+        explanation=(
+            "같은 요청 키가 다른 전략 명세에 사용되었습니다. 새 요청 키로 다시 시도해 주세요."
+            if code == "idempotency_key_reused"
+            else "동일한 전략 요청이 처리 중입니다. 잠시 후 상태를 다시 확인해 주세요."
+        ),
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(),
+    )
+
+
+def _legacy_parse_required_response(outcome: RuleDraftV1) -> JSONResponse:
+    response = LegacyParseRequiredV1(
+        explanation="전략 해석 결과를 확인한 뒤 실행해 주세요.",
+        outcome=outcome,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(mode="json"),
     )
 
 
@@ -585,6 +717,7 @@ def create_app(
     app.state.audit_sink = resolve_audit_sink(audit_sink)
     app.state.rule_draft_signer = rule_draft_signer or RuleDraftSigner.from_env()
     app.state.draft_nonce_registry = draft_nonce_registry or InMemoryDraftNonceRegistry()
+    app.state.core_job_idempotency_registry = _CoreJobIdempotencyRegistry()
     app.state.research_execution_enabled = (
         research_execution_enabled
         if research_execution_enabled is not None
@@ -690,11 +823,13 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
-        if _production_runtime():
+        production_runtime = _production_runtime()
+        if production_runtime:
             readiness = _core_execution_readiness(
                 runtime,
                 migration_probe=migration_probe,
                 provider_ready=_live_provider_configuration_is_ready(),
+                rule_draft_signer=app.state.rule_draft_signer,
             )
             if readiness.status != "ready":
                 raise HTTPException(
@@ -705,11 +840,115 @@ def create_app(
                         "checks": [check.name for check in readiness.checks if not check.ready],
                     },
                 )
-        scope_response = _preflight_rejection_response(await _scope_decision(request.query))
-        if scope_response is not None:
-            return scope_response
-        await require_preflight_user.consume_quota_after_preflight(http_request)
-        job = store.create_job(request.query, user_id=user_id)
+        if request.is_parse_bound:
+            signer = app.state.rule_draft_signer
+            spec = request.strategy_execution_spec
+            # ``is_parse_bound`` and the request validator make these non-null. Keep
+            # the defensive branch so a future model change cannot turn a malformed
+            # contract into a job creation attempt.
+            if signer is None or spec is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy parse verification is temporarily unavailable.",
+                )
+            if not spec.is_executable:
+                return _draft_conflict_response("draft_rule_mismatch")
+            idempotency_key = request.client_idempotency_key or ""
+            idempotency_status, existing_job_id = app.state.core_job_idempotency_registry.begin(
+                user_id=user_id,
+                key=idempotency_key,
+                spec_hash=request.spec_hash or "",
+            )
+            if idempotency_status == "conflict":
+                return _idempotency_conflict_response("idempotency_key_reused")
+            if idempotency_status == "pending":
+                return _idempotency_conflict_response("idempotency_in_progress")
+            if idempotency_status == "existing":
+                existing_job = store.get_job(existing_job_id or "")
+                if existing_job is not None:
+                    return existing_job
+                # A stale local idempotency record must not turn a retry into a second
+                # paid run. The durable registry migration will replace this branch
+                # with a transactionally persisted read.
+                return _idempotency_conflict_response("idempotency_in_progress")
+            if request.spec_hash != canonical_rule_digest(spec):
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=idempotency_key,
+                    spec_hash=request.spec_hash or "",
+                )
+                return _draft_conflict_response("draft_rule_mismatch")
+            try:
+                nonce = signer.verify(
+                    token=request.parse_token or "",
+                    rule=spec,
+                    user_id=user_id,
+                )
+            except DraftTokenValidationError as exc:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=idempotency_key,
+                    spec_hash=request.spec_hash or "",
+                )
+                return _draft_conflict_response(exc.code)
+            if not app.state.draft_nonce_registry.consume(user_id=user_id, nonce=nonce):
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=idempotency_key,
+                    spec_hash=request.spec_hash or "",
+                )
+                return _draft_conflict_response("draft_replayed")
+            request_text = canonical_rule_execution_query(spec)
+            entrypoint = "api.analysis_jobs"
+        else:
+            # Compatibility while old frontend bundles drain. It remains preflighted,
+            # but release callers are never allowed to skip parse → spec → token.
+            if request.query is None:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+            scope_response = _preflight_rejection_response(await _scope_decision(request.query))
+            if scope_response is not None:
+                return scope_response
+            if production_runtime:
+                signer = app.state.rule_draft_signer
+                if signer is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Strategy parse verification is temporarily unavailable.",
+                    )
+                outcome = build_rule_draft(
+                    query=request.query,
+                    user_id=user_id,
+                    signer=signer,
+                )
+                return _legacy_parse_required_response(outcome)
+            request_text = request.query
+            entrypoint = "api.analysis_jobs"
+        try:
+            await require_preflight_user.consume_quota_after_preflight(http_request)
+            job = store.create_job(
+                request_text,
+                user_id=user_id,
+                execution_spec_version=request.spec_version if request.is_parse_bound else None,
+                execution_spec_hash=request.spec_hash if request.is_parse_bound else None,
+                client_idempotency_key=(
+                    request.client_idempotency_key if request.is_parse_bound else None
+                ),
+            )
+        except Exception:
+            if request.is_parse_bound:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+            raise
+        if request.is_parse_bound:
+            app.state.core_job_idempotency_registry.complete(
+                user_id=user_id,
+                key=request.client_idempotency_key or "",
+                spec_hash=request.spec_hash or "",
+                job_id=job.job_id,
+            )
         background_tasks.add_task(
             run_job_sync,
             store,
@@ -718,7 +957,7 @@ def create_app(
                 analysis_runner,
                 audit_sink=app.state.audit_sink,
                 trace_id=job.trace_id,
-                entrypoint="api.analysis_jobs",
+                entrypoint=entrypoint,
                 feature="analysis_job",
                 user_id=user_id,
             ),
@@ -1240,11 +1479,14 @@ def _core_execution_readiness(
     *,
     migration_probe: Callable[[], bool],
     provider_ready: bool,
+    rule_draft_signer: RuleDraftSigner | None,
 ) -> ReadinessResponse:
     """Admission checks for the primary natural-language strategy workflow.
 
-    Rule-draft signing is a compatibility feature of the separate research route. It
-    must not prevent the core job endpoint from serving a verified real-data run.
+    The primary route verifies the parse-bound execution token before it creates a
+    durable job, so a release must have the signer that issued that token. This is not
+    a reason to remove the natural-language workflow: the parse endpoint stays public
+    to authenticated users and reports a typed unavailable state until configured.
     """
 
     durable_store_ready = (
@@ -1260,6 +1502,7 @@ def _core_execution_readiness(
         except Exception:  # noqa: BLE001 - public admission must not leak dependency internals.
             migration_ready = False
     contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
+    rule_draft_signer_ready = rule_draft_signer is not None
     checks = [
         ReadinessCheck(
             name="durable_job_store",
@@ -1280,6 +1523,11 @@ def _core_execution_readiness(
             name="ai_contract_version",
             ready=contract_ready,
             reason=None if contract_ready else "ai_contract_version_mismatch",
+        ),
+        ReadinessCheck(
+            name="rule_draft_signer",
+            ready=rule_draft_signer_ready,
+            reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
         ),
     ]
     return ReadinessResponse(

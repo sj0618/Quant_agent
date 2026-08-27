@@ -36,6 +36,9 @@ def _job_document(job: AnalysisJob) -> dict[str, Any]:
             "strategy_id": job.strategy_id,
             "run_id": job.run_id,
             "report_id": job.report_id,
+            "execution_spec_version": job.execution_spec_version,
+            "execution_spec_hash": job.execution_spec_hash,
+            "client_idempotency_key": job.client_idempotency_key,
             "status": job.status.value,
             "polling_stage": job.polling_stage.value,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
@@ -64,6 +67,9 @@ class PostgresAnalysisJobRepository:
         strategy_id: str | None = None,
         run_id: str | None = None,
         fallback_reasons: Sequence[str] | None = None,
+        execution_spec_version: str | None = None,
+        execution_spec_hash: str | None = None,
+        client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         job = InMemoryAnalysisJobStore().create_job(
             request_text,
@@ -71,6 +77,9 @@ class PostgresAnalysisJobRepository:
             strategy_id=strategy_id,
             run_id=run_id,
             fallback_reasons=fallback_reasons,
+            execution_spec_version=execution_spec_version,
+            execution_spec_hash=execution_spec_hash,
+            client_idempotency_key=client_idempotency_key,
         )
         self._save(job)
         return job

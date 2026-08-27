@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 import ai_graph.api as api_module
 from ai_graph.api import (
+    ANALYSIS_JOBS_PATH,
     DATA_EVIDENCE_PROBE_PATH,
     DATA_EVIDENCE_PROBE_TOKEN_ENV,
     RESEARCH_JOB_CREATE_PATH,
@@ -71,6 +72,115 @@ def test_parse_returns_rule_review_without_job_quota_or_runner_side_effects() ->
     assert "매수" not in serialized
     assert "매도" not in serialized
     assert "RSI가 30 이하이고" not in serialized
+
+
+def test_parse_executable_outcome_contains_the_versioned_spec_hash_and_bound_token() -> None:
+    calls: list[str] = []
+    client, _store = _client(execution_enabled=False, calls=calls)
+
+    draft = _parse_executable_draft(client)
+
+    assert draft["strategy_execution_spec"] == draft["canonical_rule"]
+    assert draft["spec_version"] == "strategy-execution-spec.v1"
+    assert len(draft["spec_hash"]) == 64
+    assert draft["parse_token"] == draft["draft_token"]
+
+
+def test_primary_analysis_job_accepts_only_the_verified_parse_contract() -> None:
+    calls: list[str] = []
+    client, store = _client(execution_enabled=False, calls=calls)
+    draft = _parse_executable_draft(client)
+
+    response = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={
+            "parse_token": draft["parse_token"],
+            "client_idempotency_key": "32ecc88e-a50d-4b4d-9c5e-573d817b410a",
+            "spec_version": draft["spec_version"],
+            "spec_hash": draft["spec_hash"],
+            "strategy_execution_spec": draft["strategy_execution_spec"],
+        },
+    )
+
+    assert response.status_code == 201
+    assert len(store.jobs) == 1
+    assert len(calls) == 1
+    assert "RSI가 30 이하이고" not in calls[0]
+    stored = store.get_job(response.json()["job_id"])
+    assert stored is not None
+    assert stored.execution_spec_version == draft["spec_version"]
+    assert stored.execution_spec_hash == draft["spec_hash"]
+    assert stored.client_idempotency_key == "32ecc88e-a50d-4b4d-9c5e-573d817b410a"
+
+
+def test_tampered_parse_spec_creates_no_primary_job_or_runner_side_effect() -> None:
+    calls: list[str] = []
+    client, store = _client(execution_enabled=False, calls=calls)
+    draft = _parse_executable_draft(client)
+    tampered = dict(draft["strategy_execution_spec"])
+    tampered["entry_conditions"] = [
+        {"metric": "rsi", "comparator": "lte", "value": 25, "role": "entry"}
+    ]
+
+    response = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={
+            "parse_token": draft["parse_token"],
+            "client_idempotency_key": "32ecc88e-a50d-4b4d-9c5e-573d817b410a",
+            "spec_version": draft["spec_version"],
+            "spec_hash": draft["spec_hash"],
+            "strategy_execution_spec": tampered,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["reason_code"] == "draft_rule_mismatch"
+    assert store.jobs == {}
+    assert calls == []
+
+
+def test_primary_parse_bound_job_retry_returns_the_original_job_without_replaying_token() -> None:
+    calls: list[str] = []
+    client, store = _client(execution_enabled=False, calls=calls)
+    draft = _parse_executable_draft(client)
+    payload = {
+        "parse_token": draft["parse_token"],
+        "client_idempotency_key": "32ecc88e-a50d-4b4d-9c5e-573d817b410a",
+        "spec_version": draft["spec_version"],
+        "spec_hash": draft["spec_hash"],
+        "strategy_execution_spec": draft["strategy_execution_spec"],
+    }
+
+    first = client.post(ANALYSIS_JOBS_PATH, json=payload)
+    retry = client.post(ANALYSIS_JOBS_PATH, json=payload)
+
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert retry.json()["job_id"] == first.json()["job_id"]
+    assert len(store.jobs) == 1
+    assert len(calls) == 1
+
+
+def test_primary_parse_bound_job_rejects_an_idempotency_key_reused_for_another_spec() -> None:
+    calls: list[str] = []
+    client, store = _client(execution_enabled=False, calls=calls)
+    draft = _parse_executable_draft(client)
+    payload = {
+        "parse_token": draft["parse_token"],
+        "client_idempotency_key": "32ecc88e-a50d-4b4d-9c5e-573d817b410a",
+        "spec_version": draft["spec_version"],
+        "spec_hash": draft["spec_hash"],
+        "strategy_execution_spec": draft["strategy_execution_spec"],
+    }
+
+    first = client.post(ANALYSIS_JOBS_PATH, json=payload)
+    conflicting = client.post(ANALYSIS_JOBS_PATH, json={**payload, "spec_hash": "b" * 64})
+
+    assert first.status_code == 201
+    assert conflicting.status_code == 409
+    assert conflicting.json()["reason_code"] == "idempotency_key_reused"
+    assert len(store.jobs) == 1
+    assert len(calls) == 1
 
 
 def test_data_evidence_probe_is_hidden_token_gated_and_has_no_job_side_effects(monkeypatch) -> None:

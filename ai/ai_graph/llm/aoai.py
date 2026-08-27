@@ -9,7 +9,14 @@ from typing import Any
 import httpx
 
 from ai_graph.audit import begin_model_call, finish_model_call
-from ai_graph.llm.base import LLMClientError, LLMJsonRequest, LLMResponseParseError
+from ai_graph.llm.base import (
+    LLMClientError,
+    LLMConnectionError,
+    LLMHTTPStatusError,
+    LLMJsonRequest,
+    LLMResponseParseError,
+    LLMTimeoutError,
+)
 from ai_graph.llm.concurrency_gate import AOAIConcurrencyGate, get_shared_gate
 from ai_graph.progress import report_activity
 
@@ -391,9 +398,7 @@ class AOAIResponsesClient:
                 )
                 retry_count += 1
 
-        raise LLMClientError(
-            "AOAI Responses request failed", retry_count=retry_count
-        ) from last_error
+        raise _typed_provider_failure(last_error, retry_count=retry_count) from last_error
 
     def _observe_provider_capacity(self, response: httpx.Response) -> None:
         """Report what this response says about remaining deployment capacity.
@@ -776,6 +781,24 @@ def _should_retry(exc: Exception) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_STATUS_CODES
     return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+
+
+def _typed_provider_failure(error: Exception | None, *, retry_count: int) -> LLMClientError:
+    """Convert a transport failure into a closed, message-independent cause.
+
+    ``LLMClientError`` used to retain only a generic label and leave callers to parse
+    the chained httpx exception's string. The typed result carries the only public
+    diagnostic we need: timeout, transport, or HTTP status class. HTTP response bodies
+    and endpoint details stay attached solely to the private exception cause.
+    """
+
+    if isinstance(error, httpx.TimeoutException):
+        return LLMTimeoutError("AOAI Responses request failed: timeout", retry_count=retry_count)
+    if isinstance(error, httpx.HTTPStatusError):
+        return LLMHTTPStatusError(error.response.status_code, retry_count=retry_count)
+    if isinstance(error, httpx.TransportError):
+        return LLMConnectionError("AOAI Responses request failed: transport", retry_count=retry_count)
+    return LLMClientError("AOAI Responses request failed", retry_count=retry_count)
 
 
 def _sleep_before_retry(

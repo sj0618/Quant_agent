@@ -15,7 +15,7 @@ from typing import Any, ClassVar, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.analysis_capacity import (
     ANALYSIS_CAPACITY,
@@ -25,6 +25,7 @@ from ai_graph.analysis_capacity import (
 )
 from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
 from ai_graph.job_events import JobEventBuffer
+from ai_graph.llm import LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
 from ai_graph.progress import (
     AnalysisCancelled,
     AnalysisDeadlineExceeded,
@@ -174,6 +175,14 @@ class AnalysisJob(BaseModel):
     strategy_id: str | None = Field(default=None, exclude=True)
     run_id: str | None = Field(default=None, exclude=True)
     report_id: str | None = Field(default=None, exclude=True)
+    # Parse-bound execution identity is storage-only. It makes a durable job
+    # reproducible without persisting the user's raw natural-language prompt as the
+    # authoritative strategy contract.
+    execution_spec_version: str | None = Field(default=None, exclude=True)
+    execution_spec_hash: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$", exclude=True
+    )
+    client_idempotency_key: str | None = Field(default=None, exclude=True)
     status: AnalysisJobStatus = Field(exclude=True)
     polling_stage: Stage = Field(exclude=True)
     created_at: datetime
@@ -203,6 +212,9 @@ class AnalysisJobStore(Protocol):
         strategy_id: str | None = None,
         run_id: str | None = None,
         fallback_reasons: Sequence[str] | None = None,
+        execution_spec_version: str | None = None,
+        execution_spec_hash: str | None = None,
+        client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         ...
 
@@ -292,6 +304,9 @@ class ReadOnlyAnalysisJobStore:
         strategy_id: str | None = None,
         run_id: str | None = None,
         fallback_reasons: Sequence[str] | None = None,
+        execution_spec_version: str | None = None,
+        execution_spec_hash: str | None = None,
+        client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         raise AnalysisHistoryReadOnlyError(
             "analysis history is read-only: no enabled surface may create an analysis job"
@@ -406,6 +421,9 @@ class InMemoryAnalysisJobStore:
         strategy_id: str | None = None,
         run_id: str | None = None,
         fallback_reasons: Sequence[str] | None = None,
+        execution_spec_version: str | None = None,
+        execution_spec_hash: str | None = None,
+        client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         now = datetime.now(UTC)
         job_id = f"job_{uuid4().hex[:12]}"
@@ -417,6 +435,9 @@ class InMemoryAnalysisJobStore:
             user_id=user_id,
             strategy_id=strategy_id,
             run_id=run_id,
+            execution_spec_version=execution_spec_version,
+            execution_spec_hash=execution_spec_hash,
+            client_idempotency_key=client_idempotency_key,
             status=AnalysisJobStatus.QUEUED,
             polling_stage=Stage.INTERPRETING,
             owner_incarnation=PROCESS_INCARNATION,
@@ -1033,6 +1054,45 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             evidence_refs=["failure:aoai_capacity_exhausted"],
         )
     exception_chain = _exception_chain(exc)
+    typed_provider_failure = next(
+        (
+            error
+            for error in exception_chain
+            if isinstance(error, (LLMTimeoutError, LLMConnectionError, LLMHTTPStatusError))
+        ),
+        None,
+    )
+    if isinstance(typed_provider_failure, LLMTimeoutError):
+        return _aoai_failure_diagnostic(
+            subcause="aoai_response_timeout",
+            stage=stage,
+            retryable=True,
+            safe_message="AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    if isinstance(typed_provider_failure, LLMConnectionError):
+        return _aoai_failure_diagnostic(
+            subcause="aoai_connection_error",
+            stage=stage,
+            retryable=True,
+            safe_message="AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    if isinstance(typed_provider_failure, LLMHTTPStatusError):
+        subcause = (
+            "aoai_http_5xx"
+            if typed_provider_failure.status_code >= 500
+            else "aoai_http_4xx"
+            if typed_provider_failure.status_code >= 400
+            else "aoai_http_error"
+        )
+        return _aoai_failure_diagnostic(
+            subcause=subcause,
+            stage=stage,
+            retryable=(
+                typed_provider_failure.status_code >= 500
+                or typed_provider_failure.status_code in {408, 409, 429}
+            ),
+            safe_message="AI 제공자 응답을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+        )
     provider_failure = any(
         type(error).__name__ in {"LLMClientError", "LLMTimeoutError"}
         for error in exception_chain
@@ -1082,22 +1142,6 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
                 retryable=status_code >= 500 or status_code in {408, 409, 429},
                 safe_message="AI 제공자 응답을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
             )
-    # The provider accepted the request and then stopped producing, so retries burned the
-    # budget without a usable answer. Some callers raise LLMTimeoutError directly, with
-    # no httpx cause to inspect, so retain this compatible fallback after the causal
-    # classification above.
-    if provider_failure and "timed out" in str(exc).lower():
-        return FailureDiagnostic(
-            category="infrastructure_failure",
-            subcause="aoai_response_timeout",
-            failure_stage=stage,
-            owner="ai_graph",
-            retryable=True,
-            safe_message=(
-                "AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요."
-            ),
-            evidence_refs=["failure:aoai_response_timeout"],
-        )
     # psycopg raises OutOfMemory for the server's "out of shared memory", which here has
     # only ever meant the lock table filled up: a query touched more partitions than
     # max_locks_per_transaction x max_connections leaves room for. Matched by type name
@@ -1171,36 +1215,7 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             safe_message="운영 데이터 소스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:db_connection_unavailable"],
         )
-    raw = str(exc).lower()
-    if "connection timeout" in raw or "connect timeout" in raw or "connection timed out" in raw:
-        return FailureDiagnostic(
-            category="infrastructure_failure",
-            subcause="db_connect_timeout",
-            failure_stage=stage,
-            owner="data_source_config",
-            retryable=True,
-            safe_message="데이터 소스 연결 시간이 초과되었습니다. 잠시 후 다시 시도하거나 데이터 소스 설정을 확인해 주세요.",
-            evidence_refs=["failure:db_connect_timeout"],
-        )
-    if "statement timeout" in raw or "query timeout" in raw:
-        return FailureDiagnostic(
-            category="infrastructure_failure",
-            subcause="db_statement_timeout",
-            failure_stage=stage,
-            owner="data_source_config",
-            retryable=True,
-            # Deliberately does not tell the user to narrow their conditions. The
-            # timeout that prompted this was our own backtest history query asking for
-            # twenty years of date partitions per indicator table; no wording of the
-            # user's strategy would have changed it, and the advice sent people editing
-            # a request that was never the problem.
-            safe_message=(
-                "데이터 조회가 제한 시간을 넘겨 중단했습니다. "
-                "일시적인 부하일 수 있으니 잠시 후 다시 시도해 주세요."
-            ),
-            evidence_refs=["failure:db_statement_timeout"],
-        )
-    if "validation" in raw or "contract" in raw or "schema" in raw:
+    if isinstance(exc, ValidationError):
         return FailureDiagnostic(
             category="semantic_failure",
             subcause="contract_shape_error",

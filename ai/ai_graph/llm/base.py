@@ -13,6 +13,24 @@ class LLMClientError(RuntimeError):
         self.retry_count = retry_count
 
 
+class LLMTimeoutError(LLMClientError):
+    """The provider did not respond within the configured client budget."""
+
+
+class LLMConnectionError(LLMClientError):
+    """The client could not establish or maintain a provider transport connection."""
+
+
+class LLMHTTPStatusError(LLMClientError):
+    """The provider returned a non-success HTTP status without exposing its body."""
+
+    def __init__(self, status_code: int, *, retry_count: int = 0) -> None:
+        if status_code < 100 or status_code > 599:
+            raise ValueError("status_code must be an HTTP status code")
+        super().__init__("AOAI Responses request failed with an HTTP error", retry_count=retry_count)
+        self.status_code = status_code
+
+
 class LLMProviderConfigError(LLMClientError):
     """Raised when the selected LLM provider is not configured safely."""
 

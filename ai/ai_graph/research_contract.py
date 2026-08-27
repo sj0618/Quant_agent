@@ -25,6 +25,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RULE_DRAFT_SCHEMA_VERSION = "research-rule-draft.v1"
+STRATEGY_EXECUTION_SPEC_VERSION = "strategy-execution-spec.v1"
 RULE_DRAFT_POLICY_HASH = hashlib.sha256(
     b"quantagent-research-only-preflight-v1"
 ).hexdigest()
@@ -71,6 +72,13 @@ class CanonicalRuleV1(BaseModel):
         return bool(self.entry_conditions and self.exit_conditions)
 
 
+# ``CanonicalRuleV1`` was the name exposed by the retired research-only path.  The
+# primary product path now calls the same bounded, versioned object what it is: an
+# execution specification.  Keep the old symbol as a compatibility alias while API
+# clients migrate to the explicit contract name.
+StrategyExecutionSpecV1 = CanonicalRuleV1
+
+
 class ClarificationChoiceV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -93,6 +101,13 @@ class RuleDraftV1(BaseModel):
     policy_hash: str = Field(min_length=64, max_length=64)
     expires_at: datetime
     draft_token: str = Field(min_length=32)
+    # The canonical execution fields are populated only when the parse is executable.
+    # A clarification may show its partial legacy rule summary, but it cannot be sent to
+    # the job endpoint as though it were a validated backtest specification.
+    strategy_execution_spec: StrategyExecutionSpecV1 | None = None
+    spec_version: Literal[STRATEGY_EXECUTION_SPEC_VERSION] | None = None
+    spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    parse_token: str | None = Field(default=None, min_length=32)
 
     @model_validator(mode="after")
     def executable_drafts_are_complete(self) -> RuleDraftV1:
@@ -101,6 +116,24 @@ class RuleDraftV1(BaseModel):
                 raise ValueError("executable drafts require entry and exit conditions")
             if self.clarifications:
                 raise ValueError("executable drafts cannot carry clarification choices")
+            if self.strategy_execution_spec != self.canonical_rule:
+                raise ValueError("executable drafts require a canonical execution spec")
+            if self.spec_version != STRATEGY_EXECUTION_SPEC_VERSION:
+                raise ValueError("executable drafts require the current spec version")
+            if self.spec_hash != canonical_rule_digest(self.canonical_rule):
+                raise ValueError("executable drafts require the canonical spec hash")
+            if self.parse_token != self.draft_token:
+                raise ValueError("executable drafts require the issued parse token")
+        elif any(
+            value is not None
+            for value in (
+                self.strategy_execution_spec,
+                self.spec_version,
+                self.spec_hash,
+                self.parse_token,
+            )
+        ):
+            raise ValueError("clarification drafts must not issue an execution spec or token")
         return self
 
 
@@ -128,6 +161,10 @@ ParseReviewV1 = Annotated[
     RuleDraftV1 | ScopeRefusalV1 | UnsupportedScopeV1,
     Field(discriminator="kind"),
 ]
+
+# The new name makes the parse outcome's three states explicit without breaking older
+# callers that still import ``ParseReviewV1``.
+ParseOutcomeV1 = ParseReviewV1
 
 
 class DraftTokenValidationError(ValueError):
@@ -288,14 +325,19 @@ def build_rule_draft(
     rule = _parse_rsi_rule(query)
     clarifications = _clarifications_for(rule)
     signed = signer.issue(rule=rule, user_id=user_id, now=now)
+    executable = bool(rule and rule.is_executable)
     return RuleDraftV1(
         canonical_rule=rule,
         editable_summary=_editable_summary(rule),
         clarifications=clarifications,
-        is_executable=bool(rule and rule.is_executable),
+        is_executable=executable,
         policy_hash=RULE_DRAFT_POLICY_HASH,
         expires_at=signed.expires_at,
         draft_token=signed.token,
+        strategy_execution_spec=rule if executable else None,
+        spec_version=STRATEGY_EXECUTION_SPEC_VERSION if executable else None,
+        spec_hash=canonical_rule_digest(rule) if executable else None,
+        parse_token=signed.token if executable else None,
     )
 
 

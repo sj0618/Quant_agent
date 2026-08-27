@@ -13,6 +13,33 @@ export class CoreAnalysisApiError extends Error {
   }
 }
 
+interface StrategyExecutionSpecV1 {
+  market: "KRX";
+  timeframe: "daily";
+  entry_conditions: Array<{ metric: "rsi"; comparator: "lte" | "gte"; value: number; role: "entry" }>;
+  exit_conditions: Array<{ metric: "rsi"; comparator: "lte" | "gte"; value: number; role: "exit" }>;
+}
+
+interface RuleDraftOutcome {
+  kind: "rule_draft";
+  editable_summary: string;
+  clarifications: Array<{ label: string; reason: string }>;
+  is_executable: boolean;
+  strategy_execution_spec?: StrategyExecutionSpecV1;
+  spec_version?: "strategy-execution-spec.v1";
+  spec_hash?: string;
+  parse_token?: string;
+}
+
+type ParseOutcome = RuleDraftOutcome | { kind: "scope_refusal" | "unsupported_scope"; explanation: string };
+
+export class StrategyClarificationRequiredError extends Error {
+  constructor(outcome: RuleDraftOutcome) {
+    const choices = outcome.clarifications.map((item) => `- ${item.label}: ${item.reason}`).join("\n");
+    super([outcome.editable_summary, choices].filter(Boolean).join("\n"));
+  }
+}
+
 async function requestCoreAnalysis(path: string, init: RequestInit = {}): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), ANALYSIS_REQUEST_TIMEOUT_MS);
@@ -42,10 +69,35 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
   if (!normalizedQuery) {
     throw new Error("분석할 자연어 전략을 입력하세요.");
   }
+  const parseResponse = await requestCoreAnalysis(AI_ENDPOINTS.researchRuleReview, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ natural_language: normalizedQuery }),
+  });
+  const parsed = await parseResponse.json() as ParseOutcome;
+  if (parsed.kind !== "rule_draft") {
+    throw new Error(parsed.explanation);
+  }
+  if (
+    !parsed.is_executable
+    || !parsed.strategy_execution_spec
+    || !parsed.spec_version
+    || !parsed.spec_hash
+    || !parsed.parse_token
+  ) {
+    throw new StrategyClarificationRequiredError(parsed);
+  }
+
   const response = await requestCoreAnalysis(AI_ENDPOINTS.analysisJobs, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: normalizedQuery }),
+    body: JSON.stringify({
+      parse_token: parsed.parse_token,
+      client_idempotency_key: crypto.randomUUID(),
+      spec_version: parsed.spec_version,
+      spec_hash: parsed.spec_hash,
+      strategy_execution_spec: parsed.strategy_execution_spec,
+    }),
   });
   return response.json() as Promise<AnalysisJob>;
 }
