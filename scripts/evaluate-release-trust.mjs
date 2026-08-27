@@ -9,6 +9,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 export const REPOSITORY_ROOT = resolve(scriptDirectory, "..");
 
+const RELEASE_EVIDENCE_KINDS = ["S", "R", "O", "C"];
+const FULL_GIT_SHA = /^[0-9a-f]{40}$/iu;
+const IMMUTABLE_GITHUB_EVIDENCE =
+  /^(?:actions\/runs\/\d+|commit\/[0-9a-f]{40})(?:[/?#].*)?$/iu;
+const GITHUB_REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
+
 const SENSITIVE_ENVIRONMENT_KEYS = [
   "AI_AOAI_API_KEY",
   "AI_AOAI_ENDPOINT",
@@ -54,6 +60,44 @@ export function createOfflineTestEnvironment(source = process.env) {
   // deliberately unique to this evaluator invocation and is never deployment data.
   environment.AI_BACKTEST_CACHE_DIR = join(tmpdir(), `quantagent-release-trust-${process.pid}`);
   return environment;
+}
+
+/**
+ * A deployment is allowed only when each required evidence lane points at an
+ * immutable GitHub record and names the exact revision being deployed.  The
+ * values are deliberately never printed: evidence references can contain
+ * private workflow details, while the gate's outcome is enough for operators.
+ */
+export function validateReleaseEvidence(environment = process.env) {
+  const revision = environment.RELEASE_TRUST_REVISION?.trim().toLowerCase();
+  const repository = environment.RELEASE_TRUST_REPOSITORY?.trim();
+  if (!revision || !FULL_GIT_SHA.test(revision)) {
+    throw new Error("release evidence gate requires a full target revision SHA");
+  }
+  if (!repository || !GITHUB_REPOSITORY.test(repository)) {
+    throw new Error("release evidence gate requires the trusted GitHub repository");
+  }
+
+  for (const kind of RELEASE_EVIDENCE_KINDS) {
+    const reference = environment[`RELEASE_EVIDENCE_${kind}_REF`]?.trim();
+    const evidenceRevision = environment[`RELEASE_EVIDENCE_${kind}_SHA`]
+      ?.trim()
+      .toLowerCase();
+    const evidencePath = reference?.slice(`https://github.com/${repository}/`.length);
+    if (
+      !reference ||
+      !reference.startsWith(`https://github.com/${repository}/`) ||
+      !evidencePath ||
+      !IMMUTABLE_GITHUB_EVIDENCE.test(evidencePath)
+    ) {
+      throw new Error(`release evidence gate requires an immutable ${kind} evidence reference`);
+    }
+    if (!evidenceRevision || !FULL_GIT_SHA.test(evidenceRevision) || evidenceRevision !== revision) {
+      throw new Error(`release evidence gate requires ${kind} evidence for the target revision`);
+    }
+  }
+
+  return { revision, kinds: [...RELEASE_EVIDENCE_KINDS] };
 }
 
 function createBackendContractEnvironment(source = process.env) {
@@ -204,5 +248,15 @@ export function runReleaseTrust({
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  process.exitCode = runReleaseTrust();
+  if (process.argv.slice(2).includes("--verify-release-evidence")) {
+    try {
+      validateReleaseEvidence();
+      process.stdout.write("[release-trust] same-SHA S/R/O/C evidence gate passed\n");
+    } catch (error) {
+      process.stderr.write(`[release-trust] ${error.message}\n`);
+      process.exitCode = 1;
+    }
+  } else {
+    process.exitCode = runReleaseTrust();
+  }
 }

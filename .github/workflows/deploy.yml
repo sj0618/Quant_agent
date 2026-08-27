@@ -2,9 +2,39 @@ name: Deploy to SSH Server
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+    inputs:
+      evidence_s_ref:
+        description: Immutable GitHub URL for same-SHA S evidence
+        required: true
+        type: string
+      evidence_s_sha:
+        description: Full commit SHA verified by S evidence
+        required: true
+        type: string
+      evidence_r_ref:
+        description: Immutable GitHub URL for same-SHA R evidence
+        required: true
+        type: string
+      evidence_r_sha:
+        description: Full commit SHA verified by R evidence
+        required: true
+        type: string
+      evidence_o_ref:
+        description: Immutable GitHub URL for same-SHA O evidence
+        required: true
+        type: string
+      evidence_o_sha:
+        description: Full commit SHA verified by O evidence
+        required: true
+        type: string
+      evidence_c_ref:
+        description: Immutable GitHub URL for same-SHA C evidence
+        required: true
+        type: string
+      evidence_c_sha:
+        description: Full commit SHA verified by C evidence
+        required: true
+        type: string
 
 concurrency:
   group: quant-agent-deploy
@@ -45,6 +75,20 @@ jobs:
       - name: Install frontend dependencies
         working-directory: fe
         run: npm ci
+
+      - name: Verify same-SHA S/R/O/C release evidence
+        env:
+          RELEASE_TRUST_REVISION: ${{ github.sha }}
+          RELEASE_TRUST_REPOSITORY: ${{ github.repository }}
+          RELEASE_EVIDENCE_S_REF: ${{ inputs.evidence_s_ref }}
+          RELEASE_EVIDENCE_S_SHA: ${{ inputs.evidence_s_sha }}
+          RELEASE_EVIDENCE_R_REF: ${{ inputs.evidence_r_ref }}
+          RELEASE_EVIDENCE_R_SHA: ${{ inputs.evidence_r_sha }}
+          RELEASE_EVIDENCE_O_REF: ${{ inputs.evidence_o_ref }}
+          RELEASE_EVIDENCE_O_SHA: ${{ inputs.evidence_o_sha }}
+          RELEASE_EVIDENCE_C_REF: ${{ inputs.evidence_c_ref }}
+          RELEASE_EVIDENCE_C_SHA: ${{ inputs.evidence_c_sha }}
+        run: node scripts/evaluate-release-trust.mjs --verify-release-evidence
 
       - name: Verify offline release trust
         env:

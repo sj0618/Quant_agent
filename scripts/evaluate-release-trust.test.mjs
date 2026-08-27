@@ -9,6 +9,7 @@ import {
   createOfflineTestEnvironment,
   exitCodeFromResult,
   runReleaseTrust,
+  validateReleaseEvidence,
 } from "./evaluate-release-trust.mjs";
 
 const SAMPLE_CHECKS = [
@@ -35,6 +36,57 @@ test("offline environment removes live settings and forces local test modes", ()
   assert.match(environment.AI_BACKTEST_CACHE_DIR, /quantagent-release-trust-/u);
   assert.notEqual(environment.AI_BACKTEST_CACHE_DIR, "/stale/other-revision-cache");
   assert.equal(environment.KEEP_ME, "yes");
+});
+
+test("release evidence accepts only same-SHA immutable S/R/O/C records", () => {
+  const revision = "a".repeat(40);
+  const environment = {
+    RELEASE_TRUST_REVISION: revision,
+    RELEASE_TRUST_REPOSITORY: "example/quant",
+  };
+  for (const kind of ["S", "R", "O", "C"]) {
+    environment[`RELEASE_EVIDENCE_${kind}_REF`] = `https://github.com/example/quant/actions/runs/12345`;
+    environment[`RELEASE_EVIDENCE_${kind}_SHA`] = revision;
+  }
+
+  assert.deepEqual(validateReleaseEvidence(environment), {
+    revision,
+    kinds: ["S", "R", "O", "C"],
+  });
+});
+
+test("release evidence fails closed for missing, mutable, or mismatched evidence", () => {
+  const revision = "a".repeat(40);
+  const valid = {
+    RELEASE_TRUST_REVISION: revision,
+    RELEASE_TRUST_REPOSITORY: "example/quant",
+  };
+  for (const kind of ["S", "R", "O", "C"]) {
+    valid[`RELEASE_EVIDENCE_${kind}_REF`] = `https://github.com/example/quant/commit/${revision}`;
+    valid[`RELEASE_EVIDENCE_${kind}_SHA`] = revision;
+  }
+
+  assert.throws(() => validateReleaseEvidence({}), /full target revision SHA/u);
+  assert.throws(
+    () => validateReleaseEvidence({ RELEASE_TRUST_REVISION: revision }),
+    /trusted GitHub repository/u
+  );
+  assert.throws(
+    () => validateReleaseEvidence({ ...valid, RELEASE_EVIDENCE_R_REF: "https://example.test/result" }),
+    /immutable R evidence reference/u
+  );
+  assert.throws(
+    () =>
+      validateReleaseEvidence({
+        ...valid,
+        RELEASE_EVIDENCE_C_REF: `https://github.com/other/repo/commit/${revision}`,
+      }),
+    /immutable C evidence reference/u
+  );
+  assert.throws(
+    () => validateReleaseEvidence({ ...valid, RELEASE_EVIDENCE_O_SHA: "b".repeat(40) }),
+    /O evidence for the target revision/u
+  );
 });
 
 test("release trust executes fixed checks with shell disabled and sanitized settings", () => {
