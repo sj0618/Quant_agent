@@ -612,7 +612,7 @@ jobs:
           curl --fail --silent --show-error \
             --connect-timeout 10 --max-time 30 \
             https://qt-agent.kro.kr/ai-api/readiness \
-            | python -c 'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert all(check["ready"] for check in payload["checks"])'
+            | node scripts/readiness-semantic-gate.mjs --label public-ai-readiness
 
       - name: Benchmark internal backtest on two CPU cores
         if: ${{ inputs.mode == 'deployed-backtest' }}

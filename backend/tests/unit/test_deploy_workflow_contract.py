@@ -36,15 +36,29 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
         assert f"RELEASE_EVIDENCE_{kind}_REF" in workflow
         assert f"RELEASE_EVIDENCE_{kind}_SHA" in workflow
     assert "node scripts/evaluate-release-trust.mjs" in workflow
+    assert "Verify pre-deploy readiness" in workflow
+    assert "Create deploy snapshot archive" in workflow
+    assert "Mark deploy mutation started" in workflow
+    assert 'DEPLOY_MUTATION_STARTED=true' in workflow
+    assert "failure() && env.DEPLOY_MUTATION_STARTED == 'true'" in workflow
     assert "http://127.0.0.1:18001/ai-api/readiness" in workflow
-    assert 'payload["status"] == "ready"' in workflow
+    assert 'node scripts/readiness-semantic-gate.mjs --label "$label"' in workflow
+    assert "current-backend-readiness" in workflow
+    assert "current-ai-api-readiness" in workflow
+    assert "No deploy snapshot available to restore" in workflow
+    assert "rollback-applied.marker" in workflow
+    assert "restart_restored_release" in workflow
+    assert 'wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18001/readiness" "rollback-backend-readiness"' in workflow
+    assert 'wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "rollback-ai-api-readiness"' in workflow
     assert '"014_create_report_email_tables.sql"' in workflow
     assert '"022_immutable_analysis_results.sql"' in workflow
     assert workflow.index('"014_create_report_email_tables.sql"') < workflow.index(
         '"022_immutable_analysis_results.sql"'
     )
-    assert 'payload["migration_revision"] == "024_parse_bound_analysis_job_admission"' in workflow
-    assert 'payload["ai_contract_version"] == "ai-mvp.v1"' in workflow
+    assert '"024_parse_bound_analysis_job_admission.sql"' in workflow
+    assert 'REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"' in (
+        REPOSITORY_ROOT / "ai" / "ai_graph" / "api.py"
+    ).read_text(encoding="utf-8")
     assert "AUTH_TRUSTED_PROXY_HEADERS=true" in workflow
     assert "AUTH_TRUSTED_PROXY_HOSTS=127.0.0.1,::1" in workflow
     auth_unset_block = workflow.split("for auth_var in", maxsplit=1)[1].split("do", maxsplit=1)[0]
@@ -59,6 +73,20 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert "npm run preview" not in workflow
     assert "AI_RULE_DRAFT_HMAC_SECRET" in workflow
     assert "ai-rule-draft-hmac.secret" in workflow
+    assert "--exclude='.releases/'" in workflow
+    assert "--exclude='.run/'" in workflow
+    assert "--exclude='.venv/'" in workflow
+    assert "--exclude='venv/'" in workflow
+    assert "--exclude='**/.venv/'" in workflow
+    assert "--exclude='**/venv/'" in workflow
+    assert "--exclude='ai/.venv/'" in workflow
+    assert workflow.index("Verify pre-deploy readiness") < workflow.index(
+        "Create deploy snapshot archive"
+    )
+    assert workflow.index("Create deploy snapshot archive") < workflow.index("Deploy via rsync")
+    assert workflow.index("Deploy via rsync") < workflow.index("Restore deploy snapshot on failure")
+    assert workflow.index("Mark deploy mutation started") < workflow.index("Deploy via rsync")
+    assert workflow.index("Restore deploy snapshot on failure") < workflow.index("restart_restored_release")
 
 
 def test_deploy_ai_audit_replay_applies_every_canonical_migration_in_order():

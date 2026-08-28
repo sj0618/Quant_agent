@@ -130,6 +130,85 @@ jobs:
           ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
             "mkdir -p ~/mvp_sp1/quant-proj"
 
+      - name: Verify pre-deploy readiness
+        run: |
+          set -Eeuo pipefail
+
+          check_readiness() {
+            local label="$1"
+            local url="$2"
+            ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+              "curl -q --fail --silent --show-error --connect-timeout 5 --max-time 15 '$url'" \
+              | node scripts/readiness-semantic-gate.mjs --label "$label"
+          }
+
+          check_readiness "current-backend-readiness" "http://127.0.0.1:18001/readiness"
+          check_readiness "current-ai-api-readiness" "http://127.0.0.1:18001/ai-api/readiness"
+
+      - name: Create deploy snapshot archive
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            bash -s -- "$GITHUB_SHA" <<'REMOTE'
+          set -Eeuo pipefail
+
+          DEPLOYMENT_REVISION="$1"
+          APP_DIR="$HOME/mvp_sp1/quant-proj"
+          RELEASES_DIR="$HOME/mvp_sp1/.releases"
+          SNAPSHOT_DIR="$RELEASES_DIR/$DEPLOYMENT_REVISION"
+          SNAPSHOT_STAGE="$(mktemp -d "$HOME/mvp_sp1/rollback-snapshot-stage.XXXXXX")"
+          SNAPSHOT_ARCHIVE="$SNAPSHOT_DIR/current-release.tar.gz"
+          SNAPSHOT_CHECKSUM="$SNAPSHOT_ARCHIVE.sha256"
+
+          cleanup() {
+            rm -rf "$SNAPSHOT_STAGE"
+          }
+
+          trap cleanup EXIT
+          umask 077
+          mkdir -p "$RELEASES_DIR" "$SNAPSHOT_DIR"
+          chmod 700 "$RELEASES_DIR" "$SNAPSHOT_DIR"
+
+          rsync -a --delete --omit-dir-times --no-perms --no-owner --no-group \
+            --exclude='.git/' \
+            --exclude='node_modules/' \
+            --exclude='DE/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='.releases/' \
+            --exclude='.run/' \
+            --exclude='.venv/' \
+            --exclude='venv/' \
+            --exclude='**/.venv/' \
+            --exclude='**/venv/' \
+            --exclude='ai/.venv/' \
+            --exclude='**/__pycache__/' \
+            --exclude='**/*.pyc' \
+            --exclude='**/logs/' \
+            --exclude='**/.pytest_cache/' \
+            --exclude='**/.ruff_cache/' \
+            --exclude='**/.mypy_cache/' \
+            --exclude='**/.cache/' \
+            "$APP_DIR/" "$SNAPSHOT_STAGE/"
+
+          tar -C "$SNAPSHOT_STAGE" -czf "$SNAPSHOT_ARCHIVE" .
+          sha256="$(sha256sum "$SNAPSHOT_ARCHIVE" | awk '{print $1}')"
+          printf '%s\n' "$sha256" > "$SNAPSHOT_CHECKSUM"
+          chmod 600 "$SNAPSHOT_ARCHIVE" "$SNAPSHOT_CHECKSUM"
+
+          if tar -tzf "$SNAPSHOT_ARCHIVE" | grep -Eq '(^|/)(\.env(\..*)?|\.releases|\.run|\.venv|venv)(/|$)|(^|/)(__pycache__|logs|\.pytest_cache|\.ruff_cache|\.mypy_cache|\.cache)(/|$)|(\.pyc|\.log|\.pid|\.sock)$'; then
+            echo "Snapshot archive contains disallowed entries"
+            exit 1
+          fi
+
+          printf '%s\n' "${SNAPSHOT_ARCHIVE}"
+          printf '%s\n' "${SNAPSHOT_CHECKSUM}"
+          printf '%s\n' "${sha256}"
+          REMOTE
+
+      - name: Mark deploy mutation started
+        run: |
+          echo "DEPLOY_MUTATION_STARTED=true" >> "$GITHUB_ENV"
+
       - name: Deploy via rsync
         run: |
           rsync -rlvvz --delete --stats \
@@ -141,11 +220,17 @@ jobs:
             --exclude='DE/' \
             --exclude='.env' \
             --exclude='.env.*' \
+            --exclude='.releases/' \
+            --exclude='.run/' \
+            --exclude='.venv/' \
+            --exclude='venv/' \
+            --exclude='**/.venv/' \
+            --exclude='**/venv/' \
+            --exclude='ai/.venv/' \
             --exclude='**/__pycache__/' \
             --exclude='**/*.pyc' \
             --exclude='**/logs/' \
             --exclude='**/.pytest_cache/' \
-            --exclude='ai/.venv/' \
             -e "ssh -v -i ~/.ssh/id_rsa -p 30233" \
             ./ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
@@ -213,6 +298,10 @@ jobs:
 
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             RUN_DIR="$APP_DIR/.run"
+            RELEASES_DIR="$HOME/mvp_sp1/.releases"
+            SNAPSHOT_DIR="$RELEASES_DIR/$DEPLOYMENT_REVISION"
+            SNAPSHOT_ARCHIVE="$SNAPSHOT_DIR/current-release.tar.gz"
+            SNAPSHOT_CHECKSUM="$SNAPSHOT_ARCHIVE.sha256"
             mkdir -p "$RUN_DIR"
             SECRET_DIR="$HOME/.config/quantagent"
             mkdir -p "$SECRET_DIR"
@@ -234,6 +323,84 @@ jobs:
               unset "$auth_var"
             done
             export APP_ENV=production
+
+            snapshot_disallowed_regex='(^|/)(\.env(\..*)?|\.releases|\.run|\.venv|venv)(/|$)|(^|/)(__pycache__|logs|\.pytest_cache|\.ruff_cache|\.mypy_cache|\.cache)(/|$)|(\.pyc|\.log|\.pid|\.sock)$'
+
+            validate_snapshot_archive() {
+              local expected_sha256 actual_sha256
+              expected_sha256="$(tr -d '\r\n' < "$SNAPSHOT_CHECKSUM")"
+              actual_sha256="$(sha256sum "$SNAPSHOT_ARCHIVE" | awk '{print $1}')"
+              test "$expected_sha256" = "$actual_sha256"
+              if tar -tzf "$SNAPSHOT_ARCHIVE" | grep -Eq "$snapshot_disallowed_regex"; then
+                echo "Snapshot archive contains disallowed entries"
+                return 1
+              fi
+            }
+
+            restore_deploy_snapshot() {
+              local restore_root
+              restore_root="$(mktemp -d "$HOME/mvp_sp1/rollback-snapshot-restore-stage.XXXXXX")"
+              trap 'rm -rf "$restore_root"' RETURN
+              validate_snapshot_archive
+              tar -xzf "$SNAPSHOT_ARCHIVE" -C "$restore_root"
+              rsync -a --delete --omit-dir-times --no-perms --no-owner --no-group \
+                --exclude='.git/' \
+                --exclude='node_modules/' \
+                --exclude='DE/' \
+                --exclude='.env' \
+                --exclude='.env.*' \
+                --exclude='.releases/' \
+                --exclude='.run/' \
+                --exclude='.venv/' \
+                --exclude='venv/' \
+                --exclude='**/.venv/' \
+                --exclude='**/venv/' \
+                --exclude='ai/.venv/' \
+                --exclude='**/__pycache__/' \
+                --exclude='**/*.pyc' \
+                --exclude='**/logs/' \
+                --exclude='**/.pytest_cache/' \
+                --exclude='**/.ruff_cache/' \
+                --exclude='**/.mypy_cache/' \
+                --exclude='**/.cache/' \
+                "$restore_root/" "$APP_DIR/"
+            }
+
+            wait_for_semantic_readiness() {
+              local label="$1"
+              local url="$2"
+              local checker_label="$3"
+              local body
+              body="$(mktemp "$RUN_DIR/readiness.XXXXXX")"
+              trap 'rm -f "$body"' RETURN
+              for _ in $(seq 1 30); do
+                if curl -fsS -o "$body" "$url" >/dev/null 2>&1; then
+                  if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" < "$body"; then
+                    echo "$label is ready: $url"
+                    return 0
+                  fi
+                fi
+                sleep 2
+              done
+              echo "$label did not become ready: $url"
+              tail -n 80 "$RUN_DIR/combined.log" || true
+              return 1
+            }
+
+            rollback_deploy_release() {
+              local exit_status="$1"
+              trap - ERR
+            echo "Restore deploy snapshot on failure"
+            stop_listeners_on_port 18001
+            stop_listeners_on_port 18000
+            rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
+            restore_deploy_snapshot
+            deploy_release
+            touch "$SNAPSHOT_DIR/rollback-applied.marker"
+            exit "$exit_status"
+          }
+
+            deploy_release() {
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
@@ -450,18 +617,11 @@ jobs:
             }
 
             wait_for_url "Combined backend" "http://127.0.0.1:18001/combined-health" "$RUN_DIR/combined.log"
-            wait_for_url "General backend" "http://127.0.0.1:18001/health" "$RUN_DIR/combined.log"
-            wait_for_url "Backend readiness" "http://127.0.0.1:18001/readiness" "$RUN_DIR/combined.log"
-            wait_for_url "AI API" "http://127.0.0.1:18001/ai-api/health" "$RUN_DIR/combined.log"
-            curl -fsS 'http://127.0.0.1:18001/readiness' \
-              | "$APP_DIR/ai/.venv/bin/python" -c \
-                'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert {check["name"] for check in payload["checks"]} >= {"auth_runtime", "main_db", "trading_data_db", "redis"}; assert all(check["ready"] for check in payload["checks"])'
+            wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18001/readiness" "deployed-backend-readiness"
             curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
               | "$APP_DIR/ai/.venv/bin/python" -c \
                 'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
-            curl -fsS 'http://127.0.0.1:18001/ai-api/readiness' \
-              | "$APP_DIR/ai/.venv/bin/python" -c \
-                'import json,sys; payload=json.load(sys.stdin); assert payload["status"] == "ready"; assert payload["migration_revision"] == "024_parse_bound_analysis_job_admission"; assert payload["ai_contract_version"] == "ai-mvp.v1"; assert all(check["ready"] for check in payload["checks"])'
+            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "deployed-ai-api-readiness"
             wait_for_url "Frontend gateway" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
             frontend_html="$(mktemp "$RUN_DIR/frontend-smoke.XXXXXX")"
             if ! curl -fsS -o "$frontend_html" "http://127.0.0.1:18000/"; then
@@ -500,4 +660,192 @@ jobs:
           assert query["client_id"][0].endswith(".apps.googleusercontent.com")
           PY
             rm -f "$auth_headers" "$auth_body"
+            }
+
+            trap 'rollback_deploy_release $?' ERR
+            deploy_release
+          REMOTE
+
+      - name: Restore deploy snapshot on failure
+        if: failure() && env.DEPLOY_MUTATION_STARTED == 'true'
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            bash -s -- "$GITHUB_SHA" <<'REMOTE'
+          set -Eeuo pipefail
+
+          DEPLOYMENT_REVISION="$1"
+          APP_DIR="$HOME/mvp_sp1/quant-proj"
+          RUN_DIR="$APP_DIR/.run"
+          RELEASES_DIR="$HOME/mvp_sp1/.releases"
+          SNAPSHOT_DIR="$RELEASES_DIR/$DEPLOYMENT_REVISION"
+          SNAPSHOT_ARCHIVE="$SNAPSHOT_DIR/current-release.tar.gz"
+          SNAPSHOT_CHECKSUM="$SNAPSHOT_ARCHIVE.sha256"
+          ROLLBACK_MARKER="$SNAPSHOT_DIR/rollback-applied.marker"
+          snapshot_disallowed_regex='(^|/)(\.env(\..*)?|\.releases|\.run|\.venv|venv)(/|$)|(^|/)(__pycache__|logs|\.pytest_cache|\.ruff_cache|\.mypy_cache|\.cache)(/|$)|(\.pyc|\.log|\.pid|\.sock)$'
+
+          if [ -f "$ROLLBACK_MARKER" ]; then
+            echo "Deploy snapshot rollback already applied"
+            exit 0
+          fi
+
+          if [ ! -s "$SNAPSHOT_ARCHIVE" ] || [ ! -s "$SNAPSHOT_CHECKSUM" ]; then
+            echo "No deploy snapshot available to restore"
+            exit 0
+          fi
+
+          validate_snapshot_archive() {
+            local expected_sha256 actual_sha256
+            expected_sha256="$(tr -d '\r\n' < "$SNAPSHOT_CHECKSUM")"
+            actual_sha256="$(sha256sum "$SNAPSHOT_ARCHIVE" | awk '{print $1}')"
+            test "$expected_sha256" = "$actual_sha256"
+            if tar -tzf "$SNAPSHOT_ARCHIVE" | grep -Eq "$snapshot_disallowed_regex"; then
+              echo "Snapshot archive contains disallowed entries"
+              return 1
+            fi
+          }
+
+          restore_deploy_snapshot() {
+            local restore_root
+            restore_root="$(mktemp -d "$HOME/mvp_sp1/rollback-snapshot-restore-stage.XXXXXX")"
+            trap 'rm -rf "$restore_root"' RETURN
+            validate_snapshot_archive
+            tar -xzf "$SNAPSHOT_ARCHIVE" -C "$restore_root"
+            rsync -a --delete --omit-dir-times --no-perms --no-owner --no-group \
+              --exclude='.git/' \
+              --exclude='node_modules/' \
+              --exclude='DE/' \
+              --exclude='.env' \
+              --exclude='.env.*' \
+              --exclude='.releases/' \
+              --exclude='.run/' \
+              --exclude='.venv/' \
+              --exclude='venv/' \
+              --exclude='**/.venv/' \
+              --exclude='**/venv/' \
+              --exclude='ai/.venv/' \
+              --exclude='**/__pycache__/' \
+              --exclude='**/*.pyc' \
+              --exclude='**/logs/' \
+              --exclude='**/.pytest_cache/' \
+              --exclude='**/.ruff_cache/' \
+              --exclude='**/.mypy_cache/' \
+              --exclude='**/.cache/' \
+              "$restore_root/" "$APP_DIR/"
+          }
+
+          stop_listeners_on_port() {
+            local port="$1"
+
+            find_listener_pids_on_port() {
+              local target_port="$1"
+              ss -H -ltnp "sport = :$target_port" 2>/dev/null \
+                | grep -oE 'pid=[0-9]+' \
+                | cut -d= -f2 \
+                | sort -u \
+                || true
+            }
+
+            for attempt in $(seq 1 5); do
+              local pids
+              pids="$(find_listener_pids_on_port "$port")"
+
+              if [ -z "$pids" ]; then
+                echo "No listener found on port $port"
+                return 0
+              fi
+
+              echo "Stopping listener(s) on port $port, attempt $attempt: $pids"
+              for pid in $pids; do
+                kill "$pid" 2>/dev/null || true
+              done
+
+              for _ in $(seq 1 5); do
+                if [ -z "$(find_listener_pids_on_port "$port")" ]; then
+                  return 0
+                fi
+                sleep 1
+              done
+
+              pids="$(find_listener_pids_on_port "$port")"
+              echo "Force stopping listener(s) on port $port: $pids"
+              for pid in $pids; do
+                kill -9 "$pid" 2>/dev/null || true
+              done
+              sleep 1
+            done
+
+            echo "Port $port is still occupied after stop attempts"
+            ss -H -ltnp "sport = :$port" 2>/dev/null || true
+            return 1
+          }
+
+          wait_for_url() {
+            local name="$1"
+            local url="$2"
+            local log_file="$3"
+            for _ in $(seq 1 30); do
+              if curl -fsS "$url" >/dev/null 2>&1; then
+                echo "$name is ready: $url"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "$name did not become ready: $url"
+            tail -n 80 "$log_file" || true
+            return 1
+          }
+
+          wait_for_semantic_readiness() {
+            local label="$1"
+            local url="$2"
+            local checker_label="$3"
+            local body
+            body="$(mktemp "$RUN_DIR/readiness.XXXXXX")"
+            trap 'rm -f "$body"' RETURN
+            for _ in $(seq 1 30); do
+              if curl -fsS -o "$body" "$url" >/dev/null 2>&1; then
+                if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" < "$body"; then
+                  echo "$label is ready: $url"
+                  return 0
+                fi
+              fi
+              sleep 2
+            done
+            echo "$label did not become ready: $url"
+            tail -n 80 "$RUN_DIR/combined.log" || true
+            return 1
+          }
+
+          restart_restored_release() {
+            stop_listeners_on_port 18001
+            stop_listeners_on_port 18000
+            rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
+
+            cd "$APP_DIR"
+            nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
+              --host 0.0.0.0 \
+              --port 18001 \
+              --workers 1 \
+              > "$RUN_DIR/combined.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/combined.pid"
+
+            cd "$APP_DIR/fe"
+            nohup env \
+              COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18001" \
+              HOST="127.0.0.1" PORT="18000" node scripts/production-gateway.mjs \
+              > "$RUN_DIR/fe.log" 2>&1 &
+            echo "$!" > "$RUN_DIR/fe.pid"
+
+            wait_for_url "Combined backend" "http://127.0.0.1:18001/combined-health" "$RUN_DIR/combined.log"
+            wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18001/readiness" "rollback-backend-readiness"
+            curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
+              | "$APP_DIR/ai/.venv/bin/python" -c \
+                'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
+            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "rollback-ai-api-readiness"
+            wait_for_url "Frontend gateway" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
+            touch "$ROLLBACK_MARKER"
+          }
+
+          restore_deploy_snapshot
+          restart_restored_release
           REMOTE
