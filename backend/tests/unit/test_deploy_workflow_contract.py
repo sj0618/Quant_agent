@@ -1,9 +1,14 @@
-import re
+﻿import re
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEPLOY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "deploy.yml"
+SERVER_HEALTH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "server-health.yml"
+PRODUCTION_BACKTEST_SMOKE_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "production-backtest-smoke.yml"
 SERVICE_DB_REPLAY = REPOSITORY_ROOT / "service_db" / "scripts" / "verify_fixed_migration_replay.py"
+AI_REQUIRED_CHECKS = (
+    "durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer"
+)
 
 
 def _canonical_fixed_migrations() -> list[str]:
@@ -42,14 +47,21 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert 'DEPLOY_MUTATION_STARTED=true' in workflow
     assert "failure() && env.DEPLOY_MUTATION_STARTED == 'true'" in workflow
     assert "http://127.0.0.1:18001/ai-api/readiness" in workflow
-    assert 'node scripts/readiness-semantic-gate.mjs --label "$label"' in workflow
+    assert AI_REQUIRED_CHECKS in workflow
+    assert 'node scripts/readiness-semantic-gate.mjs "${node_args[@]}"' in workflow
+    assert 'check_readiness "current-ai-api-readiness" "http://127.0.0.1:18001/ai-api/readiness" "$ai_required_checks"' in workflow
     assert "current-backend-readiness" in workflow
     assert "current-ai-api-readiness" in workflow
     assert "No deploy snapshot available to restore" in workflow
     assert "rollback-applied.marker" in workflow
     assert "restart_restored_release" in workflow
     assert 'wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18001/readiness" "rollback-backend-readiness"' in workflow
-    assert 'wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "rollback-ai-api-readiness"' in workflow
+    assert 'wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "rollback-ai-api-readiness" "$ai_required_checks"' in workflow
+    assert 'wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "deployed-ai-api-readiness" "$ai_required_checks"' in workflow
+    assert 'check_readiness() {' in workflow
+    assert 'local required_checks="${3:-}"' in workflow
+    assert 'local node_args=(--label "$label")' in workflow
+    assert 'node scripts/readiness-semantic-gate.mjs "${node_args[@]}"' in workflow
     assert '"014_create_report_email_tables.sql"' in workflow
     assert '"022_immutable_analysis_results.sql"' in workflow
     assert workflow.index('"014_create_report_email_tables.sql"') < workflow.index(
@@ -87,6 +99,32 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert workflow.index("Deploy via rsync") < workflow.index("Restore deploy snapshot on failure")
     assert workflow.index("Mark deploy mutation started") < workflow.index("Deploy via rsync")
     assert workflow.index("Restore deploy snapshot on failure") < workflow.index("restart_restored_release")
+
+
+def test_server_health_requires_semantic_readiness_contract():
+    workflow = SERVER_HEALTH_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "http://127.0.0.1:$COMBINED_PORT/readiness" in workflow
+    assert "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness" in workflow
+    assert "General backend readiness" in workflow
+    assert "AI API readiness" in workflow
+    assert AI_REQUIRED_CHECKS in workflow
+    assert 'node scripts/readiness-semantic-gate.mjs "${node_args[@]}"' in workflow
+    assert 'check_readiness "AI API readiness" "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness" "$ai_required_checks"' in workflow
+    assert 'check_readiness "General backend readiness" "http://127.0.0.1:$COMBINED_PORT/readiness"' in workflow
+    assert "http://127.0.0.1:$COMBINED_PORT/combined-health" in workflow
+    assert "http://127.0.0.1:$COMBINED_PORT/health" not in workflow
+    assert "http://127.0.0.1:$COMBINED_PORT/ai-api/health" not in workflow
+
+
+def test_live_audit_uses_public_ai_readiness_contract():
+    workflow = PRODUCTION_BACKTEST_SMOKE_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "Verify public AI readiness" in workflow
+    assert "https://qt-agent.kro.kr/ai-api/readiness" in workflow
+    assert AI_REQUIRED_CHECKS in workflow
+    assert 'node scripts/readiness-semantic-gate.mjs --label public-ai-readiness --checks "$ai_required_checks"' in workflow
+    assert "https://qt-agent.kro.kr/ai-api/health" not in workflow
 
 
 def test_deploy_ai_audit_replay_applies_every_canonical_migration_in_order():

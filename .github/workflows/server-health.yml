@@ -102,11 +102,17 @@ jobs:
           check_readiness() {
             local label="$1"
             local url="$2"
+            local required_checks="${3:-}"
+            local node_args=(--label "$label")
+            if [ -n "$required_checks" ]; then
+              node_args+=(--checks "$required_checks")
+            fi
             curl -q --fail --silent --show-error \
               --connect-timeout 5 --max-time 15 \
               "$url" \
-              | node scripts/readiness-semantic-gate.mjs --label "$label"
+              | node scripts/readiness-semantic-gate.mjs "${node_args[@]}"
           }
+          ai_required_checks='durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer'
 
           check_pid "Combined" "$RUN_DIR/combined.pid"
           check_pid "FE" "$RUN_DIR/fe.pid"
@@ -119,7 +125,7 @@ jobs:
             "http://127.0.0.1:$COMBINED_PORT/ai-api/api-status" \
             | "$APP_DIR/ai/.venv/bin/python" -c \
               'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
-          check_readiness "AI API readiness" "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness"
+          check_readiness "AI API readiness" "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness" "$ai_required_checks"
           check_http "FE" "http://127.0.0.1:$FE_PORT/"
           frontend_html="$(mktemp)"
           if ! curl -q --fail --silent --show-error \
