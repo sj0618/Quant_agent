@@ -162,7 +162,9 @@ def test_every_readiness_gate_invocation_selects_a_profile():
 
     health = HEALTH_WORKFLOW.read_text(encoding="utf-8")
     assert 'check_readiness "AI API readiness" "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness" ai' in health
-    # The remote shell starts in $HOME, so a relative gate path resolves outside the
-    # deployed tree and the health check dies with MODULE_NOT_FOUND.
-    assert 'node "$APP_DIR/scripts/readiness-semantic-gate.mjs"' in health
-    assert "| node scripts/readiness-semantic-gate.mjs" not in health
+    # The gate ships with the repo, so the health check must run it on the checked-out
+    # release. A server still on an older revision has no $APP_DIR/scripts copy, and
+    # gating there dies with MODULE_NOT_FOUND before any dependency is checked.
+    assert "uses: actions/checkout@" in health
+    assert "| node scripts/readiness-semantic-gate.mjs" in health
+    assert "$APP_DIR/scripts/readiness-semantic-gate.mjs" not in health
