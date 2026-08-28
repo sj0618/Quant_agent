@@ -99,18 +99,27 @@ jobs:
             printf '%s endpoint is healthy: %s\n' "$label" "$url"
           }
 
+          check_readiness() {
+            local label="$1"
+            local url="$2"
+            curl -q --fail --silent --show-error \
+              --connect-timeout 5 --max-time 15 \
+              "$url" \
+              | node scripts/readiness-semantic-gate.mjs --label "$label"
+          }
+
           check_pid "Combined" "$RUN_DIR/combined.pid"
           check_pid "FE" "$RUN_DIR/fe.pid"
           check_listener "Combined" "$COMBINED_PORT"
           check_listener "FE" "$FE_PORT"
           check_http "Combined" "http://127.0.0.1:$COMBINED_PORT/combined-health"
-          check_http "General backend" "http://127.0.0.1:$COMBINED_PORT/health"
-          check_http "AI API" "http://127.0.0.1:$COMBINED_PORT/ai-api/health"
+          check_readiness "General backend readiness" "http://127.0.0.1:$COMBINED_PORT/readiness"
           curl -q --fail --silent --show-error \
             --connect-timeout 5 --max-time 15 \
             "http://127.0.0.1:$COMBINED_PORT/ai-api/api-status" \
             | "$APP_DIR/ai/.venv/bin/python" -c \
               'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
+          check_readiness "AI API readiness" "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness"
           check_http "FE" "http://127.0.0.1:$FE_PORT/"
           frontend_html="$(mktemp)"
           if ! curl -q --fail --silent --show-error \
