@@ -10,6 +10,23 @@ export const REQUIRED_READINESS_CHECKS = Object.freeze([
   "redis",
 ]);
 
+// The AI API publishes its own dependency set from `_release_readiness` in
+// ai/ai_graph/api.py. Checking it against the backend names above fails twice over,
+// once as "missing required checks" and once as "unexpected checks", which is what
+// blocked every deploy and rollback that gated on /ai-api/readiness.
+export const REQUIRED_AI_READINESS_CHECKS = Object.freeze([
+  "durable_job_store",
+  "migration_revision",
+  "live_provider_configuration",
+  "ai_contract_version",
+  "rule_draft_signer",
+]);
+
+const READINESS_PROFILES = Object.freeze({
+  backend: REQUIRED_READINESS_CHECKS,
+  ai: REQUIRED_AI_READINESS_CHECKS,
+});
+
 function parseCliArguments(argv) {
   const options = {
     label: "readiness",
@@ -31,6 +48,15 @@ function parseCliArguments(argv) {
     index += 1;
   }
 
+  if (typeof options.profile === "string") {
+    const profile = READINESS_PROFILES[options.profile.trim()];
+    if (!profile) {
+      throw new Error(
+        `unknown readiness profile: ${options.profile} (expected ${Object.keys(READINESS_PROFILES).join(" or ")})`
+      );
+    }
+    options.requiredChecks = [...profile];
+  }
   if (typeof options.checks === "string" && options.checks.trim()) {
     options.requiredChecks = options.checks
       .split(",")
