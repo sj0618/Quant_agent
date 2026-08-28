@@ -4,6 +4,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEPLOY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "deploy.yml"
 HEALTH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "server-health.yml"
+SMOKE_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "production-backtest-smoke.yml"
 READINESS_GATE = REPOSITORY_ROOT / "scripts" / "readiness-semantic-gate.mjs"
 AI_API_SOURCE = REPOSITORY_ROOT / "ai" / "ai_graph" / "api.py"
 SERVICE_DB_REPLAY = REPOSITORY_ROOT / "service_db" / "scripts" / "verify_fixed_migration_replay.py"
@@ -168,3 +169,11 @@ def test_every_readiness_gate_invocation_selects_a_profile():
     assert "uses: actions/checkout@" in health
     assert "| node scripts/readiness-semantic-gate.mjs" in health
     assert "$APP_DIR/scripts/readiness-semantic-gate.mjs" not in health
+
+
+def test_public_ai_readiness_smoke_uses_the_ai_dependency_set():
+    smoke = SMOKE_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "public-ai-readiness" in smoke
+    assert "ai_required_checks='durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer'" in smoke
+    assert '--label public-ai-readiness --checks "$ai_required_checks"' in smoke
