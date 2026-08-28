@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from datetime import date, datetime
 from enum import Enum
-from typing import Any, Literal
+from hashlib import sha256
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ai_graph.research_contract import (
+    CanonicalRuleV1,
+    ClarificationChoiceV1,
+    ScopeRefusalV1,
+    UnsupportedScopeV1,
+)
 from ai_graph.research_eligibility import PublicPerformance
 
 SCHEMA_VERSION = "ai-mvp.v1"
@@ -945,3 +954,187 @@ class APIEnvelope(BaseModel):
     failure_cause: FailureDiagnostic | None = None
     evidence_refs: list[EvidenceRef] = Field(default_factory=list)
     rule_provenance: RuleProvenance | None = None
+
+
+# ---------------------------------------------------------------------------
+# CORE-CONTRACT-01: versioned public execution contract
+#
+# Frozen here rather than beside the graph shapes above because these types cross a
+# public boundary: a browser sends them, the server re-verifies them, and a job is
+# created from them. `research_contract` imports nothing from this module, so pulling
+# its bounded rule form in creates no cycle.
+# ---------------------------------------------------------------------------
+
+EXECUTION_SPEC_SCHEMA_VERSION = "strategy-execution-spec.v1"
+BACKTEST_METHOD_VERSION = "backtest-method.v1"
+
+# Keys that must never appear anywhere in a public projection. Checked structurally by
+# `find_secret_leaks` rather than by eye: the envelope grows, and a reviewer reading a
+# diff is the wrong place to catch a credential.
+FORBIDDEN_PUBLIC_KEYS: frozenset[str] = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "aws_secret_access_key",
+        "credential",
+        "credentials",
+        "dsn",
+        "password",
+        "secret",
+        "stack",
+        "stacktrace",
+        "token",
+        "traceback",
+    }
+)
+
+
+def canonical_json(value: Any) -> str:
+    """Serialize deterministically: sorted keys, no incidental whitespace.
+
+    Deliberately the same shape `immutable_snapshot.compute_snapshot_hash` already uses.
+    Two hashing conventions in one repository is how two subsystems come to disagree
+    about whether the same document is the same document.
+    """
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def compute_spec_hash(spec: StrategyExecutionSpecV1 | Mapping[str, Any]) -> str:
+    """Content hash of a spec, computed over every field except the hash itself."""
+
+    payload = (
+        spec.model_dump(mode="json")
+        if isinstance(spec, BaseModel)
+        else dict(spec)
+    )
+    payload.pop("spec_hash", None)
+    return sha256(canonical_json(payload).encode()).hexdigest()
+
+
+def find_secret_leaks(payload: Any, *, _path: str = "$") -> list[str]:
+    """Return the paths of forbidden keys reachable in a public projection.
+
+    Returns paths rather than a bool so a failing contract test names the field instead
+    of only asserting that something, somewhere, was wrong.
+    """
+
+    leaks: list[str] = []
+    if isinstance(payload, Mapping):
+        for key, value in payload.items():
+            here = f"{_path}.{key}"
+            if str(key).strip().lower() in FORBIDDEN_PUBLIC_KEYS:
+                leaks.append(here)
+            leaks.extend(find_secret_leaks(value, _path=here))
+    elif isinstance(payload, (list, tuple)):
+        for index, item in enumerate(payload):
+            leaks.extend(find_secret_leaks(item, _path=f"{_path}[{index}]"))
+    return leaks
+
+
+def execution_idempotency_key(user_id: str, client_key: str) -> str:
+    """Dedupe identity for a create request.
+
+    Deliberately independent of `spec_hash`. Running the same strategy twice on purpose
+    is ordinary use, so the content of the spec must never be what suppresses the second
+    run; only an explicit client key does.
+    """
+
+    if not user_id.strip():
+        raise ValueError("idempotency key requires a user id")
+    if not client_key.strip():
+        raise ValueError("idempotency key requires a client-supplied key")
+    return sha256(canonical_json([user_id, client_key]).encode()).hexdigest()
+
+
+def job_document_schema_version(document: Mapping[str, Any]) -> str:
+    """Dual-read: rows written before the field carry no version and read as v1."""
+
+    version = document.get("schema_version")
+    return EXECUTION_SPEC_SCHEMA_VERSION if version == EXECUTION_SPEC_SCHEMA_VERSION else "v1"
+
+
+class StrategyExecutionSpecV1(BaseModel):
+    """What the server will actually execute, in the form the client signed.
+
+    Holds execution *inputs* only. `BacktestUniversePolicy` and `BacktestEvaluationBasis`
+    are reader-facing captions for a finished run and deliberately are not reused here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["strategy-execution-spec.v1"] = EXECUTION_SPEC_SCHEMA_VERSION
+    method_version: Literal["backtest-method.v1"] = BACKTEST_METHOD_VERSION
+    rule: CanonicalRuleV1
+    period_start: date
+    period_end: date
+    universe_policy_id: str = Field(min_length=1)
+    cost_policy_id: str = Field(min_length=1)
+    oos_policy_id: str = Field(min_length=1)
+    benchmark_symbol: str = Field(min_length=1)
+    spec_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def period_is_ordered_and_hash_matches(self) -> StrategyExecutionSpecV1:
+        if self.period_end <= self.period_start:
+            raise ValueError("period_end must be after period_start")
+        if not self.rule.is_executable:
+            raise ValueError("an execution spec requires both entry and exit conditions")
+        if compute_spec_hash(self) != self.spec_hash:
+            raise ValueError("spec_hash does not match the spec content")
+        return self
+
+
+def build_execution_spec(
+    *,
+    rule: CanonicalRuleV1,
+    period_start: date | str,
+    period_end: date | str,
+    universe_policy_id: str,
+    cost_policy_id: str,
+    oos_policy_id: str,
+    benchmark_symbol: str,
+) -> StrategyExecutionSpecV1:
+    """Build a spec and stamp its own content hash. The only supported constructor."""
+
+    draft = {
+        "schema_version": EXECUTION_SPEC_SCHEMA_VERSION,
+        "method_version": BACKTEST_METHOD_VERSION,
+        "rule": rule.model_dump(mode="json"),
+        "period_start": str(period_start),
+        "period_end": str(period_end),
+        "universe_policy_id": universe_policy_id,
+        "cost_policy_id": cost_policy_id,
+        "oos_policy_id": oos_policy_id,
+        "benchmark_symbol": benchmark_symbol,
+    }
+    return StrategyExecutionSpecV1.model_validate({**draft, "spec_hash": compute_spec_hash(draft)})
+
+
+class ParseValidatedV1(BaseModel):
+    """The only outcome that may reach job creation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["validated"] = "validated"
+    spec: StrategyExecutionSpecV1
+    # Opaque, user-bound, and never the raw request text.
+    spec_token: str = Field(min_length=32)
+    expires_at: datetime
+
+
+class ParseClarificationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["clarification"] = "clarification"
+    editable_summary: str = Field(min_length=1, max_length=500)
+    clarifications: list[ClarificationChoiceV1] = Field(min_length=1, max_length=3)
+
+
+# Rejection reuses the refusal shapes the preflight boundary already publishes rather
+# than minting parallel ones that would drift from it.
+ParseOutcomeV1 = Annotated[
+    ParseValidatedV1 | ParseClarificationV1 | ScopeRefusalV1 | UnsupportedScopeV1,
+    Field(discriminator="kind"),
+]
