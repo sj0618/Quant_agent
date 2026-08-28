@@ -102,10 +102,13 @@ jobs:
           check_readiness() {
             local label="$1"
             local url="$2"
+            local profile="$3"
+            # The remote shell starts in $HOME, not $APP_DIR, so a relative path here
+            # resolves to /home/<user>/scripts/... and dies with MODULE_NOT_FOUND.
             curl -q --fail --silent --show-error \
               --connect-timeout 5 --max-time 15 \
               "$url" \
-              | node scripts/readiness-semantic-gate.mjs --label "$label"
+              | node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$label" --profile "$profile"
           }
 
           check_pid "Combined" "$RUN_DIR/combined.pid"
@@ -113,13 +116,13 @@ jobs:
           check_listener "Combined" "$COMBINED_PORT"
           check_listener "FE" "$FE_PORT"
           check_http "Combined" "http://127.0.0.1:$COMBINED_PORT/combined-health"
-          check_readiness "General backend readiness" "http://127.0.0.1:$COMBINED_PORT/readiness"
+          check_readiness "General backend readiness" "http://127.0.0.1:$COMBINED_PORT/readiness" backend
           curl -q --fail --silent --show-error \
             --connect-timeout 5 --max-time 15 \
             "http://127.0.0.1:$COMBINED_PORT/ai-api/api-status" \
             | "$APP_DIR/ai/.venv/bin/python" -c \
               'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
-          check_readiness "AI API readiness" "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness"
+          check_readiness "AI API readiness" "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness" ai
           check_http "FE" "http://127.0.0.1:$FE_PORT/"
           frontend_html="$(mktemp)"
           if ! curl -q --fail --silent --show-error \

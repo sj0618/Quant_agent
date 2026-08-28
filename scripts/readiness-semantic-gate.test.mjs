@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
-import { REQUIRED_READINESS_CHECKS, validateReadinessPayload } from "./readiness-semantic-gate.mjs";
+import {
+  REQUIRED_AI_READINESS_CHECKS,
+  REQUIRED_READINESS_CHECKS,
+  validateReadinessPayload,
+} from "./readiness-semantic-gate.mjs";
 
 function buildReadyPayload() {
   return {
@@ -77,4 +81,73 @@ test("readiness semantic gate CLI reads stdin and emits a summary", () => {
   assert.match(result.stdout, /"label": "pre-deploy"/u);
   assert.match(result.stdout, /"status": "ready"/u);
   assert.match(result.stdout, /"auth_runtime"/u);
+});
+
+function buildAiReadyPayload() {
+  return {
+    status: "ready",
+    checks: REQUIRED_AI_READINESS_CHECKS.map((name) => ({ name, ready: true, reason: null })),
+  };
+}
+
+test("the backend profile rejects the AI API's own dependency set", () => {
+  // This is the exact pair of errors that blocked every deploy gating on
+  // /ai-api/readiness: the AI names are neither expected nor present.
+  assert.throws(
+    () => validateReadinessPayload(buildAiReadyPayload()),
+    /missing required checks: auth_runtime, main_db, trading_data_db, redis/u,
+  );
+});
+
+test("the ai profile accepts the AI readiness contract and still fails closed", () => {
+  const payload = buildAiReadyPayload();
+
+  assert.deepEqual(
+    validateReadinessPayload(payload, { requiredChecks: REQUIRED_AI_READINESS_CHECKS }),
+    payload,
+  );
+  assert.throws(
+    () =>
+      validateReadinessPayload(
+        {
+          status: "ready",
+          checks: REQUIRED_AI_READINESS_CHECKS.map((name) =>
+            name === "rule_draft_signer"
+              ? { name, ready: false, reason: "rule_draft_signer_required" }
+              : { name, ready: true, reason: null },
+          ),
+        },
+        { requiredChecks: REQUIRED_AI_READINESS_CHECKS },
+      ),
+    /is not ready: rule_draft_signer/u,
+  );
+  assert.throws(
+    () => validateReadinessPayload(buildReadyPayload(), { requiredChecks: REQUIRED_AI_READINESS_CHECKS }),
+    /missing required checks: durable_job_store/u,
+  );
+});
+
+test("the CLI selects a check list by profile and refuses an unknown one", () => {
+  const accepted = spawnSync(
+    process.execPath,
+    ["scripts/readiness-semantic-gate.mjs", "--label", "deployed-ai-api-readiness", "--profile", "ai"],
+    { encoding: "utf8", input: `${JSON.stringify(buildAiReadyPayload())}\n` },
+  );
+  assert.equal(accepted.status, 0);
+  assert.match(accepted.stdout, /"durable_job_store"/u);
+
+  const rejected = spawnSync(
+    process.execPath,
+    ["scripts/readiness-semantic-gate.mjs", "--label", "deployed-ai-api-readiness"],
+    { encoding: "utf8", input: `${JSON.stringify(buildAiReadyPayload())}\n` },
+  );
+  assert.equal(rejected.status, 1);
+
+  const unknown = spawnSync(
+    process.execPath,
+    ["scripts/readiness-semantic-gate.mjs", "--label", "x", "--profile", "frontend"],
+    { encoding: "utf8", input: `${JSON.stringify(buildAiReadyPayload())}\n` },
+  );
+  assert.equal(unknown.status, 1);
+  assert.match(unknown.stderr, /unknown readiness profile: frontend/u);
 });

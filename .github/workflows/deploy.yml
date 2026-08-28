@@ -137,13 +137,14 @@ jobs:
           check_readiness() {
             local label="$1"
             local url="$2"
+            local profile="$3"
             ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
               "curl -q --fail --silent --show-error --connect-timeout 5 --max-time 15 '$url'" \
-              | node scripts/readiness-semantic-gate.mjs --label "$label"
+              | node scripts/readiness-semantic-gate.mjs --label "$label" --profile "$profile"
           }
 
-          check_readiness "current-backend-readiness" "http://127.0.0.1:18001/readiness"
-          check_readiness "current-ai-api-readiness" "http://127.0.0.1:18001/ai-api/readiness"
+          check_readiness "current-backend-readiness" "http://127.0.0.1:18001/readiness" backend
+          check_readiness "current-ai-api-readiness" "http://127.0.0.1:18001/ai-api/readiness" ai
 
       - name: Create deploy snapshot archive
         run: |
@@ -370,12 +371,13 @@ jobs:
               local label="$1"
               local url="$2"
               local checker_label="$3"
+              local profile="${4:-backend}"
               local body
               body="$(mktemp "$RUN_DIR/readiness.XXXXXX")"
               trap 'rm -f "$body"' RETURN
               for _ in $(seq 1 30); do
                 if curl -fsS -o "$body" "$url" >/dev/null 2>&1; then
-                  if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" < "$body"; then
+                  if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" --profile "$profile" < "$body"; then
                     echo "$label is ready: $url"
                     return 0
                   fi
@@ -621,7 +623,7 @@ jobs:
             curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
               | "$APP_DIR/ai/.venv/bin/python" -c \
                 'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
-            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "deployed-ai-api-readiness"
+            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "deployed-ai-api-readiness" ai
             wait_for_url "Frontend gateway" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
             frontend_html="$(mktemp "$RUN_DIR/frontend-smoke.XXXXXX")"
             if ! curl -fsS -o "$frontend_html" "http://127.0.0.1:18000/"; then
@@ -799,12 +801,13 @@ jobs:
             local label="$1"
             local url="$2"
             local checker_label="$3"
+            local profile="${4:-backend}"
             local body
             body="$(mktemp "$RUN_DIR/readiness.XXXXXX")"
             trap 'rm -f "$body"' RETURN
             for _ in $(seq 1 30); do
               if curl -fsS -o "$body" "$url" >/dev/null 2>&1; then
-                if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" < "$body"; then
+                if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" --profile "$profile" < "$body"; then
                   echo "$label is ready: $url"
                   return 0
                 fi
@@ -841,7 +844,7 @@ jobs:
             curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
               | "$APP_DIR/ai/.venv/bin/python" -c \
                 'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
-            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "rollback-ai-api-readiness"
+            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "rollback-ai-api-readiness" ai
             wait_for_url "Frontend gateway" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
             touch "$ROLLBACK_MARKER"
           }
