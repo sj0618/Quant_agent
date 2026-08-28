@@ -15,7 +15,7 @@ from typing import Any, ClassVar, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.analysis_capacity import (
     ANALYSIS_CAPACITY,
@@ -68,6 +68,20 @@ INTERRUPTED_BY_RESTART_MESSAGE = (
 
 class InterruptedJobReconciliationError(RuntimeError):
     """The process cannot safely serve jobs until restart reconciliation completes."""
+
+
+class PipelineStageError(RuntimeError):
+    """Carries the stage a failure actually happened in.
+
+    The stage was previously whatever the caller passed to `classify_failure`, which is
+    the stage the *caller* knew about, not the one the graph had reached. Raising or
+    chaining through this preserves the real one so an operator reading a failed job is
+    not sent to the wrong node.
+    """
+
+    def __init__(self, message: str, *, stage: str) -> None:
+        super().__init__(message)
+        self.stage = stage
 
 AI_JOB_STORE_ENV = "AI_JOB_STORE"
 BE_JOB_STORE_MODE_ENV = "BE_JOB_STORE_MODE"
@@ -1005,6 +1019,7 @@ def _stage_status_for(
 
 
 def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
+    stage = _stage_from_exception_chain(exc, default=stage)
     if isinstance(exc, EmptyAnalysisResultError):
         return FailureDiagnostic(
             category="data_gap",
@@ -1171,8 +1186,10 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             safe_message="운영 데이터 소스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
             evidence_refs=["failure:db_connection_unavailable"],
         )
-    raw = str(exc).lower()
-    if "connection timeout" in raw or "connect timeout" in raw or "connection timed out" in raw:
+    # `ConnectionError` is a builtin, so this stays a type check. It covers the callers
+    # that raise a plain connection failure rather than a driver error - the case the
+    # deleted `"connection timeout" in str(exc)` branch was actually catching.
+    if any(isinstance(error, ConnectionError) for error in exception_chain):
         return FailureDiagnostic(
             category="infrastructure_failure",
             subcause="db_connect_timeout",
@@ -1182,7 +1199,11 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             safe_message="데이터 소스 연결 시간이 초과되었습니다. 잠시 후 다시 시도하거나 데이터 소스 설정을 확인해 주세요.",
             evidence_refs=["failure:db_connect_timeout"],
         )
-    if "statement timeout" in raw or "query timeout" in raw:
+    # Statement timeouts are identified by SQLSTATE, not by message text. `57014` is
+    # PostgreSQL's query_canceled, which is what a `statement_timeout` cancellation
+    # raises. Matched this way for the same reason as the connection check above: this
+    # module stays importable without a database driver.
+    if any(_is_postgres_statement_timeout(error) for error in exception_chain):
         return FailureDiagnostic(
             category="infrastructure_failure",
             subcause="db_statement_timeout",
@@ -1200,7 +1221,11 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             ),
             evidence_refs=["failure:db_statement_timeout"],
         )
-    if "validation" in raw or "contract" in raw or "schema" in raw:
+    # A real contract breach is a Pydantic validation error, not a string containing the
+    # word "schema". The message heuristic this replaces sorted `RuntimeError("cache
+    # schema warm")` into `contract_shape_error`, which sent someone reading the failure
+    # to the pipeline contract for a fault that was never there.
+    if any(isinstance(error, ValidationError) for error in exception_chain):
         return FailureDiagnostic(
             category="semantic_failure",
             subcause="contract_shape_error",
@@ -1270,6 +1295,27 @@ def _is_postgres_connection_failure(error: BaseException) -> bool:
         "OperationalError",
         "InterfaceError",
     }
+
+
+def _is_postgres_statement_timeout(error: BaseException) -> bool:
+    """Recognize a server-side statement cancellation without importing the driver.
+
+    Same technique as `_is_postgres_connection_failure`: SQLSTATE plus module identity.
+    `57014` is query_canceled, which `statement_timeout` raises.
+    """
+
+    if getattr(error, "sqlstate", None) != "57014":
+        return False
+    return type(error).__module__.startswith("psycopg")
+
+
+def _stage_from_exception_chain(exc: Exception, *, default: str) -> str:
+    """Prefer the stage the failure was raised in over the one the caller assumed."""
+
+    for error in _exception_chain(exc):
+        if isinstance(error, PipelineStageError) and error.stage.strip():
+            return error.stage
+    return default
 
 
 def _aoai_failure_diagnostic(
