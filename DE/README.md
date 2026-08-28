@@ -15,7 +15,8 @@ LLM 기반 퀀트 전략을 **실제 데이터로 검증하고 서비스에서 �
 | **KIS Open API** | 공식 수정주가 기준 일봉 OHLCV(최신 검증일 2026-07-06), 재개 가능한 증분 수집 | `meta.api_request_log`에 요청 단위 로그 적재 | `feature.adjusted_ohlcv_daily` | 백테스트 기준 가격, TA 지표 입력 |
 | **TA-Lib** | 수정 OHLCV 기반 기술적 지표 계산. 정의 카탈로그 158개, mart 기본 선계산 key 45개 | - | `feature.ta_*_ticker_daily`, `mart.kis_adjusted_feature_frame_asof` | 팩터 생성, 백테스트 feature frame |
 | **SEIBro** | 분석리포트 요약 데이터 백필/증분 수집 | `raw.analyst_report_summary` | `feature.seibro_report_summary`, `feature.seibro_sentiment`, `mart.seibro_universe_asof` | 리포트 기반 보조 시그널, 종목 관심도 |
-| **BOK / DART** | BOK 금리/환율 12개 series와 월별 유가 3개 series(WTI/Dubai/Brent) 10년치 적재 완료. DART CFS 재무 데이터 2016~2026 period_end 구간 적재 완료 | `raw.bok_response`, `raw.dart_response` | `feature.bok_macro_daily`, `feature.dart_financial_quarterly` | macro/fundamental factor 결합 |
+| **BOK / DART** | BOK 금리/환율 12개 series와 월별 유가 3개 series(WTI/Dubai/Brent) 10년치 적재. DART CFS 재무 데이터와 공시별 계정/버전 이력 적재 | `raw.bok_response`, `raw.dart_response` | `feature.bok_macro_daily`, `feature.dart_financial_quarterly`, `feature.dart_financial_filing`, `feature.dart_financial_account_value` | macro/fundamental factor 결합. `available_from` 기준 PIT 조회 |
+| **FnGuide WICS** | 종목별 WICS 업종/섹터 스냅샷과 변경 이력 | `raw.wics_company_info_response` | `feature.wics_symbol_sector_history`, `feature.wics_sector_definition` | 업종/섹터 PIT 매핑 |
 
 ### 기본 퀀트 유니버스
 
@@ -64,6 +65,7 @@ meta.*       run, cursor, API request, QA issue, lineage 기록
 | `raw.seibro_report_response` | SEIBro 일반 리포트/외부 응답 payload | SEIBro 수집 디버깅, 재파싱 |
 | `raw.bok_response` | BOK API 원본 응답 | 매크로 데이터 재정규화 |
 | `raw.dart_response` | DART API 원본 응답 | 재무/공시 데이터 재정규화 |
+| `raw.wics_company_info_response` | FnGuide WICS 원본 HTML과 payload hash | WICS 파싱 재처리, 수집 감사 |
 
 ### `core` schema — 정규화된 기준 데이터
 
@@ -90,8 +92,13 @@ meta.*       run, cursor, API request, QA issue, lineage 기록
 | `feature.seibro_report_summary` | SEIBro 리포트 요약을 feature 계층으로 정규화한 데이터 | 리포트 이벤트 feature |
 | `feature.seibro_sentiment` | 리포트 텍스트/투자의견 기반 sentiment 확장 영역 | 텍스트 기반 시그널 |
 | `feature.seibro_universe_daily` | SEIBro 리포트 기반 일별 관심 종목 universe | 리포트 커버리지 필터 |
-| `feature.bok_macro_daily` | BOK `rate-fx` 12개 series와 월별 유가 3개 series를 포함한 macro feature 30,825건. 유가 series는 `902Y003:010101`(WTI), `902Y003:010102`(Dubai Fateh), `902Y003:010103`(Brent) 월평균값 | 시장 regime/거시 변수 결합 |
-| `feature.dart_financial_quarterly` | 분기 재무 feature. 73,342건, `2016-03-31 ~ 2026-03-31` period_end 구간 적재 완료 | fundamental factor |
+| `feature.bok_macro_daily` | BOK `rate-fx` 12개 series와 월별 유가 3개 series를 포함한 macro feature. 관측일과 `available_from`을 분리해 as-of 조인 | 시장 regime/거시 변수 결합 |
+| `feature.dart_financial_quarterly` | 호환용 최신 분기 재무 feature. `available_from`과 filing hash를 보유 | fundamental factor |
+| `feature.dart_financial_filing` | 공시 payload별 DART CFS 재무 버전 이력 | restatement 보존, filing-date PIT 조회 |
+| `feature.dart_financial_account_value` | filing 버전별 정규화 계정과목 값 | 계정 단위 fundamental factor |
+| `feature.wics_sector_definition` | WICS 코드·섹터 정의 | 섹터 기준정보 |
+| `feature.wics_symbol_sector_history` | 종목별 WICS 유효구간(`valid_from`/`valid_to`) | 과거 시점 섹터 매핑 |
+| `feature.kis_corporate_action_event` | KIS 수정 사유/권리락 이벤트 원본 이벤트 | 수정주가 감사·검증 |
 | `feature.dart_corp_symbol_map` | DART corp_code와 ticker 매핑 | DART 재무 데이터 종목 연결 |
 
 TA 지표는 `feature.ta_indicator_definition`의 **계산 가능 카탈로그 158개**와 `feature.ta_*_ticker_daily.values_jsonb`의 **현재 백테스트 기본 선계산 key 45개**를 구분합니다. 45개 key 구성은 Trend 16, Momentum 8, Volatility 7, Volume 4, Pattern 10입니다. 정의 1개가 여러 output key를 만들 수 있으므로 정의 수와 저장 key 수는 1:1이 아닙니다.
@@ -105,8 +112,9 @@ TA 지표는 `feature.ta_indicator_definition`의 **계산 가능 카탈로그 1
 | `mart.full_universe_asof` | listed/coverage 조건을 반영한 전체 tradable universe | 기본 universe 조회 |
 | `mart.seibro_universe_asof` | SEIBro 리포트 기반 universe view | 리포트 기반 탐색/랭킹 |
 | `mart.data_coverage_report` | 종목별 데이터 커버리지/최근 일자 요약 | 운영 대시보드, 누락 점검 |
-| `mart.bok_macro_asof` | BOK macro as-of view. 15개 series 30,825건. 월별 유가 사용 시 실제 발표일이 아닌 수집 시각이 `published_at`에 들어가므로 보수적 lag 기준 as-of join 필요 | 거시 지표 조회 |
-| `mart.dart_financial_asof` | DART financial as-of view. 73,342건, `2016-03-31 ~ 2026-03-31` | 재무 지표 조회 |
+| `mart.bok_macro_asof` | BOK macro as-of view. `available_from <= as_of_date` 조건으로 보수적 lag 적용 | 거시 지표 조회 |
+| `mart.dart_financial_asof` | DART filing 버전별 as-of view. `available_from <= as_of_date` 조건 필요 | 재무 지표 조회 |
+| `mart.dart_financial_latest` | 기간·보고서별 가장 최신 filing 버전 조회용 view | 최신 재무 조회 |
 
 ### `meta` schema — 실행·품질·관측성 메타데이터
 
@@ -130,6 +138,8 @@ TA 지표는 `feature.ta_indicator_definition`의 **계산 가능 카탈로그 1
 | 수정주가 + TA 통합 feature frame | `mart.kis_adjusted_feature_frame_asof` |
 | SEIBro 분석리포트 원본 | `raw.analyst_report_summary` |
 | 현재 상장 KOSPI/KOSDAQ 보통주 helper | `meta.view_common_stock_universe` |
+| 과거 시점 보통주 universe | `mart.common_stock_universe_asof` |
+| 과거 시점 WICS 섹터 | `feature.wics_symbol_sector_history` |
 
 ---
 
@@ -254,7 +264,7 @@ $env:QUANT_DB_NAME = "quant_agent"
 $env:QUANT_DB_USER = "quant_agent"
 $env:QUANT_DB_PORT = "5432"
 
-# 2) DB 시작 + migrations/001~006 순차 적용
+# 2) DB 시작 + migrations/*.sql 순차 적용(014 포함)
 .\scripts\apply_migrations.ps1
 ```
 
@@ -262,7 +272,7 @@ $env:QUANT_DB_PORT = "5432"
 
 1. `docker compose up -d db`
 2. PostgreSQL readiness 확인
-3. `migrations/*.sql`을 파일명 순서대로 `psql -v ON_ERROR_STOP=1`로 적용
+3. `migrations/*.sql`을 파일명 순서대로 `psql -v ON_ERROR_STOP=1`로 적용. 운영 DB의 기존 스키마가 013까지 적용되어 있어야 하며, 014는 WICS 이력·명시적 availability·DART filing 버전을 추가합니다.
 
 DB 컨테이너 기본값:
 
@@ -293,8 +303,10 @@ python -m venv .venv
 | KIS 수정주가 + TA wrapper | `scripts/run_kis_adjusted_full_pipeline.py` |
 | TA 지표 계산 | `scripts/compute_technical_indicators_pipeline.py` |
 | QA 실행 | `scripts/run_data_quality_checks.py` |
+| KRX 거래일 증거 갱신 | `scripts/refresh_krx_trading_calendar.py` |
 | 종목 메타데이터 갱신 | `scripts/refresh_symbol_metadata.py` |
 | 종목 `security_type` 분류 | `scripts/classify_symbol_security_types.py` |
+| WICS 업종/섹터 이력 스냅샷 | `scripts/ingest_wics_sectors.py` |
 | SEIBro 분석리포트 백필 | `scripts/backfill_seibro_analyst_reports.py` |
 | BOK 월별 유가 수집 | `scripts/ingest_dart_bok_history.py --scope custom --sources bok --start-date 2016-06-01 --end-date 2026-06-24 --bok-series-json '[{"stat_code":"902Y003","cycle":"M","item_code1":"010101","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010102","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010103","language":"en"}]'` |
 
@@ -303,14 +315,21 @@ python -m venv .venv
 Airflow 환경에서는 `DE/airflow/dags/quant_agent_data_engineering.py`가 일일 파이프라인을 정의합니다.
 
 ```text
-ingest_ohlcv_daily
-  ├─ refresh_symbol_metadata_daily ─┐
-  ├─ ingest_kis_adjusted_ohlcv_daily → compute_ta_indicators_daily ─┐
-  ├─ ingest_bok_daily                                                  ├─ run_data_quality_checks_daily
-  └─ ingest_seibro_reports_daily                                      ┘
+refresh_krx_trading_calendar_daily
+  → ingest_ohlcv_daily
+      ├─ refresh_symbol_metadata_daily
+      ├─ ingest_kis_adjusted_ohlcv_daily → compute_ta_indicators_daily
+      ├─ ingest_bok_daily
+      └─ ingest_seibro_reports_daily
+          → run_data_quality_checks_daily
+
+quant_agent_wics_sector_snapshot  # 주간 KIND 메타데이터 + FnGuide WICS 이력
+repair_krx_trading_calendar       # 거래일 증거 보정/재수집
 
 ingest_dart_corp_codes_daily  # 독립 실행
 ```
+
+일일 실행은 거래일 캘린더에 아직 기록되지 않은 직전 날짜를 대상으로 하며, 주말·공휴일은 원천 응답이 없어도 휴장으로 확정하지 않습니다. 평일 무응답은 `unconfirmed`로 남겨 지연 공개와 실제 휴장을 구분합니다. 백테스트는 KRX 거래일 증거와 각 매크로/DART `available_from`을 함께 필터링해야 합니다.
 
 ### 5.6 바로 조회해 보기
 

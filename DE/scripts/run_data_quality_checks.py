@@ -19,7 +19,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from quant_agent.data.config import DatabaseConfig, DEFAULT_MIN_SYMBOL_COVERAGE  # noqa: E402
+from quant_agent.data.config import (  # noqa: E402
+    DEFAULT_BOK_STALENESS_DAYS,
+    DEFAULT_MIN_SYMBOL_COVERAGE,
+    DatabaseConfig,
+)
 from quant_agent.data.quality import OhlcvQualityConfig  # noqa: E402
 from quant_agent.data.repository import DataRepository  # noqa: E402
 
@@ -61,6 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "volume_anomaly_multiplier": str(quality_config.volume_anomaly_multiplier),
             "min_volume_sample_count": quality_config.min_volume_sample_count,
             "price_mismatch_tolerance_ratio": str(quality_config.price_mismatch_tolerance_ratio),
+            "bok_staleness_days": args.bok_staleness_days,
         },
     )
 
@@ -81,6 +86,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 end_date=end_date,
                 config=quality_config,
             )
+        if "backtest-readiness" in checks or "all" in checks:
+            repository.run_backtest_readiness_checks(
+                run_id=run_id,
+                start_date=start_date,
+                end_date=end_date,
+                bok_staleness_days=args.bok_staleness_days,
+            )
+        error_count = repository.count_data_quality_errors(run_id=run_id)
+        if error_count:
+            raise RuntimeError(f"Data quality gate found {error_count} error-level issue(s).")
         repository.finish_ingestion_run(run_id, status="success")
     except Exception as exc:
         repository.finish_ingestion_run(run_id, status="failed", error_message=str(exc))
@@ -92,6 +107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "checks": checks,
+        "error_count": 0,
         "rule_version": QA_RULE_VERSION,
     }
     text = json.dumps(summary, ensure_ascii=False, indent=2)
@@ -111,7 +127,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--checks",
         nargs="+",
-        choices=["all", "ohlcv", "kis-krx"],
+        choices=["all", "ohlcv", "kis-krx", "backtest-readiness"],
         default=["all"],
         help="Quality check groups to execute.",
     )
@@ -128,6 +144,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=float(OhlcvQualityConfig().price_mismatch_tolerance_ratio),
     )
+    parser.add_argument("--bok-staleness-days", type=int, default=DEFAULT_BOK_STALENESS_DAYS)
     parser.add_argument("--db-mode", choices=["docker", "psycopg"], default=None)
     parser.add_argument("--dag-id", default="manual_data_quality_checks")
     parser.add_argument("--task-id", default="run_data_quality_checks")

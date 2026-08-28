@@ -5,12 +5,13 @@
 | 파일 | 목적 | 실행 주기/방식 |
 |---|---|---|
 | `scripts/ingest_dart_bok_history.py` | OpenDART 재무제표와 BOK ECOS 매크로 시계열을 기존 PostgreSQL feature 테이블에 스키마 스캔 후 적재 | 수동 1달 테스트, 10년 백필, Airflow 일일 실행. BOK `rate-fx` 12개 series, 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 적재 완료. |
-| `DE/airflow/dags/quant_agent_data_engineering.py` | OHLCV, KIS 수정주가, TA, DQ, BOK, DART 일일 자동 수집 DAG | 기본 cron `0 4 * * *` |
+| `DE/airflow/dags/quant_agent_data_engineering.py` | 거래일 증거, OHLCV, KIS 수정주가, TA, DQ, BOK, DART 일일 자동 수집 및 WICS 주기 스냅샷 DAG | 일일 기본 cron `0 10 * * *`, WICS 기본 cron `0 6 * * 1` |
 | `scripts/ingest_ohlcv.py` | KRX 등 원천 OHLCV 적재 | DAG `ingest_ohlcv_daily` |
 | `scripts/ingest_kis_adjusted_ohlcv.py` | KIS 공식 수정주가 OHLCV 적재 | DAG `ingest_kis_adjusted_ohlcv_daily` |
 | `scripts/compute_technical_indicators_pipeline.py` | 수정주가 기반 TA 지표 계산 | DAG `compute_ta_indicators_daily` |
 | `scripts/refresh_symbol_metadata.py` | 종목 메타데이터/분류 갱신 | DAG `refresh_symbol_metadata_daily` |
-| `scripts/ingest_wics_sectors.py` | FnGuide Company Guide WICS 섹터 스냅샷을 로컬 DB의 `core.symbol_master` 섹터 컬럼들(`sector`/`sector_source`/`sector_as_of`/`sector_run_id`)에 1회 적재 | 별도 one-shot 실행 |
+| `scripts/ingest_wics_sectors.py` | FnGuide Company Guide WICS 섹터 스냅샷을 `feature.wics_symbol_sector_history`에 기간 이력으로 적재하고 `core.symbol_master.sector`는 캐시로 갱신 | WICS DAG 기본 주 1회 또는 수동 실행 |
+| `scripts/refresh_krx_trading_calendar.py` | KRX 응답을 기준으로 거래일 증거를 적재. 데이터가 없는 평일은 폐장으로 단정하지 않고 `unconfirmed`로 보존 | 일일 DAG 및 장기 백필 수동 실행 |
 | `scripts/run_data_quality_checks.py` | 데이터 품질 검사 실행 | DAG `run_data_quality_checks_daily` |
 
 ## 1. `scripts/ingest_dart_bok_history.py`
@@ -19,40 +20,39 @@
 
 | 원칙 | 구현 |
 |---|---|
-| API 키 하드코딩 금지 | `load_runtime_dotenv()`가 `QUANT_DOTENV_PATH` 또는 repo `.env`를 `python-dotenv`로 로드하고, 값은 출력하지 않는다. |
+| API 키 하드코딩 금지 | API 키와 DB 정보는 프로세스 환경변수, Airflow Connection 또는 Secret Backend로 주입하며 스크립트가 파일을 읽지 않는다. |
 | DB 스키마 임의 변경 금지 | `scan_required_schemas()`와 `scan_table_schema()`가 `information_schema`에서 실제 컬럼/PK/UNIQUE를 읽는다. `CREATE`/`ALTER`는 없다. |
 | 기존 테이블 구조 준수 | `validate_required_values()`가 non-null/no-default 컬럼 누락을 실패 처리한다. |
-| 중복 방지 | `insert_rows()`가 모든 적재를 `ON CONFLICT DO NOTHING`으로 수행한다. |
+| 중복/정정 처리 | 일반 raw·BOK·DART filing history는 `ON CONFLICT DO NOTHING`, DART 호환 최신 테이블은 PK upsert로 정정 공시를 반영한다. |
 | Rate Limit 고려 | `--bok-request-sleep-seconds`, `--dart-request-sleep-seconds`로 API 호출 사이 대기한다. |
 
 ### 주요 함수
 
 | 함수 | 동작 |
 |---|---|
-| `main()` | CLI 인자를 파싱하고 `.env` 로드 → DB 접속 → 대상/보조 테이블 스키마 스캔 → BOK/DART 수집 실행 → JSON 결과 파일 저장. |
+| `main()` | CLI 인자를 파싱하고 런타임 환경변수로 DB 접속 → 대상/보조 테이블 스키마 스캔 → BOK/DART 수집 실행 → JSON 결과 파일 저장. |
 | `parse_args()` | `--scope test-1m/full-10y/daily/custom`, `--sources both/bok/dart`, DART/BOK sleep, DART 종목 제한, DART 보고서 모드 등을 정의한다. |
-| `load_runtime_dotenv()` | `python-dotenv`로 런타임 환경변수를 채운다. 비밀값을 로그로 남기지 않는다. |
 | `connect_db()` | `QUANT_DB_DSN`/`DATABASE_URL` 또는 `QUANT_DB_HOST/PORT/NAME/USER/PASSWORD` 계열 환경변수로 psycopg 연결을 만든다. |
-| `scan_required_schemas()` | `feature.bok_macro_daily`, `feature.dart_financial_quarterly`를 필수 스캔하고, raw/meta/map 테이블은 있으면 스캔한다. |
+| `scan_required_schemas()` | BOK `available_from`, DART 호환 테이블, DART filing history/account 정규화 테이블을 필수 스캔하고 raw/meta/map 테이블은 있으면 스캔한다. |
 | `scan_table_schema()` | 컬럼명, 타입, nullable, default, identity, primary key, unique constraints를 조회한다. |
 | `assert_target_columns()` | 수집 매핑에 반드시 필요한 컬럼이 없으면 스키마 불일치로 중단한다. |
 | `resolve_date_window()` | `test-1m`은 최근 30일, `full-10y`는 기본 `2016-01-01`부터 오늘까지, `daily`는 일일 lookback, `custom`은 명시 날짜를 사용한다. |
 | `start_ingestion_run()` / `finish_ingestion_run()` | `meta.ingestion_run`에 실행 이력을 남긴다. 중복 source는 `ON CONFLICT DO NOTHING`으로 처리한다. |
 | `ingest_bok_history()` | `BOK_SERIES_JSON`/`BOK_DAILY_SERIES_JSON`의 통계코드 목록을 기간 chunk로 호출하고 `feature.bok_macro_daily`에 적재한다. |
 | `load_bok_series_configs()` | BOK 수집 대상 JSON을 검증해 `BokSeriesConfig`로 변환한다. |
-| `ingest_dart_history()` | OpenDART corp code를 가져와 DB의 `core.symbol_master`와 매핑하고, 보고서 기간별 재무제표를 `feature.dart_financial_quarterly`에 적재한다. |
+| `ingest_dart_history()` | OpenDART corp code를 가져와 DB의 `core.symbol_master`와 매핑하고, CFS 재무제표를 가용일·payload hash와 함께 호환 테이블, versioned filing, account 값 테이블에 적재한다. |
 | `resolve_dart_universe()` | DART `stock_code`와 DB `symbol_id`를 연결해 적재 가능한 종목 universe를 만든다. |
 | `resolve_dart_report_periods()` | `period-end` 또는 `filing-window` 모드로 DART 보고서 연도/코드를 결정한다. |
-| `insert_rows()` | 스캔된 컬럼만 대상으로 INSERT를 생성하고 `ON CONFLICT DO NOTHING`을 적용한다. |
+| `insert_rows()` / `upsert_rows()` | 스캔된 컬럼만 대상으로 INSERT를 생성한다. raw/history는 중복을 보존하지 않고, 정정 가능한 DART 호환 행은 PK upsert를 사용한다. |
 | `convert_value_for_column()` | PostgreSQL 타입에 맞춰 `date`, `timestamptz`, `numeric`, `uuid`, `jsonb` 값을 변환한다. |
 
 ### 필수 환경변수
 
 | 구분 | 변수 |
 |---|---|
-| DART | `FSS_API_KEY`, `FSS_API_KEY_2`, `FSS_API_KEY_3` 권장. 기존 `.env` 호환을 위해 `DART_API_KEY`, `OPENDART_API_KEY`도 인식한다. |
+| DART | `FSS_API_KEY`, `FSS_API_KEY_2`, `FSS_API_KEY_3` 권장. 기존 변수명인 `DART_API_KEY`, `OPENDART_API_KEY`도 인식한다. |
 | BOK | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON` |
-| WICS | `WICS_COMPANY_INFO_URL`, 선택: `WICS_REQUEST_WORKERS` |
+| WICS | `WICS_COMPANY_INFO_URL`, 선택: `WICS_REQUEST_WORKERS`, `WICS_MIN_MATCH_RATIO` |
 | DB | 권장: `QUANT_DB_DSN` 또는 `DATABASE_URL`; 또는 `QUANT_DB_HOST`, `QUANT_DB_PORT`, `QUANT_DB_NAME`, `QUANT_DB_USER`, `QUANT_DB_PASSWORD` |
 | 선택 | `DART_SYMBOLS`, `DART_MAX_COMPANIES`, `DART_REFRESH_CORP_CODES`, `DART_REQUEST_SLEEP_SECONDS`, `BOK_REQUEST_SLEEP_SECONDS` |
 
@@ -67,11 +67,11 @@
   --sources both `
   --output .omx\logs\dart-bok-1m-test.json
 
-# 2016~2026 백필. BOK 금리/환율 기본 묶음은 --bok-series-preset rate-fx 사용
+# 2016~2026 백필. 금리/환율과 월별 유가를 모두 포함하는 preset
 .\.venv\Scripts\python.exe scripts\ingest_dart_bok_history.py `
   --scope full-10y `
   --sources both `
-  --bok-series-preset rate-fx `
+  --bok-series-preset all-macro `
   --output .omx\logs\dart-bok-full-10y.json
 
 # BOK 월별 유가 3개 series(WTI/Dubai/Brent) 백필 예시
@@ -106,7 +106,7 @@
 | Dubai Fateh 원유 | `902Y003` | `010102` | `M` | `$/bbl` | `902Y003:010102` |
 | Brent 원유 | `902Y003` | `010103` | `M` | `$/bbl` | `902Y003:010103` |
 
-월별 유가는 `feature.bok_macro_daily`에 기존 BOK macro와 동일하게 저장한다. 2026-06-24 기준 WTI/Dubai Fateh/Brent 3개 series는 `2016-06-01 ~ 2026-05-01` 구간 360건이 공용 DB와 로컬 동기화 DB에 적재되어 있다. `normalize_bok_observations()`는 `TIME=YYYYMM` 값을 해당 월 1일 `effective_date`로 변환하므로, 일봉 백테스트에서 사용할 때는 `effective_date`를 그대로 월초 공개값으로 취급하지 않는다. 현재 정규화 기본값은 `published_at`을 실제 ECOS 발표일이 아니라 수집 시각으로 넣고 `mart.bok_macro_asof.available_from = COALESCE(published_at::date, effective_date)`로 계산하므로, 과거 백필 자료를 백테스트에 붙일 때는 view 값을 그대로 신뢰하기보다 조인 SQL에서 `effective_date + INTERVAL '1 month'` 같은 보수적 lag를 명시한다.
+월별 유가는 `feature.bok_macro_daily`에 기존 BOK macro와 동일하게 저장한다. `TIME=YYYYMM`은 월초 `effective_date`로 정규화하지만 `available_from`은 다음 달 1일로 둔다. 일별 관측은 실제 발표일을 원천 응답에서 확인할 수 없으면 다음 날부터 사용한다. 따라서 백테스트는 `available_from <= as_of_date`를 필수 조건으로 사용하며, 수집 시각을 발표일로 간주하지 않는다.
 
 ### 현재 DART 적재 상태
 
@@ -119,7 +119,7 @@
 | 연결 symbol 수 | 2,506개 |
 | period_end 범위 | `2016-03-31 ~ 2026-03-31` |
 
-DART 수집은 연도 단위로 나눠 재개했고, `feature.dart_financial_quarterly` 기본키 `(symbol_id, period_end, report_code, fs_div)` 기준 `ON CONFLICT DO NOTHING`으로 재실행 중복을 방지한다. 현재 스크립트는 `--dart-skip-existing`를 켜면 `feature.dart_financial_quarterly`에 이미 존재하는 `(symbol_id, period_end, report_code, fs_div)` 조합을 API 호출 전에 건너뛴다. 또한 `FSS_API_KEY` 계열 키를 순환 사용하고, 사용한도 응답을 반환한 키는 같은 실행에서 비활성화해 나머지 키로 계속 진행한다. 완료 후 검증에서 중복 PK 그룹, 빈 `accounts_jsonb`, feature/mart row delta, corp-map 미연결 row가 모두 0건이었다. 검증 산출물은 `.omx/logs/dart-validation-20260604-095618.md`와 `.omx/logs/dart-validation-20260604-095618.json`에 저장했다.
+DART 수집은 `feature.dart_financial_quarterly`를 호환용 최신 행으로 유지하고, `feature.dart_financial_filing`에 payload hash별 정정 공시를 모두 보존한다. 백테스트 조인은 `available_from <= as_of_date`를 적용해야 하며, 기존 기간을 재조회할 때는 `--dart-refresh-existing`를 사용해야 정정 공시를 놓치지 않는다. `--dart-skip-existing`는 변경 없는 과거 백필을 빠르게 재개할 때만 사용한다. 또한 `FSS_API_KEY` 계열 키를 순환 사용하고, 사용한도 응답을 반환한 키는 같은 실행에서 비활성화해 나머지 키로 계속 진행한다.
 
 ## 2. `DE/airflow/dags/quant_agent_data_engineering.py`
 
@@ -131,7 +131,7 @@ DART 수집은 연도 단위로 나눠 재개했고, `feature.dart_financial_qua
 | 기본 스케줄 | `0 10 * * *` (다음 영업일 오전 10시 실행, 직전 영업일 기준 적재) |
 | 재시도 | `QUANT_AIRFLOW_RETRIES` 기본값 `3` |
 | retry delay | 5분 |
-| `.env` 매핑 | `QUANT_AIRFLOW_LOAD_DOTENV=true` 기본. `QUANT_AIRFLOW_DOTENV_PATH`로 경로 재정의 가능. |
+| 환경변수 주입 | 런타임 환경변수, Airflow Connection 또는 Secret Backend에서 주입한다. DAG와 스크립트는 `.env` 파일을 읽지 않는다. |
 | Python 실행 파일 | `QUANT_AIRFLOW_PYTHON` 또는 현재 인터프리터 |
 
 ### 일일 태스크
@@ -140,7 +140,8 @@ DART 수집은 연도 단위로 나눠 재개했고, `feature.dart_financial_qua
 |---|---|---|
 | `ingest_ohlcv_daily` | `OhlcvIngestionService` | KRX 등 원천 OHLCV 일일 적재 |
 | `refresh_symbol_metadata_daily` | `scripts/refresh_symbol_metadata.py` | 종목 메타데이터 갱신 |
-| `ingest_wics_sector_snapshot` | `scripts/ingest_wics_sectors.py` | FnGuide Company Guide WICS 섹터 스냅샷 1회 적재 |
+| `refresh_krx_trading_calendar_daily` | `scripts/refresh_krx_trading_calendar.py` | KRX 거래일 증거 갱신 |
+| `ingest_wics_sector_snapshot` | `scripts/ingest_wics_sectors.py` | FnGuide Company Guide WICS 기간 이력 스냅샷. 별도 WICS DAG에서 실행 |
 | `ingest_kis_adjusted_ohlcv_daily` | `scripts/ingest_kis_adjusted_ohlcv.py` | KIS 수정주가 적재 |
 | `compute_ta_indicators_daily` | `scripts/compute_technical_indicators_pipeline.py` | TA 지표 계산 |
 | `run_data_quality_checks_daily` | `scripts/run_data_quality_checks.py` | 품질 검사 |

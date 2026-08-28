@@ -21,11 +21,6 @@ from typing import Any, Iterable, Sequence
 from uuid import UUID, uuid4
 
 try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - exercised only in incomplete local envs.
-    load_dotenv = None
-
-try:
     import psycopg
     from psycopg import sql
     from psycopg.rows import dict_row
@@ -45,7 +40,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from quant_agent.data.config import BokConfig, DartConfig, RetryConfig  # noqa: E402
+from quant_agent.data.catalogs import (  # noqa: E402
+    BOK_SERIES_PRESETS as SHARED_BOK_SERIES_PRESETS,
+    DART_REPORT_DISCLOSURE_MONTH_DAY,
+    DART_REPORT_CODE_PERIOD_END as SHARED_DART_REPORT_CODE_PERIOD_END,
+)
+from quant_agent.data.config import BokConfig, DartConfig  # noqa: E402
 from quant_agent.data.models import RawSourcePayload  # noqa: E402
 from quant_agent.data.sources.bok import BokEcosClient, normalize_bok_observations  # noqa: E402
 from quant_agent.data.sources.dart import (  # noqa: E402
@@ -68,41 +68,11 @@ DEFAULT_REQUEST_SLEEP_SECONDS = 0.2
 DEFAULT_DART_TEST_MAX_COMPANIES = 5
 DEFAULT_DART_FS_DIV = "CFS"
 DEFAULT_DART_NO_DATA_STATUS_CODES = frozenset({"013"})
-DEFAULT_DOTENV_PATH = ROOT / ".env"
-
 BOK_SERIES_ENV_NAMES = ("BOK_SERIES_JSON", "BOK_DAILY_SERIES_JSON")
 DART_SYMBOLS_ENV_NAME = "DART_SYMBOLS"
 
-BOK_SERIES_PRESETS = {
-    "rate-fx": (
-        {"stat_code": "722Y001", "cycle": "D", "item_code1": "0101000"},  # 한국은행 기준금리
-        {"stat_code": "817Y002", "cycle": "D", "item_code1": "010101000"},  # 콜금리(1일, 전체거래)
-        {"stat_code": "817Y002", "cycle": "D", "item_code1": "010901000"},  # KOFR
-        {"stat_code": "817Y002", "cycle": "D", "item_code1": "010502000"},  # CD(91일)
-        {"stat_code": "817Y002", "cycle": "D", "item_code1": "010190000"},  # 국고채(1년)
-        {"stat_code": "817Y002", "cycle": "D", "item_code1": "010200000"},  # 국고채(3년)
-        {"stat_code": "817Y002", "cycle": "D", "item_code1": "010210000"},  # 국고채(10년)
-        {"stat_code": "817Y002", "cycle": "D", "item_code1": "010300000"},  # 회사채(3년, AA-)
-        {"stat_code": "817Y002", "cycle": "D", "item_code1": "010320000"},  # 회사채(3년, BBB-)
-        {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000003"},  # 원/달러 종가 15:30
-        {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000006"},  # 원/100엔
-        {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000010"},  # 원/위안 종가
-    ),
-}
-
-DART_REPORT_CODE_PERIOD_END = {
-    "11013": (3, 31),  # 1Q report
-    "11012": (6, 30),  # half-year report
-    "11014": (9, 30),  # 3Q report
-    "11011": (12, 31),  # annual report
-}
-
-DART_EXPECTED_DISCLOSURE_DATE = {
-    "11013": (0, 5, 15),
-    "11012": (0, 8, 14),
-    "11014": (0, 11, 14),
-    "11011": (1, 3, 31),
-}
+BOK_SERIES_PRESETS = SHARED_BOK_SERIES_PRESETS
+DART_REPORT_CODE_PERIOD_END = SHARED_DART_REPORT_CODE_PERIOD_END
 
 DATA_SOURCE_ROWS = {
     "BOK": ("Bank of Korea ECOS", "BOK_BASE_URL", False),
@@ -239,7 +209,6 @@ class RunStats:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    load_runtime_dotenv(args.dotenv_path)
 
     start_date, end_date = resolve_date_window(args)
     stats = RunStats(scope=args.scope, start_date=start_date, end_date=end_date, dry_run=args.dry_run)
@@ -297,7 +266,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sources", choices=["both", "bok", "dart"], default="both")
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
-    parser.add_argument("--dotenv-path", default=os.getenv("QUANT_DOTENV_PATH", str(DEFAULT_DOTENV_PATH)))
     parser.add_argument("--output")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--validate-schema-only", action="store_true")
@@ -325,7 +293,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--dart-skip-existing",
         action="store_true",
         default=os.getenv("DART_SKIP_EXISTING", "false").lower() == "true",
-        help="Skip DART company/period jobs whose feature rows already exist in feature.dart_financial_quarterly.",
+        help="Skip DART company/period jobs whose feature rows already exist; do not use for restatement refreshes.",
+    )
+    parser.add_argument(
+        "--dart-refresh-existing",
+        action="store_true",
+        help="Override --dart-skip-existing and refetch existing periods so filing restatements are retained.",
     )
     parser.add_argument(
         "--dart-period-mode",
@@ -345,17 +318,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=os.getenv("DART_NO_DATA_STATUS_CODES", ",".join(sorted(DEFAULT_DART_NO_DATA_STATUS_CODES))),
     )
     return parser.parse_args(argv)
-
-
-def load_runtime_dotenv(dotenv_path: str | None) -> None:
-    if os.getenv("QUANT_AIRFLOW_LOAD_DOTENV", "true").lower() in {"0", "false", "no", "off"}:
-        return
-    if not dotenv_path:
-        return
-    if load_dotenv is None:
-        raise RuntimeError("python-dotenv is required to load .env-based DART/BOK/DB credentials.")
-    path = Path(dotenv_path)
-    load_dotenv(dotenv_path=path, override=False)
 
 
 def connect_db() -> Any:
@@ -392,6 +354,8 @@ def scan_required_schemas(conn: psycopg.Connection) -> dict[str, TableSchema]:
     required = {
         "feature.bok_macro_daily": ("feature", "bok_macro_daily"),
         "feature.dart_financial_quarterly": ("feature", "dart_financial_quarterly"),
+        "feature.dart_financial_filing": ("feature", "dart_financial_filing"),
+        "feature.dart_financial_account_value": ("feature", "dart_financial_account_value"),
     }
     optional = {
         "raw.bok_response": ("raw", "bok_response"),
@@ -405,10 +369,13 @@ def scan_required_schemas(conn: psycopg.Connection) -> dict[str, TableSchema]:
         table_schema = scan_table_schema(conn, schema_name, table_name, required=key in required)
         if table_schema is not None:
             schemas[key] = table_schema
-    assert_target_columns(schemas["feature.bok_macro_daily"], {"series_id", "effective_date", "value"})
+    assert_target_columns(
+        schemas["feature.bok_macro_daily"],
+        {"series_id", "effective_date", "available_from", "value"},
+    )
     assert_target_columns(
         schemas["feature.dart_financial_quarterly"],
-        {"symbol_id", "corp_code", "period_end", "report_code", "fs_div", "accounts_jsonb"},
+        {"symbol_id", "corp_code", "period_end", "available_from", "report_code", "fs_div", "accounts_jsonb"},
     )
     return schemas
 
@@ -517,7 +484,8 @@ def run_params(args: argparse.Namespace, start_date: date, end_date: date) -> di
         "end_date": end_date.isoformat(),
         "dry_run": args.dry_run,
         "dart_period_mode": resolve_dart_period_mode(args),
-        "dart_skip_existing": args.dart_skip_existing,
+        "dart_skip_existing": args.dart_skip_existing and not args.dart_refresh_existing,
+        "dart_refresh_existing": args.dart_refresh_existing,
         "max_dart_companies": args.max_dart_companies,
         "bok_series_preset": args.bok_series_preset,
     }
@@ -618,6 +586,7 @@ def ingest_bok_history(
                     "series_id": row["series_id"],
                     "effective_date": row["effective_date"],
                     "published_at": row.get("published_at"),
+                    "available_from": row["available_from"],
                     "value": row.get("value"),
                     "metadata_jsonb": row.get("metadata", {}),
                     "run_id": run_id,
@@ -715,7 +684,7 @@ def ingest_dart_history(
     report_periods = resolve_dart_report_periods(args, start_date, end_date)
     existing_feature_keys = (
         load_existing_dart_feature_keys(conn, schemas["feature.dart_financial_quarterly"])
-        if args.dart_skip_existing
+        if args.dart_skip_existing and not args.dart_refresh_existing
         else set()
     )
     no_data_status_codes = {item.strip() for item in args.dart_no_data_status_codes.split(",") if item.strip()}
@@ -725,7 +694,7 @@ def ingest_dart_history(
         report_periods,
         args.dart_fs_div,
         existing_feature_keys,
-        skip_existing=args.dart_skip_existing,
+        skip_existing=args.dart_skip_existing and not args.dart_refresh_existing,
         stats=stats,
     ):
         raw_payload = client.fetch_financial_statement(
@@ -759,6 +728,10 @@ def ingest_dart_history(
                 "corp_code": row["corp_code"],
                 "period_end": row["period_end"],
                 "reported_at": row.get("reported_at"),
+                "available_from": row.get("available_from"),
+                "filing_id": row.get("filing_id") or f"payload:{stable_hash(raw_payload.payload)}",
+                "source_payload_hash": stable_hash(raw_payload.payload),
+                "availability_policy": "source_filing_date" if row.get("reported_at") else "conservative_report_deadline",
                 "report_code": row["report_code"],
                 "fs_div": row["fs_div"],
                 "accounts_jsonb": row.get("accounts", {}),
@@ -766,13 +739,72 @@ def ingest_dart_history(
             }
             for row in rows
         ]
-        stats.rows_inserted += insert_rows(
+        stats.rows_inserted += upsert_rows(
             conn,
             schemas["feature.dart_financial_quarterly"],
             candidate_rows,
             dry_run=args.dry_run,
             commit=True,
         )
+        filing_rows = [
+            {
+                "symbol_id": company.symbol_id,
+                "corp_code": row["corp_code"],
+                "period_end": row["period_end"],
+                "available_from": row["available_from"],
+                "reported_at": row.get("reported_at"),
+                "report_code": row["report_code"],
+                "fs_div": row["fs_div"],
+                "filing_id": row.get("filing_id") or f"payload:{stable_hash(raw_payload.payload)}",
+                "source_payload_hash": stable_hash(raw_payload.payload),
+                "availability_policy": "source_filing_date" if row.get("reported_at") else "conservative_report_deadline",
+                "accounts_jsonb": row.get("accounts", {}),
+                "run_id": run_id,
+            }
+            for row in rows
+        ]
+        stats.rows_inserted += insert_rows(
+            conn,
+            schemas["feature.dart_financial_filing"],
+            filing_rows,
+            dry_run=args.dry_run,
+            commit=True,
+        )
+        if not args.dry_run:
+            account_rows = []
+            payload_hash = stable_hash(raw_payload.payload)
+            for row in rows:
+                filing_version_id = find_filing_version_id(
+                    conn,
+                    symbol_id=company.symbol_id,
+                    period_end=row["period_end"],
+                    report_code=row["report_code"],
+                    fs_div=row["fs_div"],
+                    source_payload_hash=payload_hash,
+                )
+                for account in row.get("account_rows", []):
+                    account_rows.append(
+                        {
+                            "filing_version_id": filing_version_id,
+                            "account_id": account["account_id"],
+                            "account_name": account.get("account_name"),
+                            "statement_code": account.get("statement_code"),
+                            "amount": account.get("amount"),
+                            "current_cumulative_amount": account.get("current_cumulative_amount"),
+                            "prior_quarter_amount": account.get("prior_quarter_amount"),
+                            "prior_amount": account.get("prior_amount"),
+                            "prior_year_amount": account.get("prior_year_amount"),
+                            "currency": account.get("currency"),
+                            "raw_jsonb": account.get("raw", {}),
+                        }
+                    )
+            stats.rows_inserted += insert_rows(
+                conn,
+                schemas["feature.dart_financial_account_value"],
+                account_rows,
+                dry_run=False,
+                commit=True,
+            )
         time.sleep(args.dart_request_sleep_seconds)
 
 
@@ -796,6 +828,34 @@ def load_existing_dart_feature_keys(
                 )
             )
     return keys
+
+
+def find_filing_version_id(
+    conn: psycopg.Connection,
+    *,
+    symbol_id: int,
+    period_end: date,
+    report_code: str,
+    fs_div: str,
+    source_payload_hash: str,
+) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT filing_version_id
+              FROM feature.dart_financial_filing
+             WHERE symbol_id = %s
+               AND period_end = %s
+               AND report_code = %s
+               AND fs_div = %s
+               AND source_payload_hash = %s
+            """,
+            (symbol_id, period_end, report_code, fs_div, source_payload_hash),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise SchemaMappingError("DART filing version was not found after idempotent insert.")
+    return int(row["filing_version_id"])
 
 
 def iter_resumable_dart_jobs(
@@ -941,6 +1001,9 @@ def insert_raw_payload(
         row = {
             "corp_code": raw_payload.request.get("corp_code"),
             "report_code": raw_payload.request.get("reprt_code"),
+            "business_year": raw_payload.request.get("bsns_year"),
+            "fs_div": raw_payload.request.get("fs_div"),
+            "request_date": raw_payload.request_date,
             "payload_hash": payload_hash,
             "payload_jsonb": raw_payload.payload,
             "run_id": run_id,
@@ -982,6 +1045,66 @@ def insert_rows(
     if commit:
         conn.commit()
     return inserted
+
+
+def upsert_rows(
+    conn: Any,
+    table_schema: TableSchema,
+    rows: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+    commit: bool,
+) -> int:
+    """Upsert a scanned table while retaining the schema-drift safety checks."""
+
+    if not rows:
+        return 0
+    insertable_rows = []
+    columns = [
+        column
+        for column in table_schema.columns
+        if any(column.name in row for row in rows) and not column.identity_generation
+    ]
+    for row in rows:
+        validate_required_values(table_schema, row)
+        insertable_rows.append(tuple(convert_value_for_column(row.get(column.name), column) for column in columns))
+
+    if dry_run:
+        return 0
+    if sql is None:
+        raise RuntimeError("psycopg is required for PostgreSQL insertion.")
+    primary_key = tuple(table_schema.primary_key)
+    if not primary_key:
+        raise SchemaMappingError(f"{table_schema.qualified_name} requires a primary key for upsert.")
+    missing_primary_key = sorted(set(primary_key) - {column.name for column in columns})
+    if missing_primary_key:
+        raise SchemaMappingError(
+            f"{table_schema.qualified_name} upsert is missing primary-key columns: {', '.join(missing_primary_key)}."
+        )
+    update_columns = [column for column in columns if column.name not in primary_key]
+    if update_columns:
+        conflict_action = sql.SQL("DO UPDATE SET {} ").format(
+            sql.SQL(", ").join(
+                sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(column.name), sql.Identifier(column.name))
+                for column in update_columns
+            )
+        )
+    else:
+        conflict_action = sql.SQL("DO NOTHING")
+    query = sql.SQL("INSERT INTO {}.{} ({}) VALUES ({}) ON CONFLICT ({}) {};").format(
+        sql.Identifier(table_schema.schema_name),
+        sql.Identifier(table_schema.table_name),
+        sql.SQL(", ").join(sql.Identifier(column.name) for column in columns),
+        sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+        sql.SQL(", ").join(sql.Identifier(column) for column in primary_key),
+        conflict_action,
+    )
+    with conn.cursor() as cur:
+        cur.executemany(query, insertable_rows)
+        upserted = max(cur.rowcount, 0)
+    if commit:
+        conn.commit()
+    return upserted
 
 
 def validate_required_values(table_schema: TableSchema, row: dict[str, Any]) -> None:
@@ -1101,7 +1224,7 @@ def period_end_for_report(business_year: int, report_code: str) -> date:
 
 
 def expected_disclosure_date(business_year: int, report_code: str) -> date:
-    year_offset, month, day = DART_EXPECTED_DISCLOSURE_DATE[report_code]
+    year_offset, month, day = DART_REPORT_DISCLOSURE_MONTH_DAY[report_code]
     return date(business_year + year_offset, month, day)
 
 

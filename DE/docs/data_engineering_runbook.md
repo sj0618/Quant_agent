@@ -2,7 +2,7 @@
 
 ## 결론
 
-데이터 엔지니어링 실행 경로는 `KRX/KIS 파일럿 → KRX primary OHLCV 적재 → TA-Lib 선계산 → BOK/OpenDART 외부 데이터 적재 → WICS one-shot 섹터 적재 → mart/as-of 조회 → Airflow 운영` 순서다. MVP에서는 SEIBro를 사용하지 않는다. 2026-07-09 기준 OHLCV 일일 수집 목표는 오늘 날짜까지이며, 최신 검증 결과는 `core.ohlcv_daily=2026-07-03`, `core.ohlcv_quality_daily=2026-07-05`, `feature.adjusted_ohlcv_daily=2026-07-03`, `feature.kis_adjusted_ohlcv_daily=2026-07-06`이다. 2026-06-24 기준 BOK `rate-fx` 12개 series, BOK 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 백필이 완료되어 증분 운영 대상으로 전환한다. 2026-06-28 기준 WICS Company Guide 기반 섹터 스냅샷을 로컬 DB에 1회 적재해 `core.symbol_master.sector`를 갱신한다. BOK 월별 유가는 `902Y003` 월간 series로 저장하며 실제 ECOS 발표일이 별도 컬럼으로 저장되지 않으므로 백테스트 조인 시 보수적 lag를 적용한다.
+데이터 엔지니어링 실행 경로는 `KRX 거래일 증거 → KRX primary OHLCV → KIS 수정주가 → TA-Lib → BOK/OpenDART → WICS 기간 스냅샷 → PIT mart/QA → Airflow 운영` 순서다. MVP에서는 SEIBro를 사용하지 않는다. 장기 백테스트에서 현재 마스터 상태를 과거에 투영하지 않도록 상장 이력·종목 분류 이력·WICS 기간 이력을 별도로 사용한다. BOK와 DART는 관측일(`effective_date`/`period_end`)과 실제 백테스트 사용 가능일(`available_from`)을 분리한다.
 
 ## 주요 명령
 
@@ -13,22 +13,20 @@
 | TA-Lib 계산 | `python scripts/compute_ta_indicators.py --start-date 2026-07-03 --end-date 2026-07-09 --symbols 005930 --db-mode docker` |
 | BOK rate-fx 10년 백필/재개 | `python scripts/ingest_dart_bok_history.py --scope full-10y --sources bok --bok-series-preset rate-fx --bok-request-sleep-seconds 0.2 --output .omx/logs/bok-rate-fx-full-10y.json` |
 | BOK 월별 유가 10년 백필 | `python scripts/ingest_dart_bok_history.py --scope custom --sources bok --start-date 2016-06-01 --end-date 2026-06-24 --bok-series-json '[{"stat_code":"902Y003","cycle":"M","item_code1":"010101","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010102","language":"en"},{"stat_code":"902Y003","cycle":"M","item_code1":"010103","language":"en"}]' --output .omx/logs/bok-oil-monthly-full-10y-20260624.json` |
-| DART CFS 2016~2026 백필/재개 | `python scripts/ingest_dart_bok_history.py --scope full-10y --sources dart --dart-refresh-corp-codes --dart-fs-div CFS --dart-skip-existing --dart-request-sleep-seconds 1.5 --output .omx/logs/dart-financial-full-10y.json` |
+| DART CFS 2016~2026 백필/재개 | `python scripts/ingest_dart_bok_history.py --scope full-10y --sources dart --dart-refresh-corp-codes --dart-fs-div CFS --dart-request-sleep-seconds 1.5 --output .omx/logs/dart-financial-full-10y.json` |
+| DART 정정 공시 재조회 | 위 명령에 `--dart-refresh-existing` 추가. 기존 기간을 API 전에 건너뛰는 `--dart-skip-existing`와 함께 사용하지 않는다. |
 | BOK 단일 series 점검 | `python scripts/ingest_external_data.py --job bok-series --stat-code 722Y001 --cycle D --start-period 20260514 --end-period 20260515 --item-code1 0101000 --db-mode docker` |
 | BOK 유가 단일 series 점검 | `python scripts/ingest_external_data.py --job bok-series --stat-code 902Y003 --cycle M --start-period 202601 --end-period 202605 --item-code1 010102 --db-mode docker` |
 | OpenDART corp code | `python scripts/ingest_external_data.py --job dart-corp-codes --db-mode docker` |
 | OpenDART financial | `python scripts/ingest_external_data.py --job dart-financial --symbol 005930 --corp-code <corp_code> --business-year 2025 --report-code 11011 --db-mode docker` |
-| WICS 섹터 스냅샷(1회) | `python scripts/ingest_wics_sectors.py --as-of-date 2026-06-28 --db-mode docker` |
+| KRX 거래일 증거 백필 | `python scripts/refresh_krx_trading_calendar.py --start-date <YYYY-MM-DD> --end-date <YYYY-MM-DD> --db-mode docker` |
+| WICS 섹터 스냅샷 | `python scripts/ingest_wics_sectors.py --as-of-date <YYYY-MM-DD> --db-mode docker` |
 | KIS official adjusted full + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode full --start-date 2016-05-20 --end-date 2026-07-09 --resume` |
 | KIS official adjusted daily incremental + TA | `python scripts/run_kis_adjusted_full_pipeline.py --run-mode daily-incremental --target-date 2026-07-09 --resume` |
 
-2026-06-28 검증 결과, WICS 적재는 listed common-stock 2,536개 중 2,535개를 매칭했고 `230980`은 FnGuide Company Guide가 `InvalidCompany`를 반환해 `sector`가 `NULL`로 남았다.
+WICS는 `feature.wics_sector_definition`에 정의를, `feature.wics_symbol_sector_history`에 종목별 기간 이력을 저장한다. `core.symbol_master.sector`는 최신 상태를 빠르게 조회하기 위한 캐시이며, 과거 백테스트의 섹터 기준값으로 사용하지 않는다. `mart.common_stock_universe_asof`와 관련 PIT view는 WICS 이력의 `valid_from`/`valid_to` 구간을 조인하므로, 수집하지 않은 과거 구간은 현재 섹터로 보간하지 않고 제외한다. KIND 분류는 WICS와 별도의 메타데이터/캐시 경로로 취급한다.
 
-섹터 저장 방식:
-- 별도 섹터 테이블은 만들지 않고, WICS/KIND 섹터 스냅샷을 `core.symbol_master`의 `sector` 컬럼에 저장한다.
-- 출처와 스냅샷 시점은 각각 `sector_source`, `sector_as_of`, `sector_run_id`로 추적한다.
-- `mart.common_stock_feature_frame_asof`는 `mart.kis_adjusted_feature_frame_asof`를 기반으로 하지만, 섹터는 `core.symbol_master.sm.sector`를 **명시적으로** 다시 뽑는다. 그래서 섹터를 백테스트 기본 view까지 전파하려면 이 뷰도 `migrations/008_symbol_sector_metadata.sql`에서 함께 재생성해야 한다.
-- 2026-06-28 기준 WICS distinct sector 예시(현재 DB, 26개): `IT가전`, `IT하드웨어`, `건강관리`, `건설,건축관련`, `기계`, `디스플레이`, `미디어,교육`, `반도체`, `보험`, `비철,목재등`, `상사,자본재`, `소매(유통)`, `소프트웨어`, `에너지`, `운송`, `유틸리티`, `은행`, `자동차`, `조선`, `증권`, `철강`, `통신서비스`, `필수소비재`, `호텔,레저서비스`, `화장품,의류,완구`, `화학`.
+WICS 과거 백테스트를 10년 범위로 수행하려면 해당 기간의 스냅샷을 별도로 확보해 날짜 순으로 적재해야 한다. 현재 수집 이후 구간에 대한 주 1회 스냅샷만으로는 10년 전체 WICS 이력을 복원할 수 없다.
 
 ## 환경변수
 
@@ -52,7 +50,7 @@
 | Airflow Connection / Secret Backend | 클라우드/관리형 Airflow에서 권장. Connection 값이 환경으로 주입되면 스크립트가 그대로 사용한다. |
 | 셸 환경변수 | 수동 실행과 로컬 검증용. `.env`를 쓰지 않고 `export`/프로파일 스크립트로 주입한다. |
 
-공용 DB만 쓰려면 서버에서는 `QUANT_AIRFLOW_LOAD_DOTENV=false`로 두어 repo 루트 `.env`를 읽지 않게 하는 편이 안전하다.
+DAG와 수집 스크립트는 저장소의 `.env`를 읽지 않으므로, 운영 환경에서는 필요한 값만 Airflow Connection, Secret Backend 또는 프로세스 환경변수로 주입한다.
 
 ### BOK 유가 series
 
@@ -70,8 +68,8 @@ BOK 월별 유가의 `TIME=YYYYMM`은 `feature.bok_macro_daily.effective_date = 
 |---|---|
 | Raw | `raw.ohlcv_response`, `raw.bok_response`, `raw.dart_response` |
 | Core | `core.symbol_master`, `core.ohlcv_daily`, `core.ohlcv_quality_daily`, `core.trading_calendar` |
-| Feature | `feature.ta_*_daily`, `feature.ta_*_ticker_daily`, `feature.bok_macro_daily`, `feature.dart_*` |
-| Mart | `mart.full_universe_asof`, `mart.symbol_feature_frame_asof`, `mart.bok_macro_asof`, `mart.dart_financial_asof` |
+| Feature | `feature.ta_*_daily`, `feature.ta_*_ticker_daily`, `feature.bok_macro_daily`, `feature.dart_financial_filing`, `feature.dart_financial_account_value`, `feature.wics_symbol_sector_history`, `feature.kis_corporate_action_event` |
+| Mart | `mart.full_universe_asof`, `mart.symbol_feature_frame_asof`, `mart.bok_macro_asof`, `mart.dart_financial_asof`, `mart.dart_financial_latest` |
 
 MVP에서는 SEIBro 계층을 사용하지 않는다. 위 SEIBro 관련 raw/feature/mart 항목은 기존 적재 이력 또는 후속 과제용으로만 남겨둔다.
 
@@ -157,11 +155,13 @@ wrapper 내부 검증은 KIS 적재 후 `failed_windows`가 비어 있을 때만
 
 ## Airflow
 
-`DE/airflow/dags/quant_agent_data_engineering.py`는 다음 DAG를 제공한다. 일일 DAG에는 섹터 스냅샷 태스크가 없고, WICS 섹터 수집은 `scripts/ingest_wics_sectors.py`로 한 번만 실행한다.
+`DE/airflow/dags/quant_agent_data_engineering.py`는 다음 DAG를 제공한다. 일일 DAG는 실행일 전일을 기준으로 KRX 거래일 증거·OHLCV·수정주가·TA·외부 데이터·QA를 처리하고, WICS는 별도 주기 DAG에서 현재 스냅샷을 이력으로 저장한다.
 
 | DAG | 역할 |
 |---|---|
 | `quant_agent_daily_data_engineering` | 일일 OHLCV, TA-Lib, BOK, DART corp code refresh |
 | `quant_agent_backfill_ohlcv_10y` | 설정된 primary source 기준 10년 OHLCV backfill |
+| `quant_agent_ohlcv_repair` | 최근 KRX 지연·정정 데이터 재수집 |
+| `quant_agent_wics_sector_snapshot` | KIND 메타데이터와 FnGuide WICS 기간 스냅샷 |
 
-Airflow task는 credentials를 코드/파일에서 읽지 않고 런타임 환경, Airflow Connection, Secret Backend에 의존한다. WICS 섹터 수집은 Airflow가 아닌 별도 one-shot 스크립트로만 실행한다. KIS TA/품질 스크립트는 DB 정보가 주입되면 `psycopg`를 자동 선택하고, 그렇지 않으면 로컬 Docker DB 경로를 따른다.
+Airflow task는 credentials를 코드/파일에서 읽지 않고 런타임 환경, Airflow Connection, Secret Backend에 의존한다. WICS 섹터 수집은 `quant_agent_wics_sector_snapshot`에서 주기 실행하며, 수동 스크립트도 같은 이력 테이블을 사용한다. KIS TA/품질 스크립트는 DB 정보가 주입되면 `psycopg`를 자동 선택하고, 그렇지 않으면 로컬 Docker DB 경로를 따른다.

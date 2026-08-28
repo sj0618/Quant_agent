@@ -33,6 +33,13 @@ CREATE TABLE IF NOT EXISTS core.symbol_security_type_history (
 CREATE INDEX IF NOT EXISTS idx_symbol_security_type_history_asof
     ON core.symbol_security_type_history (symbol_id, valid_from DESC, valid_to);
 
+-- 007 and 012 created versions of these views with different column layouts.
+-- PostgreSQL cannot rename an existing view column through CREATE OR REPLACE VIEW.
+-- Drop only the dependent views, then recreate the canonical PIT definitions below.
+DROP VIEW IF EXISTS mart.common_stock_universe_asof;
+DROP VIEW IF EXISTS mart.common_stock_feature_frame_asof;
+DROP VIEW IF EXISTS mart.full_universe_asof;
+
 CREATE OR REPLACE VIEW mart.common_stock_feature_frame_asof AS
 SELECT
     f.as_of_date,

@@ -144,6 +144,15 @@ class ExternalDataIngestionService:
             )
             self.repository.store_external_raw_payloads([raw_payload], run_id)
             rows = normalize_financial_statement(raw_payload, symbol=symbol, period_end=period_end)
+            payload_hash = _stable_hash(raw_payload.payload)
+            rows = [
+                {
+                    **row,
+                    "source_payload_hash": payload_hash,
+                    "filing_id": row.get("filing_id") or f"payload:{payload_hash}",
+                }
+                for row in rows
+            ]
             written = self.repository.upsert_dart_financials(rows, run_id)
             self.repository.finish_ingestion_run(run_id, status="success")
             return written
@@ -166,6 +175,7 @@ class ExternalDataIngestionService:
             rows = self.kind_client.fetch_listed_company_rows()
             for row in rows:
                 row["sector_as_of"] = snapshot_date
+            self.repository.upsert_kind_symbol_metadata(rows, run_id, as_of_date=snapshot_date)
             self.repository.upsert_kind_symbol_sectors(rows, run_id)
             matched_rows = self.repository.executor.fetch_json(
                 f"""
@@ -260,14 +270,8 @@ class ExternalDataIngestionService:
             if not sector_rows:
                 raise ValueError("WICS ingestion did not normalize any sector rows.")
 
-            self.repository.upsert_wics_symbol_sectors(sector_rows, run_id)
-            matched_rows = self.repository.executor.fetch_json(
-                f"""
-                SELECT COUNT(*)::int AS matched_count
-                  FROM core.symbol_master
-                 WHERE sector_run_id = {sql_literal(run_id)}
-                """
-            )[0]["matched_count"]
+            matched_symbols = {str(row["symbol"]) for row in sector_rows if row.get("symbol")}
+            matched_rows = len(matched_symbols)
             listed_common_null_sector_count = self.repository.executor.fetch_json(
                 """
                 SELECT COUNT(*)::int AS null_count
@@ -287,6 +291,15 @@ class ExternalDataIngestionService:
                     f"common_null_sector={listed_common_null_sector_count}"
                     + (f", failed={len(failed_symbols)} [{sample_failures}]" if failed_symbols else "")
                 )
+            match_ratio = matched_rows / len(target_rows) if target_rows else 0.0
+            if match_ratio < self.wics_client.config.min_match_ratio:
+                raise ValueError(
+                    "WICS sector coverage is below the configured threshold: "
+                    f"{matched_rows}/{len(target_rows)} ({match_ratio:.4f}) < "
+                    f"{self.wics_client.config.min_match_ratio:.4f}."
+                )
+            self.repository.store_wics_raw_payloads(sector_rows, run_id)
+            self.repository.upsert_wics_symbol_sectors(sector_rows, run_id)
             self.repository.finish_ingestion_run(run_id, status="success")
             return matched_rows
         except Exception as exc:

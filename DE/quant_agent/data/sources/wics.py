@@ -44,6 +44,7 @@ class WicsCompanyGuideClient:
             source_url=page["source_url"],
             as_of_date=as_of_date,
         )
+        row["raw_html"] = page["html_text"]
         return row
 
     def fetch_company_info_page(self, symbol: str) -> dict[str, Any]:

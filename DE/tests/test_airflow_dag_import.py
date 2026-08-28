@@ -141,6 +141,17 @@ class AirflowDagImportTests(unittest.TestCase):
         self.assertEqual(module._run_reference_date("2026-08-26"), date(2026, 8, 26))
         self.assertEqual(module._run_reference_date(None, date(2026, 8, 26)), date(2026, 8, 26))
 
+    def test_daily_tasks_target_the_previous_wall_clock_date(self):
+        module = _load_dag_module("quant_agent_data_engineering_dag_previous_trade_date")
+
+        self.assertEqual(
+            module._previous_run_trade_date("2026-08-27T10:00:00+09:00"),
+            date(2026, 8, 26),
+        )
+
+        source = Path("airflow/dags/quant_agent_data_engineering.py").read_text(encoding="utf-8")
+        self.assertIn("target_date = _previous_run_trade_date(logical_date, data_interval_end)", source)
+
     def test_daily_ingest_window_ends_at_run_date_even_when_calendar_is_stale(self):
         # The regression guard: the daily OHLCV window must advance to the run date
         # instead of pinning to MAX(core.trading_calendar). A stale calendar (stuck at

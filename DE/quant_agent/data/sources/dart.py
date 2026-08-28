@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
 from zipfile import BadZipFile, ZipFile
 
 from quant_agent.data.config import DartConfig
+from quant_agent.data.catalogs import (
+    DART_REPORT_CODE_PERIOD_END,
+    dart_conservative_available_from,
+)
 from quant_agent.data.models import RawSourcePayload
 from quant_agent.data.sources.base import (
     SourceConfigurationError,
@@ -248,7 +252,12 @@ def normalize_financial_statement(raw_payload: RawSourcePayload, *, symbol: str,
     report_code = str(request["reprt_code"])
     fs_div = str(request["fs_div"])
     normalized_period_end = period_end or _period_end_from_report_code(business_year, report_code)
-    reported_at = datetime.now(timezone.utc).isoformat()
+    filing_id, reported_at = extract_dart_filing_metadata(raw_payload.payload)
+    available_from = (
+        reported_at[:10]
+        if reported_at
+        else dart_conservative_available_from(business_year, report_code).isoformat()
+    )
     account_candidates: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
@@ -259,6 +268,7 @@ def normalize_financial_statement(raw_payload: RawSourcePayload, *, symbol: str,
         account_candidates.setdefault(account_id, []).append((index, row))
 
     accounts = {}
+    account_rows = []
     for account_id, candidates in account_candidates.items():
         selected_row = _select_financial_statement_row(account_id, candidates)
         accounts[account_id] = {
@@ -268,12 +278,30 @@ def normalize_financial_statement(raw_payload: RawSourcePayload, *, symbol: str,
             "amount": _decimal_or_none(selected_row.get("thstrm_amount")),
             "raw": selected_row,
         }
+        account_rows.append(
+            {
+                "account_id": account_id,
+                "account_name": selected_row.get("account_nm"),
+                "statement_code": selected_row.get("sj_div"),
+                "amount": _decimal_or_none(selected_row.get("thstrm_amount")),
+                "current_amount": _decimal_or_none(selected_row.get("thstrm_amount")),
+                "current_cumulative_amount": _decimal_or_none(selected_row.get("thstrm_add_amount")),
+                "prior_quarter_amount": _decimal_or_none(selected_row.get("frmtrm_q_amount")),
+                "prior_amount": _decimal_or_none(selected_row.get("frmtrm_amount")),
+                "prior_year_amount": _decimal_or_none(selected_row.get("bfefrmtrm_amount")),
+                "currency": selected_row.get("currency"),
+                "raw": selected_row,
+            }
+        )
     return [
         {
             "symbol": symbol,
             "corp_code": str(request["corp_code"]),
             "period_end": normalized_period_end,
             "reported_at": reported_at,
+            "available_from": available_from,
+            "filing_id": filing_id,
+            "account_rows": account_rows,
             "report_code": report_code,
             "fs_div": fs_div,
             "accounts": accounts,
@@ -287,15 +315,48 @@ def _xml_text(item: ET.Element, tag: str) -> str:
 
 
 def _period_end_from_report_code(business_year: int, report_code: str) -> date:
-    month_day = {
-        "11013": (3, 31),
-        "11012": (6, 30),
-        "11014": (9, 30),
-        "11011": (12, 31),
-    }.get(report_code)
+    month_day = DART_REPORT_CODE_PERIOD_END.get(report_code)
     if month_day is None:
         raise SourceResponseError(f"Unsupported OpenDART report code: {report_code}")
     return date(business_year, month_day[0], month_day[1])
+
+
+def extract_dart_filing_metadata(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Extract receipt identity/date when the source payload provides them."""
+
+    candidates: list[dict[str, Any]] = [payload]
+    rows = payload.get("list")
+    if isinstance(rows, list):
+        candidates.extend(row for row in rows if isinstance(row, dict))
+    filing_id = None
+    filing_date = None
+    for candidate in candidates:
+        if filing_id is None:
+            for key in ("rcept_no", "receipt_no", "filing_id"):
+                value = candidate.get(key)
+                if value not in (None, ""):
+                    filing_id = str(value).strip()
+                    break
+        if filing_date is None:
+            for key in ("rcept_dt", "receipt_date", "filing_date"):
+                value = candidate.get(key)
+                parsed = _parse_dart_date(value)
+                if parsed:
+                    filing_date = parsed.isoformat()
+                    break
+    return filing_id, filing_date
+
+
+def _parse_dart_date(value: Any) -> date | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    try:
+        if len(text) == 8 and text.isdigit():
+            return datetime.strptime(text, "%Y%m%d").date()
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:
