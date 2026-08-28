@@ -609,10 +609,11 @@ jobs:
       - name: Verify public AI readiness
         if: ${{ inputs.mode == 'live-audit' }}
         run: |
+          ai_required_checks='durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer'
           curl --fail --silent --show-error \
             --connect-timeout 10 --max-time 30 \
             https://qt-agent.kro.kr/ai-api/readiness \
-            | node scripts/readiness-semantic-gate.mjs --label public-ai-readiness
+            | node scripts/readiness-semantic-gate.mjs --label public-ai-readiness --checks "$ai_required_checks"
 
       - name: Benchmark internal backtest on two CPU cores
         if: ${{ inputs.mode == 'deployed-backtest' }}
