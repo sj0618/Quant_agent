@@ -228,6 +228,7 @@ jobs:
                   "021_ai_analysis_jobs.sql",
                   "022_immutable_analysis_results.sql",
                   "023_archive_undecodable_analysis_jobs.sql",
+                  "024_ai_analysis_job_lease_and_outbox.sql",
               ):
                   conn.execute(
                       (app_dir / "service_db" / "migrations" / name).read_text(

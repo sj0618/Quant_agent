@@ -32,6 +32,7 @@ FIXED_MIGRATIONS = (
     "021_ai_analysis_jobs.sql",
     "022_immutable_analysis_results.sql",
     "023_archive_undecodable_analysis_jobs.sql",
+    "024_ai_analysis_job_lease_and_outbox.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 PG17_MIN_VERSION_NUM = 170000
@@ -60,7 +61,7 @@ OWNED_RELATIONS = {
         "email_delivery_history", "ai_backtest_request",
         "ai_backtest_replacement_approval", "email_delivery_outbox",
         "ai_account_token", "ai_analysis_job", "ai_analysis_job_legacy",
-        "analysis_result",
+        "analysis_result", "ai_analysis_job_outbox",
     ),
     "i": (
         "idx_users_email", "idx_users_provider_user_id", "idx_strategy_user_created",
@@ -105,6 +106,8 @@ OWNED_RELATIONS = {
         "idx_analysis_result_owner_created", "idx_ai_analysis_job_analysis_result",
         "idx_backtest_run_analysis_result", "idx_ai_backtest_report_analysis_result",
         "idx_strategy_email_report_analysis_result",
+            "uq_ai_analysis_job_owner_idempotency", "idx_ai_analysis_job_lease_expiry",
+        "idx_ai_analysis_job_outbox_unpublished",
     ),
     "v": ("strategy_report_summary_v", "email_digest_history_v"),
 }
@@ -124,6 +127,12 @@ OWNED_COLUMNS = (
     ("users", "marketing_email"),
     ("users", "delivery_hour"),
     ("ai_analysis_job", "analysis_result_id"),
+    ("ai_analysis_job", "version"),
+    ("ai_analysis_job", "lease_owner"),
+    ("ai_analysis_job", "lease_expires_at"),
+    ("ai_analysis_job", "fencing_token"),
+    ("ai_analysis_job", "idempotency_key"),
+    ("ai_analysis_job", "spec_hash"),
     ("backtest_run", "analysis_result_id"),
     ("ai_backtest_report", "analysis_result_id"),
     ("strategy_email_report", "analysis_result_id"),
@@ -148,6 +157,12 @@ OWNED_CONSTRAINTS = (
     "ck_analysis_result_public_snapshot_object",
     "uq_analysis_result_owner_manifest_hash",
     "fk_ai_analysis_job_analysis_result",
+    "ck_ai_analysis_job_version_positive",
+    "ck_ai_analysis_job_fencing_token_monotonic",
+    "ck_ai_analysis_job_lease_pairing",
+    "ck_ai_analysis_job_spec_hash_sha256",
+    "fk_ai_analysis_job_outbox_job",
+    "ck_ai_analysis_job_outbox_payload_object",
     "fk_backtest_run_analysis_result",
     "fk_ai_backtest_report_analysis_result",
     "fk_strategy_email_report_analysis_result",

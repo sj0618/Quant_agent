@@ -70,6 +70,15 @@ class InterruptedJobReconciliationError(RuntimeError):
     """The process cannot safely serve jobs until restart reconciliation completes."""
 
 
+class JobConcurrentUpdateError(RuntimeError):
+    """Another writer changed the job between our read and our write.
+
+    Raised rather than retried here: the caller holds the transition it wanted to apply
+    and is the only one that knows whether re-applying it on top of the newer row is
+    still correct.
+    """
+
+
 class PipelineStageError(RuntimeError):
     """Carries the stage a failure actually happened in.
 
@@ -204,6 +213,10 @@ class AnalysisJob(BaseModel):
     # Canonical writer persists this versioned ledger in job_jsonb; it deliberately has
     # no DSN, credential, or arbitrary provider payload fields.
     execution_manifest: ExecutionManifest = Field(exclude=True)
+    # Optimistic-concurrency version. Storage-only, like the fields above: it is a
+    # property of the row, not of the analysis, and the public job response must not
+    # change shape because the row was written twice. In-memory stores leave it at 1.
+    version: int = Field(default=1, exclude=True, ge=1)
 
 
 class AnalysisJobStore(Protocol):

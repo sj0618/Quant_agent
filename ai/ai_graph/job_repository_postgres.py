@@ -10,7 +10,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import ValidationError
 
-from ai_graph.jobs import AnalysisJob, AnalysisJobStatus, InMemoryAnalysisJobStore
+from ai_graph.jobs import (
+    AnalysisJob,
+    AnalysisJobStatus,
+    InMemoryAnalysisJobStore,
+    JobConcurrentUpdateError,
+)
 from ai_graph.schemas import APIEnvelope, Stage
 
 _logger = logging.getLogger(__name__)
@@ -72,16 +77,21 @@ class PostgresAnalysisJobRepository:
             run_id=run_id,
             fallback_reasons=fallback_reasons,
         )
-        self._save(job)
+        self._insert(job)
         return job
 
     def get_job(self, job_id: str) -> AnalysisJob | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT job_jsonb FROM app.ai_analysis_job WHERE job_id = %s",
+                "SELECT job_jsonb, version FROM app.ai_analysis_job WHERE job_id = %s",
                 (job_id,),
             ).fetchone()
-        return AnalysisJob.model_validate(row["job_jsonb"]) if row else None
+        if row is None:
+            return None
+        # `version` is a column, not part of the document: it describes the row, and
+        # putting it in the JSONB would make every write change the document it is
+        # meant to guard.
+        return AnalysisJob.model_validate({**row["job_jsonb"], "version": row["version"]})
 
     def update_job_status(
         self,
@@ -102,8 +112,7 @@ class PostgresAnalysisJobRepository:
             error_message=error_message,
             message=message,
         )
-        self._save(job)
-        return job
+        return self._save(job)
 
     def complete_job(
         self,
@@ -118,8 +127,7 @@ class PostgresAnalysisJobRepository:
             result_envelope,
             fallback_reasons=fallback_reasons,
         )
-        self._save(job)
-        return job
+        return self._save(job)
 
     def fail_job(
         self,
@@ -136,8 +144,7 @@ class PostgresAnalysisJobRepository:
             fallback_reasons=fallback_reasons,
             result_envelope=result_envelope,
         )
-        self._save(job)
-        return job
+        return self._save(job)
 
     def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
         with self._connect() as connection:
@@ -299,17 +306,45 @@ class PostgresAnalysisJobRepository:
             raise KeyError(f"analysis job not found: {job_id}")
         return InMemoryAnalysisJobStore(jobs={job_id: job})
 
-    def _save(self, job: AnalysisJob) -> None:
+    def _save(self, job: AnalysisJob) -> AnalysisJob:
+        """Apply a transition only if nobody else moved the row since we read it.
+
+        The previous implementation was `INSERT ... ON CONFLICT DO UPDATE` with no
+        predicate, so two writers each read version N, each wrote, and the second write
+        silently discarded the first transition. The predicate turns that into a raised
+        conflict the caller can see.
+        """
+
         with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE app.ai_analysis_job
+                   SET job_jsonb = %s, updated_at = %s, version = version + 1
+                 WHERE job_id = %s AND version = %s
+             RETURNING version
+                """,
+                (Jsonb(_job_document(job)), job.updated_at, job.job_id, job.version),
+            ).fetchone()
+        if updated is None:
+            raise JobConcurrentUpdateError(
+                f"analysis job {job.job_id} was modified by another writer"
+            )
+        return job.model_copy(update={"version": updated["version"]})
+
+    def _insert(self, job: AnalysisJob, *, idempotency_key: str | None = None) -> None:
+        """Create the row and its outbox event in one transaction.
+
+        Atomic on purpose: a job with no event is invisible to the publisher, and an
+        event with no job is a message about something that does not exist.
+        """
+
+        with self._connect() as connection, connection.transaction():
             connection.execute(
                 """
                 INSERT INTO app.ai_analysis_job (
-                    job_id, user_id, job_jsonb, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (job_id) DO UPDATE SET
-                    user_id = EXCLUDED.user_id,
-                    job_jsonb = EXCLUDED.job_jsonb,
-                    updated_at = EXCLUDED.updated_at
+                    job_id, user_id, job_jsonb, created_at, updated_at,
+                    version, idempotency_key
+                ) VALUES (%s, %s, %s, %s, %s, 1, %s)
                 """,
                 (
                     job.job_id,
@@ -317,5 +352,73 @@ class PostgresAnalysisJobRepository:
                     Jsonb(_job_document(job)),
                     job.created_at,
                     job.updated_at,
+                    idempotency_key,
                 ),
             )
+            connection.execute(
+                """
+                INSERT INTO app.ai_analysis_job_outbox (job_id, event_type, payload_jsonb)
+                VALUES (%s, %s, %s)
+                """,
+                (job.job_id, "analysis_job_created", Jsonb({"job_id": job.job_id})),
+            )
+
+    def claim_job(self, job_id: str, *, owner: str, lease_seconds: int) -> int | None:
+        """Take the lease, or return None because someone else holds a live one.
+
+        The condition is the whole point: `status = 'queued'` alone would let a second
+        worker take a job the first is running, and `owner_incarnation != mine` cannot
+        tell a dead owner from a busy one because nothing refreshes it.
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE app.ai_analysis_job
+                   SET lease_owner = %s,
+                       lease_expires_at = now() + make_interval(secs => %s),
+                       fencing_token = fencing_token + 1,
+                       version = version + 1
+                 WHERE job_id = %s
+                   AND (lease_expires_at IS NULL OR lease_expires_at < now())
+             RETURNING fencing_token
+                """,
+                (owner, lease_seconds, job_id),
+            ).fetchone()
+        return row["fencing_token"] if row else None
+
+    def renew_lease(self, job_id: str, *, owner: str, lease_seconds: int) -> bool:
+        """Extend our own lease. A holder that stops renewing is treated as gone."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE app.ai_analysis_job
+                   SET lease_expires_at = now() + make_interval(secs => %s)
+                 WHERE job_id = %s AND lease_owner = %s AND lease_expires_at >= now()
+             RETURNING job_id
+                """,
+                (lease_seconds, job_id, owner),
+            ).fetchone()
+        return row is not None
+
+    def release_lease(self, job_id: str, *, owner: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE app.ai_analysis_job
+                   SET lease_owner = NULL, lease_expires_at = NULL
+                 WHERE job_id = %s AND lease_owner = %s
+             RETURNING job_id
+                """,
+                (job_id, owner),
+            ).fetchone()
+        return row is not None
+
+    def fencing_token(self, job_id: str) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT fencing_token FROM app.ai_analysis_job WHERE job_id = %s",
+                (job_id,),
+            ).fetchone()
+        return row["fencing_token"] if row else None
