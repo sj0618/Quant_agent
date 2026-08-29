@@ -98,16 +98,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_wics_symbol_sector_history_symbol_date
 -- Preserve the existing current WICS snapshot as the first historical interval.
 INSERT INTO feature.wics_sector_definition
     (wics_code, sector_name, source_id, run_id, metadata_jsonb)
-SELECT DISTINCT
-    COALESCE(NULLIF(sm.metadata_jsonb->>'wics_sector_code', ''), sm.sector),
-    sm.sector,
+WITH current_wics AS (
+    SELECT
+        COALESCE(NULLIF(sm.metadata_jsonb->>'wics_sector_code', ''), sm.sector) AS wics_code,
+        sm.sector AS sector_name,
+        sm.sector_run_id AS run_id,
+        sm.sector_as_of,
+        sm.updated_at,
+        sm.symbol_id
+    FROM core.symbol_master sm
+    WHERE sm.sector IS NOT NULL
+      AND sm.sector_source = 'WICS'
+      AND COALESCE(NULLIF(sm.metadata_jsonb->>'wics_sector_code', ''), sm.sector) IS NOT NULL
+), canonical_wics AS (
+    SELECT DISTINCT ON (wics_code)
+        wics_code,
+        sector_name,
+        run_id
+    FROM current_wics
+    ORDER BY wics_code, sector_as_of DESC NULLS LAST, updated_at DESC, symbol_id
+)
+SELECT
+    wics_code,
+    sector_name,
     'WICS',
-    sm.sector_run_id,
+    run_id,
     jsonb_build_object('migration_source', 'core.symbol_master.sector')
-FROM core.symbol_master sm
-WHERE sm.sector IS NOT NULL
-  AND sm.sector_source = 'WICS'
-  AND COALESCE(NULLIF(sm.metadata_jsonb->>'wics_sector_code', ''), sm.sector) IS NOT NULL
+FROM canonical_wics
 ON CONFLICT (wics_code) DO UPDATE SET
     sector_name = EXCLUDED.sector_name,
     source_id = COALESCE(EXCLUDED.source_id, feature.wics_sector_definition.source_id),
@@ -131,7 +148,8 @@ WHERE sm.sector IS NOT NULL
   AND sm.sector_source = 'WICS'
   AND sm.sector_as_of IS NOT NULL
   AND COALESCE(NULLIF(sm.metadata_jsonb->>'wics_sector_code', ''), sm.sector) IS NOT NULL
-ON CONFLICT (symbol_id, wics_code, valid_from) DO UPDATE SET
+ON CONFLICT (symbol_id, valid_from) DO UPDATE SET
+    wics_code = EXCLUDED.wics_code,
     sector_name = EXCLUDED.sector_name,
     market_segment = EXCLUDED.market_segment,
     source_id = EXCLUDED.source_id,
