@@ -496,16 +496,17 @@ SELECT DISTINCT ON (symbol_id, period_end, report_code, fs_div)
 FROM feature.dart_financial_filing
 ORDER BY symbol_id, period_end, report_code, fs_div, available_from DESC, filing_version_id DESC;
 
--- Migration 002 creates this reader role, but existing databases may have
--- skipped that role-only block while retaining the data-engineering schema.
+-- Migration 002 creates this reader role, but application migration users may
+-- not have CREATEROLE. Keep this optional grant non-blocking when the role is
+-- managed separately by a database administrator.
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'backtest_reader') THEN
-        EXECUTE 'CREATE ROLE backtest_reader NOLOGIN';
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'backtest_reader') THEN
+        EXECUTE 'GRANT SELECT ON mart.dart_financial_latest TO backtest_reader';
+    ELSE
+        RAISE NOTICE 'Skipping optional grant: role backtest_reader does not exist';
     END IF;
 END $$;
-
-GRANT SELECT ON mart.dart_financial_latest TO backtest_reader;
 
 COMMENT ON COLUMN feature.bok_macro_daily.available_from IS
     'First safe backtest date. It is deliberately conservative when ECOS release time is unavailable.';
