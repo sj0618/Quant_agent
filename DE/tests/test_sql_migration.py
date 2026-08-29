@@ -83,6 +83,35 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertNotIn("sm.market_segment IN ('KOSPI', 'KOSDAQ')", sql)
         self.assertNotIn("sm.security_type = '보통주'", sql)
 
+        self.assertIn("DROP VIEW IF EXISTS mart.common_stock_universe_asof", sql)
+
+    def test_backtest_readiness_migration_recreates_bok_view_after_layout_change(self):
+        sql = Path("migrations/014_backtest_readiness.sql").read_text(encoding="utf-8")
+        self.assertIn("DROP VIEW IF EXISTS mart.bok_macro_asof", sql)
+        self.assertIn("CREATE VIEW mart.bok_macro_asof", sql)
+
+    def test_backtest_readiness_migration_contains_pit_data_contracts(self):
+        sql = Path("migrations/014_backtest_readiness.sql").read_text(encoding="utf-8")
+
+        for table_name in (
+            "raw.wics_company_info_response",
+            "feature.wics_sector_definition",
+            "feature.wics_symbol_sector_history",
+            "feature.kis_corporate_action_event",
+            "feature.dart_financial_filing",
+            "feature.dart_financial_account_value",
+        ):
+            self.assertIn(f"CREATE TABLE IF NOT EXISTS {table_name}", sql)
+        self.assertIn("evidence_status", sql)
+        self.assertIn("available_from", sql)
+        self.assertIn("mart.dart_financial_latest", sql)
+        self.assertIn("ON CONFLICT (symbol_id, period_end, report_code, fs_div, source_payload_hash)", sql)
+        self.assertIn("JOIN feature.wics_symbol_sector_history w", sql)
+        self.assertIn("w.sector_name AS sector", sql)
+        self.assertIn("AND sm.sector_source = 'WICS'", sql)
+        self.assertIn("ALTER COLUMN mod_yn SET NOT NULL", sql)
+        self.assertIn("feature.kis_corporate_action_event", sql)
+
     def test_app_ai_backtest_erd_migration_contains_requested_tables(self):
         sql = Path("../service_db/migrations/011_app_ai_backtest_erd.sql").read_text(encoding="utf-8")
         self.assertIn("CREATE SCHEMA IF NOT EXISTS app;", sql)

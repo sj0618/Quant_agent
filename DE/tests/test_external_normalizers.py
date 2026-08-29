@@ -29,7 +29,26 @@ class ExternalNormalizerTests(unittest.TestCase):
         rows = normalize_bok_observations(raw, published_at_policy="none")
         self.assertEqual(rows[0]["series_id"], "722Y001:0101000")
         self.assertEqual(rows[0]["effective_date"], date(2026, 5, 15))
+        self.assertEqual(rows[0]["available_from"], date(2026, 5, 16))
         self.assertEqual(rows[0]["value"], Decimal("3.50"))
+
+    def test_normalize_bok_monthly_observations_waits_until_next_month(self):
+        raw = RawSourcePayload(
+            source="BOK",
+            endpoint_key="StatisticSearch",
+            request_date=date(2026, 6, 10),
+            request={"stat_code": "902Y003", "cycle": "M", "item_code1": "010101"},
+            payload={
+                "StatisticSearch": {
+                    "row": [{"TIME": "202605", "DATA_VALUE": "65.20"}],
+                }
+            },
+        )
+
+        rows = normalize_bok_observations(raw, published_at_policy="none")
+
+        self.assertEqual(rows[0]["effective_date"], date(2026, 5, 1))
+        self.assertEqual(rows[0]["available_from"], date(2026, 6, 1))
 
     def test_normalize_dart_corp_codes_and_financials(self):
         xml = b"<result><list><corp_code>00126380</corp_code><corp_name>Samsung</corp_name><stock_code>005930</stock_code><modify_date>20260515</modify_date></list></result>"
@@ -48,7 +67,28 @@ class ExternalNormalizerTests(unittest.TestCase):
         )
         financial_rows = normalize_financial_statement(raw, symbol="005930")
         self.assertEqual(financial_rows[0]["period_end"], date(2025, 12, 31))
+        self.assertEqual(financial_rows[0]["available_from"], "2026-03-31")
         self.assertEqual(financial_rows[0]["accounts"]["ifrs-full_Revenue"]["amount"], Decimal("1000"))
+
+    def test_normalize_dart_financials_uses_source_filing_metadata_when_available(self):
+        raw = RawSourcePayload(
+            source="DART",
+            endpoint_key="fnlttSinglAcntAll",
+            request_date=date(2026, 5, 17),
+            request={"corp_code": "00126380", "bsns_year": "2025", "reprt_code": "11011", "fs_div": "CFS"},
+            payload={
+                "status": "000",
+                "rcept_no": "20260517000001",
+                "rcept_dt": "20260517",
+                "list": [{"account_id": "ifrs-full_Revenue", "account_nm": "매출액", "thstrm_amount": "1,000"}],
+            },
+        )
+
+        rows = normalize_financial_statement(raw, symbol="005930")
+
+        self.assertEqual(rows[0]["filing_id"], "20260517000001")
+        self.assertEqual(rows[0]["reported_at"], "2026-05-17")
+        self.assertEqual(rows[0]["available_from"], "2026-05-17")
 
     def test_normalize_dart_financials_prefers_total_rows_by_statement(self):
         raw = RawSourcePayload(

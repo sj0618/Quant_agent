@@ -45,7 +45,11 @@ def main() -> int:
         symbol_limit=args.limit,
     )
 
-    text = json.dumps({"job": "wics-sector", "written": count}, ensure_ascii=False, indent=2)
+    text = json.dumps(
+        {"job": "wics-sector", "written": count, "min_match_ratio": service.wics_client.config.min_match_ratio},
+        ensure_ascii=False,
+        indent=2,
+    )
     print(text)
     if args.output:
         output_path = Path(args.output)

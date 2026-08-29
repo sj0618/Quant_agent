@@ -1,7 +1,4 @@
-import os
-import tempfile
 from datetime import date
-from pathlib import Path
 import unittest
 
 from scripts.ingest_dart_bok_history import (
@@ -84,6 +81,25 @@ class DartBokHistoryIngestTests(unittest.TestCase):
 
         self.assertTrue(args.dart_skip_existing)
 
+    def test_refresh_existing_overrides_skip_existing_for_restatements(self):
+        args = parse_args(
+            [
+                "--scope",
+                "custom",
+                "--sources",
+                "dart",
+                "--start-date",
+                "2016-01-01",
+                "--end-date",
+                "2016-12-31",
+                "--dart-skip-existing",
+                "--dart-refresh-existing",
+            ]
+        )
+
+        self.assertTrue(args.dart_skip_existing)
+        self.assertTrue(args.dart_refresh_existing)
+
     def test_resumable_dart_jobs_skip_existing_feature_keys(self):
         universe = [
             DartUniverseEntry(symbol="005930", corp_code="00126380", symbol_id=1),
@@ -143,24 +159,14 @@ class DartBokHistoryIngestTests(unittest.TestCase):
         self.assertEqual(configs[0].item_code1, "0101000")
         self.assertIn("731Y003", {config.stat_code for config in configs})
 
-    def test_load_runtime_dotenv_skips_when_airflow_disables_it(self):
-        from scripts import ingest_dart_bok_history as module
+    def test_all_macro_preset_includes_monthly_oil_series(self):
+        configs = load_bok_series_configs(None, "all-macro")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dotenv_path = Path(tmpdir) / "runtime.env"
-            dotenv_path.write_text("SENTINEL_DOTENV_SHOULD_NOT_APPEAR=loaded\n", encoding="utf-8")
-            previous = os.environ.get("QUANT_AIRFLOW_LOAD_DOTENV")
-            os.environ["QUANT_AIRFLOW_LOAD_DOTENV"] = "false"
-            try:
-                module.load_runtime_dotenv(str(dotenv_path))
-            finally:
-                if previous is None:
-                    os.environ.pop("QUANT_AIRFLOW_LOAD_DOTENV", None)
-                else:
-                    os.environ["QUANT_AIRFLOW_LOAD_DOTENV"] = previous
-
-        self.assertIsNone(os.environ.get("SENTINEL_DOTENV_SHOULD_NOT_APPEAR"))
-
+        self.assertEqual(len(configs), 15)
+        self.assertEqual(
+            {config.item_code1 for config in configs if config.stat_code == "902Y003"},
+            {"010101", "010102", "010103"},
+        )
 
 if __name__ == "__main__":
     unittest.main()

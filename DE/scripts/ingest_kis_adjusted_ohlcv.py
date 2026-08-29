@@ -194,6 +194,18 @@ SELECT
     'fid_org_adj_prc', '0'
   )
 FROM tmp_kis_adjusted_ohlcv;
+INSERT INTO feature.kis_corporate_action_event
+  (ticker, effective_date, event_type, mod_yn, revision_reason, raw_payload_jsonb, source_id, run_id)
+SELECT ticker, "time", 'KIS_REVISION', COALESCE(NULLIF(BTRIM(mod_yn), ''), ''),
+       COALESCE(NULLIF(BTRIM(revision_reason), ''), ''), raw_payload_jsonb, 'KIS', run_id
+  FROM tmp_kis_adjusted_ohlcv
+ WHERE NULLIF(BTRIM(mod_yn), '') IS NOT NULL
+    OR NULLIF(BTRIM(revision_reason), '') IS NOT NULL
+ON CONFLICT (ticker, effective_date, mod_yn, revision_reason) DO UPDATE SET
+  event_type = EXCLUDED.event_type,
+  raw_payload_jsonb = EXCLUDED.raw_payload_jsonb,
+  source_id = EXCLUDED.source_id,
+  run_id = EXCLUDED.run_id;
 COMMIT;
 """
         self.execute(sql)
@@ -313,6 +325,18 @@ class PsycopgClient(PsycopgScriptClient):
                 'fid_org_adj_prc', '0'
               )
             FROM tmp_kis_adjusted_ohlcv;
+            INSERT INTO feature.kis_corporate_action_event
+              (ticker, effective_date, event_type, mod_yn, revision_reason, raw_payload_jsonb, source_id, run_id)
+SELECT ticker, "time", 'KIS_REVISION', COALESCE(NULLIF(BTRIM(mod_yn), ''), ''),
+       COALESCE(NULLIF(BTRIM(revision_reason), ''), ''), raw_payload_jsonb, 'KIS', run_id
+              FROM tmp_kis_adjusted_ohlcv
+             WHERE NULLIF(BTRIM(mod_yn), '') IS NOT NULL
+                OR NULLIF(BTRIM(revision_reason), '') IS NOT NULL
+            ON CONFLICT (ticker, effective_date, mod_yn, revision_reason) DO UPDATE SET
+              event_type = EXCLUDED.event_type,
+              raw_payload_jsonb = EXCLUDED.raw_payload_jsonb,
+              source_id = EXCLUDED.source_id,
+              run_id = EXCLUDED.run_id;
             """,
         )
 
@@ -561,6 +585,22 @@ def ensure_tables(db: DockerPsqlClient) -> None:
         SELECT create_hypertable('{KIS_ADJUSTED_TABLE}', 'time', if_not_exists => TRUE);
         CREATE INDEX IF NOT EXISTS idx_feature_kis_adjusted_ohlcv_daily_ticker_time
           ON {KIS_ADJUSTED_TABLE} (ticker, "time" DESC);
+        CREATE TABLE IF NOT EXISTS feature.kis_corporate_action_event (
+          event_id BIGSERIAL PRIMARY KEY,
+          ticker TEXT NOT NULL,
+          effective_date DATE NOT NULL,
+          event_type TEXT NOT NULL,
+          mod_yn TEXT,
+          revision_reason TEXT,
+          raw_payload_jsonb JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+          source_id TEXT REFERENCES meta.data_source(source_id),
+          run_id UUID REFERENCES meta.ingestion_run(run_id),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE (ticker, effective_date, mod_yn, revision_reason)
+        );
+        CREATE INDEX IF NOT EXISTS idx_kis_corporate_action_event_ticker_date
+          ON feature.kis_corporate_action_event (ticker, effective_date DESC);
         """
     )
 

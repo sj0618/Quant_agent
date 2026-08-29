@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import date, datetime, timezone
-from decimal import Decimal
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from typing import Any
 from uuid import UUID, uuid4
 
-from quant_agent.data.config import DatabaseConfig
+from quant_agent.data.config import DEFAULT_BOK_STALENESS_DAYS, DatabaseConfig
+from quant_agent.data.catalogs import BOK_SERIES_PRESETS, DART_REPORT_CODE_PERIOD_END, bok_series_id
 from quant_agent.data.db import SqlExecutor, jsonb_literal, make_executor, sql_literal
 from quant_agent.data.models import (
     AnalystReportSummary,
@@ -334,8 +334,8 @@ class DataRepository:
 
         calendar_rows = [
             "("
-            f"{sql_literal('KRX')}, {sql_literal(trade_date)}, TRUE, "
-            f"{sql_literal(source_id)}, {sql_literal(run_id)}"
+            f"{sql_literal('KRX')}, {sql_literal(trade_date)}, TRUE, {sql_literal('OPEN_OBSERVED')}, "
+            f"{sql_literal(source_id)}, {sql_literal(run_id)}, {sql_literal('observed')}"
             ")"
             for trade_date in sorted(calendar_dates)
         ]
@@ -364,12 +364,15 @@ class DataRepository:
             _symbol_security_type_history_sql(security_type_history_rows),
             _symbol_name_history_sql(name_history_rows),
             f"""
-            INSERT INTO core.trading_calendar (market, trade_date, is_open, source_id, run_id)
+            INSERT INTO core.trading_calendar
+              (market, trade_date, is_open, reason, source_id, run_id, evidence_status)
             VALUES {", ".join(calendar_rows)}
             ON CONFLICT (market, trade_date) DO UPDATE SET
               is_open = EXCLUDED.is_open,
+              reason = EXCLUDED.reason,
               source_id = EXCLUDED.source_id,
-              run_id = EXCLUDED.run_id;
+              run_id = EXCLUDED.run_id,
+              evidence_status = EXCLUDED.evidence_status;
             """,
             f"""
             INSERT INTO core.ohlcv_daily
@@ -405,7 +408,76 @@ class DataRepository:
         self.executor.execute_script("\n".join(script_parts))
         return len(deduped_bars), issues
 
+    def upsert_trading_calendar_observations(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        observed_open_dates: set[date],
+        run_id: UUID,
+        source_id: str = "KRX",
+    ) -> int:
+        """Persist calendar evidence without treating missing weekday data as closed."""
+
+        if end_date < start_date:
+            raise ValueError("end_date must be greater than or equal to start_date.")
+        rows = []
+        current = start_date
+        while current <= end_date:
+            if current.weekday() >= 5:
+                is_open, reason, evidence = False, "WEEKEND", "weekend"
+            elif current in observed_open_dates:
+                is_open, reason, evidence = True, "OPEN_OBSERVED", "observed"
+            else:
+                is_open, reason, evidence = None, "UNCONFIRMED_NO_DATA", "unconfirmed"
+            rows.append(
+                "("
+                f"{sql_literal('KRX')}, {sql_literal(current)}, {sql_literal(is_open)}, {sql_literal(reason)}, "
+                f"{sql_literal(source_id)}, {sql_literal(run_id)}, {sql_literal(evidence)}"
+                ")"
+            )
+            current += timedelta(days=1)
+        self.executor.execute_script(
+            f"""
+            INSERT INTO core.trading_calendar
+              (market, trade_date, is_open, reason, source_id, run_id, evidence_status)
+            VALUES {", ".join(rows)}
+            ON CONFLICT (market, trade_date) DO UPDATE SET
+                is_open = CASE
+                    WHEN EXCLUDED.is_open IS TRUE THEN TRUE
+                    WHEN core.trading_calendar.is_open IS TRUE THEN TRUE
+                    ELSE EXCLUDED.is_open
+                END,
+                reason = CASE
+                    WHEN EXCLUDED.is_open IS TRUE THEN EXCLUDED.reason
+                    WHEN core.trading_calendar.is_open IS TRUE THEN core.trading_calendar.reason
+                    ELSE EXCLUDED.reason
+                END,
+                source_id = EXCLUDED.source_id,
+                run_id = EXCLUDED.run_id,
+                evidence_status = CASE
+                    WHEN EXCLUDED.is_open IS TRUE THEN EXCLUDED.evidence_status
+                    WHEN core.trading_calendar.is_open IS TRUE THEN core.trading_calendar.evidence_status
+                    ELSE EXCLUDED.evidence_status
+                END;
+            """
+        )
+        return len(rows)
+
     def refresh_symbol_lifecycle(self, *, run_id: UUID, as_of_date: date, source_id: str = "KRX") -> None:
+        confirmed_calendar = self.executor.fetch_json(
+            f"""
+            SELECT 1
+              FROM core.trading_calendar
+             WHERE market = 'KRX'
+               AND trade_date = {sql_literal(as_of_date)}
+               AND is_open IS TRUE
+               AND evidence_status = 'observed'
+             LIMIT 1;
+            """
+        )
+        if not confirmed_calendar:
+            return
         self.executor.execute_script(
             f"""
             WITH observations AS (
@@ -837,6 +909,265 @@ class DataRepository:
             """
         )
 
+    def run_backtest_readiness_checks(
+        self,
+        *,
+        run_id: UUID,
+        start_date: date,
+        end_date: date,
+        bok_staleness_days: int = DEFAULT_BOK_STALENESS_DAYS,
+    ) -> None:
+        """Record PIT contract violations and coverage gaps for backtest inputs."""
+
+        if bok_staleness_days < 0:
+            raise ValueError("bok_staleness_days must be non-negative.")
+        expected_bok_values = ", ".join(
+            f"({sql_literal(bok_series_id(item))}, {sql_literal(item['cycle'])})"
+            for item in BOK_SERIES_PRESETS["all-macro"]
+        )
+        expected_dart_values = ", ".join(
+            f"({sql_literal(report_code)}, {sql_literal(date(year, month, day))})"
+            for year in range(start_date.year, end_date.year + 1)
+            for report_code, (month, day) in DART_REPORT_CODE_PERIOD_END.items()
+            if start_date <= date(year, month, day) <= end_date
+        ) or "(NULL::text, NULL::date)"
+        bok_stale_before = end_date - timedelta(days=bok_staleness_days)
+
+        self.executor.execute_script(
+            f"""
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'core.trading_calendar', c.trade_date,
+                   'warning', 'KRX_CALENDAR_UNCONFIRMED',
+                   'Weekday has no confirmed KRX open/holiday evidence.'
+              FROM core.trading_calendar c
+             WHERE c.market = 'KRX'
+               AND c.trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+               AND EXTRACT(ISODOW FROM c.trade_date) NOT IN (6, 7)
+               AND c.is_open IS NULL;
+
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.wics_symbol_sector_history',
+                   {sql_literal(end_date)}, 'warning', 'WICS_PIT_COVERAGE_GAP',
+                   'WICS sector membership history does not cover all listed common stocks at the requested as-of date.'
+              WHERE EXISTS (
+                  SELECT 1
+                    FROM core.symbol_master sm
+                   WHERE sm.listing_status = 'listed'
+                     AND sm.security_type = '보통주'
+                     AND sm.market_segment IN ('KOSPI', 'KOSDAQ')
+                     AND NOT EXISTS (
+                         SELECT 1
+                           FROM feature.wics_symbol_sector_history h
+                          WHERE h.symbol_id = sm.symbol_id
+                            AND h.valid_from <= {sql_literal(end_date)}
+                            AND (h.valid_to IS NULL OR h.valid_to >= {sql_literal(end_date)})
+                     )
+              );
+
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.wics_symbol_sector_history',
+                   'error', 'WICS_INTERVAL_OVERLAP',
+                   'WICS sector membership intervals overlap for a symbol.'
+              WHERE EXISTS (
+                  SELECT 1
+                    FROM feature.wics_symbol_sector_history a
+                    JOIN feature.wics_symbol_sector_history b
+                      ON a.symbol_id = b.symbol_id
+                     AND (a.wics_code, a.valid_from) < (b.wics_code, b.valid_from)
+                     AND a.valid_from <= COALESCE(b.valid_to, DATE '9999-12-31')
+                     AND b.valid_from <= COALESCE(a.valid_to, DATE '9999-12-31')
+              );
+
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, symbol, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.dart_financial_filing', sm.symbol,
+                   f.period_end, 'error', 'DART_AVAILABILITY_BEFORE_PERIOD',
+                   'DART filing availability date precedes its reporting period end.'
+              FROM feature.dart_financial_filing f
+              JOIN core.symbol_master sm ON sm.symbol_id = f.symbol_id
+             WHERE f.period_end BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+               AND f.available_from < f.period_end;
+
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.bok_macro_daily', 'error',
+                   'BOK_AVAILABILITY_BEFORE_EFFECTIVE',
+                   'BOK available_from precedes effective_date.'
+              WHERE EXISTS (
+                  SELECT 1
+                    FROM feature.bok_macro_daily
+                   WHERE available_from < effective_date
+              );
+
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.ta_indicator_definition', 'error',
+                   'TA_DEFINITION_COUNT_INVALID',
+                   'TA indicator definition catalog count is not 158.'
+              WHERE (SELECT COUNT(*) FROM feature.ta_indicator_definition) <> 158;
+
+            WITH expected(series_id, cycle) AS (
+                VALUES {expected_bok_values}
+            ), observed AS (
+                SELECT series_id,
+                       MAX(available_from) AS latest_available_from,
+                       COUNT(*)::int AS observation_count
+                 FROM feature.bok_macro_daily
+                 WHERE effective_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+                   AND available_from <= {sql_literal(end_date)}
+                 GROUP BY series_id
+            )
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.bok_macro_daily', {sql_literal(end_date)},
+                   'warning', 'BOK_EXPECTED_SERIES_MISSING',
+                   'Expected BOK macro series has no observation in the requested range: ' || e.series_id
+              FROM expected e
+              LEFT JOIN observed o ON o.series_id = e.series_id
+             WHERE o.series_id IS NULL;
+
+            WITH expected(series_id, cycle) AS (
+                VALUES {expected_bok_values}
+            ), expected_trade_days AS (
+                SELECT COUNT(*)::int AS day_count
+                  FROM core.trading_calendar
+                 WHERE market = 'KRX'
+                   AND is_open IS TRUE
+                   AND trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+            ), observed AS (
+                SELECT series_id, COUNT(*)::int AS observation_count
+                 FROM feature.bok_macro_daily
+                 WHERE effective_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+                   AND available_from <= {sql_literal(end_date)}
+                 GROUP BY series_id
+            )
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.bok_macro_daily', {sql_literal(end_date)},
+                   'warning', 'BOK_DAILY_FREQUENCY_GAP',
+                   'Daily BOK series has fewer observations than confirmed KRX open days: ' || e.series_id
+              FROM expected e
+              CROSS JOIN expected_trade_days d
+              LEFT JOIN observed o ON o.series_id = e.series_id
+             WHERE e.cycle = 'D'
+               AND d.day_count > 0
+               AND COALESCE(o.observation_count, 0) < d.day_count;
+
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.bok_macro_daily', {sql_literal(end_date)},
+                   'warning', 'BOK_SERIES_STALE',
+                   'BOK series latest available_from is older than the configured staleness threshold: ' || series_id
+              FROM feature.bok_macro_daily
+             WHERE available_from <= {sql_literal(end_date)}
+             GROUP BY series_id
+            HAVING MAX(available_from) < {sql_literal(bok_stale_before)};
+
+            WITH expected(report_code, period_end) AS (
+                VALUES {expected_dart_values}
+            ), observed AS (
+                SELECT report_code, period_end, COUNT(*)::int AS cfs_count
+                 FROM feature.dart_financial_filing
+                 WHERE fs_div = 'CFS'
+                   AND available_from <= {sql_literal(end_date)}
+                 GROUP BY report_code, period_end
+            )
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.dart_financial_filing', e.period_end,
+                   'warning', 'DART_CFS_REPORT_MISSING',
+                   'No CFS filing was found for report ' || e.report_code || ' at ' || e.period_end
+              FROM expected e
+              LEFT JOIN observed o
+                ON o.report_code = e.report_code
+               AND o.period_end = e.period_end
+             WHERE e.period_end IS NOT NULL
+               AND o.period_end IS NULL;
+
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.dart_financial_filing', 'warning',
+                   'DART_NON_CFS_ONLY',
+                   'Financial filing coverage contains periods without a CFS version.'
+              WHERE EXISTS (
+                  SELECT 1
+                   FROM feature.dart_financial_filing f
+                   WHERE f.period_end BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+                     AND f.available_from <= {sql_literal(end_date)}
+                   GROUP BY f.period_end, f.report_code
+                  HAVING BOOL_OR(f.fs_div = 'CFS') IS FALSE
+              );
+
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, symbol, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.dart_financial_account_value', sm.symbol,
+                   f.period_end, 'warning', 'DART_ACCOUNT_VALUES_MISSING',
+                   'CFS filing has no normalized account values.'
+              FROM feature.dart_financial_filing f
+              JOIN core.symbol_master sm ON sm.symbol_id = f.symbol_id
+             WHERE f.fs_div = 'CFS'
+               AND f.period_end BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+               AND f.available_from <= {sql_literal(end_date)}
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM feature.dart_financial_account_value a
+                    WHERE a.filing_version_id = f.filing_version_id
+               );
+
+            WITH expected_dates AS (
+                SELECT trade_date
+                  FROM core.trading_calendar
+                 WHERE market = 'KRX'
+                   AND is_open IS TRUE
+                   AND trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+            ), observed_dates AS (
+                SELECT DISTINCT "time" AS trade_date
+                  FROM feature.kis_adjusted_ohlcv_daily
+                 WHERE "time" BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+            )
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.kis_adjusted_ohlcv_daily', e.trade_date,
+                   'warning', 'KIS_ADJUSTED_DATE_MISSING',
+                   'Confirmed KRX open date has no KIS adjusted OHLCV rows.'
+              FROM expected_dates e
+              LEFT JOIN observed_dates o ON o.trade_date = e.trade_date
+             WHERE o.trade_date IS NULL;
+
+            INSERT INTO meta.data_quality_issue
+              (run_id, dataset, trade_date, severity, rule_code, message)
+            SELECT {sql_literal(run_id)}, 'feature.kis_corporate_action_event', a."time",
+                   'error', 'KIS_REVISION_EVENT_NOT_RETAINED',
+                   'KIS adjustment metadata was present without a retained corporate-action event.'
+              FROM feature.kis_adjusted_ohlcv_daily a
+             WHERE a."time" BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+               AND (NULLIF(BTRIM(a.mod_yn), '') IS NOT NULL
+                    OR NULLIF(BTRIM(a.revision_reason), '') IS NOT NULL)
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM feature.kis_corporate_action_event e
+                    WHERE e.ticker = a.ticker
+                      AND e.effective_date = a."time"
+                      AND COALESCE(e.mod_yn, '') IS NOT DISTINCT FROM COALESCE(a.mod_yn, '')
+                      AND COALESCE(e.revision_reason, '') IS NOT DISTINCT FROM COALESCE(a.revision_reason, '')
+               );
+            """
+        )
+
+    def count_data_quality_errors(self, *, run_id: UUID) -> int:
+        rows = self.executor.fetch_json(
+            f"""
+            SELECT COUNT(*)::int AS error_count
+              FROM meta.data_quality_issue
+             WHERE run_id = {sql_literal(run_id)}
+               AND severity = 'error';
+            """
+        )
+        return int(rows[0]["error_count"]) if rows else 0
+
     def set_cursor(self, *, source_id: str, dataset: str, cursor_key: str, cursor_value: str) -> None:
         self.executor.execute_script(
             f"""
@@ -920,18 +1251,19 @@ class DataRepository:
             "("
             f"{sql_literal(row['series_id'])}, {sql_literal(row['effective_date'])}, "
             f"{sql_literal(row.get('published_at'))}, {sql_literal(row.get('value'))}, "
-            f"{jsonb_literal(row.get('metadata', {}))}, {sql_literal(run_id)}"
+            f"{sql_literal(row.get('available_from'))}, {jsonb_literal(row.get('metadata', {}))}, {sql_literal(run_id)}"
             ")"
             for row in rows
         ]
         self.executor.execute_script(
             f"""
             INSERT INTO feature.bok_macro_daily
-              (series_id, effective_date, published_at, value, metadata_jsonb, run_id)
+              (series_id, effective_date, published_at, value, available_from, metadata_jsonb, run_id)
             VALUES {", ".join(values)}
             ON CONFLICT (series_id, effective_date) DO UPDATE SET
               published_at = EXCLUDED.published_at,
               value = EXCLUDED.value,
+              available_from = EXCLUDED.available_from,
               metadata_jsonb = EXCLUDED.metadata_jsonb,
               run_id = EXCLUDED.run_id;
             """
@@ -1086,6 +1418,64 @@ class DataRepository:
         )
         return len(usable_rows)
 
+    def upsert_kind_symbol_metadata(self, rows: list[dict[str, Any]], run_id: UUID, *, as_of_date: date) -> int:
+        usable_rows = [row for row in rows if row.get("symbol") and row.get("company_name")]
+        if not usable_rows:
+            return 0
+        values = [
+            "("
+            f"{sql_literal(row['symbol'])}, {sql_literal(row.get('company_name'))}, "
+            f"{sql_literal(row.get('market_segment'))}, {sql_literal(row.get('listed_at'))}, "
+            f"{sql_literal(as_of_date)}, {jsonb_literal(_kind_sector_metadata(row, run_id))}, {sql_literal(run_id)}"
+            ")"
+            for row in usable_rows
+        ]
+        self.executor.execute_script(
+            f"""
+            WITH incoming(symbol, name, market_segment, listed_at, as_of_date, metadata_jsonb, run_id) AS (
+                VALUES {", ".join(values)}
+            ), resolved AS (
+                SELECT sm.symbol_id, i.symbol, i.name, i.market_segment,
+                       COALESCE(i.listed_at::date, i.as_of_date::date) AS valid_from,
+                       i.metadata_jsonb::jsonb, i.run_id::uuid
+                  FROM incoming i
+                  JOIN core.symbol_master sm ON sm.symbol = i.symbol
+            )
+            UPDATE core.symbol_master sm
+               SET name = COALESCE(NULLIF(r.name, ''), sm.name),
+                   market_segment = COALESCE(NULLIF(r.market_segment, ''), sm.market_segment),
+                   listing_status = 'listed',
+                   listed_at = COALESCE(LEAST(sm.listed_at, r.valid_from), r.valid_from, sm.listed_at),
+                   delisted_at = NULL,
+                   metadata_jsonb = sm.metadata_jsonb || r.metadata_jsonb,
+                   updated_at = now()
+              FROM resolved r
+             WHERE sm.symbol_id = r.symbol_id;
+
+            WITH incoming(symbol, name, market_segment, listed_at, as_of_date, metadata_jsonb, run_id) AS (
+                VALUES {", ".join(values)}
+            ), resolved AS (
+                SELECT sm.symbol_id, i.market_segment,
+                       COALESCE(i.listed_at::date, i.as_of_date::date) AS valid_from,
+                       i.metadata_jsonb::jsonb, i.run_id::uuid
+                  FROM incoming i
+                  JOIN core.symbol_master sm ON sm.symbol = i.symbol
+            )
+            INSERT INTO core.symbol_listing_history
+              (symbol_id, valid_from, valid_to, market, listing_status, event_type, source_id, run_id, metadata_jsonb)
+            SELECT r.symbol_id, r.valid_from, NULL, r.market_segment, 'listed', 'listed', 'KIND', r.run_id, r.metadata_jsonb
+              FROM resolved r
+            ON CONFLICT (symbol_id, valid_from) DO UPDATE SET
+              market = COALESCE(EXCLUDED.market, core.symbol_listing_history.market),
+              listing_status = 'listed',
+              event_type = 'listed',
+              source_id = 'KIND',
+              run_id = EXCLUDED.run_id,
+              metadata_jsonb = core.symbol_listing_history.metadata_jsonb || EXCLUDED.metadata_jsonb;
+            """
+        )
+        return len(usable_rows)
+
     def upsert_kind_symbol_sectors(self, rows: list[dict[str, Any]], run_id: UUID) -> int:
         usable_rows = [row for row in rows if row.get("symbol") and row.get("sector")]
         if not usable_rows:
@@ -1121,23 +1511,108 @@ class DataRepository:
         usable_rows = [row for row in rows if row.get("symbol") and row.get("sector")]
         if not usable_rows:
             return 0
+        missing_as_of = [row.get("symbol") for row in usable_rows if not row.get("sector_as_of")]
+        if missing_as_of:
+            raise ValueError(
+                "WICS sector rows require an explicit sector_as_of date for PIT history: "
+                + ", ".join(str(symbol) for symbol in missing_as_of[:5])
+            )
         values = [
             "("
-            f"{sql_literal(row['symbol'])}, {sql_literal(row.get('sector'))}, "
-            f"{sql_literal(row.get('market_segment'))}, {sql_literal(row.get('sector_as_of'))}, "
+            f"{sql_literal(row['symbol'])}, {sql_literal(row.get('sector_code') or row.get('sector'))}, "
+            f"{sql_literal(row.get('sector'))}, {sql_literal(row.get('market_segment'))}, "
+            f"{sql_literal(row.get('sector_as_of'))}, "
             f"{jsonb_literal(_wics_sector_metadata(row, run_id))}, {sql_literal(run_id)}"
             ")"
             for row in usable_rows
         ]
         self.executor.execute_script(
             f"""
-            WITH incoming(symbol, sector, market_segment, sector_as_of, metadata_jsonb, run_id) AS (
+            WITH incoming(symbol, wics_code, sector, market_segment, valid_from, metadata_jsonb, run_id) AS (
+                VALUES {", ".join(values)}
+            ), resolved AS (
+                SELECT sm.symbol_id, i.wics_code, i.sector, i.market_segment,
+                       i.valid_from::date, i.metadata_jsonb::jsonb, i.run_id::uuid
+                  FROM incoming i
+                  JOIN core.symbol_master sm ON sm.symbol = i.symbol
+            )
+            INSERT INTO feature.wics_sector_definition
+                (wics_code, sector_name, source_id, run_id, metadata_jsonb)
+            SELECT DISTINCT r.wics_code, r.sector, 'WICS', r.run_id,
+                   r.metadata_jsonb || jsonb_build_object('sector_level', 'sector')
+              FROM resolved r
+            ON CONFLICT (wics_code) DO UPDATE SET
+                sector_name = EXCLUDED.sector_name,
+                source_id = EXCLUDED.source_id,
+                run_id = EXCLUDED.run_id,
+                metadata_jsonb = feature.wics_sector_definition.metadata_jsonb || EXCLUDED.metadata_jsonb,
+                updated_at = now();
+
+            WITH incoming(symbol, wics_code, sector, market_segment, valid_from, metadata_jsonb, run_id) AS (
+                VALUES {", ".join(values)}
+            ), resolved AS (
+                SELECT sm.symbol_id, i.wics_code, i.sector, i.market_segment,
+                       i.valid_from::date, i.metadata_jsonb::jsonb, i.run_id::uuid
+                  FROM incoming i
+                  JOIN core.symbol_master sm ON sm.symbol = i.symbol
+            )
+            DELETE FROM feature.wics_symbol_sector_history h
+             USING resolved r
+             WHERE h.symbol_id = r.symbol_id
+               AND h.valid_from = r.valid_from;
+
+            WITH incoming(symbol, wics_code, sector, market_segment, valid_from, metadata_jsonb, run_id) AS (
+                VALUES {", ".join(values)}
+            ), resolved AS (
+                SELECT sm.symbol_id, i.wics_code, i.sector, i.market_segment,
+                       i.valid_from::date, i.metadata_jsonb::jsonb, i.run_id::uuid
+                  FROM incoming i
+                  JOIN core.symbol_master sm ON sm.symbol = i.symbol
+            )
+            INSERT INTO feature.wics_symbol_sector_history
+                (symbol_id, wics_code, sector_name, market_segment, valid_from, valid_to, source_id, run_id, metadata_jsonb)
+            SELECT r.symbol_id, r.wics_code, r.sector, r.market_segment, r.valid_from,
+                   NULL, 'WICS', r.run_id, r.metadata_jsonb
+              FROM resolved r
+             WHERE NOT EXISTS (
+                 SELECT 1
+                   FROM feature.wics_symbol_sector_history h
+                  WHERE h.symbol_id = r.symbol_id
+                    AND h.valid_to IS NULL
+                    AND h.wics_code = r.wics_code
+                    AND h.sector_name = r.sector
+             )
+            ON CONFLICT (symbol_id, valid_from) DO UPDATE SET
+                wics_code = EXCLUDED.wics_code,
+                sector_name = EXCLUDED.sector_name,
+                market_segment = EXCLUDED.market_segment,
+                valid_to = EXCLUDED.valid_to,
+                source_id = EXCLUDED.source_id,
+                run_id = EXCLUDED.run_id,
+                metadata_jsonb = feature.wics_symbol_sector_history.metadata_jsonb || EXCLUDED.metadata_jsonb;
+
+            WITH ordered AS (
+                SELECT symbol_id, wics_code, valid_from,
+                       LEAD(valid_from) OVER (
+                           PARTITION BY symbol_id
+                           ORDER BY valid_from
+                       ) AS next_valid_from
+                  FROM feature.wics_symbol_sector_history
+            )
+            UPDATE feature.wics_symbol_sector_history h
+               SET valid_to = ordered.next_valid_from - 1
+              FROM ordered
+             WHERE h.symbol_id = ordered.symbol_id
+               AND h.wics_code = ordered.wics_code
+               AND h.valid_from = ordered.valid_from;
+
+            WITH incoming(symbol, wics_code, sector, market_segment, valid_from, metadata_jsonb, run_id) AS (
                 VALUES {", ".join(values)}
             )
             UPDATE core.symbol_master sm
                SET sector = i.sector,
                    sector_source = 'WICS',
-                   sector_as_of = i.sector_as_of::date,
+                   sector_as_of = i.valid_from::date,
                    sector_run_id = i.run_id::uuid,
                    market_segment = COALESCE(NULLIF(sm.market_segment, ''), NULLIF(i.market_segment, '')),
                    metadata_jsonb = sm.metadata_jsonb || i.metadata_jsonb,
@@ -1148,32 +1623,111 @@ class DataRepository:
         )
         return len(usable_rows)
 
+    def store_wics_raw_payloads(self, rows: list[dict[str, Any]], run_id: UUID) -> int:
+        usable_rows = [
+            row
+            for row in rows
+            if row.get("symbol") and row.get("raw_html") and row.get("sector_as_of")
+        ]
+        if not usable_rows:
+            return 0
+        values = [
+            "("
+            f"{sql_literal('WICS')}, {sql_literal(row['symbol'])}, {sql_literal(row['sector_as_of'])}, "
+            f"{sql_literal(row.get('source_url'))}, {sql_literal(row['raw_html'])}, "
+            f"{sql_literal(_stable_hash(row['raw_html']))}, {sql_literal(run_id)}"
+            ")"
+            for row in usable_rows
+        ]
+        self.executor.execute_script(
+            f"""
+            INSERT INTO raw.wics_company_info_response
+              (source_id, ticker, request_date, source_url, payload_html, payload_hash, run_id)
+            VALUES {", ".join(values)}
+            ON CONFLICT (source_id, ticker, request_date, payload_hash) DO NOTHING;
+            """
+        )
+        return len(usable_rows)
+
     def upsert_dart_financials(self, rows: list[dict[str, Any]], run_id: UUID) -> int:
         if not rows:
             return 0
+        normalized_rows = []
+        for row in rows:
+            payload_hash = row.get("source_payload_hash") or _stable_hash(row.get("accounts", {}))
+            normalized_rows.append({**row, "source_payload_hash": payload_hash})
         values = [
             "("
             "(SELECT symbol_id FROM core.symbol_master WHERE symbol = "
             f"{sql_literal(row['symbol'])}), {sql_literal(row['corp_code'])}, "
-            f"{sql_literal(row['period_end'])}, {sql_literal(row.get('reported_at'))}, "
-            f"{sql_literal(row['report_code'])}, {sql_literal(row['fs_div'])}, "
+            f"{sql_literal(row['period_end'])}, {sql_literal(row.get('available_from'))}, "
+            f"{sql_literal(row.get('reported_at'))}, {sql_literal(row['report_code'])}, {sql_literal(row['fs_div'])}, "
+            f"{sql_literal(row.get('filing_id') or 'payload:' + row['source_payload_hash'])}, "
+            f"{sql_literal(row['source_payload_hash'])}, {sql_literal(row.get('availability_policy') or 'conservative_report_deadline')}, "
             f"{jsonb_literal(row.get('accounts', {}))}, {sql_literal(run_id)}"
             ")"
-            for row in rows
+            for row in normalized_rows
         ]
         self.executor.execute_script(
             f"""
             INSERT INTO feature.dart_financial_quarterly
-              (symbol_id, corp_code, period_end, reported_at, report_code, fs_div, accounts_jsonb, run_id)
+              (symbol_id, corp_code, period_end, available_from, reported_at, report_code, fs_div,
+               filing_id, source_payload_hash, availability_policy, accounts_jsonb, run_id)
             VALUES {", ".join(values)}
             ON CONFLICT (symbol_id, period_end, report_code, fs_div) DO UPDATE SET
               corp_code = EXCLUDED.corp_code,
+              available_from = EXCLUDED.available_from,
               reported_at = EXCLUDED.reported_at,
+              filing_id = EXCLUDED.filing_id,
+              source_payload_hash = EXCLUDED.source_payload_hash,
+              availability_policy = EXCLUDED.availability_policy,
               accounts_jsonb = EXCLUDED.accounts_jsonb,
               run_id = EXCLUDED.run_id;
+
+            INSERT INTO feature.dart_financial_filing
+              (symbol_id, corp_code, period_end, available_from, reported_at, report_code, fs_div,
+               filing_id, source_payload_hash, availability_policy, accounts_jsonb, run_id)
+            VALUES {", ".join(values)}
+            ON CONFLICT (symbol_id, period_end, report_code, fs_div, source_payload_hash) DO NOTHING;
             """
         )
-        return len(rows)
+        account_values = []
+        for row in normalized_rows:
+            payload_hash = row["source_payload_hash"]
+            for account in row.get("account_rows", []):
+                account_values.append(
+                    "("
+                    "(SELECT filing_version_id FROM feature.dart_financial_filing WHERE symbol_id = "
+                    f"(SELECT symbol_id FROM core.symbol_master WHERE symbol = {sql_literal(row['symbol'])}) "
+                    f"AND period_end = {sql_literal(row['period_end'])} AND report_code = {sql_literal(row['report_code'])} "
+                    f"AND fs_div = {sql_literal(row['fs_div'])} AND source_payload_hash = {sql_literal(payload_hash)}), "
+                    f"{sql_literal(account['account_id'])}, {sql_literal(account.get('account_name'))}, "
+                    f"{sql_literal(account.get('statement_code'))}, {sql_literal(account.get('amount'))}, "
+                    f"{sql_literal(account.get('current_cumulative_amount'))}, {sql_literal(account.get('prior_quarter_amount'))}, "
+                    f"{sql_literal(account.get('prior_amount'))}, {sql_literal(account.get('prior_year_amount'))}, "
+                    f"{sql_literal(account.get('currency'))}, {jsonb_literal(account.get('raw', {}))}"
+                    ")"
+                )
+        if account_values:
+            self.executor.execute_script(
+                f"""
+                INSERT INTO feature.dart_financial_account_value
+                  (filing_version_id, account_id, account_name, statement_code, amount,
+                   current_cumulative_amount, prior_quarter_amount, prior_amount, prior_year_amount, currency, raw_jsonb)
+                VALUES {", ".join(account_values)}
+                ON CONFLICT (filing_version_id, account_id) DO UPDATE SET
+                    account_name = EXCLUDED.account_name,
+                    statement_code = EXCLUDED.statement_code,
+                    amount = EXCLUDED.amount,
+                    current_cumulative_amount = EXCLUDED.current_cumulative_amount,
+                    prior_quarter_amount = EXCLUDED.prior_quarter_amount,
+                    prior_amount = EXCLUDED.prior_amount,
+                    prior_year_amount = EXCLUDED.prior_year_amount,
+                    currency = EXCLUDED.currency,
+                    raw_jsonb = EXCLUDED.raw_jsonb;
+                """
+            )
+        return len(normalized_rows)
 
 
 def _stable_hash(value: Any) -> str:

@@ -27,20 +27,10 @@ else:
     DE_ROOT = Path(__file__).resolve().parents[2]  # 로컬의 Quant-agent/DE 폴더
     REPO_ROOT = DE_ROOT.parent                     # 로컬의 Quant-agent 최상위 폴더
 
+if str(DE_ROOT) not in sys.path:
+    sys.path.insert(0, str(DE_ROOT))
 
-def _airflow_dotenv_disabled() -> bool:
-    return os.getenv("QUANT_AIRFLOW_LOAD_DOTENV", "true").lower() in {"0", "false", "no", "off"}
-
-def _load_airflow_dotenv() -> None:
-    if _airflow_dotenv_disabled():
-        return
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        return
-    # 로컬 루트의 .env 파일 타겟팅
-    dotenv_path = Path(os.getenv("QUANT_AIRFLOW_DOTENV_PATH", str(REPO_ROOT / ".env")))
-    load_dotenv(dotenv_path=dotenv_path, override=False)
+from quant_agent.data.catalogs import BOK_SERIES_PRESETS  # noqa: E402
 
 
 try:  # pragma: no cover - installed with Airflow in production.
@@ -49,12 +39,11 @@ except ImportError:  # Local import-safe fallback.
     pendulum = None
     from zoneinfo import ZoneInfo
 
-_load_airflow_dotenv()
-
 # 2. 한국 타임존 세팅 및 크론식에서 CRON_TZ 문구 제거 (순수 시간만 남김)
 LOCAL_TZ = pendulum.timezone("Asia/Seoul") if pendulum else ZoneInfo("Asia/Seoul")
 DEFAULT_DAILY_SCHEDULE = "0 10 * * *"
 DEFAULT_OHLCV_REPAIR_SCHEDULE = "0 7 * * *"
+DEFAULT_WICS_SCHEDULE = os.getenv("QUANT_AIRFLOW_WICS_SCHEDULE", "0 6 * * 1")
 DEFAULT_PROMPT_RETENTION_SCHEDULE = "0 5 * * *"
 PROMPT_RETENTION_DAG_ID = "quant_agent_ai_prompt_retention"
 PROMPT_RETENTION_RETRIES = 3
@@ -67,6 +56,16 @@ DEFAULT_START_DATE = datetime.fromisoformat(os.getenv("QUANT_AIRFLOW_START_DATE"
 DEFAULT_TA_WARMUP_DAYS = int(os.getenv("QUANT_AIRFLOW_TA_WARMUP_DAYS", "365"))
 DEFAULT_EXTERNAL_LOOKBACK_DAYS = int(os.getenv("QUANT_AIRFLOW_EXTERNAL_LOOKBACK_DAYS", "7"))
 DEFAULT_OHLCV_REPAIR_LOOKBACK_DAYS = int(os.getenv("QUANT_AIRFLOW_OHLCV_REPAIR_LOOKBACK_DAYS", "7"))
+DEFAULT_TRADING_CALENDAR_LOOKBACK_DAYS = int(os.getenv("QUANT_AIRFLOW_TRADING_CALENDAR_LOOKBACK_DAYS", "7"))
+TRADING_CALENDAR_SCRIPT = Path(
+    os.getenv("QUANT_AIRFLOW_TRADING_CALENDAR_SCRIPT", str(DE_ROOT / "scripts" / "refresh_krx_trading_calendar.py"))
+)
+WICS_SECTOR_SCRIPT = Path(
+    os.getenv("QUANT_AIRFLOW_WICS_SECTOR_SCRIPT", str(DE_ROOT / "scripts" / "ingest_wics_sectors.py"))
+)
+EXTERNAL_DATA_SCRIPT = Path(
+    os.getenv("QUANT_AIRFLOW_EXTERNAL_DATA_SCRIPT", str(DE_ROOT / "scripts" / "ingest_external_data.py"))
+)
 KIS_ADJUSTED_INGEST_SCRIPT = Path(
     os.getenv("QUANT_AIRFLOW_KIS_ADJUSTED_INGEST_SCRIPT", str(DE_ROOT / "scripts" / "ingest_kis_adjusted_ohlcv.py"))
 )
@@ -85,27 +84,12 @@ SYMBOL_METADATA_SCRIPT = Path(
 PROMPT_RETENTION_SCRIPT = DE_ROOT / "scripts" / "purge_ai_prompt_logs.py"
 PYTHON_EXECUTABLE = os.getenv("QUANT_AIRFLOW_PYTHON", sys.executable)
 
-DEFAULT_BOK_RATE_FX_SERIES = (
-    {"stat_code": "722Y001", "cycle": "D", "item_code1": "0101000"},  # 한국은행 기준금리
-    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010101000"},  # 콜금리(1일, 전체거래)
-    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010901000"},  # KOFR
-    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010502000"},  # CD(91일)
-    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010190000"},  # 국고채(1년)
-    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010200000"},  # 국고채(3년)
-    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010210000"},  # 국고채(10년)
-    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010300000"},  # 회사채(3년, AA-)
-    {"stat_code": "817Y002", "cycle": "D", "item_code1": "010320000"},  # 회사채(3년, BBB-)
-    {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000003"},  # 원/달러 종가 15:30
-    {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000006"},  # 원/100엔
-    {"stat_code": "731Y003", "cycle": "D", "item_code1": "0000010"},  # 원/위안 종가
-)
-DEFAULT_BOK_MONTHLY_OIL_SERIES = (
-    {"stat_code": "902Y003", "cycle": "M", "item_code1": "010101", "language": "en"},  # WTI
-    {"stat_code": "902Y003", "cycle": "M", "item_code1": "010102", "language": "en"},  # Dubai Fateh
-    {"stat_code": "902Y003", "cycle": "M", "item_code1": "010103", "language": "en"},  # Brent
+DEFAULT_BOK_RATE_FX_SERIES = BOK_SERIES_PRESETS["rate-fx"]
+DEFAULT_BOK_MONTHLY_OIL_SERIES = tuple(
+    item for item in BOK_SERIES_PRESETS["all-macro"] if item not in DEFAULT_BOK_RATE_FX_SERIES
 )
 DEFAULT_BOK_SERIES_JSON = json.dumps(
-    [*DEFAULT_BOK_RATE_FX_SERIES, *DEFAULT_BOK_MONTHLY_OIL_SERIES],
+    list(BOK_SERIES_PRESETS["all-macro"]),
     ensure_ascii=False,
     separators=(",", ":"),
 )
@@ -142,16 +126,23 @@ if dag and task:  # pragma: no branch
         tags=["quant-agent", "data-engineering"],
     )
     def daily_data_engineering():
+        @task(task_id="refresh_krx_trading_calendar_daily")
+        def refresh_krx_trading_calendar_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            run_date = _run_reference_date(logical_date, data_interval_end)
+            return _run_python_script(
+                TRADING_CALENDAR_SCRIPT,
+                _trading_calendar_args(
+                    start_date=run_date - timedelta(days=DEFAULT_TRADING_CALENDAR_LOOKBACK_DAYS),
+                    end_date=run_date,
+                ),
+            )
+
         @task(task_id="ingest_ohlcv_daily")
         def ingest_ohlcv_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
             from quant_agent.data.config import OhlcvIngestionConfig
             from quant_agent.data.ingestion import OhlcvIngestionRequest, OhlcvIngestionService
 
-            target_date = _target_date(
-                logical_date,
-                data_interval_end,
-                include_same_day_trade_date=False,
-            )
+            target_date = _previous_run_trade_date(logical_date, data_interval_end)
             start_date, end_date = _daily_ohlcv_ingest_window(target_date)
             config = OhlcvIngestionConfig.from_env()
             result = OhlcvIngestionService().ingest_range(
@@ -168,11 +159,7 @@ if dag and task:  # pragma: no branch
 
         @task(task_id="compute_ta_indicators_daily")
         def compute_ta_indicators_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
-            target_date = _target_date(
-                logical_date,
-                data_interval_end,
-                include_same_day_trade_date=False,
-            )
+            target_date = _previous_run_trade_date(logical_date, data_interval_end)
             start_date = _warmup_start_date(target_date)
             return _run_python_script(
                 TA_PIPELINE_SCRIPT,
@@ -181,11 +168,7 @@ if dag and task:  # pragma: no branch
 
         @task(task_id="ingest_kis_adjusted_ohlcv_daily")
         def ingest_kis_adjusted_ohlcv_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
-            target_date = _target_date(
-                logical_date,
-                data_interval_end,
-                include_same_day_trade_date=False,
-            )
+            target_date = _previous_run_trade_date(logical_date, data_interval_end)
             return _run_python_script(
                 KIS_ADJUSTED_INGEST_SCRIPT,
                 _kis_adjusted_ingest_args(start_date=target_date, end_date=target_date),
@@ -193,11 +176,7 @@ if dag and task:  # pragma: no branch
 
         @task(task_id="refresh_symbol_metadata_daily")
         def refresh_symbol_metadata_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
-            target_date = _target_date(
-                logical_date,
-                data_interval_end,
-                include_same_day_trade_date=False,
-            )
+            target_date = _previous_run_trade_date(logical_date, data_interval_end)
             return _run_python_script(
                 SYMBOL_METADATA_SCRIPT,
                 _symbol_metadata_args(as_of_date=target_date),
@@ -205,11 +184,7 @@ if dag and task:  # pragma: no branch
 
         @task(task_id="run_data_quality_checks_daily")
         def run_data_quality_checks_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
-            target_date = _target_date(
-                logical_date,
-                data_interval_end,
-                include_same_day_trade_date=False,
-            )
+            target_date = _previous_run_trade_date(logical_date, data_interval_end)
             start_date = _warmup_start_date(target_date)
             return _run_python_script(
                 QA_CHECK_SCRIPT,
@@ -222,11 +197,7 @@ if dag and task:  # pragma: no branch
 
             if not BokConfig.from_env().is_configured:
                 _skip("BOK_API_KEY is not configured.")
-            target_date = _target_date(
-                logical_date,
-                data_interval_end,
-                include_same_day_trade_date=False,
-            )
+            target_date = _previous_run_trade_date(logical_date, data_interval_end)
             return _run_python_script(
                 DART_BOK_INGEST_SCRIPT,
                 _dart_bok_ingest_args(
@@ -239,11 +210,7 @@ if dag and task:  # pragma: no branch
 
         @task(task_id="ingest_dart_financials_daily")
         def ingest_dart_financials_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
-            target_date = _target_date(
-                logical_date,
-                data_interval_end,
-                include_same_day_trade_date=False,
-            )
+            target_date = _previous_run_trade_date(logical_date, data_interval_end)
             return _run_python_script(
                 DART_BOK_INGEST_SCRIPT,
                 _dart_bok_ingest_args(
@@ -253,6 +220,7 @@ if dag and task:  # pragma: no branch
                 ),
             )
 
+        calendar = refresh_krx_trading_calendar_daily()
         ingested = ingest_ohlcv_daily()
         symbol_metadata = refresh_symbol_metadata_daily()
         kis_adjusted = ingest_kis_adjusted_ohlcv_daily()
@@ -260,11 +228,14 @@ if dag and task:  # pragma: no branch
         qa = run_data_quality_checks_daily()
         bok = ingest_bok_daily()
         dart = ingest_dart_financials_daily()
+        calendar >> ingested
         ingested >> [symbol_metadata, kis_adjusted, bok]
         symbol_metadata >> qa
         symbol_metadata >> dart
         kis_adjusted >> computed
         computed >> qa
+        bok >> qa
+        dart >> qa
 
     @dag(
         dag_id="quant_agent_ohlcv_repair",
@@ -378,6 +349,36 @@ if dag and task:  # pragma: no branch
         purge_ai_prompt_logs()
 
     quant_agent_daily_data_engineering = daily_data_engineering()
+
+    @dag(
+        dag_id="quant_agent_wics_sector_snapshot",
+        description="Periodic FnGuide WICS sector membership snapshot with history tracking.",
+        schedule=DEFAULT_WICS_SCHEDULE,
+        start_date=DEFAULT_START_DATE,
+        catchup=False,
+        max_active_runs=1,
+        default_args={"retries": int(os.getenv("QUANT_AIRFLOW_RETRIES", "3")), "retry_delay": timedelta(minutes=10)},
+        tags=["quant-agent", "data-engineering", "wics"],
+    )
+    def wics_sector_snapshot():
+        @task(task_id="refresh_kind_symbol_metadata")
+        def refresh_kind_symbol_metadata(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            run_date = _run_reference_date(logical_date, data_interval_end)
+            return _run_python_script(
+                EXTERNAL_DATA_SCRIPT,
+                ["--job", "kind-sector", "--as-of-date", run_date.isoformat()],
+            )
+
+        @task(task_id="ingest_wics_sector_snapshot")
+        def ingest_wics_sector_snapshot(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
+            run_date = _run_reference_date(logical_date, data_interval_end)
+            return _run_python_script(WICS_SECTOR_SCRIPT, ["--as-of-date", run_date.isoformat()])
+
+        kind_metadata = refresh_kind_symbol_metadata()
+        wics = ingest_wics_sector_snapshot()
+        kind_metadata >> wics
+
+    quant_agent_wics_sector_snapshot = wics_sector_snapshot()
     quant_agent_ohlcv_repair = ohlcv_repair()
     quant_agent_backfill_ohlcv_10y = backfill_ohlcv_10y()
     quant_agent_ai_prompt_retention = ai_prompt_retention()
@@ -470,6 +471,17 @@ def _run_reference_date(logical_date, data_interval_end=None) -> date:
         return _run_reference_date(context.get("logical_date"), context.get("data_interval_end"))
     except (ImportError, KeyError, RuntimeError):
         return date.today()
+
+
+def _previous_run_trade_date(logical_date=None, data_interval_end=None) -> date:
+    """Use the prior wall-clock date without depending on a self-written calendar.
+
+    The daily 10:00 KST run must request the previous date even when KRX has not
+    published rows yet.  KRX holidays and weekends remain harmless empty requests,
+    while a stale ``core.trading_calendar`` cannot pin the ingestion high-water mark.
+    """
+
+    return _run_reference_date(logical_date, data_interval_end) - timedelta(days=1)
 
 
 def _latest_ingested_krx_trade_date() -> date | None:
@@ -578,6 +590,15 @@ def _symbol_metadata_args(*, as_of_date: date) -> list[str]:
     ]
 
 
+def _trading_calendar_args(*, start_date: date, end_date: date) -> list[str]:
+    return [
+        "--start-date",
+        start_date.isoformat(),
+        "--end-date",
+        end_date.isoformat(),
+    ]
+
+
 def _dart_bok_ingest_args(
     *, source: str, start_date: date, end_date: date, bok_series_json: str | None = None
 ) -> list[str]:
@@ -599,8 +620,6 @@ def _dart_bok_ingest_args(
             args.append("--dart-refresh-corp-codes")
     elif source == "bok" and bok_series_json:
         args.extend(["--bok-series-json", bok_series_json])
-    if _airflow_dotenv_disabled():
-        args.extend(["--dotenv-path", ""])
     return args
 
 

@@ -54,6 +54,8 @@ DEFAULT_DART_BASE_URL = "https://opendart.fss.or.kr/api"
 DEFAULT_KIND_CORP_LIST_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do"
 DEFAULT_WICS_COMPANY_INFO_URL = "https://wcomp.fnguide.com/CompanyInfo/Information"
 DEFAULT_WICS_REQUEST_WORKERS = 4
+DEFAULT_WICS_MIN_MATCH_RATIO = 0.95
+DEFAULT_BOK_STALENESS_DAYS = 7
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -393,6 +395,7 @@ class KindConfig:
 class WicsConfig:
     company_info_url: str
     request_workers: int
+    min_match_ratio: float
     request_timeout_seconds: int
     retry: RetryConfig
 
@@ -403,6 +406,7 @@ class WicsConfig:
                 _env("WICS_COMPANY_INFO_URL", DEFAULT_WICS_COMPANY_INFO_URL) or DEFAULT_WICS_COMPANY_INFO_URL
             ).rstrip("/"),
             request_workers=_env_int("WICS_REQUEST_WORKERS", DEFAULT_WICS_REQUEST_WORKERS),
+            min_match_ratio=_env_float("WICS_MIN_MATCH_RATIO", DEFAULT_WICS_MIN_MATCH_RATIO),
             request_timeout_seconds=_env_int("API_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS),
             retry=RetryConfig.from_env(),
         )

@@ -69,6 +69,18 @@ class OhlcvIngestionService:
                 raw_payloads, bars = self._fetch_chunk(source, chunk_start, chunk_end, request.symbols)
                 total_fetched += len(bars)
                 total_raw_written += self.repository.store_raw_payloads(raw_payloads, run_id)
+                observed_open_dates = {
+                    raw.request_date
+                    for raw in raw_payloads
+                    if isinstance(raw.payload.get("OutBlock_1"), list) and bool(raw.payload.get("OutBlock_1"))
+                }
+                self.repository.upsert_trading_calendar_observations(
+                    start_date=chunk_start,
+                    end_date=chunk_end,
+                    observed_open_dates=observed_open_dates,
+                    run_id=run_id,
+                    source_id=source,
+                )
                 written, issues = self.repository.upsert_ohlcv_bars(bars, run_id, source)
                 total_written += written
                 all_issues.extend(issues)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -64,7 +64,12 @@ class BokEcosClient:
         )
 
 
-def normalize_bok_observations(raw_payload: RawSourcePayload, *, published_at_policy: str = "fetch_time") -> list[dict[str, Any]]:
+def normalize_bok_observations(
+    raw_payload: RawSourcePayload,
+    *,
+    published_at_policy: str = "source",
+    available_from_policy: str = "conservative",
+) -> list[dict[str, Any]]:
     rows = raw_payload.payload.get("StatisticSearch", {}).get("row")
     if rows is None:
         error = raw_payload.payload.get("RESULT") or raw_payload.payload.get("StatisticSearch", {}).get("RESULT")
@@ -76,7 +81,6 @@ def normalize_bok_observations(raw_payload: RawSourcePayload, *, published_at_po
     if not isinstance(rows, list):
         raise SourceResponseError("BOK StatisticSearch.row is not a list.")
 
-    fetch_time = datetime.now(timezone.utc)
     normalized = []
     for row in rows:
         if not isinstance(row, dict):
@@ -86,16 +90,75 @@ def normalize_bok_observations(raw_payload: RawSourcePayload, *, published_at_po
         item_code = str(row.get("ITEM_CODE1") or raw_payload.request.get("item_code1") or "").strip()
         value = _decimal_or_none(row.get("DATA_VALUE"))
         effective_date = _period_to_effective_date(time_text, str(raw_payload.request.get("cycle", "")))
+        source_published_at = _source_published_at(row)
+        published_at = source_published_at if published_at_policy == "source" else None
+        if published_at_policy == "fetch_time":
+            published_at = datetime.now(timezone.utc)
+        available_from = bok_available_from(
+            effective_date,
+            cycle=str(raw_payload.request.get("cycle", "")),
+            published_at=published_at,
+            policy=available_from_policy,
+        )
         normalized.append(
             {
                 "series_id": f"{stat_code}:{item_code}",
                 "effective_date": effective_date,
-                "published_at": fetch_time.isoformat() if published_at_policy == "fetch_time" else None,
+                "published_at": published_at.isoformat() if published_at else None,
+                "available_from": available_from,
                 "value": value,
                 "metadata": row,
             }
         )
     return normalized
+
+
+def bok_available_from(
+    effective_date: date,
+    *,
+    cycle: str,
+    published_at: datetime | None = None,
+    policy: str = "conservative",
+) -> date:
+    """Resolve the first date on which a BOK observation may enter a backtest.
+
+    The ECOS statistic response usually carries an observation period rather
+    than a release timestamp. Conservative policy therefore delays daily
+    observations by one day and monthly observations until the next month.
+    """
+
+    normalized_policy = policy.strip().lower()
+    if normalized_policy not in {"conservative", "effective_date", "published_at"}:
+        raise ValueError("available_from_policy must be conservative, effective_date, or published_at.")
+    if normalized_policy == "effective_date":
+        return effective_date
+    if normalized_policy == "published_at" and published_at is not None:
+        return published_at.date()
+    if normalized_policy == "conservative":
+        if cycle.upper() == "M":
+            year = effective_date.year + (1 if effective_date.month == 12 else 0)
+            month = 1 if effective_date.month == 12 else effective_date.month + 1
+            return date(year, month, 1)
+        return effective_date + timedelta(days=1)
+    return published_at.date() if published_at is not None else effective_date
+
+
+def _source_published_at(row: dict[str, Any]) -> datetime | None:
+    for key in ("PUBLISHED_AT", "published_at", "RELEASE_DATE", "release_date"):
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            if len(text) == 8 and text.isdigit():
+                return datetime.strptime(text, "%Y%m%d").replace(tzinfo=timezone.utc)
+            if len(text) == 10 and text[4] == "-":
+                return datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+            parsed = datetime.fromisoformat(text)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 def _period_to_effective_date(period: str, cycle: str) -> date:
