@@ -423,7 +423,49 @@ FROM feature.dart_financial_filing f
 CROSS JOIN LATERAL jsonb_each(f.accounts_jsonb) item
 ON CONFLICT (filing_version_id, account_id) DO NOTHING;
 
-CREATE OR REPLACE VIEW mart.dart_financial_asof AS
+-- Some installations contain a table under the legacy compatibility name.
+-- Preserve non-view objects under a legacy name before creating the canonical view.
+DO $$
+DECLARE
+    object_kind TEXT;
+BEGIN
+    SELECT c.relkind::text
+      INTO object_kind
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'mart'
+       AND c.relname = 'dart_financial_asof';
+
+    IF object_kind = 'v' THEN
+        EXECUTE 'DROP VIEW mart.dart_financial_asof';
+    ELSIF object_kind = 'm' THEN
+        IF EXISTS (
+            SELECT 1
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'mart'
+               AND c.relname = 'dart_financial_asof_legacy'
+        ) THEN
+            RAISE EXCEPTION 'mart.dart_financial_asof_legacy already exists';
+        END IF;
+        EXECUTE 'ALTER MATERIALIZED VIEW mart.dart_financial_asof RENAME TO dart_financial_asof_legacy';
+    ELSIF object_kind IN ('r', 'p', 'f') THEN
+        IF EXISTS (
+            SELECT 1
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'mart'
+               AND c.relname = 'dart_financial_asof_legacy'
+        ) THEN
+            RAISE EXCEPTION 'mart.dart_financial_asof_legacy already exists';
+        END IF;
+        EXECUTE 'ALTER TABLE mart.dart_financial_asof RENAME TO dart_financial_asof_legacy';
+    ELSIF object_kind IS NOT NULL THEN
+        RAISE EXCEPTION 'mart.dart_financial_asof has unsupported relation kind %', object_kind;
+    END IF;
+END $$;
+
+CREATE VIEW mart.dart_financial_asof AS
 SELECT
     sm.symbol,
     f.corp_code,
