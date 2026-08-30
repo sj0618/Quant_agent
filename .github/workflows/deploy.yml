@@ -374,7 +374,9 @@ jobs:
               local profile="${4:-backend}"
               local body
               body="$(mktemp "$RUN_DIR/readiness.XXXXXX")"
-              trap 'rm -f "$body"' RETURN
+              # The RETURN trap must clear itself: a leftover RETURN trap fires on
+              # every later function return, where "$body" is unbound under set -u.
+              trap 'rm -f "$body"; trap - RETURN' RETURN
               for _ in $(seq 1 30); do
                 if curl -fsS -o "$body" "$url" >/dev/null 2>&1; then
                   if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" --profile "$profile" < "$body"; then
@@ -804,9 +806,17 @@ jobs:
             local profile="${4:-backend}"
             local body
             body="$(mktemp "$RUN_DIR/readiness.XXXXXX")"
-            trap 'rm -f "$body"' RETURN
+            # The RETURN trap must clear itself: a leftover RETURN trap fires on
+            # every later function return, where "$body" is unbound under set -u.
+            trap 'rm -f "$body"; trap - RETURN' RETURN
             for _ in $(seq 1 30); do
               if curl -fsS -o "$body" "$url" >/dev/null 2>&1; then
+                if [ ! -f "$APP_DIR/scripts/readiness-semantic-gate.mjs" ]; then
+                  # A restored snapshot can predate the semantic gate script; a
+                  # reachable readiness endpoint is then the strongest check available.
+                  echo "$label is ready (semantic gate script absent in restored release): $url"
+                  return 0
+                fi
                 if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" --profile "$profile" < "$body"; then
                   echo "$label is ready: $url"
                   return 0
