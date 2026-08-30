@@ -6,7 +6,11 @@ from fastapi import APIRouter, Query, Request, status
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
-from app.api.contract_policy import api_status_endpoints, fe_live_allowlist
+from app.api.contract_policy import (
+    api_status_endpoints,
+    fe_live_allowlist,
+    raise_retired_public_create,
+)
 from app.api.routes import email_reports
 from app.api.routes.auth import get_session_cookie, get_session_store
 from app.core.errors import AppError
@@ -177,6 +181,12 @@ async def get_api_status(request: Request) -> dict[str, Any]:
 
 @router.post("/runs", status_code=status.HTTP_201_CREATED)
 async def create_analysis_run(request: Request, payload: TrackCRunRequest) -> dict[str, Any]:
+    if getattr(get_runtime_settings(request), "is_production", False):
+        raise_retired_public_create(
+            boundary_id="public-analysis-run-create",
+            method="POST",
+            path="/api/v1/runs",
+        )
     await _require_track_c_csrf(request)
     user_id = await _require_current_user_id(request)
     engine = get_trading_data_engine(request)
@@ -207,6 +217,12 @@ async def get_analysis_run(request: Request, run_id: str) -> dict[str, Any]:
 
 @router.post("/runs/{run_id}/complete")
 async def complete_analysis_run(request: Request, run_id: str, payload: TrackCRunCompletionRequest) -> dict[str, Any]:
+    if getattr(get_runtime_settings(request), "is_production", False):
+        raise_retired_public_create(
+            boundary_id="public-analysis-run-complete",
+            method="POST",
+            path="/api/v1/runs/{run_id}/complete",
+        )
     await _require_track_c_csrf(request)
     user_id = await _require_current_user_id(request)
     engine = get_trading_data_engine(request)

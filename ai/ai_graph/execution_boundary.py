@@ -8,6 +8,25 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 BoundaryKind = Literal["public_create", "internal_evaluator", "read_only_projection"]
+PUBLIC_CREATE_RETIREMENT_SCHEMA = "execution-boundary.v1"
+
+
+def retired_public_create_detail(
+    *,
+    boundary_id: str,
+    path: str,
+    read_only_alternative: str,
+) -> dict[str, str]:
+    """Return the stable response body for a retired public writer."""
+
+    return {
+        "code": "public_create_retired",
+        "message": "새 분석 생성은 제공하지 않습니다. 보관된 읽기 전용 결과만 조회할 수 있습니다.",
+        "boundary_id": boundary_id,
+        "path": path,
+        "read_only_alternative": read_only_alternative,
+        "schema_version": PUBLIC_CREATE_RETIREMENT_SCHEMA,
+    }
 
 
 class ExecutionBoundary(BaseModel):
@@ -52,6 +71,17 @@ APPROVED_EXECUTION_BOUNDARIES: tuple[ExecutionBoundary, ...] = (
         kind="public_create",
         method="POST",
         path="/api/v1/runs",
+        owner="none",
+        auth="none",
+        failure_delivery="410_feature_disabled_with_read_only_alternative",
+        allowed=False,
+        write_allowed=False,
+    ),
+    ExecutionBoundary(
+        boundary_id="public-research-job-create",
+        kind="public_create",
+        method="POST",
+        path="/api/research/jobs",
         owner="none",
         auth="none",
         failure_delivery="410_feature_disabled_with_read_only_alternative",

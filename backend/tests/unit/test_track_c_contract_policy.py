@@ -20,7 +20,9 @@ def test_track_ac_contract_policy_is_the_ordered_union_of_track_a_and_track_c():
     assert {(entry["method"], entry["path"]) for entry in api_status_endpoints()} == {
         (item.method, item.path) for item in CONTRACT_POLICY
     }
-    assert fe_live_allowlist() == {(item.method, item.path) for item in CONTRACT_POLICY}
+    assert fe_live_allowlist() == {
+        (item.method, item.path) for item in CONTRACT_POLICY if item.fe_live_allowed
+    }
 
 
 def test_track_ac_contract_metadata_updates_classified_openapi_operations():
@@ -35,7 +37,7 @@ def test_track_ac_contract_metadata_updates_classified_openapi_operations():
     assert schema["paths"]["/api/v1/runs"]["post"]["x-quantagent-owner"] == "backend"
     assert schema["paths"]["/api/v1/runs"]["post"]["x-quantagent-csrf-required-for-unsafe"] is True
     assert schema["paths"]["/api/v1/runs/{run_id}"]["get"]["x-quantagent-implementation"] == "db-backed"
-    assert schema["paths"]["/api/v1/runs/{run_id}/complete"]["post"]["x-quantagent-fe-live-allowed"] is True
+    assert schema["paths"]["/api/v1/runs/{run_id}/complete"]["post"]["x-quantagent-fe-live-allowed"] is False
     assert schema["paths"]["/api/v1/me/notifications"]["patch"]["x-quantagent-csrf-required-for-unsafe"] is True
     assert schema["paths"]["/api/v1/me/email-deliveries"]["get"]["x-quantagent-auth-required"] is True
     assert schema["paths"]["/api/v1/unsubscribe"]["post"]["x-quantagent-auth-required"] is False

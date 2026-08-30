@@ -25,6 +25,7 @@ def make_client(settings=None):
     install_runtime_performance_middleware(app)
     app.include_router(fe_contract.router)
     app.state.settings = settings or valid_settings(
+        APP_ENV="local",
         AUTH_PUBLIC_BACKEND_ORIGIN=API_ORIGIN,
         AUTH_ALLOWED_ORIGINS=FE_ORIGIN,
         AUTH_CSRF_REQUIRED=True,
@@ -55,8 +56,36 @@ def test_track_c_api_status_exposes_only_track_c_contract_endpoints():
         (item.method, item.path) for item in CONTRACT_POLICY
     }
     assert {(entry["method"], entry["path"]) for entry in body["feLiveAllowlist"]} == {
-        (item.method, item.path) for item in CONTRACT_POLICY
+        (item.method, item.path) for item in CONTRACT_POLICY if item.fe_live_allowed
     }
+
+
+def test_production_public_writers_are_retired_before_auth_or_storage_access():
+    client, _app = make_client(valid_settings(APP_ENV="production"))
+
+    for method, path, payload in (
+        ("POST", "/api/v1/runs", {"query": "RSI 30"}),
+        ("POST", "/api/v1/runs/run-1/complete", {"aiJobId": "job-1"}),
+    ):
+        response = client.request(method, path, json=payload)
+
+        assert response.status_code == 410
+        assert response.json()["error"] == {
+            "component": "contract",
+            "code": "public_create_retired",
+            "message": "새 분석 생성은 제공하지 않습니다. 보관된 읽기 전용 결과만 조회할 수 있습니다.",
+            "details": {
+                "boundaryId": (
+                    "public-analysis-run-create"
+                    if path == "/api/v1/runs"
+                    else "public-analysis-run-complete"
+                ),
+                "method": "POST",
+                "path": "/api/v1/runs" if path == "/api/v1/runs" else "/api/v1/runs/{run_id}/complete",
+                "readOnlyAlternative": "/api/v1/reports",
+                "schemaVersion": "execution-boundary.v1",
+            },
+        }
 
 
 def test_track_c_create_run_requires_csrf_and_uses_trading_data_engine(monkeypatch):

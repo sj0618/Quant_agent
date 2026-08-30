@@ -48,6 +48,7 @@ from ai_graph.data_sources.db import (
     measure_research_runtime_facts_from_env,
     resolve_database_dsn_from_env,
 )
+from ai_graph.execution_boundary import retired_public_create_detail
 from ai_graph.graph import run_analysis
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
@@ -948,7 +949,7 @@ def create_app(
             openapi_url=OPENAPI_URL,
             data_source=_data_source_status(),
             job_store=_job_store_status(runtime),
-            endpoints=_endpoint_statuses(),
+            endpoints=_endpoint_statuses(production_runtime=_production_runtime()),
         )
 
     @app.post(
@@ -972,6 +973,16 @@ def create_app(
         GET /analysis-jobs/{job_id} already exist for exactly this shape: the client
         polls the queued job instead of holding one long request open.
         """
+
+        if _production_runtime():
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail=retired_public_create_detail(
+                    boundary_id="public-analysis-create",
+                    path=ANALYSIS_JOBS_PATH,
+                    read_only_alternative="/api/v1/reports",
+                ),
+            )
 
         production_runtime = _production_runtime()
         if production_runtime:
@@ -1407,6 +1418,15 @@ def create_app(
         http_request: Request,
         user_id: str = Depends(require_preflight_user),
     ) -> ResearchJobAcceptedV1 | JSONResponse:
+        if _production_runtime():
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail=retired_public_create_detail(
+                    boundary_id="public-research-job-create",
+                    path=RESEARCH_JOB_CREATE_PATH,
+                    read_only_alternative="/api/v1/reports",
+                ),
+            )
         signer = app.state.rule_draft_signer
         if signer is None or not app.state.research_execution_enabled:
             raise HTTPException(
@@ -1594,9 +1614,10 @@ def create_app(
     return app
 
 
-def _endpoint_statuses() -> list[EndpointStatus]:
+def _endpoint_statuses(*, production_runtime: bool | None = None) -> list[EndpointStatus]:
     """The public inventory of core execution and compatibility surfaces."""
 
+    retired = _production_runtime() if production_runtime is None else production_runtime
     return [
         EndpointStatus(
             method="GET",
@@ -1619,8 +1640,12 @@ def _endpoint_statuses() -> list[EndpointStatus]:
         EndpointStatus(
             method="POST",
             path=ANALYSIS_JOBS_PATH,
-            state="job_async",
-            summary="Queue a natural-language strategy analysis job; release execution fails closed when real-data dependencies are unavailable.",
+            state="retired" if retired else "job_async",
+            summary=(
+                "Retired public analysis creation; use authenticated read-only report snapshots."
+                if retired
+                else "Queue a local development analysis job; release public creation is retired."
+            ),
         ),
         EndpointStatus(
             method="GET",
@@ -1643,8 +1668,12 @@ def _endpoint_statuses() -> list[EndpointStatus]:
         EndpointStatus(
             method="POST",
             path=RESEARCH_JOB_CREATE_PATH,
-            state="local_sync",
-            summary="Create a job only from a signed research rule when activation is explicitly enabled.",
+            state="retired" if retired else "local_sync",
+            summary=(
+                "Retired public research execution; use authenticated read-only report snapshots."
+                if retired
+                else "Create a job only from a signed research rule when activation is explicitly enabled."
+            ),
         ),
         EndpointStatus(
             method="GET",
