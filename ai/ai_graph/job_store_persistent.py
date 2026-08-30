@@ -75,6 +75,20 @@ class RestartReconciliationRepository(Protocol):
         ...
 
 
+@runtime_checkable
+class LeasedJobRepository(Protocol):
+    """A repository that can arbitrate between two workers claiming the same job."""
+
+    def claim_job(self, job_id: str, *, owner: str, lease_seconds: int) -> int | None:
+        ...
+
+    def renew_lease(self, job_id: str, *, owner: str, lease_seconds: int) -> bool:
+        ...
+
+    def release_lease(self, job_id: str, *, owner: str) -> bool:
+        ...
+
+
 class PersistentAnalysisJobStore:
     """Adapter over the DB-team-owned analysis job repository contract."""
 
@@ -177,3 +191,26 @@ class PersistentAnalysisJobStore:
         return self._repository.force_fail_undecodable_job(
             job_id, error_message=error_message, reason=reason
         )
+
+    def claim_job(self, job_id: str, *, owner: str, lease_seconds: int) -> int | None:
+        """Take the lease, or return None because a live holder already has it.
+
+        Refuses rather than silently succeeding when the repository has no lease
+        support: a claim that always succeeds is worse than no claim at all, because
+        callers would treat it as arbitration that never happened.
+        """
+
+        return self._leased().claim_job(job_id, owner=owner, lease_seconds=lease_seconds)
+
+    def renew_lease(self, job_id: str, *, owner: str, lease_seconds: int) -> bool:
+        return self._leased().renew_lease(job_id, owner=owner, lease_seconds=lease_seconds)
+
+    def release_lease(self, job_id: str, *, owner: str) -> bool:
+        return self._leased().release_lease(job_id, owner=owner)
+
+    def _leased(self) -> LeasedJobRepository:
+        if not isinstance(self._repository, LeasedJobRepository):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires lease support for job claims."
+            )
+        return self._repository

@@ -162,14 +162,15 @@ def test_the_reaper_would_take_a_live_sibling_workers_job() -> None:
     mid-analysis, and this sweep would fail work in flight - the client sees a run that
     was progressing turn into `interrupted_by_restart` for no reason it can observe.
 
-    There is no lease behind the rule: no heartbeat, no expiry, nothing the owner
-    refreshes while it works. So the reaper has no way to tell a dead owner from a busy
-    one, and the safety comes entirely from the startup guard below rather than from the
-    claim itself.
+    A lease now exists (CORE-JOB-01), and a job carrying a live one is skipped - see
+    `test_a_live_lease_protects_a_sibling_workers_job` in
+    `test_job_lease_recovery.py`. This job has no lease, so the sweep falls back to the
+    incarnation comparison and still takes it.
 
-    This asserts the unsafe behaviour on purpose. It is not a description of what should
-    happen under two workers - it is the tripwire that makes anyone lifting the worker
-    limit come here and build the lease first.
+    That fallback is correct for the in-memory store, which has no second worker to
+    arbitrate between, and it is what a persisted row written before the lease columns
+    existed will hit. It remains unsafe under two live workers on rows with no lease, so
+    the startup guard below still carries that case.
     """
 
     store, job_id = _store_with_running_job()

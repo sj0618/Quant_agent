@@ -33,6 +33,20 @@ class ReconciliationBatch:
     undecodable_job_ids: list[str]
 
 
+def _row_level_fields(row: Any) -> dict[str, Any]:
+    """Columns that describe the row rather than the analysis."""
+
+    fields: dict[str, Any] = {}
+    for name in ("version", "lease_expires_at"):
+        try:
+            value = row[name]
+        except (KeyError, TypeError, IndexError):
+            continue
+        if value is not None:
+            fields[name] = value
+    return fields
+
+
 def _job_document(job: AnalysisJob) -> dict[str, Any]:
     document = job.model_dump(mode="json")
     document.update(
@@ -150,9 +164,9 @@ class PostgresAnalysisJobRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT job_jsonb
+                SELECT job_jsonb, version, lease_expires_at
                 FROM (
-                    SELECT job_jsonb, updated_at
+                    SELECT job_jsonb, version, lease_expires_at, updated_at
                     FROM app.ai_analysis_job
                     ORDER BY updated_at DESC
                     LIMIT %s
@@ -179,7 +193,7 @@ class PostgresAnalysisJobRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT job_jsonb
+                SELECT job_jsonb, version, lease_expires_at
                 FROM app.ai_analysis_job
                 WHERE job_jsonb ->> 'status' IN ('queued', 'running')
                 ORDER BY updated_at ASC
@@ -240,7 +254,17 @@ class PostgresAnalysisJobRepository:
         for row in rows:
             document = row["job_jsonb"]
             try:
-                decoded.append(AnalysisJob.model_validate(document))
+                # `version` and `lease_expires_at` are columns, not document fields, so
+                # they are merged in here rather than being absent on everything the
+                # list reads. A row read without its version cannot be safely written
+                # back: the compare-and-swap would compare against the default.
+                decoded.append(
+                    AnalysisJob.model_validate(
+                        {**document, **_row_level_fields(row)}
+                        if isinstance(document, dict)
+                        else document
+                    )
+                )
             except ValidationError:
                 job_id = None
                 if isinstance(document, dict):

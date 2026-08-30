@@ -217,6 +217,9 @@ class AnalysisJob(BaseModel):
     # property of the row, not of the analysis, and the public job response must not
     # change shape because the row was written twice. In-memory stores leave it at 1.
     version: int = Field(default=1, exclude=True, ge=1)
+    # When the current holder's claim runs out. Storage-only like `version`. Absent on
+    # in-memory stores, which have no second worker to arbitrate between.
+    lease_expires_at: datetime | None = Field(default=None, exclude=True)
 
 
 class AnalysisJobStore(Protocol):
@@ -1405,6 +1408,23 @@ def job_deadline_seconds(environ_map: Mapping[str, str] | None = None) -> float 
 _REAPABLE_STATUSES = frozenset({AnalysisJobStatus.QUEUED, AnalysisJobStatus.RUNNING})
 
 
+def _lease_is_live(job: AnalysisJob, *, now: datetime | None = None) -> bool:
+    """Is someone demonstrably still working this job?
+
+    A lease answers the question `owner_incarnation` cannot: that field only says the
+    row was written by a different process, not whether that process is still alive. A
+    holder that keeps renewing is working; one that stopped renewing has, by the only
+    evidence available, stopped.
+    """
+
+    expiry = job.lease_expires_at
+    if expiry is None:
+        return False
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=UTC)
+    return expiry > (now or datetime.now(UTC))
+
+
 def reap_interrupted_jobs(
     store: AnalysisJobStore,
     *,
@@ -1471,7 +1491,14 @@ def reap_interrupted_jobs(
             reaped.append(job_id)
 
     for job in jobs:
-        if job.status not in _REAPABLE_STATUSES or job.owner_incarnation == incarnation:
+        if job.status not in _REAPABLE_STATUSES:
+            continue
+        # A live lease outranks the incarnation comparison below. Without this the sweep
+        # settles a job a sibling worker is actively running, because from this process's
+        # side "written by someone else" and "abandoned" look identical.
+        if _lease_is_live(job):
+            continue
+        if job.owner_incarnation == incarnation:
             continue
         try:
             store.fail_job(
