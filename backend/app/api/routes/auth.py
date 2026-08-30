@@ -118,7 +118,18 @@ async def google_callback(request: Request, code: str, state: str) -> RedirectRe
     settings = get_runtime_settings(request)
     store = get_session_store(request)
     oauth_state = await store.consume_oauth_state(state)
-    _user, session_id = await _complete_google_callback(request, code=code, oauth_state=oauth_state)
+    stored_redirect_uri = oauth_state.get("redirect_uri")
+    redirect_uri = (
+        stored_redirect_uri
+        if isinstance(stored_redirect_uri, str) and stored_redirect_uri
+        else None
+    )
+    _user, session_id = await _complete_google_callback(
+        request,
+        code=code,
+        oauth_state=oauth_state,
+        redirect_uri=redirect_uri,
+    )
     response = RedirectResponse(sanitize_return_to(str(oauth_state.get("return_to") or "/app")), status_code=303)
     set_session_cookie(response, settings, session_id)
     return response

@@ -213,6 +213,57 @@ def test_google_callback_sets_cookie_and_redirects(monkeypatch):
     assert asyncio.run(store.get_session_user_id(previous_session_id)) is None
 
 
+def test_google_callback_uses_stored_redirect_uri_for_token_exchange(monkeypatch):
+    client, app = make_client()
+    store = AuthSessionStore(app.state.redis_client, app.state.settings)
+
+    async def seed_state():
+        await store.store_oauth_state(
+            state="state-redirect",
+            nonce="nonce-redirect",
+            return_to="/app",
+            redirect_uri=FE_CALLBACK,
+        )
+
+    asyncio.run(seed_state())
+
+    async def fake_exchange(settings, *, code, redirect_uri=None):
+        assert code == "code-redirect"
+        assert redirect_uri == FE_CALLBACK
+        return {"id_token": "id-token"}
+
+    async def fake_validate(settings, *, id_token, expected_nonce):
+        assert expected_nonce == "nonce-redirect"
+        return GoogleIdentity(
+            sub="google-sub",
+            email="user@example.co.kr",
+            email_verified=True,
+            name="User",
+            picture=None,
+        )
+
+    async def fake_upsert(engine, identity):
+        return {
+            "id": "user-1",
+            "email": identity.email,
+            "name": identity.name,
+            "auth_provider": "google",
+            "provider_user_id": identity.sub,
+        }
+
+    monkeypatch.setattr(auth, "exchange_authorization_code", fake_exchange)
+    monkeypatch.setattr(auth, "validate_google_id_token", fake_validate)
+    monkeypatch.setattr(auth, "upsert_google_user", fake_upsert)
+
+    response = client.get(
+        "/api/v1/auth/google/callback?code=code-redirect&state=state-redirect",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/app"
+
+
 def test_google_callback_session_supports_follow_up_auth_me(monkeypatch):
     client, app = make_client()
     store = AuthSessionStore(app.state.redis_client, app.state.settings)
