@@ -148,10 +148,17 @@ def test_the_readiness_gate_ai_profile_tracks_the_ai_api_dependency_set():
 
 
 def test_every_readiness_gate_invocation_selects_a_profile():
+    gate_invocation_tokens = (
+        "readiness-semantic-gate.mjs",
+        '"$READINESS_CHECKER"',
+    )
+
     for workflow_path in (DEPLOY_WORKFLOW, HEALTH_WORKFLOW):
         workflow = workflow_path.read_text(encoding="utf-8")
         for line in workflow.splitlines():
-            if "readiness-semantic-gate.mjs" not in line:
+            if "node " not in line:
+                continue
+            if not any(token in line for token in gate_invocation_tokens):
                 continue
             assert "--profile" in line, f"{workflow_path.name} gates readiness without a profile: {line.strip()}"
 

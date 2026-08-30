@@ -206,6 +206,28 @@ jobs:
           printf '%s\n' "${sha256}"
           REMOTE
 
+      - name: Pin rollback readiness checker
+        run: |
+          set -Eeuo pipefail
+          test -s scripts/readiness-semantic-gate.mjs
+
+          scp -q -i ~/.ssh/id_rsa -P 30233 scripts/readiness-semantic-gate.mjs "etluser@quant-agent.kro.kr:~/mvp_sp1/.releases/$GITHUB_SHA/readiness-semantic-gate.mjs.upload"
+
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr bash -s -- "$GITHUB_SHA" <<'REMOTE'
+          set -Eeuo pipefail
+
+          DEPLOYMENT_REVISION="$1"
+          SNAPSHOT_DIR="$HOME/mvp_sp1/.releases/$DEPLOYMENT_REVISION"
+          incoming="$SNAPSHOT_DIR/readiness-semantic-gate.mjs.upload"
+          target="$SNAPSHOT_DIR/readiness-semantic-gate.mjs"
+
+          test -d "$SNAPSHOT_DIR"
+          test -s "$incoming"
+          chmod 600 "$incoming"
+          mv "$incoming" "$target"
+          test -s "$target"
+          REMOTE
+
       - name: Mark deploy mutation started
         run: |
           echo "DEPLOY_MUTATION_STARTED=true" >> "$GITHUB_ENV"
@@ -303,10 +325,13 @@ jobs:
             SNAPSHOT_DIR="$RELEASES_DIR/$DEPLOYMENT_REVISION"
             SNAPSHOT_ARCHIVE="$SNAPSHOT_DIR/current-release.tar.gz"
             SNAPSHOT_CHECKSUM="$SNAPSHOT_ARCHIVE.sha256"
+            READINESS_CHECKER="$SNAPSHOT_DIR/readiness-semantic-gate.mjs"
             mkdir -p "$RUN_DIR"
             SECRET_DIR="$HOME/.config/quantagent"
             mkdir -p "$SECRET_DIR"
             chmod 700 "$SECRET_DIR"
+
+            test -s "$READINESS_CHECKER"
 
             for auth_var in \
               AUTH_ENABLED \
@@ -341,7 +366,7 @@ jobs:
             restore_deploy_snapshot() {
               local restore_root
               restore_root="$(mktemp -d "$HOME/mvp_sp1/rollback-snapshot-restore-stage.XXXXXX")"
-              trap 'rm -rf "$restore_root"' RETURN
+              trap 'rm -rf "$restore_root"; trap - RETURN' RETURN
               validate_snapshot_archive
               tar -xzf "$SNAPSHOT_ARCHIVE" -C "$restore_root"
               rsync -a --delete --omit-dir-times --no-perms --no-owner --no-group \
@@ -379,7 +404,7 @@ jobs:
               trap 'rm -f "$body"; trap - RETURN' RETURN
               for _ in $(seq 1 30); do
                 if curl -fsS -o "$body" "$url" >/dev/null 2>&1; then
-                  if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" --profile "$profile" < "$body"; then
+                  if node "$READINESS_CHECKER" --label "$checker_label" --profile "$profile" < "$body"; then
                     echo "$label is ready: $url"
                     return 0
                   fi
@@ -684,6 +709,7 @@ jobs:
           SNAPSHOT_DIR="$RELEASES_DIR/$DEPLOYMENT_REVISION"
           SNAPSHOT_ARCHIVE="$SNAPSHOT_DIR/current-release.tar.gz"
           SNAPSHOT_CHECKSUM="$SNAPSHOT_ARCHIVE.sha256"
+          READINESS_CHECKER="$SNAPSHOT_DIR/readiness-semantic-gate.mjs"
           ROLLBACK_MARKER="$SNAPSHOT_DIR/rollback-applied.marker"
           snapshot_disallowed_regex='(^|/)(\.env(\..*)?|\.releases|\.run|\.venv|venv)(/|$)|(^|/)(__pycache__|logs|\.pytest_cache|\.ruff_cache|\.mypy_cache|\.cache)(/|$)|(\.pyc|\.log|\.pid|\.sock)$'
 
@@ -695,6 +721,11 @@ jobs:
           if [ ! -s "$SNAPSHOT_ARCHIVE" ] || [ ! -s "$SNAPSHOT_CHECKSUM" ]; then
             echo "No deploy snapshot available to restore"
             exit 0
+          fi
+
+          if [ ! -s "$READINESS_CHECKER" ]; then
+            echo "Pinned readiness checker is unavailable for rollback"
+            exit 1
           fi
 
           validate_snapshot_archive() {
@@ -711,7 +742,7 @@ jobs:
           restore_deploy_snapshot() {
             local restore_root
             restore_root="$(mktemp -d "$HOME/mvp_sp1/rollback-snapshot-restore-stage.XXXXXX")"
-            trap 'rm -rf "$restore_root"' RETURN
+            trap 'rm -rf "$restore_root"; trap - RETURN' RETURN
             validate_snapshot_archive
             tar -xzf "$SNAPSHOT_ARCHIVE" -C "$restore_root"
             rsync -a --delete --omit-dir-times --no-perms --no-owner --no-group \
@@ -811,7 +842,7 @@ jobs:
             trap 'rm -f "$body"; trap - RETURN' RETURN
             for _ in $(seq 1 30); do
               if curl -fsS -o "$body" "$url" >/dev/null 2>&1; then
-                if node "$APP_DIR/scripts/readiness-semantic-gate.mjs" --label "$checker_label" --profile "$profile" < "$body"; then
+                if node "$READINESS_CHECKER" --label "$checker_label" --profile "$profile" < "$body"; then
                   echo "$label is ready: $url"
                   return 0
                 fi
