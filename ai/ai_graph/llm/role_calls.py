@@ -72,7 +72,10 @@ class RoleDebatePayload(BaseModel):
 class _LiveRoleCitation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    title: str
+    # Deployed AOAI models return citations as {"url": ...} without a title whenever
+    # provider-side structured outputs are not enforced; the url is the identifier, so
+    # a missing title must not fail the whole analysis.
+    title: str = ""
     url: str
 
 
