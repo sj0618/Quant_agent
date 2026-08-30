@@ -178,6 +178,19 @@ def test_an_empty_resolution_is_refused_rather_than_passed_downstream(live_inten
     assert resolve_strategy_intent(query="화학 관련주 사줘", capabilities=[]) is None
 
 
+def test_a_citation_without_a_title_still_resolves(live_intent) -> None:
+    """Deployed AOAI models cite as {"url": ...} with no title whenever provider-side
+    structured outputs are not enforced; that shape killed every production analysis
+    at the Ambiguity Classifier and must validate instead."""
+
+    live_intent(_intent_payload(citations=[{"url": "https://example.com/krx"}]))
+
+    resolved = resolve_strategy_intent(query="화학 관련주 사줘", capabilities=[])
+
+    assert resolved is not None
+    assert resolved["citations"] == [{"title": "", "url": "https://example.com/krx"}]
+
+
 def test_provider_failure_still_runs_the_analysis() -> None:
     """Mock mode and provider outages must not turn into questions either; without a
     model to interpret with, the fallback answers the one question that needs no
