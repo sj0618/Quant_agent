@@ -925,12 +925,7 @@ class DataRepository:
             f"({sql_literal(bok_series_id(item))}, {sql_literal(item['cycle'])})"
             for item in BOK_SERIES_PRESETS["all-macro"]
         )
-        expected_dart_values = ", ".join(
-            f"({sql_literal(report_code)}, {sql_literal(date(year, month, day))})"
-            for year in range(start_date.year, end_date.year + 1)
-            for report_code, (month, day) in DART_REPORT_CODE_PERIOD_END.items()
-            if start_date <= date(year, month, day) <= end_date
-        ) or "(NULL::text, NULL::date)"
+        expected_dart_values = _expected_dart_period_values(start_date, end_date)
         bok_stale_before = end_date - timedelta(days=bok_staleness_days)
 
         self.executor.execute_script(
@@ -2066,6 +2061,16 @@ def _dq_issue_row(issue: DataQualityIssue, run_id: UUID) -> str:
         f"{sql_literal(issue.rule_code)}, {sql_literal(issue.message)}"
         ")"
     )
+
+
+def _expected_dart_period_values(start_date: date, end_date: date) -> str:
+    values = ", ".join(
+        f"({sql_literal(report_code)}, {sql_literal(date(year, month, day))}::date)"
+        for year in range(start_date.year, end_date.year + 1)
+        for report_code, (month, day) in DART_REPORT_CODE_PERIOD_END.items()
+        if start_date <= date(year, month, day) <= end_date
+    )
+    return values or "(NULL::text, NULL::date)"
 
 
 def _ta_table_name(category: str) -> str:
