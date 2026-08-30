@@ -859,6 +859,23 @@ jobs:
             stop_listeners_on_port 18000
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
 
+            SECRET_DIR="$HOME/.config/quantagent"
+            mkdir -p "$SECRET_DIR"
+            chmod 700 "$SECRET_DIR"
+
+            export APP_ENV=production
+            export AI_JOB_STORE=persistent
+
+            RULE_DRAFT_SECRET_FILE="$SECRET_DIR/ai-rule-draft-hmac.secret"
+            if [ ! -s "$RULE_DRAFT_SECRET_FILE" ]; then
+              umask 077
+              openssl rand -hex 32 > "$RULE_DRAFT_SECRET_FILE"
+            fi
+            chmod 600 "$RULE_DRAFT_SECRET_FILE"
+            export AI_RULE_DRAFT_HMAC_SECRET
+            AI_RULE_DRAFT_HMAC_SECRET="$(tr -d '\r\n' < "$RULE_DRAFT_SECRET_FILE")"
+            export AI_RULE_DRAFT_HMAC_KEY_VERSION=server-v1
+
             cd "$APP_DIR"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
               --host 0.0.0.0 \
