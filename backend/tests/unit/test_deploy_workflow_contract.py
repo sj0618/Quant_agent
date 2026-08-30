@@ -184,3 +184,38 @@ def test_public_ai_readiness_smoke_uses_the_ai_dependency_set():
     assert "public-ai-readiness" in smoke
     assert "ai_required_checks='durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer'" in smoke
     assert '--label public-ai-readiness --checks "$ai_required_checks"' in smoke
+
+
+def test_failure_rollback_restores_ai_readiness_runtime():
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+
+    rollback_start = workflow.index("restart_restored_release() {")
+    rollback_end = workflow.index(
+        "          restore_deploy_snapshot",
+        rollback_start,
+    )
+    rollback = workflow[rollback_start:rollback_end]
+
+    required = (
+        'SECRET_DIR="$HOME/.config/quantagent"',
+        "export APP_ENV=production",
+        "export AI_JOB_STORE=persistent",
+        'RULE_DRAFT_SECRET_FILE="$SECRET_DIR/ai-rule-draft-hmac.secret"',
+        "export AI_RULE_DRAFT_HMAC_SECRET",
+        "export AI_RULE_DRAFT_HMAC_KEY_VERSION=server-v1",
+    )
+
+    for token in required:
+        assert token in rollback
+
+    assert rollback.index("export AI_JOB_STORE=persistent") < rollback.index(
+        'nohup "$APP_DIR/ai/.venv/bin/python"'
+    )
+
+    assert rollback.index("export AI_RULE_DRAFT_HMAC_SECRET") < rollback.index(
+        'nohup "$APP_DIR/ai/.venv/bin/python"'
+    )
+
+    assert "npm ci" not in rollback
+    assert "npm run build" not in rollback
+    assert "stop_listeners_on_port() {" not in rollback
