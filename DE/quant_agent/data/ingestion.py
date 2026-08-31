@@ -10,10 +10,12 @@ from quant_agent.data.config import KrxConfig, OhlcvIngestionConfig
 from quant_agent.data.lineage_quality import LineageQualityReport
 from quant_agent.data.models import OhlcvBar, OhlcvIngestionResult, RawSourcePayload
 from quant_agent.data.repository import DataRepository
+from quant_agent.data.release_manifest import build_release_manifest
 from quant_agent.data.sources.krx import KrxOhlcvClient
 
 CANONICAL_OHLCV_SOURCE = "KRX"
 KIS_ADJUSTED_INGESTION_SCRIPT = "scripts/ingest_kis_adjusted_ohlcv.py"
+CANONICAL_OHLCV_SOURCE_VERSION = "krx-ohlcv.v1"
 
 
 @dataclass(frozen=True)
