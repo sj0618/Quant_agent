@@ -92,6 +92,20 @@ export function gitSha({ repositoryRoot = REPOSITORY_ROOT } = {}) {
   }).trim();
 }
 
+export function limitationRecord(manifest) {
+  return manifest.source === "postgres"
+    ? {
+        release_eligible: true,
+        reason: "postgres manifest still needs independently reviewed server execution evidence",
+        source: manifest.source,
+      }
+    : {
+        release_eligible: false,
+        reason: "fixture manifest: local deterministic contract only; not production or live-data evidence",
+        source: manifest.source,
+      };
+}
+
 export function replayOnce(manifest, { repositoryRoot = REPOSITORY_ROOT } = {}) {
   const inputHash = sha256(canonicalJson(manifest));
   const environmentHash = sha256(canonicalJson({
@@ -99,6 +113,24 @@ export function replayOnce(manifest, { repositoryRoot = REPOSITORY_ROOT } = {}) 
     node: process.version,
     platform: process.platform,
   }));
+  const provenanceTrace = [
+    {
+      as_of: manifest.as_of,
+      indicator_input_hash: manifest.indicator_input_hash,
+      lineage_hash: manifest.lineage_hash,
+      source: manifest.source,
+      source_version: manifest.source_version,
+      stage: "immutable_input",
+      universe_snapshot_hash: manifest.universe_snapshot_hash,
+    },
+    {
+      environment_hash: environmentHash,
+      formula_version: manifest.formula_version,
+      git_sha: gitSha({ repositoryRoot }),
+      seed_hash: manifest.seed_hash,
+      stage: "strategy_validation",
+    },
+  ];
   const output = {
     as_of: manifest.as_of,
     environment_hash: environmentHash,
@@ -107,12 +139,18 @@ export function replayOnce(manifest, { repositoryRoot = REPOSITORY_ROOT } = {}) 
     indicator_input_hash: manifest.indicator_input_hash,
     input_hash: inputHash,
     lineage_hash: manifest.lineage_hash,
+    limitation_record: limitationRecord(manifest),
+    provenance_trace: provenanceTrace,
     seed_hash: manifest.seed_hash,
     source: manifest.source,
     source_version: manifest.source_version,
     universe_snapshot_hash: manifest.universe_snapshot_hash,
   };
-  return { ...output, output_hash: sha256(canonicalJson(output)) };
+  return {
+    ...output,
+    provenance_trace_hash: sha256(canonicalJson(provenanceTrace)),
+    output_hash: sha256(canonicalJson(output)),
+  };
 }
 
 export function parseArgs(argv) {
@@ -142,16 +180,26 @@ export function runReplay(argv = process.argv.slice(2), { repositoryRoot = REPOS
   const runs = Array.from({ length: options.runs }, () =>
     replayOnce(manifest, { repositoryRoot }),
   );
-  if (options.assertIdenticalOutputHash && new Set(runs.map((run) => run.output_hash)).size !== 1) {
-    throw new Error("replay output hashes differ");
+  const first = runs[0];
+  const equality = {
+    immutable_input_hash: runs.every((run) => run.input_hash === first.input_hash),
+    git_sha: runs.every((run) => run.git_sha === first.git_sha),
+    environment_hash: runs.every((run) => run.environment_hash === first.environment_hash),
+    formula_version: runs.every((run) => run.formula_version === first.formula_version),
+    seed_hash: runs.every((run) => run.seed_hash === first.seed_hash),
+    output_hash: runs.every((run) => run.output_hash === first.output_hash),
+    provenance_trace: runs.every((run) => run.provenance_trace_hash === first.provenance_trace_hash),
+    limitation_record: runs.every((run) => canonicalJson(run.limitation_record) === canonicalJson(first.limitation_record)),
+  };
+  if (options.assertIdenticalOutputHash && Object.values(equality).some((value) => value !== true)) {
+    throw new Error("replay provenance or output hashes differ");
   }
   return {
     contract: "strategy-validation-replay.v1",
     input_manifest: path,
-    limitation: manifest.source === "postgres"
-      ? "postgres manifest still needs independently reviewed server execution evidence"
-      : "fixture manifest: local deterministic contract only; not production or live-data evidence",
-    release_eligible: manifest.source === "postgres",
+    limitation_record: first.limitation_record,
+    release_eligible: first.limitation_record.release_eligible,
+    equality,
     runs,
   };
 }
