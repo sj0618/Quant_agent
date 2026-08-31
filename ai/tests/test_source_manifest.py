@@ -10,6 +10,7 @@ from ai_graph.source_manifest import (
     build_pipeline_extract_snapshot,
     build_source_manifest,
     compute_lineage_hash,
+    is_release_profile,
     validate_release_metadata,
     validate_source_manifest,
 )
@@ -87,6 +88,12 @@ def test_fixture_and_stale_manifest_are_not_release_eligible() -> None:
     assert "release source manifest freshness must be current" in validate_source_manifest(
         stale_manifest, release_profile=True
     )
+
+
+def test_server_deployment_profile_enables_the_same_release_provenance_gate() -> None:
+    assert is_release_profile({"APP_ENV": "production"}) is True
+    assert is_release_profile({"APP_ENV": "prod"}) is False
+    assert is_release_profile({"AI_RELEASE_PROFILE": "release"}) is True
 
 
 def test_lineage_hash_mismatch_is_rejected() -> None:

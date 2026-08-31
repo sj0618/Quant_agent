@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 RELEASE_PROFILE_ENV = "AI_RELEASE_PROFILE"
+DEPLOYMENT_PROFILE_ENV = "APP_ENV"
 RELEASE_PROFILES = frozenset({"release", "production"})
 LINEAGE_HASH_LENGTH = 64
 LINEAGE_HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -332,4 +333,7 @@ def _extract_row_date(row: Mapping[str, Any]) -> date | None:
 
 def is_release_profile(environ: Mapping[str, str] | None = None) -> bool:
     values = environ if environ is not None else os.environ
-    return values.get(RELEASE_PROFILE_ENV, "").strip().lower() in RELEASE_PROFILES
+    return any(
+        values.get(environment_name, "").strip().lower() in RELEASE_PROFILES
+        for environment_name in (RELEASE_PROFILE_ENV, DEPLOYMENT_PROFILE_ENV)
+    )
