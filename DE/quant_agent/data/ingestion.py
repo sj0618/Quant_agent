@@ -9,10 +9,12 @@ from datetime import date, timedelta
 from quant_agent.data.config import KrxConfig, OhlcvIngestionConfig
 from quant_agent.data.models import OhlcvBar, OhlcvIngestionResult, RawSourcePayload
 from quant_agent.data.repository import DataRepository
+from quant_agent.data.release_manifest import build_release_manifest
 from quant_agent.data.sources.krx import KrxOhlcvClient
 
 CANONICAL_OHLCV_SOURCE = "KRX"
 KIS_ADJUSTED_INGESTION_SCRIPT = "scripts/ingest_kis_adjusted_ohlcv.py"
+CANONICAL_OHLCV_SOURCE_VERSION = "krx-ohlcv.v1"
 
 
 @dataclass(frozen=True)
@@ -113,6 +115,14 @@ class OhlcvIngestionService:
             rows_written=total_written,
             raw_payloads_written=total_raw_written,
             quality_issues=all_issues,
+            release_manifest=build_release_manifest(
+                source=source,
+                as_of=request.end_date,
+                freshness=f"ingested-through:{request.end_date.isoformat()}",
+                lineage_refs=("raw.ohlcv_response", "core.ohlcv_daily", "meta.lineage_event"),
+                source_version=CANONICAL_OHLCV_SOURCE_VERSION,
+                fallback_count=0,
+            ).to_dict(),
         )
 
     def _fetch_chunk(
