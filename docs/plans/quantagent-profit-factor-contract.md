@@ -2,32 +2,29 @@
 
 ## Decision
 
-`profit_factor` is the ratio of gross positive **daily period returns** to the
-absolute gross negative daily period returns from the same backtest equity curve.
-It is not inferred from trade win rate, the number of trades, or the number of
-winning sessions.
+`profit_factor` is the ratio of gross positive **realized net PnL from closed trades**
+to the absolute gross negative realized net PnL from those same trades. It is not
+inferred from trade win rate, daily period returns, or the number of winning sessions.
 
 ```text
-PF = sum(max(R_t, 0)) / abs(sum(min(R_t, 0)))
+PF = sum(max(net_pnl_i, 0)) / abs(sum(min(net_pnl_i, 0)))
 ```
 
 - Unit: dimensionless ratio.
-- Numerator: the sum of strictly positive daily period returns after the first equity
-  observation.
-- Denominator: the absolute sum of strictly negative daily period returns from that
-  same interval.
-- Zero returns affect neither side.
+- Numerator: the sum of strictly positive realized net PnL for closed trades.
+- Denominator: the absolute sum of strictly negative realized net PnL for those trades.
+- Zero-PnL trades affect neither side.
 - Clip policy: none. A finite engine result is published as measured; no 0–3 cap or
   win-rate-derived proxy is allowed.
-- Null policy: a missing, non-finite, or engine-defaulted value—including the
-  zero-denominator case—is `value=null` and `is_available=false`. It is never shown as
-  a favourable `1`, `0`, or capped maximum.
+- Null policy: a missing, non-finite, or zero-denominator value is `value=null` and
+  `is_available=false`. It is never shown as a favourable `1`, `0`, or capped maximum.
 
 ## Ownership and enforcement
 
-The full backtest engine calculates the raw period-return metric through QuantStats.
-`ai_graph.nodes.backtest._profit_factor` may only read that engine field and must reject
-engine metric warnings. `ai_graph.quant_explanations.public_metric_registry()` is the
+The full backtest engine calculates the raw ratio from closed-trade net PnL.
+`ai_graph.nodes.backtest._profit_factor` may only read the engine's
+`trade_profit_factor` field and must reject period-return substitutes.
+`ai_graph.quant_explanations.public_metric_registry()` is the
 public whitelist and carries the formula, denominator, input window, null/clip policy,
 implementation reference, and implementation hash for every public metric.
 

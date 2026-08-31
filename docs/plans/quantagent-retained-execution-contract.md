@@ -21,6 +21,7 @@
 | public-analysis-create | POST | `/analysis-jobs` | none | none | 410 feature-disabled + read-only alternative | 아니오 | 아니오 |
 | public-daily-digest-create | POST | `/ai/daily-digest` | none | none | 410 feature-disabled + read-only alternative | 아니오 | 아니오 |
 | public-analysis-run-create | POST | `/api/v1/runs` | none | none | 410 feature-disabled + read-only alternative | 아니오 | 아니오 |
+| public-research-job-create | POST | `/api/research/jobs` | none | none | 410 feature-disabled + read-only alternative | 아니오 | 아니오 |
 | internal-release-evaluator | POST | `/internal/evaluator/analysis` | data_ai_trust_lead | local_ci_or_approved_operator | evaluator FAIL + control board blocker | 예 | 예 |
 | historical-report-read | GET | `/api/reports/{report_id}` | ux_verification_lead | existing_authenticated_user | stale/unavailable reason + next action | 예 | 아니오 |
 

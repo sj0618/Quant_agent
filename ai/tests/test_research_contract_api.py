@@ -87,6 +87,39 @@ def test_parse_returns_rule_review_without_job_quota_or_runner_side_effects() ->
     assert "RSI가 30 이하이고" not in serialized
 
 
+def test_production_research_job_creation_is_retired_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    calls: list[str] = []
+    client, store = _client(execution_enabled=True, calls=calls)
+    draft = build_rule_draft(
+        query="RSI가 30 이하이고 RSI가 70 이상인 일반 조건식을 검토해 주세요.",
+        user_id="local-dev-user",
+        signer=RuleDraftSigner("research-contract-test-secret", key_version="test-v1"),
+    )
+
+    response = client.post(
+        RESEARCH_JOB_CREATE_PATH,
+        json={
+            "canonical_rule": draft.canonical_rule.model_dump(mode="json"),
+            "draft_token": draft.draft_token,
+        },
+    )
+
+    assert response.status_code == 410
+    assert response.json()["detail"] == {
+        "code": "public_create_retired",
+        "message": "새 분석 생성은 제공하지 않습니다. 보관된 읽기 전용 결과만 조회할 수 있습니다.",
+        "boundary_id": "public-research-job-create",
+        "path": RESEARCH_JOB_CREATE_PATH,
+        "read_only_alternative": "/api/v1/reports",
+        "schema_version": "execution-boundary.v1",
+    }
+    assert store.jobs == {}
+    assert calls == []
+
+
 def test_parse_executable_outcome_contains_the_versioned_spec_hash_and_bound_token() -> None:
     calls: list[str] = []
     client, _store = _client(execution_enabled=False, calls=calls)

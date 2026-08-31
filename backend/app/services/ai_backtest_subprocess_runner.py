@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import time
 from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -24,7 +25,22 @@ _RELEASE_BYTE = b"\x01"
 _RELEASE_FAILURE_EXIT_CODE = 2
 
 
-def _await_release(release_fd: int) -> bool:
+def _await_release(release_spec: str) -> bool:
+    if release_spec.startswith("path:"):
+        release_path = Path(release_spec.removeprefix("path:"))
+        while not release_path.exists():
+            time.sleep(0.01)
+        try:
+            return release_path.read_bytes() == _RELEASE_BYTE
+        finally:
+            release_path.unlink(missing_ok=True)
+    fd_spec = release_spec.removeprefix("fd:")
+    try:
+        # Keep accepting the legacy raw descriptor form for direct runner callers;
+        # the executor uses the explicit ``fd:``/``path:`` forms.
+        release_fd = int(fd_spec)
+    except ValueError:
+        return False
     try:
         if os.read(release_fd, 1) != _RELEASE_BYTE:
             return False
@@ -43,11 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     code_path = Path(args[1])
     result_path = Path(args[2])
     trace_id = UUID(args[3])
-    try:
-        release_fd = int(args[4])
-    except ValueError:
-        return _RELEASE_FAILURE_EXIT_CODE
-    if not _await_release(release_fd):
+    if not _await_release(args[4]):
         return _RELEASE_FAILURE_EXIT_CODE
 
     request = AICodeBacktestFlowRequest.model_validate_json(request_path.read_text(encoding="utf-8"))

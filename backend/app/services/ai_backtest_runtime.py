@@ -315,7 +315,19 @@ class SandboxedBacktestExecutor:
             output_path = temp_path / "result.json"
             request_path.write_text(request.model_dump_json(indent=2), encoding="utf-8")
             generated_path.write_text(generated.generated_code, encoding="utf-8")
-            release_read_fd, release_write_fd = os.pipe()
+            release_path: Path | None = None
+            if os.name == "nt":
+                # Windows does not preserve a numeric CRT descriptor across a
+                # subprocess boundary.  A private signal file in the same temporary
+                # directory keeps the release fence explicit without weakening the
+                # ownership gate.
+                release_read_fd = None
+                release_write_fd = None
+                release_path = temp_path / "release.signal"
+                release_argument = f"path:{release_path}"
+            else:
+                release_read_fd, release_write_fd = os.pipe()
+                release_argument = f"fd:{release_read_fd}"
             command = [
                 sys.executable,
                 "-m",
@@ -324,28 +336,36 @@ class SandboxedBacktestExecutor:
                 str(generated_path),
                 str(output_path),
                 str(trace_id),
-                str(release_read_fd),
+                release_argument,
             ]
-            try:
-                process = subprocess.Popen(
-                    command,
-                    cwd=temp_dir,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=True,
-                    pass_fds=(release_read_fd,),
-                    preexec_fn=_limit_subprocess_resources(request.memory_limit_mb, request.timeout_seconds),
+            popen_options: dict[str, Any] = {
+                "cwd": temp_dir,
+                "env": env,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "start_new_session": True,
+            }
+            if os.name == "nt":
+                # Windows does not support ``pass_fds``.  The release fence uses the
+                # private signal file passed in the command instead.
+                popen_options["close_fds"] = True
+            else:
+                popen_options["pass_fds"] = (release_read_fd,)
+                popen_options["preexec_fn"] = _limit_subprocess_resources(
+                    request.memory_limit_mb, request.timeout_seconds
                 )
+            try:
+                process = subprocess.Popen(command, **popen_options)
             except Exception:
-                os.close(release_write_fd)
+                _close_release_writer(release_write_fd)
                 raise
             finally:
-                os.close(release_read_fd)
+                if release_read_fd is not None:
+                    os.close(release_read_fd)
 
             if process_identity_recorder is None:
-                os.close(release_write_fd)
+                _close_release_writer(release_write_fd)
                 await _withhold_release_and_wait(process)
                 return _failed_execution_result(
                     request=request,
@@ -360,12 +380,12 @@ class SandboxedBacktestExecutor:
                     attempt_id=uuid4(),
                     worker_host=socket.gethostname(),
                     worker_pid=process.pid,
-                    worker_pgid=os.getpgid(process.pid),
+                    worker_pgid=_process_group_id(process),
                     worker_started_at=started_at,
                 )
                 await process_identity_recorder(identity)
             except Exception:  # noqa: BLE001 - child must never run without durable ownership
-                os.close(release_write_fd)
+                _close_release_writer(release_write_fd)
                 await _withhold_release_and_wait(process)
                 return _failed_execution_result(
                     request=request,
@@ -375,7 +395,7 @@ class SandboxedBacktestExecutor:
                     stderr="subprocess ownership persistence failed; execution was not released",
                 )
             if release_authorizer is None:
-                os.close(release_write_fd)
+                _close_release_writer(release_write_fd)
                 await _withhold_release_and_wait(process)
                 return _failed_execution_result(
                     request=request,
@@ -387,7 +407,7 @@ class SandboxedBacktestExecutor:
             try:
                 await release_authorizer(identity)
             except Exception:  # noqa: BLE001 - child must never run without a durable release fence
-                os.close(release_write_fd)
+                _close_release_writer(release_write_fd)
                 await _withhold_release_and_wait(process)
                 return _failed_execution_result(
                     request=request,
@@ -398,11 +418,15 @@ class SandboxedBacktestExecutor:
                 )
 
             try:
-                release_written = os.write(release_write_fd, _RELEASE_BYTE)
+                if release_path is not None:
+                    release_path.write_bytes(_RELEASE_BYTE)
+                    release_written = len(_RELEASE_BYTE)
+                else:
+                    release_written = os.write(release_write_fd, _RELEASE_BYTE)
             except OSError:
                 release_written = 0
             finally:
-                os.close(release_write_fd)
+                _close_release_writer(release_write_fd)
             if release_written != len(_RELEASE_BYTE):
                 await _withhold_release_and_wait(process)
                 return _failed_execution_result(
@@ -429,7 +453,8 @@ class SandboxedBacktestExecutor:
             ended_at = datetime.now(UTC)
             stdout = stdout or ""
             stderr = stderr or ""
-            if process.returncode == -signal.SIGXCPU:
+            sigxcpu = getattr(signal, "SIGXCPU", None)
+            if sigxcpu is not None and process.returncode == -sigxcpu:
                 return _timeout_execution_result(
                     request=request,
                     generated=generated,
@@ -795,6 +820,23 @@ def _limit_subprocess_resources(memory_limit_mb: int, timeout_seconds: int):
                 pass
 
     return _apply_limits
+
+
+def _close_release_writer(release_write_fd: int | None) -> None:
+    if release_write_fd is not None:
+        os.close(release_write_fd)
+
+
+def _process_group_id(process: subprocess.Popen[str]) -> int:
+    """Return a durable process-group identity on POSIX and Windows."""
+
+    getpgid = getattr(os, "getpgid", None)
+    if getpgid is not None:
+        try:
+            return int(getpgid(process.pid))
+        except OSError:
+            pass
+    return int(process.pid)
 
 
 def _pythonpath_error(exc: ModuleNotFoundError) -> AppError:

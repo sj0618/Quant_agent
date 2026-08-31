@@ -1069,7 +1069,11 @@ def test_no_rng_backs_the_deterministic_selection_claim() -> None:
     ]
     for root in roots:
         for source in root.rglob("*.py"):
-            if "test" in source.parts or source.name.startswith("test_"):
+            if (
+                "test" in source.parts
+                or source.name.startswith("test_")
+                or any(part in {".venv", "venv", "site-packages"} for part in source.parts)
+            ):
                 continue
             tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
             for node in ast.walk(tree):

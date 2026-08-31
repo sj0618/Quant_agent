@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from ai_graph.immutable_snapshot import validate_snapshot_bundle
 from ai_graph.data_sources.db import (
     AI_DATABASE_DSN_ENV,
     DATABASE_URL_ENV,
@@ -218,6 +219,8 @@ def test_pipeline_data_source_without_dsn_uses_explicit_nonproduction_fixture(mo
 
     assert bundle.metadata["source"] == "fixture"
     assert bundle.metadata["production_eligible"] is False
+    assert bundle.metadata["immutable_snapshot_bundle"]["pit_universe"]["source"] == "fixture"
+    assert validate_snapshot_bundle(bundle.metadata["immutable_snapshot_bundle"]) == ()
 
 
 def test_runtime_facts_keep_fixture_runs_explicitly_local_only(monkeypatch) -> None:
@@ -412,6 +415,8 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
     bundle = source.load("005930 RSI", "trace-db")
 
     assert bundle.metadata["source"] == "postgres"
+    assert bundle.metadata["immutable_snapshot_bundle"]["pit_universe"]["source"] == "postgres"
+    assert validate_snapshot_bundle(bundle.metadata["immutable_snapshot_bundle"]) == ()
     assert bundle.price_rows[0]["rsi"] == 28.5
     assert bundle.metadata["timings"]["total_seconds"] >= 0
     assert bundle.metadata["timings"]["price_rows_seconds"] >= 0
@@ -1668,6 +1673,8 @@ def test_development_still_gets_the_fixture_bundle_with_its_badge(monkeypatch) -
 
     assert bundle.metadata["source"] == "fixture"
     assert bundle.metadata["production_eligible"] is False
+    assert bundle.metadata["immutable_snapshot_bundle"]["pit_universe"]["source"] == "fixture"
+    assert validate_snapshot_bundle(bundle.metadata["immutable_snapshot_bundle"]) == ()
     assert bundle.metadata["reason"]
 
 

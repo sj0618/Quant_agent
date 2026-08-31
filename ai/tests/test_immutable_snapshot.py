@@ -52,6 +52,24 @@ def test_snapshot_hash_changes_when_any_input_changes() -> None:
     assert validate_snapshot_bundle(bundle.model_copy(update={"pit_universe": changed}))
 
 
+def test_same_input_hash_reproduces_universe_and_delisting_outputs() -> None:
+    first = _bundle()
+    second = build_snapshot_bundle(
+        as_of=AS_OF,
+        source="postgres",
+        lineage_refs=["core.symbol_listing_history", "mart.common_stock_universe_asof"],
+        captured_at=datetime(2026, 8, 22, 0, 0, tzinfo=UTC),
+        pit_universe={"members": ["005930", "000660"], "policy": "pit-v1"},
+        delisting={"events": [], "policy": "official-event-then-final-close-v1"},
+        indicator_input={"families": ["ohlcv_ta"], "lookback_days": 126},
+    )
+
+    assert first.bundle_hash == second.bundle_hash
+    assert first.pit_universe.content_hash == second.pit_universe.content_hash
+    assert first.delisting.content_hash == second.delisting.content_hash
+    assert first.indicator_input.content_hash == second.indicator_input.content_hash
+
+
 def test_bundle_rejects_mixed_as_of_dates() -> None:
     bundle = _bundle()
     changed = build_immutable_snapshot(

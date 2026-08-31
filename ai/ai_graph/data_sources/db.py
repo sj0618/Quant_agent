@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai_graph.immutable_snapshot import build_snapshot_bundle
 from ai_graph.quant_strategy import rsi_trade_rules
 from ai_graph.research_eligibility import ResearchRuntimeFacts
 from ai_graph.source_manifest import build_pipeline_extract_snapshot, build_source_manifest
@@ -536,6 +537,27 @@ class PostgresPipelineDataSource:
             source_version=BACKTEST_WINDOW_POLICY_ID,
             extract_snapshot=extract_snapshot,
         )
+        immutable_snapshot_bundle = build_snapshot_bundle(
+            as_of=research_as_of,
+            source="postgres",
+            pit_universe={
+                "members": sorted(tickers),
+                "descriptor": universe_descriptor,
+                "member_count": len(tickers),
+            },
+            delisting={
+                "policy_version": "official-event-then-final-close-v1",
+                "provenance": SYMBOL_LISTING_HISTORY_TABLE,
+                "members_without_price_rows": pit_members_without_price_rows,
+            },
+            indicator_input={
+                "families": list(indicator_families),
+                "sources": [INDICATOR_TABLES[family] for family in indicator_families],
+                "lookback_days": effective_lookback_days,
+                "query": query,
+            },
+            lineage_refs=source_manifest.lineage_refs,
+        )
 
         return PipelineDataBundle(
             price_rows=price_rows,
@@ -547,6 +569,7 @@ class PostgresPipelineDataSource:
             metadata={
                 "source": "postgres",
                 "source_manifest": source_manifest.model_dump(mode="json"),
+                "immutable_snapshot_bundle": immutable_snapshot_bundle.model_dump(mode="json"),
                 "source_snapshot_as_of": research_as_of,
                 "source_snapshot_freshness": source_freshness,
                 "source_snapshot_version": BACKTEST_WINDOW_POLICY_ID,
@@ -1602,6 +1625,14 @@ def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:
         data_availability=data_availability,
         metadata={
             "source": "fixture",
+            "immutable_snapshot_bundle": build_snapshot_bundle(
+                as_of=fixture_as_of,
+                source="fixture",
+                pit_universe={"members": [], "policy": "fixture"},
+                delisting={"events": [], "policy": "fixture"},
+                indicator_input={"families": [], "query": query},
+                lineage_refs=[reason, query],
+            ).model_dump(mode="json"),
             "source_manifest": build_source_manifest(
                 source="fixture",
                 as_of=fixture_as_of,

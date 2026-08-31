@@ -166,14 +166,13 @@ TRACK_C_CONTRACT_POLICY: tuple[EndpointContract, ...] = (
     contract(
         "POST",
         "/api/v1/runs",
-        implementation=ContractImplementation.DB_BACKED,
+        implementation=ContractImplementation.SCHEMA_ONLY_NOT_DB,
         visibility=ContractVisibility.AUTHENTICATED,
-        production_ready=True,
-        fe_live_allowed=True,
+        production_ready=False,
+        fe_live_allowed=False,
         auth_required=True,
         csrf_required_for_unsafe=True,
-        summary="Create a Track C analysis run.",
-        required_dependency="trading-data DB engine",
+        summary="Retired public analysis-run creation; use archived read-only reports.",
     ),
     contract(
         "GET",
@@ -190,14 +189,13 @@ TRACK_C_CONTRACT_POLICY: tuple[EndpointContract, ...] = (
     contract(
         "POST",
         "/api/v1/runs/{run_id}/complete",
-        implementation=ContractImplementation.DB_BACKED,
+        implementation=ContractImplementation.SCHEMA_ONLY_NOT_DB,
         visibility=ContractVisibility.AUTHENTICATED,
-        production_ready=True,
-        fe_live_allowed=True,
+        production_ready=False,
+        fe_live_allowed=False,
         auth_required=True,
         csrf_required_for_unsafe=True,
-        summary="Persist completion state and report content for a Track C run.",
-        required_dependency="trading-data DB engine",
+        summary="Retired public analysis-run completion; archived reports are read-only.",
     ),
     contract(
         "GET",
@@ -371,5 +369,25 @@ def raise_feature_not_implemented(*, feature: str, method: str, path: str) -> No
             "feature": feature,
             "implementation": contract.implementation.value,
             "requiredDependency": contract.required_dependency or "",
+        },
+    )
+
+
+def raise_retired_public_create(*, boundary_id: str, method: str, path: str) -> NoReturn:
+    """Reject retired public writers without touching auth, quota, or storage."""
+
+    if get_contract(method, path) is None:
+        raise RuntimeError(f"Cannot retire unclassified contract: {method.upper()} {path}")
+    raise AppError(
+        status_code=410,
+        component="contract",
+        code="public_create_retired",
+        message="새 분석 생성은 제공하지 않습니다. 보관된 읽기 전용 결과만 조회할 수 있습니다.",
+        details={
+            "boundaryId": boundary_id,
+            "method": method.upper(),
+            "path": path,
+            "readOnlyAlternative": "/api/v1/reports",
+            "schemaVersion": "execution-boundary.v1",
         },
     )
