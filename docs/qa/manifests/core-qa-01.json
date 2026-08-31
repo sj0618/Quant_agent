@@ -1,0 +1,293 @@
+{
+  "document_status": "DRAFT FOR REVIEW",
+  "approval": "PENDING",
+  "wbs_id": "CORE-QA-01",
+  "quantqa_version": "QuantQA:v1",
+  "full_git_sha": "2783022c59711353dabe54da0403ae287e8dd4cd",
+  "required_tier": "T4",
+  "required_classes": ["S", "R", "O", "C"],
+  "observed_classes": ["S", "R"],
+  "status": "BLOCKED",
+  "requirement_origin": {
+    "required_classes": "GOOGLE_SHEET_DIRECT",
+    "tier_label": "QUANTQA_V1_IMPLEMENTATION_DEFINITION"
+  },
+  "wbs_contract_ref": {
+    "spreadsheet_id": "1V7SnG_x-cLIFbrSurDIadtx5GCY9HfL9jRqdyAl70Ks",
+    "gid": 2030261433,
+    "sheet": "2_WBS",
+    "wbs_id": "CORE-QA-01",
+    "row_number": 137,
+    "observed_at": "2026-08-31T12:16:00+09:00"
+  },
+  "roles": {
+    "owner": "CORE-QA-01 owner",
+    "executor": "CORE-QA-01 owner",
+    "reviewer": null,
+    "approver": "WBS-designated approver",
+    "reviewer_approver_same_allowed_v1": true
+  },
+  "execution_boundary": {
+    "scope": "LOCAL",
+    "uses_mock": true,
+    "uses_memory": true,
+    "uses_noop": true,
+    "configuration_environment_values_recorded": false,
+    "secret_values_recorded": false,
+    "production_node3_pve_load_performed": false,
+    "effective_classes": ["S", "R"]
+  },
+  "evidence": [
+    {
+      "evidence_id": "CORE-QA-01-S-CAUSE",
+      "evidence_class": "S",
+      "scenario": "Terminal failure classification preserves a typed cause chain and the real source stage, and a generic error carrying schema, validation or contract wording is not misclassified.",
+      "pass_criteria": "Typed provider, timeout, connection, HTTP and data-gap failures resolve to distinct closed causes; only a safe message reaches the public result; the targeted suites exit 0.",
+      "actual_result": "Two supplemental verification commands exited 0. The failure-classifier suite reported 21 passed, 0 failed, 0 skipped. The job-lifecycle suite reported 13 passed, 0 failed, 0 skipped. Source review confirmed typed diagnostic construction carrying stage and subcause in the job module, and that only the safe message is placed on the terminal envelope.",
+      "validation_method": "Static source-invariant review plus targeted offline pytest suites in an isolated detached worktree at the tested baseline.",
+      "uses_mock": true,
+      "uses_memory": true,
+      "uses_noop": true,
+      "exit_code": 0,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": "2783022c59711353dabe54da0403ae287e8dd4cd",
+      "executor": "CORE-QA-01 owner",
+      "reviewer": null,
+      "executed_at": "2026-08-31T12:30:00+09:00",
+      "status": "PASS",
+      "limitations": [
+        "Mock provider, in-memory job store and noop audit sink were used, so this item is S-class only and does not substitute for R, O or C.",
+        "No approved isolated command set exists in the repository; the commands are supplemental verification commands selected by the executor."
+      ]
+    },
+    {
+      "evidence_id": "CORE-QA-01-S-HASH",
+      "evidence_class": "S",
+      "scenario": "The canonical execution-spec hash and version are deterministic and are carried unchanged from parse through durable job admission.",
+      "pass_criteria": "The canonical digest is a deterministic canonical serialisation, and the stored job records the same spec version and spec hash that the parse issued.",
+      "actual_result": "One supplemental verification command exited 0 with 2 passed, 0 failed, 0 skipped. Source review confirmed the canonical digest computes a SHA-256 over a sorted, separator-fixed JSON serialisation of the canonical rule, and the tests assert the stored execution spec version and hash equal the parse-issued values.",
+      "validation_method": "Static source-invariant review plus targeted offline pytest node identifiers in an isolated detached worktree at the tested baseline.",
+      "uses_mock": true,
+      "uses_memory": true,
+      "uses_noop": true,
+      "exit_code": 0,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": "2783022c59711353dabe54da0403ae287e8dd4cd",
+      "executor": "CORE-QA-01 owner",
+      "reviewer": null,
+      "executed_at": "2026-08-31T12:32:00+09:00",
+      "status": "PASS",
+      "limitations": [
+        "Mock provider, in-memory job store and noop audit sink were used, so this item is S-class only.",
+        "Hash propagation into a real durable store is covered by the R item, not by this item."
+      ]
+    },
+    {
+      "evidence_id": "CORE-QA-01-S-TAMPER",
+      "evidence_class": "S",
+      "scenario": "A client-tampered execution spec is rejected before any job, outbox or runner side effect occurs.",
+      "pass_criteria": "The request is refused with a typed conflict reason, and no job row and no runner invocation are produced.",
+      "actual_result": "One supplemental verification command exited 0 with 2 passed, 0 failed, 0 skipped. The tests assert an HTTP 409 response, a draft rule mismatch reason code, an empty job store and an empty runner call list. Source review confirmed the spec-hash comparison precedes quota consumption and durable admission, and that token forgery raises a typed draft token validation error on the same path.",
+      "validation_method": "Static source-invariant review plus targeted offline pytest node identifiers in an isolated detached worktree at the tested baseline.",
+      "uses_mock": true,
+      "uses_memory": true,
+      "uses_noop": true,
+      "exit_code": 0,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": "2783022c59711353dabe54da0403ae287e8dd4cd",
+      "executor": "CORE-QA-01 owner",
+      "reviewer": null,
+      "executed_at": "2026-08-31T12:33:00+09:00",
+      "status": "PASS",
+      "limitations": [
+        "Mock provider, in-memory job store and noop audit sink were used, so this item is S-class only.",
+        "Absence of an audit side effect was observed through in-memory test doubles, not against a durable audit sink."
+      ]
+    },
+    {
+      "evidence_id": "CORE-QA-01-S-CLARIFICATION",
+      "evidence_class": "S",
+      "scenario": "A clarification parse outcome stays non-executable and cannot be promoted into a canonical create request.",
+      "pass_criteria": "Clarification drafts issue no execution spec, spec version, spec hash or parse token, and offer at most three explained choices.",
+      "actual_result": "One supplemental verification command exited 0 with 2 passed, 0 failed, 0 skipped. Source review confirmed the rule draft model validator rejects executable drafts that carry clarification choices and rejects clarification drafts that carry any execution spec or token, and that the clarification list is bounded at three entries.",
+      "validation_method": "Static source-invariant review plus targeted offline pytest node identifiers in an isolated detached worktree at the tested baseline.",
+      "uses_mock": true,
+      "uses_memory": true,
+      "uses_noop": true,
+      "exit_code": 0,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": "2783022c59711353dabe54da0403ae287e8dd4cd",
+      "executor": "CORE-QA-01 owner",
+      "reviewer": null,
+      "executed_at": "2026-08-31T12:34:00+09:00",
+      "status": "PASS",
+      "limitations": [
+        "Mock provider, in-memory job store and noop audit sink were used, so this item is S-class only.",
+        "Clarification wording quality was not evaluated; only the structural non-executability contract was."
+      ]
+    },
+    {
+      "evidence_id": "CORE-QA-01-R-TRANSACTION-MIGRATION-RACE",
+      "evidence_class": "R",
+      "scenario": "Against a disposable PostgreSQL database with the full migration set applied, concurrent parse-bound admission is atomic, migration-backed and race-safe, and an expired outbox lease is recoverable.",
+      "pass_criteria": "Exactly one job, one idempotency record and one outbox row exist after two concurrent admissions; only one admission reports created; the raw natural-language input is absent from the stored job document; restart reconciliation preserves the queued outbox dispatch; an expired lease is reclaimed under the same outbox identifier and then settles.",
+      "actual_result": "One supplemental verification command exited 0 with 1 passed, 0 failed and 0 skipped, executed against a real disposable PostgreSQL 16 instance rather than a test double. Transaction: the test asserts the job, idempotency and outbox row counts are exactly one each and that the raw query text is absent from the stored job document. Migration: the harness applies every service database migration, including the parse-bound admission migration, to a freshly created schema before exercising it. Race: two concurrent admissions on a thread pool yield exactly one created flag set true and a single job identifier, and after the outbox claim timestamp is aged the same outbox identifier is reclaimed, then settled and no longer claimable. Post-run inspection of the disposable database showed the migration-created analysis job, idempotency and outbox tables present with one row each.",
+      "validation_method": "Isolated disposable PostgreSQL integration test executed from a detached worktree at the tested baseline, with shared and production database environment variables unset.",
+      "uses_mock": false,
+      "uses_memory": false,
+      "uses_noop": false,
+      "exit_code": 0,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": "2783022c59711353dabe54da0403ae287e8dd4cd",
+      "executor": "CORE-QA-01 owner",
+      "reviewer": null,
+      "executed_at": "2026-08-31T12:50:00+09:00",
+      "status": "PASS",
+      "limitations": [
+        "The database was a loopback-bound, auto-removed, memory-backed disposable container created solely for this run; it is not an operational or staging environment and this item is not promoted to O.",
+        "Concurrency was exercised with two threads inside a single process, so this item does not establish cross-process containment and is not promoted to C.",
+        "The single-process restart reconciliation observed here is R-level evidence only."
+      ]
+    },
+    {
+      "evidence_id": "CORE-QA-01-O-STAGING-PROVENANCE",
+      "evidence_class": "O",
+      "scenario": "A generic exchange-listed relative-strength strategy run in an authorized same-revision isolated staging environment records PostgreSQL source provenance with an as-of date and universe and candidate counts.",
+      "pass_criteria": "Same-revision staging provenance is captured from a real PostgreSQL end-of-day source with no fixture or fallback substitution.",
+      "actual_result": "Not executed. No authorized same-revision isolated persistent staging environment is reachable from the tested baseline, and the repository contains no executable staging harness or staging manifest, only planning and QA documents.",
+      "validation_method": "Authorized isolated staging execution with a non-secret provenance manifest.",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "BLOCKED",
+      "limitations": [
+        "Local disposable PostgreSQL results were deliberately not promoted to O.",
+        "Mock, memory and noop results were deliberately not promoted to O.",
+        "The deployed public environment is not the tested baseline revision and was therefore not used as O evidence."
+      ]
+    },
+    {
+      "evidence_id": "CORE-QA-01-O-STAGING-REPORT",
+      "evidence_class": "O",
+      "scenario": "The completed staging run yields an immutable terminal result identifier and version together with a human-readable strategy, method, performance and limitation report.",
+      "pass_criteria": "The terminal report carries the same execution identity and data provenance as the job, with no fixture-derived performance figures.",
+      "actual_result": "Not executed. No path exists to obtain a same-revision immutable result and report, because the prerequisite staging environment is unavailable.",
+      "validation_method": "Authorized isolated staging execution with immutable result and report capture.",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "BLOCKED",
+      "limitations": [
+        "Upstream staging promotion and deployment gating rows are themselves recorded as blocked in the WBS, so this evidence cannot be produced by the CORE-QA-01 owner alone.",
+        "Reported upstream obstacles include an authentication redirect configuration mismatch, a non-persistent public job store and a public readiness surface returning only generic backend checks; these were recorded as status observations without inspecting any configuration or secret value."
+      ]
+    },
+    {
+      "evidence_id": "CORE-QA-01-C-CGROUP",
+      "evidence_class": "C",
+      "scenario": "Worker-only resource containment is measured under representative load, keeping the API and sentinel outside the worker resource scope.",
+      "pass_criteria": "Processor, memory, swap and pressure metrics plus cleanup and result parity artifacts are recorded with no limit breach.",
+      "actual_result": "Not executed. The repository contains no executable resource-containment or pressure-measurement harness; the concept appears only in planning and QA documents. The capacity module at the tested baseline contains no containment or pressure instrumentation. The execution host provides no control-group facility.",
+      "validation_method": "Worker-only non-root resource containment harness in an authorized isolated environment.",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "BLOCKED",
+      "limitations": [
+        "The upstream capacity measurement row has produced no artifact at the tested baseline."
+      ]
+    },
+    {
+      "evidence_id": "CORE-QA-01-C-RESTART",
+      "evidence_class": "C",
+      "scenario": "A restart across multiple worker processes reclaims interrupted work and reaps descendant processes without duplicating execution.",
+      "pass_criteria": "Cross-process restart preserves exactly one durable job and one immutable terminal result, and descendant processes are cleaned up.",
+      "actual_result": "Not satisfied; partial evidence only. Single-process restart reconciliation was observed against real PostgreSQL under the R item, where reconciliation reaped no jobs and preserved the queued outbox dispatch, and further reconciliation behaviour was exercised at S level with 11 passed against an in-memory store. Neither observation establishes multi-process worker containment or descendant cleanup, so this axis is not satisfied.",
+      "validation_method": "Multi-process worker restart and descendant cleanup in an authorized isolated environment.",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "BLOCKED",
+      "limitations": [
+        "The single-process PostgreSQL reconciliation evidence is R-level and is explicitly not promoted to C.",
+        "The in-memory reconciliation suite is S-level only under the mock, memory and noop rule."
+      ]
+    },
+    {
+      "evidence_id": "CORE-QA-01-C-ROLLBACK",
+      "evidence_class": "C",
+      "scenario": "A failed deployment or rollback blocks promotion of the candidate revision.",
+      "pass_criteria": "Rollback behaviour and promotion gating are demonstrated at the tested baseline revision.",
+      "actual_result": "Not executed. The deployment gating row is recorded as blocked in the WBS and no corresponding evidence artifact exists at the tested baseline.",
+      "validation_method": "Deployment and rollback gating exercise in an authorized isolated environment.",
+      "uses_mock": null,
+      "uses_memory": null,
+      "uses_noop": null,
+      "exit_code": null,
+      "evidence_uri": null,
+      "artifact_sha256": null,
+      "artifact_subject_sha": null,
+      "executor": null,
+      "reviewer": null,
+      "executed_at": null,
+      "status": "BLOCKED",
+      "limitations": [
+        "Rollback gating depends on an operations row outside the CORE-QA-01 workspace lock, and that row is itself blocked."
+      ]
+    }
+  ],
+  "limitations": [
+    "The owner execution result for this WBS row is PARTIAL. This schema's status enumeration has no PARTIAL member, so the manifest status is recorded as BLOCKED, which matches the contract definition that a required isolated environment or prerequisite access is unavailable. The human-readable report states the same outcome.",
+    "The required_tier value T4 is a reference classification required by this schema. QuantQA:v1 is DRAFT FOR REVIEW with approval PENDING, and no approved WBS-to-tier mapping was found, so the authoritative statement is the WBS-required class set S, R, O and C, which is structurally equivalent to T4 but is not asserted as an approved mapping.",
+    "No approved isolated command set for CORE-QA-01 exists in the repository; searches for approved isolated commands and for the WBS identifier returned no match. Every command executed is a supplemental verification command selected by the executor and must not be read as a literal verifier or as an approved command set.",
+    "No scenario matrix in the repository declares itself applicable to CORE-QA-01. The staging runbook matrix and the superseded research-lane matrix were consulted as reference only, and the staging runbook states it may not be used to mark a WBS row complete.",
+    "A reproducible configuration-dependent latent runtime defect was observed in the optional and undeclared primary graph path at this baseline. It is recorded as an unresolved observation and did not change the four directly evaluated S contract axes. The human-readable report describes it in full.",
+    "The governance check that the approver differs from the owner and the executor is recorded as UNVERIFIED rather than PASS, because the WBS-designated approver is the implementation owner of several underlying subject rows evaluated here.",
+    "Uncommitted or local changes held by other contributors are not included in the tested baseline and were not evaluated.",
+    "Historical branch revisions cited in the WBS share no merge base with the canonical default branch and were not used as the subject revision.",
+    "The WBS row was read from an exported workbook copy of the canonical sheet rather than by opening the live spreadsheet, so the contract reference identifies the canonical source while the observation timestamp refers to reading that export.",
+    "The interpreter used was Python 3.12.5, whereas the repository continuous integration pins Python 3.11.",
+    "No reviewer has examined this evidence; every reviewer field is null and approval remains PENDING."
+  ],
+  "blockers": [
+    "No authorized same-revision isolated persistent staging environment is available for the O staging provenance scenario.",
+    "No path exists to capture a same-revision immutable result and human-readable report for the O staging report scenario.",
+    "No executable resource-containment or pressure-measurement harness exists at the tested baseline and the execution host provides no control-group facility, blocking the C containment scenario.",
+    "Cross-process worker restart and descendant cleanup containment cannot be demonstrated with the available environment, leaving the C restart scenario unsatisfied.",
+    "Deployment and rollback promotion gating depends on a blocked operations row and has no artifact at the tested baseline, blocking the C rollback scenario.",
+    "The absence of an approved isolated command set, and of a scenario matrix declared applicable to CORE-QA-01, leaves the verification contract ambiguous and requires a contract decision."
+  ]
+}
