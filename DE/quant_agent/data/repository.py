@@ -12,6 +12,12 @@ from uuid import UUID, uuid4
 from quant_agent.data.config import DEFAULT_BOK_STALENESS_DAYS, DatabaseConfig
 from quant_agent.data.catalogs import BOK_SERIES_PRESETS, DART_REPORT_CODE_PERIOD_END, bok_series_id
 from quant_agent.data.db import SqlExecutor, jsonb_literal, make_executor, sql_literal
+from quant_agent.data.lineage_quality import (
+    DEFAULT_MIN_LINEAGE_COVERAGE,
+    LineageQualityReport,
+    assess_lineage_quality,
+    require_lineage_quality,
+)
 from quant_agent.data.models import (
     AnalystReportSummary,
     ApiRequestLog,
@@ -845,6 +851,41 @@ class DataRepository:
               FROM anomalous;
             """
         )
+
+    def enforce_lineage_quality_slo(
+        self,
+        *,
+        run_id: UUID,
+        source_id: str,
+        start_date: date,
+        end_date: date,
+        min_coverage: float = DEFAULT_MIN_LINEAGE_COVERAGE,
+    ) -> LineageQualityReport:
+        rows = self.executor.fetch_json(
+            f"""
+            SELECT
+              (
+                SELECT COUNT(*)::int
+                  FROM core.ohlcv_daily
+                 WHERE run_id = {sql_literal(run_id)}
+                   AND source_id = {sql_literal(source_id)}
+                   AND trade_date BETWEEN {sql_literal(start_date)} AND {sql_literal(end_date)}
+              ) AS target_rows,
+              (
+                SELECT COUNT(*)::int
+                  FROM meta.lineage_event
+                 WHERE run_id = {sql_literal(run_id)}
+                   AND target_table = 'core.ohlcv_daily'
+              ) AS lineage_rows
+            """
+        )
+        counts = rows[0] if rows else {}
+        report = assess_lineage_quality(
+            target_rows=int(counts.get("target_rows") or 0),
+            lineage_rows=int(counts.get("lineage_rows") or 0),
+            min_coverage=min_coverage,
+        )
+        return require_lineage_quality(report)
 
     def run_kis_krx_consistency_checks(
         self,

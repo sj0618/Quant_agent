@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 
 from quant_agent.data.config import KrxConfig, OhlcvIngestionConfig
+from quant_agent.data.lineage_quality import LineageQualityReport
 from quant_agent.data.models import OhlcvBar, OhlcvIngestionResult, RawSourcePayload
 from quant_agent.data.repository import DataRepository
 from quant_agent.data.release_manifest import build_release_manifest
@@ -101,6 +102,12 @@ class OhlcvIngestionService:
                 end_date=request.end_date,
                 min_coverage=self.ingestion_config.min_symbol_coverage,
             )
+            lineage_quality: LineageQualityReport = self.repository.enforce_lineage_quality_slo(
+                run_id=run_id,
+                source_id=source,
+                start_date=request.start_date,
+                end_date=request.end_date,
+            )
             self.repository.finish_ingestion_run(run_id, status="success")
         except Exception as exc:
             self.repository.finish_ingestion_run(run_id, status="failed", error_message=str(exc))
@@ -115,14 +122,7 @@ class OhlcvIngestionService:
             rows_written=total_written,
             raw_payloads_written=total_raw_written,
             quality_issues=all_issues,
-            release_manifest=build_release_manifest(
-                source=source,
-                as_of=request.end_date,
-                freshness=f"ingested-through:{request.end_date.isoformat()}",
-                lineage_refs=("raw.ohlcv_response", "core.ohlcv_daily", "meta.lineage_event"),
-                source_version=CANONICAL_OHLCV_SOURCE_VERSION,
-                fallback_count=0,
-            ).to_dict(),
+            lineage_quality=lineage_quality.to_dict(),
         )
 
     def _fetch_chunk(
