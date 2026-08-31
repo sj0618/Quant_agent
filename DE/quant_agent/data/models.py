@@ -105,6 +105,7 @@ class OhlcvIngestionResult:
     rows_written: int
     raw_payloads_written: int
     quality_issues: list[DataQualityIssue] = field(default_factory=list)
+    lineage_quality: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
