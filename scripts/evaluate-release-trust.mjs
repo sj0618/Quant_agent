@@ -62,6 +62,39 @@ export function createOfflineTestEnvironment(source = process.env) {
   return environment;
 }
 
+function validateImmutableGitHubEvidence({
+  environment = process.env,
+  evidenceRefKey,
+  evidenceShaKey,
+  evidenceLabel,
+}) {
+  const revision = environment.RELEASE_TRUST_REVISION?.trim().toLowerCase();
+  const repository = environment.RELEASE_TRUST_REPOSITORY?.trim();
+  if (!revision || !FULL_GIT_SHA.test(revision)) {
+    throw new Error("release evidence gate requires a full target revision SHA");
+  }
+  if (!repository || !GITHUB_REPOSITORY.test(repository)) {
+    throw new Error("release evidence gate requires the trusted GitHub repository");
+  }
+
+  const reference = environment[evidenceRefKey]?.trim();
+  const evidenceRevision = environment[evidenceShaKey]?.trim().toLowerCase();
+  const evidencePath = reference?.slice(`https://github.com/${repository}/`.length);
+  if (
+    !reference ||
+    !reference.startsWith(`https://github.com/${repository}/`) ||
+    !evidencePath ||
+    !IMMUTABLE_GITHUB_EVIDENCE.test(evidencePath)
+  ) {
+    throw new Error(`release evidence gate requires an immutable ${evidenceLabel} reference`);
+  }
+  if (!evidenceRevision || !FULL_GIT_SHA.test(evidenceRevision) || evidenceRevision !== revision) {
+    throw new Error(`release evidence gate requires ${evidenceLabel} for the target revision`);
+  }
+
+  return { revision, repository, reference, evidenceRevision };
+}
+
 /**
  * A deployment is allowed only when each required evidence lane points at an
  * immutable GitHub record and names the exact revision being deployed.  The
@@ -79,25 +112,29 @@ export function validateReleaseEvidence(environment = process.env) {
   }
 
   for (const kind of RELEASE_EVIDENCE_KINDS) {
-    const reference = environment[`RELEASE_EVIDENCE_${kind}_REF`]?.trim();
-    const evidenceRevision = environment[`RELEASE_EVIDENCE_${kind}_SHA`]
-      ?.trim()
-      .toLowerCase();
-    const evidencePath = reference?.slice(`https://github.com/${repository}/`.length);
-    if (
-      !reference ||
-      !reference.startsWith(`https://github.com/${repository}/`) ||
-      !evidencePath ||
-      !IMMUTABLE_GITHUB_EVIDENCE.test(evidencePath)
-    ) {
-      throw new Error(`release evidence gate requires an immutable ${kind} evidence reference`);
-    }
-    if (!evidenceRevision || !FULL_GIT_SHA.test(evidenceRevision) || evidenceRevision !== revision) {
-      throw new Error(`release evidence gate requires ${kind} evidence for the target revision`);
-    }
+    validateImmutableGitHubEvidence({
+      environment,
+      evidenceRefKey: `RELEASE_EVIDENCE_${kind}_REF`,
+      evidenceShaKey: `RELEASE_EVIDENCE_${kind}_SHA`,
+      evidenceLabel: `${kind} evidence`,
+    });
   }
 
   return { revision, kinds: [...RELEASE_EVIDENCE_KINDS] };
+}
+
+export function validateRollbackDrillEvidence(environment = process.env) {
+  const details = validateImmutableGitHubEvidence({
+    environment,
+    evidenceRefKey: "ROLLBACK_DRILL_EVIDENCE_REF",
+    evidenceShaKey: "ROLLBACK_DRILL_EVIDENCE_SHA",
+    evidenceLabel: "rollback drill evidence",
+  });
+
+  return {
+    revision: details.revision,
+    kinds: ["rollback-drill"],
+  };
 }
 
 function createBackendContractEnvironment(source = process.env) {
@@ -248,10 +285,20 @@ export function runReleaseTrust({
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  if (process.argv.slice(2).includes("--verify-release-evidence")) {
+  const argv = process.argv.slice(2);
+  const verifyReleaseEvidence = argv.includes("--verify-release-evidence");
+  const verifyRollbackDrillEvidence = argv.includes("--verify-rollback-evidence");
+
+  if (verifyReleaseEvidence || verifyRollbackDrillEvidence) {
     try {
-      validateReleaseEvidence();
-      process.stdout.write("[release-trust] same-SHA S/R/O/C evidence gate passed\n");
+      if (verifyReleaseEvidence) {
+        validateReleaseEvidence();
+        process.stdout.write("[release-trust] same-SHA S/R/O/C evidence gate passed\n");
+      }
+      if (verifyRollbackDrillEvidence) {
+        validateRollbackDrillEvidence();
+        process.stdout.write("[release-trust] same-SHA rollback drill evidence gate passed\n");
+      }
     } catch (error) {
       process.stderr.write(`[release-trust] ${error.message}\n`);
       process.exitCode = 1;

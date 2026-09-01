@@ -3,16 +3,20 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  copyFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  readlinkSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, posix } from "node:path";
+import { dirname, join, posix, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
@@ -43,6 +47,102 @@ export const DEFAULT_SNAPSHOT_EXCLUDES = [
 
 function ensureTrailingSlash(pathValue) {
   return pathValue.endsWith("/") ? pathValue : `${pathValue}/`;
+}
+
+function normalizeSnapshotRelPath(rootPath, entryPath) {
+  const rel = relative(rootPath, entryPath);
+  if (!rel || rel === ".") {
+    return "";
+  }
+  return rel.replace(/\\/g, "/");
+}
+
+function normalizeSnapshotPattern(pattern) {
+  return String(pattern).replace(/\\/g, "/").replace(/^\.\/+/u, "").replace(/^\/+/u, "");
+}
+
+function matchesSnapshotExcludePattern(relPath, pattern) {
+  const normalizedPattern = normalizeSnapshotPattern(pattern);
+  if (!normalizedPattern) {
+    return false;
+  }
+
+  const pathValue = relPath.replace(/\\/g, "/");
+  const leaf = pathValue.split("/").at(-1) ?? "";
+
+  if (normalizedPattern.includes("**/")) {
+    const shortPattern = normalizedPattern.replace(/\*\*\//gu, "");
+    return (
+      pathValue === shortPattern ||
+      pathValue.startsWith(`${shortPattern}/`) ||
+      pathValue.split("/").includes(shortPattern)
+    );
+  }
+
+  if (normalizedPattern.endsWith("/")) {
+    const directoryName = normalizedPattern.slice(0, -1);
+    return (
+      pathValue === directoryName ||
+      pathValue.startsWith(`${directoryName}/`) ||
+      pathValue.split("/").includes(directoryName)
+    );
+  }
+
+  if (normalizedPattern === ".env.*") {
+    return leaf === ".env" || leaf.startsWith(".env.");
+  }
+
+  if (normalizedPattern.startsWith("*")) {
+    return leaf.endsWith(normalizedPattern.slice(1));
+  }
+
+  return (
+    pathValue === normalizedPattern ||
+    pathValue.startsWith(`${normalizedPattern}/`) ||
+    pathValue.split("/").includes(normalizedPattern)
+  );
+}
+
+function shouldExcludeSnapshotPath(relPath, excludePatterns) {
+  return excludePatterns.some((pattern) => matchesSnapshotExcludePattern(relPath, pattern));
+}
+
+function mirrorSnapshotDirectoryContents(sourceRoot, destinationRoot, excludePatterns) {
+  mkdirSync(destinationRoot, { recursive: true });
+  for (const entry of existsSync(sourceRoot) ? readdirSync(sourceRoot, { withFileTypes: true }) : []) {
+    const sourceEntryPath = join(sourceRoot, entry.name);
+    const destinationEntryPath = join(destinationRoot, entry.name);
+    const relativePath = normalizeSnapshotRelPath(sourceRoot, sourceEntryPath);
+    if (shouldExcludeSnapshotPath(relativePath, excludePatterns)) {
+      continue;
+    }
+    if (entry.isDirectory()) {
+      mirrorSnapshotDirectoryContents(sourceEntryPath, destinationEntryPath, excludePatterns);
+      continue;
+    }
+    if (entry.isFile()) {
+      mkdirSync(dirname(destinationEntryPath), { recursive: true });
+      copyFileSync(sourceEntryPath, destinationEntryPath);
+      continue;
+    }
+    if (entry.isSymbolicLink()) {
+      const linkTargetPath = readlinkSync(sourceEntryPath);
+      symlinkSync(linkTargetPath, destinationEntryPath);
+    }
+  }
+}
+
+export function mirrorSnapshotDirectory(sourceRoot, destinationRoot, excludePatterns = DEFAULT_SNAPSHOT_EXCLUDES) {
+  rmSync(destinationRoot, { recursive: true, force: true });
+  mirrorSnapshotDirectoryContents(sourceRoot, destinationRoot, excludePatterns);
+}
+
+function isMissingCommandError(result, commandName) {
+  return Boolean(
+    result?.error &&
+      (result.error.code === "ENOENT" ||
+        String(result.error.message ?? "").includes(`spawnSync ${commandName} ENOENT`))
+  );
 }
 
 function normalizeArchiveEntry(entry) {
@@ -371,7 +471,11 @@ export function createRollbackSnapshot({
       shell: false,
       stdio: "inherit",
     });
-    ensureRunSucceeded(stageResult, "Snapshot staging");
+    if (isMissingCommandError(stageResult, "rsync")) {
+      mirrorSnapshotDirectory(sourceRoot, stagingRoot);
+    } else {
+      ensureRunSucceeded(stageResult, "Snapshot staging");
+    }
 
     const archiveCommand = buildSnapshotArchiveCommand({ stagingRoot, archivePath });
     const archiveResult = run(archiveCommand.command, archiveCommand.args, {
@@ -458,7 +562,11 @@ export function restoreLocalRollbackSnapshot({
       shell: false,
       stdio: "inherit",
     });
-    ensureRunSucceeded(restoreResult, "Local snapshot restore");
+    if (isMissingCommandError(restoreResult, "rsync")) {
+      mirrorSnapshotDirectory(extractionRoot, localTarget);
+    } else {
+      ensureRunSucceeded(restoreResult, "Local snapshot restore");
+    }
 
     return { ...verification, extractionRoot, localTarget };
   } finally {

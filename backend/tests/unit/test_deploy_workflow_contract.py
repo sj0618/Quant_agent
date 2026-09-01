@@ -44,7 +44,13 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert "if: github.event_name == 'workflow_dispatch'" in workflow
     assert "Verify same-SHA S/R/O/C release evidence" in workflow
     assert "node scripts/evaluate-release-trust.mjs --verify-release-evidence" in workflow
+    assert "Verify same-SHA rollback drill evidence" in workflow
+    assert "node scripts/evaluate-release-trust.mjs --verify-rollback-evidence" in workflow
     assert "RELEASE_TRUST_REPOSITORY: ${{ github.repository }}" in workflow
+    assert "rollback_evidence_ref" in workflow
+    assert "rollback_evidence_sha" in workflow
+    assert "ROLLBACK_DRILL_EVIDENCE_REF" in workflow
+    assert "ROLLBACK_DRILL_EVIDENCE_SHA" in workflow
     for kind in ("S", "R", "O", "C"):
         assert f"RELEASE_EVIDENCE_{kind}_REF" in workflow
         assert f"RELEASE_EVIDENCE_{kind}_SHA" in workflow
