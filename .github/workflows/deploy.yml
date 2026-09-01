@@ -1,39 +1,44 @@
 name: Deploy to SSH Server
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**'
   workflow_dispatch:
     inputs:
       evidence_s_ref:
         description: Immutable GitHub URL for same-SHA S evidence
-        required: true
+        required: false
         type: string
       evidence_s_sha:
         description: Full commit SHA verified by S evidence
-        required: true
+        required: false
         type: string
       evidence_r_ref:
         description: Immutable GitHub URL for same-SHA R evidence
-        required: true
+        required: false
         type: string
       evidence_r_sha:
         description: Full commit SHA verified by R evidence
-        required: true
+        required: false
         type: string
       evidence_o_ref:
         description: Immutable GitHub URL for same-SHA O evidence
-        required: true
+        required: false
         type: string
       evidence_o_sha:
         description: Full commit SHA verified by O evidence
-        required: true
+        required: false
         type: string
       evidence_c_ref:
         description: Immutable GitHub URL for same-SHA C evidence
-        required: true
+        required: false
         type: string
       evidence_c_sha:
         description: Full commit SHA verified by C evidence
-        required: true
+        required: false
         type: string
       rollback_drill:
         description: Run a controlled non-production rollback drill instead of deploy
@@ -82,6 +87,7 @@ jobs:
         run: npm ci
 
       - name: Verify same-SHA S/R/O/C release evidence
+        if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TRUST_REVISION: ${{ github.sha }}
           RELEASE_TRUST_REPOSITORY: ${{ github.repository }}

@@ -31,10 +31,38 @@ jobs:
       - name: Create deploy directory on server
         run: |
           ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
-            "mkdir -p ~/mvp_sp1/quant-proj/DE"
+            "mkdir -p ~/mvp_sp1/quant-proj"
 
-      # 1단계: 먼저 소스 코드 파일들부터 서버로 동기화합니다.
-      - name: Deploy via rsync
+      # 저장소 루트의 DE 외 코드도 함께 동기화합니다.
+      - name: Deploy application code via rsync
+        run: |
+          rsync -rlvz --delete \
+            --omit-dir-times \
+            --no-perms --no-owner --no-group \
+            --exclude='.git/' \
+            --exclude='DE/' \
+            --exclude='node_modules/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='.releases/' \
+            --exclude='.run/' \
+            --exclude='.venv/' \
+            --exclude='venv/' \
+            --exclude='**/.venv/' \
+            --exclude='**/venv/' \
+            --exclude='**/__pycache__/' \
+            --exclude='**/*.pyc' \
+            --exclude='**/logs/' \
+            --exclude='**/.pytest_cache/' \
+            --exclude='**/.ruff_cache/' \
+            --exclude='**/.mypy_cache/' \
+            --exclude='**/.cache/' \
+            -e "ssh -i ~/.ssh/id_rsa -p 30233" \
+            ./ \
+            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
+
+      # DE 코드는 기존처럼 별도 동기화하여 Airflow 배포를 유지합니다.
+      - name: Deploy DE code via rsync
         run: |
           rsync -rlvz --delete \
             --omit-dir-times \
