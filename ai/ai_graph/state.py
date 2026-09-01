@@ -8,6 +8,7 @@ class QuantAgentState(TypedDict, total=False):
     # What the interpreter turned user_query into: one concrete, self-contained
     # strategy. Every stage after the Ambiguity Classifier reads this.
     resolved_query: str
+    execution_spec: dict[str, Any]
     intent: dict[str, Any]
     trace_id: str
     debug_ref: str

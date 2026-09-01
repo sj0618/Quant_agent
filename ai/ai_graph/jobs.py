@@ -42,6 +42,7 @@ from ai_graph.schemas import (
     FailureDiagnostic,
     Stage,
     StageStatus,
+    StrategyExecutionSpecV1,
     UserPayload,
 )
 
@@ -183,6 +184,7 @@ class AnalysisJob(BaseModel):
     execution_spec_hash: str | None = Field(
         default=None, pattern=r"^[0-9a-f]{64}$", exclude=True
     )
+    execution_spec: StrategyExecutionSpecV1 | None = Field(default=None, exclude=True)
     client_idempotency_key: str | None = Field(default=None, exclude=True)
     status: AnalysisJobStatus = Field(exclude=True)
     polling_stage: Stage = Field(exclude=True)
@@ -215,6 +217,7 @@ class AnalysisJobStore(Protocol):
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         ...
@@ -324,6 +327,7 @@ class ParseBoundJobAdmissionStore(Protocol):
         user_id: str,
         spec_version: str,
         spec_hash: str,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str,
     ) -> ParseBoundJobAdmission:
         ...
@@ -390,6 +394,7 @@ class ReadOnlyAnalysisJobStore:
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         raise AnalysisHistoryReadOnlyError(
@@ -524,6 +529,7 @@ class InMemoryAnalysisJobStore:
         user_id: str,
         spec_version: str,
         spec_hash: str,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str,
     ) -> ParseBoundJobAdmission:
         with self._parse_admission_lock:
@@ -555,6 +561,7 @@ class InMemoryAnalysisJobStore:
                 user_id=user_id,
                 execution_spec_version=spec_version,
                 execution_spec_hash=spec_hash,
+                execution_spec=execution_spec,
                 client_idempotency_key=client_idempotency_key,
             )
             self._parse_idempotency[idempotency_key] = (spec_hash, job.job_id)
@@ -632,11 +639,17 @@ class InMemoryAnalysisJobStore:
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         now = datetime.now(UTC)
         job_id = f"job_{uuid4().hex[:12]}"
         trace_id = sha256(f"{request_text}:{now.isoformat()}".encode("utf-8")).hexdigest()[:16]
+        normalized_execution_spec = (
+            StrategyExecutionSpecV1.model_validate(execution_spec.model_dump(mode="json"))
+            if execution_spec is not None
+            else None
+        )
         job = AnalysisJob(
             job_id=job_id,
             trace_id=trace_id,
@@ -646,6 +659,7 @@ class InMemoryAnalysisJobStore:
             run_id=run_id,
             execution_spec_version=execution_spec_version,
             execution_spec_hash=execution_spec_hash,
+            execution_spec=normalized_execution_spec,
             client_idempotency_key=client_idempotency_key,
             status=AnalysisJobStatus.QUEUED,
             polling_stage=Stage.INTERPRETING,

@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
-from ai_graph.schemas import APIEnvelope, Stage
+from ai_graph.schemas import APIEnvelope, Stage, StrategyExecutionSpecV1
 
 from .jobs import (
     PERSISTENT_JOB_STORE_MODE,
@@ -30,6 +30,7 @@ class AnalysisJobRepository(Protocol):
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         ...
@@ -106,6 +107,7 @@ class PersistentAnalysisJobStore:
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         kwargs: dict[str, object] = {
@@ -119,6 +121,7 @@ class PersistentAnalysisJobStore:
             for value in (
                 execution_spec_version,
                 execution_spec_hash,
+                execution_spec,
                 client_idempotency_key,
             )
         ):
@@ -126,6 +129,7 @@ class PersistentAnalysisJobStore:
                 {
                     "execution_spec_version": execution_spec_version,
                     "execution_spec_hash": execution_spec_hash,
+                    "execution_spec": execution_spec,
                     "client_idempotency_key": client_idempotency_key,
                 }
             )
@@ -216,6 +220,7 @@ class PersistentAnalysisJobStore:
         user_id: str,
         spec_version: str,
         spec_hash: str,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str,
     ) -> ParseBoundJobAdmission:
         if not isinstance(self._repository, ParseBoundJobAdmissionStore):
@@ -228,6 +233,7 @@ class PersistentAnalysisJobStore:
             user_id=user_id,
             spec_version=spec_version,
             spec_hash=spec_hash,
+            execution_spec=execution_spec,
             client_idempotency_key=client_idempotency_key,
         )
 

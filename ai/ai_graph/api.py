@@ -539,6 +539,8 @@ def _build_analysis_runner_with_audit(
     client_request_id: str | None = None,
     user_id: str | None = None,
     session_id: str | None = None,
+    execution_spec: object | None = None,
+    execution_spec_hash: str | None = None,
 ) -> AnalysisRunner:
     def runner(query: str, trace_id: str) -> APIEnvelope:
         session = _open_request_audit_session(
@@ -564,6 +566,8 @@ def _build_analysis_runner_with_audit(
                     client_request_id=client_request_id,
                     user_id=user_id,
                     session_id=session_id,
+                    execution_spec=execution_spec,
+                    execution_spec_hash=execution_spec_hash,
                 )
             _record_step(session, "analysis_started", message="analysis runner execution started")
             try:
@@ -644,6 +648,8 @@ async def _dispatch_analysis_job_outbox(
                     entrypoint="api.analysis_job_outbox",
                     feature="analysis_job",
                     user_id=job.user_id,
+                    execution_spec=job.execution_spec,
+                    execution_spec_hash=job.execution_spec_hash,
                 ),
                 events=events,
                 cancellations=cancellations,
@@ -1167,6 +1173,7 @@ def create_app(
                     user_id=user_id,
                     spec_version=request.spec_version or "",
                     spec_hash=request.spec_hash or "",
+                    execution_spec=spec,
                     client_idempotency_key=request.client_idempotency_key or "",
                 )
                 job = admission.job
@@ -1481,6 +1488,9 @@ def create_app(
         job = store.create_job(
             canonical_rule_execution_query(request.canonical_rule),
             user_id=user_id,
+            execution_spec_version=STRATEGY_EXECUTION_SPEC_VERSION,
+            execution_spec_hash=canonical_rule_digest(request.canonical_rule),
+            execution_spec=request.canonical_rule,
         )
         background_tasks.add_task(
             run_job_sync,
@@ -1493,6 +1503,8 @@ def create_app(
                 entrypoint="api.research_jobs",
                 feature="research_job",
                 user_id=user_id,
+                execution_spec=request.canonical_rule,
+                execution_spec_hash=canonical_rule_digest(request.canonical_rule),
             ),
             events=app.state.job_events,
             cancellations=app.state.job_cancellations,

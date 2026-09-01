@@ -114,13 +114,12 @@ export async function createConfirmedAnalysisJob(parsed: RuleDraftOutcome): Prom
   return response.json() as Promise<AnalysisJob>;
 }
 
-/** Compatibility wrapper; new UI callers use reviewStrategy + confirmation. */
-export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
-  const parsed = await reviewStrategy(query);
-  if (parsed.kind !== "rule_draft") {
-    throw new Error(parsed.explanation);
-  }
-  return createConfirmedAnalysisJob(parsed);
+/**
+ * Deprecated compatibility entry point.  Raw natural-language requests must stop at
+ * review; only the explicit confirmation API may create a job.
+ */
+export async function createAnalysisJob(_query: string): Promise<never> {
+  throw new Error("전략 조건을 확인한 뒤 확인 버튼으로 실행해 주세요.");
 }
 
 export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {

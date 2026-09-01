@@ -22,6 +22,7 @@ from ai_graph.jobs import (
     ParseBoundJobAdmission,
 )
 from ai_graph.schemas import APIEnvelope, Stage
+from ai_graph.schemas import StrategyExecutionSpecV1
 
 _logger = logging.getLogger(__name__)
 
@@ -48,6 +49,11 @@ def _job_document(job: AnalysisJob) -> dict[str, Any]:
             "report_id": job.report_id,
             "execution_spec_version": job.execution_spec_version,
             "execution_spec_hash": job.execution_spec_hash,
+            "execution_spec": (
+                job.execution_spec.model_dump(mode="json")
+                if job.execution_spec is not None
+                else None
+            ),
             "client_idempotency_key": job.client_idempotency_key,
             "status": job.status.value,
             "polling_stage": job.polling_stage.value,
@@ -170,6 +176,7 @@ class PostgresAnalysisJobRepository:
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         job = InMemoryAnalysisJobStore().create_job(
@@ -180,6 +187,7 @@ class PostgresAnalysisJobRepository:
             fallback_reasons=fallback_reasons,
             execution_spec_version=execution_spec_version,
             execution_spec_hash=execution_spec_hash,
+            execution_spec=execution_spec,
             client_idempotency_key=client_idempotency_key,
         )
         self._save(job)
@@ -215,6 +223,7 @@ class PostgresAnalysisJobRepository:
         user_id: str,
         spec_version: str,
         spec_hash: str,
+        execution_spec: StrategyExecutionSpecV1 | None = None,
         client_idempotency_key: str,
     ) -> ParseBoundJobAdmission:
         """Atomically consume one parse nonce, persist the job, and enqueue its outbox row."""
@@ -224,6 +233,7 @@ class PostgresAnalysisJobRepository:
             user_id=user_id,
             execution_spec_version=spec_version,
             execution_spec_hash=spec_hash,
+            execution_spec=execution_spec,
             client_idempotency_key=client_idempotency_key,
         )
         with self._connect() as connection, connection.transaction():

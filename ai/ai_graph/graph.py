@@ -59,6 +59,7 @@ from ai_graph.nodes.backtest import (
     backtest_node,
 )
 from ai_graph.nodes.backtest_code import backtest_code_node
+from ai_graph.nodes.condition_compiler import canonical_metric
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
@@ -88,6 +89,7 @@ from ai_graph.schemas import (
     CandidateBacktestResult,
     ClarificationOption,
     Condition,
+    ConditionOperator,
     DataRequirement,
     EnvelopeStatus,
     EvidenceRef,
@@ -99,9 +101,12 @@ from ai_graph.schemas import (
     SemanticSlots,
     SourceUsage,
     StrategyCandidateCard,
+    StrategyExecutionSpecV1,
     StrategySpec,
+    STRATEGY_EXECUTION_SPEC_VERSION_V1,
     TickerAction,
     UserPayload,
+    canonical_execution_spec_digest,
 )
 from ai_graph.source_manifest import (
     build_pipeline_extract_snapshot,
@@ -240,8 +245,19 @@ def run_analysis(
     client_request_id: str | None = None,
     user_id: str | None = None,
     session_id: str | None = None,
+    execution_spec: StrategyExecutionSpecV1 | Mapping[str, Any] | None = None,
+    execution_spec_hash: str | None = None,
 ) -> APIEnvelope:
     query = _normalize_user_query(user_query)
+    normalized_execution_spec = (
+        StrategyExecutionSpecV1.model_validate(execution_spec)
+        if execution_spec is not None
+        else None
+    )
+    if normalized_execution_spec is not None:
+        expected_hash = canonical_execution_spec_digest(normalized_execution_spec)
+        if execution_spec_hash is not None and execution_spec_hash != expected_hash:
+            raise ValueError("execution spec hash does not match the confirmed contract")
     resolved_trace_id = trace_id or (_trace_id(query) if query else None)
     scope_decision = classify_research_request(query)
     if not scope_decision.allowed:
@@ -280,7 +296,15 @@ def run_analysis(
     node_error_token = _NODE_ERROR_RECORDED.set(False)
     try:
         state = build_graph(audit_session=session).invoke(
-            {"user_query": query, "trace_id": resolved_trace_id or ""}
+            {
+                "user_query": query,
+                "trace_id": resolved_trace_id or "",
+                **(
+                    {"execution_spec": normalized_execution_spec.model_dump(mode="json")}
+                    if normalized_execution_spec is not None
+                    else {}
+                ),
+            }
         )
         envelope = APIEnvelope.model_validate(state["envelope"])
     except Exception as exc:
@@ -560,6 +584,17 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
     query = state["user_query"]
     if _is_small_talk(query):
         return _ambiguity_state(AmbiguityCode.NO_STRATEGY_INTENT, query, intent=None)
+    if state.get("execution_spec"):
+        report_activity("step", label="요청 해석 완료", detail="사용자가 확인한 실행 조건을 적용합니다.")
+        return _ambiguity_state(
+            AmbiguityCode.READY,
+            query,
+            intent={
+                "scope": "strategy",
+                "resolved_query": query,
+                "interpretation": "사용자가 확인한 구조화 실행 조건",
+            },
+        )
     report_activity("step", label="요청 해석", detail="입력을 실행 가능한 전략으로 구체화하는 중")
     intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
     if intent is None:
@@ -822,6 +857,46 @@ def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[st
     }
 
 
+def _strategy_spec_from_execution_spec(
+    raw_spec: Mapping[str, Any] | StrategyExecutionSpecV1,
+) -> StrategySpec:
+    """Compile the confirmed rule without asking another model to reinterpret it."""
+
+    execution_spec = StrategyExecutionSpecV1.model_validate(raw_spec)
+
+    def condition_from_contract(item: Any) -> Condition:
+        metric = canonical_metric(item.metric)
+        return Condition(
+            left=metric,
+            operator=ConditionOperator(item.comparator),
+            right=item.value,
+            description=f"{item.metric} {item.comparator} {item.value:g} (lookback {item.lookback})",
+        )
+
+    entry_conditions = [condition_from_contract(item) for item in execution_spec.entry_conditions]
+    exit_conditions = [condition_from_contract(item) for item in execution_spec.exit_conditions]
+    indicators = list(
+        dict.fromkeys(
+            canonical_metric(item.metric)
+            for item in [*execution_spec.entry_conditions, *execution_spec.exit_conditions]
+        )
+    )
+    return StrategySpec(
+        strategy_id=f"parsed_{canonical_execution_spec_digest(execution_spec)[:12]}",
+        name="사용자 확인 전략",
+        market=execution_spec.market,
+        timeframe=execution_spec.timeframe,
+        entry_conditions=entry_conditions,
+        exit_conditions=exit_conditions,
+        indicators=indicators,
+        risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
+        assumptions=["사용자가 확인한 구조화 실행 조건을 그대로 적용"],
+        source_refs=[STRATEGY_EXECUTION_SPEC_VERSION_V1],
+        selection_mode="user_defined",
+        confidence=1.0,
+    )
+
+
 def research_node(state: QuantAgentState) -> dict[str, Any]:
     """Turn the query into a StrategySpec.
 
@@ -832,12 +907,16 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
     appended to `assumptions` while the conditions that got backtested stayed identical.
     """
 
-    strategy_a = build_strategy_spec(
-        _strategy_query(state),
-        variant="A",
-        semantic_slots=state.get("semantic_slots"),
-        original_query=state.get("user_query"),
-    )
+    confirmed_spec = state.get("execution_spec")
+    if confirmed_spec:
+        strategy_a = _strategy_spec_from_execution_spec(confirmed_spec)
+    else:
+        strategy_a = build_strategy_spec(
+            _strategy_query(state),
+            variant="A",
+            semantic_slots=state.get("semantic_slots"),
+            original_query=state.get("user_query"),
+        )
 
     # If the screen already expressed the rule as structured conditions, adopt them as
     # the spec's entry/exit conditions. That makes the screen and the spec one
@@ -847,7 +926,7 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
     relaxation = screening.get("screening_relaxation") or {}
     screen_entry = relaxation.get("entry_conditions") or []
     screen_exit = relaxation.get("exit_conditions") or []
-    if screen_entry and strategy_a.selection_mode != "automatic":
+    if screen_entry and strategy_a.selection_mode != "automatic" and not confirmed_spec:
         try:
             strategy_a = strategy_a.model_copy(
                 update={
@@ -937,12 +1016,26 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         }
     internal = build_internal_payload(state)
     DEBUG_STORE.put(state["debug_ref"], internal)
+    execution_spec = (
+        StrategyExecutionSpecV1.model_validate(state["execution_spec"])
+        if state.get("execution_spec")
+        else None
+    )
     envelope = build_envelope(
         status=status,
         trace_id=state["trace_id"],
         debug_ref=state["debug_ref"],
         user_payload=payload,
         strategy_spec=state.get("strategy_spec"),
+        execution_spec=execution_spec,
+        execution_spec_version=(
+            STRATEGY_EXECUTION_SPEC_VERSION_V1 if execution_spec is not None else None
+        ),
+        execution_spec_hash=(
+            canonical_execution_spec_digest(execution_spec)
+            if execution_spec is not None
+            else None
+        ),
         retryable=status in {EnvelopeStatus.NEED_CLARIFICATION, EnvelopeStatus.FAILED},
         semantic_slots=state.get("semantic_slots"),
         data_requirements=state.get("data_requirements"),
