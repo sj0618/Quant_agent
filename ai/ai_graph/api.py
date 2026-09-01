@@ -1062,8 +1062,12 @@ def create_app(
             request_text = canonical_rule_execution_query(spec)
             entrypoint = "api.analysis_jobs"
         else:
-            # Compatibility while old frontend bundles drain. It remains preflighted,
-            # but release callers are never allowed to skip parse → spec → token.
+            # Natural-language browser submissions are parsed and bound *inside* this
+            # one admission request.  Requiring a browser to carry an opaque token
+            # from a preceding request made valid strategies susceptible to a 409 when
+            # a reload, rolling restart, or stale bundle interrupted that hand-off.
+            # This preserves parse → versioned spec/hash → durable nonce/job admission
+            # without exposing the short-lived token as a client-side state machine.
             if request.query is None:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
             scope_response = _preflight_rejection_response(await _scope_decision(request.query))
@@ -1081,7 +1085,53 @@ def create_app(
                     user_id=user_id,
                     signer=signer,
                 )
-                return _legacy_parse_required_response(outcome)
+                if not outcome.is_executable:
+                    return _legacy_parse_required_response(outcome)
+                spec = outcome.strategy_execution_spec
+                parse_token = outcome.parse_token
+                spec_version = outcome.spec_version
+                spec_hash = outcome.spec_hash
+                if spec is None or parse_token is None or spec_version is None or spec_hash is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Strategy execution admission is temporarily unavailable.",
+                    )
+                nonce = signer.verify(token=parse_token, rule=spec, user_id=user_id)
+                if not (
+                    isinstance(store, ParseBoundJobAdmissionStore)
+                    and isinstance(store, AnalysisJobOutboxStore)
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Strategy execution admission is temporarily unavailable.",
+                    )
+                try:
+                    store.register_parse_token(
+                        nonce_hash=_parse_nonce_hash(nonce),
+                        user_id=user_id,
+                        spec_version=spec_version,
+                        spec_hash=spec_hash,
+                        expires_at=outcome.expires_at,
+                    )
+                except JobStoreConfigurationError:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Strategy execution admission is temporarily unavailable.",
+                    ) from None
+                # Re-enter using the normal sealed-admission path so there is a single
+                # source of truth for idempotency, quota, outbox, and audit behavior.
+                return await create_analysis_job(
+                    CreateAnalysisJobRequest(
+                        parse_token=parse_token,
+                        client_idempotency_key=str(uuid.uuid4()),
+                        spec_version=spec_version,
+                        spec_hash=spec_hash,
+                        strategy_execution_spec=spec,
+                    ),
+                    background_tasks,
+                    http_request,
+                    user_id,
+                )
             request_text = request.query
             entrypoint = "api.analysis_jobs"
         if request.is_parse_bound:

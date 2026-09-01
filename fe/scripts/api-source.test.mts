@@ -25,23 +25,16 @@ test("workspace restores the latest server analysis on a fresh browser", async (
   assert.match(source, /setAnalysisJobs\(\(jobs\) => \(jobs\.length \? jobs : \[latestJob\]\)\)/);
 });
 
-test("workspace creates an analysis only from the server-issued parse contract", async () => {
-  const [clientSource, configSource] = await Promise.all([
-    readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
-    readFile(new URL("../src/config/appConfig.ts", import.meta.url), "utf8"),
-  ]);
-
-  assert.match(configSource, /strategyParse: "\/api\/strategies\/parse"/);
+test("workspace delegates parse-bound admission to the server in one request", async () => {
+  const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
   const createJob = clientSource.slice(
     clientSource.indexOf("export async function createAnalysisJob"),
     clientSource.indexOf("export async function cancelAnalysisJob"),
   );
-  assert.match(createJob, /fetchAI\(AI_ENDPOINTS\.strategyParse/);
-  assert.match(createJob, /natural_language: trimmedQuery/);
-  assert.match(createJob, /parse_token: review\.parse_token/);
-  assert.match(createJob, /client_idempotency_key: crypto\.randomUUID\(\)/);
-  assert.match(createJob, /strategy_execution_spec: review\.strategy_execution_spec/);
-  assert.doesNotMatch(createJob, /JSON\.stringify\(\{ query: trimmedQuery \}\)/);
+  assert.match(createJob, /fetchAI\(AI_ENDPOINTS\.analysisJobs/);
+  assert.match(createJob, /JSON\.stringify\(\{ query: trimmedQuery \}\)/);
+  assert.doesNotMatch(createJob, /fetchAI\(AI_ENDPOINTS\.strategyParse/);
+  assert.doesNotMatch(createJob, /parse_token:/);
 });
 
 test("workspace discards a running job lost during a server restart", async () => {

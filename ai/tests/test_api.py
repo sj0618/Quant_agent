@@ -405,14 +405,16 @@ def test_ready_release_accepts_parse_bound_core_natural_language_job(
     assert response.json()["job_id"]
 
 
-def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
+def test_ready_release_natural_language_query_creates_a_parse_bound_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APP_ENV", "production")
     _configure_live_provider(monkeypatch)
+    runtime = _persistent_job_store_runtime()
     client = TestClient(
         create_app(
-            job_store_runtime=_persistent_job_store_runtime(),
+            job_store_runtime=runtime,
+            analysis_runner=lambda _query, trace_id: _ready_envelope(trace_id),
             readiness_migration_probe=lambda: True,
             rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
         )
@@ -423,8 +425,12 @@ def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
         json={"query": "RSI 30 이하 진입, RSI 70 이상 청산 전략"},
     )
 
-    assert response.status_code == 409
-    assert response.json()["kind"] == "parse_required"
+    assert response.status_code == 201
+    job = response.json()
+    stored = runtime.store.get_job(job["job_id"])
+    assert stored is not None
+    assert stored.execution_spec_version == "strategy-execution-spec.v1"
+    assert len(stored.execution_spec_hash or "") == 64
 
 
 def test_core_execution_keeps_restart_reconciliation_for_prior_process_jobs(

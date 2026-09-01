@@ -125,32 +125,6 @@ interface StrategyDescriptionApiResponse {
   }>;
 }
 
-interface StrategyExecutionSpecApi {
-  market: "KRX";
-  timeframe: "daily";
-  entry_conditions: Array<{ metric: "rsi"; comparator: "lte" | "gte"; value: number; role: "entry" }>;
-  exit_conditions: Array<{ metric: "rsi"; comparator: "lte" | "gte"; value: number; role: "exit" }>;
-}
-
-interface ExecutableRuleDraftApi {
-  kind: "rule_draft";
-  editable_summary: string;
-  clarifications: Array<{ label: string; reason: string }>;
-  is_executable: boolean;
-  strategy_execution_spec?: StrategyExecutionSpecApi;
-  spec_version?: "strategy-execution-spec.v1";
-  spec_hash?: string;
-  parse_token?: string;
-}
-
-interface ParseRejectionApi {
-  kind: "scope_refusal" | "unsupported_scope";
-  explanation: string;
-  guidance?: string;
-}
-
-type ParseReviewApi = ExecutableRuleDraftApi | ParseRejectionApi;
-
 class AIResponseError extends Error {
   constructor(readonly status: number) {
     super(`AI 서버 응답 실패: ${status}`);
@@ -320,45 +294,13 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
     throw new Error("분석할 자연어 전략을 입력하세요.");
   }
 
-  // Production admission is intentionally two-step.  The parse response supplies a
-  // short-lived, server-signed execution spec; posting the original natural language
-  // directly would be a legacy request and cannot prove what was actually backtested.
-  const parseResponse = await fetchAI(AI_ENDPOINTS.strategyParse, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ natural_language: trimmedQuery }),
-  });
-  assertOk(parseResponse);
-
-  const review = (await parseResponse.json()) as ParseReviewApi;
-  if (review.kind !== "rule_draft") {
-    throw new Error(review.guidance ? `${review.explanation} ${review.guidance}` : review.explanation);
-  }
-  if (
-    !review.is_executable ||
-    !review.strategy_execution_spec ||
-    !review.spec_version ||
-    !review.spec_hash ||
-    !review.parse_token
-  ) {
-    const clarification = review.clarifications.map((choice) => choice.label).join(" / ");
-    throw new Error(
-      clarification
-        ? `${review.editable_summary}\n선택하거나 보완해 주세요: ${clarification}`
-        : review.editable_summary,
-    );
-  }
-
+  // The server performs parse → versioned spec/hash → durable job admission as one
+  // request. This keeps opaque short-lived tokens out of browser state and prevents
+  // a valid strategy from failing when a reload lands between two API calls.
   const response = await fetchAI(AI_ENDPOINTS.analysisJobs, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      parse_token: review.parse_token,
-      client_idempotency_key: crypto.randomUUID(),
-      spec_version: review.spec_version,
-      spec_hash: review.spec_hash,
-      strategy_execution_spec: review.strategy_execution_spec,
-    }),
+    body: JSON.stringify({ query: trimmedQuery }),
   });
   assertOk(response);
 
