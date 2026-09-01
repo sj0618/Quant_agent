@@ -4,10 +4,47 @@ on:
   workflow_dispatch:
     inputs:
       deploy:
-        description: Deploy the checked-out main revision after validation
+        description: Deploy the current main revision through the canonical SSH/rsync release workflow
         required: true
         type: boolean
         default: true
+      evidence_s_ref:
+        description: Immutable GitHub URL for same-SHA S evidence
+        required: false
+        type: string
+      evidence_s_sha:
+        description: Full commit SHA verified by S evidence
+        required: false
+        type: string
+      evidence_r_ref:
+        description: Immutable GitHub URL for same-SHA R evidence
+        required: false
+        type: string
+      evidence_r_sha:
+        description: Full commit SHA verified by R evidence
+        required: false
+        type: string
+      evidence_o_ref:
+        description: Immutable GitHub URL for same-SHA O evidence
+        required: false
+        type: string
+      evidence_o_sha:
+        description: Full commit SHA verified by O evidence
+        required: false
+        type: string
+      evidence_c_ref:
+        description: Immutable GitHub URL for same-SHA C evidence
+        required: false
+        type: string
+      evidence_c_sha:
+        description: Full commit SHA verified by C evidence
+        required: false
+        type: string
+      rollback_drill:
+        description: Run a controlled non-production rollback drill instead of deploy
+        required: false
+        default: false
+        type: boolean
 
 # A deployment must never overlap another deployment of the same service. Do not
 # cancel an in-progress rollout: its health check and rollback decision are part of
@@ -53,71 +90,25 @@ jobs:
           pytest -q tests/test_research_contract.py tests/test_research_contract_api.py
 
   deploy:
-    name: Deploy validated main revision
+    name: Deploy validated main revision via canonical SSH release
     needs: validate
-    # Deploying is opt-in until repository secrets and variables are configured.
-    # This makes a push validate safely instead of attempting an unauthenticated SSH
-    # connection or silently falling back to another server.
+    # The running FE/BE service is deployed by deploy.yml with rsync and explicit
+    # process/readiness checks. It is not a Git worktree or a Docker Compose app.
     if: >-
       ${{
         vars.QUANTAGENT_DEPLOY_ENABLED == 'true' &&
-        (github.event_name == 'push' || inputs.deploy)
+        (inputs.deploy || inputs.rollback_drill)
       }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      DEPLOY_HOST: ${{ secrets.QUANTAGENT_DEPLOY_HOST }}
-      DEPLOY_USER: ${{ secrets.QUANTAGENT_DEPLOY_USER }}
-      DEPLOY_SSH_KEY: ${{ secrets.QUANTAGENT_DEPLOY_SSH_KEY }}
-      DEPLOY_PATH: ${{ vars.QUANTAGENT_DEPLOY_PATH }}
-      DEPLOY_COMPOSE_FILE: ${{ vars.QUANTAGENT_DEPLOY_COMPOSE_FILE }}
-      DEPLOY_HEALTH_URL: ${{ vars.QUANTAGENT_DEPLOY_HEALTH_URL }}
-      DEPLOY_SHA: ${{ github.sha }}
-    steps:
-      - name: Verify deployment configuration without printing credentials
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$DEPLOY_HOST"
-          test -n "$DEPLOY_USER"
-          test -n "$DEPLOY_SSH_KEY"
-          test -n "$DEPLOY_PATH"
-          test -n "$DEPLOY_COMPOSE_FILE"
-
-      - name: Configure SSH
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          mkdir -p "$HOME/.ssh"
-          printf '%s' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
-          ssh-keyscan -H "$DEPLOY_HOST" >> "$HOME/.ssh/known_hosts"
-
-      - name: Deploy the exact validated revision
-        shell: bash
-        run: |
-          set -euo pipefail
-          deploy_path_b64="$(printf '%s' "$DEPLOY_PATH" | base64 | tr -d '\n')"
-          deploy_compose_b64="$(printf '%s' "$DEPLOY_COMPOSE_FILE" | base64 | tr -d '\n')"
-          ssh -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
-            "DEPLOY_PATH_B64=$deploy_path_b64 DEPLOY_COMPOSE_B64=$deploy_compose_b64 DEPLOY_SHA=$DEPLOY_SHA bash -s" <<'REMOTE'
-          set -euo pipefail
-          DEPLOY_PATH="$(printf '%s' "$DEPLOY_PATH_B64" | base64 --decode)"
-          DEPLOY_COMPOSE_FILE="$(printf '%s' "$DEPLOY_COMPOSE_B64" | base64 --decode)"
-          cd "$DEPLOY_PATH"
-          case "$(git remote get-url origin)" in
-            *sj0618/Quant_agent.git) ;;
-            *) echo "deployment checkout is not the approved Quant_agent repository" >&2; exit 1 ;;
-          esac
-          git fetch --depth=1 origin "$DEPLOY_SHA"
-          git checkout --detach "$DEPLOY_SHA"
-          test "$(git rev-parse HEAD)" = "$DEPLOY_SHA"
-          docker compose -f "$DEPLOY_COMPOSE_FILE" up -d --build --remove-orphans
-          REMOTE
-
-      - name: Check the configured public health endpoint
-        if: ${{ vars.QUANTAGENT_DEPLOY_HEALTH_URL != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --max-time 15 --retry 2 "$DEPLOY_HEALTH_URL" >/dev/null
+    uses: ./.github/workflows/deploy.yml
+    with:
+      evidence_s_ref: ${{ inputs.evidence_s_ref }}
+      evidence_s_sha: ${{ inputs.evidence_s_sha }}
+      evidence_r_ref: ${{ inputs.evidence_r_ref }}
+      evidence_r_sha: ${{ inputs.evidence_r_sha }}
+      evidence_o_ref: ${{ inputs.evidence_o_ref }}
+      evidence_o_sha: ${{ inputs.evidence_o_sha }}
+      evidence_c_ref: ${{ inputs.evidence_c_ref }}
+      evidence_c_sha: ${{ inputs.evidence_c_sha }}
+      rollback_drill: ${{ inputs.rollback_drill }}
+    secrets:
+      SSH_PRIVATE_KEY: ${{ secrets.QUANTAGENT_DEPLOY_SSH_KEY }}
