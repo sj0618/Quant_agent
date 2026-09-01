@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
@@ -367,10 +368,27 @@ class StrategyExecutionConditionV1(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    metric: Literal["rsi"]
-    comparator: Literal["lte", "gte"]
-    value: float = Field(gt=0.0, le=100.0)
+    metric: str = Field(min_length=1, max_length=64)
+    comparator: Literal["lt", "lte", "gt", "gte", "eq", "ne"]
+    value: float
+    lookback: int = Field(default=14, ge=1, le=2000)
     role: Literal["entry", "exit"]
+
+    @field_validator("value")
+    @classmethod
+    def finite_value(cls, value: float) -> float:
+        if not math.isfinite(value) or abs(value) > 1_000_000_000:
+            raise ValueError("condition value is outside the supported range")
+        return value
+
+    @model_validator(mode="after")
+    def metric_value_range(self) -> "StrategyExecutionConditionV1":
+        metric = self.metric.strip().lower().replace("-", "_")
+        if metric in {"rsi", "rsi_14", "mfi", "stoch_k", "stoch_d"} and not 0 <= self.value <= 100:
+            raise ValueError("bounded oscillator value is outside the supported range")
+        if metric == "willr" and not -100 <= self.value <= 0:
+            raise ValueError("willr value is outside the supported range")
+        return self
 
 
 class StrategyExecutionSpecV1(BaseModel):

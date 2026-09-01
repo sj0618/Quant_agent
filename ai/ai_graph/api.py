@@ -186,10 +186,10 @@ class CreateAnalysisJobRequest(BaseModel):
                         "market": "KRX",
                         "timeframe": "daily",
                         "entry_conditions": [
-                            {"metric": "rsi", "comparator": "lte", "value": 30, "role": "entry"}
+                            {"metric": "rsi", "comparator": "lte", "value": 30, "lookback": 14, "role": "entry"}
                         ],
                         "exit_conditions": [
-                            {"metric": "rsi", "comparator": "gte", "value": 70, "role": "exit"}
+                            {"metric": "rsi", "comparator": "gte", "value": 70, "lookback": 14, "role": "exit"}
                         ],
                     },
                 }
