@@ -14,6 +14,7 @@ import { PerformanceTab } from "./PerformanceTab";
 import { StrategyInputPanel } from "./StrategyInputPanel";
 import { EMPTY_WORKSPACE, stageLabel, workspaceOverviewFromJob } from "./strategyWorkspaceMapper";
 import { TradingInfoTab } from "./TradingInfoTab";
+import { ExplorationBaseReport } from "../reports/ExplorationBaseReport";
 
 type WorkspaceTab = "overview" | "trading" | "performance";
 
@@ -65,6 +66,7 @@ export function StrategyWorkspace() {
   const running = Boolean(job && !job.result);
   const result = job?.result ?? null;
   const ready = result?.status === "ready";
+  const explorationReport = result?.user_payload.report?.base_report_v2;
 
   const submit = async (query: string) => {
     setRequestError(null);
@@ -137,6 +139,7 @@ export function StrategyWorkspace() {
               <strong>과거 EOD 데이터 기반 전략 검증</strong>
               <span>실제 주문을 실행하지 않으며, 과거 성과는 미래 수익을 보장하지 않습니다.</span>
             </section>
+            {explorationReport ? <ExplorationBaseReport jobId={job!.job_id} report={explorationReport} /> : <>
             <Tabs
               activeId={activeTab}
               items={TAB_ITEMS.map((tab) => tab.id === "trading" ? { ...tab, count: overview.candidates.length } : tab)}
@@ -147,6 +150,7 @@ export function StrategyWorkspace() {
             {activeTab === "trading" ? <TradingInfoTab candidates={overview.candidates} /> : null}
             {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
             <NaturalLanguageReport job={job!} />
+            </>}
           </>
         ) : null}
       </main>
@@ -169,14 +173,33 @@ function StrategyDraftConfirmation({
     `${condition.metric} ${condition.comparator} ${condition.value} · ${condition.lookback}일`;
   return (
     <section className="workspace-rule-review" aria-labelledby="workspace-rule-review-title">
-      <strong id="workspace-rule-review-title">해석한 전략 조건을 확인해 주세요</strong>
+      <strong id="workspace-rule-review-title">
+        {draft.exploration ? "탐색 연구 가정과 후보를 확인해 주세요" : "해석한 전략 조건을 확인해 주세요"}
+      </strong>
       <p>{draft.explanation}</p>
-      <dl>
+      {draft.exploration ? (
+        <>
+          <p><strong>연구 가설</strong> · {draft.exploration.research_hypothesis}</p>
+          <p><strong>반대 가설</strong> · {draft.exploration.opposing_hypothesis}</p>
+          <p><strong>시장·기간</strong> · {draft.exploration.market} · {draft.exploration.period}</p>
+          <p><strong>적용한 기본값</strong></p>
+          <ul>{draft.exploration.defaults.map((item) => <li key={item}>{item}</li>)}</ul>
+          <p><strong>대안</strong></p>
+          <ul>{draft.exploration.alternatives.map((item) => <li key={item}>{item}</li>)}</ul>
+          <ul>
+            {draft.exploration.candidate_reasons.map((candidate) => (
+              <li key={candidate.catalog_id}><strong>{candidate.title}</strong> · {candidate.reason}</li>
+            ))}
+          </ul>
+          <p>정책 {draft.exploration.policy_version} ({draft.exploration.policy_hash.slice(0, 12)}) · 후보 카탈로그 {draft.exploration.catalog_version} ({draft.exploration.catalog_hash.slice(0, 12)})</p>
+          <ul>{draft.exploration.limitations.map((item) => <li key={item}>{item}</li>)}</ul>
+        </>
+      ) : <dl>
         <dt>진입 조건</dt>
         <dd>{draft.entry_conditions.map(conditionText).join(" · ") || "없음"}</dd>
         <dt>종료 조건</dt>
         <dd>{draft.exit_conditions.map(conditionText).join(" · ") || "없음"}</dd>
-      </dl>
+      </dl>}
       {draft.indicator_selections.length ? (
         <ul>
           {draft.indicator_selections.map((selection) => (
@@ -193,7 +216,7 @@ function StrategyDraftConfirmation({
       ) : null}
       {draft.is_executable ? (
         <button disabled={confirming} type="button" onClick={onConfirm}>
-          {confirming ? "백테스트를 준비하는 중" : "이 조건으로 백테스트 시작"}
+          {confirming ? "백테스트를 준비하는 중" : draft.exploration ? "이 후보군으로 탐색 시작" : "이 조건으로 백테스트 시작"}
         </button>
       ) : (
         <p>조건을 보완한 뒤 다시 확인해 주세요.</p>

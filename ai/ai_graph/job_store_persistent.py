@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
-from ai_graph.schemas import APIEnvelope, Stage, StrategyExecutionSpecV1
+from ai_graph.schemas import APIEnvelope, ExecutionSpecV1OrV2, Stage
 
 from .jobs import (
     PERSISTENT_JOB_STORE_MODE,
@@ -15,6 +15,8 @@ from .jobs import (
     JobStoreConfigurationError,
     ParseBoundJobAdmission,
     ParseBoundJobAdmissionStore,
+    ResearchAppendixOutboxMessage,
+    ResearchAppendixStore,
 )
 
 
@@ -30,7 +32,7 @@ class AnalysisJobRepository(Protocol):
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
-        execution_spec: StrategyExecutionSpecV1 | None = None,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         ...
@@ -107,7 +109,7 @@ class PersistentAnalysisJobStore:
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
-        execution_spec: StrategyExecutionSpecV1 | None = None,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         kwargs: dict[str, object] = {
@@ -220,7 +222,7 @@ class PersistentAnalysisJobStore:
         user_id: str,
         spec_version: str,
         spec_hash: str,
-        execution_spec: StrategyExecutionSpecV1 | None = None,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str,
     ) -> ParseBoundJobAdmission:
         if not isinstance(self._repository, ParseBoundJobAdmissionStore):
@@ -281,6 +283,40 @@ class PersistentAnalysisJobStore:
                 "PersistentAnalysisJobStore requires analysis-job outbox support."
             )
         return self._repository.has_recoverable_analysis_job_outbox(job_id)
+
+    def claim_research_appendix_outbox(
+        self, *, limit: int = 1
+    ) -> list[ResearchAppendixOutboxMessage]:
+        if not isinstance(self._repository, ResearchAppendixStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires research-appendix support."
+            )
+        return self._repository.claim_research_appendix_outbox(limit=limit)
+
+    def complete_research_appendix(
+        self, outbox_id: str, job_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        if not isinstance(self._repository, ResearchAppendixStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires research-appendix support."
+            )
+        self._repository.complete_research_appendix(outbox_id, job_id, payload)
+
+    def mark_research_appendix_unavailable(
+        self, outbox_id: str, job_id: str, reason: str
+    ) -> None:
+        if not isinstance(self._repository, ResearchAppendixStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires research-appendix support."
+            )
+        self._repository.mark_research_appendix_unavailable(outbox_id, job_id, reason)
+
+    def get_research_appendix(self, job_id: str) -> Mapping[str, Any] | None:
+        if not isinstance(self._repository, ResearchAppendixStore):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires research-appendix support."
+            )
+        return self._repository.get_research_appendix(job_id)
 
     def list_jobs_for_reconciliation(self, *, limit: int = 500) -> Any:
         """Do not let compatibility history reads weaken restart recovery."""

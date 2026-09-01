@@ -273,10 +273,11 @@ export function workspaceOverviewFromJob(job: AnalysisJob): AppOverview {
     if (signal) signalCounts[signal] += 1;
   }
   const report = payload?.report;
+  const exploration = report?.base_report_v2;
   return {
     ...EMPTY_WORKSPACE,
     strategy: strategyFromJob(job),
-    recommendationScore: result?.strategy_spec ? `${Math.round(result.strategy_spec.confidence * 100)}%` : "—",
+    recommendationScore: exploration ? "연구" : result?.strategy_spec ? `${Math.round(result.strategy_spec.confidence * 100)}%` : "—",
     recommendationDelta: result ? resultStatusLabel(result.status) : "진행 중",
     passCount: signalCounts.BUY + signalCounts.HOLD + signalCounts.DROP,
     buyCount: signalCounts.BUY,
@@ -297,7 +298,7 @@ export function workspaceOverviewFromJob(job: AnalysisJob): AppOverview {
       summary: report.web_projection.summary,
       status: result?.status === "failed" ? "failed" : "draft",
       strategyName: result?.strategy_spec?.name ?? payload?.headline ?? "전략 분석",
-      recommendationScore: result?.strategy_spec ? `${Math.round(result.strategy_spec.confidence * 100)}%` : "—",
+      recommendationScore: exploration ? "연구" : result?.strategy_spec ? `${Math.round(result.strategy_spec.confidence * 100)}%` : "—",
       signals: signalCounts,
       marketSnapshot: [],
     }] : [],

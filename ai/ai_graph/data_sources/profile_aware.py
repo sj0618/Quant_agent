@@ -25,11 +25,15 @@ class PostgresPipelineDataSource(_impl.PostgresPipelineDataSource):
     pass
 
 
-def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle:
+def load_pipeline_data_from_env(
+    query: str, trace_id: str, *, screen_current: bool = True
+) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
         return _fixture_bundle(
             f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.",
             query=query,
         )
-    return PostgresPipelineDataSource(config).load(query, trace_id)
+    return PostgresPipelineDataSource(config).load(
+        query, trace_id, screen_current=screen_current
+    )

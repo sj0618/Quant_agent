@@ -1736,7 +1736,14 @@ def run_candidate_backtest(
     sample = _walk_forward_sample(rows)
     if _walk_forward_enabled and sample.status == READY_WALK_FORWARD:
         return _run_walk_forward_candidate_backtest(
-            strategy_a, candidates, rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons
+            strategy_a,
+            candidates,
+            rows,
+            feature_coverage=feature_coverage,
+            fallback_reasons=fallback_reasons,
+            benchmark_context=(
+                _session.benchmark_context if _session is not None else None
+            ),
         )
     owns_session = _session is None
     session = _session or _CandidateBacktestSession(strategy_a, rows)
@@ -1948,7 +1955,15 @@ def _walk_forward_aggregate_metrics(returns: Sequence[float]) -> BacktestMetrics
         out_sample_return=round(total_return, METRIC_ROUND_DIGITS),
     )
 
-def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: list[CodeCandidate], rows: Sequence[Mapping[str, Any]], *, feature_coverage: Mapping[str, Any] | None, fallback_reasons: Sequence[str] | None) -> CandidateBacktestResult:
+def _run_walk_forward_candidate_backtest(
+    strategy: AIStrategySpec,
+    candidates: list[CodeCandidate],
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    feature_coverage: Mapping[str, Any] | None,
+    fallback_reasons: Sequence[str] | None,
+    benchmark_context: _BenchmarkContext | None = None,
+) -> CandidateBacktestResult:
     if any(candidate.representation != "structured" for candidate in candidates):
         result = run_candidate_backtest(strategy, candidates, price_rows=rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons, _walk_forward_enabled=False)
         masked = result.selected_candidate.model_copy(update={"metrics": _mask_unavailable_walk_forward_metrics(result.selected_candidate.metrics, UNSAFE_WALK_FORWARD_CANDIDATE)})
@@ -1970,6 +1985,13 @@ def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: l
     selections: list[WalkForwardFoldSelection] = []
     fills: list[dict[str, Any]] = []
     evaluation_ledgers: list[dict[str, Any]] = []
+    returns_by_candidate: dict[str, dict[str, float]] = {
+        candidate.candidate_id: {} for candidate in candidates
+    }
+    fills_by_candidate: dict[str, list[dict[str, Any]]] = {
+        candidate.candidate_id: [] for candidate in candidates
+    }
+    folds_by_candidate: dict[str, int] = {candidate.candidate_id: 0 for candidate in candidates}
     deduped = 0
     selected: CodeCandidate | None = None
     policy = _walk_forward_split_policy(rows)
@@ -2005,14 +2027,41 @@ def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: l
         context_rows = _rows_for_sessions(rows, (*selection_sessions, *targets))
         # Fresh engine gets bridge + target only; actions retain all causal feature history.
         engine_rows = _rows_for_sessions(rows, (*fold.validation_sessions[-1:], *targets))
-        evaluation_engine = _fold_engine(strategy, candidate, context_rows, engine_rows, target_set)
-        target_returns = _complete_target_returns(evaluation_engine, target_set)
-        if target_returns is None:
+        fold_results: dict[str, tuple[dict[str, float], Any]] = {}
+        eligible_by_id = {item.candidate_id: item for item in eligible}
+        evaluation_candidates = [
+            eligible_by_id.get(proposed.candidate_id, proposed)
+            for proposed in candidates
+            if proposed.validation_ok
+        ]
+        for evaluation_candidate in evaluation_candidates:
+            candidate_engine = _fold_engine(
+                strategy,
+                evaluation_candidate,
+                context_rows,
+                engine_rows,
+                target_set,
+            )
+            candidate_returns = _complete_target_returns(candidate_engine, target_set)
+            if candidate_returns is not None:
+                fold_results[evaluation_candidate.candidate_id] = (
+                    candidate_returns,
+                    candidate_engine,
+                )
+        selected_result = fold_results.get(candidate.candidate_id)
+        if selected_result is None:
             continue
+        target_returns, evaluation_engine = selected_result
         claimed.update(target_set)
         returns_by_session.update(target_returns)
         fills.extend(_full_target_fills(evaluation_engine, target_set))
         evaluation_ledgers.append(_storage_execution_ledger(evaluation_engine))
+        for candidate_id, (candidate_returns, candidate_engine) in fold_results.items():
+            returns_by_candidate[candidate_id].update(candidate_returns)
+            fills_by_candidate[candidate_id].extend(
+                _full_target_fills(candidate_engine, target_set)
+            )
+            folds_by_candidate[candidate_id] += 1
         selected = candidate
         digest = sha256(json.dumps({"fold": fold.fold_index, "candidate": _candidate_identity(candidate), "train": fold.train_sessions, "validation": fold.validation_sessions}, sort_keys=True).encode()).hexdigest()
         selections.append(WalkForwardFoldSelection(fold_index=fold.fold_index, selection_hash=digest, candidate_id=candidate.candidate_id, evaluation_sessions=list(targets)))
@@ -2038,6 +2087,61 @@ def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: l
     aggregate_metrics = (
         _walk_forward_aggregate_metrics(list(daily_returns.values())) if ready else None
     )
+    engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
+    for proposed in candidates:
+        candidate_returns = returns_by_candidate[proposed.candidate_id]
+        candidate_months = {session[:7] for session in candidate_returns}
+        candidate_ready = bool(
+            folds_by_candidate[proposed.candidate_id] >= WALK_FORWARD_MIN_VALID_FOLDS
+            and len(candidate_months) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS
+            and len(candidate_returns) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS
+            and len(candidate_returns) == len(claimed)
+        )
+        candidate_fills = fills_by_candidate[proposed.candidate_id]
+        candidate_costs = sum(
+            sum(
+                float(fill.get(key, 0.0) or 0.0)
+                for key in ("commission_cost", "tax_cost", "slippage_cost")
+            )
+            for fill in candidate_fills
+        )
+        candidate_metrics = (
+            _walk_forward_aggregate_metrics(
+                [candidate_returns[session] for session in sorted(candidate_returns)]
+            )
+            if candidate_ready
+            else None
+        )
+        engine_summaries_by_candidate[proposed.candidate_id] = {
+            "walk_forward_policy": "rolling_selection_policy",
+            "aggregate_oos_result": (
+                {
+                    "availability": "available",
+                    "total_return": candidate_metrics.out_sample_return,
+                    "sharpe_ratio": candidate_metrics.out_sample_sharpe,
+                    "max_drawdown": candidate_metrics.max_drawdown,
+                    "evaluation_session_count": len(candidate_returns),
+                    "trade_count": len(candidate_fills),
+                    "costs": candidate_costs,
+                    "after_costs": True,
+                }
+                if candidate_metrics is not None
+                else {
+                    "availability": (
+                        "unavailable" if proposed.validation_ok else "failed"
+                    ),
+                    "reason": (
+                        INSUFFICIENT_WALK_FORWARD_SAMPLE
+                        if proposed.validation_ok
+                        else "candidate_validation_failed"
+                    ),
+                    "evaluation_session_count": len(candidate_returns),
+                    "trade_count": len(candidate_fills),
+                    "costs": candidate_costs,
+                    "after_costs": True,
+                }
+            ),
+        }
     engine_summary = {
         "walk_forward_sample": _walk_forward_metadata(_walk_forward_sample(rows), policy),
         "walk_forward_policy": "rolling_selection_policy",
@@ -2049,10 +2153,11 @@ def _run_walk_forward_candidate_backtest(strategy: AIStrategySpec, candidates: l
         selected_candidate=selected,
         equity_curve=curve,
         engine_summary=engine_summary,
+        engine_summaries_by_candidate=engine_summaries_by_candidate,
         backtest_payload=_backtest_payload(
             strategy,
             rows,
-            benchmark_context=_build_benchmark_context(rows),
+            benchmark_context=benchmark_context or _build_benchmark_context(rows),
         ),
         feature_coverage=dict(feature_coverage or {}),
         fallback_reasons=list(fallback_reasons or ()),
@@ -2553,6 +2658,19 @@ def _engine_strategy_spec(
             available_ticker_count=available_ticker_count,
         ),
         risk_controls=_engine_risk_controls(strategy, candidate=candidate),
+        backtest={
+            "cost_model": {
+                "commission_pct": float(
+                    strategy.risk_constraints.get("commission_pct", DEFAULT_COMMISSION_PCT)
+                ),
+                "tax_pct": float(
+                    strategy.risk_constraints.get("tax_pct", DEFAULT_TAX_PCT)
+                ),
+                "slippage_pct": float(
+                    strategy.risk_constraints.get("slippage_pct", DEFAULT_SLIPPAGE_PCT)
+                ),
+            }
+        },
     )
 
 

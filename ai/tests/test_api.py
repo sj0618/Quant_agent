@@ -176,7 +176,7 @@ def test_release_readiness_rejects_missing_migration_and_contract_drift(monkeypa
     )
     ready = ready_client.get(READINESS_PATH)
     assert ready.status_code == 200
-    assert ready.json()["migration_revision"] == "024_parse_bound_analysis_job_admission"
+    assert ready.json()["migration_revision"] == "025_exploration_policy_v2"
 
     monkeypatch.setattr("ai_graph.api.SCHEMA_VERSION", "ai-mvp.v0")
     drifted = ready_client.get(READINESS_PATH)
@@ -368,7 +368,7 @@ def test_production_refuses_unready_core_execution_before_side_effects(
     assert sink.sessions == ()
 
 
-def test_ready_release_rejects_parse_bound_core_natural_language_job(
+def test_ready_release_accepts_parse_bound_core_natural_language_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Release admission accepts only a parse-bound natural-language execution spec."""
@@ -402,8 +402,7 @@ def test_ready_release_rejects_parse_bound_core_natural_language_job(
         },
     )
 
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "public_create_retired"
+    assert response.status_code == 201
 
 
 def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(

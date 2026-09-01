@@ -16,6 +16,7 @@ export const AI_ENDPOINTS = {
   analysisJobs: "/analysis-jobs",
   analysisJob: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}`,
   analysisJobCancel: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/cancel`,
+  analysisJobResearchAppendix: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/research-appendix`,
   researchRuleReview: "/api/strategies/parse",
   researchJobs: "/api/research/jobs",
   researchJobResult: (id: string) => `/api/research/jobs/${encodeURIComponent(id)}/result`,

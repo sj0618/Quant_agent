@@ -156,6 +156,7 @@ class Loop3Request(BaseModel):
     variant: str = Field(pattern="^(A|B)$")
     trace_id: str = Field(min_length=1)
     max_positions: int = Field(default=DEFAULT_MAX_POSITIONS, gt=0)
+    server_only: bool = False
 
 
 class Loop3Result(BaseModel):
@@ -177,9 +178,20 @@ def generate_loop3_candidates(
 ) -> Loop3Result:
     feature_mapping = map_strategy_features(request.strategy)
     code_plan = build_code_generation_plan(request.strategy, feature_mapping)
-
-    client = llm_client or create_llm_client(role="BACKTEST_CODE")
-    output = _generate_backtest_code_output(client, request)
+    if request.server_only:
+        output = BacktestCodeLLMOutput.model_construct(
+            strategy_ir=_normalized_strategy_ir(None, request.strategy, code_plan),
+            candidates=_default_parameter_sets(
+                request.strategy,
+                code_plan,
+                request.max_positions,
+            ),
+            fallback_code=[],
+            fallback_reasons=[],
+        )
+    else:
+        client = llm_client or create_llm_client(role="BACKTEST_CODE")
+        output = _generate_backtest_code_output(client, request)
     strategy_ir = _normalized_strategy_ir(output.strategy_ir, request.strategy, code_plan)
     fallback_reasons = list(output.fallback_reasons)
     if len(output.fallback_code) >= MIN_GENERATED_CANDIDATES:
@@ -385,7 +397,12 @@ def _structured_candidates(
         validation = validate_backtest_code(code)
         candidates.append(
             CodeCandidate(
-                candidate_id=f"{request.variant}{index}",
+                candidate_id=(
+                    parameters.blueprint_id
+                    if blueprint is not None
+                    and request.strategy.risk_constraints.get("sealed_candidate_ids")
+                    else f"{request.variant}{index}"
+                ),
                 variant=request.variant,  # type: ignore[arg-type]
                 code=code,
                 validation_ok=validation.ok,
@@ -555,6 +572,7 @@ def backtest_code_node(state: dict) -> dict:
             variant="A",
             trace_id=state["trace_id"],
             max_positions=max_positions,
+            server_only=True,
         )
     )
     candidates = result_a.candidates
@@ -863,16 +881,37 @@ def build_code_generation_plan(
         horizon: Literal["short", "medium", "long"] = (
             raw_horizon if raw_horizon in {"short", "medium", "long"} else "medium"
         )  # type: ignore[assignment]
-        profile_priority = automatic_candidate_profiles(style, horizon)
         catalog_query = str(strategy.risk_constraints.get("catalog_query", "")).strip()
         selection_text = catalog_query or " ".join([strategy.name, requested_text])
-        selected_templates = select_strategy_blueprints(
-            selection_text,
-            risk_style=style,
-            horizon=horizon,
-            profile_priority=profile_priority,  # type: ignore[arg-type]
-            limit=MAX_GENERATED_CANDIDATES,
-        )
+        sealed_ids = [
+            item
+            for item in str(strategy.risk_constraints.get("sealed_candidate_ids", "")).split(",")
+            if item
+        ]
+        if sealed_ids:
+            catalog = {item.catalog_id: item for item in strategy_blueprint_catalog()}
+            try:
+                selected_templates = [catalog[item] for item in sealed_ids]
+            except KeyError as exc:
+                raise ValueError("sealed exploration candidate is not in the catalog") from exc
+            sealed_signatures = [
+                item
+                for item in str(
+                    strategy.risk_constraints.get("sealed_candidate_signatures", "")
+                ).split(",")
+                if item
+            ]
+            if [item.execution_signature for item in selected_templates] != sealed_signatures:
+                raise ValueError("sealed exploration candidate signature changed")
+        else:
+            profile_priority = automatic_candidate_profiles(style, horizon)
+            selected_templates = select_strategy_blueprints(
+                selection_text,
+                risk_style=style,
+                horizon=horizon,
+                profile_priority=profile_priority,  # type: ignore[arg-type]
+                limit=MAX_GENERATED_CANDIDATES,
+            )
         selected_profiles = tuple(template.profile for template in selected_templates)
         rotation_lookbacks = automatic_candidate_lookbacks(
             selected_profiles,

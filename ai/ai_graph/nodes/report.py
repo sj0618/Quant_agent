@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from time import perf_counter
 from typing import Any
 
+from ai_graph.exploration_policy import ExplorationPolicyV2
 from ai_graph.freshness import (
     build_freshness_evidence,
     withhold_recommendations_without_l4_evidence,
@@ -14,12 +16,17 @@ from ai_graph.research_eligibility import (
     PublicPerformance,
 )
 from ai_graph.schemas import (
+    BaseReportV2,
+    ExplorationCandidateResultV2,
+    ExplorationExecutionSpecV2,
     ReportBundle,
     ReportProjection,
     RiskDecision,
     SignalDecision,
     StrategySpec,
+    validate_execution_spec,
 )
+from ai_graph.strategy_blueprint_catalog import strategy_blueprint_catalog
 
 
 def build_report_bundle(
@@ -33,6 +40,7 @@ def build_report_bundle(
     objective_floor: dict[str, Any] | None = None,
     public_performance: PublicPerformance | None = None,
     l4_evidence: list[dict[str, Any]] | None = None,
+    base_report_v2: BaseReportV2 | None = None,
 ) -> ReportBundle:
     signal = risk.signal
     risk_text = (
@@ -41,12 +49,23 @@ def build_report_bundle(
         else "Risk Manager did not change the signal."
     )
     sections: list[dict[str, Any]] = [
-        {"id": "strategy", "title": "StrategySpec", "items": strategy.model_dump()},
-        {"id": "entry_conditions", "title": "진입 조건", "items": [item.model_dump() for item in strategy.entry_conditions]},
         {"id": "assumptions", "title": "검증 가정", "items": strategy.assumptions},
-        {"id": "signal", "title": "Signal Judge", "items": signal.model_dump()},
-        {"id": "risk", "title": "Risk Manager", "items": [item.model_dump() for item in risk.adjustments]},
     ]
+    if base_report_v2 is None:
+        sections[:0] = [
+            {"id": "strategy", "title": "StrategySpec", "items": strategy.model_dump()},
+            {"id": "entry_conditions", "title": "진입 조건", "items": [item.model_dump() for item in strategy.entry_conditions]},
+        ]
+        sections.extend([
+            {"id": "signal", "title": "Signal Judge", "items": signal.model_dump()},
+            {"id": "risk", "title": "Risk Manager", "items": [item.model_dump() for item in risk.adjustments]},
+        ])
+    else:
+        sections.append({
+            "id": "exploration_candidates",
+            "title": "후보별 비용 반영 미래 구간 결과",
+            "items": base_report_v2.model_dump(mode="json"),
+        })
     if citations:
         sections.append({"id": "citations", "title": "출처", "items": citations})
     if data:
@@ -78,7 +97,7 @@ def build_report_bundle(
                 "items": freshness_evidence.model_dump(mode="json"),
             },
         )
-    if public_performance is not None:
+    if public_performance is not None and base_report_v2 is None:
         sections.insert(
             3,
             {
@@ -101,16 +120,43 @@ def build_report_bundle(
                 "items": objective_floor,
             }
         )
+    observation = base_report_v2.historical_observation if base_report_v2 else None
+    observation_text = {
+        "observed": "비용 반영 후 양(+) 수익 후보가 관측됨",
+        "not_observed": "비용 반영 후 양(+) 수익 후보가 관측되지 않음",
+        "inconclusive": "표본 부족으로 결론을 보류함",
+    }.get(observation or "")
     web = ReportProjection(
         title=f"{strategy.name} 분석 결과",
-        summary=f"{signal.action} / confidence {signal.confidence:.2f}. {risk_text}",
+        summary=(
+            f"과거 미래 구간 결과: {observation_text}. 모든 사전등록 후보를 함께 표시합니다."
+            if observation_text
+            else f"{signal.action} / confidence {signal.confidence:.2f}. {risk_text}"
+        ),
         sections=sections,
     )
     email_sections: list[dict[str, Any]] = [
-        {"id": "summary", "title": "요약", "items": {"confidence": signal.confidence}},
+        {
+            "id": "summary",
+            "title": "요약",
+            "items": (
+                {"과거_미래_구간_관측": observation_text}
+                if base_report_v2
+                else {"confidence": signal.confidence}
+            ),
+        },
         {"id": "assumptions", "title": "검증 가정", "items": strategy.assumptions},
-        {"id": "risk", "title": "리스크 변경", "items": [item.model_dump() for item in risk.adjustments]},
     ]
+    if base_report_v2 is None:
+        email_sections.append(
+            {"id": "risk", "title": "리스크 변경", "items": [item.model_dump() for item in risk.adjustments]}
+        )
+    else:
+        email_sections.append({
+            "id": "exploration_candidates",
+            "title": "후보별 결과",
+            "items": base_report_v2.model_dump(mode="json"),
+        })
     if data:
         email_sections.append(
             {
@@ -123,14 +169,23 @@ def build_report_bundle(
             }
         )
     email = ReportProjection(
-        title=f"[QuantAgent] {strategy.name}: {signal.action}",
-        summary=f"{strategy.timeframe} 전략 신호는 {signal.action}입니다.",
+        title=(
+            f"[QuantAgent] {strategy.name}: 과거 검증 결과"
+            if base_report_v2
+            else f"[QuantAgent] {strategy.name}: {signal.action}"
+        ),
+        summary=(
+            "개인별 매매 지시가 아닌 사전등록 후보군의 과거 검증 결과입니다."
+            if base_report_v2
+            else f"{strategy.timeframe} 전략 신호는 {signal.action}입니다."
+        ),
         sections=email_sections,
     )
     return ReportBundle(
         web_projection=web,
         email_projection=email,
-        risk_adjustments=risk.adjustments,
+        risk_adjustments=[] if base_report_v2 else risk.adjustments,
+        base_report_v2=base_report_v2,
     )
 
 
@@ -143,7 +198,10 @@ def report_node(state: dict) -> dict:
         pipeline_data_source=(state.get("data") or {}).get("pipeline_data_source"),
     )
     public_risk = _risk_for_public_report(risk, public_performance)
-    debate = build_report_debate(state, strategy, public_risk)
+    base_report_v2 = _build_base_report_v2(state, strategy)
+    if base_report_v2 is not None and not _can_publish_base_report_v2(public_performance):
+        base_report_v2 = None
+    debate = None if base_report_v2 else build_report_debate(state, strategy, public_risk)
     report = build_report_bundle(
         strategy,
         public_risk,
@@ -154,8 +212,86 @@ def report_node(state: dict) -> dict:
         public_performance=public_performance,
         l4_evidence=state.get("l4_evidence"),
         objective_floor=state.get("objective_floor"),
+        base_report_v2=base_report_v2,
     )
-    return {"report": report.model_dump(), "report_debate": debate}
+    return {"report": report.model_dump(), "report_debate": debate or {}}
+
+
+def _can_publish_base_report_v2(public_performance: PublicPerformance | None) -> bool:
+    if not isinstance(public_performance, PerformanceAvailable):
+        return False
+    reliability = public_performance.performance.get("reliability")
+    return isinstance(reliability, dict) and reliability.get("source") == "postgres"
+
+
+def _build_base_report_v2(
+    state: dict[str, Any], strategy: StrategySpec
+) -> BaseReportV2 | None:
+    raw_spec = state.get("execution_spec")
+    if not raw_spec:
+        return None
+    spec = validate_execution_spec(raw_spec)
+    if not isinstance(spec, ExplorationExecutionSpecV2):
+        return None
+    policy = ExplorationPolicyV2.model_validate(state["exploration_policy"])
+
+    backtest = state.get("backtest") or {}
+    summaries = backtest.get("engine_summaries_by_candidate") or {}
+    titles = {item.catalog_id: item.title for item in strategy_blueprint_catalog()}
+    results: list[ExplorationCandidateResultV2] = []
+    for candidate in spec.candidates:
+        aggregate = (summaries.get(candidate.catalog_id) or {}).get("aggregate_oos_result") or {}
+        available = aggregate.get("availability") == "available"
+        failed = aggregate.get("availability") == "failed"
+        results.append(ExplorationCandidateResultV2(
+            catalog_id=candidate.catalog_id,
+            title=titles[candidate.catalog_id],
+            status="available" if available else "failed" if failed else "insufficient_data",
+            total_return=aggregate.get("total_return") if available else None,
+            max_drawdown=aggregate.get("max_drawdown") if available else None,
+            sharpe_ratio=aggregate.get("sharpe_ratio") if available else None,
+            trade_count=int(aggregate.get("trade_count") or 0),
+            evaluation_session_count=int(aggregate.get("evaluation_session_count") or 0),
+            costs=aggregate.get("costs"),
+            after_costs=True,
+            reason=None if available else str(aggregate.get("reason") or "미래 구간 표본 부족"),
+        ))
+    available_returns = [item.total_return for item in results if item.total_return is not None]
+    observation = (
+        "inconclusive"
+        if len(available_returns) != len(results)
+        else "observed"
+        if any(value > 0.0 for value in available_returns)
+        else "not_observed"
+    )
+    started_at = state.get("base_report_started_at")
+    elapsed_ms = (
+        round(max(0.0, perf_counter() - float(started_at)) * 1_000, 3)
+        if started_at is not None
+        else 0.0
+    )
+    return BaseReportV2(
+        policy_version=spec.policy_version,
+        policy_hash=spec.policy_hash,
+        catalog_version=spec.catalog_version,
+        catalog_hash=spec.catalog_hash,
+        benchmark=policy.benchmark,
+        validation_method=policy.validation.method,
+        elapsed_ms=elapsed_ms,
+        llm_call_counts={
+            "post_parse_intent": 0,
+            "screening_sql": 0,
+            "python_generation": 0,
+        },
+        historical_observation=observation,
+        candidates=results,
+        assumptions=strategy.assumptions,
+        limitations=[
+            "과거 성과는 미래 수익을 보장하지 않습니다.",
+            "개인 보유자산과 재무상황을 반영한 매매 추천이 아닙니다.",
+            "후보는 성과 조회 전에 고정했으며 일부 후보만 골라 결과를 표시하지 않습니다.",
+        ],
+    )
 
 
 def _risk_for_public_report(

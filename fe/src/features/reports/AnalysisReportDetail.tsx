@@ -7,6 +7,7 @@ import { OverviewTab } from "../app/OverviewTab";
 import { PerformanceTab } from "../app/PerformanceTab";
 import { TradingInfoTab } from "../app/TradingInfoTab";
 import { workspaceOverviewFromJob } from "../app/strategyWorkspaceMapper";
+import { ExplorationBaseReport } from "./ExplorationBaseReport";
 
 type ReportTab = "overview" | "trading" | "performance";
 
@@ -34,6 +35,7 @@ export function AnalysisReportDetail({ job }: { job: AnalysisJob }) {
   const overview = workspaceOverviewFromJob(job);
   const result = job.result;
   const report = result?.user_payload.report?.web_projection;
+  const explorationReport = result?.user_payload.report?.base_report_v2;
   const method = result?.user_payload.performance?.availability === "available"
     ? result.user_payload.performance.method_manifest
     : null;
@@ -57,8 +59,10 @@ export function AnalysisReportDetail({ job }: { job: AnalysisJob }) {
         <p>{summary}</p>
         <dl className="analysis-report-hero__facts">
           <div><dt>입력 전략</dt><dd>{job.query}</dd></div>
-          <div><dt>진입 조건</dt><dd>{overview.strategy.buy_condition}</dd></div>
-          <div><dt>청산 조건</dt><dd>{overview.strategy.drop_condition}</dd></div>
+          {explorationReport ? <div><dt>연구 유형</dt><dd>사전등록 후보군 과거 검증</dd></div> : <>
+            <div><dt>진입 조건</dt><dd>{overview.strategy.buy_condition}</dd></div>
+            <div><dt>청산 조건</dt><dd>{overview.strategy.drop_condition}</dd></div>
+          </>}
           <div><dt>데이터 기준</dt><dd>{reliability?.source === "postgres" ? "PostgreSQL EOD" : "검증 범위 확인 필요"}</dd></div>
           {method ? <div><dt>검증 구간</dt><dd>{method.start_date} ~ {method.end_date}</dd></div> : null}
         </dl>
@@ -69,6 +73,7 @@ export function AnalysisReportDetail({ job }: { job: AnalysisJob }) {
         <span>현재 시장 상태나 주문 지시가 아니며, 성과 수치는 실데이터 출처·표본·방법이 확인된 경우에만 표시합니다.</span>
       </section>
 
+      {explorationReport ? <ExplorationBaseReport jobId={job.job_id} report={explorationReport} /> : <>
       <Tabs
         activeId={activeTab}
         items={TAB_ITEMS.map((tab) => tab.id === "trading" ? { ...tab, count: overview.candidates.length } : tab)}
@@ -78,6 +83,7 @@ export function AnalysisReportDetail({ job }: { job: AnalysisJob }) {
       {activeTab === "overview" ? <OverviewTab overview={overview} validated={overview.recommendationGate?.validated === true} /> : null}
       {activeTab === "trading" ? <TradingInfoTab candidates={overview.candidates} /> : null}
       {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
+      </>}
 
       <Card className="analysis-report-limitations">
         <strong>해석 한계</strong>

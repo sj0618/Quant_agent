@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from os import environ
 from threading import Lock
@@ -50,6 +50,12 @@ from ai_graph.data_sources.db import (
     resolve_database_dsn_from_env,
 )
 from ai_graph.execution_boundary import retired_public_create_detail
+from ai_graph.exploration_policy import (
+    ActiveExplorationPolicyV2,
+    ExplorationPolicyUnavailableError,
+    load_active_exploration_policy_from_env,
+    validate_exploration_spec_against_policy,
+)
 from ai_graph.graph import run_analysis
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
@@ -67,11 +73,12 @@ from ai_graph.jobs import (
     JobStoreRuntime,
     ParseBoundAdmissionError,
     ParseBoundJobAdmissionStore,
+    ResearchAppendixStore,
     create_analysis_job_store_from_env,
     reap_interrupted_jobs,
     run_job_sync,
 )
-from ai_graph.llm.role_calls import generate_strategy_description
+from ai_graph.llm.role_calls import generate_strategy_description, research_screening_terms
 from ai_graph.preflight import (
     SCOPE_REFUSAL_REASON,
     UNSUPPORTED_SCOPE_REASON,
@@ -79,10 +86,14 @@ from ai_graph.preflight import (
     classify_research_request,
 )
 from ai_graph.quant_performance import sanitize_public_performance
+from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.research_contract import (
     CanonicalRuleV1,
     DraftConflictV1,
     DraftTokenValidationError,
+    EXPLORATION_EXECUTION_SPEC_VERSION,
+    ExecutionSpecV1OrV2,
+    ExplorationExecutionSpecV2,
     InMemoryDraftNonceRegistry,
     ParseReviewV1,
     ResearchJobAcceptedV1,
@@ -90,7 +101,6 @@ from ai_graph.research_contract import (
     RuleDraftSigner,
     RuleDraftV1,
     STRATEGY_EXECUTION_SPEC_VERSION,
-    StrategyExecutionSpecV1,
     ScopeRefusalV1,
     UnsupportedScopeV1,
     build_rule_draft,
@@ -136,6 +146,9 @@ ANALYSIS_JOBS_PATH = "/analysis-jobs"
 ANALYSIS_JOB_DETAIL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}"
 ANALYSIS_JOB_EVENTS_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}/events"
 ANALYSIS_JOB_CANCEL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}/cancel"
+ANALYSIS_JOB_RESEARCH_APPENDIX_PATH = (
+    f"{ANALYSIS_JOBS_PATH}/{{job_id}}/research-appendix"
+)
 # How long an idle SSE reader waits before checking for new provider activity.
 ANALYSIS_EVENT_POLL_SECONDS = 0.25
 # Idle gap after which a comment line is sent so intermediaries keep the stream open.
@@ -157,7 +170,7 @@ DATA_EVIDENCE_PROBE_PATH = "/_operator/research-data-evidence"
 DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
 READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
 REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
-ANALYSIS_JOBS_MIGRATION_REVISION = "024_parse_bound_analysis_job_admission"
+ANALYSIS_JOBS_MIGRATION_REVISION = "025_exploration_policy_v2"
 AI_LLM_PROVIDER_ENV = "AI_LLM_PROVIDER"
 AI_AOAI_RESPONSES_URL_ENV = "AI_AOAI_RESPONSES_URL"
 AI_AOAI_API_KEY_ENV = "AI_AOAI_API_KEY"
@@ -200,9 +213,12 @@ class CreateAnalysisJobRequest(BaseModel):
     query: str | None = Field(default=None, min_length=1)
     parse_token: str | None = Field(default=None, min_length=32)
     client_idempotency_key: str | None = Field(default=None, min_length=16, max_length=200)
-    spec_version: Literal[STRATEGY_EXECUTION_SPEC_VERSION] | None = None
+    spec_version: Literal[
+        STRATEGY_EXECUTION_SPEC_VERSION,
+        EXPLORATION_EXECUTION_SPEC_VERSION,
+    ] | None = None
     spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    strategy_execution_spec: StrategyExecutionSpecV1 | None = None
+    strategy_execution_spec: ExecutionSpecV1OrV2 | None = None
 
     @model_validator(mode="after")
     def require_one_admission_shape(self) -> CreateAnalysisJobRequest:
@@ -216,6 +232,13 @@ class CreateAnalysisJobRequest(BaseModel):
         has_parsed_contract = all(value is not None for value in parsed_values)
         has_partial_contract = any(value is not None for value in parsed_values)
         if has_parsed_contract and self.query is None:
+            expected_version = (
+                EXPLORATION_EXECUTION_SPEC_VERSION
+                if isinstance(self.strategy_execution_spec, ExplorationExecutionSpecV2)
+                else STRATEGY_EXECUTION_SPEC_VERSION
+            )
+            if self.spec_version != expected_version:
+                raise ValueError("spec_version must match strategy_execution_spec")
             return self
         if self.query is not None and not has_partial_contract:
             return self
@@ -718,6 +741,83 @@ async def _dispatch_analysis_job_outbox(
         await run_in_threadpool(store.mark_analysis_job_outbox_delivered, message.outbox_id)
 
 
+def _default_research_appendix_runner(job: AnalysisJob) -> Mapping[str, object] | None:
+    return research_screening_terms(query=job.query)
+
+
+async def _dispatch_research_appendix_outbox(
+    store: AnalysisJobStore,
+    *,
+    research_runner: Callable[[AnalysisJob], Mapping[str, object] | None],
+    max_messages: int = 32,
+) -> None:
+    if not isinstance(store, ResearchAppendixStore):
+        return
+    for _ in range(max_messages):
+        messages = await run_in_threadpool(store.claim_research_appendix_outbox, limit=1)
+        if not messages:
+            return
+        message = messages[0]
+        job = await run_in_threadpool(store.get_job, message.job_id)
+        if job is None:
+            await run_in_threadpool(
+                store.mark_research_appendix_unavailable,
+                message.outbox_id,
+                message.job_id,
+                "analysis_job_missing",
+            )
+            continue
+        if job.status is not AnalysisJobStatus.COMPLETED:
+            await run_in_threadpool(
+                store.mark_research_appendix_unavailable,
+                message.outbox_id,
+                job.job_id,
+                "base_report_unavailable",
+            )
+            continue
+        try:
+            payload = await run_in_threadpool(research_runner, job)
+        except Exception:  # noqa: BLE001 - the base report remains complete without the appendix.
+            _logger.exception("asynchronous research appendix failed: job_id=%s", job.job_id)
+            payload = None
+        if payload is None:
+            await run_in_threadpool(
+                store.mark_research_appendix_unavailable,
+                message.outbox_id,
+                job.job_id,
+                "live_research_unavailable",
+            )
+        else:
+            await run_in_threadpool(
+                store.complete_research_appendix,
+                message.outbox_id,
+                job.job_id,
+                payload,
+            )
+
+
+async def _dispatch_analysis_and_research_outboxes(
+    store: AnalysisJobStore,
+    *,
+    analysis_runner: AnalysisRunner,
+    research_runner: Callable[[AnalysisJob], Mapping[str, object] | None],
+    audit_sink: AuditSink | None,
+    events: JobEventBuffer,
+    cancellations: CancellationRegistry,
+) -> None:
+    await _dispatch_analysis_job_outbox(
+        store,
+        analysis_runner=analysis_runner,
+        audit_sink=audit_sink,
+        events=events,
+        cancellations=cancellations,
+    )
+    await _dispatch_research_appendix_outbox(
+        store,
+        research_runner=research_runner,
+    )
+
+
 def _open_request_audit_session(
     audit_sink: AuditSink | None,
     *,
@@ -794,6 +894,9 @@ def create_app(
     research_execution_enabled: bool | None = None,
     readiness_migration_probe: Callable[[], bool] | None = None,
     indicator_catalog_resolver: Callable[[], Sequence[str] | None] | None = None,
+    exploration_policy_resolver: Callable[[], ActiveExplorationPolicyV2] | None = None,
+    research_appendix_runner: Callable[[AnalysisJob], Mapping[str, object] | None]
+    | None = None,
 ) -> FastAPI:
     runtime = job_store_runtime or _job_store_runtime(job_store)
     store = runtime.store
@@ -834,9 +937,10 @@ def create_app(
         outbox_task: asyncio.Task[None] | None = None
         if isinstance(store, AnalysisJobOutboxStore):
             outbox_task = asyncio.create_task(
-                _dispatch_analysis_job_outbox(
+                _dispatch_analysis_and_research_outboxes(
                     store,
                     analysis_runner=analysis_runner,
+                    research_runner=app.state.research_appendix_runner,
                     audit_sink=app.state.audit_sink,
                     events=app.state.job_events,
                     cancellations=app.state.job_cancellations,
@@ -877,6 +981,12 @@ def create_app(
     app.state.rule_draft_signer = rule_draft_signer or RuleDraftSigner.from_env()
     app.state.indicator_catalog_resolver = (
         indicator_catalog_resolver or _resolve_indicator_catalog
+    )
+    app.state.exploration_policy_resolver = (
+        exploration_policy_resolver or load_active_exploration_policy_from_env
+    )
+    app.state.research_appendix_runner = (
+        research_appendix_runner or _default_research_appendix_runner
     )
     app.state.indicator_catalog_uses_server = bool(
         indicator_catalog_resolver or resolve_database_dsn_from_env()[0]
@@ -993,7 +1103,7 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
-        if _production_runtime():
+        if _production_runtime() and not request.is_parse_bound:
             raise HTTPException(
                 status_code=status.HTTP_410_GONE,
                 detail=retired_public_create_detail(
@@ -1005,10 +1115,16 @@ def create_app(
 
         production_runtime = _production_runtime()
         if production_runtime:
+            exploration_request = isinstance(
+                request.strategy_execution_spec,
+                ExplorationExecutionSpecV2,
+            )
             readiness = _core_execution_readiness(
                 runtime,
                 migration_probe=migration_probe,
-                provider_ready=_live_provider_configuration_is_ready(),
+                provider_ready=(
+                    exploration_request or _live_provider_configuration_is_ready()
+                ),
                 rule_draft_signer=app.state.rule_draft_signer,
             )
             if readiness.status != "ready":
@@ -1033,6 +1149,20 @@ def create_app(
                 )
             if not spec.is_executable:
                 return _draft_conflict_response("draft_rule_mismatch")
+            if isinstance(spec, ExplorationExecutionSpecV2):
+                try:
+                    validate_exploration_spec_against_policy(
+                        spec,
+                        app.state.exploration_policy_resolver(),
+                    )
+                except ExplorationPolicyUnavailableError:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "code": "exploration_policy_unavailable",
+                            "message": "탐색 정책을 확인할 수 없어 실행을 시작하지 않았습니다. 잠시 후 다시 시도해 주세요.",
+                        },
+                    ) from None
             idempotency_key = request.client_idempotency_key or ""
             if not (
                 isinstance(store, ParseBoundJobAdmissionStore)
@@ -1057,9 +1187,10 @@ def create_app(
                     # Retrying is also a harmless recovery nudge if the first
                     # response was interrupted before its post-response task started.
                     background_tasks.add_task(
-                        _dispatch_analysis_job_outbox,
+                        _dispatch_analysis_and_research_outboxes,
                         store,
                         analysis_runner=analysis_runner,
+                        research_runner=app.state.research_appendix_runner,
                         audit_sink=app.state.audit_sink,
                         events=app.state.job_events,
                         cancellations=app.state.job_cancellations,
@@ -1152,9 +1283,10 @@ def create_app(
                     job_id=existing_durable_job.job_id,
                 )
                 background_tasks.add_task(
-                    _dispatch_analysis_job_outbox,
+                    _dispatch_analysis_and_research_outboxes,
                     store,
                     analysis_runner=analysis_runner,
+                    research_runner=app.state.research_appendix_runner,
                     audit_sink=app.state.audit_sink,
                     events=app.state.job_events,
                     cancellations=app.state.job_cancellations,
@@ -1200,6 +1332,20 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Strategy execution admission is temporarily unavailable.",
             ) from None
+        except ExplorationPolicyUnavailableError:
+            if request.is_parse_bound:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "exploration_policy_stale",
+                    "message": "확인한 탐색 정책이 바뀌어 실행을 시작하지 않았습니다. 다시 확인해 주세요.",
+                },
+            ) from None
         except Exception:
             if request.is_parse_bound:
                 app.state.core_job_idempotency_registry.discard(
@@ -1219,9 +1365,10 @@ def create_app(
             # The dispatch record was written with the job. A replay after a process
             # restart can safely call this again: claim leasing selects it at most once.
             background_tasks.add_task(
-                _dispatch_analysis_job_outbox,
+                _dispatch_analysis_and_research_outboxes,
                 store,
                 analysis_runner=analysis_runner,
+                research_runner=app.state.research_appendix_runner,
                 audit_sink=app.state.audit_sink,
                 events=app.state.job_events,
                 cancellations=app.state.job_cancellations,
@@ -1373,14 +1520,28 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Server indicator data is temporarily unavailable.",
             )
+        exploration_policy = None
+        available_metrics = None
+        automatic = classify_strategy_request(request.request_text) == "automatic"
         try:
-            available_metrics = app.state.indicator_catalog_resolver()
+            if automatic:
+                exploration_policy = app.state.exploration_policy_resolver()
+            else:
+                available_metrics = app.state.indicator_catalog_resolver()
+        except ExplorationPolicyUnavailableError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "exploration_policy_unavailable",
+                    "message": "탐색 정책을 확인할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+                },
+            ) from None
         except Exception:  # noqa: BLE001 - parser admission must fail closed on data errors.
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Server indicator data is temporarily unavailable.",
             ) from None
-        if not available_metrics:
+        if not automatic and not available_metrics:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Server indicator data is temporarily unavailable.",
@@ -1390,14 +1551,21 @@ def create_app(
             user_id=user_id,
             signer=signer,
             available_metrics=available_metrics,
-            use_llm=app.state.strategy_parser_uses_llm,
+            use_llm=False if automatic else app.state.strategy_parser_uses_llm,
+            exploration_policy=exploration_policy,
         )
         if outcome.is_executable:
             if _production_runtime():
                 readiness = _core_execution_readiness(
                     runtime,
                     migration_probe=migration_probe,
-                    provider_ready=_live_provider_configuration_is_ready(),
+                    provider_ready=(
+                        isinstance(
+                            outcome.strategy_execution_spec,
+                            ExplorationExecutionSpecV2,
+                        )
+                        or _live_provider_configuration_is_ready()
+                    ),
                     rule_draft_signer=signer,
                 )
                 if readiness.status != "ready":
@@ -1601,6 +1769,33 @@ def create_app(
                 detail="analysis job not found",
             )
         return _public_job(job)
+
+    @app.get(
+        ANALYSIS_JOB_RESEARCH_APPENDIX_PATH,
+        response_model=dict[str, object],
+        tags=["Analysis Jobs"],
+    )
+    def get_research_appendix(
+        job_id: str,
+        user_id: str = Depends(require_user),
+    ) -> dict[str, object]:
+        if _owned_job(store, job_id, user_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="analysis job not found",
+            )
+        if not isinstance(store, ResearchAppendixStore):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Research appendix is temporarily unavailable.",
+            )
+        appendix = store.get_research_appendix(job_id)
+        if appendix is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="research appendix not found",
+            )
+        return dict(appendix)
 
     @app.get(
         SPEC_ANALYSIS_JOB_DETAIL_PATH,
@@ -1991,6 +2186,10 @@ def _analysis_jobs_migration_is_current() -> bool:
                     to_regclass('app.ai_parse_token') IS NOT NULL,
                     to_regclass('app.ai_analysis_job_idempotency') IS NOT NULL,
                     to_regclass('app.ai_analysis_job_outbox') IS NOT NULL,
+                    to_regclass('app.ai_exploration_policy') IS NOT NULL,
+                    to_regclass('app.ai_active_exploration_policy') IS NOT NULL,
+                    to_regclass('app.ai_research_appendix_event') IS NOT NULL,
+                    to_regclass('app.ai_research_appendix_outbox') IS NOT NULL,
                     EXISTS (
                         SELECT 1
                         FROM pg_class

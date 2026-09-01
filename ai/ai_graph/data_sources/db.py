@@ -325,7 +325,9 @@ class PostgresPipelineDataSource:
         # for this load, so the report can say so instead of silently not matching.
         self.unavailable_indicator_families: tuple[str, ...] = ()
 
-    def load(self, query: str, trace_id: str) -> PipelineDataBundle:
+    def load(
+        self, query: str, trace_id: str, *, screen_current: bool = True
+    ) -> PipelineDataBundle:
         load_started = perf_counter()
         timings: dict[str, float] = {}
         with self._connect() as conn:
@@ -368,8 +370,8 @@ class PostgresPipelineDataSource:
             }
             recommended: list[str] = []
             ticker_resolution = "screening"
-            already_screened = _query_requests_screening(query)
-            screening_mode = already_screened
+            already_screened = screen_current and _query_requests_screening(query)
+            screening_mode = not screen_current or already_screened
             pit_market: tuple[
                 list[str],
                 dict[str, Any],
@@ -395,7 +397,7 @@ class PostgresPipelineDataSource:
                     ) = screening.result()
                 timings.update(screening_timings)
             single_ticker: str | None = None
-            if not screening_candidates:
+            if not screening_candidates and screen_current:
                 single_ticker = self._resolve_ticker(conn, query)
                 if single_ticker is None:
                     screening_mode = True
@@ -580,6 +582,7 @@ class PostgresPipelineDataSource:
                 "recommendation_ticker": recommended[0] if recommended else None,
                 "backtest_universe": universe_descriptor,
                 "parallel_screening_backtest": parallel_screening_backtest,
+                "current_screening": "enabled" if screen_current else "skipped_for_sealed_exploration",
                 "ticker_resolution": ticker_resolution,
                 "price_source": KIS_ADJUSTED_OHLCV_TABLE,
                 "indicator_sources": [
@@ -1569,14 +1572,18 @@ class PostgresPipelineDataSource:
 
 
 
-def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle:
+def load_pipeline_data_from_env(
+    query: str, trace_id: str, *, screen_current: bool = True
+) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
         return _fixture_bundle(
             f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.",
             query=query,
         )
-    return PostgresPipelineDataSource(config).load(query, trace_id)
+    return PostgresPipelineDataSource(config).load(
+        query, trace_id, screen_current=screen_current
+    )
 
 
 def measure_research_runtime_facts_from_env(

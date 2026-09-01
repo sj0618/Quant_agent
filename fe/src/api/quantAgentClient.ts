@@ -20,6 +20,34 @@ interface StrategyExecutionSpecV1 {
   exit_conditions: Array<{ metric: string; comparator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne"; value: number; lookback: number; role: "exit" }>;
 }
 
+interface ExplorationExecutionSpecV2 {
+  classification: "exploratory_return_seeking";
+  market: "KRX";
+  timeframe: "daily";
+  policy_version: string;
+  policy_hash: string;
+  catalog_version: string;
+  catalog_hash: string;
+  candidates: Array<{ catalog_id: string; execution_signature: string }>;
+}
+
+export interface ExplorationReviewV2 {
+  classification: "exploratory_return_seeking";
+  research_hypothesis: string;
+  opposing_hypothesis: string;
+  market: "KRX";
+  period: string;
+  available_metrics: string[];
+  defaults: string[];
+  alternatives: string[];
+  candidate_reasons: Array<{ catalog_id: string; title: string; reason: string; required_data: string[] }>;
+  limitations: string[];
+  policy_version: string;
+  policy_hash: string;
+  catalog_version: string;
+  catalog_hash: string;
+}
+
 export interface RuleDraftOutcome {
   kind: "rule_draft";
   market: "KRX";
@@ -33,8 +61,9 @@ export interface RuleDraftOutcome {
   editable_summary: string;
   clarifications: Array<{ label: string; reason: string }>;
   is_executable: boolean;
-  strategy_execution_spec?: StrategyExecutionSpecV1;
-  spec_version?: "strategy-execution-spec.v1";
+  exploration?: ExplorationReviewV2 | null;
+  strategy_execution_spec?: StrategyExecutionSpecV1 | ExplorationExecutionSpecV2;
+  spec_version?: "strategy-execution-spec.v1" | "exploration-execution-spec.v2";
   spec_hash?: string;
   parse_token?: string;
 }
@@ -125,6 +154,21 @@ export async function createAnalysisJob(_query: string): Promise<never> {
 export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
   const response = await requestCoreAnalysis(AI_ENDPOINTS.analysisJob(jobId));
   return response.json() as Promise<AnalysisJob>;
+}
+
+export interface ResearchAppendix {
+  status: "pending" | "ready" | "unavailable";
+  payload: {
+    strategy_reading?: string;
+    metrics?: Array<{ name: string; definition: string; formula: string; required_inputs: string[] }>;
+    citations?: Array<{ title: string; url: string }>;
+    reason?: string;
+  };
+}
+
+export async function getResearchAppendix(jobId: string): Promise<ResearchAppendix> {
+  const response = await requestCoreAnalysis(AI_ENDPOINTS.analysisJobResearchAppendix(jobId));
+  return response.json() as Promise<ResearchAppendix>;
 }
 
 /**

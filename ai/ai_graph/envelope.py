@@ -5,11 +5,11 @@ from typing import Any
 
 from ai_graph.schemas import (
     APIEnvelope,
+    ExecutionSpecV1OrV2,
     EnvelopeStatus,
     FailureDiagnostic,
     FreshnessEvidence,
     InternalPayload,
-    StrategyExecutionSpecV1,
     StrategySpec,
     UserPayload,
 )
@@ -35,7 +35,7 @@ def build_envelope(
     debug_ref: str,
     user_payload: UserPayload | dict[str, Any],
     strategy_spec: StrategySpec | dict[str, Any] | None,
-    execution_spec: StrategyExecutionSpecV1 | dict[str, Any] | None = None,
+    execution_spec: ExecutionSpecV1OrV2 | dict[str, Any] | None = None,
     execution_spec_version: str | None = None,
     execution_spec_hash: str | None = None,
     retryable: bool,

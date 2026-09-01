@@ -316,11 +316,27 @@ def test_rolling_walk_forward_artifact_binds_actual_oos_result(monkeypatch, tmp_
         llm_client=MockLLMClient(),
     ).candidates
     monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "oos-rolling"))
-    result = backtest_node.run_candidate_backtest(
+    rows = _walk_forward_price_rows()
+    sessions = sorted({str(row["date"]) for row in rows})
+    official_benchmark = {
+        "available": True,
+        "kospi_tr": {session: 100.0 + index for index, session in enumerate(sessions)},
+        "kosdaq_tr": {session: 200.0 + index for index, session in enumerate(sessions)},
+        "monthly_weights": {
+            backtest_node._previous_month(month): [0.8, 0.2]
+            for month in {session[:7] for session in sessions}
+        },
+    }
+    with backtest_node._CandidateBacktestSession(
         strategy,
-        candidates,
-        price_rows=_walk_forward_price_rows(),
-    )
+        rows,
+        official_benchmark=official_benchmark,
+    ) as session:
+        result = backtest_node.run_candidate_backtest(
+            strategy,
+            candidates,
+            _session=session,
+        )
 
     artifact = result.engine_summary["walk_forward_sample"]
     assert result.walk_forward is not None
@@ -333,6 +349,15 @@ def test_rolling_walk_forward_artifact_binds_actual_oos_result(monkeypatch, tmp_
     assert isinstance(artifact["aggregate_oos_result"]["total_return"], float)
     assert isinstance(artifact["aggregate_oos_result"]["sharpe_ratio"], float)
     assert isinstance(artifact["aggregate_oos_result"]["max_drawdown"], float)
+    candidate_results = {
+        candidate_id: summary["aggregate_oos_result"]
+        for candidate_id, summary in result.engine_summaries_by_candidate.items()
+    }
+    assert set(candidate_results) == {candidate.candidate_id for candidate in candidates}
+    assert {item["evaluation_session_count"] for item in candidate_results.values()} == {480}
+    assert all(item["after_costs"] is True for item in candidate_results.values())
+    assert all("costs" in item for item in candidate_results.values())
+    assert result.backtest_payload["benchmark"]["primary"]["available"] is True
 
 
 def test_unsafe_rolling_candidate_artifact_uses_its_actual_unavailable_reason(

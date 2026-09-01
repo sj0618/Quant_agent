@@ -26,8 +26,15 @@ from ai_graph.data_sources import (
     load_pipeline_data_from_env,
     screening_data_families,
 )
+from ai_graph.data_sources.db import BACKTEST_EVALUATION_YEARS
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
+from ai_graph.exploration_policy import (
+    ExplorationPolicyV2,
+    ExplorationPolicyUnavailableError,
+    load_exploration_policy_from_env,
+    validate_exploration_spec_against_policy,
+)
 from ai_graph.freshness import (
     build_freshness_evidence,
     freshness_status_from_metadata,
@@ -56,6 +63,11 @@ from ai_graph.nodes.backtest import (
     _profit_factor,
     _public_engine_summary,
     _summary_float_default,
+    WALK_FORWARD_EVALUATION_MONTHS,
+    WALK_FORWARD_ROLL_MONTHS,
+    WALK_FORWARD_TRAIN_MONTHS,
+    WALK_FORWARD_VALIDATION_MONTHS,
+    WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
     backtest_node,
 )
 from ai_graph.nodes.backtest_code import backtest_code_node
@@ -93,6 +105,8 @@ from ai_graph.schemas import (
     DataRequirement,
     EnvelopeStatus,
     EvidenceRef,
+    ExecutionSpecV1OrV2,
+    ExplorationExecutionSpecV2,
     InternalPayload,
     PublicMetricDetail,
     PublicMetricProvenance,
@@ -104,10 +118,13 @@ from ai_graph.schemas import (
     StrategyExecutionSpecV1,
     StrategySpec,
     STRATEGY_EXECUTION_SPEC_VERSION_V1,
+    EXPLORATION_EXECUTION_SPEC_VERSION_V2,
     TickerAction,
     UserPayload,
     canonical_execution_spec_digest,
+    validate_execution_spec,
 )
+from ai_graph.strategy_blueprint_catalog import strategy_blueprint_catalog
 from ai_graph.source_manifest import (
     build_pipeline_extract_snapshot,
     is_release_profile,
@@ -245,15 +262,42 @@ def run_analysis(
     client_request_id: str | None = None,
     user_id: str | None = None,
     session_id: str | None = None,
-    execution_spec: StrategyExecutionSpecV1 | Mapping[str, Any] | None = None,
+    execution_spec: ExecutionSpecV1OrV2 | Mapping[str, Any] | None = None,
     execution_spec_hash: str | None = None,
 ) -> APIEnvelope:
+    base_report_started_at = perf_counter()
     query = _normalize_user_query(user_query)
     normalized_execution_spec = (
-        StrategyExecutionSpecV1.model_validate(execution_spec)
+        validate_execution_spec(execution_spec)
         if execution_spec is not None
         else None
     )
+    exploration_policy = None
+    if isinstance(normalized_execution_spec, ExplorationExecutionSpecV2):
+        sealed_policy = load_exploration_policy_from_env(
+            normalized_execution_spec.policy_version
+        )
+        validate_exploration_spec_against_policy(normalized_execution_spec, sealed_policy)
+        validation = sealed_policy.policy.validation
+        if (
+            validation.train_months,
+            validation.validation_months,
+            validation.evaluation_months,
+            validation.roll_months,
+            validation.minimum_evaluation_sessions,
+            sealed_policy.policy.history_years,
+        ) != (
+            WALK_FORWARD_TRAIN_MONTHS,
+            WALK_FORWARD_VALIDATION_MONTHS,
+            WALK_FORWARD_EVALUATION_MONTHS,
+            WALK_FORWARD_ROLL_MONTHS,
+            WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
+            BACKTEST_EVALUATION_YEARS,
+        ):
+            raise ExplorationPolicyUnavailableError(
+                "exploration_policy_engine_version_stale"
+            )
+        exploration_policy = sealed_policy.policy
     if normalized_execution_spec is not None:
         expected_hash = canonical_execution_spec_digest(normalized_execution_spec)
         if execution_spec_hash is not None and execution_spec_hash != expected_hash:
@@ -304,6 +348,12 @@ def run_analysis(
                     if normalized_execution_spec is not None
                     else {}
                 ),
+                **(
+                    {"exploration_policy": exploration_policy.model_dump(mode="json")}
+                    if exploration_policy is not None
+                    else {}
+                ),
+                "base_report_started_at": base_report_started_at,
             }
         )
         envelope = APIEnvelope.model_validate(state["envelope"])
@@ -710,7 +760,12 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         label="필요 데이터 정리",
         detail=f"조회할 데이터 항목 {len(data_requirements)}종을 확정했습니다.",
     )
-    pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
+    exploration = bool(state.get("exploration_policy"))
+    pipeline_data = (
+        load_pipeline_data_from_env(query, state["trace_id"], screen_current=False)
+        if exploration
+        else load_pipeline_data_from_env(query, state["trace_id"])
+    )
     if is_release_profile():
         raw_required_tickers = pipeline_data.metadata.get("tickers", ())
         required_tickers = (
@@ -858,11 +913,58 @@ def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[st
 
 
 def _strategy_spec_from_execution_spec(
-    raw_spec: Mapping[str, Any] | StrategyExecutionSpecV1,
+    raw_spec: Mapping[str, Any] | ExecutionSpecV1OrV2,
+    raw_policy: Mapping[str, Any] | None = None,
 ) -> StrategySpec:
     """Compile the confirmed rule without asking another model to reinterpret it."""
 
-    execution_spec = StrategyExecutionSpecV1.model_validate(raw_spec)
+    execution_spec = validate_execution_spec(raw_spec)
+    if isinstance(execution_spec, ExplorationExecutionSpecV2):
+        if raw_policy is None:
+            raise ValueError("exploration policy payload is required")
+        policy = ExplorationPolicyV2.model_validate(raw_policy)
+        templates_by_id = {item.catalog_id: item for item in strategy_blueprint_catalog()}
+        templates = [templates_by_id[item.catalog_id] for item in execution_spec.candidates]
+        first = templates[0]
+        return StrategySpec(
+            strategy_id=f"exploration_{canonical_execution_spec_digest(execution_spec)[:12]}",
+            name="사전등록 후보군 탐색 연구",
+            market=execution_spec.market,
+            timeframe=execution_spec.timeframe,
+            entry_conditions=first.entry_conditions,
+            exit_conditions=first.exit_conditions,
+            indicators=list(dict.fromkeys(
+                key for template in templates for key in template.required_data
+            )),
+            risk_constraints={
+                "max_position_pct": round(1.0 / policy.max_positions, 8),
+                "stop_loss_pct": policy.stop_loss_pct,
+                "take_profit_pct": policy.take_profit_pct,
+                "trailing_stop_pct": policy.trailing_stop_pct,
+                "rebalance_interval_days": policy.rebalance_interval_days,
+                "strategy_style": policy.risk_style,
+                "investment_horizon": policy.investment_horizon,
+                "sealed_candidate_ids": ",".join(item.catalog_id for item in execution_spec.candidates),
+                "sealed_candidate_signatures": ",".join(
+                    item.execution_signature for item in execution_spec.candidates
+                ),
+                "exploration_policy_version": policy.policy_version,
+                "exploration_policy_hash": execution_spec.policy_hash,
+                "commission_pct": policy.cost_model.commission_pct,
+                "tax_pct": policy.cost_model.tax_pct,
+                "slippage_pct": policy.cost_model.slippage_pct,
+            },
+            assumptions=[
+                "성과 조회 전에 정책과 후보군을 고정함",
+                "모든 후보에 같은 PIT 데이터, 비용, 검증 구간을 적용함",
+                "개인별 매매 추천이 아닌 과거 데이터 연구임",
+            ],
+            source_refs=[policy.catalog_version, policy.policy_version],
+            selection_mode="automatic",
+            confidence=1.0,
+        )
+
+    execution_spec = StrategyExecutionSpecV1.model_validate(execution_spec)
 
     def condition_from_contract(item: Any) -> Condition:
         metric = canonical_metric(item.metric)
@@ -909,7 +1011,10 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
 
     confirmed_spec = state.get("execution_spec")
     if confirmed_spec:
-        strategy_a = _strategy_spec_from_execution_spec(confirmed_spec)
+        strategy_a = _strategy_spec_from_execution_spec(
+            confirmed_spec,
+            state.get("exploration_policy"),
+        )
     else:
         strategy_a = build_strategy_spec(
             _strategy_query(state),
@@ -955,6 +1060,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         for card in state.get("data", {}).get("candidate_cards", [])
     ]
     if status == EnvelopeStatus.READY:
+        exploration = bool(state.get("exploration_policy"))
         performance = project_public_performance(
             state.get("backtest"),
             price_rows=state.get("price_rows"),
@@ -964,6 +1070,9 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         validated = gate is None or gate.validated
         payload = {
             "headline": (
+                "탐색 연구가 완료되었습니다."
+                if exploration
+                else
                 "전략 분석이 완료되었습니다."
                 if validated
                 else "전략이 백테스트 검증을 통과하지 못했습니다."
@@ -979,8 +1088,8 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             "candidate_cards": cards,
             "report": report,
             "performance": performance,
-            "recommendation_gate": gate,
-            "ticker_actions": _ticker_actions(
+            "recommendation_gate": None if exploration else gate,
+            "ticker_actions": [] if exploration else _ticker_actions(
                 state,
                 cards,
                 performance=performance,
@@ -1017,7 +1126,7 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
     internal = build_internal_payload(state)
     DEBUG_STORE.put(state["debug_ref"], internal)
     execution_spec = (
-        StrategyExecutionSpecV1.model_validate(state["execution_spec"])
+        validate_execution_spec(state["execution_spec"])
         if state.get("execution_spec")
         else None
     )
@@ -1029,7 +1138,13 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         strategy_spec=state.get("strategy_spec"),
         execution_spec=execution_spec,
         execution_spec_version=(
-            STRATEGY_EXECUTION_SPEC_VERSION_V1 if execution_spec is not None else None
+            (
+                EXPLORATION_EXECUTION_SPEC_VERSION_V2
+                if isinstance(execution_spec, ExplorationExecutionSpecV2)
+                else STRATEGY_EXECUTION_SPEC_VERSION_V1
+            )
+            if execution_spec is not None
+            else None
         ),
         execution_spec_hash=(
             canonical_execution_spec_digest(execution_spec)
@@ -1059,6 +1174,11 @@ def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
     specify, instead of being stopped at a form.
     """
 
+    if state.get("exploration_policy"):
+        return (
+            "사전등록 후보 전체를 같은 PostgreSQL 데이터, 비용, 미래 구간 방식으로 검증했습니다. "
+            "현재 매매 지시가 아니라 과거 조건 관측 결과입니다."
+        )
     freshness = state.get("freshness_evidence") or {}
     if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
         base = "freshness 한계로 추천을 생성하지 않았습니다. 아래 결과는 검토용입니다."
