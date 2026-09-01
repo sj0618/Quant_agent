@@ -360,15 +360,14 @@ def test_production_refuses_unready_core_execution_before_side_effects(
 
     response = client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
 
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "public_create_retired"
-    assert response.json()["detail"]["read_only_alternative"] == "/api/v1/reports"
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "analysis_execution_unavailable"
     assert store.list_jobs() == []
     assert runner_calls == 0
     assert sink.sessions == ()
 
 
-def test_ready_release_rejects_parse_bound_core_natural_language_job(
+def test_ready_release_accepts_parse_bound_core_natural_language_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Release admission accepts only a parse-bound natural-language execution spec."""
@@ -402,8 +401,8 @@ def test_ready_release_rejects_parse_bound_core_natural_language_job(
         },
     )
 
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "public_create_retired"
+    assert response.status_code == 201
+    assert response.json()["job_id"]
 
 
 def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
@@ -424,8 +423,8 @@ def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
         json={"query": "RSI 30 이하 진입, RSI 70 이상 청산 전략"},
     )
 
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "public_create_retired"
+    assert response.status_code == 409
+    assert response.json()["kind"] == "parse_required"
 
 
 def test_core_execution_keeps_restart_reconciliation_for_prior_process_jobs(
@@ -1298,10 +1297,10 @@ def test_the_endpoint_inventory_advertises_core_execution_and_unready_release_ad
     monkeypatch.setenv("APP_ENV", "production")
     release_client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
-    assert _analysis_job_create_status(release_client) == "retired"
+    assert _analysis_job_create_status(release_client) == "job_async"
     response = release_client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "public_create_retired"
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "analysis_execution_unavailable"
 
     monkeypatch.delenv("APP_ENV", raising=False)
     live_client = TestClient(create_app(InMemoryAnalysisJobStore()))
@@ -1325,5 +1324,5 @@ def test_the_inventory_summary_describes_core_execution(
         if item["method"] == "POST" and item["path"] == ANALYSIS_JOBS_PATH
     )
 
-    assert "Retired public analysis creation" in entry["summary"]
-    assert "read-only report snapshots" in entry["summary"]
+    assert entry["state"] == "job_async"
+    assert "authenticated, parse-bound" in entry["summary"]

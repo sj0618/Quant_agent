@@ -14,6 +14,7 @@ export const ROUTES = {
   // 이메일 템플릿 확인용 예비 라우트. mock 데이터만 쓰고 로그인도 요구하지 않으므로 BE가 바로 열어볼 수 있다.
   emailTemplatePreview: "/dev/email-template",
   reportDetail: (id: string) => `/reports/${encodeURIComponent(id)}`,
+  emailReportDetail: (id: string) => `/me/email-reports/${encodeURIComponent(id)}`,
 } as const;
 
 const RETIRED_REPORT_ROUTE_SEGMENTS = new Set(["history", "strategies"]);
@@ -51,6 +52,26 @@ export function parseReportDetailId(pathname: string) {
       return null;
     }
     return reportId;
+  } catch {
+    return null;
+  }
+}
+
+export function parseEmailReportDetailId(pathname: string) {
+  const normalizedPath = pathname.replace(/\/+$/, "") || "/";
+  const prefix = `${ROUTES.me}/email-reports/`;
+  if (!normalizedPath.startsWith(prefix)) {
+    return null;
+  }
+
+  const encodedId = normalizedPath.slice(prefix.length);
+  if (!encodedId || encodedId.includes("/")) {
+    return null;
+  }
+
+  try {
+    const reportId = decodeURIComponent(encodedId);
+    return reportId && !reportId.includes("/") ? reportId : null;
   } catch {
     return null;
   }

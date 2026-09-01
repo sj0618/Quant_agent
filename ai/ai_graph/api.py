@@ -974,16 +974,6 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
-        if _production_runtime():
-            raise HTTPException(
-                status_code=status.HTTP_410_GONE,
-                detail=retired_public_create_detail(
-                    boundary_id="public-analysis-create",
-                    path=ANALYSIS_JOBS_PATH,
-                    read_only_alternative="/api/v1/reports",
-                ),
-            )
-
         production_runtime = _production_runtime()
         if production_runtime:
             readiness = _core_execution_readiness(
@@ -1617,7 +1607,7 @@ def create_app(
 def _endpoint_statuses(*, production_runtime: bool | None = None) -> list[EndpointStatus]:
     """The public inventory of core execution and compatibility surfaces."""
 
-    retired = _production_runtime() if production_runtime is None else production_runtime
+    release_runtime = _production_runtime() if production_runtime is None else production_runtime
     return [
         EndpointStatus(
             method="GET",
@@ -1640,12 +1630,8 @@ def _endpoint_statuses(*, production_runtime: bool | None = None) -> list[Endpoi
         EndpointStatus(
             method="POST",
             path=ANALYSIS_JOBS_PATH,
-            state="retired" if retired else "job_async",
-            summary=(
-                "Retired public analysis creation; use authenticated read-only report snapshots."
-                if retired
-                else "Queue a local development analysis job; release public creation is retired."
-            ),
+            state="job_async",
+            summary="Queue an authenticated, parse-bound strategy analysis job in the durable store.",
         ),
         EndpointStatus(
             method="GET",
@@ -1668,10 +1654,10 @@ def _endpoint_statuses(*, production_runtime: bool | None = None) -> list[Endpoi
         EndpointStatus(
             method="POST",
             path=RESEARCH_JOB_CREATE_PATH,
-            state="retired" if retired else "local_sync",
+            state="retired" if release_runtime else "local_sync",
             summary=(
                 "Retired public research execution; use authenticated read-only report snapshots."
-                if retired
+                if release_runtime
                 else "Create a job only from a signed research rule when activation is explicitly enabled."
             ),
         ),

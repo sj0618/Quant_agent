@@ -1,8 +1,6 @@
 import { AI_ENDPOINTS, appConfig } from "../config/appConfig";
 import { backendRequest } from "./backendClient";
 import { landingSample } from "../mocks/landing.mock";
-import { performanceSummary } from "../mocks/app.mock";
-import { reportDetails } from "../mocks/reports.mock";
 import { formatScoreValue, SCORE_SCALE, selectRecommendationConfidence } from "../utils/score";
 import { clearUserScopedStorage } from "../utils/userScopedStorage";
 import type {
@@ -38,6 +36,7 @@ import type {
   StrategySpec,
   Tone,
   TradingCandidate,
+  WorkspaceReportDetail,
 } from "../types/quantagent";
 
 const APP_LOCALE = "ko-KR";
@@ -126,14 +125,31 @@ interface StrategyDescriptionApiResponse {
   }>;
 }
 
-interface LiveReportListResponse {
-  items: ReportSummary[];
-  meta?: {
-    limit?: number;
-    hasMore?: boolean;
-    nextCursor?: string | null;
-  };
+interface StrategyExecutionSpecApi {
+  market: "KRX";
+  timeframe: "daily";
+  entry_conditions: Array<{ metric: "rsi"; comparator: "lte" | "gte"; value: number; role: "entry" }>;
+  exit_conditions: Array<{ metric: "rsi"; comparator: "lte" | "gte"; value: number; role: "exit" }>;
 }
+
+interface ExecutableRuleDraftApi {
+  kind: "rule_draft";
+  editable_summary: string;
+  clarifications: Array<{ label: string; reason: string }>;
+  is_executable: boolean;
+  strategy_execution_spec?: StrategyExecutionSpecApi;
+  spec_version?: "strategy-execution-spec.v1";
+  spec_hash?: string;
+  parse_token?: string;
+}
+
+interface ParseRejectionApi {
+  kind: "scope_refusal" | "unsupported_scope";
+  explanation: string;
+  guidance?: string;
+}
+
+type ParseReviewApi = ExecutableRuleDraftApi | ParseRejectionApi;
 
 class AIResponseError extends Error {
   constructor(readonly status: number) {
@@ -233,84 +249,42 @@ async function hydrateStrategyDescriptions(strategies: StrategyReportSummary[]) 
   }));
 }
 
-function normalizeReportListResponse(response: LiveReportListResponse | ReportSummary[]): ReportSummary[] {
-  const items = Array.isArray(response) ? response : response.items;
-  return items.map(normalizeReportSummary);
-}
-
-function normalizeReportSummary(report: Partial<ReportSummary>): ReportSummary {
+function normalizeEmailReportDetail(report: ReportDetail | null): ReportDetail | null {
+  if (!report) {
+    return null;
+  }
   return {
-    id: report.id ?? "",
-    runId: report.runId,
-    strategyId: report.strategyId,
-    instrumentId: report.instrumentId,
-    instrumentName: report.instrumentName,
-    ticker: report.ticker,
-    createdAt: report.createdAt,
-    updatedAt: report.updatedAt,
-    publishedAt: report.publishedAt,
+    ...report,
     date: report.date ?? "",
     weekday: report.weekday ?? "",
     sentAt: report.sentAt ?? "",
-    title: report.title ?? "",
-    summary: report.summary ?? "",
     status: report.status ?? "unknown",
-    strategyName: report.strategyName ?? "",
+    title: report.title ?? "이메일 리포트",
+    summary: report.summary ?? "",
+    strategyName: report.strategyName ?? "전략 미상",
     recommendationScore: report.recommendationScore ?? "—",
     signals: {
       BUY: report.signals?.BUY ?? 0,
       HOLD: report.signals?.HOLD ?? 0,
       DROP: report.signals?.DROP ?? 0,
     },
-    marketSnapshot: normalizeMarketSnapshot(report.marketSnapshot),
-  };
-}
-
-function normalizeNullableText(value: string | null | undefined): string | null {
-  const text = value?.trim();
-  return text ? text : null;
-}
-
-function normalizeText(value: string | null | undefined, fallback = ""): string {
-  const text = value?.trim();
-  return text ? text : fallback;
-}
-
-function normalizeReportDetail(report: ReportDetail | null): ReportDetail | null {
-  if (!report) {
-    return null;
-  }
-  return {
-    ...normalizeReportSummary(report),
-    recipient: normalizeNullableText(report.recipient),
-    marketBrief: normalizeText(report.marketBrief, normalizeText(report.summary)),
-    marketContext: normalizeNullableText(report.marketContext),
-    contentSections: report.contentSections,
+    marketSnapshot: Array.isArray(report.marketSnapshot) ? report.marketSnapshot : [],
+    recipient: report.recipient ?? null,
+    marketBrief: report.marketBrief ?? report.summary ?? "",
+    marketContext: report.marketContext ?? null,
+    contentSections: Array.isArray(report.contentSections) ? report.contentSections : [],
     news: Array.isArray(report.news) ? report.news : [],
     candidates: Array.isArray(report.candidates) ? report.candidates : [],
     signalAxes: Array.isArray(report.signalAxes) ? report.signalAxes : [],
-    riskManagerOverride: normalizeText(report.riskManagerOverride),
-    conclusion: normalizeText(report.conclusion, normalizeText(report.summary)),
-    warningNote: normalizeNullableText(report.warningNote),
+    riskManagerOverride: report.riskManagerOverride ?? "",
+    conclusion: report.conclusion ?? report.summary ?? "",
+    warningNote: report.warningNote ?? null,
     performance: {
       metrics: Array.isArray(report.performance?.metrics) ? report.performance.metrics : [],
-      disclaimer: normalizeText(report.performance?.disclaimer),
+      disclaimer: report.performance?.disclaimer ?? "",
     },
-    costNotes: Array.isArray(report.costNotes) ? report.costNotes.filter((note) => typeof note === "string" && note.trim()) : [],
+    costNotes: Array.isArray(report.costNotes) ? report.costNotes : [],
   };
-}
-
-function normalizeMarketSnapshot(snapshot: ReportSummary["marketSnapshot"] | undefined): ReportSummary["marketSnapshot"] {
-  if (!Array.isArray(snapshot)) {
-    return [];
-  }
-  return snapshot
-    .filter((item): item is { label: string; value: string; tone?: Tone } => Boolean(item && typeof item.label === "string" && typeof item.value === "string"))
-    .map((item) => ({
-      label: item.label,
-      value: item.value,
-      tone: item.tone,
-    }));
 }
 
 function readLatestAnalysisJob(): AnalysisJob | null {
@@ -346,10 +320,45 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
     throw new Error("분석할 자연어 전략을 입력하세요.");
   }
 
+  // Production admission is intentionally two-step.  The parse response supplies a
+  // short-lived, server-signed execution spec; posting the original natural language
+  // directly would be a legacy request and cannot prove what was actually backtested.
+  const parseResponse = await fetchAI(AI_ENDPOINTS.strategyParse, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ natural_language: trimmedQuery }),
+  });
+  assertOk(parseResponse);
+
+  const review = (await parseResponse.json()) as ParseReviewApi;
+  if (review.kind !== "rule_draft") {
+    throw new Error(review.guidance ? `${review.explanation} ${review.guidance}` : review.explanation);
+  }
+  if (
+    !review.is_executable ||
+    !review.strategy_execution_spec ||
+    !review.spec_version ||
+    !review.spec_hash ||
+    !review.parse_token
+  ) {
+    const clarification = review.clarifications.map((choice) => choice.label).join(" / ");
+    throw new Error(
+      clarification
+        ? `${review.editable_summary}\n선택하거나 보완해 주세요: ${clarification}`
+        : review.editable_summary,
+    );
+  }
+
   const response = await fetchAI(AI_ENDPOINTS.analysisJobs, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: trimmedQuery }),
+    body: JSON.stringify({
+      parse_token: review.parse_token,
+      client_idempotency_key: crypto.randomUUID(),
+      spec_version: review.spec_version,
+      spec_hash: review.spec_hash,
+      strategy_execution_spec: review.strategy_execution_spec,
+    }),
   });
   assertOk(response);
 
@@ -502,15 +511,53 @@ export async function completeAnalysisRun(runId: string, job: AnalysisJob): Prom
   });
 }
 
+/**
+ * `/reports` is the user's workspace-analysis library, not the email outbox.
+ *
+ * The canonical source is the completed analysis job: it contains the strategy
+ * specification, actual backtest payload, and generated web report as one unit.
+ * Email delivery records deliberately stay under `/me`.
+ */
 export async function getReports(q?: string): Promise<ReportSummary[]> {
-  const normalizedQuery = q?.trim();
-  const path = normalizedQuery ? `/reports?${new URLSearchParams({ q: normalizedQuery }).toString()}` : "/reports";
-  const response = await backendRequest<LiveReportListResponse | ReportSummary[]>(path);
-  return normalizeReportListResponse(response);
+  const normalizedQuery = q?.trim().toLocaleLowerCase(APP_LOCALE);
+  const reports = (await listAnalysisJobs())
+    .map(buildReportSummaryFromAnalysisJob)
+    .filter((report): report is ReportSummary => report !== null);
+
+  if (!normalizedQuery) {
+    return reports;
+  }
+
+  return reports.filter((report) =>
+    [report.title, report.summary, report.strategyName, report.date]
+      .join(" ")
+      .toLocaleLowerCase(APP_LOCALE)
+      .includes(normalizedQuery),
+  );
 }
 
-export async function getReportById(id: string): Promise<ReportDetail | null> {
-  return normalizeReportDetail(await backendRequest<ReportDetail | null>(`/reports/${encodeURIComponent(id)}`));
+function workspaceJobIdFromReportId(id: string) {
+  if (!id.startsWith(AI_REPORT_ID_PREFIX)) {
+    return null;
+  }
+  const jobId = id.slice(AI_REPORT_ID_PREFIX.length);
+  return jobId || null;
+}
+
+export async function getWorkspaceReportById(id: string): Promise<WorkspaceReportDetail | null> {
+  const jobId = workspaceJobIdFromReportId(id);
+  if (!jobId) {
+    return null;
+  }
+  const job = await requestAnalysisJob(jobId);
+  return buildWorkspaceReportDetailFromAnalysisJob(job);
+}
+
+/** Email delivery history opens this separately from the workspace-report route. */
+export async function getEmailReportById(id: string): Promise<ReportDetail | null> {
+  return normalizeEmailReportDetail(
+    await backendRequest<ReportDetail | null>(`/me/email-reports/${encodeURIComponent(id)}`),
+  );
 }
 
 export async function getReportStrategies(): Promise<StrategyReportSummary[]> {
@@ -646,7 +693,7 @@ function mergeChatMessages(base: ChatMessage[], next: ChatMessage[]) {
 function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | null {
   const result = job.result;
   const report = result?.user_payload.report;
-  if (!result || !report) {
+  if (!result || result.status !== "ready" || !report) {
     return null;
   }
 
@@ -663,7 +710,7 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
     sentAt: formatDateTime(job.updated_at),
     title: report.web_projection.title,
     summary: report.web_projection.summary,
-    status: result.status === "failed" ? "failed" : "draft",
+    status: "draft",
     strategyName: result.strategy_spec?.name ?? result.user_payload.headline,
     recommendationScore: confidence === null || confidence === undefined ? formatEnvelopeStatus(result.status) : formatScoreValue(confidence),
     signals: signalCounts(signal?.action ?? null),
@@ -671,6 +718,25 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
       { label: "AI 상태", value: formatEnvelopeStatus(result.status), tone: toneForStatus(result.status) },
       { label: "Trace", value: result.trace_id.slice(0, TRACE_PREVIEW_LENGTH), tone: "neutral" },
     ],
+  };
+}
+
+function buildWorkspaceReportDetailFromAnalysisJob(job: AnalysisJob): WorkspaceReportDetail | null {
+  const report = buildReportSummaryFromAnalysisJob(job);
+  const result = job.result;
+  if (!report || !result) {
+    return null;
+  }
+
+  const overview = mergeAnalysisJobIntoOverview(clone(EMPTY_WORKSPACE), job);
+  return {
+    id: report.id,
+    query: job.query,
+    createdAt: job.created_at,
+    updatedAt: job.updated_at,
+    report,
+    overview,
+    recommendationValidated: result.user_payload.recommendation_gate?.validated ?? true,
   };
 }
 
@@ -707,15 +773,14 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
   const result = job.result;
   const report = result?.user_payload.report;
   const summary = buildReportSummaryFromAnalysisJob(job);
-  const baselineReport = reportDetails[0];
-  if (!result || !report || !summary || !baselineReport) {
+  if (!result || !report || !summary) {
     return null;
   }
-  const performance = buildPerformanceSummaryFromAnalysisJob(job, performanceSummary);
+  const performance = buildPerformanceSummaryFromAnalysisJob(job, EMPTY_PERFORMANCE);
 
   return {
     ...summary,
-    recipient: baselineReport.recipient,
+    recipient: null,
     marketBrief: result.user_payload.message,
     news: report.web_projection.sections.map((section, index) => ({
       rank: index + 1,
@@ -723,8 +788,8 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
       source: "QuantAgent AI",
       tone: toneForStatus(result.status),
     })),
-    candidates: baselineReport.candidates,
-    signalAxes: baselineReport.signalAxes,
+    candidates: buildTradingCandidatesFromAnalysisJob(job),
+    signalAxes: [],
     riskManagerOverride: report.risk_adjustments.length ? describeRiskAdjustments(report.risk_adjustments) : "Risk Manager 변경 없음",
     conclusion: report.web_projection.summary,
     performance: { metrics: performance.metrics, disclaimer: performance.disclaimer },

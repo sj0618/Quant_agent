@@ -603,7 +603,25 @@ export interface ReportDetail extends ReportSummary {
   costNotes: string[];
 }
 
-export type EmailDeliveryStatus = "sent" | "resent" | "failed" | "draft";
+/**
+ * A read-only report produced by a completed workspace analysis job.
+ *
+ * This is intentionally distinct from an email-delivery record.  A workspace
+ * report answers "what did this strategy analysis produce?" while an email
+ * report answers "what was sent and when?".  Mixing the two made `/reports`
+ * render an email layout for a user-created strategy result.
+ */
+export interface WorkspaceReportDetail {
+  id: string;
+  query: string;
+  createdAt: string;
+  updatedAt: string;
+  report: ReportSummary;
+  overview: AppOverview;
+  recommendationValidated: boolean;
+}
+
+export type EmailDeliveryStatus = ReportDeliveryStatus;
 
 /** One row of `GET /api/v1/me/email-deliveries`, trimmed to what the timeline renders. */
 export interface EmailDeliveryEntry {

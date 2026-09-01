@@ -6,19 +6,21 @@ async function read(relativePath: string) {
   return readFile(new URL(relativePath, import.meta.url), "utf8");
 }
 
-test("reports page restores generated report roles and exports", async () => {
-  const [reportsPage, reportList, reportActions] = await Promise.all([
+test("reports page lists workspace results while email actions remain out of the list", async () => {
+  const [reportsPage, reportList, reportActions, clientSource] = await Promise.all([
     read("../src/pages/ReportsPage.tsx"),
     read("../src/features/reports/ReportList.tsx"),
     read("../src/api/reportActionsClient.ts"),
+    read("../src/api/quantAgentClient.ts"),
   ]);
 
   assert.match(reportsPage, /getReports/);
   assert.match(reportsPage, /downloadReportsCsv/);
   assert.match(reportsPage, /printCurrentView/);
   assert.match(reportsPage, /ReportList/);
-  assert.match(reportList, /resendReportEmail/);
   assert.match(reportList, /copyReportShareLink/);
+  assert.doesNotMatch(reportList, /resendReportEmail/);
+  assert.match(clientSource, /await listAnalysisJobs\(\)/);
   assert.match(reportActions, /export async function resendReportEmail/);
   assert.doesNotMatch(reportsPage, /getReportStrategies/);
   assert.doesNotMatch(reportList, /getDigestStrategySelection|getEmailDeliveryHistory|reportsHistory|reportStrategies/);
@@ -60,15 +62,14 @@ test("canonical routes exclude retired history and strategy pages", async () => 
   assert.match(profilePage, /EmailHistoryTimeline/);
 });
 
-test("report detail keeps generated report export/share/resend actions", async () => {
-  const [detailPage, reportActions] = await Promise.all([
-    read("../src/pages/ReportDetailPage.tsx"),
-    read("../src/api/reportActionsClient.ts"),
+test("workspace and email detail routes use distinct components", async () => {
+  const [workspaceDetail, emailDetail, timeline] = await Promise.all([
+    read("../src/pages/WorkspaceReportDetailPage.tsx"),
+    read("../src/pages/EmailReportDetailPage.tsx"),
+    read("../src/features/reports/EmailHistoryTimeline.tsx"),
   ]);
 
-  assert.match(detailPage, /getReportById/);
-  assert.match(detailPage, /copyReportShareLink/);
-  assert.match(detailPage, /printCurrentView/);
-  assert.match(detailPage, /resendReportEmail/);
-  assert.match(reportActions, /export async function resendReportEmail/);
+  assert.match(workspaceDetail, /getWorkspaceReportById/);
+  assert.match(emailDetail, /getEmailReportById/);
+  assert.match(timeline, /ROUTES\.emailReportDetail/);
 });

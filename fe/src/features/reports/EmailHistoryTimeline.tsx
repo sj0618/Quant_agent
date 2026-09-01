@@ -12,13 +12,18 @@ const STATUS_LABELS: Record<EmailDeliveryStatus, string> = {
   resent: "재전송",
   failed: "전송 실패",
   draft: "발송 대기",
+  submitted: "전송 접수",
+  processing: "전송 처리 중",
+  delivered: "수신 확인",
+  cancelled: "발송 취소",
+  unknown: "상태 미확인",
 };
 
 function statusVariant(status: EmailDeliveryStatus) {
-  if (status === "failed") {
+  if (status === "failed" || status === "cancelled") {
     return "negative" as const;
   }
-  if (status === "draft") {
+  if (status === "draft" || status === "submitted" || status === "processing" || status === "unknown") {
     return "neutral" as const;
   }
   return "info" as const;
@@ -59,7 +64,7 @@ export function EmailHistoryTimeline({ entries }: EmailHistoryTimelineProps) {
             <p>{entry.reportTitle ?? "제목 없음"}</p>
             {entry.reportId ? (
               <div className="email-history-item__actions">
-                <a href={ROUTES.reportDetail(entry.reportId)}>리포트 보기</a>
+                <a href={ROUTES.emailReportDetail(entry.reportId)}>이메일 리포트 보기</a>
               </div>
             ) : null}
           </Card>

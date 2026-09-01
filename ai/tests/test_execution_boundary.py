@@ -7,19 +7,20 @@ from ai_graph.execution_boundary import (
 )
 
 
-def test_approved_execution_boundary_has_no_public_create_and_one_internal_evaluator() -> None:
+def test_approved_execution_boundary_has_one_authenticated_job_create_and_one_internal_evaluator() -> None:
     result = validate_execution_boundaries()
 
     assert result.valid, result.errors
     assert result.summary.as_dict() == {
         "public_create_allowed": 0,
+        "authenticated_job_create_allowed": 1,
         "internal_evaluator_allowed": 1,
         "read_only_projection_count": 1,
         "read_only_projection_with_owner_auth_failure": 1,
     }
 
 
-def test_public_create_cannot_be_enabled() -> None:
+def test_unauthenticated_public_create_cannot_be_enabled() -> None:
     public_create = next(
         boundary for boundary in APPROVED_EXECUTION_BOUNDARIES if boundary.kind == "public_create"
     )

@@ -3,16 +3,23 @@ import { AsyncState } from "./components/common/AsyncState";
 import { AppPage } from "./pages/AppPage";
 import { AuthCallbackPage } from "./pages/AuthCallbackPage";
 import { AuthRequiredPage } from "./pages/AuthRequiredPage";
+import { EmailReportDetailPage } from "./pages/EmailReportDetailPage";
 import { LandingPage } from "./pages/LandingPage";
 import { LegalPage } from "./pages/LegalPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ProfilePage } from "./pages/ProfilePage";
-import { ReportDetailPage } from "./pages/ReportDetailPage";
+import { WorkspaceReportDetailPage } from "./pages/WorkspaceReportDetailPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { SearchPage } from "./pages/SearchPage";
 import { UnsubscribePage } from "./pages/UnsubscribePage";
 import { getCurrentSession, isSessionRecentlyValidated, validateCurrentSession } from "./api/authClient";
-import { ROUTES, getCurrentPathWithSearch, parseReportDetailId, sanitizeReturnTo } from "./config/routes";
+import {
+  ROUTES,
+  getCurrentPathWithSearch,
+  parseEmailReportDetailId,
+  parseReportDetailId,
+  sanitizeReturnTo,
+} from "./config/routes";
 import type { AuthSession } from "./types/auth";
 
 // 이 페이지만 react-dom/server 를 끌어오기 때문에(발송용 HTML 문자열 렌더) 별도 chunk 로 떼어낸다.
@@ -31,6 +38,7 @@ function isProtectedRoute(path: string) {
     path.startsWith(`${ROUTES.app}/`) ||
     path === ROUTES.reports ||
     parseReportDetailId(path) !== null ||
+    parseEmailReportDetailId(path) !== null ||
     path === ROUTES.me ||
     path === ROUTES.notifications ||
     path === ROUTES.search
@@ -132,9 +140,14 @@ function AppRoutes() {
     return <ReportsPage />;
   }
 
+  const emailReportDetailId = parseEmailReportDetailId(path);
+  if (emailReportDetailId) {
+    return <EmailReportDetailPage id={emailReportDetailId} />;
+  }
+
   const reportDetailId = parseReportDetailId(path);
   if (reportDetailId) {
-    return <ReportDetailPage id={reportDetailId} />;
+    return <WorkspaceReportDetailPage id={reportDetailId} />;
   }
 
   return (

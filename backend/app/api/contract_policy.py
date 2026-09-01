@@ -235,6 +235,18 @@ TRACK_C_CONTRACT_POLICY: tuple[EndpointContract, ...] = (
     ),
     contract(
         "GET",
+        "/api/v1/me/email-reports/{report_id}",
+        implementation=ContractImplementation.DB_BACKED,
+        visibility=ContractVisibility.AUTHENTICATED,
+        production_ready=True,
+        fe_live_allowed=True,
+        auth_required=True,
+        csrf_required_for_unsafe=False,
+        summary="Read the full owner-scoped report opened from email delivery history.",
+        required_dependency="trading-data DB engine",
+    ),
+    contract(
+        "GET",
         "/api/v1/unsubscribe",
         implementation=ContractImplementation.DB_BACKED,
         visibility=ContractVisibility.PUBLIC,

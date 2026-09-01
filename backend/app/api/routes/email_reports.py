@@ -11,10 +11,10 @@ from app.core.security import csrf_token_required, require_csrf_token, validate_
 from app.db import email_delivery_history as email_delivery_history_db
 from app.db import user_preferences
 from app.db.user_queries import load_user_by_id
-from app.dependencies import get_db_engine, get_runtime_settings
+from app.dependencies import get_db_engine, get_runtime_settings, get_trading_data_engine
 from app.schemas.email_delivery_history import EmailDeliveryHistoryResponse
 from app.schemas.email_unsubscribe import UnsubscribeInspectionResponse, UnsubscribeMutationResponse
-from app.services import email_delivery, email_unsubscribe
+from app.services import email_delivery, email_unsubscribe, fe_contract_store
 
 router = APIRouter(tags=["email-reports"])
 
@@ -133,6 +133,34 @@ async def get_my_email_deliveries(
     return await email_delivery_history_db.list_email_deliveries(
         get_db_engine(request), user_id=user_id, limit=limit, cursor=cursor, status=status
     )
+
+
+@router.get("/me/email-reports/{report_id}")
+async def get_my_email_report(request: Request, report_id: str) -> dict[str, Any]:
+    """Return the rendered report linked from the owner's email-delivery timeline.
+
+    The browser archive endpoint at ``/reports/{report_id}`` intentionally exposes
+    only a narrow evidence projection.  That is not the right source for the actual
+    report email a user clicked in their own delivery history.  This route is owner
+    scoped and read-only, and preserves the full report contract needed by the email
+    report screen.
+    """
+
+    user_id = await _require_current_user_id(request)
+    report = await fe_contract_store.get_report_from_db(
+        get_trading_data_engine(request),
+        report_id,
+        user_id=user_id,
+    )
+    if report is None:
+        raise AppError(
+            status_code=404,
+            component="email_reports",
+            code="email_report_not_found",
+            message="Email report was not found",
+            details={"reportId": report_id},
+        )
+    return report
 
 
 @router.post("/reports/{report_id}/resend")

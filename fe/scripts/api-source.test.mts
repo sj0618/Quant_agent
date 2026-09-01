@@ -3,14 +3,16 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
 
-test("report surfaces keep the restored live report source", async () => {
+test("workspace reports use completed analysis jobs and keep email snapshots separate", async () => {
   const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
 
-  assert.match(source, /mocks\/(?:app|reports)\.mock/);
   assert.match(source, /backendRequest/);
   assert.match(source, /export async function getReports\(q\?: string\)/);
-  assert.match(source, /new URLSearchParams\(\{ q: normalizedQuery \}\)/);
-  assert.match(source, /export async function getReportById/);
+  assert.match(source, /await listAnalysisJobs\(\)/);
+  assert.match(source, /buildReportSummaryFromAnalysisJob/);
+  assert.match(source, /export async function getWorkspaceReportById/);
+  assert.match(source, /export async function getEmailReportById/);
+  assert.match(source, /`\/me\/email-reports\/\$\{encodeURIComponent\(id\)\}`/);
   assert.doesNotMatch(source, /export async function searchInstruments/);
   assert.match(source, /AI_REPORT_ID_PREFIX/);
   assert.doesNotMatch(source, /reportClient|reportAdapter/);
@@ -21,6 +23,25 @@ test("workspace restores the latest server analysis on a fresh browser", async (
 
   assert.match(source, /refreshLatestAnalysisJob\(\)/);
   assert.match(source, /setAnalysisJobs\(\(jobs\) => \(jobs\.length \? jobs : \[latestJob\]\)\)/);
+});
+
+test("workspace creates an analysis only from the server-issued parse contract", async () => {
+  const [clientSource, configSource] = await Promise.all([
+    readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/config/appConfig.ts", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(configSource, /strategyParse: "\/api\/strategies\/parse"/);
+  const createJob = clientSource.slice(
+    clientSource.indexOf("export async function createAnalysisJob"),
+    clientSource.indexOf("export async function cancelAnalysisJob"),
+  );
+  assert.match(createJob, /fetchAI\(AI_ENDPOINTS\.strategyParse/);
+  assert.match(createJob, /natural_language: trimmedQuery/);
+  assert.match(createJob, /parse_token: review\.parse_token/);
+  assert.match(createJob, /client_idempotency_key: crypto\.randomUUID\(\)/);
+  assert.match(createJob, /strategy_execution_spec: review\.strategy_execution_spec/);
+  assert.doesNotMatch(createJob, /JSON\.stringify\(\{ query: trimmedQuery \}\)/);
 });
 
 test("workspace discards a running job lost during a server restart", async () => {
@@ -42,11 +63,12 @@ test("report completion sends only the durable AI job id", async () => {
   assert.doesNotMatch(completion, /recommendationGate|performance|strategySpec|sections/);
 });
 
-test("canonical product surface excludes retired history and strategy routes", async () => {
-  const [appSource, routesSource, profileSource, searchSource] = await Promise.all([
+test("canonical product surface separates workspace reports from My Page email reports", async () => {
+  const [appSource, routesSource, profileSource, timelineSource, searchSource] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/config/routes.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/pages/ProfilePage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/features/reports/EmailHistoryTimeline.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/pages/SearchPage.tsx", import.meta.url), "utf8"),
   ]);
 
@@ -58,6 +80,10 @@ test("canonical product surface excludes retired history and strategy routes", a
   assert.doesNotMatch(profileSource, /reportsHistory/);
   assert.match(profileSource, /EmailHistoryTimeline/);
   assert.match(profileSource, /getEmailDeliveries/);
+  assert.match(routesSource, /emailReportDetail/);
+  assert.match(appSource, /EmailReportDetailPage/);
+  assert.match(appSource, /WorkspaceReportDetailPage/);
+  assert.match(timelineSource, /ROUTES\.emailReportDetail/);
   assert.match(searchSource, /getReports/);
   assert.match(searchSource, /getReports\(normalizedQuery\)/);
   assert.match(searchSource, /ROUTES\.reportDetail/);
