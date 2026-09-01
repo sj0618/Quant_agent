@@ -6,7 +6,7 @@ async function read(relativePath: string) {
   return readFile(new URL(relativePath, import.meta.url), "utf8");
 }
 
-test("reports page exposes a safe read-only archive and export", async () => {
+test("reports page restores generated report roles and exports", async () => {
   const [reportsPage, reportList, reportActions] = await Promise.all([
     read("../src/pages/ReportsPage.tsx"),
     read("../src/features/reports/ReportList.tsx"),
@@ -17,9 +17,9 @@ test("reports page exposes a safe read-only archive and export", async () => {
   assert.match(reportsPage, /downloadReportsCsv/);
   assert.match(reportsPage, /printCurrentView/);
   assert.match(reportsPage, /ReportList/);
-  assert.match(reportList, /읽기 전용 결과 스냅샷/);
-  assert.doesNotMatch(reportList, /resendReportEmail|copyReportShareLink|recommendationScore|report\.signals/);
-  assert.match(reportActions, /result_id/);
+  assert.match(reportList, /resendReportEmail/);
+  assert.match(reportList, /copyReportShareLink/);
+  assert.match(reportActions, /export async function resendReportEmail/);
   assert.doesNotMatch(reportsPage, /getReportStrategies/);
   assert.doesNotMatch(reportList, /getDigestStrategySelection|getEmailDeliveryHistory|reportsHistory|reportStrategies/);
 });
@@ -33,7 +33,7 @@ test("search is report-centric and sends q to the live report endpoint", async (
   assert.match(searchPage, /getReports/);
   assert.match(searchPage, /getReports\(normalizedQuery\)/);
   assert.match(searchPage, /ROUTES\.reportDetail/);
-  assert.match(searchPage, /placeholder="결과 ID 또는 보관 기준일"/);
+  assert.match(searchPage, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
   assert.match(searchPage, /Badge variant="info">report<\/Badge>/);
   assert.doesNotMatch(clientSource, /export async function searchInstruments/);
   assert.doesNotMatch(searchPage, /getWorkspaceTemplate/);
@@ -60,13 +60,15 @@ test("canonical routes exclude retired history and strategy pages", async () => 
   assert.match(profilePage, /EmailHistoryTimeline/);
 });
 
-test("report detail keeps a read-only PDF export action", async () => {
+test("report detail keeps generated report export/share/resend actions", async () => {
   const [detailPage, reportActions] = await Promise.all([
     read("../src/pages/ReportDetailPage.tsx"),
     read("../src/api/reportActionsClient.ts"),
   ]);
 
   assert.match(detailPage, /getReportById/);
+  assert.match(detailPage, /copyReportShareLink/);
   assert.match(detailPage, /printCurrentView/);
-  assert.match(reportActions, /buildReportPrintTitle/);
+  assert.match(detailPage, /resendReportEmail/);
+  assert.match(reportActions, /export async function resendReportEmail/);
 });

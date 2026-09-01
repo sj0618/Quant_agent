@@ -44,14 +44,14 @@ export function createBackendProxyConfig(env: Record<string, string | undefined>
     mode: "split",
     proxy: {
       "/api/v1": {
-          target: backendTarget,
-          changeOrigin: true,
-          xfwd: true,
+        target: backendTarget,
+        changeOrigin: true,
+        xfwd: true,
       },
       "/ai-api": {
-          target: aiTarget,
-          changeOrigin: true,
-          xfwd: true,
+        target: aiTarget,
+        changeOrigin: true,
+        xfwd: true,
         rewrite: (path: string) => path.replace(/^\/ai-api/, ""),
       },
     },

@@ -196,7 +196,7 @@ export function ProfilePage({ initialTab }: ProfilePageProps) {
                 onChange={(event) => updateNotificationSettings((current) => ({ ...current, actionEmails: event.target.checked }))}
                 type="checkbox"
               />
-              <span>공유 링크 관련 처리 결과 이메일 수신</span>
+              <span>공유 링크와 재발송 처리 결과 이메일 수신</span>
             </label>
             <label className="toggle-row">
               <input

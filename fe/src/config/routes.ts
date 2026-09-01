@@ -10,19 +10,11 @@ export const ROUTES = {
   terms: "/terms",
   privacy: "/privacy",
   disclaimer: "/disclaimer",
-  trust: "/trust",
   unsubscribe: "/unsubscribe",
+  // 이메일 템플릿 확인용 예비 라우트. mock 데이터만 쓰고 로그인도 요구하지 않으므로 BE가 바로 열어볼 수 있다.
+  emailTemplatePreview: "/dev/email-template",
   reportDetail: (id: string) => `/reports/${encodeURIComponent(id)}`,
-  analysisReportDetail: (jobId: string) => `/reports/${encodeURIComponent(`analysis:${jobId}`)}`,
 } as const;
-
-export function trustFeedback(resultId: string, version?: string | null) {
-  const params = new URLSearchParams({ result_id: resultId });
-  if (version?.trim()) {
-    params.set("version", version.trim());
-  }
-  return `${ROUTES.trust}?${params.toString()}#feedback`;
-}
 
 const RETIRED_REPORT_ROUTE_SEGMENTS = new Set(["history", "strategies"]);
 
@@ -62,13 +54,4 @@ export function parseReportDetailId(pathname: string) {
   } catch {
     return null;
   }
-}
-
-export function parseAnalysisReportJobId(reportId: string) {
-  const prefix = "analysis:";
-  if (!reportId.startsWith(prefix)) {
-    return null;
-  }
-  const jobId = reportId.slice(prefix.length);
-  return jobId && !jobId.includes("/") ? jobId : null;
 }

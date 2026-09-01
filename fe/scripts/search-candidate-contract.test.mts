@@ -13,12 +13,12 @@ test("trading candidate meta keeps confidence when present and omits it when abs
   assert.equal(formatTradingCandidateMeta({ price: "₩100,000" }), "₩100,000");
 });
 
-test("search page is archive-centric and forwards q to the report list endpoint", async () => {
+test("search page is report-centric and forwards q to the report list endpoint", async () => {
   const searchPage = await read("../src/pages/SearchPage.tsx");
 
   assert.match(searchPage, /getReports\(normalizedQuery\)/);
   assert.match(searchPage, /ROUTES\.reportDetail/);
-  assert.match(searchPage, /placeholder="결과 ID 또는 보관 기준일"/);
+  assert.match(searchPage, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
   assert.match(searchPage, /Badge variant="info">report<\/Badge>/);
   assert.doesNotMatch(searchPage, /formatTradingCandidateMeta/);
   assert.doesNotMatch(searchPage, /kind: "strategy"/);

@@ -11,7 +11,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { ROUTES } from "@/config/routes";
-import type { ArchivedReportSummary } from "@/types/quantagent";
+import type { ReportSummary } from "@/types/quantagent";
 
 const SEARCH_DEBOUNCE_MS = 220;
 const RESULT_LIMIT = 6;
@@ -29,7 +29,7 @@ interface SearchCommandProps {
  */
 export function SearchCommand({ open, onOpenChange }: SearchCommandProps) {
   const [query, setQuery] = useState("");
-  const [reports, setReports] = useState<ArchivedReportSummary[]>([]);
+  const [reports, setReports] = useState<ReportSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const requestIdRef = useRef(0);
 
@@ -84,7 +84,7 @@ export function SearchCommand({ open, onOpenChange }: SearchCommandProps) {
       {/* cmdk filters client-side by default; results here already come filtered from the server. */}
       <CommandInput
         onValueChange={setQuery}
-        placeholder="결과 ID·보관 기준일 검색"
+        placeholder="전략·종목·리포트 검색"
         value={query}
       />
       <CommandList>
@@ -97,7 +97,7 @@ export function SearchCommand({ open, onOpenChange }: SearchCommandProps) {
                 {reports.map((report) => (
                   <CommandItem key={report.id} value={report.id} onSelect={() => go(ROUTES.reportDetail(report.id))}>
                     <FileText aria-hidden className="size-4 text-subdued" />
-                    <span className="min-w-0 flex-1 truncate">읽기 전용 결과 스냅샷</span>
+                    <span className="min-w-0 flex-1 truncate">{report.title}</span>
                     <span className="shrink-0 text-[11px] font-bold text-subdued">{report.date}</span>
                   </CommandItem>
                 ))}
