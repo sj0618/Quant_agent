@@ -470,16 +470,26 @@ def build_rule_draft(
     """Make a bounded natural-language rule review without retaining raw input."""
 
     research_requested = _research_resolution_enabled(use_llm)
+    research_error: StrategyResearchError | None = None
     if classify_strategy_request(query) == "automatic" and research_requested:
-        return _build_researched_draft(
-            query=query,
-            user_id=user_id,
-            signer=signer,
-            available_metrics=available_metrics,
-            llm_client=llm_client,
-            now=now,
-        )
-    if classify_strategy_request(query) == "automatic" and exploration_policy is not None:
+        try:
+            return _build_researched_draft(
+                query=query,
+                user_id=user_id,
+                signer=signer,
+                available_metrics=available_metrics,
+                llm_client=llm_client,
+                now=now,
+            )
+        except StrategyResearchError as exc:
+            # The public contract must fail closed as a review response, never leak a
+            # provider/schema exception that callers turn into a 500 or an admission.
+            research_error = exc
+    if (
+        classify_strategy_request(query) == "automatic"
+        and exploration_policy is not None
+        and research_error is None
+    ):
         return _build_exploration_draft(
             query=query,
             user_id=user_id,
@@ -488,33 +498,46 @@ def build_rule_draft(
             now=now,
         )
 
-    parser_uses_llm = use_llm if use_llm is not None else _live_parser_enabled()
-    authoring_method = "llm" if parser_uses_llm else "deterministic"
-    try:
-        parsed = parse_natural_language_strategy(
-            query,
-            available_metrics=available_metrics,
-            llm_client=llm_client,  # type: ignore[arg-type]
-            use_llm=use_llm,
-        )
-    except StrategyParseError as exc:
+    if research_error is not None:
         parsed = StrategyParseResultV1(
             clarification_required=True,
-            explanation="조건을 허용된 JSON 구조로 해석하지 못했습니다. 지표와 수치를 다시 입력해 주세요.",
+            explanation="전략 의미는 조사했지만 현재 서버가 같은 규칙으로 백테스트할 수 없습니다.",
             unsupported_conditions=[
                 UnsupportedStrategyConditionV1(
-                    condition="입력 조건",
-                    reason=f"구조화 실패({type(exc).__name__})",
+                    condition="AI 연구 전략",
+                    reason=str(research_error)[:300],
                 )
             ],
         )
+        authoring_method = "llm"
+    else:
+        parser_uses_llm = use_llm if use_llm is not None else _live_parser_enabled()
+        authoring_method = "llm" if parser_uses_llm else "deterministic"
+        try:
+            parsed = parse_natural_language_strategy(
+                query,
+                available_metrics=available_metrics,
+                llm_client=llm_client,  # type: ignore[arg-type]
+                use_llm=use_llm,
+            )
+        except StrategyParseError as exc:
+            parsed = StrategyParseResultV1(
+                clarification_required=True,
+                explanation="조건을 허용된 JSON 구조로 해석하지 못했습니다. 지표와 수치를 다시 입력해 주세요.",
+                unsupported_conditions=[
+                    UnsupportedStrategyConditionV1(
+                        condition="입력 조건",
+                        reason=f"구조화 실패({type(exc).__name__})",
+                    )
+                ],
+            )
     # A beginner may name a research direction without supplying an executable DSL
     # expression.  When a published exploration policy is available, continue through
     # its pre-registered, versioned candidate set rather than returning a form asking
     # for technical implementation parameters.  The resulting report labels those
     # candidates and assumptions; it never pretends the incomplete text was a precise
     # rule or selects a winner after seeing performance.
-    if research_requested and (
+    if research_requested and research_error is None and (
         parsed.clarification_required
         or parsed.unsupported_conditions
         or not parsed.entry_conditions

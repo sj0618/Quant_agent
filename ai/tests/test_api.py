@@ -530,6 +530,43 @@ def test_live_v3_parse_uses_the_server_metric_catalog_before_sealing(
     assert '"sma20"' in request.user_prompt
 
 
+def test_malformed_live_v3_research_returns_a_no_admission_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider/schema failures must not become a 500 or create an execution token."""
+
+    monkeypatch.setenv("APP_ENV", "production")
+    _configure_live_provider(monkeypatch)
+
+    class _MalformedResearchClient:
+        def generate_json(self, _request):
+            return {"unexpected": True}
+
+    monkeypatch.setattr(
+        "ai_graph.nodes.strategy_research.create_llm_client",
+        lambda **_kwargs: _MalformedResearchClient(),
+    )
+    client = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+            indicator_catalog_resolver=lambda: ["sma20"],
+        )
+    )
+
+    response = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": "돈 벌 수 있는 전략 만들어줘"},
+    )
+
+    assert response.status_code == 200
+    review = response.json()
+    assert review["is_executable"] is False
+    assert review["parse_token"] is None
+    assert review["strategy_execution_spec"] is None
+
+
 def test_production_rejects_catalogue_fallback_when_ai_research_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
