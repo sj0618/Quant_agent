@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ import {
   buildSnapshotRestoreCommand,
   computeFileSha256,
   createRollbackSnapshot,
+  mirrorSnapshotDirectory,
   protectSnapshotArtifacts,
   restoreLocalRollbackSnapshot,
   restoreRollbackSnapshot,
@@ -187,6 +188,26 @@ test("rollback snapshot checksum files record sha256 evidence and restricted per
     [archivePath, 0o600],
     [checksumPath, 0o600],
   ]);
+});
+
+test("mirrorSnapshotDirectory mirrors source files and drops excluded or stale destination content", () => {
+  const tempDir = mkdtempSync(join(tmpdir(), "rollback-snapshot-mirror-"));
+  const sourceRoot = join(tempDir, "source");
+  const destinationRoot = join(tempDir, "destination");
+  mkdirSync(join(sourceRoot, "backend", "app"), { recursive: true });
+  mkdirSync(join(sourceRoot, "logs"), { recursive: true });
+  mkdirSync(join(destinationRoot, "obsolete"), { recursive: true });
+  writeFileSync(join(sourceRoot, "backend", "app", "main.py"), "print('ok')\n", "utf8");
+  writeFileSync(join(sourceRoot, "logs", "ignored.log"), "ignore-me\n", "utf8");
+  writeFileSync(join(sourceRoot, ".env"), "SECRET=1\n", "utf8");
+  writeFileSync(join(destinationRoot, "obsolete", "legacy.txt"), "legacy\n", "utf8");
+
+  mirrorSnapshotDirectory(sourceRoot, destinationRoot);
+
+  assert.equal(readFileSync(join(destinationRoot, "backend", "app", "main.py"), "utf8"), "print('ok')\n");
+  assert.equal(existsSync(join(destinationRoot, "logs", "ignored.log")), false);
+  assert.equal(existsSync(join(destinationRoot, ".env")), false);
+  assert.equal(existsSync(join(destinationRoot, "obsolete", "legacy.txt")), false);
 });
 
 test("rollback snapshot checksum mismatch fails closed before restore", () => {
