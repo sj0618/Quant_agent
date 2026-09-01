@@ -1,9 +1,5 @@
 import type {
-  AIBacktestEvaluationBasis,
-  AIBacktestUniversePolicy,
   AIEnvelope,
-  AIRecommendationGate,
-  AITickerAction,
   AnalysisJobStatus,
   AppOverview,
   PerformanceSummary,
@@ -39,7 +35,7 @@ export const analysisJobStatus: AnalysisJobStatus = {
     { stage: "strategy_parse", status: "done", label: "전략 정형화", updated_at: "2026-04-18T07:12:00+09:00" },
     { stage: "data_collect", status: "done", label: "KIS·DART·뉴스 수집", updated_at: "2026-04-18T07:29:00+09:00" },
     { stage: "signal_judge", status: "done", label: "신호 판정", updated_at: "2026-04-18T07:44:00+09:00" },
-    { stage: "backtest", status: "done", label: "홀드아웃 백테스트", updated_at: "2026-04-18T07:52:00+09:00" },
+    { stage: "backtest", status: "done", label: "Walk-forward 백테스트", updated_at: "2026-04-18T07:52:00+09:00" },
     { stage: "risk_review", status: "done", label: "Risk Manager 검토", updated_at: "2026-04-18T07:57:00+09:00" },
     { stage: "report_ready", status: "done", label: "리포트 준비 완료", updated_at: "2026-04-18T08:00:00+09:00" },
   ],
@@ -210,118 +206,40 @@ export const tradingCandidates: TradingCandidate[] = [
   },
 ];
 
-// Shaped exactly like `BacktestPerformance.evaluation_basis`, so the demo cannot describe
-// a period the backend would never report. The fixed five-year window matches the loader's
-// krx_pit_common_stock_5y_kst_settled_session_v2 policy.
-export const evaluationBasis: AIBacktestEvaluationBasis = {
-  basis: "hold_out",
-  caption: "2021-08-23~2026-08-21 구간 중 마지막 30% 검증 구간 누적 · 거래비용 반영",
-  hold_out_fraction: 0.3,
-  window_start: "2021-08-23",
-  window_end: "2026-08-21",
-  window_policy_id: "krx_pit_common_stock_5y_kst_settled_session_v2",
-  cost_model_applied: true,
-};
-
-export const universePolicy: AIBacktestUniversePolicy = {
-  summary:
-    "백테스트는 과거 시점(PIT) 기준으로 그 시점에 상장돼 있던 종목만 거래해 규칙 자체를 검증하고, 오늘의 추천 종목은 같은 규칙을 오늘 데이터에 적용한 결과입니다. 두 목록이 서로 다른 것은 정상입니다.",
-  policy_id: "krx_pit_common_stock_5y_kst_settled_session_v2",
-  window_start: "2021-08-23",
-  window_end: "2026-08-21",
-  traded_ticker_count: 812,
-  excluded_screening_candidate_count: 2,
-  excluded_notice:
-    "오늘 스크리닝 후보 중 2종목은 백테스트 구간의 과거 시점 유니버스에 없어 백테스트 거래 대상에서 제외됐습니다.",
-};
-
 export const performanceSummary: PerformanceSummary = {
   headline: "백테스트 결과",
-  // Both evaluation paths the backend can take are named here rather than one of them
-  // being asserted: this fixture is a hold-out run, and it says so, with the same window
-  // the basis object carries.
-  period: "단일 홀드아웃 · 선택 70% / 검증 30% · 2021.08 ~ 2026.08",
+  period: "Walk-forward · IS 18M / OOS 3M · 2016.01 ~ 2026.03",
   metrics: [
-    { key: "sharpe", label: "Sharpe Ratio", value: "1.42", delta: "기준선 1.11", tone: "positive", caption: "검증 구간(마지막 30%) 기준. 1.5 이상이 우수." },
+    { key: "sharpe", label: "Sharpe Ratio", value: "1.42", delta: "기준선 1.11", tone: "positive", caption: "Walk-forward 평균. 1.5 이상이 우수." },
     { key: "mdd", label: "Max Drawdown", value: "-9.4%", delta: "기준선 -12.1%", tone: "negative", caption: "감내 가능한 수준. 시장 평균 -15% 대비 양호." },
-    { key: "winRate", label: "Win Rate", value: "58.2%", delta: "+3.4pp", tone: "positive", caption: "수익 거래 비율. 5년 누적 612 거래." },
-    { key: "totalReturn", label: "Total Return (검증 구간)", value: "+31.6%", delta: "CAGR 6.8%", tone: "positive", caption: evaluationBasis.caption },
+    { key: "winRate", label: "Win Rate", value: "58.2%", delta: "+3.4pp", tone: "positive", caption: "수익 거래 비율. 10년 누적 1,247 거래." },
+    { key: "totalReturn", label: "Total Return (10y)", value: "+92.4%", delta: "CAGR 6.8%", tone: "positive", caption: "거래비용 반영. KOSPI200 동기간 +54.3%." },
   ],
   equityCurve: [
-    { date: "2021", strategy: 0, original: 0, benchmark: 0 },
-    { date: "2022", strategy: 9, original: 7, benchmark: 4 },
-    { date: "2023", strategy: 21, original: 16, benchmark: 12 },
-    { date: "2024", strategy: 34, original: 25, benchmark: 21 },
-    { date: "2025", strategy: 48, original: 36, benchmark: 30 },
-    { date: "2026", strategy: 61.2, original: 45.3, benchmark: 38.7 },
+    { date: "2016", strategy: 0, original: 0, benchmark: 0 },
+    { date: "2018", strategy: 18, original: 14, benchmark: 9 },
+    { date: "2020", strategy: 35, original: 27, benchmark: 21 },
+    { date: "2022", strategy: 52, original: 38, benchmark: 30 },
+    { date: "2024", strategy: 68, original: 51, benchmark: 43 },
+    { date: "2026", strategy: 92.4, original: 70.1, benchmark: 54.3 },
   ],
   comparison: [
     { metric: "Sharpe", value: "1.42", context: "리스크 대비 수익", assessment: "양호", tone: "positive" },
     { metric: "MDD", value: "-9.4%", context: "최대 낙폭", assessment: "방어 양호", tone: "positive" },
     { metric: "Win Rate", value: "58.2%", context: "수익 거래 비율", assessment: "양호", tone: "positive" },
-    { metric: "Total Return", value: "+61.2%", context: "선택 구간 포함 5년 누적", assessment: "초과수익", tone: "positive" },
-    { metric: "Trades", value: "612회", context: "엔진 요약", assessment: "거래 충분", tone: "positive" },
+    { metric: "Total Return", value: "+92.4%", context: "10년 누적", assessment: "초과수익", tone: "positive" },
+    { metric: "Trades", value: "1,247회", context: "엔진 요약", assessment: "거래 충분", tone: "positive" },
   ],
   macroEvents: [
+    { date: "20.03", label: "코로나19 패닉, KOSPI -33%", impact: "+α", tone: "positive" },
     { date: "22.02", label: "러시아 우크라이나 침공", impact: "-α", tone: "negative" },
     { date: "22.10", label: "美 연준 4연속 자이언트 스텝", impact: "-α", tone: "negative" },
     { date: "23.10", label: "이스라엘·하마스 무력 충돌", impact: "≈", tone: "warning" },
     { date: "24.08", label: "엔캐리 청산, 글로벌 변동성", impact: "+α", tone: "positive" },
     { date: "25.04", label: "美 상호관세 발표", impact: "-α", tone: "negative" },
   ],
-  evaluationBasis,
-  universePolicy,
   disclaimer:
-    "단일 홀드아웃 구간(마지막 30%) 기준. 여러 후보 중 선택 구간 성과가 가장 좋은 하나를 고른 결과이므로 탐색 폭만큼 상향 편향이 있습니다. 미래 수익률을 보장하지 않으며, 거래비용은 수수료 0.015% · 거래세 0.23% · 슬리피지 0.1% 반영.",
-};
-
-export const tickerActions: AITickerAction[] = [
-  {
-    ticker: "005930",
-    name: "삼성전자",
-    action: "BUY",
-    reason: "진입 조건 충족 - 신규 매수",
-    as_of_date: "2026-08-21",
-    close: 82400,
-    source_candidate_id: "A2",
-  },
-  {
-    ticker: "000660",
-    name: "SK하이닉스",
-    action: "HOLD",
-    reason: "청산 조건 미충족 - 보유 유지",
-    as_of_date: "2026-08-21",
-    close: 201500,
-    source_candidate_id: "A2",
-  },
-  {
-    ticker: "035420",
-    name: "NAVER",
-    action: "WATCH",
-    reason: "백테스트 마지막 거래일에 전략 보유 슬롯 5/5이 모두 차 있어 신규 진입이 제한된 상태였습니다.",
-    as_of_date: "2026-08-21",
-    close: 187000,
-  },
-  {
-    ticker: "035720",
-    name: "카카오",
-    action: "WATCH",
-    reason:
-      "백테스트가 거래한 과거 시점(PIT) 유니버스에 없는 종목이라 백테스트가 판정한 적이 없습니다. 오늘 스크리닝 조건에는 부합합니다.",
-    as_of_date: "2026-08-21",
-    close: 54200,
-  },
-];
-
-export const recommendationGate: AIRecommendationGate = {
-  validated: true,
-  reason:
-    "측정된 objective 지표는 모두 통과했지만, 검증에 필요한 데이터가 없어 검증을 끝내지 못했습니다: 공식 KOSPI/KOSDAQ TR 벤치마크 시계열이 아직 적재되지 않아 벤치마크 대비 검증을 완료하지 못했습니다 (official KOSPI/KOSDAQ TR rows are not loaded for the backtest window)",
-  verification_complete: false,
-  unmet_objective_criteria: [],
-  unmet_data_requirements: [
-    "공식 KOSPI/KOSDAQ TR 벤치마크 시계열이 아직 적재되지 않아 벤치마크 대비 검증을 완료하지 못했습니다 (official KOSPI/KOSDAQ TR rows are not loaded for the backtest window)",
-  ],
+    "Walk-forward 6개 윈도우 평균. OOS 구간 신뢰구간 ±2.1%pp. 미래 수익률을 보장하지 않으며, 거래비용은 수수료 0.015% · 거래세 0.23% · 슬리피지 0.1% 반영.",
 };
 
 export const appOverview: AppOverview = {
@@ -365,8 +283,6 @@ export const appOverview: AppOverview = {
   candidates: tradingCandidates,
   performance: performanceSummary,
   recentReports: [],
-  tickerActions,
-  recommendationGate,
   envelope: readyEnvelope,
   jobStatus: analysisJobStatus,
 };

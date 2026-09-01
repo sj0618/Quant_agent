@@ -6,13 +6,23 @@ interface EmailDeliveryListResponse {
   meta?: { limit?: number; hasMore?: boolean; nextCursor?: string | null };
 }
 
-const KNOWN_STATUSES: EmailDeliveryStatus[] = ["sent", "resent", "failed", "draft"];
+const KNOWN_STATUSES: EmailDeliveryStatus[] = [
+  "sent",
+  "resent",
+  "failed",
+  "draft",
+  "submitted",
+  "processing",
+  "delivered",
+  "cancelled",
+  "unknown",
+];
 
 function normalizeStatus(status: string | undefined): EmailDeliveryStatus {
   const normalized = (status ?? "").toLowerCase();
   return KNOWN_STATUSES.includes(normalized as EmailDeliveryStatus)
     ? (normalized as EmailDeliveryStatus)
-    : "draft";
+    : "unknown";
 }
 
 /** Recent report emails for the signed-in user, newest first.

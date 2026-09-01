@@ -156,6 +156,7 @@ def test_email_routes_require_authentication_and_csrf_before_database_access():
     for path in (
         "/api/v1/me/notifications",
         "/api/v1/me/email-deliveries",
+        "/api/v1/me/email-reports/report-1",
     ):
         response = client.get(path)
         assert response.status_code == 401
@@ -170,6 +171,50 @@ def test_email_routes_require_authentication_and_csrf_before_database_access():
         response = client.request(method, path, cookies=cookie, headers={"Origin": API_ORIGIN}, json=payload)
         assert response.status_code == 403
         assert response.json()["error"]["code"] == "csrf_invalid"
+
+
+def test_email_report_detail_uses_owner_scoped_full_report_contract(monkeypatch):
+    client, app = make_client()
+    owner_session_id, _owner_csrf = _create_session(app, user_id="user-1")
+    intruder_session_id, _intruder_csrf = _create_session(app, user_id="user-2")
+    observed: dict[str, object] = {}
+
+    async def fake_get_report(engine, report_id: str, *, user_id: str):
+        observed["engine"] = engine
+        observed["report_id"] = report_id
+        observed["user_id"] = user_id
+        if user_id != "user-1":
+            return None
+        return {
+            "id": report_id,
+            "date": "2026.09.01",
+            "weekday": "월요일",
+            "sentAt": "오전 08:00",
+            "status": "sent",
+            "title": "RSI 전략 리포트",
+            "summary": "전송된 전략 분석 리포트",
+            "signals": {"BUY": 1, "HOLD": 0, "DROP": 0},
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(fe_contract.email_reports.fe_contract_store, "get_report_from_db", fake_get_report)
+
+    owner = client.get(
+        "/api/v1/me/email-reports/report-1",
+        cookies={app.state.settings.auth_session_cookie_name: owner_session_id},
+    )
+    intruder = client.get(
+        "/api/v1/me/email-reports/report-1",
+        cookies={app.state.settings.auth_session_cookie_name: intruder_session_id},
+    )
+
+    assert owner.status_code == 200
+    assert owner.json()["title"] == "RSI 전략 리포트"
+    assert owner.json()["signals"] == {"BUY": 1, "HOLD": 0, "DROP": 0}
+    assert observed["engine"] is app.state.trading_data_db_engine
+    assert observed["report_id"] == "report-1"
+    assert intruder.status_code == 404
+    assert intruder.json()["error"]["code"] == "email_report_not_found"
 
 
 def test_daily_digest_subscription_routes_are_retired_before_auth_or_database_access(monkeypatch):

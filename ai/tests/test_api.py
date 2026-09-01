@@ -403,6 +403,7 @@ def test_ready_release_accepts_parse_bound_core_natural_language_job(
     )
 
     assert response.status_code == 201
+    assert response.json()["job_id"]
 
 
 def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
@@ -1324,5 +1325,6 @@ def test_the_inventory_summary_describes_core_execution(
         if item["method"] == "POST" and item["path"] == ANALYSIS_JOBS_PATH
     )
 
+    assert entry["state"] == "retired"
     assert "Retired public analysis creation" in entry["summary"]
     assert "read-only report snapshots" in entry["summary"]

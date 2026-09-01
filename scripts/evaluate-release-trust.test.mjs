@@ -10,6 +10,7 @@ import {
   exitCodeFromResult,
   runReleaseTrust,
   validateReleaseEvidence,
+  validateRollbackDrillEvidence,
 } from "./evaluate-release-trust.mjs";
 
 const SAMPLE_CHECKS = [
@@ -86,6 +87,57 @@ test("release evidence fails closed for missing, mutable, or mismatched evidence
   assert.throws(
     () => validateReleaseEvidence({ ...valid, RELEASE_EVIDENCE_O_SHA: "b".repeat(40) }),
     /O evidence for the target revision/u
+  );
+});
+
+test("rollback drill evidence accepts only same-SHA immutable drill records", () => {
+  const revision = "a".repeat(40);
+  const environment = {
+    RELEASE_TRUST_REVISION: revision,
+    RELEASE_TRUST_REPOSITORY: "example/quant",
+    ROLLBACK_DRILL_EVIDENCE_REF: "https://github.com/example/quant/actions/runs/12345",
+    ROLLBACK_DRILL_EVIDENCE_SHA: revision,
+  };
+
+  assert.deepEqual(validateRollbackDrillEvidence(environment), {
+    revision,
+    kinds: ["rollback-drill"],
+  });
+});
+
+test("rollback drill evidence fails closed for missing, mutable, or mismatched evidence", () => {
+  const revision = "a".repeat(40);
+  const valid = {
+    RELEASE_TRUST_REVISION: revision,
+    RELEASE_TRUST_REPOSITORY: "example/quant",
+    ROLLBACK_DRILL_EVIDENCE_REF: `https://github.com/example/quant/commit/${revision}`,
+    ROLLBACK_DRILL_EVIDENCE_SHA: revision,
+  };
+
+  assert.throws(() => validateRollbackDrillEvidence({}), /full target revision SHA/u);
+  assert.throws(
+    () => validateRollbackDrillEvidence({ RELEASE_TRUST_REVISION: revision }),
+    /trusted GitHub repository/u
+  );
+  assert.throws(
+    () =>
+      validateRollbackDrillEvidence({
+        ...valid,
+        ROLLBACK_DRILL_EVIDENCE_REF: "https://example.test/result",
+      }),
+    /immutable rollback drill evidence reference/u
+  );
+  assert.throws(
+    () =>
+      validateRollbackDrillEvidence({
+        ...valid,
+        ROLLBACK_DRILL_EVIDENCE_REF: `https://github.com/other/repo/commit/${revision}`,
+      }),
+    /immutable rollback drill evidence reference/u
+  );
+  assert.throws(
+    () => validateRollbackDrillEvidence({ ...valid, ROLLBACK_DRILL_EVIDENCE_SHA: "b".repeat(40) }),
+    /rollback drill evidence for the target revision/u
   );
 });
 

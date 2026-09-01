@@ -7,7 +7,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-BoundaryKind = Literal["public_create", "internal_evaluator", "read_only_projection"]
+BoundaryKind = Literal[
+    "public_create",
+    "authenticated_job_create",
+    "internal_evaluator",
+    "read_only_projection",
+]
 PUBLIC_CREATE_RETIREMENT_SCHEMA = "execution-boundary.v1"
 
 
@@ -45,15 +50,15 @@ class ExecutionBoundary(BaseModel):
 
 APPROVED_EXECUTION_BOUNDARIES: tuple[ExecutionBoundary, ...] = (
     ExecutionBoundary(
-        boundary_id="public-analysis-create",
-        kind="public_create",
+        boundary_id="authenticated-analysis-job-create",
+        kind="authenticated_job_create",
         method="POST",
         path="/analysis-jobs",
-        owner="none",
-        auth="none",
-        failure_delivery="410_feature_disabled_with_read_only_alternative",
-        allowed=False,
-        write_allowed=False,
+        owner="quantagent_analysis_service",
+        auth="authenticated_session_and_preflight",
+        failure_delivery="typed_readiness_or_parse_admission_failure",
+        allowed=True,
+        write_allowed=True,
     ),
     ExecutionBoundary(
         boundary_id="public-daily-digest-create",
@@ -116,6 +121,7 @@ APPROVED_EXECUTION_BOUNDARIES: tuple[ExecutionBoundary, ...] = (
 @dataclass(frozen=True)
 class ExecutionBoundarySummary:
     public_create_allowed: int
+    authenticated_job_create_allowed: int
     internal_evaluator_allowed: int
     read_only_projection_count: int
     read_only_projection_with_owner_auth_failure: int
@@ -123,6 +129,7 @@ class ExecutionBoundarySummary:
     def as_dict(self) -> dict[str, int]:
         return {
             "public_create_allowed": self.public_create_allowed,
+            "authenticated_job_create_allowed": self.authenticated_job_create_allowed,
             "internal_evaluator_allowed": self.internal_evaluator_allowed,
             "read_only_projection_count": self.read_only_projection_count,
             "read_only_projection_with_owner_auth_failure": self.read_only_projection_with_owner_auth_failure,
@@ -153,6 +160,10 @@ def validate_execution_boundaries(
     internal_evaluator_allowed = sum(
         boundary.allowed for boundary in boundaries if boundary.kind == "internal_evaluator"
     )
+    authenticated_job_creates = [
+        boundary for boundary in boundaries if boundary.kind == "authenticated_job_create"
+    ]
+    authenticated_job_create_allowed = sum(boundary.allowed for boundary in authenticated_job_creates)
     read_only_boundaries = [
         boundary for boundary in boundaries if boundary.kind == "read_only_projection"
     ]
@@ -163,6 +174,13 @@ def validate_execution_boundaries(
 
     if public_create_allowed != 0:
         errors.append("public create boundary count must be zero")
+    if authenticated_job_create_allowed != 1:
+        errors.append("exactly one authenticated job create boundary must be allowed")
+    for boundary in authenticated_job_creates:
+        if boundary.method != "POST" or not boundary.write_allowed:
+            errors.append(f"authenticated job create boundary is not writable: {boundary.boundary_id}")
+        if not boundary.owner or not boundary.auth or not boundary.failure_delivery:
+            errors.append(f"authenticated job create lacks owner/auth/failure: {boundary.boundary_id}")
     if internal_evaluator_allowed != 1:
         errors.append("exactly one internal evaluator boundary must be allowed")
     for boundary in read_only_boundaries:
@@ -177,6 +195,7 @@ def validate_execution_boundaries(
 
     summary = ExecutionBoundarySummary(
         public_create_allowed=public_create_allowed,
+        authenticated_job_create_allowed=authenticated_job_create_allowed,
         internal_evaluator_allowed=internal_evaluator_allowed,
         read_only_projection_count=len(read_only_boundaries),
         read_only_projection_with_owner_auth_failure=read_only_with_fields,

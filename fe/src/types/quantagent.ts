@@ -46,19 +46,11 @@ export interface AISourceUsage {
   evidence_refs: string[];
 }
 
-export interface AIFreshnessEvidence {
-  status: AIFreshnessStatus;
-  as_of?: string | null;
-  reason: string;
-  source: string;
-  no_recommendation: boolean;
-}
-
 export interface AIFailureDiagnostic {
   category: string;
   subcause: string;
   failure_stage: string;
-  owner: "ai_graph" | "data_source_config" | "fe_state" | "outside_owner" | "product_data_gap" | "user" | "unknown";
+  owner: "ai_graph" | "data_source_config" | "fe_state" | "outside_owner" | "product_data_gap" | "unknown";
   retryable: boolean;
   safe_message: string;
   evidence_refs: string[];
@@ -105,7 +97,6 @@ export interface AIEnvelope<TUserPayload = unknown, TStrategySpec = StrategySpec
   data_requirements?: AIDataRequirement[];
   source_usage?: AISourceUsage[];
   freshness_status?: AIFreshnessStatus | null;
-  freshness_evidence?: AIFreshnessEvidence | null;
   proxy_disclosure?: Record<string, string> | null;
   failure_cause?: AIFailureDiagnostic | null;
   evidence_refs?: AIEvidenceRef[];
@@ -311,36 +302,6 @@ export interface AIStrategyExplanation {
   source_refs: string[];
 }
 
-/**
- * Which slice of the history the public numbers were measured on. The backend decides
- * this per run - a single hold-out tail, or the rolling policy's evaluation sessions -
- * so a caption written in the client would be wrong whenever the run takes the other
- * path. Render `caption`; the structured fields are there for anything that needs to
- * reason about the basis rather than print it.
- */
-export interface AIBacktestEvaluationBasis {
-  basis: "hold_out" | "walk_forward_policy";
-  caption: string;
-  hold_out_fraction?: number | null;
-  window_start?: string | null;
-  window_end?: string | null;
-  window_policy_id?: string | null;
-  evaluation_session_count?: number | null;
-  fold_count?: number | null;
-  cost_model_applied?: boolean;
-}
-
-/** Why a name recommended today can be missing from the backtest that was run. */
-export interface AIBacktestUniversePolicy {
-  summary: string;
-  policy_id?: string | null;
-  window_start?: string | null;
-  window_end?: string | null;
-  traded_ticker_count?: number | null;
-  excluded_screening_candidate_count: number;
-  excluded_notice?: string | null;
-}
-
 export interface AIBacktestPerformance {
   selected_candidate_id: string;
   metrics: AIBacktestMetrics;
@@ -351,60 +312,11 @@ export interface AIBacktestPerformance {
   benchmark?: AIBacktestBenchmark | null;
   metric_details?: AIBacktestMetricDetail[];
   strategy_explanation?: AIStrategyExplanation | null;
-  evaluation_basis?: AIBacktestEvaluationBasis | null;
-  universe_policy?: AIBacktestUniversePolicy | null;
 }
-
-/** Public result variants mirror the API discriminator. A missing/unsafe performance
- * payload must never be rendered as a zero-value backtest in the workspace. */
-export interface AIPerformanceUnavailable {
-  availability: "unavailable";
-  reason_code: string;
-  safe_facts: Record<string, string | number | boolean | null>;
-}
-
-export interface AIPerformanceMethodManifest {
-  start_date: string;
-  end_date: string;
-  data_version: string;
-  result_version: string;
-  execution_version: string;
-  historical_simulation_warning: string;
-}
-
-export interface AIPerformanceAvailable {
-  availability: "available";
-  performance: AIBacktestPerformance;
-  method_manifest: AIPerformanceMethodManifest;
-  limitations: string[];
-}
-
-export type AIPublicPerformance = AIPerformanceAvailable | AIPerformanceUnavailable;
 
 export interface AIRecommendationGate {
   validated: boolean;
   reason: string;
-  /**
-   * False when the acceptance rule could not be evaluated at all - a missing input, not a
-   * measured shortfall. A gate can be `validated` on the metrics it did measure and still
-   * be incomplete, so both flags have to be read.
-   */
-  verification_complete?: boolean;
-  unmet_objective_criteria?: string[];
-  unmet_data_requirements?: string[];
-}
-
-export type AITickerActionType = 'BUY' | 'SELL' | 'HOLD' | 'WATCH';
-
-/** Today's verdict for one stock, produced by the same backtest run as `performance`. */
-export interface AITickerAction {
-  ticker: string;
-  name: string;
-  action: AITickerActionType;
-  reason: string;
-  as_of_date: string;
-  close?: number | null;
-  source_candidate_id?: string | null;
 }
 
 export interface AIUserPayload {
@@ -413,9 +325,8 @@ export interface AIUserPayload {
   next_actions: string[];
   candidate_cards: StrategyCandidateCard[];
   report: AIReportBundle | null;
-  performance?: AIPublicPerformance | null;
+  performance?: AIBacktestPerformance | null;
   recommendation_gate?: AIRecommendationGate | null;
-  ticker_actions?: AITickerAction[];
   question?: string | null;
   options?: AIClarificationOption[];
   recommended?: number | null;
@@ -487,13 +398,6 @@ export interface BacktestMetric {
   whyUsed?: string;
   caution?: string;
   sourceRefs?: string[];
-  /** Provenance fields are optional for retired mock-only views, but required before a
-   * live value can be presented as a current operational metric. */
-  source?: "fixture" | "postgres" | "unknown";
-  asOf?: string | null;
-  freshness?: "eod_current" | "stale" | "unknown";
-  availability?: "available" | "unavailable";
-  unavailableReason?: string | null;
 }
 
 export interface EquityPoint {
@@ -532,8 +436,6 @@ export interface PerformanceSummary {
   benchmark?: AIBacktestBenchmark;
   metricDetails?: AIBacktestMetricDetail[];
   strategyExplanation?: AIStrategyExplanation | null;
-  evaluationBasis?: AIBacktestEvaluationBasis | null;
-  universePolicy?: AIBacktestUniversePolicy | null;
   disclaimer: string;
 }
 
@@ -574,13 +476,23 @@ export interface AppOverview {
   candidates: TradingCandidate[];
   performance: PerformanceSummary;
   recentReports: ReportSummary[];
-  // The graph's own verdict per stock, and why the picks are (or are not) validated.
-  // Both are decided in the backtest run behind `performance`, so the overview reads
-  // them rather than deriving a second opinion from the candidate rows.
-  tickerActions?: AITickerAction[];
-  recommendationGate?: AIRecommendationGate | null;
   envelope: AIEnvelope<{ active_tab: "overview" } | AIUserPayload, StrategySpec | AIStrategySpec | null> | null;
   jobStatus: AnalysisJobStatus | null;
+}
+
+export interface LandingSample {
+  heroStats: Array<{ value: string; label: string }>;
+  steps: Array<{ label: string; title: string; description: string; example: string[] }>;
+  reportPreview: {
+    title: string;
+    date: string;
+    score: string;
+    market: Array<{ label: string; value: string; tone?: Tone }>;
+    signals: Array<{ signal: SignalType; name: string; ticker: string; score: string }>;
+  };
+  comparisonRows: Array<{ item: string; traditional: string; terminal: string; quantAgent: string }>;
+  principles: Array<{ label: string; title: string; description: string }>;
+  faqs: Array<{ question: string; answer?: string }>;
 }
 
 export type ReportDeliveryStatus = "sent" | "draft" | "failed" | "resent" | "submitted" | "processing" | "delivered" | "cancelled" | "unknown";
@@ -607,27 +519,9 @@ export interface ReportSummary {
   marketSnapshot: Array<{ label: string; value: string; tone?: Tone }>;
 }
 
-/**
- * Browser contract for the read-only report archive.  This is intentionally
- * separate from ReportSummary because the archive API must not transfer report
- * narratives, market snapshots, rankings, action signals, or performance data.
- */
-export interface ArchivedReportSummary {
-  id: string;
-  runId?: string;
-  date: string;
-  weekday: string;
-  sentAt: string;
-  status: ReportDeliveryStatus;
-  createdAt?: string;
-  updatedAt?: string;
-  publishedAt?: string;
-}
-
 export interface PersistedReportSection {
   id?: string;
   title?: string;
-  note?: string;
   body?: string;
   entries?: PersistedReportEntry[];
 }
@@ -636,7 +530,6 @@ export interface PersistedReportEntry {
   label?: string;
   value: string;
   depth: number;
-  description?: string;
 }
 
 export interface DailyDigestHeader {
@@ -742,12 +635,25 @@ export interface ReportDetail extends ReportSummary {
   costNotes: string[];
 }
 
-/** Reader-safe detail: immutable archive metadata plus allow-listed evidence. */
-export interface ArchivedReportDetail extends ArchivedReportSummary {
-  contentSections: PersistedReportSection[];
+/**
+ * A read-only report produced by a completed workspace analysis job.
+ *
+ * This is intentionally distinct from an email-delivery record.  A workspace
+ * report answers "what did this strategy analysis produce?" while an email
+ * report answers "what was sent and when?".  Mixing the two made `/reports`
+ * render an email layout for a user-created strategy result.
+ */
+export interface WorkspaceReportDetail {
+  id: string;
+  query: string;
+  createdAt: string;
+  updatedAt: string;
+  report: ReportSummary;
+  overview: AppOverview;
+  recommendationValidated: boolean;
 }
 
-export type EmailDeliveryStatus = "sent" | "resent" | "failed" | "draft";
+export type EmailDeliveryStatus = ReportDeliveryStatus;
 
 /** One row of `GET /api/v1/me/email-deliveries`, trimmed to what the timeline renders. */
 export interface EmailDeliveryEntry {

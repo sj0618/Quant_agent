@@ -6,20 +6,22 @@ async function read(relativePath: string) {
   return readFile(new URL(relativePath, import.meta.url), "utf8");
 }
 
-test("reports page exposes a safe read-only archive and export", async () => {
-  const [reportsPage, reportList, reportActions] = await Promise.all([
+test("reports page lists workspace results while email actions remain out of the list", async () => {
+  const [reportsPage, reportList, reportActions, clientSource] = await Promise.all([
     read("../src/pages/ReportsPage.tsx"),
     read("../src/features/reports/ReportList.tsx"),
     read("../src/api/reportActionsClient.ts"),
+    read("../src/api/quantAgentClient.ts"),
   ]);
 
   assert.match(reportsPage, /getReports/);
   assert.match(reportsPage, /downloadReportsCsv/);
   assert.match(reportsPage, /printCurrentView/);
   assert.match(reportsPage, /ReportList/);
-  assert.match(reportList, /읽기 전용 결과 스냅샷/);
-  assert.doesNotMatch(reportList, /resendReportEmail|copyReportShareLink|recommendationScore|report\.signals/);
-  assert.match(reportActions, /result_id/);
+  assert.match(reportList, /copyReportShareLink/);
+  assert.doesNotMatch(reportList, /resendReportEmail/);
+  assert.match(clientSource, /await listAnalysisJobs\(\)/);
+  assert.match(reportActions, /export async function resendReportEmail/);
   assert.doesNotMatch(reportsPage, /getReportStrategies/);
   assert.doesNotMatch(reportList, /getDigestStrategySelection|getEmailDeliveryHistory|reportsHistory|reportStrategies/);
 });
@@ -33,7 +35,7 @@ test("search is report-centric and sends q to the live report endpoint", async (
   assert.match(searchPage, /getReports/);
   assert.match(searchPage, /getReports\(normalizedQuery\)/);
   assert.match(searchPage, /ROUTES\.reportDetail/);
-  assert.match(searchPage, /placeholder="결과 ID 또는 보관 기준일"/);
+  assert.match(searchPage, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
   assert.match(searchPage, /Badge variant="info">report<\/Badge>/);
   assert.doesNotMatch(clientSource, /export async function searchInstruments/);
   assert.doesNotMatch(searchPage, /getWorkspaceTemplate/);
@@ -60,13 +62,14 @@ test("canonical routes exclude retired history and strategy pages", async () => 
   assert.match(profilePage, /EmailHistoryTimeline/);
 });
 
-test("report detail keeps a read-only PDF export action", async () => {
-  const [detailPage, reportActions] = await Promise.all([
-    read("../src/pages/ReportDetailPage.tsx"),
-    read("../src/api/reportActionsClient.ts"),
+test("workspace and email detail routes use distinct components", async () => {
+  const [workspaceDetail, emailDetail, timeline] = await Promise.all([
+    read("../src/pages/WorkspaceReportDetailPage.tsx"),
+    read("../src/pages/EmailReportDetailPage.tsx"),
+    read("../src/features/reports/EmailHistoryTimeline.tsx"),
   ]);
 
-  assert.match(detailPage, /getReportById/);
-  assert.match(detailPage, /printCurrentView/);
-  assert.match(reportActions, /buildReportPrintTitle/);
+  assert.match(workspaceDetail, /getWorkspaceReportById/);
+  assert.match(emailDetail, /getEmailReportById/);
+  assert.match(timeline, /ROUTES\.emailReportDetail/);
 });

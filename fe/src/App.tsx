@@ -1,24 +1,32 @@
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
+import { AsyncState } from "./components/common/AsyncState";
 import { AppPage } from "./pages/AppPage";
 import { AuthCallbackPage } from "./pages/AuthCallbackPage";
 import { AuthRequiredPage } from "./pages/AuthRequiredPage";
+import { EmailReportDetailPage } from "./pages/EmailReportDetailPage";
 import { LandingPage } from "./pages/LandingPage";
 import { LegalPage } from "./pages/LegalPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ProfilePage } from "./pages/ProfilePage";
-import { ReportDetailPage } from "./pages/ReportDetailPage";
+import { WorkspaceReportDetailPage } from "./pages/WorkspaceReportDetailPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { SearchPage } from "./pages/SearchPage";
 import { UnsubscribePage } from "./pages/UnsubscribePage";
-import { AsyncState } from "./components/common/AsyncState";
+import { getCurrentSession, isSessionRecentlyValidated, validateCurrentSession } from "./api/authClient";
 import {
-  bootstrapSessionFromCookie,
-  getCurrentSession,
-  isSessionRecentlyValidated,
-  validateCurrentSession,
-} from "./api/authClient";
-import { ROUTES, getCurrentPathWithSearch, parseReportDetailId, sanitizeReturnTo } from "./config/routes";
+  ROUTES,
+  getCurrentPathWithSearch,
+  parseEmailReportDetailId,
+  parseReportDetailId,
+  sanitizeReturnTo,
+} from "./config/routes";
 import type { AuthSession } from "./types/auth";
+
+// 이 페이지만 react-dom/server 를 끌어오기 때문에(발송용 HTML 문자열 렌더) 별도 chunk 로 떼어낸다.
+// 정적 import 로 두면 실사용자 메인 번들이 190kB 커진다.
+const EmailTemplatePreviewPage = lazy(() =>
+  import("./pages/EmailTemplatePreviewPage").then((module) => ({ default: module.EmailTemplatePreviewPage })),
+);
 
 function normalizePath(pathname: string) {
   return pathname.replace(/\/+$/, "") || "/";
@@ -30,6 +38,7 @@ function isProtectedRoute(path: string) {
     path.startsWith(`${ROUTES.app}/`) ||
     path === ROUTES.reports ||
     parseReportDetailId(path) !== null ||
+    parseEmailReportDetailId(path) !== null ||
     path === ROUTES.me ||
     path === ROUTES.notifications ||
     path === ROUTES.search
@@ -48,41 +57,6 @@ function AppRoutes() {
   // click. The cached session renders immediately and revalidation happens behind it; only
   // an actual 401 (validateCurrentSession returning null) takes the user to the login page.
   const [session, setSession] = useState<AuthSession | null>(getCurrentSession);
-  // A cookie-authenticated user with no cached SPA session — the normal state after the
-  // backend's server-side OAuth callback in the combined production topology — must be
-  // admitted, not walled. Until the cookie bootstrap resolves we cannot tell "signed out"
-  // apart from "session lives only in the cookie", so hold the protected-route gate closed
-  // meanwhile instead of flashing the login wall.
-  const [bootstrappingCookieSession, setBootstrappingCookieSession] = useState(
-    () => protectedRoute && session === null,
-  );
-
-  useEffect(() => {
-    if (!protectedRoute || session !== null) {
-      return;
-    }
-    let cancelled = false;
-    bootstrapSessionFromCookie()
-      .then((cookieSession) => {
-        if (!cancelled) {
-          setSession(cookieSession);
-        }
-      })
-      .catch((error: unknown) => {
-        // No valid cookie session (or the check failed): fall through to the login wall.
-        console.warn("쿠키 세션 부트스트랩에 실패해 로그인 화면으로 이동합니다.", error);
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setBootstrappingCookieSession(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-    // session is null here and the bootstrap either sets it or leaves it null; re-running
-    // on a null->null no-op would not loop, but keep the dependency explicit.
-  }, [protectedRoute, session]);
 
   useEffect(() => {
     if (!protectedRoute || !session || isSessionRecentlyValidated(session)) {
@@ -130,18 +104,19 @@ function AppRoutes() {
     return <LegalPage kind="disclaimer" />;
   }
 
-  if (path === ROUTES.trust) {
-    return <LegalPage kind="trust" />;
-  }
-
   if (path === ROUTES.unsubscribe) {
     return <UnsubscribePage />;
   }
 
+  if (path === ROUTES.emailTemplatePreview) {
+    return (
+      <Suspense fallback={<AsyncState title="이메일 템플릿을 불러오는 중입니다" tone="loading" />}>
+        <EmailTemplatePreviewPage />
+      </Suspense>
+    );
+  }
+
   if (protectedRoute && !session) {
-    if (bootstrappingCookieSession) {
-      return <AsyncState title="세션을 확인하는 중" description="로그인 상태를 확인하고 있습니다." tone="loading" />;
-    }
     return <AuthRequiredPage returnTo={getCurrentPathWithSearch()} />;
   }
 
@@ -165,15 +140,20 @@ function AppRoutes() {
     return <ReportsPage />;
   }
 
+  const emailReportDetailId = parseEmailReportDetailId(path);
+  if (emailReportDetailId) {
+    return <EmailReportDetailPage id={emailReportDetailId} />;
+  }
+
   const reportDetailId = parseReportDetailId(path);
   if (reportDetailId) {
-    return <ReportDetailPage id={reportDetailId} />;
+    return <WorkspaceReportDetailPage id={reportDetailId} />;
   }
 
   return (
     <main className="not-found">
       <h1>페이지를 찾을 수 없습니다</h1>
-      <p>주소를 다시 확인하거나 홈에서 이용 가능한 기능을 선택해 주세요.</p>
+      <p>Figma HI-FI 구현 대상 route가 아닙니다.</p>
       <a href={ROUTES.home}>홈으로 가기</a>
     </main>
   );

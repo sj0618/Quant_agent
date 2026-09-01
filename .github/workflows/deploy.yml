@@ -6,6 +6,39 @@ on:
       - main
     paths:
       - '**'
+  workflow_call:
+    inputs:
+      evidence_s_ref:
+        required: false
+        type: string
+      evidence_s_sha:
+        required: false
+        type: string
+      evidence_r_ref:
+        required: false
+        type: string
+      evidence_r_sha:
+        required: false
+        type: string
+      evidence_o_ref:
+        required: false
+        type: string
+      evidence_o_sha:
+        required: false
+        type: string
+      evidence_c_ref:
+        required: false
+        type: string
+      evidence_c_sha:
+        required: false
+        type: string
+      rollback_drill:
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
   workflow_dispatch:
     inputs:
       evidence_s_ref:
@@ -38,6 +71,14 @@ on:
         type: string
       evidence_c_sha:
         description: Full commit SHA verified by C evidence
+        required: false
+        type: string
+      rollback_evidence_ref:
+        description: Immutable GitHub URL for same-SHA rollback drill evidence
+        required: false
+        type: string
+      rollback_evidence_sha:
+        description: Full commit SHA verified by rollback drill evidence
         required: false
         type: string
       rollback_drill:
@@ -100,6 +141,15 @@ jobs:
           RELEASE_EVIDENCE_C_REF: ${{ inputs.evidence_c_ref }}
           RELEASE_EVIDENCE_C_SHA: ${{ inputs.evidence_c_sha }}
         run: node scripts/evaluate-release-trust.mjs --verify-release-evidence
+
+      - name: Verify same-SHA rollback drill evidence
+        if: github.event_name == 'workflow_dispatch' && inputs.rollback_drill != true
+        env:
+          RELEASE_TRUST_REVISION: ${{ github.sha }}
+          RELEASE_TRUST_REPOSITORY: ${{ github.repository }}
+          ROLLBACK_DRILL_EVIDENCE_REF: ${{ inputs.rollback_evidence_ref }}
+          ROLLBACK_DRILL_EVIDENCE_SHA: ${{ inputs.rollback_evidence_sha }}
+        run: node scripts/evaluate-release-trust.mjs --verify-rollback-evidence
 
       - name: Verify offline release trust
         env:

@@ -9,17 +9,18 @@ export const AUTH_ENDPOINTS = {
 export const STRATEGY_ENDPOINTS = {
   create: "/strategies",
   update: (id: string) => `/strategies/${encodeURIComponent(id)}`,
+  run: (id: string) => `/strategies/${encodeURIComponent(id)}/analysis-runs`,
 } as const;
 
 export const AI_ENDPOINTS = {
   apiStatus: "/api-status",
   analysisJobs: "/analysis-jobs",
   analysisJob: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}`,
+  analysisJobEvents: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/events`,
   analysisJobCancel: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/cancel`,
   analysisJobResearchAppendix: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/research-appendix`,
-  researchRuleReview: "/api/strategies/parse",
-  researchJobs: "/api/research/jobs",
-  researchJobResult: (id: string) => `/api/research/jobs/${encodeURIComponent(id)}/result`,
+  strategyParse: "/api/strategies/parse",
+  strategyDescriptions: "/api/strategies/descriptions",
 } as const;
 
 function trimTrailingSlash(value: string | undefined) {
@@ -38,5 +39,6 @@ export const appConfig = {
   aiApiBaseUrl: aiApiBaseUrl(),
   backendApiBaseUrl: backendApiBaseUrl(),
   authApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_AUTH_API_BASE_URL) || backendApiBaseUrl(),
+  reportActionApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_REPORT_ACTION_API_BASE_URL) || backendApiBaseUrl(),
   strategyApiBaseUrl: trimTrailingSlash(import.meta.env.VITE_STRATEGY_API_BASE_URL) || backendApiBaseUrl(),
 } as const;

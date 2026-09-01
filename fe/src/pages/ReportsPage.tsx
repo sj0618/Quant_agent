@@ -1,11 +1,10 @@
 import { useState } from "react";
 import { AsyncState } from "../components/common/AsyncState";
 import { AppLayout } from "../components/layout/AppLayout";
-import { getAnalysisJobs, getReports } from "../api/quantAgentClient";
+import { getReports } from "../api/quantAgentClient";
 import { downloadReportsCsv, printCurrentView } from "../api/reportActionsClient";
 import { ROUTES } from "../config/routes";
 import { ReportList } from "../features/reports/ReportList";
-import { GeneratedReportList } from "../features/reports/GeneratedReportList";
 import {
   DEFAULT_REPORT_FILTERS,
   applyReportFilters,
@@ -16,20 +15,11 @@ import {
 import { useAsyncData } from "../hooks/useAsyncData";
 
 export function ReportsPage() {
-  const { data, loading, error } = useAsyncData(async () => {
-    const [jobsResult, archiveResult] = await Promise.allSettled([getAnalysisJobs(), getReports()]);
-    return {
-      jobs: jobsResult.status === "fulfilled" ? jobsResult.value : [],
-      archive: archiveResult.status === "fulfilled" ? archiveResult.value : [],
-      jobsError: jobsResult.status === "rejected" ? jobsResult.reason : null,
-      archiveError: archiveResult.status === "rejected" ? archiveResult.reason : null,
-    };
-  }, []);
+  const { data, loading, error } = useAsyncData(getReports, []);
   const [filters, setFilters] = useState<ReportFilters>(() => parseReportFilters(window.location.search));
   const [actionStatus, setActionStatus] = useState<string | null>(null);
 
-  const reports = data?.archive ?? [];
-  const jobs = data?.jobs ?? [];
+  const reports = data ?? [];
   const filteredReports = applyReportFilters(reports, filters);
 
   const handleApplyFilters = (nextFilters: ReportFilters) => {
@@ -54,7 +44,7 @@ export function ReportsPage() {
 
   // Loading/empty/error used to return before AppLayout, so every non-happy path silently
   // dropped the top bar and left the user with no way to navigate out.
-  if (loading || error || !data) {
+  if (loading || error || !data || data.length === 0) {
     return (
       <AppLayout active="reports">
         {loading ? (
@@ -62,7 +52,7 @@ export function ReportsPage() {
         ) : error ? (
           <AsyncState title="리포트 목록을 불러오지 못했습니다" description={error.message} tone="error" />
         ) : (
-          <AsyncState title="리포트 목록을 준비할 수 없습니다" tone="error" />
+          <AsyncState title="아직 생성된 전략 분석 리포트가 없습니다" description="워크스페이스에서 전략 분석이 완료되면 이곳에 리포트가 쌓입니다." tone="empty" />
         )}
       </AppLayout>
     );
@@ -73,8 +63,8 @@ export function ReportsPage() {
       <main className="reports-page">
         <div className="reports-page__head">
           <div>
-            <h1>전략 리포트</h1>
-            <p>완료된 자연어 분석의 결과·근거·한계를 다시 확인할 수 있습니다.</p>
+            <h1>리포트</h1>
+            <p>워크스페이스에서 완료한 전략 분석과 백테스트 결과를 확인할 수 있습니다.</p>
           </div>
           <div>
             <button onClick={handlePrintPdf} type="button">전체 PDF 다운로드</button>
@@ -82,26 +72,13 @@ export function ReportsPage() {
           </div>
         </div>
         {actionStatus ? <div className="action-feedback">{actionStatus}</div> : null}
-        {data.jobsError ? <div className="action-feedback action-feedback--error">생성된 전략 리포트 목록을 불러오지 못했습니다. 과거 보관 기록은 아래에서 계속 확인할 수 있습니다.</div> : null}
-        <GeneratedReportList jobs={jobs} />
-        {data.archiveError ? <div className="action-feedback action-feedback--error">과거 보관 기록을 불러오지 못했습니다.</div> : null}
-        {filteredReports.length ? (
-          <section className="legacy-archive-section" aria-labelledby="legacy-archive-title">
-            <div className="report-list-head">
-              <div>
-                <strong id="legacy-archive-title">이전 보관 기록</strong>
-                <p>본문이 보존되지 않은 과거 기록입니다. 생성된 전략 리포트를 대신하지 않습니다.</p>
-              </div>
-              <span>{filteredReports.length}건</span>
-            </div>
-            <ReportList
-              filters={filters}
-              onApplyFilters={handleApplyFilters}
-              onResetFilters={handleResetFilters}
-              reports={filteredReports}
-            />
-          </section>
-        ) : null}
+        <ReportList
+          allReports={reports}
+          filters={filters}
+          onApplyFilters={handleApplyFilters}
+          onResetFilters={handleResetFilters}
+          reports={filteredReports}
+        />
       </main>
     </AppLayout>
   );

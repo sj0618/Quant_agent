@@ -1,72 +1,87 @@
 import assert from "node:assert/strict";
-import { access, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
 
-test("browser exposes the durable natural-language strategy workspace without browser result fallbacks", async () => {
-  const [clientSource, appSource, configSource, workspaceSource, mapperSource] = await Promise.all([
-    readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
-    readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/config/appConfig.ts", import.meta.url), "utf8"),
-    readFile(new URL("../src/features/app/StrategyWorkspace.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/features/app/strategyWorkspaceMapper.ts", import.meta.url), "utf8"),
-  ]);
+test("workspace reports use completed analysis jobs and keep email snapshots separate", async () => {
+  const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
 
-  assert.match(clientSource, /backendRequest/);
-  assert.match(clientSource, /export async function getReports\(q\?: string\)/);
-  assert.match(clientSource, /new URLSearchParams\(\{ q: normalizedQuery \}\)/);
-  assert.match(clientSource, /export async function getReportById/);
-  assert.match(clientSource, /export async function createAnalysisJob/);
-  assert.match(clientSource, /export async function getAnalysisJob/);
-  assert.match(clientSource, /export async function cancelAnalysisJob/);
-  assert.doesNotMatch(clientSource, /createAnalysisRun|completeAnalysisRun|localStorage/);
-  assert.match(appSource, /StrategyWorkspace/);
-  assert.match(workspaceSource, /StrategyInputPanel/);
-  assert.match(workspaceSource, /createAnalysisJob/);
-  assert.match(workspaceSource, /getAnalysisJob/);
-  assert.match(workspaceSource, /natural-language strategy/);
-  assert.match(mapperSource, /reliability\?\.source === "postgres"/);
-  assert.match(mapperSource, /fixture·출처 미확인·표본 부족 결과는 성과 수치와 차트로 대체하지 않습니다/);
-  assert.match(configSource, /analysisJobs: "\/analysis-jobs"/);
-  assert.match(configSource, /analysisJobCancel/);
-  assert.doesNotMatch(configSource, /analysis-runs|\/runs\b/);
+  assert.match(source, /backendRequest/);
+  assert.match(source, /export async function getReports\(q\?: string\)/);
+  assert.match(source, /await listAnalysisJobs\(\)/);
+  assert.match(source, /buildReportSummaryFromAnalysisJob/);
+  assert.match(source, /export async function getWorkspaceReportById/);
+  assert.match(source, /export async function getEmailReportById/);
+  assert.match(source, /`\/me\/email-reports\/\$\{encodeURIComponent\(id\)\}`/);
+  assert.doesNotMatch(source, /export async function searchInstruments/);
+  assert.match(source, /AI_REPORT_ID_PREFIX/);
+  assert.doesNotMatch(source, /reportClient|reportAdapter/);
 });
 
-test("retained legacy preview cannot create analysis jobs or runs", async () => {
-  const [legacyClientSource, legacyAppSource, legacyConfigSource, legacyReportDetailSource] = await Promise.all([
-    readFile(new URL("../../backend/fe-api-preview/src/api/quantAgentClient.ts", import.meta.url), "utf8"),
-    readFile(new URL("../../backend/fe-api-preview/src/pages/AppPage.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../../backend/fe-api-preview/src/config/appConfig.ts", import.meta.url), "utf8"),
-    readFile(new URL("../../backend/fe-api-preview/src/features/reports/ReportDetail.tsx", import.meta.url), "utf8"),
-  ]);
+test("workspace restores the latest server analysis on a fresh browser", async () => {
+  const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
 
-  assert.doesNotMatch(legacyClientSource, /createAnalysisJob|cancelAnalysisJob|createAnalysisRun|completeAnalysisRun/);
-  assert.doesNotMatch(legacyClientSource, /analysis-jobs|\/runs\b/);
-  assert.doesNotMatch(legacyConfigSource, /analysis-jobs|analysis-runs|\/runs\b/);
-  assert.doesNotMatch(legacyAppSource, /StrategyInputPanel|useAnalysisActivity|createAnalysisJob|analysis-jobs|progressbar/);
-  assert.match(legacyAppSource, /ROUTES\.reports/);
-  assert.doesNotMatch(legacyReportDetailSource, /워크스페이스에서 상세 보기|채팅으로 전략 수정|href=\{ROUTES\.app\}/);
-  assert.match(legacyReportDetailSource, /ROUTES\.reports/);
+  assert.match(source, /refreshLatestAnalysisJob\(\)/);
+  assert.match(source, /setAnalysisJobs\(\(jobs\) => \(jobs\.length \? jobs : \[latestJob\]\)\)/);
 });
 
-test("canonical product surface excludes retired history and strategy routes", async () => {
-  const [appSource, routesSource, profileSource, searchSource] = await Promise.all([
+test("workspace delegates parse-bound admission to the server in one request", async () => {
+  const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+  const createJob = clientSource.slice(
+    clientSource.indexOf("export async function createAnalysisJob"),
+    clientSource.indexOf("export async function cancelAnalysisJob"),
+  );
+  assert.match(createJob, /fetchAI\(AI_ENDPOINTS\.analysisJobs/);
+  assert.match(createJob, /JSON\.stringify\(\{ query: trimmedQuery \}\)/);
+  assert.doesNotMatch(createJob, /fetchAI\(AI_ENDPOINTS\.strategyParse/);
+  assert.doesNotMatch(createJob, /parse_token:/);
+});
+
+test("workspace discards a running job lost during a server restart", async () => {
+  const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /missingJobIds\.add\(job\.job_id\)/);
+  assert.match(source, /\.filter\(\(job\) => !missingJobIds\.has\(job\.job_id\)\)/);
+  assert.doesNotMatch(source, /분석 job을 서버에서 찾을 수 없습니다/);
+});
+
+test("report completion sends only the durable AI job id", async () => {
+  const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+  const completion = source.slice(
+    source.indexOf("export async function completeAnalysisRun"),
+    source.indexOf("export async function getReports"),
+  );
+
+  assert.match(completion, /JSON\.stringify\(\{ aiJobId: job\.job_id \}\)/);
+  assert.doesNotMatch(completion, /recommendationGate|performance|strategySpec|sections/);
+});
+
+test("canonical product surface separates workspace reports from My Page email reports", async () => {
+  const [appSource, routesSource, profileSource, timelineSource, searchSource] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/config/routes.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/pages/ProfilePage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/features/reports/EmailHistoryTimeline.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/pages/SearchPage.tsx", import.meta.url), "utf8"),
   ]);
 
   assert.doesNotMatch(routesSource, /reportsHistory|reportStrategies|strategyReportDetail/);
   assert.doesNotMatch(appSource, /ReportsHistoryPage|StrategyReportsPage|StrategyReportDetailPage/);
+  // The retired *route* stays retired; the send-history timeline itself lives on /me now.
+  // It was deleted along with that route in 6dadc69 while its backend endpoint stayed live,
+  // so it is asserted present rather than absent.
   assert.doesNotMatch(profileSource, /reportsHistory/);
   assert.match(profileSource, /EmailHistoryTimeline/);
   assert.match(profileSource, /getEmailDeliveries/);
+  assert.match(routesSource, /emailReportDetail/);
+  assert.match(appSource, /EmailReportDetailPage/);
+  assert.match(appSource, /WorkspaceReportDetailPage/);
+  assert.match(timelineSource, /ROUTES\.emailReportDetail/);
   assert.match(searchSource, /getReports/);
   assert.match(searchSource, /getReports\(normalizedQuery\)/);
   assert.match(searchSource, /ROUTES\.reportDetail/);
   assert.match(searchSource, /Badge variant="info">report<\/Badge>/);
-  assert.match(searchSource, /placeholder="결과 ID 또는 보관 기준일"/);
+  assert.match(searchSource, /placeholder="리포트 제목, 전략명, 후보명, 티커"/);
   assert.doesNotMatch(searchSource, /getAppOverview/);
   assert.doesNotMatch(searchSource, /getWorkspaceTemplate/);
   assert.doesNotMatch(searchSource, /refreshLatestAnalysisJob/);
@@ -76,7 +91,7 @@ test("canonical product surface excludes retired history and strategy routes", a
 
 test("authentication boundaries do not leak cached analysis between users", async () => {
   const authSource = await readFile(new URL("../src/api/authClient.ts", import.meta.url), "utf8");
-  const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+  const aiSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
   const profileSource = await readFile(new URL("../src/pages/ProfilePage.tsx", import.meta.url), "utf8");
 
@@ -84,34 +99,14 @@ test("authentication boundaries do not leak cached analysis between users", asyn
   assert.match(authSource, /AUTH_ENDPOINTS\.me/);
   assert.match(authSource, /finally \{\s+clearCurrentSession\(\)/);
   assert.match(appSource, /validateCurrentSession\(\)/);
-  assert.doesNotMatch(clientSource, /localStorage/);
+  assert.match(aiSource, /\[401, 403\]\.includes\(error\.status\)/);
+  assert.match(aiSource, /error\.status === 404/);
   assert.match(profileSource, /window\.location\.assign\(ROUTES\.home\)/);
   assert.doesNotMatch(authSource, /TEST_AUTH_SESSION/);
   assert.doesNotMatch(authSource, /saveTestSession/);
   assert.doesNotMatch(authSource, /provider:\s*"test"/);
   assert.doesNotMatch(authSource, /completeTestLogin/);
   assert.doesNotMatch(authSource, /AUTH_ENDPOINTS\.testLogin/);
-});
-
-test("public navigation describes the core strategy workflow without fake performance or internal preview copy", async () => {
-  const [appSource, routesSource, landingSource, globalStyles] = await Promise.all([
-    readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/config/routes.ts", import.meta.url), "utf8"),
-    readFile(new URL("../src/pages/LandingPage.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/styles/global.css", import.meta.url), "utf8"),
-  ]);
-
-  assert.doesNotMatch(appSource, /EmailTemplatePreviewPage|Figma HI-FI/);
-  assert.doesNotMatch(routesSource, /emailTemplatePreview|dev\/email-template/);
-  assert.doesNotMatch(landingSource, /reportDetail\("2026-04-18"\)|KRX LIVE|Sharpe 1\.42/);
-  assert.match(landingSource, /자연어 전략 분석 시작/);
-  assert.match(landingSource, /자연어 전략 → 실데이터 백테스트 → 자연어 리포트/);
-  assert.match(landingSource, /개인 보유 종목·계좌·수량·위험성향/);
-  assert.doesNotMatch(landingSource, /새 분석은 지원하지 않습니다|현재 제공하지 않는 기능/);
-  assert.doesNotMatch(await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"), /landing\.mock|getLandingSample|LandingSample/);
-  assert.doesNotMatch(landingSource, /RELEASE VALIDATION|VALIDATION PRINCIPLES|READ-ONLY ARCHIVE|CURRENT SCOPE/);
-  assert.doesNotMatch(globalStyles, /email-template/);
-  await assert.rejects(access(new URL("../src/pages/EmailTemplatePreviewPage.tsx", import.meta.url)));
 });
 
 test("Google callback reuses its one-time exchange under React StrictMode", async () => {

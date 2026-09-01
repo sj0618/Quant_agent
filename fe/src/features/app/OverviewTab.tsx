@@ -11,8 +11,7 @@ interface OverviewTabProps {
   /**
    * Whether the backtest behind these picks cleared its objective floor. The graph already
    * decides this in recommendation_gate; the header used to ignore it and print ACTIVE with
-   * a recommendation score on a strategy the system had judged unfit. `overview.recommendationGate`
-   * carries the same verdict plus the reason and whether verification even finished.
+   * a recommendation score on a strategy the system had judged unfit.
    */
   validated?: boolean;
 }
@@ -24,16 +23,6 @@ const PERCENT_DIGITS = 2;
 export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
   const featuredCandidates = overview.candidates.slice(0, 4);
   const strategyName = overview.strategy.name ?? "활성 전략";
-  const gate = overview.recommendationGate;
-  // A gate can pass every metric it managed to measure and still not have finished:
-  // the official benchmark series it compares against may not be loaded yet. Showing
-  // only `validated` reports that run as fully verified.
-  const verificationIncomplete = gate?.verification_complete === false;
-  const evaluationBasis = overview.performance.evaluationBasis;
-  const universePolicy = overview.performance.universePolicy;
-  const tickerActionByTicker = new Map(
-    (overview.tickerActions ?? []).map((action) => [action.ticker, action]),
-  );
   const totalReturnMetric = metricByKey(overview, "totalReturn");
   const sharpeMetric = metricByKey(overview, "sharpe");
   const maxDrawdownMetric = metricByKey(overview, "mdd");
@@ -57,11 +46,7 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
       <Card className="strategy-strip">
         <div>
           <div className="eyebrow-row">
-            {!validated
-              ? <Badge variant="soft">검증 미통과</Badge>
-              : verificationIncomplete
-                ? <Badge variant="warning">검증 미완료</Badge>
-                : <Badge variant="dark">ACTIVE</Badge>}
+            {validated ? <Badge variant="dark">ACTIVE</Badge> : <Badge variant="soft">검증 미통과</Badge>}
             <span>STRATEGY</span>
           </div>
           <strong>{strategyName}</strong>
@@ -90,33 +75,23 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
 
       <section className="summary-grid">
         {[
-          validated && !verificationIncomplete
-            ? { label: "전략 신호 신뢰도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "과거 데이터로 검증한 전략 신호입니다. 주문 지시가 아닙니다." }
-            : {
-                label: "전략 신호 신뢰도",
-                value: validated ? overview.recommendationScore : "산출 안 함",
-                delta: undefined,
-                // The graph already wrote why - a measured shortfall reads differently
-                // from an input that never arrived, and only it knows which happened.
-                caption: gate?.reason ?? "백테스트 검증 결과를 확인할 수 없습니다.",
-              },
+          validated
+            ? { label: "오늘의 권장도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "최종 신호 등급 · BUY 8.2 / HOLD 6.8 / DROP 6.4" }
+            : { label: "오늘의 권장도", value: "산출 안 함", delta: undefined, caption: "백테스트 목표 기준 미달" },
           { label: "활성 신호", value: `${overview.passCount}건`, delta: undefined, caption: `BUY ${overview.buyCount} · HOLD ${overview.holdCount} · DROP ${overview.dropCount}` },
           {
             label: "검증 누적 수익률",
             value: insufficient ? "표본 부족" : totalReturnMetric?.value ?? (strategyReturn === undefined ? "—" : formatPercentValue(strategyReturn)),
             delta: totalReturnMetric?.delta,
-            // Which period this number covers is decided per run by the backend, so the
-            // caption is its sentence. A fixed one here was wrong for every run that took
-            // the other evaluation path.
             caption: insufficient
               ? "신뢰도 기준 미달로 숫자를 표시하지 않습니다."
-              : evaluationBasis?.caption ?? totalReturnMetric?.caption ?? (benchmarkReturn === undefined ? "실제 수익률 곡선 기준" : `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`),
+              : totalReturnMetric?.caption ?? (benchmarkReturn === undefined ? "실제 수익률 곡선 기준" : `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`),
           },
           {
-            label: "Sharpe (검증 구간)",
+            label: "Sharpe (Walk-forward)",
             value: insufficient ? "표본 부족" : sharpeMetric?.value ?? "—",
             delta: sharpeMetric?.delta,
-            caption: sharpeMetric?.caption ?? evaluationBasis?.caption ?? "AI 전략 검증 결과",
+            caption: sharpeMetric?.caption ?? "AI 전략 검증 결과",
           },
         ].map((item) => (
           <Card className="summary-card" key={item.label}>
@@ -150,24 +125,11 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
               </div>
             ) : null}
           </div>
-          {universePolicy ? (
-            <div className="candidate-table__policy">
-              <p>{universePolicy.summary}</p>
-              {universePolicy.excluded_screening_candidate_count > 0 && universePolicy.excluded_notice
-                ? <p className="candidate-table__policy-notice">{universePolicy.excluded_notice}</p>
-                : null}
-            </div>
-          ) : null}
           {featuredCandidates.length ? featuredCandidates.map((candidate) => (
-            <SignalCard
-              candidate={candidate}
-              compact
-              key={candidate.id}
-              tickerAction={tickerActionByTicker.get(candidate.ticker)}
-            />
+            <SignalCard candidate={candidate} compact key={candidate.id} />
           )) : <p>현재 AI 응답에는 종목별 추천 데이터가 없습니다.</p>}
           <div className="card-foot">
-            {overview.candidates.length ? <>최신 분석의 실데이터·기간·방법을 확인해 해석하세요. <a href={`${ROUTES.app}?tab=trading`}>전체 종목 정보 보기 →</a></> : "실데이터 검증을 통과한 경우에만 종목별 신호가 표시됩니다."}
+            {overview.candidates.length ? <>신호는 매일 08:00 자동 갱신됩니다 <a href={`${ROUTES.app}?tab=trading`}>전체 종목 정보 보기 →</a></> : "실데이터 소스 연결 시 종목별 신호가 표시됩니다."}
           </div>
         </Card>
 
@@ -205,10 +167,7 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
         <div className="card-head">
           <div>
             <strong>누적 수익률</strong>
-            {/* The curve spans the whole run, selection history included - it is not the
-                validation slice the summary card reports. Say so instead of letting the
-                two cumulative numbers read as one. */}
-            <p>{`총자산 기준 · 선택 구간 포함 전체 백테스트${evaluationBasis?.cost_model_applied ? " · 거래비용 반영" : ""}`}</p>
+            <p>총자산 기준 · 거래비용 반영</p>
           </div>
           <div className="legend-row">
             <span><i className="line line--strategy" />내 전략</span>

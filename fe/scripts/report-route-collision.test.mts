@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseReportDetailId } from "../src/config/routes.ts";
+import { parseEmailReportDetailId, parseReportDetailId } from "../src/config/routes.ts";
 
 test("retired report route segments do not resolve to report detail ids", () => {
   assert.equal(parseReportDetailId("/reports/history"), null);
@@ -11,4 +11,11 @@ test("retired report route segments do not resolve to report detail ids", () => 
     parseReportDetailId("/reports/123e4567-e89b-12d3-a456-426614174000"),
     "123e4567-e89b-12d3-a456-426614174000",
   );
+});
+
+test("email delivery report route is distinct from the workspace report route", () => {
+  assert.equal(parseEmailReportDetailId("/me/email-reports/abc-123"), "abc-123");
+  assert.equal(parseEmailReportDetailId("/reports/abc-123"), null);
+  assert.equal(parseReportDetailId("/me/email-reports/abc-123"), null);
+  assert.equal(parseEmailReportDetailId("/me/email-reports/abc-123/extra"), null);
 });
