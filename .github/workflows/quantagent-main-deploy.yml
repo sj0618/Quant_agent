@@ -31,7 +31,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # The frontend test runner uses Node's TypeScript stripping support.
+          node-version: 22
           cache: npm
           cache-dependency-path: fe/package-lock.json
 
