@@ -1,0 +1,122 @@
+name: Deploy QuantAgent from main
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy the checked-out main revision after validation
+        required: true
+        type: boolean
+        default: true
+
+# A deployment must never overlap another deployment of the same service. Do not
+# cancel an in-progress rollout: its health check and rollback decision are part of
+# the release evidence.
+concurrency:
+  group: quantagent-main-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate frontend and AI contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: fe/package-lock.json
+
+      - name: Test and build frontend
+        working-directory: fe
+        run: |
+          npm ci
+          npm test
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Test parse-to-job execution contract
+        working-directory: ai
+        run: |
+          python -m pip install --disable-pip-version-check -e . pytest
+          pytest -q tests/test_research_contract.py tests/test_research_contract_api.py
+
+  deploy:
+    name: Deploy validated main revision
+    needs: validate
+    # Deploying is opt-in until repository secrets and variables are configured.
+    # This makes a push validate safely instead of attempting an unauthenticated SSH
+    # connection or silently falling back to another server.
+    if: >-
+      ${{
+        vars.QUANTAGENT_DEPLOY_ENABLED == 'true' &&
+        (github.event_name == 'push' || inputs.deploy)
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DEPLOY_HOST: ${{ secrets.QUANTAGENT_DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.QUANTAGENT_DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.QUANTAGENT_DEPLOY_SSH_KEY }}
+      DEPLOY_PATH: ${{ vars.QUANTAGENT_DEPLOY_PATH }}
+      DEPLOY_COMPOSE_FILE: ${{ vars.QUANTAGENT_DEPLOY_COMPOSE_FILE }}
+      DEPLOY_HEALTH_URL: ${{ vars.QUANTAGENT_DEPLOY_HEALTH_URL }}
+      DEPLOY_SHA: ${{ github.sha }}
+    steps:
+      - name: Verify deployment configuration without printing credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_PATH"
+          test -n "$DEPLOY_COMPOSE_FILE"
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME/.ssh"
+          printf '%s' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -H "$DEPLOY_HOST" >> "$HOME/.ssh/known_hosts"
+
+      - name: Deploy the exact validated revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          deploy_path_b64="$(printf '%s' "$DEPLOY_PATH" | base64 | tr -d '\n')"
+          deploy_compose_b64="$(printf '%s' "$DEPLOY_COMPOSE_FILE" | base64 | tr -d '\n')"
+          ssh -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "DEPLOY_PATH_B64=$deploy_path_b64 DEPLOY_COMPOSE_B64=$deploy_compose_b64 DEPLOY_SHA=$DEPLOY_SHA bash -s" <<'REMOTE'
+          set -euo pipefail
+          DEPLOY_PATH="$(printf '%s' "$DEPLOY_PATH_B64" | base64 --decode)"
+          DEPLOY_COMPOSE_FILE="$(printf '%s' "$DEPLOY_COMPOSE_B64" | base64 --decode)"
+          cd "$DEPLOY_PATH"
+          case "$(git remote get-url origin)" in
+            *sj0618/Quant_agent.git) ;;
+            *) echo "deployment checkout is not the approved Quant_agent repository" >&2; exit 1 ;;
+          esac
+          git fetch --depth=1 origin "$DEPLOY_SHA"
+          git checkout --detach "$DEPLOY_SHA"
+          test "$(git rev-parse HEAD)" = "$DEPLOY_SHA"
+          docker compose -f "$DEPLOY_COMPOSE_FILE" up -d --build --remove-orphans
+          REMOTE
+
+      - name: Check the configured public health endpoint
+        if: ${{ vars.QUANTAGENT_DEPLOY_HEALTH_URL != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 15 --retry 2 "$DEPLOY_HEALTH_URL" >/dev/null
