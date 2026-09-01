@@ -107,6 +107,19 @@ export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
   return response.json() as Promise<AnalysisJob>;
 }
 
+/**
+ * Returns only jobs owned by the authenticated browser user.  Unlike the legacy
+ * `/reports` archive this is the durable execution ledger endpoint. The server owns
+ * retention and pagination; this client intentionally presents the returned recent page
+ * rather than pretending it has every historical job locally.
+ */
+export async function getAnalysisJobs(limit = 50): Promise<AnalysisJob[]> {
+  const safeLimit = Math.min(Math.max(Math.trunc(limit), 1), 100);
+  const response = await requestCoreAnalysis(`${AI_ENDPOINTS.analysisJobs}?${new URLSearchParams({ limit: String(safeLimit) })}`);
+  const jobs = await response.json() as unknown;
+  return Array.isArray(jobs) ? jobs as AnalysisJob[] : [];
+}
+
 export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
   const response = await requestCoreAnalysis(AI_ENDPOINTS.analysisJobCancel(jobId), { method: "POST" });
   return response.json() as Promise<AnalysisJob>;
