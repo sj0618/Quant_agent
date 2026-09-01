@@ -13,6 +13,7 @@ export const ROUTES = {
   trust: "/trust",
   unsubscribe: "/unsubscribe",
   reportDetail: (id: string) => `/reports/${encodeURIComponent(id)}`,
+  analysisReportDetail: (jobId: string) => `/reports/${encodeURIComponent(`analysis:${jobId}`)}`,
 } as const;
 
 export function trustFeedback(resultId: string, version?: string | null) {
@@ -61,4 +62,13 @@ export function parseReportDetailId(pathname: string) {
   } catch {
     return null;
   }
+}
+
+export function parseAnalysisReportJobId(reportId: string) {
+  const prefix = "analysis:";
+  if (!reportId.startsWith(prefix)) {
+    return null;
+  }
+  const jobId = reportId.slice(prefix.length);
+  return jobId && !jobId.includes("/") ? jobId : null;
 }

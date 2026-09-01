@@ -12,6 +12,8 @@ import type {
 } from "@/types/quantagent";
 
 interface StrategyInputPanelProps {
+  /** The product dashboard keeps the strategy composer above the report area. */
+  presentation?: "sidebar" | "dashboard";
   /** Extra classes for the panel shell, used by the phone pane switch to hide it. */
   className?: string;
   history: ChatConversationPreview[];
@@ -51,6 +53,7 @@ const cardButtonClass =
   "w-full rounded-2xl border border-dark-line bg-dark-surface p-3 text-left transition-colors hover:border-cornflower/60";
 
 export function StrategyInputPanel({
+  presentation = "sidebar",
   className,
   history,
   strategy,
@@ -114,6 +117,62 @@ export function StrategyInputPanel({
 
   // An analysis is already in flight; a second submit would start a parallel paid run.
   const inputDisabled = submitting || running;
+
+  if (presentation === "dashboard") {
+    const recentMessages = messages.slice(-2);
+    return (
+      <section className={cn("strategy-composer", className)} aria-label="자연어 전략 입력">
+        <div className="strategy-composer__head">
+          <div>
+            <p>STRATEGY WORKSPACE</p>
+            <strong>자연어 전략을 입력해 검증하세요</strong>
+            <span>{activeStrategyLabel}</span>
+          </div>
+          <Button className="strategy-composer__new" onClick={handleNewConversation} size="sm" variant="secondary">
+            <Plus aria-hidden className="size-3.5" />새 전략
+          </Button>
+        </div>
+
+        {recentMessages.length ? (
+          <div className="strategy-composer__messages" aria-label="최근 전략 대화">
+            {recentMessages.map((message) => (
+              <p data-sender={message.sender} key={message.id}>
+                <strong>{message.label}</strong>
+                <span>{message.body}</span>
+              </p>
+            ))}
+          </div>
+        ) : null}
+
+        <form className="strategy-composer__form" onSubmit={handleSubmit}>
+          <label htmlFor="strategy-natural-language">전략 설명</label>
+          <div>
+            <input
+              id="strategy-natural-language"
+              aria-label="자연어 전략"
+              disabled={inputDisabled}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder={running ? "분석이 진행 중입니다" : "예: KRX 일봉에서 RSI 30 이하일 때 진입하고 70 이상일 때 청산해줘"}
+              required
+              value={draft}
+            />
+            {running && onCancel ? (
+              <button aria-label="분석 중단" className="strategy-composer__submit strategy-composer__submit--stop" disabled={cancelRequested} onClick={() => void onCancel()} type="button">
+                {cancelRequested ? <span>중단</span> : <Square aria-hidden className="size-3 fill-current" />}
+              </button>
+            ) : (
+              <button aria-label="전략 분석 요청" className="strategy-composer__submit" disabled={submitting} type="submit">
+                <ArrowUp aria-hidden className="size-4" />
+              </button>
+            )}
+          </div>
+          <small>입력한 조건은 실행 전 구조화해 확인하며, 과거 데이터 기반 분석은 실제 주문을 실행하지 않습니다.</small>
+          {submitError ? <small className="strategy-composer__error">{submitError}</small> : null}
+          {cancelError ? <small className="strategy-composer__error">{cancelError}</small> : null}
+        </form>
+      </section>
+    );
+  }
 
   return (
     <aside
