@@ -22,6 +22,7 @@ from ai_graph.jobs import (
     ParseBoundJobAdmission,
     ResearchAppendixOutboxMessage,
 )
+from ai_graph.immutable_results import ImmutableResultEvidence, read_immutable_result_evidence
 from ai_graph.schemas import APIEnvelope, ExecutionSpecV1OrV2, ExplorationExecutionSpecV2, Stage
 from ai_graph.exploration_policy import (
     load_active_exploration_policy,
@@ -169,6 +170,10 @@ class PostgresAnalysisJobRepository:
     def __init__(self, dsn: str, *, connector: Callable[..., Any] = psycopg.connect) -> None:
         self._dsn = dsn
         self._connector = connector
+
+    def immutable_result_evidence(self, job_id: str) -> ImmutableResultEvidence | None:
+        with self._connect() as connection:
+            return read_immutable_result_evidence(connection, job_id)
 
     def create_job(
         self,

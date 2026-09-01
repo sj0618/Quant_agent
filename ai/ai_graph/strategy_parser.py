@@ -128,6 +128,17 @@ def parse_natural_language_strategy(
     metrics = _metric_catalog(available_metrics)
     use_live_llm = is_live_llm_provider() if use_llm is None else use_llm
     if use_live_llm:
+        # A complete, supported rule does not need a second interpretation before it
+        # can be reviewed.  In particular, natural Korean RSI pairs such as
+        # ``RSI가 30 이하이고 RSI가 70 이상`` are already an unambiguous execution
+        # rule.  Sending them to the provider here made admission depend on an
+        # otherwise unnecessary network request and let a parser outage turn a valid
+        # strategy into a clarification/409 response.  Free-form or incomplete
+        # strategies still proceed to the live structured parser below, where the AI
+        # can interpret their domain context before the later research/backtest job.
+        deterministic = _deterministic_parse(query, metrics)
+        if _is_complete_supported_parse(deterministic):
+            return deterministic
         try:
             payload = (llm_client or create_llm_client(role="STRATEGY_PARSE")).generate_json(
                 _llm_request(query, metrics)
@@ -147,6 +158,23 @@ def parse_natural_language_strategy(
         ) as exc:
             raise StrategyParseError(f"strategy JSON validation failed: {type(exc).__name__}") from exc
     return _deterministic_parse(query, metrics)
+
+
+def _is_complete_supported_parse(result: StrategyParseResultV1) -> bool:
+    """Whether the bounded parser has an execution-ready result.
+
+    This is deliberately stricter than merely finding two numeric conditions: no
+    unsupported condition or pending clarification may bypass the AI-assisted review
+    path.  It only prevents redundant provider calls for a complete rule whose
+    semantics already fit the versioned execution contract.
+    """
+
+    return bool(
+        result.entry_conditions
+        and result.exit_conditions
+        and not result.unsupported_conditions
+        and not result.clarification_required
+    )
 
 
 def _llm_request(query: str, metrics: Sequence[str]) -> LLMJsonRequest:

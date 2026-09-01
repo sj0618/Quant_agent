@@ -1,0 +1,54 @@
+name: Isolated staging AI pipeline gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolated-staging-ai-pipeline-gate
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify three real PostgreSQL/AOAI analyses
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    # This GitHub environment must represent an isolated deployment of this SHA. The
+    # gate rejects the production host even when an HTTPS variable is supplied.
+    environment: ai-staging
+    env:
+      AI_STAGING_AI_API_BASE_URL: ${{ vars.AI_STAGING_AI_API_BASE_URL }}
+      AI_STAGING_BACKEND_API_BASE_URL: ${{ vars.AI_STAGING_BACKEND_API_BASE_URL }}
+      AI_STAGING_FE_ORIGIN: ${{ vars.AI_STAGING_FE_ORIGIN }}
+      AI_STAGING_EXPECTED_REVISION: ${{ github.sha }}
+      AI_STAGING_ACCOUNT_TOKEN: ${{ secrets.AI_STAGING_ACCOUNT_TOKEN }}
+      AI_STAGING_EVIDENCE_PROBE_TOKEN: ${{ secrets.AI_STAGING_EVIDENCE_PROBE_TOKEN }}
+      AI_STAGING_SESSION_COOKIE: ${{ secrets.AI_STAGING_SESSION_COOKIE }}
+      AI_STAGING_CSRF_TOKEN: ${{ secrets.AI_STAGING_CSRF_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the AI client and contract runner
+        run: python -m pip install --disable-pip-version-check ./ai
+
+      - name: Run the 3 x 30-second isolated-staging gate
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m ai_graph.staging_pipeline_gate \
+            | tee "$RUNNER_TEMP/isolated-staging-evidence.json"
+
+      - name: Preserve isolated-staging evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-staging-ai-pipeline-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/isolated-staging-evidence.json
+          if-no-files-found: ignore

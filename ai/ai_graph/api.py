@@ -59,7 +59,10 @@ from ai_graph.exploration_policy import (
 from ai_graph.graph import run_analysis
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
-from ai_graph.job_store_persistent import PersistentAnalysisJobStore
+from ai_graph.job_store_persistent import (
+    ImmutableResultEvidenceRepository,
+    PersistentAnalysisJobStore,
+)
 from ai_graph.jobs import (
     AI_JOB_STORE_ENV,
     PERSISTENT_JOB_STORE_MODE,
@@ -167,6 +170,7 @@ CORS_ALLOW_HEADERS = ["Authorization", "Content-Type"]
 RESEARCH_EXECUTION_ENABLED_ENV = "AI_RESEARCH_EXECUTION_ENABLED"
 DATA_EVIDENCE_PROBE_TOKEN_ENV = "AI_DATA_EVIDENCE_PROBE_TOKEN"
 DATA_EVIDENCE_PROBE_PATH = "/_operator/research-data-evidence"
+ANALYSIS_JOB_EVIDENCE_PROBE_PATH = "/_operator/analysis-job-evidence/{job_id}"
 DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
 READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
 REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
@@ -344,6 +348,24 @@ class DataEvidenceProbeResponse(BaseModel):
     reason_code: str | None = None
     facts: ResearchRuntimeFacts
     deployment_revision: str | None = None
+
+
+class AnalysisJobEvidenceProbeResponse(BaseModel):
+    """Secret-free immutable result proof used only by the isolated staging gate."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    job_id: str
+    execution_spec_version: Literal["strategy-execution-spec.v1"]
+    execution_spec_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    analysis_result_id: str
+    manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source: Literal["postgres"]
+    as_of: str = Field(min_length=1)
+    observations: int = Field(gt=0)
+    candidate_count: int = Field(ge=0)
+    successful_aoai_calls: int = Field(ge=0)
+    immutable_trigger_present: bool
 
 
 PreflightRejectionResponse = ScopeRefusalV1 | UnsupportedScopeV1
@@ -549,6 +571,7 @@ class APIStatusResponse(BaseModel):
     data_source: DataSourceStatus
     job_store: JobStoreStatus
     endpoints: list[EndpointStatus]
+    deployment_revision: str | None = None
 
 
 def _build_analysis_runner_with_audit(
@@ -897,6 +920,7 @@ def create_app(
     exploration_policy_resolver: Callable[[], ActiveExplorationPolicyV2] | None = None,
     research_appendix_runner: Callable[[AnalysisJob], Mapping[str, object] | None]
     | None = None,
+    immutable_result_evidence_probe: Callable[[str], Mapping[str, object] | None] | None = None,
 ) -> FastAPI:
     runtime = job_store_runtime or _job_store_runtime(job_store)
     store = runtime.store
@@ -1044,6 +1068,36 @@ def create_app(
                 deployment_revision=(environ.get(DEPLOYMENT_REVISION_ENV) or "").strip() or None,
             )
 
+    evidence_reader = immutable_result_evidence_probe
+    if evidence_reader is None and isinstance(store, ImmutableResultEvidenceRepository):
+        evidence_reader = store.immutable_result_evidence
+    if evidence_reader is not None:
+        @app.get(
+            ANALYSIS_JOB_EVIDENCE_PROBE_PATH,
+            response_model=AnalysisJobEvidenceProbeResponse,
+            include_in_schema=False,
+        )
+        def analysis_job_evidence_probe(
+            job_id: str,
+            x_ai_evidence_probe: str | None = Header(default=None),
+        ) -> AnalysisJobEvidenceProbeResponse:
+            if not probe_token or not x_ai_evidence_probe or not secrets.compare_digest(
+                x_ai_evidence_probe, probe_token
+            ):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            try:
+                evidence = evidence_reader(job_id)
+            except Exception:  # noqa: BLE001 - never disclose database details on a probe.
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="immutable result evidence unavailable",
+                ) from None
+            if evidence is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            if hasattr(evidence, "__dict__"):
+                evidence = vars(evidence)
+            return AnalysisJobEvidenceProbeResponse.model_validate(evidence)
+
     # async on purpose: a sync handler runs in the same anyio worker pool the analysis
     # background tasks occupy, so a burst of analyses used to make liveness time out and
     # the service look dead to whatever was watching it. Neither of these touches the
@@ -1079,6 +1133,7 @@ def create_app(
             data_source=_data_source_status(),
             job_store=_job_store_status(runtime),
             endpoints=_endpoint_statuses(production_runtime=_production_runtime()),
+            deployment_revision=(environ.get(DEPLOYMENT_REVISION_ENV) or "").strip() or None,
         )
 
     @app.post(

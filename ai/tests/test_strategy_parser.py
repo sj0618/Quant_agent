@@ -60,6 +60,28 @@ def test_live_json_selects_only_server_metrics_and_records_unsupported_condition
     assert "natural_language" in client.requests[0].user_prompt
 
 
+def test_live_parser_keeps_an_unambiguous_korean_rsi_pair_out_of_the_provider() -> None:
+    """A provider outage must not turn a complete RSI rule into a 409 admission."""
+
+    client = _StructuredClient(_payload())
+
+    result = parse_natural_language_strategy(
+        "RSI가 30 이하이고 RSI가 70 이상인 일반 조건식을 검토해 주세요.",
+        available_metrics=["rsi", "sma20"],
+        llm_client=client,
+        use_llm=True,
+    )
+
+    assert [(item.metric, item.comparator, item.value) for item in result.entry_conditions] == [
+        ("rsi", "lte", 30.0)
+    ]
+    assert [(item.metric, item.comparator, item.value) for item in result.exit_conditions] == [
+        ("rsi", "gte", 70.0)
+    ]
+    assert result.clarification_required is False
+    assert client.requests == []
+
+
 def test_live_json_schema_errors_never_become_a_parseable_rule() -> None:
     client = _StructuredClient({**_payload(), "unexpected": True})
 

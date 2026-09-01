@@ -86,6 +86,14 @@ class RestartReconciliationRepository(Protocol):
         ...
 
 
+@runtime_checkable
+class ImmutableResultEvidenceRepository(Protocol):
+    def immutable_result_evidence(self, job_id: str) -> Any | None:
+        """Return the safe operator evidence projection for a completed job."""
+
+        ...
+
+
 class PersistentAnalysisJobStore:
     """Adapter over the DB-team-owned analysis job repository contract."""
 
@@ -192,6 +200,13 @@ class PersistentAnalysisJobStore:
 
     def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
         return self._repository.list_jobs(limit=limit)
+
+    def immutable_result_evidence(self, job_id: str) -> Any | None:
+        if not isinstance(self._repository, ImmutableResultEvidenceRepository):
+            raise JobStoreConfigurationError(
+                "PersistentAnalysisJobStore requires immutable-result evidence support."
+            )
+        return self._repository.immutable_result_evidence(job_id)
 
     def register_parse_token(
         self,

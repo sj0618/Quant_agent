@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 from ai_graph.api import (
     AI_CORS_ALLOW_ORIGINS_ENV,
+    ANALYSIS_JOB_EVIDENCE_PROBE_PATH,
     ANALYSIS_JOB_CANCEL_PATH,
     ANALYSIS_JOB_DETAIL_PATH,
     ANALYSIS_JOBS_PATH,
@@ -252,6 +253,45 @@ def test_api_status_exposes_data_source_without_dsn_value(monkeypatch) -> None:
     assert data_source["price_source"] == "feature.kis_adjusted_ohlcv_daily"
     assert response.json()["job_store"]["active_mode"] == "memory"
     assert "secret" not in str(response.json()["job_store"])
+
+
+def test_isolated_staging_evidence_probe_requires_the_operator_token_and_projects_no_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AI_DATA_EVIDENCE_PROBE_TOKEN", "operator-test-token")
+    monkeypatch.setenv("AI_AUDIT_GATE_B_DEPLOYMENT_REVISION", "a" * 40)
+    evidence = {
+        "job_id": "job-1",
+        "execution_spec_version": "strategy-execution-spec.v1",
+        "execution_spec_hash": "b" * 64,
+        "analysis_result_id": "result-1",
+        "manifest_hash": "c" * 64,
+        "source": "postgres",
+        "as_of": "2026-08-28",
+        "observations": 500,
+        "candidate_count": 2,
+        "successful_aoai_calls": 1,
+        "immutable_trigger_present": True,
+    }
+    client = TestClient(
+        create_app(
+            InMemoryAnalysisJobStore(),
+            immutable_result_evidence_probe=lambda _job_id: evidence,
+        )
+    )
+
+    denied = client.get(ANALYSIS_JOB_EVIDENCE_PROBE_PATH.format(job_id="job-1"))
+    accepted = client.get(
+        ANALYSIS_JOB_EVIDENCE_PROBE_PATH.format(job_id="job-1"),
+        headers={"X-AI-Evidence-Probe": "operator-test-token"},
+    )
+    status = client.get(API_STATUS_PATH)
+
+    assert denied.status_code == 404
+    assert accepted.status_code == 200
+    assert accepted.json() == evidence
+    assert status.json()["deployment_revision"] == "a" * 40
+    assert "operator-test-token" not in accepted.text
 
 
 def test_api_status_uses_database_url_alias_for_data_source(monkeypatch) -> None:
