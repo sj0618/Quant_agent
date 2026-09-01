@@ -16,12 +16,20 @@ export class CoreAnalysisApiError extends Error {
 interface StrategyExecutionSpecV1 {
   market: "KRX";
   timeframe: "daily";
-  entry_conditions: Array<{ metric: "rsi"; comparator: "lte" | "gte"; value: number; role: "entry" }>;
-  exit_conditions: Array<{ metric: "rsi"; comparator: "lte" | "gte"; value: number; role: "exit" }>;
+  entry_conditions: Array<{ metric: string; comparator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne"; value: number; lookback: number; role: "entry" }>;
+  exit_conditions: Array<{ metric: string; comparator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne"; value: number; lookback: number; role: "exit" }>;
 }
 
-interface RuleDraftOutcome {
+export interface RuleDraftOutcome {
   kind: "rule_draft";
+  market: "KRX";
+  timeframe: "daily";
+  entry_conditions: StrategyExecutionSpecV1["entry_conditions"];
+  exit_conditions: StrategyExecutionSpecV1["exit_conditions"];
+  unsupported_conditions: Array<{ condition: string; reason: string }>;
+  clarification_required: boolean;
+  explanation: string;
+  indicator_selections: Array<{ metric: string; reason: string }>;
   editable_summary: string;
   clarifications: Array<{ label: string; reason: string }>;
   is_executable: boolean;
@@ -31,7 +39,7 @@ interface RuleDraftOutcome {
   parse_token?: string;
 }
 
-type ParseOutcome = RuleDraftOutcome | { kind: "scope_refusal" | "unsupported_scope"; explanation: string };
+export type ParseOutcome = RuleDraftOutcome | { kind: "scope_refusal" | "unsupported_scope"; explanation: string };
 
 export class StrategyClarificationRequiredError extends Error {
   constructor(outcome: RuleDraftOutcome) {
@@ -63,8 +71,8 @@ async function requestCoreAnalysis(path: string, init: RequestInit = {}): Promis
   }
 }
 
-/** Submit the primary natural-language strategy workflow. Browser state is never used as a result fallback. */
-export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
+/** Parse only; no job is created until the caller confirms the returned draft. */
+export async function reviewStrategy(query: string): Promise<ParseOutcome> {
   const normalizedQuery = query.trim();
   if (!normalizedQuery) {
     throw new Error("분석할 자연어 전략을 입력하세요.");
@@ -75,11 +83,15 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
     body: JSON.stringify({ natural_language: normalizedQuery }),
   });
   const parsed = await parseResponse.json() as ParseOutcome;
-  if (parsed.kind !== "rule_draft") {
-    throw new Error(parsed.explanation);
-  }
+  return parsed;
+}
+
+/** Queue only a server-validated draft that the user has explicitly confirmed. */
+export async function createConfirmedAnalysisJob(parsed: RuleDraftOutcome): Promise<AnalysisJob> {
   if (
     !parsed.is_executable
+    || parsed.clarification_required
+    || parsed.unsupported_conditions.length > 0
     || !parsed.strategy_execution_spec
     || !parsed.spec_version
     || !parsed.spec_hash
@@ -100,6 +112,15 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
     }),
   });
   return response.json() as Promise<AnalysisJob>;
+}
+
+/** Compatibility wrapper; new UI callers use reviewStrategy + confirmation. */
+export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
+  const parsed = await reviewStrategy(query);
+  if (parsed.kind !== "rule_draft") {
+    throw new Error(parsed.explanation);
+  }
+  return createConfirmedAnalysisJob(parsed);
 }
 
 export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {

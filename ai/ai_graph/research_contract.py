@@ -13,7 +13,7 @@ import base64
 import hashlib
 import hmac
 import json
-import re
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -22,7 +22,15 @@ from threading import Lock
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from ai_graph.strategy_parser import (
+    IndicatorSelectionV1,
+    StrategyParseError,
+    StrategyParseResultV1,
+    UnsupportedStrategyConditionV1,
+    parse_natural_language_strategy,
+)
 
 RULE_DRAFT_SCHEMA_VERSION = "research-rule-draft.v1"
 STRATEGY_EXECUTION_SPEC_VERSION = "strategy-execution-spec.v1"
@@ -35,7 +43,7 @@ DEFAULT_RULE_DRAFT_TTL_SECONDS = 600
 
 
 class RuleConditionV1(BaseModel):
-    """One deterministic, user-editable research condition.
+    """One user-editable research condition.
 
     ``entry`` and ``exit`` describe rule boundaries only; they are intentionally not
     trading instructions and are never rendered as order actions.
@@ -43,10 +51,27 @@ class RuleConditionV1(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    metric: Literal["rsi"]
-    comparator: Literal["lte", "gte"]
-    value: float = Field(gt=0.0, le=100.0)
+    metric: str = Field(min_length=1, max_length=64)
+    comparator: Literal["lt", "lte", "gt", "gte", "eq", "ne"]
+    value: float
+    lookback: int = Field(default=14, ge=1, le=2000)
     role: Literal["entry", "exit"]
+
+    @field_validator("value")
+    @classmethod
+    def finite_value(cls, value: float) -> float:
+        if not math.isfinite(value) or abs(value) > 1_000_000_000:
+            raise ValueError("condition value is outside the supported range")
+        return value
+
+    @model_validator(mode="after")
+    def metric_value_range(self) -> RuleConditionV1:
+        metric = self.metric.strip().lower().replace("-", "_")
+        if metric in {"rsi", "rsi_14", "mfi", "stoch_k", "stoch_d"} and not 0 <= self.value <= 100:
+            raise ValueError("bounded oscillator value is outside the supported range")
+        if metric == "willr" and not -100 <= self.value <= 0:
+            raise ValueError("willr value is outside the supported range")
+        return self
 
 
 class CanonicalRuleV1(BaseModel):
@@ -92,11 +117,21 @@ class RuleDraftV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal["rule_draft"] = "rule_draft"
+    market: Literal["KRX"] = "KRX"
+    timeframe: Literal["daily"] = "daily"
+    entry_conditions: list[RuleConditionV1] = Field(default_factory=list, max_length=3)
+    exit_conditions: list[RuleConditionV1] = Field(default_factory=list, max_length=3)
+    unsupported_conditions: list[UnsupportedStrategyConditionV1] = Field(
+        default_factory=list, max_length=10
+    )
+    clarification_required: bool = False
+    explanation: str = Field(min_length=1, max_length=500)
+    indicator_selections: list[IndicatorSelectionV1] = Field(default_factory=list, max_length=6)
     canonical_rule: CanonicalRuleV1 | None = None
     editable_summary: str = Field(min_length=1, max_length=500)
     clarifications: list[ClarificationChoiceV1] = Field(default_factory=list, max_length=3)
     is_executable: bool
-    authoring_method: Literal["deterministic"] = "deterministic"
+    authoring_method: Literal["deterministic", "llm"] = "deterministic"
     schema_version: Literal[RULE_DRAFT_SCHEMA_VERSION] = RULE_DRAFT_SCHEMA_VERSION
     policy_hash: str = Field(min_length=64, max_length=64)
     expires_at: datetime
@@ -114,6 +149,14 @@ class RuleDraftV1(BaseModel):
         if self.is_executable:
             if self.canonical_rule is None or not self.canonical_rule.is_executable:
                 raise ValueError("executable drafts require entry and exit conditions")
+            if self.clarification_required:
+                raise ValueError("executable drafts cannot require clarification")
+            if self.unsupported_conditions:
+                raise ValueError("executable drafts cannot contain unsupported conditions")
+            if self.entry_conditions != self.canonical_rule.entry_conditions:
+                raise ValueError("draft conditions must match the canonical rule")
+            if self.exit_conditions != self.canonical_rule.exit_conditions:
+                raise ValueError("draft conditions must match the canonical rule")
             if self.clarifications:
                 raise ValueError("executable drafts cannot carry clarification choices")
             if self.strategy_execution_spec != self.canonical_rule:
@@ -319,18 +362,57 @@ def build_rule_draft(
     user_id: str,
     signer: RuleDraftSigner,
     now: datetime | None = None,
+    available_metrics: list[str] | tuple[str, ...] | None = None,
+    llm_client: object | None = None,
+    use_llm: bool | None = None,
 ) -> RuleDraftV1:
-    """Make a bounded deterministic RSI rule review without retaining raw input."""
+    """Make a bounded natural-language rule review without retaining raw input."""
 
-    rule = _parse_rsi_rule(query)
-    clarifications = _clarifications_for(rule)
+    parser_uses_llm = use_llm if use_llm is not None else _live_parser_enabled()
+    authoring_method = "llm" if parser_uses_llm else "deterministic"
+    try:
+        parsed = parse_natural_language_strategy(
+            query,
+            available_metrics=available_metrics,
+            llm_client=llm_client,  # type: ignore[arg-type]
+            use_llm=use_llm,
+        )
+    except StrategyParseError as exc:
+        parsed = StrategyParseResultV1(
+            clarification_required=True,
+            explanation="조건을 허용된 JSON 구조로 해석하지 못했습니다. 지표와 수치를 다시 입력해 주세요.",
+            unsupported_conditions=[
+                UnsupportedStrategyConditionV1(
+                    condition="입력 조건",
+                    reason=f"구조화 실패({type(exc).__name__})",
+                )
+            ],
+        )
+    rule = _canonical_rule_from_parse(parsed)
+    clarifications = _clarifications_for(rule, parsed)
+    executable = bool(
+        rule
+        and rule.is_executable
+        and not parsed.clarification_required
+        and not parsed.unsupported_conditions
+    )
+    # ``draft_token`` is a review token for every response; ``parse_token`` below is
+    # the one-shot execution token and is deliberately absent for incomplete parses.
     signed = signer.issue(rule=rule, user_id=user_id, now=now)
-    executable = bool(rule and rule.is_executable)
     return RuleDraftV1(
+        market=parsed.market,
+        timeframe=parsed.timeframe,
+        entry_conditions=[RuleConditionV1.model_validate(item.model_dump()) for item in parsed.entry_conditions],
+        exit_conditions=[RuleConditionV1.model_validate(item.model_dump()) for item in parsed.exit_conditions],
+        unsupported_conditions=parsed.unsupported_conditions,
+        clarification_required=parsed.clarification_required or not executable,
+        explanation=parsed.explanation,
+        indicator_selections=parsed.indicator_selections,
         canonical_rule=rule,
         editable_summary=_editable_summary(rule),
         clarifications=clarifications,
         is_executable=executable,
+        authoring_method=authoring_method,
         policy_hash=RULE_DRAFT_POLICY_HASH,
         expires_at=signed.expires_at,
         draft_token=signed.token,
@@ -466,36 +548,37 @@ def unavailable_result_for_unverified_job(*, job_id: str) -> ResearchUnavailable
     )
 
 
-_RSI_LTE = re.compile(
-    r"rsi\s*(?:가|는|은)?\s*(\d+(?:\.\d+)?)\s*(?:이하|미만|below|under|<=|<)",
-    re.IGNORECASE,
-)
-_RSI_GTE = re.compile(
-    r"rsi\s*(?:가|는|은)?\s*(\d+(?:\.\d+)?)\s*(?:이상|초과|above|over|>=|>)",
-    re.IGNORECASE,
-)
+def _live_parser_enabled() -> bool:
+    from ai_graph.llm import is_live_llm_provider
+
+    return is_live_llm_provider()
 
 
-def _parse_rsi_rule(query: str) -> CanonicalRuleV1 | None:
-    entry_conditions = [
-        RuleConditionV1(metric="rsi", comparator="lte", value=float(match.group(1)), role="entry")
-        for match in _RSI_LTE.finditer(query)
-    ][:3]
-    exit_conditions = [
-        RuleConditionV1(metric="rsi", comparator="gte", value=float(match.group(1)), role="exit")
-        for match in _RSI_GTE.finditer(query)
-    ][:3]
-    if not entry_conditions and not exit_conditions:
+def _canonical_rule_from_parse(parsed: StrategyParseResultV1) -> CanonicalRuleV1 | None:
+    if not parsed.entry_conditions and not parsed.exit_conditions:
         return None
     return CanonicalRuleV1(
-        entry_conditions=entry_conditions,
-        exit_conditions=exit_conditions,
+        market=parsed.market,
+        timeframe=parsed.timeframe,
+        entry_conditions=[RuleConditionV1.model_validate(item.model_dump()) for item in parsed.entry_conditions],
+        exit_conditions=[RuleConditionV1.model_validate(item.model_dump()) for item in parsed.exit_conditions],
     )
 
 
-def _clarifications_for(rule: CanonicalRuleV1 | None) -> list[ClarificationChoiceV1]:
+def _clarifications_for(
+    rule: CanonicalRuleV1 | None,
+    parsed: StrategyParseResultV1 | None = None,
+) -> list[ClarificationChoiceV1]:
+    choices: list[ClarificationChoiceV1] = []
+    if parsed is not None and parsed.unsupported_conditions:
+        choices.append(
+            ClarificationChoiceV1(
+                label="사용 가능한 지표로 조건 수정",
+                reason="서버에 없는 지표는 백테스트에 사용할 수 없습니다.",
+            )
+        )
     if rule is None:
-        return [
+        choices.extend([
             ClarificationChoiceV1(
                 label="진입 지표와 수치 추가",
                 reason="조건 일치 여부를 계산하려면 하나 이상의 진입 조건이 필요합니다.",
@@ -504,22 +587,23 @@ def _clarifications_for(rule: CanonicalRuleV1 | None) -> list[ClarificationChoic
                 label="종료 또는 평가 조건 추가",
                 reason="과거 시뮬레이션의 평가 범위를 정하려면 종료 조건이 필요합니다.",
             ),
-        ]
+        ])
+        return choices[:3]
     if not rule.entry_conditions:
-        return [
+        choices.append(
             ClarificationChoiceV1(
                 label="진입 조건 추가",
                 reason="조건 일치 여부를 계산하려면 하나 이상의 진입 조건이 필요합니다.",
             )
-        ]
+        )
     if not rule.exit_conditions:
-        return [
+        choices.append(
             ClarificationChoiceV1(
                 label="종료 또는 평가 조건 추가",
                 reason="과거 시뮬레이션의 평가 범위를 정하려면 종료 조건이 필요합니다.",
             )
-        ]
-    return []
+        )
+    return choices[:3]
 
 
 def _editable_summary(rule: CanonicalRuleV1 | None) -> str:
@@ -534,8 +618,16 @@ def _editable_summary(rule: CanonicalRuleV1 | None) -> str:
 
 
 def _condition_summary(condition: RuleConditionV1) -> str:
-    operator = "이하" if condition.comparator == "lte" else "이상"
-    return f"RSI {condition.value:g} {operator}"
+    operators = {
+        "lt": "미만",
+        "lte": "이하",
+        "gt": "초과",
+        "gte": "이상",
+        "eq": "같음",
+        "ne": "다름",
+    }
+    lookback = f" ({condition.lookback}일)" if condition.lookback != 14 else ""
+    return f"{condition.metric.upper()} {condition.value:g} {operators[condition.comparator]}{lookback}"
 
 
 def _condition_clause(condition: RuleConditionV1) -> str:

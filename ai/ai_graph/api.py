@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from os import environ
 from threading import Lock
@@ -44,6 +44,7 @@ from ai_graph.data_sources.db import (
     BOK_MACRO_VIEW,
     KIS_ADJUSTED_OHLCV_TABLE,
     SYMBOL_MASTER_TABLE,
+    available_indicator_metrics_from_env,
     is_release_profile,
     measure_research_runtime_facts_from_env,
     resolve_database_dsn_from_env,
@@ -786,6 +787,7 @@ def create_app(
     draft_nonce_registry: InMemoryDraftNonceRegistry | None = None,
     research_execution_enabled: bool | None = None,
     readiness_migration_probe: Callable[[], bool] | None = None,
+    indicator_catalog_resolver: Callable[[], Sequence[str] | None] | None = None,
 ) -> FastAPI:
     runtime = job_store_runtime or _job_store_runtime(job_store)
     store = runtime.store
@@ -867,6 +869,17 @@ def create_app(
     app.state.job_cancellations = CancellationRegistry()
     app.state.audit_sink = resolve_audit_sink(audit_sink)
     app.state.rule_draft_signer = rule_draft_signer or RuleDraftSigner.from_env()
+    app.state.indicator_catalog_resolver = (
+        indicator_catalog_resolver or _resolve_indicator_catalog
+    )
+    app.state.indicator_catalog_uses_server = bool(
+        indicator_catalog_resolver or resolve_database_dsn_from_env()[0]
+    )
+    from ai_graph.llm import is_live_llm_provider
+
+    app.state.strategy_parser_uses_llm = bool(
+        app.state.indicator_catalog_uses_server and is_live_llm_provider()
+    )
     app.state.draft_nonce_registry = draft_nonce_registry or InMemoryDraftNonceRegistry()
     app.state.core_job_idempotency_registry = _CoreJobIdempotencyRegistry()
     app.state.research_execution_enabled = (
@@ -1348,10 +1361,29 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Research rule review is temporarily unavailable.",
             )
+        if _production_runtime() and not resolve_database_dsn_from_env()[0] and not runtime.dsn_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Server indicator data is temporarily unavailable.",
+            )
+        try:
+            available_metrics = app.state.indicator_catalog_resolver()
+        except Exception:  # noqa: BLE001 - parser admission must fail closed on data errors.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Server indicator data is temporarily unavailable.",
+            ) from None
+        if not available_metrics:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Server indicator data is temporarily unavailable.",
+            )
         outcome = build_rule_draft(
             query=request.request_text,
             user_id=user_id,
             signer=signer,
+            available_metrics=available_metrics,
+            use_llm=app.state.strategy_parser_uses_llm,
         )
         if outcome.is_executable:
             if _production_runtime():
@@ -1663,7 +1695,7 @@ def _endpoint_statuses(*, production_runtime: bool | None = None) -> list[Endpoi
             method="POST",
             path=SPEC_STRATEGY_PARSE_PATH,
             state="available",
-            summary="Deterministic research-rule review; it never creates an analysis job.",
+            summary="Natural-language strategy review against the configured server indicator catalog.",
         ),
         EndpointStatus(
             method="POST",
@@ -1728,6 +1760,20 @@ def _production_runtime() -> bool:
     # Delegates so the API layer and the data layer cannot disagree about what a
     # release profile is; the fixture guard in `data_sources.db` reads the same answer.
     return is_release_profile()
+
+
+def _resolve_indicator_catalog() -> list[str] | None:
+    """Use measured PostgreSQL indicators when configured; keep local review usable."""
+
+    dsn, _ = resolve_database_dsn_from_env()
+    if dsn:
+        return available_indicator_metrics_from_env()
+    from ai_graph.nodes.condition_compiler import supported_metrics
+
+    # The release execution gate below still requires PostgreSQL before a job can run;
+    # keeping the static vocabulary here lets an operator inspect a draft while the
+    # catalog connection is being provisioned.
+    return supported_metrics()
 
 
 def _data_source_status() -> DataSourceStatus:

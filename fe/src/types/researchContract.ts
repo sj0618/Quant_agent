@@ -4,10 +4,21 @@ export interface ResearchClarificationChoiceV1 {
 }
 
 export interface ResearchRuleConditionV1 {
-  metric: "rsi";
-  comparator: "lte" | "gte";
+  metric: string;
+  comparator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne";
   value: number;
+  lookback: number;
   role: "entry" | "exit";
+}
+
+export interface ResearchUnsupportedConditionV1 {
+  condition: string;
+  reason: string;
+}
+
+export interface ResearchIndicatorSelectionV1 {
+  metric: string;
+  reason: string;
 }
 
 export interface CanonicalResearchRuleV1 {
@@ -19,11 +30,19 @@ export interface CanonicalResearchRuleV1 {
 
 export interface ResearchRuleDraftV1 {
   kind: "rule_draft";
+  market: "KRX";
+  timeframe: "daily";
+  entry_conditions: ResearchRuleConditionV1[];
+  exit_conditions: ResearchRuleConditionV1[];
+  unsupported_conditions: ResearchUnsupportedConditionV1[];
+  clarification_required: boolean;
+  explanation: string;
+  indicator_selections: ResearchIndicatorSelectionV1[];
   canonical_rule: CanonicalResearchRuleV1 | null;
   editable_summary: string;
   clarifications: ResearchClarificationChoiceV1[];
   is_executable: boolean;
-  authoring_method: "deterministic";
+  authoring_method: "deterministic" | "llm";
   schema_version: string;
   policy_hash: string;
   expires_at: string;

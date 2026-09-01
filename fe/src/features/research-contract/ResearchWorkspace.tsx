@@ -156,6 +156,29 @@ function RuleDraftReview({
     <section aria-labelledby="rule-review-title" className="research-workspace__review">
       <h2 id="rule-review-title">검토된 조건식</h2>
       <p>{draft.editable_summary}</p>
+      <p>{draft.explanation}</p>
+      <ConditionList title="진입 조건" conditions={draft.entry_conditions} />
+      <ConditionList title="종료 조건" conditions={draft.exit_conditions} />
+      {draft.indicator_selections.length ? (
+        <section aria-label="선택한 지표">
+          <h3>선택한 지표</h3>
+          <ul>
+            {draft.indicator_selections.map((selection) => (
+              <li key={selection.metric}><strong>{selection.metric}</strong> · {selection.reason}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      {draft.unsupported_conditions.length ? (
+        <section aria-label="사용하지 못한 조건">
+          <h3>사용하지 못한 조건</h3>
+          <ul>
+            {draft.unsupported_conditions.map((item) => (
+              <li key={`${item.condition}:${item.reason}`}><strong>{item.condition}</strong> · {item.reason}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
       {draft.clarifications.length ? (
         <ul>
           {draft.clarifications.map((choice) => (
@@ -172,6 +195,30 @@ function RuleDraftReview({
       ) : (
         <p>조건식을 보완하면 다음 단계로 진행할 수 있습니다.</p>
       )}
+    </section>
+  );
+}
+
+function ConditionList({
+  title,
+  conditions,
+}: {
+  title: string;
+  conditions: ResearchRuleDraftV1["entry_conditions"];
+}) {
+  if (!conditions.length) {
+    return null;
+  }
+  return (
+    <section aria-label={title}>
+      <h3>{title}</h3>
+      <ul>
+        {conditions.map((condition, index) => (
+          <li key={`${condition.metric}:${condition.comparator}:${condition.value}:${index}`}>
+            {condition.metric} {condition.comparator} {condition.value} · {condition.lookback}일
+          </li>
+        ))}
+      </ul>
     </section>
   );
 }

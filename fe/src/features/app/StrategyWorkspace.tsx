@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { cancelAnalysisJob, createAnalysisJob, getAnalysisJob } from "../../api/quantAgentClient";
+import {
+  cancelAnalysisJob,
+  createConfirmedAnalysisJob,
+  getAnalysisJob,
+  reviewStrategy,
+  type RuleDraftOutcome,
+} from "../../api/quantAgentClient";
 import { Tabs, type TabItem } from "../../components/common/Tabs";
 import type { AnalysisJob } from "../../types/quantagent";
 import { OverviewTab } from "./OverviewTab";
@@ -19,15 +25,19 @@ const TAB_ITEMS: Array<TabItem<WorkspaceTab>> = [
 ];
 
 /**
- * The core product workspace submits a natural-language strategy, polls the durable
- * server job, and renders only that terminal public result. Browser state is never a
- * result fallback, so a refresh cannot turn a fixture or stale cache into a backtest.
+ * The core product workspace reviews a natural-language strategy, waits for explicit
+ * confirmation, then polls the durable server job. Browser state is never a result
+ * fallback, so a refresh cannot turn a fixture or stale cache into a backtest.
+ * The compatibility `createAnalysisJob` helper is intentionally not called here;
+ * review and confirmation stay separate in the product flow.
  */
 export function StrategyWorkspace() {
   const [job, setJob] = useState<AnalysisJob | null>(null);
+  const [draft, setDraft] = useState<RuleDraftOutcome | null>(null);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("overview");
   const [requestError, setRequestError] = useState<string | null>(null);
   const [cancelRequested, setCancelRequested] = useState(false);
+  const [confirming, setConfirming] = useState(false);
 
   useEffect(() => {
     if (!job || job.result) return undefined;
@@ -60,7 +70,27 @@ export function StrategyWorkspace() {
     setRequestError(null);
     setCancelRequested(false);
     setActiveTab("overview");
-    setJob(await createAnalysisJob(query));
+    const review = await reviewStrategy(query);
+    if (review.kind !== "rule_draft") {
+      throw new Error(review.explanation);
+    }
+    setDraft(review);
+    setJob(null);
+  };
+
+  const confirmDraft = async () => {
+    if (!draft) return;
+    setRequestError(null);
+    setConfirming(true);
+    try {
+      const confirmedJob = await createConfirmedAnalysisJob(draft);
+      setDraft(null);
+      setJob(confirmedJob);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "백테스트 요청을 처리할 수 없습니다.");
+    } finally {
+      setConfirming(false);
+    }
   };
 
   const cancel = async () => {
@@ -86,6 +116,8 @@ export function StrategyWorkspace() {
         onCancel={cancel}
         onNewConversation={() => {
           setJob(null);
+          setDraft(null);
+          setConfirming(false);
           setRequestError(null);
           setCancelRequested(false);
           setActiveTab("overview");
@@ -95,8 +127,9 @@ export function StrategyWorkspace() {
         strategy={overview.strategy}
       />
       <main className="workspace-main">
-        {!job ? <WorkspaceIntro /> : null}
+        {!job && !draft ? <WorkspaceIntro /> : null}
         {job && running ? <WorkspaceProgress cancelRequested={cancelRequested} job={job} /> : null}
+        {draft ? <StrategyDraftConfirmation confirming={confirming} draft={draft} onConfirm={() => void confirmDraft()} /> : null}
         {job && result && !ready ? <TerminalFailure job={job} /> : null}
         {ready ? (
           <>
@@ -118,6 +151,54 @@ export function StrategyWorkspace() {
         ) : null}
       </main>
     </div>
+  );
+}
+
+function StrategyDraftConfirmation({
+  draft,
+  confirming,
+  onConfirm,
+}: {
+  draft: RuleDraftOutcome;
+  confirming: boolean;
+  onConfirm: () => void;
+}) {
+  const conditionText = (
+    condition: RuleDraftOutcome["entry_conditions"][number] | RuleDraftOutcome["exit_conditions"][number],
+  ) =>
+    `${condition.metric} ${condition.comparator} ${condition.value} · ${condition.lookback}일`;
+  return (
+    <section className="workspace-rule-review" aria-labelledby="workspace-rule-review-title">
+      <strong id="workspace-rule-review-title">해석한 전략 조건을 확인해 주세요</strong>
+      <p>{draft.explanation}</p>
+      <dl>
+        <dt>진입 조건</dt>
+        <dd>{draft.entry_conditions.map(conditionText).join(" · ") || "없음"}</dd>
+        <dt>종료 조건</dt>
+        <dd>{draft.exit_conditions.map(conditionText).join(" · ") || "없음"}</dd>
+      </dl>
+      {draft.indicator_selections.length ? (
+        <ul>
+          {draft.indicator_selections.map((selection) => (
+            <li key={selection.metric}><strong>{selection.metric}</strong> · {selection.reason}</li>
+          ))}
+        </ul>
+      ) : null}
+      {draft.unsupported_conditions.length ? (
+        <ul>
+          {draft.unsupported_conditions.map((item) => (
+            <li key={`${item.condition}:${item.reason}`}>{item.condition} · {item.reason}</li>
+          ))}
+        </ul>
+      ) : null}
+      {draft.is_executable ? (
+        <button disabled={confirming} type="button" onClick={onConfirm}>
+          {confirming ? "백테스트를 준비하는 중" : "이 조건으로 백테스트 시작"}
+        </button>
+      ) : (
+        <p>조건을 보완한 뒤 다시 확인해 주세요.</p>
+      )}
+    </section>
   );
 }
 

@@ -2288,6 +2288,73 @@ BACKTEST_INDICATOR_ALIASES: dict[str, str] = {
     for spelling in _key_spellings(source)
 }
 
+
+def available_indicator_metrics(conn: Any, *, as_of: date | None = None) -> list[str]:
+    """Return indicator names that have rows in PostgreSQL's bounded recent window.
+
+    This is intentionally a data probe, not the static compiler vocabulary.  A metric
+    is offered to the language parser only when its warehouse JSONB key was observed.
+    """
+
+    from ai_graph.nodes.condition_compiler import supported_metrics
+
+    ceiling = as_of or datetime.now(KST).date()
+    floor = ceiling - timedelta(days=SCREENING_DATE_LOOKBACK_DAYS)
+    observed: set[str] = {"open", "high", "low", "close", "volume"}
+    successful_queries = 0
+    for table in INDICATOR_TABLES.values():
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT jsonb_object_keys(values_jsonb) AS key
+            FROM {table}
+            WHERE time >= %s::date AND time <= %s::date
+            """,
+            [floor, ceiling],
+        ).fetchall()
+        successful_queries += 1
+        for row in rows:
+            source_key = str(row.get("key") or "")
+            alias = BACKTEST_INDICATOR_ALIASES.get(source_key)
+            if alias:
+                observed.add(alias)
+    try:
+        financial_row = conn.execute(
+            f"""
+            SELECT EXISTS (
+                SELECT 1 FROM {DART_FINANCIAL_TABLE}
+                WHERE available_from <= %s::date
+                  AND available_from >= %s::date - INTERVAL '3 years'
+                LIMIT 1
+            ) AS present
+            """,
+            [ceiling, ceiling],
+        ).fetchone()
+        if financial_row and financial_row.get("present"):
+            observed.update({"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"})
+    except Exception:  # noqa: BLE001 - optional financial catalog must not hide TA metrics.
+        _logger.info("financial indicator catalog is unavailable", exc_info=True)
+    if successful_queries == 0:
+        raise RuntimeError("indicator catalog could not be read")
+    if "volume" in observed:
+        observed.add("volume_ratio_20")
+    for period in (20, 50, 200):
+        if f"sma{period}" in observed:
+            observed.update({f"close_above_sma_{period}", f"close_below_sma_{period}"})
+    compiler_metrics = set(supported_metrics())
+    return sorted(observed & compiler_metrics)
+
+
+def available_indicator_metrics_from_env() -> list[str] | None:
+    """Read the indicator catalog through the configured PostgreSQL connection."""
+
+    config = DataSourceConfig.from_env()
+    if not config.database_dsn:
+        return None
+    source = PostgresPipelineDataSource(config)
+    with source._connect() as conn:  # noqa: SLF001 - shared adapter owns connection policy.
+        source._set_statement_timeout(conn)
+        return available_indicator_metrics(conn)
+
 INDICATOR_FIELDS: tuple[str, ...] = (
     *_TREND_KEYS,
     *_VOLATILITY_KEYS,
