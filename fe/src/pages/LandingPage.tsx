@@ -1,14 +1,25 @@
+import { useState } from "react";
+import { AsyncState } from "../components/common/AsyncState";
 import { Badge } from "../components/common/Badge";
+import { Button } from "../components/common/Button";
 import { Card } from "../components/common/Card";
-import { PublicClaimDisclosure } from "../components/common/PublicClaimDisclosure";
 import { Footer } from "../components/layout/Footer";
+import { getLandingSample } from "../api/quantAgentClient";
 import { ROUTES, withReturnTo } from "../config/routes";
+import { useAsyncData } from "../hooks/useAsyncData";
 
 export function LandingPage() {
-  const reportsHref = withReturnTo(ROUTES.login, ROUTES.reports);
-  const workspaceHref = withReturnTo(ROUTES.login, ROUTES.app);
-  const workspaceAccessNoteId = "workspace-access-note";
-  const archiveAccessNoteId = "archive-access-note";
+  const { data, loading, error } = useAsyncData(getLandingSample, []);
+  const [openFaqIndex, setOpenFaqIndex] = useState(0);
+  const loginHref = withReturnTo(ROUTES.login, ROUTES.app);
+
+  if (loading) {
+    return <AsyncState title="랜딩 데이터를 불러오는 중입니다" tone="loading" />;
+  }
+
+  if (error || !data) {
+    return <AsyncState title="랜딩 데이터를 불러오지 못했습니다" description={error?.message} tone="error" />;
+  }
 
   return (
     <main className="landing-page">
@@ -18,98 +29,157 @@ export function LandingPage() {
           <span>QuantAgent</span>
         </a>
         <div>
-          <a href="#principles">검증 원칙</a>
-          <a href="#workspace">전략 검증</a>
-          <a href="#archive">리포트 보관함</a>
-          <a href="#limits">안전 기준</a>
+          <a href="#service">서비스 소개</a>
+          <a href="#how">작동 방식</a>
+          <a href="#sample">샘플 리포트</a>
+          <a href="#faq">FAQ</a>
         </div>
-        <a aria-describedby={workspaceAccessNoteId} className="button button--dark" href={workspaceHref}>전략 분석 시작</a>
+        {/* 로그인 링크와 이 버튼은 같은 곳(loginHref)으로 가는 중복 진입점이었다. */}
+        <div>
+          <Button onClick={() => window.location.assign(loginHref)} variant="dark">Google로 시작</Button>
+        </div>
       </nav>
 
       <section className="hero" id="service">
-        <Badge variant="dark">릴리스 검증 진행 중</Badge>
+        <Badge variant="dark">KRX LIVE · 매일 오전 8시 자동 분석</Badge>
         <h1>
-          수익률보다 먼저,
+          자연어로 입력한 전략을,
           <br />
-          검증 근거를 <span>확인</span>합니다
+          데이터로 <span>검증</span>
         </h1>
         <p>
-          QuantAgent는 자연어 전략을 실데이터 백테스트로 검증하고, 데이터 기준 시점·산출식·재현 조건·한계를 함께 설명하는 것을 목표로 합니다.
-          검증 조건이 부족하면 결과를 꾸며내지 않고 이유를 알려드립니다.
+          TA-Lib 150개 정형 팩터 + 애널리스트·뉴스·외국인 흐름 비정형 신호. LLM 멀티 에이전트가 매일 분석해서
+          조건 일치 추천 종목을 보내드립니다.
         </p>
         <div className="hero__actions">
-          <a aria-describedby={workspaceAccessNoteId} className="button button--primary" href={workspaceHref}>자연어 전략 분석 시작 →</a>
-          <a className="button button--ghost" href="#principles">검증 원칙 보기</a>
+          <Button onClick={() => window.location.assign(loginHref)} variant="primary">Google 계정으로 시작하기 →</Button>
+          <Button onClick={() => window.location.assign(ROUTES.reportDetail("2026-04-18"))} variant="ghost">▷ 샘플 리포트 보기</Button>
         </div>
-        <small id={workspaceAccessNoteId}>로그인 후 전략 검증 워크스페이스로 이동합니다. 실데이터 실행 준비가 안 되면 성과 수치 없이 안전하게 안내합니다.</small>
-      </section>
-
-      <section className="landing-section landing-section--soft" id="workspace">
-        <SectionHead eyebrow="전략 검증" title="말로 입력하고, 근거와 한계를 함께 확인하세요" description="전략 조건을 자연어로 입력하면 서버가 검토하고 실데이터 기반 백테스트 job으로 처리합니다." />
-        <Card className="sample-report-card">
-          <div className="sample-report-card__head"><Badge variant="dark">CORE WORKFLOW</Badge></div>
-          <h3>자연어 전략 → 실데이터 백테스트 → 자연어 리포트</h3>
-          <p>기간, 데이터 기준일, 체결·비용 가정, 표본 한계가 확인된 결과만 표시합니다. 준비되지 않은 데이터나 provider 오류는 예시 성과로 바꾸지 않습니다.</p>
-          <a aria-describedby={workspaceAccessNoteId} href={workspaceHref}>전략 검증 시작 →</a>
-        </Card>
-      </section>
-
-      <section className="landing-section" id="principles">
-        <SectionHead eyebrow="검증 원칙" title="읽을 수 있는 리포트가 아니라, 검증할 수 있는 리포트" />
-        <div className="principle-grid">
-          <Card>
-            <Badge variant="soft">출처</Badge>
-            <h3>근거와 기준 시점</h3>
-            <p>데이터 출처, 관측 시점, 사용 범위가 확인되지 않으면 수치와 종목 선정을 신뢰 가능한 결과로 표시하지 않습니다.</p>
-          </Card>
-          <Card>
-            <Badge variant="soft">산출식</Badge>
-            <h3>지표의 산출식과 단위</h3>
-            <p>지표 이름만 제시하지 않고 입력값, 산출 절차, 적용 구간, 결측·비정상값 처리 원칙을 함께 검토합니다.</p>
-          </Card>
-          <Card>
-            <Badge variant="soft">재현성</Badge>
-            <h3>재현 가능한 검증</h3>
-            <p>동일한 입력과 버전에서 결과를 다시 확인할 수 있는 실행 기록과 검증 증적을 릴리스 조건으로 둡니다.</p>
-          </Card>
+        <small>무료 · 가입 30초 · 신용카드 등록 없음</small>
+        <div className="hero__stats">
+          {data.heroStats.map((stat) => (
+            <div key={stat.label}>
+              <strong>{stat.value}</strong>
+              <span>{stat.label}</span>
+            </div>
+          ))}
         </div>
       </section>
 
-      <section className="landing-section landing-section--soft" id="archive">
-        <SectionHead eyebrow="읽기 전용 보관함" title="완료된 분석 기록은 보관함에서 다시 확인하세요" description="리포트마다 최신성, 검증 범위, 제한 사항을 확인한 뒤 해석해야 합니다." />
+      <section className="landing-section" id="how">
+        <SectionHead eyebrow="HOW IT WORKS" title="전략 한 줄에서 리포트까지 자동" description="자연어로 한 문장만 입력하시면 정형화 · 백테스트 · 신호 · 리포트까지 모두 자동으로 처리됩니다." />
+        <div className="step-grid">
+          {data.steps.map((step) => (
+            <Card key={step.label}>
+              <Badge variant="dark">{step.label}</Badge>
+              <h3>{step.title}</h3>
+              <p>{step.description}</p>
+              <pre>{step.example.join("\n")}</pre>
+            </Card>
+          ))}
+        </div>
+      </section>
+
+      <section className="landing-section landing-section--soft" id="sample">
+        <SectionHead eyebrow="SAMPLE REPORT" title="이런 리포트를 매일 받게 됩니다" description="실제 서비스 화면과 동일한 구조의 Daily Report 샘플입니다." />
         <Card className="sample-report-card">
           <div className="sample-report-card__head">
             <div>
-              <Badge variant="dark">보관 원칙</Badge>
-              <small>읽기 전용</small>
+              <Badge variant="dark">DAILY REPORT</Badge>
+              <small>{data.reportPreview.date}</small>
             </div>
+            <Badge variant="info">권장도 {data.reportPreview.score}</Badge>
           </div>
-          <h3>실행 화면과 분리된 과거 기록</h3>
-          <p>보관 리포트는 과거 결과를 확인하기 위한 읽기 전용 화면입니다. 새 분석은 전략 검증 워크스페이스에서 시작합니다.</p>
-          <a aria-describedby={archiveAccessNoteId} href={reportsHref}>로그인 후 리포트 보관함 열기 →</a>
-          <small id={archiveAccessNoteId}>로그인 후 읽기 전용 리포트 보관함으로 이동합니다.</small>
+          <h3>{data.reportPreview.title}</h3>
+          <div className="sample-market-grid">
+            {data.reportPreview.market.map((item) => (
+              <span key={item.label}>
+                <small>{item.label}</small>
+                <strong>{item.value}</strong>
+              </span>
+            ))}
+          </div>
+          <div className="sample-signal-row">
+            {data.reportPreview.signals.map((signal) => (
+              <span key={signal.ticker}>
+                <Badge signal={signal.signal}>{signal.signal}</Badge>
+                {signal.name} <small>{signal.ticker}</small>
+              </span>
+            ))}
+          </div>
+          <a href={ROUTES.reportDetail("2026-04-18")}>샘플 리포트 자세히 보기 →</a>
         </Card>
       </section>
 
-      <section className="landing-section" id="limits">
-        <SectionHead eyebrow="이용 안전 기준" title="전략 분석은 제공하고, 개인화·주문은 제공하지 않습니다" />
-        <Card>
-          <ul>
-            <li>개인 보유 종목·계좌·수량·위험성향을 전제로 한 맞춤 자문</li>
-            <li>자동 주문이나 직접 거래 실행을 유도하는 기능</li>
-            <li>검증 근거가 없는 예시 성과를 실제 성과처럼 제시하는 화면</li>
-          </ul>
-          <p>이 기준은 자연어 전략 분석과 백테스트를 막기 위한 것이 아니라, 준비되지 않은 데이터를 정상 결과처럼 보이지 않게 하기 위한 안전장치입니다.</p>
+      <section className="landing-section">
+        <SectionHead eyebrow="WHY" title="기존 도구와 무엇이 다른가?" />
+        <Card padded={false}>
+          {/* 840px of table cannot fit a phone; it scrolls inside its own box instead of
+              dragging the whole page sideways. */}
+          <div className="table-scroll">
+          <table className="comparison-table landing-comparison">
+            <thead>
+              <tr>
+                <th>비교 항목</th>
+                <th>증권사 HTS</th>
+                <th>Bloomberg Terminal</th>
+                <th>QuantAgent</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.comparisonRows.map((row) => (
+                <tr key={row.item}>
+                  <td>{row.item}</td>
+                  <td>{row.traditional}</td>
+                  <td>{row.terminal}</td>
+                  <td><strong>{row.quantAgent}</strong></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          </div>
         </Card>
+        <div className="principle-grid">
+          {data.principles.map((principle) => (
+            <Card key={principle.label}>
+              <Badge variant="soft">{principle.label}</Badge>
+              <h3>{principle.title}</h3>
+              <p>{principle.description}</p>
+            </Card>
+          ))}
+        </div>
       </section>
-      <section aria-labelledby="public-claim-title" className="landing-section landing-section--soft">
-        <SectionHead eyebrow="공개 문구 기준" title="성과 수치와 검증 범위를 함께 공개합니다" />
-        <Card>
-          <h3 id="public-claim-title">보관 리포트의 공개 범위</h3>
-          <p>랜딩에는 예시 성과 수치를 표시하지 않습니다. 전략 검증 결과와 보관 리포트에서 기준일·방법·한계를 확인해 주세요.</p>
-          <PublicClaimDisclosure claimKey="landingArchiveScope" />
-          <a href={ROUTES.trust}>신뢰센터에서 데이터·표시 원칙 확인 →</a>
-        </Card>
+
+      <section className="landing-section landing-section--soft" id="faq">
+        <SectionHead eyebrow="FAQ" title="자주 묻는 질문" />
+        <div className="faq-list">
+          {data.faqs.map((faq, index) => (
+            <Card key={faq.question} padded={false}>
+              <div className="faq-question">
+                <button
+                  aria-controls={`faq-answer-${index}`}
+                  aria-expanded={openFaqIndex === index}
+                  onClick={() => setOpenFaqIndex((current) => (current === index ? -1 : index))}
+                  type="button"
+                >
+                  <strong>{faq.question}</strong>
+                  <span>{openFaqIndex === index ? "−" : "+"}</span>
+                </button>
+              </div>
+              {openFaqIndex === index ? <p id={`faq-answer-${index}`}>{faq.answer}</p> : null}
+            </Card>
+          ))}
+        </div>
+      </section>
+
+      <section className="landing-cta">
+        <h2>
+          내일 아침 8시,
+          <br />
+          데이터 기반 추천을 받아보세요
+        </h2>
+        <p>가입은 Google 로그인 30초로 끝. 신용카드도, 자산 정보도 필요 없습니다.</p>
+        <Button onClick={() => window.location.assign(loginHref)} variant="primary">Google 계정으로 시작하기 →</Button>
       </section>
       <Footer />
     </main>
