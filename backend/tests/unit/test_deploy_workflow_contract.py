@@ -39,7 +39,9 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert 'if: ${{ inputs.rollback_drill != true }}' in workflow
     assert "node scripts/rollback-drill-harness.mjs --artifact" in workflow
     assert "actions/upload-artifact@v4" in workflow
-    assert "push:" not in workflow.split("concurrency:", maxsplit=1)[0]
+    assert "push:" in workflow.split("concurrency:", maxsplit=1)[0]
+    assert "branches:\n      - main" in workflow
+    assert "if: github.event_name == 'workflow_dispatch'" in workflow
     assert "Verify same-SHA S/R/O/C release evidence" in workflow
     assert "node scripts/evaluate-release-trust.mjs --verify-release-evidence" in workflow
     assert "RELEASE_TRUST_REPOSITORY: ${{ github.repository }}" in workflow
