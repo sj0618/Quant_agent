@@ -80,6 +80,7 @@ export function StrategyWorkspace() {
         cancelError={requestError}
         cancelRequested={cancelRequested}
         history={[]}
+        presentation="dashboard"
         messages={overview.chatMessages}
         onAnalyze={submit}
         onCancel={cancel}
