@@ -183,4 +183,7 @@ test("pull-request CI invokes the fixed offline release-trust command", async ()
   assert.match(workflow, /release-trust:\r?\n\s+name: Offline release-trust gate/u);
   assert.match(workflow, /node --test scripts\/evaluate-release-trust\.test\.mjs/u);
   assert.match(workflow, /node scripts\/evaluate-release-trust\.mjs/u);
+  assert.ok(
+    workflow.includes("node --test scripts/rollback-snapshot.test.mjs scripts/rollback-drill-harness.test.mjs"),
+  );
 });

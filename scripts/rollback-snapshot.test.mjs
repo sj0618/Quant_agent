@@ -11,10 +11,12 @@ import {
   buildSnapshotEntryListCommand,
   buildSnapshotEntryMetadataCommand,
   buildSnapshotExtractCommand,
+  buildLocalSnapshotRestoreCommand,
   buildSnapshotRestoreCommand,
   computeFileSha256,
   createRollbackSnapshot,
   protectSnapshotArtifacts,
+  restoreLocalRollbackSnapshot,
   restoreRollbackSnapshot,
   verifySnapshotArchive,
   writeSnapshotChecksum,
@@ -73,6 +75,41 @@ test("rollback snapshot stage and restore commands preserve the source/assets ex
   assert.ok(restoreCommand.args.includes("--exclude=venv/"));
   assert.ok(restoreCommand.args.includes("/extract/"));
   assert.ok(restoreCommand.args.includes("etluser@quant-agent.kro.kr:/home/etluser/mvp_sp1/quant-proj/"));
+  assert.deepEqual(buildLocalSnapshotRestoreCommand({ extractionRoot: "/extract", localTarget: "/sandbox" }), {
+    command: "rsync",
+    args: [
+      "-a",
+      "--delete",
+      "--stats",
+      "--old-args",
+      "--omit-dir-times",
+      "--no-perms",
+      "--no-owner",
+      "--no-group",
+      "--exclude=.git/",
+      "--exclude=node_modules/",
+      "--exclude=DE/",
+      "--exclude=.env",
+      "--exclude=.env.*",
+      "--exclude=.releases/",
+      "--exclude=.run/",
+      "--exclude=.venv/",
+      "--exclude=venv/",
+      "--exclude=**/.venv/",
+      "--exclude=**/venv/",
+      "--exclude=ai/.venv/",
+      "--exclude=__pycache__/",
+      "--exclude=*.pyc",
+      "--exclude=logs/",
+      "--exclude=*.log",
+      "--exclude=.pytest_cache/",
+      "--exclude=.ruff_cache/",
+      "--exclude=.mypy_cache/",
+      "--exclude=.cache/",
+      "/extract/",
+      "/sandbox/",
+    ],
+  });
   assert.deepEqual(buildSnapshotEntryListCommand({ archivePath: "/tmp/snapshot.tar.gz" }), {
     command: "tar",
     args: ["-tzf", "/tmp/snapshot.tar.gz"],
@@ -257,4 +294,32 @@ test("verifySnapshotArchive rejects tampered checksums and restore replays the s
   assert.ok(calls.some(({ command, args }) => command === "tar" && args[0] === "-xzf"));
   assert.ok(calls.some(({ command, args }) => command === "rsync" && args.includes("-e")));
   assert.ok(calls.some(({ command, args }) => command === "rsync" && args.includes("ssh -i /tmp/id_rsa -p 30233")));
+});
+
+test("restoreLocalRollbackSnapshot replays the snapshot into a local target without SSH", () => {
+  const tempDir = mkdtempSync(join(tmpdir(), "rollback-snapshot-local-restore-"));
+  const archivePath = join(tempDir, "snapshot.tar.gz");
+  const checksumPath = join(tempDir, "snapshot.tar.gz.sha256");
+  writeFileSync(archivePath, "snapshot-bytes", "utf8");
+  writeSnapshotChecksum(checksumPath, computeFileSha256(archivePath));
+
+  const calls = [];
+  const restoreResult = restoreLocalRollbackSnapshot({
+    archivePath,
+    checksumPath,
+    localTarget: "/tmp/local-target",
+    mkdtemp: () => join(tempDir, "restore"),
+    run(command, args) {
+      calls.push({ command, args });
+      if (command === "tar" && (args[0] === "-tzf" || args[0] === "-tvzf")) {
+        return { status: 0, stdout: "./backend/app/main.py\nfe/dist/index.html\n" };
+      }
+      return { status: 0, stdout: "" };
+    },
+  });
+
+  assert.equal(restoreResult.localTarget, "/tmp/local-target");
+  assert.ok(calls.some(({ command, args }) => command === "tar" && args[0] === "-xzf"));
+  assert.ok(calls.some(({ command, args }) => command === "rsync" && !args.includes("-e")));
+  assert.ok(calls.some(({ command, args }) => command === "rsync" && args.includes("/tmp/local-target/")));
 });

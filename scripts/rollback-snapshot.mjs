@@ -212,6 +212,36 @@ export function buildSnapshotRestoreCommand({
   };
 }
 
+export function buildLocalSnapshotRestoreCommand({
+  extractionRoot,
+  localTarget,
+  excludePatterns = DEFAULT_SNAPSHOT_EXCLUDES,
+} = {}) {
+  if (!extractionRoot) {
+    throw new Error("extractionRoot is required");
+  }
+  if (!localTarget) {
+    throw new Error("localTarget is required");
+  }
+
+  return {
+    command: "rsync",
+    args: [
+      "-a",
+      "--delete",
+      "--stats",
+      "--old-args",
+      "--omit-dir-times",
+      "--no-perms",
+      "--no-owner",
+      "--no-group",
+      ...excludePatterns.map((pattern) => `--exclude=${pattern}`),
+      ensureTrailingSlash(extractionRoot),
+      ensureTrailingSlash(localTarget),
+    ],
+  };
+}
+
 export function computeFileSha256(filePath) {
   const digest = createHash("sha256");
   digest.update(readFileSync(filePath));
@@ -400,6 +430,42 @@ export function restoreRollbackSnapshot({
   }
 }
 
+export function restoreLocalRollbackSnapshot({
+  archivePath,
+  checksumPath,
+  localTarget,
+  run = spawnSync,
+  mkdtemp = mkdtempSync,
+  tmpdirBase = join(tmpdir(), "quantagent-rollback-local-restore-"),
+} = {}) {
+  const verification = verifySnapshotArchive({ archivePath, checksumPath, run });
+  const extractionRoot = mkdtemp(tmpdirBase);
+  try {
+    const extractCommand = buildSnapshotExtractCommand({ archivePath, extractionRoot });
+    const extractResult = run(extractCommand.command, extractCommand.args, {
+      encoding: "utf8",
+      shell: false,
+      stdio: "inherit",
+    });
+    ensureRunSucceeded(extractResult, "Snapshot extraction");
+
+    const restoreCommand = buildLocalSnapshotRestoreCommand({
+      extractionRoot,
+      localTarget,
+    });
+    const restoreResult = run(restoreCommand.command, restoreCommand.args, {
+      encoding: "utf8",
+      shell: false,
+      stdio: "inherit",
+    });
+    ensureRunSucceeded(restoreResult, "Local snapshot restore");
+
+    return { ...verification, extractionRoot, localTarget };
+  } finally {
+    rmSync(extractionRoot, { recursive: true, force: true });
+  }
+}
+
 function parseCliArguments(argv) {
   const options = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -504,5 +570,6 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
 export {
   createRollbackSnapshot as createDeploySnapshot,
   restoreRollbackSnapshot as restoreDeploySnapshot,
+  restoreLocalRollbackSnapshot as restoreLocalDeploySnapshot,
   runRollbackSnapshotCli as runDeploySnapshotCli,
 };

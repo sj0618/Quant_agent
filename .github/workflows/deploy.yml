@@ -35,6 +35,11 @@ on:
         description: Full commit SHA verified by C evidence
         required: true
         type: string
+      rollback_drill:
+        description: Run a controlled non-production rollback drill instead of deploy
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: quant-agent-deploy
@@ -95,8 +100,37 @@ jobs:
           RELEASE_TRUST_PYTHON: python
         run: node scripts/evaluate-release-trust.mjs
 
+  rollback-drill:
+    name: Controlled rollback drill
+    if: ${{ inputs.rollback_drill == true }}
+    needs: release-trust
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: fe/package-lock.json
+
+      - name: Run controlled rollback drill harness
+        run: node scripts/rollback-drill-harness.mjs --artifact "$RUNNER_TEMP/rollback-drill-evidence.json" --baseline-sha "${{ github.sha }}" --candidate-sha "${{ github.sha }}" --workflow-run-id "${{ github.run_id }}"
+
+      - name: Capture rollback drill evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-drill-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/rollback-drill-evidence.json
+          if-no-files-found: error
+
   deploy:
     needs: release-trust
+    if: ${{ inputs.rollback_drill != true }}
     runs-on: ubuntu-latest
 
     steps:

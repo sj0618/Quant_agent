@@ -32,6 +32,13 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
 
     assert "release-trust:\n    name: Offline release-trust gate" in workflow
     assert "deploy:\n    needs: release-trust" in workflow
+    assert "rollback_drill:" in workflow
+    assert "Run a controlled non-production rollback drill instead of deploy" in workflow
+    assert "Controlled rollback drill" in workflow
+    assert 'if: ${{ inputs.rollback_drill == true }}' in workflow
+    assert 'if: ${{ inputs.rollback_drill != true }}' in workflow
+    assert "node scripts/rollback-drill-harness.mjs --artifact" in workflow
+    assert "actions/upload-artifact@v4" in workflow
     assert "push:" not in workflow.split("concurrency:", maxsplit=1)[0]
     assert "Verify same-SHA S/R/O/C release evidence" in workflow
     assert "node scripts/evaluate-release-trust.mjs --verify-release-evidence" in workflow
