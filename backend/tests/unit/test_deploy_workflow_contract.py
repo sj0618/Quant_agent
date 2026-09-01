@@ -75,6 +75,7 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
         '"022_immutable_analysis_results.sql"'
     )
     assert '"024_parse_bound_analysis_job_admission.sql"' in workflow
+    assert '"025_exploration_policy_v2.sql"' in workflow
     assert 'REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"' in (
         REPOSITORY_ROOT / "ai" / "ai_graph" / "api.py"
     ).read_text(encoding="utf-8")

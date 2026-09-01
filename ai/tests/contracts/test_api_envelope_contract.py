@@ -68,7 +68,7 @@ USER_PAYLOAD_FIELDS = {
     "options",
     "recommended",
 }
-REPORT_FIELDS = {"web_projection", "email_projection", "risk_adjustments"}
+REPORT_FIELDS = {"web_projection", "email_projection", "risk_adjustments", "base_report_v2"}
 PROJECTION_FIELDS = {"title", "summary", "sections"}
 
 

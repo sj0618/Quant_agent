@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import ai_graph.api as api_module
+import ai_graph.graph as graph_module
 from ai_graph.api import (
     ANALYSIS_JOBS_PATH,
     DATA_EVIDENCE_PROBE_PATH,
@@ -21,7 +22,7 @@ from ai_graph.job_events import JobEventBuffer
 from ai_graph.jobs import AnalysisJobStatus, CancellationRegistry, InMemoryAnalysisJobStore
 from ai_graph.research_contract import RuleDraftSigner, build_rule_draft
 from ai_graph.research_eligibility import ResearchRuntimeFacts
-from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
+from ai_graph.schemas import APIEnvelope, EnvelopeStatus, StrategyExecutionSpecV1, UserPayload
 from ai_graph.token_auth import ResolvedAccountToken
 
 
@@ -157,6 +158,95 @@ def test_primary_analysis_job_accepts_only_the_verified_parse_contract() -> None
     assert stored.execution_spec_version == draft["spec_version"]
     assert stored.execution_spec_hash == draft["spec_hash"]
     assert stored.client_idempotency_key == "32ecc88e-a50d-4b4d-9c5e-573d817b410a"
+
+
+def test_parse_bound_job_passes_the_confirmed_spec_to_the_analysis_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[object] = []
+
+    def confirmed_runner(_query: str, trace_id: str, **kwargs: object) -> APIEnvelope:
+        captured.append(kwargs["execution_spec"])
+        return _ready_envelope(trace_id)
+
+    monkeypatch.setattr(api_module, "run_analysis", confirmed_runner)
+    store = InMemoryAnalysisJobStore()
+    app = api_module.create_app(
+        store,
+        analysis_runner=confirmed_runner,
+        session_resolver=DisabledSessionResolver(),
+        rule_draft_signer=RuleDraftSigner("research-contract-test-secret", key_version="test-v1"),
+        research_execution_enabled=False,
+    )
+    client = TestClient(app)
+
+    draft = _parse_executable_draft(client)
+    response = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={
+            "parse_token": draft["parse_token"],
+            "client_idempotency_key": "confirmed-spec-runner-key",
+            "spec_version": draft["spec_version"],
+            "spec_hash": draft["spec_hash"],
+            "strategy_execution_spec": draft["strategy_execution_spec"],
+        },
+    )
+
+    assert response.status_code == 201
+    stored = store.get_job(response.json()["job_id"])
+    assert stored is not None
+    assert stored.execution_spec is not None
+    assert stored.execution_spec.model_dump(mode="json") == draft["strategy_execution_spec"]
+    assert len(captured) == 1
+    assert captured[0] is not None
+
+
+def test_confirmed_execution_spec_is_compiled_without_reinterpretation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = StrategyExecutionSpecV1.model_validate(
+        {
+            "market": "KRX",
+            "timeframe": "daily",
+            "entry_conditions": [
+                {
+                    "metric": "rsi",
+                    "comparator": "lte",
+                    "value": 30,
+                    "lookback": 14,
+                    "role": "entry",
+                }
+            ],
+            "exit_conditions": [
+                {
+                    "metric": "sma_20",
+                    "comparator": "gte",
+                    "value": 100,
+                    "lookback": 20,
+                    "role": "exit",
+                }
+            ],
+        }
+    )
+
+    def fail_reinterpretation(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("confirmed execution conditions must not be reinterpreted")
+
+    monkeypatch.setattr(graph_module, "build_strategy_spec", fail_reinterpretation)
+    result = graph_module.research_node(
+        {
+            "user_query": "사용자가 확인한 전략",
+            "execution_spec": spec.model_dump(mode="json"),
+        }
+    )
+
+    strategy = graph_module.StrategySpec.model_validate(result["strategy_spec"])
+    assert [(condition.left, condition.operator.value, condition.right) for condition in strategy.entry_conditions] == [
+        ("rsi", "lte", 30)
+    ]
+    assert [(condition.left, condition.operator.value, condition.right) for condition in strategy.exit_conditions] == [
+        ("sma20", "gte", 100)
+    ]
 
 
 def test_tampered_parse_spec_creates_no_primary_job_or_runner_side_effect() -> None:

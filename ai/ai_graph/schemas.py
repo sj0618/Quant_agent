@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from ai_graph.research_eligibility import PublicPerformance
 
@@ -72,6 +73,8 @@ FailureSubcause = Literal[
     "parser_low_confidence",
     "source_conflict",
     "data_required",
+    "exploration_policy_unavailable",
+    "exploration_policy_stale",
     # A release deployment must never substitute local fixture rows for an absent
     # operational data source. This is a stable configuration-safety diagnosis, not
     # an arbitrary exception string carried into the public contract.
@@ -360,6 +363,7 @@ class StrategySpec(BaseModel):
 
 
 STRATEGY_EXECUTION_SPEC_VERSION_V1 = "strategy-execution-spec.v1"
+EXPLORATION_EXECUTION_SPEC_VERSION_V2 = "exploration-execution-spec.v2"
 
 
 class StrategyExecutionConditionV1(BaseModel):
@@ -367,10 +371,27 @@ class StrategyExecutionConditionV1(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    metric: Literal["rsi"]
-    comparator: Literal["lte", "gte"]
-    value: float = Field(gt=0.0, le=100.0)
+    metric: str = Field(min_length=1, max_length=64)
+    comparator: Literal["lt", "lte", "gt", "gte", "eq", "ne"]
+    value: float
+    lookback: int = Field(default=14, ge=1, le=2000)
     role: Literal["entry", "exit"]
+
+    @field_validator("value")
+    @classmethod
+    def finite_value(cls, value: float) -> float:
+        if not math.isfinite(value) or abs(value) > 1_000_000_000:
+            raise ValueError("condition value is outside the supported range")
+        return value
+
+    @model_validator(mode="after")
+    def metric_value_range(self) -> "StrategyExecutionConditionV1":
+        metric = self.metric.strip().lower().replace("-", "_")
+        if metric in {"rsi", "rsi_14", "mfi", "stoch_k", "stoch_d"} and not 0 <= self.value <= 100:
+            raise ValueError("bounded oscillator value is outside the supported range")
+        if metric == "willr" and not -100 <= self.value <= 0:
+            raise ValueError("willr value is outside the supported range")
+        return self
 
 
 class StrategyExecutionSpecV1(BaseModel):
@@ -396,7 +417,48 @@ class StrategyExecutionSpecV1(BaseModel):
         return self
 
 
-def canonical_execution_spec_digest(spec: StrategyExecutionSpecV1) -> str:
+class ExplorationCandidateRefV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    catalog_id: str = Field(pattern=r"^qb-v2-[a-z0-9-]+$")
+    execution_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ExplorationExecutionSpecV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    classification: Literal["exploratory_return_seeking"] = "exploratory_return_seeking"
+    market: Literal["KRX"] = "KRX"
+    timeframe: Literal["daily"] = "daily"
+    policy_version: str = Field(min_length=1, max_length=100)
+    policy_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_version: str = Field(min_length=1)
+    catalog_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    candidates: list[ExplorationCandidateRefV2] = Field(min_length=2, max_length=10)
+
+    @model_validator(mode="after")
+    def candidate_ids_are_unique(self) -> "ExplorationExecutionSpecV2":
+        ids = [candidate.catalog_id for candidate in self.candidates]
+        if len(ids) != len(set(ids)):
+            raise ValueError("exploration candidates must be unique")
+        return self
+
+    @property
+    def is_executable(self) -> bool:
+        return True
+
+
+ExecutionSpecV1OrV2 = StrategyExecutionSpecV1 | ExplorationExecutionSpecV2
+_EXECUTION_SPEC_ADAPTER = TypeAdapter(ExecutionSpecV1OrV2)
+
+
+def validate_execution_spec(raw: Any) -> ExecutionSpecV1OrV2:
+    """Decode either admitted contract at one shared boundary."""
+
+    return _EXECUTION_SPEC_ADAPTER.validate_python(raw)
+
+
+def canonical_execution_spec_digest(spec: ExecutionSpecV1OrV2) -> str:
     """Return the stable, public digest for a validated execution specification.
 
     The parse boundary signs the same canonical JSON shape.  Keeping the serializer
@@ -773,12 +835,52 @@ class ReportProjection(BaseModel):
     sections: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class ExplorationCandidateResultV2(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    catalog_id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    status: Literal["available", "insufficient_data", "failed"]
+    total_return: float | None = None
+    max_drawdown: float | None = None
+    sharpe_ratio: float | None = None
+    trade_count: int = Field(default=0, ge=0)
+    evaluation_session_count: int = Field(default=0, ge=0)
+    costs: float | None = Field(default=None, ge=0.0)
+    after_costs: bool = True
+    reason: str | None = None
+
+
+class BaseReportV2(BaseModel):
+    """Fixed, server-numbered exploration report returned by the primary job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["base-report.v2"] = "base-report.v2"
+    classification: Literal["exploratory_return_seeking"] = "exploratory_return_seeking"
+    policy_version: str = Field(min_length=1)
+    policy_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_version: str = Field(min_length=1)
+    catalog_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    benchmark: str = Field(min_length=1)
+    validation_method: str = Field(min_length=1)
+    elapsed_ms: float = Field(ge=0.0)
+    llm_call_counts: dict[str, int]
+    historical_observation: Literal["observed", "not_observed", "inconclusive"]
+    candidates: list[ExplorationCandidateResultV2] = Field(min_length=2, max_length=10)
+    comparison_candidate_id: str | None = None
+    assumptions: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    deep_research_status: Literal["pending", "ready", "unavailable"] = "pending"
+
+
 class ReportBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     web_projection: ReportProjection
     email_projection: ReportProjection
     risk_adjustments: list[RiskAdjustment] = Field(default_factory=list)
+    base_report_v2: BaseReportV2 | None = None
 
 
 class BacktestEvaluationBasis(BaseModel):
@@ -997,8 +1099,11 @@ class APIEnvelope(BaseModel):
     # The legacy ``strategy_spec`` remains readable while callers migrate.  A
     # parse-bound analysis carries this separately versioned and hash-addressed
     # execution contract; all three fields are present or absent together.
-    execution_spec: StrategyExecutionSpecV1 | None = None
-    execution_spec_version: Literal["strategy-execution-spec.v1"] | None = None
+    execution_spec: ExecutionSpecV1OrV2 | None = None
+    execution_spec_version: Literal[
+        "strategy-execution-spec.v1",
+        "exploration-execution-spec.v2",
+    ] | None = None
     execution_spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     debug_ref: str = Field(min_length=1)
     retryable: bool
@@ -1024,6 +1129,13 @@ class APIEnvelope(BaseModel):
         ):
             raise ValueError("execution spec, version, and hash must be present together")
         if self.execution_spec is not None:
+            expected_version = (
+                EXPLORATION_EXECUTION_SPEC_VERSION_V2
+                if isinstance(self.execution_spec, ExplorationExecutionSpecV2)
+                else STRATEGY_EXECUTION_SPEC_VERSION_V1
+            )
+            if self.execution_spec_version != expected_version:
+                raise ValueError("execution spec version must match the execution spec shape")
             expected_hash = canonical_execution_spec_digest(self.execution_spec)
             if self.execution_spec_hash != expected_hash:
                 raise ValueError("execution spec hash must match the canonical execution spec")

@@ -33,6 +33,7 @@ FIXED_MIGRATIONS = (
     "022_immutable_analysis_results.sql",
     "023_archive_undecodable_analysis_jobs.sql",
     "024_parse_bound_analysis_job_admission.sql",
+    "025_exploration_policy_v2.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 ROLLBACK_RESTORE_MIGRATION = "022_immutable_analysis_results.sql"

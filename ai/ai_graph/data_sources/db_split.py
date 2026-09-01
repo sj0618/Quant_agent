@@ -314,10 +314,17 @@ class PostgresPipelineDataSource:
         # for this load, so the report can say so instead of silently not matching.
         self.unavailable_indicator_families: tuple[str, ...] = ()
 
-    def load(self, query: str, trace_id: str) -> PipelineDataBundle:
+    def load(
+        self, query: str, trace_id: str, *, screen_current: bool = True
+    ) -> PipelineDataBundle:
         if self.config.load_mode == "screening_only":
+            if not screen_current:
+                raise PipelineDataUnavailableError(
+                    "backtest_data_required",
+                    "sealed exploration requires the server backtest data load mode",
+                )
             return self.load_screening_only(query, trace_id)
-        return self.load_with_backtest(query, trace_id)
+        return self.load_with_backtest(query, trace_id, screen_current=screen_current)
 
     def load_screening_only(self, query: str, trace_id: str) -> PipelineDataBundle:
         self.unavailable_indicator_families = ()
@@ -414,7 +421,9 @@ class PostgresPipelineDataSource:
                 },
             )
 
-    def load_with_backtest(self, query: str, trace_id: str) -> PipelineDataBundle:
+    def load_with_backtest(
+        self, query: str, trace_id: str, *, screen_current: bool = True
+    ) -> PipelineDataBundle:
         self.unavailable_indicator_families = ()
         with self._connect() as conn:
             self._set_statement_timeout(conn)
@@ -446,12 +455,12 @@ class PostgresPipelineDataSource:
             screening_relaxation: dict[str, Any] = {}
             recommended: list[str] = []
             ticker_resolution = "screening"
-            already_screened = _query_requests_screening(query)
-            screening_mode = already_screened
+            already_screened = screen_current and _query_requests_screening(query)
+            screening_mode = not screen_current or already_screened
             if already_screened:
                 screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
             single_ticker: str | None = None
-            if not screening_candidates:
+            if not screening_candidates and screen_current:
                 single_ticker = self._resolve_ticker(conn, query)
                 if single_ticker is None:
                     screening_mode = True
@@ -611,6 +620,7 @@ class PostgresPipelineDataSource:
                 "price_rows": len(price_rows),
                 "screening_candidates": len(screening_candidates),
                 "screening_relaxation": screening_relaxation,
+                "current_screening": "enabled" if screen_current else "skipped_for_sealed_exploration",
                 "backtest_lookback_days": effective_lookback_days,
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_rows": len(l4_evidence),
@@ -1420,14 +1430,18 @@ class PostgresPipelineDataSource:
         }
 
 
-def load_pipeline_data_from_env(query: str, trace_id: str) -> PipelineDataBundle:
+def load_pipeline_data_from_env(
+    query: str, trace_id: str, *, screen_current: bool = True
+) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
         return _fixture_bundle(
             f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.",
             query=query,
         )
-    return PostgresPipelineDataSource(config).load(query, trace_id)
+    return PostgresPipelineDataSource(config).load(
+        query, trace_id, screen_current=screen_current
+    )
 
 
 def _fixture_bundle(reason: str, *, query: str) -> PipelineDataBundle:

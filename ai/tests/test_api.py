@@ -176,7 +176,7 @@ def test_release_readiness_rejects_missing_migration_and_contract_drift(monkeypa
     )
     ready = ready_client.get(READINESS_PATH)
     assert ready.status_code == 200
-    assert ready.json()["migration_revision"] == "024_parse_bound_analysis_job_admission"
+    assert ready.json()["migration_revision"] == "025_exploration_policy_v2"
 
     monkeypatch.setattr("ai_graph.api.SCHEMA_VERSION", "ai-mvp.v0")
     drifted = ready_client.get(READINESS_PATH)
@@ -360,8 +360,9 @@ def test_production_refuses_unready_core_execution_before_side_effects(
 
     response = client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
 
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "analysis_execution_unavailable"
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "public_create_retired"
+    assert response.json()["detail"]["read_only_alternative"] == "/api/v1/reports"
     assert store.list_jobs() == []
     assert runner_calls == 0
     assert sink.sessions == ()
@@ -405,16 +406,14 @@ def test_ready_release_accepts_parse_bound_core_natural_language_job(
     assert response.json()["job_id"]
 
 
-def test_ready_release_natural_language_query_creates_a_parse_bound_job(
+def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APP_ENV", "production")
     _configure_live_provider(monkeypatch)
-    runtime = _persistent_job_store_runtime()
     client = TestClient(
         create_app(
-            job_store_runtime=runtime,
-            analysis_runner=lambda _query, trace_id: _ready_envelope(trace_id),
+            job_store_runtime=_persistent_job_store_runtime(),
             readiness_migration_probe=lambda: True,
             rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
         )
@@ -425,12 +424,8 @@ def test_ready_release_natural_language_query_creates_a_parse_bound_job(
         json={"query": "RSI 30 이하 진입, RSI 70 이상 청산 전략"},
     )
 
-    assert response.status_code == 201
-    job = response.json()
-    stored = runtime.store.get_job(job["job_id"])
-    assert stored is not None
-    assert stored.execution_spec_version == "strategy-execution-spec.v1"
-    assert len(stored.execution_spec_hash or "") == 64
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "public_create_retired"
 
 
 def test_core_execution_keeps_restart_reconciliation_for_prior_process_jobs(
@@ -1303,10 +1298,10 @@ def test_the_endpoint_inventory_advertises_core_execution_and_unready_release_ad
     monkeypatch.setenv("APP_ENV", "production")
     release_client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
-    assert _analysis_job_create_status(release_client) == "job_async"
+    assert _analysis_job_create_status(release_client) == "retired"
     response = release_client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "analysis_execution_unavailable"
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "public_create_retired"
 
     monkeypatch.delenv("APP_ENV", raising=False)
     live_client = TestClient(create_app(InMemoryAnalysisJobStore()))
@@ -1330,5 +1325,6 @@ def test_the_inventory_summary_describes_core_execution(
         if item["method"] == "POST" and item["path"] == ANALYSIS_JOBS_PATH
     )
 
-    assert entry["state"] == "job_async"
-    assert "authenticated, parse-bound" in entry["summary"]
+    assert entry["state"] == "retired"
+    assert "Retired public analysis creation" in entry["summary"]
+    assert "read-only report snapshots" in entry["summary"]

@@ -24,6 +24,7 @@ from ai_graph.analysis_capacity import (
     AnalysisCapacityTimeout,
 )
 from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
+from ai_graph.exploration_policy import ExplorationPolicyUnavailableError
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.llm import LLMClientError, LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
 from ai_graph.llm.concurrency_gate import AOAIGateBusyError
@@ -42,7 +43,9 @@ from ai_graph.schemas import (
     FailureDiagnostic,
     Stage,
     StageStatus,
+    ExecutionSpecV1OrV2,
     UserPayload,
+    validate_execution_spec,
 )
 
 _logger = logging.getLogger(__name__)
@@ -183,6 +186,7 @@ class AnalysisJob(BaseModel):
     execution_spec_hash: str | None = Field(
         default=None, pattern=r"^[0-9a-f]{64}$", exclude=True
     )
+    execution_spec: ExecutionSpecV1OrV2 | None = Field(default=None, exclude=True)
     client_idempotency_key: str | None = Field(default=None, exclude=True)
     status: AnalysisJobStatus = Field(exclude=True)
     polling_stage: Stage = Field(exclude=True)
@@ -215,6 +219,7 @@ class AnalysisJobStore(Protocol):
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         ...
@@ -301,6 +306,33 @@ class AnalysisJobOutboxMessage:
     job_id: str
 
 
+@dataclass(frozen=True)
+class ResearchAppendixOutboxMessage:
+    outbox_id: str
+    job_id: str
+
+
+@runtime_checkable
+class ResearchAppendixStore(Protocol):
+    def claim_research_appendix_outbox(
+        self, *, limit: int = 1
+    ) -> list[ResearchAppendixOutboxMessage]:
+        ...
+
+    def complete_research_appendix(
+        self, outbox_id: str, job_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        ...
+
+    def mark_research_appendix_unavailable(
+        self, outbox_id: str, job_id: str, reason: str
+    ) -> None:
+        ...
+
+    def get_research_appendix(self, job_id: str) -> Mapping[str, Any] | None:
+        ...
+
+
 @runtime_checkable
 class ParseBoundJobAdmissionStore(Protocol):
     """Contract that binds parse token consumption and job creation to one store."""
@@ -324,6 +356,7 @@ class ParseBoundJobAdmissionStore(Protocol):
         user_id: str,
         spec_version: str,
         spec_hash: str,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str,
     ) -> ParseBoundJobAdmission:
         ...
@@ -390,6 +423,7 @@ class ReadOnlyAnalysisJobStore:
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         raise AnalysisHistoryReadOnlyError(
@@ -499,6 +533,8 @@ class InMemoryAnalysisJobStore:
     _parse_tokens: dict[str, tuple[str, str, str, datetime, bool]] = field(default_factory=dict)
     _parse_idempotency: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     _analysis_job_outbox: dict[str, tuple[str, str, datetime | None]] = field(default_factory=dict)
+    _research_appendix_outbox: dict[str, tuple[str, str, datetime | None]] = field(default_factory=dict)
+    _research_appendix: dict[str, dict[str, Any]] = field(default_factory=dict)
     _parse_admission_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def register_parse_token(
@@ -524,6 +560,7 @@ class InMemoryAnalysisJobStore:
         user_id: str,
         spec_version: str,
         spec_hash: str,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str,
     ) -> ParseBoundJobAdmission:
         with self._parse_admission_lock:
@@ -555,11 +592,23 @@ class InMemoryAnalysisJobStore:
                 user_id=user_id,
                 execution_spec_version=spec_version,
                 execution_spec_hash=spec_hash,
+                execution_spec=execution_spec,
                 client_idempotency_key=client_idempotency_key,
             )
             self._parse_idempotency[idempotency_key] = (spec_hash, job.job_id)
             outbox_id = str(uuid4())
             self._analysis_job_outbox[outbox_id] = (job.job_id, "pending", None)
+            if getattr(execution_spec, "classification", None) == "exploratory_return_seeking":
+                appendix_outbox_id = str(uuid4())
+                self._research_appendix_outbox[appendix_outbox_id] = (
+                    job.job_id,
+                    "pending",
+                    None,
+                )
+                self._research_appendix[job.job_id] = {
+                    "status": "pending",
+                    "payload": {},
+                }
             return ParseBoundJobAdmission(job=job, created=True, outbox_id=outbox_id)
 
     def find_parse_bound_job(
@@ -622,6 +671,54 @@ class InMemoryAnalysisJobStore:
                 for candidate_job_id, state, _claimed_at in self._analysis_job_outbox.values()
             )
 
+    def claim_research_appendix_outbox(
+        self, *, limit: int = 1
+    ) -> list[ResearchAppendixOutboxMessage]:
+        claimed: list[ResearchAppendixOutboxMessage] = []
+        now = datetime.now(UTC)
+        with self._parse_admission_lock:
+            for outbox_id, (job_id, state, _claimed_at) in self._research_appendix_outbox.items():
+                job = self.get_job(job_id)
+                if state != "pending" or job is None or job.status not in {
+                    AnalysisJobStatus.COMPLETED,
+                    AnalysisJobStatus.FAILED,
+                }:
+                    continue
+                self._research_appendix_outbox[outbox_id] = (job_id, "claimed", now)
+                claimed.append(ResearchAppendixOutboxMessage(outbox_id, job_id))
+                if len(claimed) >= limit:
+                    break
+        return claimed
+
+    def complete_research_appendix(
+        self, outbox_id: str, job_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        with self._parse_admission_lock:
+            self._research_appendix[job_id] = {"status": "ready", "payload": dict(payload)}
+            record = self._research_appendix_outbox.get(outbox_id)
+            if record:
+                self._research_appendix_outbox[outbox_id] = (job_id, "delivered", record[2])
+
+    def mark_research_appendix_unavailable(
+        self, outbox_id: str, job_id: str, reason: str
+    ) -> None:
+        with self._parse_admission_lock:
+            self._research_appendix[job_id] = {
+                "status": "unavailable",
+                "payload": {"reason": reason},
+            }
+            record = self._research_appendix_outbox.get(outbox_id)
+            if record:
+                self._research_appendix_outbox[outbox_id] = (
+                    job_id,
+                    "delivered",
+                    record[2],
+                )
+
+    def get_research_appendix(self, job_id: str) -> Mapping[str, Any] | None:
+        with self._parse_admission_lock:
+            return self._research_appendix.get(job_id)
+
     def create_job(
         self,
         request_text: str,
@@ -632,11 +729,17 @@ class InMemoryAnalysisJobStore:
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         now = datetime.now(UTC)
         job_id = f"job_{uuid4().hex[:12]}"
         trace_id = sha256(f"{request_text}:{now.isoformat()}".encode("utf-8")).hexdigest()[:16]
+        normalized_execution_spec = (
+            validate_execution_spec(execution_spec.model_dump(mode="json"))
+            if execution_spec is not None
+            else None
+        )
         job = AnalysisJob(
             job_id=job_id,
             trace_id=trace_id,
@@ -646,6 +749,7 @@ class InMemoryAnalysisJobStore:
             run_id=run_id,
             execution_spec_version=execution_spec_version,
             execution_spec_hash=execution_spec_hash,
+            execution_spec=normalized_execution_spec,
             client_idempotency_key=client_idempotency_key,
             status=AnalysisJobStatus.QUEUED,
             polling_stage=Stage.INTERPRETING,
@@ -1250,6 +1354,33 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             evidence_refs=["failure:empty_analysis_result"],
         )
     exception_chain = _exception_chain(exc)
+    policy_failure = next(
+        (
+            error
+            for error in exception_chain
+            if isinstance(error, ExplorationPolicyUnavailableError)
+        ),
+        None,
+    )
+    if isinstance(policy_failure, ExplorationPolicyUnavailableError):
+        stale = policy_failure.code.endswith("_stale")
+        return FailureDiagnostic(
+            category="data_gap" if stale else "infrastructure_failure",
+            subcause="exploration_policy_stale" if stale else "exploration_policy_unavailable",
+            failure_stage=failure_stage,
+            owner="data_source_config",
+            retryable=True,
+            safe_message=(
+                "확인한 탐색 정책이 바뀌어 실행을 시작하지 않았습니다. 전략을 다시 확인해 주세요."
+                if stale
+                else "탐색 정책을 확인할 수 없어 실행을 시작하지 않았습니다. 잠시 후 다시 시도해 주세요."
+            ),
+            evidence_refs=[
+                "failure:exploration_policy_stale"
+                if stale
+                else "failure:exploration_policy_unavailable"
+            ],
+        )
     # Provider and data adapters expose stable typed causes.  Public diagnostics must
     # use those causes, never arbitrary provider/database text that can both misclassify
     # a failure and leak operational details.

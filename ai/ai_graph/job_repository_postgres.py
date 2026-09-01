@@ -20,8 +20,13 @@ from ai_graph.jobs import (
     InMemoryAnalysisJobStore,
     ParseBoundAdmissionError,
     ParseBoundJobAdmission,
+    ResearchAppendixOutboxMessage,
 )
-from ai_graph.schemas import APIEnvelope, Stage
+from ai_graph.schemas import APIEnvelope, ExecutionSpecV1OrV2, ExplorationExecutionSpecV2, Stage
+from ai_graph.exploration_policy import (
+    load_active_exploration_policy,
+    validate_exploration_spec_against_policy,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -48,6 +53,11 @@ def _job_document(job: AnalysisJob) -> dict[str, Any]:
             "report_id": job.report_id,
             "execution_spec_version": job.execution_spec_version,
             "execution_spec_hash": job.execution_spec_hash,
+            "execution_spec": (
+                job.execution_spec.model_dump(mode="json")
+                if job.execution_spec is not None
+                else None
+            ),
             "client_idempotency_key": job.client_idempotency_key,
             "status": job.status.value,
             "polling_stage": job.polling_stage.value,
@@ -170,6 +180,7 @@ class PostgresAnalysisJobRepository:
         fallback_reasons: Sequence[str] | None = None,
         execution_spec_version: str | None = None,
         execution_spec_hash: str | None = None,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str | None = None,
     ) -> AnalysisJob:
         job = InMemoryAnalysisJobStore().create_job(
@@ -180,6 +191,7 @@ class PostgresAnalysisJobRepository:
             fallback_reasons=fallback_reasons,
             execution_spec_version=execution_spec_version,
             execution_spec_hash=execution_spec_hash,
+            execution_spec=execution_spec,
             client_idempotency_key=client_idempotency_key,
         )
         self._save(job)
@@ -215,6 +227,7 @@ class PostgresAnalysisJobRepository:
         user_id: str,
         spec_version: str,
         spec_hash: str,
+        execution_spec: ExecutionSpecV1OrV2 | None = None,
         client_idempotency_key: str,
     ) -> ParseBoundJobAdmission:
         """Atomically consume one parse nonce, persist the job, and enqueue its outbox row."""
@@ -224,9 +237,15 @@ class PostgresAnalysisJobRepository:
             user_id=user_id,
             execution_spec_version=spec_version,
             execution_spec_hash=spec_hash,
+            execution_spec=execution_spec,
             client_idempotency_key=client_idempotency_key,
         )
         with self._connect() as connection, connection.transaction():
+            if isinstance(execution_spec, ExplorationExecutionSpecV2):
+                validate_exploration_spec_against_policy(
+                    execution_spec,
+                    load_active_exploration_policy(connection, for_update=True),
+                )
             existing = connection.execute(
                 """
                 SELECT spec_hash, job_id
@@ -332,6 +351,26 @@ class PostgresAnalysisJobRepository:
                     ),
                 ),
             )
+            if isinstance(execution_spec, ExplorationExecutionSpecV2):
+                connection.execute(
+                    """
+                    INSERT INTO app.ai_research_appendix_event (
+                        event_id, job_id, status, payload_jsonb
+                    ) VALUES (%s, %s, 'pending', %s)
+                    """,
+                    (
+                        str(uuid4()),
+                        job.job_id,
+                        Jsonb({"policy_version": execution_spec.policy_version}),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO app.ai_research_appendix_outbox (outbox_id, job_id)
+                    VALUES (%s, %s)
+                    """,
+                    (str(uuid4()), job.job_id),
+                )
         return ParseBoundJobAdmission(job=job, created=True, outbox_id=outbox_id)
 
     def find_parse_bound_job(
@@ -441,6 +480,95 @@ class PostgresAnalysisJobRepository:
                 (job_id,),
             ).fetchone()
         return bool(row and row["recoverable"])
+
+    def claim_research_appendix_outbox(
+        self, *, limit: int = 1
+    ) -> list[ResearchAppendixOutboxMessage]:
+        if limit < 1:
+            return []
+        with self._connect() as connection, connection.transaction():
+            rows = connection.execute(
+                """
+                WITH candidates AS (
+                    SELECT outbox.outbox_id
+                    FROM app.ai_research_appendix_outbox AS outbox
+                    JOIN app.ai_analysis_job AS job ON job.job_id = outbox.job_id
+                    WHERE job.job_jsonb ->> 'status' IN ('completed', 'failed')
+                      AND (
+                        outbox.status = 'pending'
+                        OR (
+                            outbox.status = 'claimed'
+                            AND outbox.claimed_at < now() - interval '5 minutes'
+                        )
+                      )
+                    ORDER BY outbox.created_at
+                    FOR UPDATE OF outbox SKIP LOCKED
+                    LIMIT %s
+                )
+                UPDATE app.ai_research_appendix_outbox AS outbox
+                SET status = 'claimed', claimed_at = now()
+                FROM candidates
+                WHERE outbox.outbox_id = candidates.outbox_id
+                RETURNING outbox.outbox_id::text AS outbox_id, outbox.job_id
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            ResearchAppendixOutboxMessage(row["outbox_id"], row["job_id"])
+            for row in rows
+        ]
+
+    def complete_research_appendix(
+        self, outbox_id: str, job_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        self._settle_research_appendix(outbox_id, job_id, "ready", payload)
+
+    def mark_research_appendix_unavailable(
+        self, outbox_id: str, job_id: str, reason: str
+    ) -> None:
+        self._settle_research_appendix(
+            outbox_id, job_id, "unavailable", {"reason": reason}
+        )
+
+    def _settle_research_appendix(
+        self,
+        outbox_id: str,
+        job_id: str,
+        status: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        with self._connect() as connection, connection.transaction():
+            connection.execute(
+                """
+                INSERT INTO app.ai_research_appendix_event (
+                    event_id, job_id, status, payload_jsonb
+                ) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (job_id, status) DO NOTHING
+                """,
+                (str(uuid4()), job_id, status, Jsonb(dict(payload))),
+            )
+            connection.execute(
+                """
+                UPDATE app.ai_research_appendix_outbox
+                SET status = 'delivered', delivered_at = now()
+                WHERE outbox_id = %s::uuid AND job_id = %s AND status = 'claimed'
+                """,
+                (outbox_id, job_id),
+            )
+
+    def get_research_appendix(self, job_id: str) -> Mapping[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status, payload_jsonb AS payload, created_at
+                FROM app.ai_research_appendix_event
+                WHERE job_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def get_job(self, job_id: str) -> AnalysisJob | None:
         with self._connect() as connection:

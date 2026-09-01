@@ -174,10 +174,42 @@ export interface AIRiskAdjustment {
   reason: string;
 }
 
+export interface AIBaseReportV2 {
+    schema_version: "base-report.v2";
+    classification: "exploratory_return_seeking";
+    policy_version: string;
+    policy_hash: string;
+    catalog_version: string;
+    catalog_hash: string;
+    benchmark: string;
+    validation_method: string;
+    elapsed_ms: number;
+    llm_call_counts: Record<string, number>;
+    historical_observation: "observed" | "not_observed" | "inconclusive";
+    candidates: Array<{
+      catalog_id: string;
+      title: string;
+      status: "available" | "insufficient_data" | "failed";
+      total_return?: number | null;
+      max_drawdown?: number | null;
+      sharpe_ratio?: number | null;
+      trade_count: number;
+      evaluation_session_count: number;
+      costs?: number | null;
+      after_costs: boolean;
+      reason?: string | null;
+    }>;
+    comparison_candidate_id?: string | null;
+    assumptions: string[];
+    limitations: string[];
+    deep_research_status: "pending" | "ready" | "unavailable";
+}
+
 export interface AIReportBundle {
   web_projection: AIReportProjection;
   email_projection: AIReportProjection;
   risk_adjustments: AIRiskAdjustment[];
+  base_report_v2?: AIBaseReportV2 | null;
 }
 
 export interface AIBacktestMetrics {
