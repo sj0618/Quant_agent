@@ -95,7 +95,7 @@ from ai_graph.research_contract import (
     ExecutionSpecV1OrV2,
     ExplorationExecutionSpecV2,
     InMemoryDraftNonceRegistry,
-    ParseReviewV1,
+    ParseOutcomeV1,
     ResearchJobAcceptedV1,
     ResearchResultV1,
     RuleDraftSigner,
@@ -1547,7 +1547,7 @@ def create_app(
 
     @app.post(
         SPEC_STRATEGY_PARSE_PATH,
-        response_model=ParseReviewV1,
+        response_model=ParseOutcomeV1,
         status_code=status.HTTP_200_OK,
         tags=["Research Rule Review"],
         responses={status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": PreflightRejectionResponse}},
@@ -1555,7 +1555,7 @@ def create_app(
     async def parse_strategy(
         request: ParseStrategyRequest,
         user_id: str = Depends(require_preflight_user),
-    ) -> ParseReviewV1 | JSONResponse:
+    ) -> ParseOutcomeV1 | JSONResponse:
         scope_response = _preflight_rejection_response(await _scope_decision(request.request_text))
         if scope_response is not None:
             return scope_response
