@@ -1,0 +1,83 @@
+{
+  "document_status": "DRAFT FOR REVIEW",
+  "approval": "PENDING",
+  "wbs_id": "RMP-PERF-01",
+  "quantqa_version": "QuantQA:v1",
+  "full_git_sha": "d6ecd2d1bbf0ce78d6bbaa945ea5d15ea7a31570",
+  "required_tier": "T2",
+  "required_classes": [
+    "S",
+    "R"
+  ],
+  "observed_classes": [
+    "S"
+  ],
+  "status": "UNVERIFIED",
+  "requirement_origin": {
+    "required_classes": "QUANTQA_V1_IMPLEMENTATION_DEFINITION",
+    "tier_label": "QUANTQA_V1_IMPLEMENTATION_DEFINITION"
+  },
+  "wbs_contract_ref": {
+    "spreadsheet_id": "1V7SnG_x-cLIFbrSurDIadtx5GCY9HfL9jRqdyAl70Ks",
+    "gid": 2030261433,
+    "sheet": "2_WBS",
+    "wbs_id": "RMP-PERF-01",
+    "row_number": 62,
+    "observed_at": "2026-09-01T09:00:00+09:00"
+  },
+  "roles": {
+    "owner": "윤서준",
+    "executor": "윤서준",
+    "reviewer": null,
+    "approver": "조은채",
+    "reviewer_approver_same_allowed_v1": true
+  },
+  "execution_boundary": {
+    "scope": "LOCAL",
+    "uses_mock": true,
+    "uses_memory": true,
+    "uses_noop": true,
+    "configuration_environment_values_recorded": false,
+    "secret_values_recorded": false,
+    "production_node3_pve_load_performed": false,
+    "effective_classes": [
+      "S"
+    ]
+  },
+  "evidence": [
+    {
+      "evidence_id": "RMP-PERF-01-S-FIXED-COMMAND",
+      "evidence_class": "S",
+      "scenario": "Run the WBS row's fixed verification command at d6ecd2d.",
+      "pass_criteria": "필수 metadata 누락 또는 신뢰도 부족이면 모든 성과 숫자/chart가 unavailable이고 proxy는 공식 benchmark로 표시되지 않는다.",
+      "actual_result": "exit_code=0 — 116 passed, 1 warning in 3.50s",
+      "validation_method": "cd ai && pytest -q (offline env per docs/evidence/_RUNNER.md)",
+      "uses_mock": true,
+      "uses_memory": true,
+      "uses_noop": true,
+      "exit_code": 0,
+      "evidence_uri": "repo:docs/evidence/RMP-PERF-01/d6ecd2d1bbf0ce78d6bbaa945ea5d15ea7a31570.md@d6ecd2d1bbf0ce78d6bbaa945ea5d15ea7a31570",
+      "artifact_sha256": "7c09d293b04562c51eb2f50988dbd744276f3f195eece2eeea1f18196b3e80b3",
+      "artifact_subject_sha": "d6ecd2d1bbf0ce78d6bbaa945ea5d15ea7a31570",
+      "executor": "윤서준",
+      "reviewer": null,
+      "executed_at": "2026-08-28",
+      "status": "UNVERIFIED",
+      "limitations": [
+        "Mock provider, in-memory job store and fixture inputs only; this is Static/Structural evidence and cannot establish Runtime.",
+        "No reviewer has re-examined this artifact, so the evidence stays UNVERIFIED regardless of the exit code."
+      ]
+    }
+  ],
+  "limitations": [
+    "T2/S+R is a QuantQA:v1 implementation assignment. The Google Sheet does not state a class or tier for this row, so a reviewer may contest it.",
+    "Every command was run locally with secrets unset and mock/memory/noop enabled, which QuantQA:v1 section 4 confines to class S.",
+    "The evidence bundle is Markdown; this manifest is derived from it and adds no observation of its own.",
+    "This manifest records no configuration or environment values, per QuantQA:v1 section 5. The referenced bundle's runner note (docs/evidence/_RUNNER.md) does list the non-secret offline switches used (AUTH_ENABLED, AI_LLM_PROVIDER, AI_JOB_STORE, AI_AUDIT_SINK) and the names of the variables unset. No secret values appear anywhere. A reviewer applying section 5 strictly may still judge those switches to be configuration values that do not belong in an artifact."
+  ],
+  "blockers": [
+    "No reviewer is assigned. QuantQA:v1 requires reviewer != owner and reviewer != executor; the owner and executor are both 윤서준.",
+    "QuantQA:v1 itself is not an approved contract (section 9 lists five open decisions, including whether reviewer and approver may be the same person).",
+    "Required classes R have no evidence: no non-mock runtime, isolated staging, or approved CI run exists at d6ecd2d."
+  ]
+}
