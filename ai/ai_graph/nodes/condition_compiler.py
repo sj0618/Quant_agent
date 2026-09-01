@@ -402,6 +402,27 @@ def compile_conditions(conditions: Sequence[Condition]) -> CompiledConditions | 
     return CompiledConditions(per_stock, rank_filters, warmup_bars)
 
 
+def untranslatable_conditions(
+    conditions: Sequence[Condition], *, allow_rank_filters: bool = True
+) -> tuple[str, ...]:
+    """Return the explicit conditions this evaluator cannot execute faithfully.
+
+    Callers use this before a job is admitted so an unfamiliar researched strategy is
+    reported as a capability gap instead of being replaced with a template strategy.
+    """
+
+    unsupported: list[str] = []
+    for condition in conditions:
+        if _rank_filter(condition) is not None and allow_rank_filters:
+            continue
+        if _compile_one(condition) is not None:
+            continue
+        label = (condition.description or condition.left).strip()
+        if label and label not in unsupported:
+            unsupported.append(label)
+    return tuple(unsupported)
+
+
 def _rank_filter(condition: Condition) -> tuple[str, float, bool] | None:
     """A cross-sectional top/bottom-percentile cut, or None if this is not one.
 
@@ -520,6 +541,24 @@ def _compile_one(condition: Condition) -> str | None:
     if condition.universe_rank_pct is not None:
         # Cross-sectional cuts are pulled out by _rank_filter before this point.
         return None
+    if condition.operator == ConditionOperator.BETWEEN:
+        if not isinstance(condition.right, list) or len(condition.right) != 2:
+            return None
+        left = _series_value(condition.left, condition.window, condition.aggregate)
+        if left is None:
+            return None
+        scale = _PERCENT_SCALED.get(condition.left.strip().lower())
+        factor = scale[1] if scale else 1.0
+        try:
+            low, high = (float(value) * factor for value in condition.right)
+        except (TypeError, ValueError):
+            return None
+        if condition.scale is not None:
+            low *= float(condition.scale)
+            high *= float(condition.scale)
+        if low > high:
+            return None
+        return f"({low!r} <= {left} <= {high!r})"
     if condition.operator not in _OPERATOR:
         return None
 

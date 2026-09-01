@@ -71,7 +71,9 @@ from ai_graph.nodes.backtest import (
     backtest_node,
 )
 from ai_graph.nodes.backtest_code import backtest_code_node
-from ai_graph.nodes.condition_compiler import canonical_metric
+from ai_graph.nodes.backtest_features import unavailable_condition_metrics
+from ai_graph.nodes.condition_compiler import canonical_metric, untranslatable_conditions
+from ai_graph.nodes.research_compile import compile_research
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
@@ -107,6 +109,7 @@ from ai_graph.schemas import (
     EvidenceRef,
     ExecutionSpecV1OrV2,
     ExplorationExecutionSpecV2,
+    ResearchCandidateExecutionSpecV3,
     InternalPayload,
     PublicMetricDetail,
     PublicMetricProvenance,
@@ -119,6 +122,7 @@ from ai_graph.schemas import (
     StrategySpec,
     STRATEGY_EXECUTION_SPEC_VERSION_V1,
     EXPLORATION_EXECUTION_SPEC_VERSION_V2,
+    RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3,
     TickerAction,
     UserPayload,
     canonical_execution_spec_digest,
@@ -187,11 +191,12 @@ class FallbackGraph:
         current.update(self._invoke("Data", data_node, current))
         if current["status"] == EnvelopeStatus.READY.value:
             current.update(self._invoke("Research", research_node, current))
-            current.update(self._invoke("BacktestCode", backtest_code_node, current))
-            current.update(self._invoke("Backtest", backtest_node, current))
-            current.update(self._invoke("Signal", signal_node, current))
-            current.update(self._invoke("Risk Manager", risk_manager_node, current))
-            current.update(self._invoke("Report", report_node, current))
+            if _route_after_research(current) == "ready":
+                current.update(self._invoke("BacktestCode", backtest_code_node, current))
+                current.update(self._invoke("Backtest", backtest_node, current))
+                current.update(self._invoke("Signal", signal_node, current))
+                current.update(self._invoke("Risk Manager", risk_manager_node, current))
+                current.update(self._invoke("Report", report_node, current))
         current.update(self._invoke("Envelope", envelope_node, current))
         return current
 
@@ -240,7 +245,11 @@ def build_graph(audit_session: AuditSession | None = None) -> Any:
         _route_after_data,
         {"ready": "Research", "final": "Envelope"},
     )
-    graph.add_edge("Research", "BacktestCode")
+    graph.add_conditional_edges(
+        "Research",
+        _route_after_research,
+        {"ready": "BacktestCode", "final": "Envelope"},
+    )
     graph.add_edge("BacktestCode", "Backtest")
     graph.add_edge("Backtest", "Signal")
     graph.add_edge("Signal", "Risk Manager")
@@ -742,7 +751,10 @@ def _strategy_query(state: Mapping[str, Any]) -> str:
 def data_node(state: QuantAgentState) -> dict[str, Any]:
     query = _strategy_query(state)
     semantic_slots = parse_semantic_slots(query, trace_id=state["trace_id"])
-    data_requirements = plan_data_requirements(semantic_slots, query=query)
+    data_requirements = _data_requirements_from_sealed_spec(
+        state.get("execution_spec"),
+        fallback=plan_data_requirements(semantic_slots, query=query),
+    )
     if not data_requirements:
         # An empty plan means we could not name a single thing to read, so there is
         # nothing to screen on and nothing a later stage could honestly verify. It used
@@ -841,6 +853,74 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
     return output
 
 
+def _data_requirements_from_sealed_spec(
+    raw_spec: Mapping[str, Any] | ExecutionSpecV1OrV2 | None,
+    *,
+    fallback: list[DataRequirement],
+) -> list[DataRequirement]:
+    """Derive V3 data needs from its sealed IR, not raw keyword matching.
+
+    The V3 researcher can resolve a Korean term that does not occur in the old slot
+    table.  Letting the raw sentence decide the loader would make the data plan disagree
+    with the rule that is subsequently compiled and backtested.
+    """
+
+    if raw_spec is None:
+        return fallback
+    spec = validate_execution_spec(raw_spec)
+    if not isinstance(spec, ResearchCandidateExecutionSpecV3):
+        return fallback
+    metrics = {
+        canonical_metric(metric)
+        for candidate in spec.candidates
+        for metric in candidate.required_metrics
+    }
+    # ``required_metrics`` is an explanatory declaration from the researcher, not an
+    # authority to omit an operand.  Derive the load plan from the actual sealed AST
+    # as well, so a malformed/under-declared answer cannot make the loader prepare a
+    # different feature set from the one the compiler will execute.
+    for candidate in spec.candidates:
+        for condition in [*candidate.entry_conditions, *candidate.exit_conditions]:
+            metrics.add(canonical_metric(condition.left))
+            if isinstance(condition.right, str):
+                metrics.add(canonical_metric(condition.right))
+    requirements: list[DataRequirement] = []
+    technical_metrics = metrics - {
+        "roe",
+        "debt_to_equity",
+        "operating_margin",
+        "operating_income",
+        "revenue",
+    }
+    if technical_metrics:
+        requirements.append(
+            DataRequirement(
+                family="ohlcv_ta",
+                availability="available",
+                owner="ai_graph",
+                preferred_source="internal_db",
+                fallback_sources=["krx"],
+                freshness_requirement="same_trading_day",
+                source_confidence_floor=0.85,
+                evidence_ref="data-plan:v3-ohlcv-ta",
+            )
+        )
+    if metrics & {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"}:
+        requirements.append(
+            DataRequirement(
+                family="fundamentals",
+                availability="outside_owner",
+                owner="product_data_gap",
+                preferred_source="dart",
+                fallback_sources=[],
+                freshness_requirement="report_period",
+                source_confidence_floor=0.75,
+                evidence_ref="data-plan:v3-fundamentals",
+            )
+        )
+    return requirements
+
+
 def _no_data_plan_ambiguity(query: str) -> dict[str, Any]:
     reason = "요청에서 조회할 데이터 항목을 하나도 확정하지 못했습니다."
     return {
@@ -919,6 +999,32 @@ def _strategy_spec_from_execution_spec(
     """Compile the confirmed rule without asking another model to reinterpret it."""
 
     execution_spec = validate_execution_spec(raw_spec)
+    if isinstance(execution_spec, ResearchCandidateExecutionSpecV3):
+        candidate = execution_spec.candidates[0]
+        return StrategySpec(
+            strategy_id=f"researched_{canonical_execution_spec_digest(execution_spec)[:12]}",
+            name=candidate.title,
+            market=execution_spec.market,
+            timeframe=execution_spec.timeframe,
+            entry_conditions=candidate.entry_conditions,
+            exit_conditions=candidate.exit_conditions,
+            indicators=list(dict.fromkeys(candidate.required_metrics)),
+            risk_constraints={
+                "max_position_pct": 0.1,
+                "stop_loss_pct": 0.08,
+                "research_snapshot_hash": execution_spec.research_snapshot_hash,
+                "research_capability_hash": execution_spec.capability_hash,
+                "research_candidate_id": candidate.candidate_id,
+            },
+            assumptions=[
+                *candidate.assumptions,
+                "AI 웹 리서치로 전략 의미를 정규화하고, 조건과 근거를 성과 조회 전에 봉인함",
+                f"반대 가설: {candidate.counter_hypothesis}",
+            ],
+            source_refs=[source.url for source in execution_spec.sources],
+            selection_mode="user_defined",
+            confidence=1.0,
+        )
     if isinstance(execution_spec, ExplorationExecutionSpecV2):
         if raw_policy is None:
             raise ValueError("exploration policy payload is required")
@@ -1000,13 +1106,10 @@ def _strategy_spec_from_execution_spec(
 
 
 def research_node(state: QuantAgentState) -> dict[str, Any]:
-    """Turn the query into a StrategySpec.
+    """Compile the strategy and its one bounded AI interpretation.
 
-    There is no debate and no separate review here any more. The screening stage already
-    researches the strategy's terminology and reasons its conditions into SQL, judging
-    its own work when a query returns nothing and rewriting it; a second panel arguing
-    over the same specification produced commentary, not changes - its verdict was
-    appended to `assumptions` while the conditions that got backtested stayed identical.
+    The structured ResearchCompileV2 call is explanatory only: the confirmed execution
+    contract remains the sole source of entry/exit conditions for the compiler.
     """
 
     confirmed_spec = state.get("execution_spec")
@@ -1046,9 +1149,76 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
         except ValidationError:
             _logger.warning("screening conditions failed spec validation; keeping built spec")
 
+    sealed_spec = validate_execution_spec(confirmed_spec) if confirmed_spec else None
+    if isinstance(sealed_spec, ResearchCandidateExecutionSpecV3):
+        unsupported = [
+            *untranslatable_conditions(strategy_a.entry_conditions),
+            *untranslatable_conditions(
+                strategy_a.exit_conditions,
+                allow_rank_filters=False,
+            ),
+        ]
+        if unsupported:
+            missing = [
+                {
+                    "label": label,
+                    "reason": "현재 구조화 백테스트 엔진이 이 조건을 같은 규칙으로 계산하지 못합니다.",
+                }
+                for label in dict.fromkeys(unsupported)
+            ]
+            return {
+                "original_strategy_spec": strategy_a.model_dump(),
+                "strategy_spec": strategy_a.model_dump(),
+                "status": EnvelopeStatus.NEED_CLARIFICATION.value,
+                "ambiguity": _unverifiable_ambiguity(missing),
+            }
+
+    if isinstance(sealed_spec, ResearchCandidateExecutionSpecV3):
+        candidate = sealed_spec.candidates[0]
+        missing_metrics = unavailable_condition_metrics(
+            state.get("price_rows") or [],
+            [*candidate.entry_conditions, *candidate.exit_conditions],
+        )
+        if missing_metrics:
+            missing = [
+                {
+                    "label": metric,
+                    "reason": "봉인된 전략 조건에 필요한 과거 PIT 지표가 분석 구간에 없습니다.",
+                }
+                for metric in missing_metrics
+            ]
+            return {
+                "original_strategy_spec": strategy_a.model_dump(),
+                "strategy_spec": strategy_a.model_dump(),
+                "status": EnvelopeStatus.NEED_CLARIFICATION.value,
+                "ambiguity": _unverifiable_ambiguity(missing),
+            }
+        research_compile: dict[str, Any] = {
+            "provider": "aoai",
+            "interpretation": sealed_spec.resolution_summary,
+            "supporting_rationale": [source.claim for source in sealed_spec.sources],
+            "counterpoints": [candidate.counter_hypothesis],
+            "limitations": [
+                "웹 리서치는 전략 용어와 가설의 근거이며 성과 수치는 PostgreSQL 백테스트만 사용합니다.",
+                "봉인 뒤에는 연구 결과가 진입·종료 조건을 바꾸지 않습니다.",
+            ],
+        }
+        research_sources = [
+            {"title": source.title, "url": source.url}
+            for source in sealed_spec.sources
+        ]
+    else:
+        research_compile = compile_research(
+            query=str(state.get("user_query") or ""),
+            strategy=strategy_a,
+            data=state.get("data"),
+        ).model_dump()
+        research_sources = []
     return {
         "original_strategy_spec": strategy_a.model_dump(),
         "strategy_spec": strategy_a.model_dump(),
+        "research_compile": research_compile,
+        "research_sources": research_sources,
     }
 
 
@@ -1141,6 +1311,8 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
             (
                 EXPLORATION_EXECUTION_SPEC_VERSION_V2
                 if isinstance(execution_spec, ExplorationExecutionSpecV2)
+                else RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3
+                if isinstance(execution_spec, ResearchCandidateExecutionSpecV3)
                 else STRATEGY_EXECUTION_SPEC_VERSION_V1
             )
             if execution_spec is not None
@@ -2369,7 +2541,7 @@ def _strategy_profile_base(
             "indicators": ["dividend_yield", "debt_ratio", "dividend_cut_5y", "SMA200"],
             "assumptions": [
                 "배당수익률과 부채비율은 L1/L2에서 재무 안정성 필터로 해석",
-                "배당 삭감 이력 데이터가 없으면 후보 확정 후 기술 proxy 백테스트로 검증",
+                "배당 삭감 이력 데이터가 없으면 원 조건을 보류하며 기술 조건으로 대체 백테스트하지 않음",
             ],
             "confidence": 0.73,
         }
@@ -2611,7 +2783,7 @@ def _strategy_profile_base(
             "indicators": ["dividend_yield", "debt_ratio", "dividend_cut_5y", "SMA200"],
             "assumptions": [
                 "배당수익률과 부채비율은 L1/L2에서 재무 안정성 필터로 해석",
-                "배당 삭감 이력 데이터가 없으면 후보 확정 후 기술 proxy 백테스트로 검증",
+                "배당 삭감 이력 데이터가 없으면 원 조건을 보류하며 기술 조건으로 대체 백테스트하지 않음",
             ],
             "confidence": 0.73,
         }
@@ -3054,10 +3226,10 @@ def _strategy_profile_base(
                     description="120일 신고가 돌파 이력",
                 ),
                 Condition(
-                    left="pullback_to_sma_20",
-                    operator="eq",
-                    right=1,
-                    description="20일선까지 되돌림",
+                    left="close_to_sma20",
+                    operator="between",
+                    right=[0.98, 1.02],
+                    description="종가가 20일선의 ±2% 범위로 되돌림",
                 ),
                 Condition(
                     left="relative_strength_60d",
@@ -3081,13 +3253,29 @@ def _strategy_profile_base(
             "name": "돌파 대기",
             "entry_conditions": [
                 Condition(
-                    left="near_recent_high", operator="eq", right=1, description="최근 신고가 근처"
+                    left="close",
+                    operator="gte",
+                    right="high",
+                    window=60,
+                    aggregate="max",
+                    scale=0.98,
+                    description="직전 60거래일 고점의 98% 이상",
                 ),
                 Condition(
-                    left="volume_dry_up", operator="eq", right=1, description="거래량 감소 횡보"
+                    left="volume",
+                    operator="lte",
+                    right="volume",
+                    window=20,
+                    aggregate="avg",
+                    scale=0.8,
+                    description="직전 20거래일 평균 거래량의 80% 이하",
                 ),
                 Condition(
-                    left="turnover_sufficient", operator="eq", right=1, description="거래대금 충분"
+                    left="traded_value",
+                    operator="gte",
+                    right=0.0,
+                    universe_rank_pct=0.5,
+                    description="당일 유니버스 거래대금 상위 50%",
                 ),
             ],
             "exit_conditions": [
@@ -3095,8 +3283,11 @@ def _strategy_profile_base(
                     left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
                 )
             ],
-            "indicators": ["near_recent_high", "volume_dry_up", "turnover"],
-            "assumptions": ["거래대금과 횡보 압축은 OHLCV proxy로 검증"],
+            "indicators": ["rolling_high_60", "volume_avg_20", "traded_value"],
+            "assumptions": [
+                "고점 근접은 직전 60거래일 최고가의 98% 이상으로, 거래량 감소는 직전 20거래일 평균의 80% 이하로 정의",
+                "거래대금은 KRX 원천 ACC_TRDVAL을 사용하고, 당일 유니버스 상위 50% 조건을 적용",
+            ],
             "confidence": 0.68,
         }
     if any(
@@ -3247,10 +3438,10 @@ def _strategy_profile_base(
                     description="주가가 200일선 위",
                 ),
                 Condition(
-                    left="pullback_to_sma_20",
-                    operator="eq",
-                    right=1,
-                    description="20일선 근처 조정",
+                    left="close_to_sma20",
+                    operator="between",
+                    right=[0.98, 1.02],
+                    description="종가가 20일선의 ±2% 범위에서 조정",
                 ),
             ],
             "exit_conditions": [
@@ -3259,7 +3450,9 @@ def _strategy_profile_base(
                 )
             ],
             "indicators": ["SMA20", "SMA200"],
-            "assumptions": ["눌림목은 L1 정의에 따라 장기 상승추세 안의 단기 조정으로 해석"],
+            "assumptions": [
+                "눌림목은 장기 상승추세 안에서 종가가 20일선의 ±2% 범위로 되돌린 상태로 정의"
+            ],
             "confidence": 0.78,
         }
     if "볼린저" in query or "변동성" in query:
@@ -3364,6 +3557,8 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
             "data",
             "strategy_spec",
             "original_strategy_spec",
+            "research_compile",
+            "research_sources",
             "research_review",
             "backtest_code",
             "backtest",
@@ -3577,6 +3772,12 @@ def _route_after_ambiguity(state: QuantAgentState) -> str:
 
 
 def _route_after_data(state: QuantAgentState) -> str:
+    return "ready" if state["status"] == EnvelopeStatus.READY.value else "final"
+
+
+def _route_after_research(state: QuantAgentState) -> str:
+    """Only run code/backtest after Research has confirmed the rule is executable."""
+
     return "ready" if state["status"] == EnvelopeStatus.READY.value else "final"
 
 

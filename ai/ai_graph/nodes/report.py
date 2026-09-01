@@ -41,6 +41,8 @@ def build_report_bundle(
     public_performance: PublicPerformance | None = None,
     l4_evidence: list[dict[str, Any]] | None = None,
     base_report_v2: BaseReportV2 | None = None,
+    research_compile: dict[str, Any] | None = None,
+    risk_context: dict[str, Any] | None = None,
 ) -> ReportBundle:
     signal = risk.signal
     risk_text = (
@@ -51,6 +53,14 @@ def build_report_bundle(
     sections: list[dict[str, Any]] = [
         {"id": "assumptions", "title": "검증 가정", "items": strategy.assumptions},
     ]
+    if research_compile:
+        sections.append(
+            {
+                "id": "ai_research",
+                "title": "AI 전략 해석",
+                "items": research_compile,
+            }
+        )
     if base_report_v2 is None:
         sections[:0] = [
             {"id": "strategy", "title": "StrategySpec", "items": strategy.model_dump()},
@@ -60,6 +70,14 @@ def build_report_bundle(
             {"id": "signal", "title": "Signal Judge", "items": signal.model_dump()},
             {"id": "risk", "title": "Risk Manager", "items": [item.model_dump() for item in risk.adjustments]},
         ])
+        if risk_context:
+            sections.append(
+                {
+                    "id": "risk_context",
+                    "title": "위험 입력·평가 상태",
+                    "items": risk_context,
+                }
+            )
     else:
         sections.append({
             "id": "exploration_candidates",
@@ -151,6 +169,14 @@ def build_report_bundle(
         email_sections.append(
             {"id": "risk", "title": "리스크 변경", "items": [item.model_dump() for item in risk.adjustments]}
         )
+        if risk_context:
+            email_sections.append(
+                {
+                    "id": "risk_context",
+                    "title": "위험 입력·평가 상태",
+                    "items": risk_context,
+                }
+            )
     else:
         email_sections.append({
             "id": "exploration_candidates",
@@ -168,6 +194,8 @@ def build_report_bundle(
                 ).model_dump(mode="json"),
             }
         )
+    if citations:
+        email_sections.append({"id": "citations", "title": "출처", "items": citations})
     email = ReportProjection(
         title=(
             f"[QuantAgent] {strategy.name}: 과거 검증 결과"
@@ -208,11 +236,13 @@ def report_node(state: dict) -> dict:
         state.get("backtest"),
         data=state.get("data"),
         debate=debate,
-        citations=_screening_citations(state),
+        citations=_research_citations(state),
         public_performance=public_performance,
         l4_evidence=state.get("l4_evidence"),
         objective_floor=state.get("objective_floor"),
         base_report_v2=base_report_v2,
+        research_compile=state.get("research_compile"),
+        risk_context=state.get("risk_context"),
     )
     return {"report": report.model_dump(), "report_debate": debate or {}}
 
@@ -301,7 +331,7 @@ def _risk_for_public_report(
     """Withhold every report recommendation when public performance is unavailable.
 
     A raw RiskDecision is useful internal context, but it can be derived from an
-    undersized backtest.  Do not let its BUY/HOLD/DROP text outrun the public
+    undersized backtest.  Do not let its BUY/HOLD/SELL text outrun the public
     performance contract: web, email, and the report writer must all see the same
     no-recommendation decision.
     """
@@ -326,7 +356,7 @@ def _risk_for_public_report(
     )
 
 
-def _screening_citations(state: dict[str, Any]) -> list[dict[str, str]]:
+def _research_citations(state: dict[str, Any]) -> list[dict[str, str]]:
     """Sources behind the report.
 
     These used to come from the research debate. That debate is gone, and the sources
@@ -338,6 +368,14 @@ def _screening_citations(state: dict[str, Any]) -> list[dict[str, str]]:
     research = (pipeline.get("screening_relaxation") or {}).get("research") or {}
     seen: set[str] = set()
     citations: list[dict[str, str]] = []
+    # V3 research sources are sealed before the backtest.  They therefore belong in
+    # the report even when the screening stage did not perform a separate lookup.
+    for citation in state.get("research_sources") or []:
+        url = citation.get("url")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        citations.append(citation)
     for citation in research.get("citations") or []:
         url = citation.get("url")
         if not url or url in seen:

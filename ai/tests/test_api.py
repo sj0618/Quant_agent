@@ -33,7 +33,12 @@ from ai_graph.jobs import (
     JobStoreConfigurationError,
     JobStoreRuntime,
 )
-from ai_graph.research_contract import RuleDraftSigner
+from ai_graph.research_contract import (
+    ExplorationCandidateRefV2,
+    ExplorationExecutionSpecV2,
+    RuleDraftSigner,
+    canonical_rule_digest,
+)
 from ai_graph.research_eligibility import PerformanceAvailable
 from ai_graph.schemas import (
     APIEnvelope,
@@ -377,7 +382,7 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert polled_job["result"]["user_payload"]["ticker_actions"] == []
 
 
-def test_production_refuses_unready_core_execution_before_side_effects(
+def test_production_rejects_unready_core_execution_before_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APP_ENV", "production")
@@ -400,9 +405,8 @@ def test_production_refuses_unready_core_execution_before_side_effects(
 
     response = client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
 
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "public_create_retired"
-    assert response.json()["detail"]["read_only_alternative"] == "/api/v1/reports"
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "analysis_execution_unavailable"
     assert store.list_jobs() == []
     assert runner_calls == 0
     assert sink.sessions == ()
@@ -446,7 +450,135 @@ def test_ready_release_accepts_parse_bound_core_natural_language_job(
     assert response.json()["job_id"]
 
 
-def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
+def test_live_v3_parse_uses_the_server_metric_catalog_before_sealing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown strategy cannot be sealed against a static prompt-only vocabulary."""
+
+    import ai_graph.llm
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setattr(ai_graph.llm, "is_live_llm_provider", lambda: True)
+    monkeypatch.setattr("ai_graph.api._live_provider_configuration_is_ready", lambda: True)
+
+    captured: list[object] = []
+
+    class _ResearchClient:
+        def generate_json(self, request):
+            captured.append(request)
+            return {
+                "resolution_summary": "돈치안 채널을 20일 최고가 돌파 규칙으로 해석했습니다.",
+                "sources": [
+                    {
+                        "source_id": "source-1",
+                        "title": "Donchian channel definition",
+                        "url": "https://example.com/donchian",
+                        "claim": "돈치안 채널은 일정 기간의 최고가와 최저가 범위입니다.",
+                    }
+                ],
+                "candidates": [
+                    {
+                        "candidate_id": "research-donchian-breakout-20",
+                        "title": "20일 돈치안 상단 돌파",
+                        "hypothesis": "상단 돌파 뒤 추세가 이어질 수 있습니다.",
+                        "counter_hypothesis": "횡보장에서는 거짓 돌파가 잦을 수 있습니다.",
+                        "entry_conditions": [
+                            {
+                                "left": "close",
+                                "operator": "gte",
+                                "right": "high",
+                                "window": 20,
+                                "aggregate": "max",
+                                "scale": 0.995,
+                            }
+                        ],
+                        "exit_conditions": [
+                            {"left": "close", "operator": "lte", "right": "sma20"}
+                        ],
+                        "required_metrics": ["close", "high", "sma20"],
+                        "assumptions": ["일봉 종가 기준으로 다음 거래일 체결을 가정합니다."],
+                        "source_ids": ["source-1"],
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        "ai_graph.nodes.strategy_research.create_llm_client",
+        lambda **_kwargs: _ResearchClient(),
+    )
+    client = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+            indicator_catalog_resolver=lambda: ["sma20"],
+        )
+    )
+
+    response = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": "돈치안 채널 돌파 전략으로 검증해줘"},
+    )
+
+    assert response.status_code == 200
+    review = response.json()
+    assert review["spec_version"] == "research-candidate-execution-spec.v3"
+    assert review["strategy_execution_spec"]["candidates"][0]["title"] == "20일 돈치안 상단 돌파"
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.enable_web_search is True
+    assert '"sma20"' in request.user_prompt
+
+
+def test_production_rejects_catalogue_fallback_when_ai_research_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    signer = RuleDraftSigner("test-rule-draft-secret")
+    app = create_app(
+        job_store_runtime=_persistent_job_store_runtime(),
+        readiness_migration_probe=lambda: True,
+        rule_draft_signer=signer,
+        indicator_catalog_resolver=lambda: ["sma20"],
+    )
+    app.state.strategy_parser_uses_llm = False
+    client = TestClient(app)
+
+    parse = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": "돈 벌 수 있는 전략 만들어줘"},
+    )
+
+    assert parse.status_code == 503
+    assert parse.json()["detail"]["code"] == "strategy_research_unavailable"
+
+    legacy_spec = ExplorationExecutionSpecV2(
+        policy_version="v2-test",
+        policy_hash="a" * 64,
+        catalog_version="v2-test",
+        catalog_hash="b" * 64,
+        candidates=[
+            ExplorationCandidateRefV2(catalog_id="qb-v2-momentum", execution_signature="c" * 64),
+            ExplorationCandidateRefV2(catalog_id="qb-v2-value", execution_signature="d" * 64),
+        ],
+    )
+    legacy_token = signer.issue(rule=legacy_spec, user_id="local-dev-user")
+    admission = client.post(
+        ANALYSIS_JOBS_PATH,
+        json={
+            "parse_token": legacy_token.token,
+            "client_idempotency_key": "v3-regression-reject-v2-0001",
+            "spec_version": "exploration-execution-spec.v2",
+            "spec_hash": canonical_rule_digest(legacy_spec),
+            "strategy_execution_spec": legacy_spec.model_dump(mode="json"),
+        },
+    )
+
+    assert admission.status_code == 503
+    assert admission.json()["detail"]["code"] == "strategy_research_required"
+
+
+def test_ready_release_accepts_raw_natural_language_and_seals_it_server_side(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APP_ENV", "production")
@@ -454,6 +586,7 @@ def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
     client = TestClient(
         create_app(
             job_store_runtime=_persistent_job_store_runtime(),
+            analysis_runner=lambda _query, trace_id: _ready_envelope(trace_id),
             readiness_migration_probe=lambda: True,
             rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
         )
@@ -464,8 +597,19 @@ def test_ready_release_legacy_raw_query_returns_parse_required_without_a_job(
         json={"query": "RSI 30 이하 진입, RSI 70 이상 청산 전략"},
     )
 
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "public_create_retired"
+    assert response.status_code == 201
+    job_id = response.json()["job_id"]
+    persisted = _poll_job(client, job_id)
+    assert persisted["result"]["status"] == "ready", persisted
+    # The browser supplies one human-readable query only. The server creates and
+    # consumes the short-lived parse nonce inside the durable admission path, so a
+    # stale client-side token cannot cause the 409 replay failure that this route
+    # replaced.
+    # The execution spec, not this text, is the authority for the backtest.  Keeping
+    # the original request gives the later AOAI Research node the user's actual
+    # strategy context while the signed contract still prevents it from changing the
+    # entry/exit rules.
+    assert persisted["query"] == "RSI 30 이하 진입, RSI 70 이상 청산 전략"
 
 
 def test_core_execution_keeps_restart_reconciliation_for_prior_process_jobs(
@@ -1338,10 +1482,10 @@ def test_the_endpoint_inventory_advertises_core_execution_and_unready_release_ad
     monkeypatch.setenv("APP_ENV", "production")
     release_client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
-    assert _analysis_job_create_status(release_client) == "retired"
+    assert _analysis_job_create_status(release_client) == "job_async"
     response = release_client.post(ANALYSIS_JOBS_PATH, json={"query": "RSI 30 이하 종목"})
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "public_create_retired"
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "analysis_execution_unavailable"
 
     monkeypatch.delenv("APP_ENV", raising=False)
     live_client = TestClient(create_app(InMemoryAnalysisJobStore()))
@@ -1365,6 +1509,6 @@ def test_the_inventory_summary_describes_core_execution(
         if item["method"] == "POST" and item["path"] == ANALYSIS_JOBS_PATH
     )
 
-    assert entry["state"] == "retired"
-    assert "Retired public analysis creation" in entry["summary"]
-    assert "read-only report snapshots" in entry["summary"]
+    assert entry["state"] == "job_async"
+    assert "Parse natural-language input on the server" in entry["summary"]
+    assert "queue an authenticated analysis job" in entry["summary"]

@@ -38,6 +38,7 @@ from ai_graph.nodes.condition_compiler import (
     compile_conditions,
     compile_score_expression,
     indicator_row_keys,
+    untranslatable_conditions,
 )
 from ai_graph.quant_strategy import (
     AUTOMATIC_TOURNAMENT_PROFILES,
@@ -163,9 +164,7 @@ class Loop3Result(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     variant: str
-    candidates: list[CodeCandidate] = Field(
-        min_length=MIN_GENERATED_CANDIDATES, max_length=MAX_GENERATED_CANDIDATES
-    )
+    candidates: list[CodeCandidate] = Field(min_length=1, max_length=MAX_GENERATED_CANDIDATES)
     selected_candidate: CodeCandidate
     feature_mapping: FeatureMapping
     code_plan: CodeGenerationPlan
@@ -173,9 +172,29 @@ class Loop3Result(BaseModel):
     fallback_reasons: list[str] = Field(default_factory=list)
 
 
+class StrategyConditionCompilationError(ValueError):
+    """A concrete strategy cannot be evaluated faithfully by the structured engine."""
+
+    def __init__(self, condition_labels: tuple[str, ...]) -> None:
+        self.condition_labels = condition_labels
+        super().__init__("untranslatable strategy conditions: " + ", ".join(condition_labels))
+
+
 def generate_loop3_candidates(
     request: Loop3Request, *, llm_client: LLMClient | None = None
 ) -> Loop3Result:
+    # A user-defined or standard natural-language rule must either run as its own
+    # structured conditions or stop before a backtest. The only exception is
+    # ``automatic``: its generated candidates are a declared, pre-registered catalog
+    # chosen before results exist, not a substitution for a concrete user rule.
+    if _is_researched_strategy(request.strategy):
+        unsupported = (*untranslatable_conditions(request.strategy.entry_conditions),)
+        unsupported += untranslatable_conditions(
+            request.strategy.exit_conditions,
+            allow_rank_filters=False,
+        )
+        if unsupported:
+            raise StrategyConditionCompilationError(unsupported)
     feature_mapping = map_strategy_features(request.strategy)
     code_plan = build_code_generation_plan(request.strategy, feature_mapping)
     if request.server_only:
@@ -194,7 +213,8 @@ def generate_loop3_candidates(
         output = _generate_backtest_code_output(client, request)
     strategy_ir = _normalized_strategy_ir(output.strategy_ir, request.strategy, code_plan)
     fallback_reasons = list(output.fallback_reasons)
-    if len(output.fallback_code) >= MIN_GENERATED_CANDIDATES:
+    minimum_candidates = _minimum_candidate_count(request.strategy)
+    if len(output.fallback_code) >= minimum_candidates:
         candidates = _validate_candidates(request, output.fallback_code)
     else:
         parameter_sets = _normalized_parameter_sets(
@@ -313,8 +333,9 @@ def _normalized_parameter_sets(
         normalized.append(candidate)
         if len(normalized) >= MAX_GENERATED_CANDIDATES:
             break
-    if len(normalized) < MIN_GENERATED_CANDIDATES:
-        raise ValueError("unable to create three distinct structured candidates")
+    minimum_candidates = _minimum_candidate_count(strategy)
+    if len(normalized) < minimum_candidates:
+        raise ValueError(f"unable to create {minimum_candidates} distinct structured candidates")
     return normalized
 
 
@@ -323,6 +344,29 @@ def _default_parameter_sets(
     plan: CodeGenerationPlan,
     max_positions: int,
 ) -> list[CandidateParameters]:
+    if _is_researched_strategy(strategy):
+        if compile_conditions(strategy.entry_conditions) is None:
+            raise StrategyConditionCompilationError(
+                tuple(untranslatable_conditions(strategy.entry_conditions))
+            )
+        # The V3 contract sealed exactly one researched condition AST. Do not run
+        # generic comparison profiles beside it: that would make a report include
+        # strategies the research node never proposed or sealed.
+        return [
+            CandidateParameters(
+                profile="compiled_conditions",
+                lookback=max(3, min(252, int(plan.lookbacks[0]))),
+                threshold=float(plan.thresholds[0]),
+                stop_loss_pct=float(strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct)),
+                take_profit_pct=float(
+                    strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct)
+                ),
+                max_positions=max_positions,
+                rebalance_interval_days=plan.rebalance_interval_days,
+                trailing_stop_pct=plan.trailing_stop_pct,
+                medium_momentum_weight=plan.medium_momentum_weight,
+            )
+        ]
     if plan.generated_strategies:
         return [
             CandidateParameters(
@@ -412,9 +456,18 @@ def _structured_candidates(
                 parameters=parameters,
             )
         )
-    if len(candidates) < MIN_GENERATED_CANDIDATES:
-        raise ValueError(f"Loop3 requires at least {MIN_GENERATED_CANDIDATES} candidates")
+    minimum_candidates = _minimum_candidate_count(request.strategy)
+    if len(candidates) < minimum_candidates:
+        raise ValueError(f"Loop3 requires at least {minimum_candidates} candidates")
     return candidates
+
+
+def _is_researched_strategy(strategy: StrategySpec) -> bool:
+    return bool(strategy.risk_constraints.get("research_snapshot_hash"))
+
+
+def _minimum_candidate_count(strategy: StrategySpec) -> int:
+    return 1 if _is_researched_strategy(strategy) else MIN_GENERATED_CANDIDATES
 
 
 def _parameter_identity(parameters: CandidateParameters) -> str:
@@ -1166,12 +1219,12 @@ def _render_condition_signal_code(
             if ready:
                 try:
                     entry_ok = bool({entry_expr})
-                except (ValueError, ZeroDivisionError, IndexError):
+                except (TypeError, ValueError, ZeroDivisionError, IndexError):
                     entry_ok = False
                 if entry_ok:
                     try:
                         entry_score = float({score_expr})
-                    except (ValueError, ZeroDivisionError, IndexError):
+                    except (TypeError, ValueError, ZeroDivisionError, IndexError):
                         entry_score = 0.0
                     # NaN and the _fin() sentinel both fall outside this band; neither is
                     # a strength, so they rank as untested rather than as best or worst.

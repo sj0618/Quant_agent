@@ -32,6 +32,59 @@ from ai_graph.schemas import CandidateParameters, Condition, ConditionOperator, 
 
 FEATURE_DEFINITION_VERSION = "structured-features.v3"
 
+
+def unavailable_condition_metrics(
+    rows: Sequence[Mapping[str, Any]],
+    conditions: Sequence[Condition],
+) -> list[str]:
+    """Return sealed operands that have no usable value anywhere in this snapshot.
+
+    A recent indicator catalogue only proves that a metric exists *now*.  V3 must also
+    prove that the historical PIT rows handed to the engine contain (or can derive) the
+    operand before a backtest starts; otherwise the evaluator converts every comparison
+    to a non-match and produces a misleading no-signal result.
+    """
+
+    if not rows:
+        return []
+    store = PreparedFeatureStore(rows)
+    unavailable: set[str] = set()
+    for condition in conditions:
+        metric_names = _condition_metric_names(condition)
+        for metric in metric_names:
+            series = store._metric_series(metric)  # noqa: SLF001 - same evaluator contract.
+            if not np.any(np.isfinite(series)):
+                unavailable.add(canonical_metric(metric))
+        if condition.window and condition.aggregate:
+            rolling_metric = (
+                str(condition.right)
+                if isinstance(condition.right, str)
+                else condition.left
+            )
+            series = store._rolling_metric(  # noqa: SLF001 - same evaluator contract.
+                rolling_metric,
+                condition.window,
+                condition.aggregate,
+            )
+            if not np.any(np.isfinite(series)):
+                unavailable.add(
+                    f"{canonical_metric(rolling_metric)}:{condition.aggregate}{condition.window}"
+                )
+    return sorted(unavailable)
+
+
+def _condition_metric_names(condition: Condition) -> tuple[str, ...]:
+    comparison = boolean_comparison(condition.left)
+    if comparison is not None:
+        return (comparison[0], comparison[2])
+    window_rule = boolean_window_rule(condition.left)
+    if window_rule is not None:
+        return ("close", window_rule[0])
+    values = [condition.left]
+    if isinstance(condition.right, str):
+        values.append(condition.right)
+    return tuple(values)
+
 READY = 0
 AVERAGE = 1
 SHORT_AVERAGE = 2
@@ -982,7 +1035,10 @@ class PreparedFeatureStore:
         if operator == ConditionOperator.BETWEEN:
             if not isinstance(condition.right, list) or len(condition.right) != 2:
                 return False
-            low, high = float(condition.right[0]), float(condition.right[1])
+            # Keep the structured evaluator identical to condition_compiler: ratios
+            # stored as decimals still accept a user-facing percentage band.
+            factor = percent_scale(condition.left)
+            low, high = float(condition.right[0]) * factor, float(condition.right[1]) * factor
             if condition.scale is not None:
                 low *= condition.scale
                 high *= condition.scale

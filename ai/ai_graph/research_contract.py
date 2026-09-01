@@ -29,6 +29,11 @@ from ai_graph.exploration_policy import (
     select_exploration_templates,
 )
 from ai_graph.quant_strategy import classify_strategy_request
+from ai_graph.nodes.strategy_research import StrategyResearchError, research_strategy_execution_spec
+from ai_graph.schemas import (
+    RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3,
+    ResearchCandidateExecutionSpecV3,
+)
 from ai_graph.strategy_parser import (
     IndicatorSelectionV1,
     StrategyParseError,
@@ -40,6 +45,7 @@ from ai_graph.strategy_parser import (
 RULE_DRAFT_SCHEMA_VERSION = "research-rule-draft.v1"
 STRATEGY_EXECUTION_SPEC_VERSION = "strategy-execution-spec.v1"
 EXPLORATION_EXECUTION_SPEC_VERSION = "exploration-execution-spec.v2"
+RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION = RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3
 RULE_DRAFT_POLICY_HASH = hashlib.sha256(
     b"quantagent-research-only-preflight-v1"
 ).hexdigest()
@@ -143,7 +149,7 @@ class ExplorationExecutionSpecV2(BaseModel):
         return True
 
 
-ExecutionSpecV1OrV2 = CanonicalRuleV1 | ExplorationExecutionSpecV2
+ExecutionSpecV1OrV2 = CanonicalRuleV1 | ExplorationExecutionSpecV2 | ResearchCandidateExecutionSpecV3
 
 
 class ExplorationCandidateReasonV2(BaseModel):
@@ -214,6 +220,7 @@ class RuleDraftV1(BaseModel):
     spec_version: Literal[
         STRATEGY_EXECUTION_SPEC_VERSION,
         EXPLORATION_EXECUTION_SPEC_VERSION,
+        RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION,
     ] | None = None
     spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     parse_token: str | None = Field(default=None, min_length=32)
@@ -234,6 +241,13 @@ class RuleDraftV1(BaseModel):
                     raise ValueError("exploration drafts cannot carry ad-hoc conditions")
                 if self.spec_version != EXPLORATION_EXECUTION_SPEC_VERSION:
                     raise ValueError("exploration drafts require the V2 spec version")
+            elif isinstance(self.strategy_execution_spec, ResearchCandidateExecutionSpecV3):
+                if self.exploration is not None or self.canonical_rule is not None:
+                    raise ValueError("researched drafts must not claim a legacy parsed rule")
+                if self.entry_conditions or self.exit_conditions:
+                    raise ValueError("researched drafts keep conditions in the sealed V3 candidates")
+                if self.spec_version != RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION:
+                    raise ValueError("researched drafts require the V3 spec version")
             else:
                 if self.canonical_rule is None or not self.canonical_rule.is_executable:
                     raise ValueError("executable rule drafts require entry and exit conditions")
@@ -455,6 +469,16 @@ def build_rule_draft(
 ) -> RuleDraftV1:
     """Make a bounded natural-language rule review without retaining raw input."""
 
+    research_requested = _research_resolution_enabled(use_llm)
+    if classify_strategy_request(query) == "automatic" and research_requested:
+        return _build_researched_draft(
+            query=query,
+            user_id=user_id,
+            signer=signer,
+            available_metrics=available_metrics,
+            llm_client=llm_client,
+            now=now,
+        )
     if classify_strategy_request(query) == "automatic" and exploration_policy is not None:
         return _build_exploration_draft(
             query=query,
@@ -483,6 +507,54 @@ def build_rule_draft(
                     reason=f"구조화 실패({type(exc).__name__})",
                 )
             ],
+        )
+    # A beginner may name a research direction without supplying an executable DSL
+    # expression.  When a published exploration policy is available, continue through
+    # its pre-registered, versioned candidate set rather than returning a form asking
+    # for technical implementation parameters.  The resulting report labels those
+    # candidates and assumptions; it never pretends the incomplete text was a precise
+    # rule or selects a winner after seeing performance.
+    if research_requested and (
+        parsed.clarification_required
+        or parsed.unsupported_conditions
+        or not parsed.entry_conditions
+        or not parsed.exit_conditions
+    ):
+        try:
+            return _build_researched_draft(
+                query=query,
+                user_id=user_id,
+                signer=signer,
+                available_metrics=available_metrics,
+                llm_client=llm_client,
+                now=now,
+            )
+        except StrategyResearchError as exc:
+            # Do not replace a strategy that the researcher/compiler cannot express
+            # with a catalogue or RSI proxy.  The no-run draft names the capability
+            # gap while keeping the raw request out of the public contract.
+            parsed = StrategyParseResultV1(
+                clarification_required=True,
+                explanation="전략 의미는 조사했지만 현재 서버가 같은 규칙으로 백테스트할 수 없습니다.",
+                unsupported_conditions=[
+                    UnsupportedStrategyConditionV1(
+                        condition="AI 연구 전략",
+                        reason=str(exc)[:300],
+                    )
+                ],
+            )
+    if not research_requested and exploration_policy is not None and (
+        parsed.clarification_required
+        or parsed.unsupported_conditions
+        or not parsed.entry_conditions
+        or not parsed.exit_conditions
+    ):
+        return _build_exploration_draft(
+            query=query,
+            user_id=user_id,
+            signer=signer,
+            policy_record=exploration_policy,
+            now=now,
         )
     rule = _canonical_rule_from_parse(parsed)
     clarifications = _clarifications_for(rule, parsed)
@@ -535,6 +607,10 @@ def canonical_rule_execution_query(rule: ExecutionSpecV1OrV2) -> str:
     if isinstance(rule, ExplorationExecutionSpecV2):
         candidate_ids = ", ".join(candidate.catalog_id for candidate in rule.candidates)
         return f"KRX 일봉 탐색 연구: 봉인 후보 {candidate_ids}의 과거 성과를 동일 조건으로 검증"
+
+    if isinstance(rule, ResearchCandidateExecutionSpecV3):
+        candidate_ids = ", ".join(candidate.candidate_id for candidate in rule.candidates)
+        return f"KRX 일봉 AI 연구 전략: 봉인 후보 {candidate_ids}의 과거 성과를 동일 조건으로 검증"
 
     clauses = [
         _condition_clause(condition)
@@ -633,6 +709,45 @@ def _build_exploration_draft(
         draft_token=signed.token,
         strategy_execution_spec=spec,
         spec_version=EXPLORATION_EXECUTION_SPEC_VERSION,
+        spec_hash=canonical_rule_digest(spec),
+        parse_token=signed.token,
+    )
+
+
+def _build_researched_draft(
+    *,
+    query: str,
+    user_id: str,
+    signer: RuleDraftSigner,
+    available_metrics: list[str] | tuple[str, ...] | None,
+    llm_client: object | None,
+    now: datetime | None,
+) -> RuleDraftV1:
+    """Research unfamiliar terminology before issuing an executable contract."""
+
+    spec = research_strategy_execution_spec(
+        query=query,
+        available_metrics=available_metrics,
+        llm_client=llm_client,  # type: ignore[arg-type]
+    )
+    signed = signer.issue(rule=spec, user_id=user_id, now=now)
+    titles = ", ".join(candidate.title for candidate in spec.candidates)
+    return RuleDraftV1(
+        explanation="AI가 전략 용어와 대안 가설을 조사한 뒤, 실행 가능한 후보 조건을 봉인했습니다.",
+        canonical_rule=None,
+        exploration=None,
+        editable_summary=(
+            f"KRX 일봉 · AI 연구 후보 {len(spec.candidates)}개: {titles}. "
+            "후보와 근거는 성과를 보기 전에 확정됩니다."
+        ),
+        clarification_required=False,
+        is_executable=True,
+        authoring_method="llm",
+        policy_hash=RULE_DRAFT_POLICY_HASH,
+        expires_at=signed.expires_at,
+        draft_token=signed.token,
+        strategy_execution_spec=spec,
+        spec_version=RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION,
         spec_hash=canonical_rule_digest(spec),
         parse_token=signed.token,
     )
@@ -747,6 +862,12 @@ def _live_parser_enabled() -> bool:
     from ai_graph.llm import is_live_llm_provider
 
     return is_live_llm_provider()
+
+
+def _research_resolution_enabled(use_llm: bool | None) -> bool:
+    """Whether this admission has a live AOAI researcher, not a fixture substitute."""
+
+    return _live_parser_enabled() if use_llm is None else use_llm
 
 
 def _canonical_rule_from_parse(parsed: StrategyParseResultV1) -> CanonicalRuleV1 | None:

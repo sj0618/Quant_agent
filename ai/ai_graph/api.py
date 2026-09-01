@@ -95,6 +95,7 @@ from ai_graph.research_contract import (
     DraftConflictV1,
     DraftTokenValidationError,
     EXPLORATION_EXECUTION_SPEC_VERSION,
+    RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION,
     ExecutionSpecV1OrV2,
     ExplorationExecutionSpecV2,
     InMemoryDraftNonceRegistry,
@@ -124,6 +125,7 @@ from ai_graph.schemas import (
     ReportBundle,
     Stage,
     UserPayload,
+    ResearchCandidateExecutionSpecV3,
 )
 from ai_graph.scope_review import review_research_scope
 from ai_graph.single_process import enforce_single_process
@@ -184,10 +186,11 @@ AI_AOAI_MODEL_ENV = "AI_AOAI_MODEL"
 class CreateAnalysisJobRequest(BaseModel):
     """Admission request for the primary strategy workflow.
 
-    The ``query`` member is retained temporarily for old web bundles. Current clients
-    must submit the parse-bound execution contract.  The route still runs legacy text
-    through the preflight guard, but production activation will move it to a typed
-    parse-required response once the durable token ledger is deployed.
+    A browser may submit one natural-language ``query``. In the production route the
+    server parses it, signs a short-lived contract, registers that nonce durably, and
+    then enters the same parse-bound admission path. A parse-bound caller may retain
+    that original query as non-authoritative research/report context; the signed
+    execution spec is always the sole source of backtest conditions.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(
@@ -220,6 +223,7 @@ class CreateAnalysisJobRequest(BaseModel):
     spec_version: Literal[
         STRATEGY_EXECUTION_SPEC_VERSION,
         EXPLORATION_EXECUTION_SPEC_VERSION,
+        RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION,
     ] | None = None
     spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     strategy_execution_spec: ExecutionSpecV1OrV2 | None = None
@@ -235,10 +239,12 @@ class CreateAnalysisJobRequest(BaseModel):
         )
         has_parsed_contract = all(value is not None for value in parsed_values)
         has_partial_contract = any(value is not None for value in parsed_values)
-        if has_parsed_contract and self.query is None:
+        if has_parsed_contract:
             expected_version = (
                 EXPLORATION_EXECUTION_SPEC_VERSION
                 if isinstance(self.strategy_execution_spec, ExplorationExecutionSpecV2)
+                else RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION
+                if isinstance(self.strategy_execution_spec, ResearchCandidateExecutionSpecV3)
                 else STRATEGY_EXECUTION_SPEC_VERSION
             )
             if self.spec_version != expected_version:
@@ -1158,28 +1164,25 @@ def create_app(
         polls the queued job instead of holding one long request open.
         """
 
-        if _production_runtime() and not request.is_parse_bound:
-            raise HTTPException(
-                status_code=status.HTTP_410_GONE,
-                detail=retired_public_create_detail(
-                    boundary_id="public-analysis-create",
-                    path=ANALYSIS_JOBS_PATH,
-                    read_only_alternative="/api/v1/reports",
-                ),
-            )
-
         production_runtime = _production_runtime()
         if production_runtime:
-            exploration_request = isinstance(
-                request.strategy_execution_spec,
-                ExplorationExecutionSpecV2,
-            )
+            # V2 is a deterministic development fallback for the old exploratory
+            # route.  It is not a semantic substitute for an unfamiliar strategy in
+            # production: only a V3 web-researched spec or a complete explicit V1
+            # rule may cross this admission boundary.
+            if isinstance(request.strategy_execution_spec, ExplorationExecutionSpecV2):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "strategy_research_required",
+                        "message": "이 전략은 AI 리서치로 의미를 확정한 뒤에만 검증할 수 있습니다. 잠시 후 다시 시도해 주세요.",
+                        "checks": ["live_provider_configuration"],
+                    },
+                )
             readiness = _core_execution_readiness(
                 runtime,
                 migration_probe=migration_probe,
-                provider_ready=(
-                    exploration_request or _live_provider_configuration_is_ready()
-                ),
+                provider_ready=_live_provider_configuration_is_ready(),
                 rule_draft_signer=app.state.rule_draft_signer,
             )
             if readiness.status != "ready":
@@ -1274,7 +1277,13 @@ def create_app(
                     spec_hash=request.spec_hash or "",
                 )
                 return _draft_conflict_response(exc.code)
-            request_text = canonical_rule_execution_query(spec)
+            # Keep the user's original Korean request with the durable job.  The
+            # parse-bound ``spec`` remains the only authority for entry/exit rules,
+            # so retaining this text cannot change what is backtested.  It does let
+            # the later Research node explain the actual requested idea (for example
+            # RSI rebound, Bollinger breakout, or a value screen) instead of receiving
+            # a generic internal description of already-sealed candidates.
+            request_text = request.query or canonical_rule_execution_query(spec)
             entrypoint = "api.analysis_jobs"
         else:
             # Natural-language browser submissions are parsed and bound *inside* this
@@ -1295,10 +1304,63 @@ def create_app(
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                         detail="Strategy parse verification is temporarily unavailable.",
                     )
+                # Raw browser admission must use the same supervisor split as the
+                # review endpoint.  Otherwise a vague request bypassed the exploratory
+                # research policy while a named rule bypassed the server's real metric
+                # catalog, making the UI path decide a different pipeline from the API.
+                automatic = classify_strategy_request(request.query) == "automatic"
+                exploration_policy = None
+                available_metrics = None
+                if automatic and not app.state.strategy_parser_uses_llm:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "code": "strategy_research_unavailable",
+                            "message": "낯선 전략은 AI 리서치로 의미를 확인한 뒤 검증합니다. 현재 리서치 서비스를 준비 중이니 잠시 후 다시 시도해 주세요.",
+                            "checks": ["live_provider_configuration"],
+                        },
+                    )
+                try:
+                    # A live V3 research resolution must be grounded in the *actual*
+                    # server capability catalogue before AOAI can propose a rule.  The
+                    # old automatic path only loaded an exploration policy, which made
+                    # an unfamiliar strategy look executable even when its required
+                    # metrics were not present in PostgreSQL.
+                    if app.state.strategy_parser_uses_llm:
+                        available_metrics = app.state.indicator_catalog_resolver()
+                    else:
+                        available_metrics = app.state.indicator_catalog_resolver()
+                except ExplorationPolicyUnavailableError:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "code": "exploration_policy_unavailable",
+                            "message": "탐색 정책을 확인할 수 없어 실행을 시작하지 않았습니다. 잠시 후 다시 시도해 주세요.",
+                        },
+                    ) from None
+                except Exception:  # noqa: BLE001 - no job without a verified data catalog.
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Server indicator data is temporarily unavailable.",
+                    ) from None
+                if (app.state.strategy_parser_uses_llm or not automatic) and not available_metrics:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Server indicator data is temporarily unavailable.",
+                    )
+                # Production never gets a V2 catalogue fallback.  A complete V1
+                # rule remains executable without AOAI; every incomplete or unknown
+                # idea must wait for V3 research instead of being silently replaced.
                 outcome = build_rule_draft(
                     query=request.query,
                     user_id=user_id,
                     signer=signer,
+                    available_metrics=available_metrics,
+                    # Automatic/underspecified requests are the V3 research path. A
+                    # live provider must resolve their meaning before the execution
+                    # spec is sealed; a catalogue profile is not a substitute.
+                    use_llm=app.state.strategy_parser_uses_llm,
+                    exploration_policy=exploration_policy,
                 )
                 if not outcome.is_executable:
                     return _legacy_parse_required_response(outcome)
@@ -1342,6 +1404,9 @@ def create_app(
                         spec_version=spec_version,
                         spec_hash=spec_hash,
                         strategy_execution_spec=spec,
+                        # The signed spec is authoritative. ``query`` is retained as
+                        # user context for the Research/Report nodes only.
+                        query=request.query,
                     ),
                     background_tasks,
                     http_request,
@@ -1628,9 +1693,22 @@ def create_app(
         exploration_policy = None
         available_metrics = None
         automatic = classify_strategy_request(request.request_text) == "automatic"
+        if _production_runtime() and automatic and not app.state.strategy_parser_uses_llm:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "strategy_research_unavailable",
+                    "message": "낯선 전략은 AI 리서치로 의미를 확인한 뒤 검증합니다. 현재 리서치 서비스를 준비 중이니 잠시 후 다시 시도해 주세요.",
+                    "checks": ["live_provider_configuration"],
+                },
+            )
         try:
-            if automatic:
-                exploration_policy = app.state.exploration_policy_resolver()
+            # See raw admission above.  The browser review and direct admission
+            # endpoint must ask AOAI about exactly the same server-supported metric
+            # set; otherwise the user could approve a rule that the job endpoint
+            # cannot evaluate.
+            if app.state.strategy_parser_uses_llm:
+                available_metrics = app.state.indicator_catalog_resolver()
             else:
                 available_metrics = app.state.indicator_catalog_resolver()
         except ExplorationPolicyUnavailableError:
@@ -1646,17 +1724,26 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Server indicator data is temporarily unavailable.",
             ) from None
-        if not automatic and not available_metrics:
+        if (app.state.strategy_parser_uses_llm or not automatic) and not available_metrics:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Server indicator data is temporarily unavailable.",
             )
+        if not automatic and not _production_runtime():
+            # See raw admission above: retain a published candidate policy as a
+            # development-only fallback for an underspecified natural-language
+            # request. Release admission never changes an unknown strategy into a
+            # catalogue selection when AI research is unavailable.
+            try:
+                exploration_policy = app.state.exploration_policy_resolver()
+            except Exception:  # noqa: BLE001 - optional incomplete-request fallback.
+                exploration_policy = None
         outcome = build_rule_draft(
             query=request.request_text,
             user_id=user_id,
             signer=signer,
             available_metrics=available_metrics,
-            use_llm=False if automatic else app.state.strategy_parser_uses_llm,
+            use_llm=app.state.strategy_parser_uses_llm,
             exploration_policy=exploration_policy,
         )
         if outcome.is_executable:
@@ -1664,13 +1751,7 @@ def create_app(
                 readiness = _core_execution_readiness(
                     runtime,
                     migration_probe=migration_probe,
-                    provider_ready=(
-                        isinstance(
-                            outcome.strategy_execution_spec,
-                            ExplorationExecutionSpecV2,
-                        )
-                        or _live_provider_configuration_is_ready()
-                    ),
+                    provider_ready=_live_provider_configuration_is_ready(),
                     rule_draft_signer=signer,
                 )
                 if readiness.status != "ready":
@@ -1984,11 +2065,11 @@ def _endpoint_statuses(*, production_runtime: bool | None = None) -> list[Endpoi
         EndpointStatus(
             method="POST",
             path=ANALYSIS_JOBS_PATH,
-            state="retired" if release_runtime else "job_async",
+            state="job_async",
             summary=(
-                "Retired public analysis creation; use authenticated read-only report snapshots."
+                "Parse natural-language input on the server, seal the execution spec, and queue an authenticated analysis job."
                 if release_runtime
-                else "Queue a local development analysis job; release public creation is retired."
+                else "Queue a local development analysis job."
             ),
         ),
         EndpointStatus(

@@ -126,6 +126,7 @@ def test_report_node_surfaces_deduplicated_research_citations(monkeypatch) -> No
         adjustments=[],
     )
     duplicate = {"title": "Same source", "url": "https://example.com/dup"}
+    sealed_source = {"title": "Sealed source", "url": "https://example.com/sealed"}
     state = {
         "strategy_spec": strategy.model_dump(),
         "risk": risk.model_dump(),
@@ -142,6 +143,7 @@ def test_report_node_surfaces_deduplicated_research_citations(monkeypatch) -> No
                 }
             }
         },
+        "research_sources": [sealed_source, duplicate],
     }
 
     output = report_node(state)
@@ -152,5 +154,15 @@ def test_report_node_surfaces_deduplicated_research_citations(monkeypatch) -> No
         if section["id"] == "citations"
     )
     urls = {item["url"] for item in citation_section["items"]}
-    assert urls == {"https://example.com/dup", "https://example.com/bear"}
-    assert len(citation_section["items"]) == 2
+    assert urls == {
+        "https://example.com/sealed",
+        "https://example.com/dup",
+        "https://example.com/bear",
+    }
+    assert len(citation_section["items"]) == 3
+    email_citations = next(
+        section
+        for section in output["report"]["email_projection"]["sections"]
+        if section["id"] == "citations"
+    )
+    assert {item["url"] for item in email_citations["items"]} == urls

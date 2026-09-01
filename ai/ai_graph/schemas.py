@@ -5,9 +5,17 @@ import json
 import math
 from datetime import date, datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 from ai_graph.research_eligibility import PublicPerformance
 
@@ -364,6 +372,7 @@ class StrategySpec(BaseModel):
 
 STRATEGY_EXECUTION_SPEC_VERSION_V1 = "strategy-execution-spec.v1"
 EXPLORATION_EXECUTION_SPEC_VERSION_V2 = "exploration-execution-spec.v2"
+RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3 = "research-candidate-execution-spec.v3"
 
 
 class StrategyExecutionConditionV1(BaseModel):
@@ -448,7 +457,85 @@ class ExplorationExecutionSpecV2(BaseModel):
         return True
 
 
-ExecutionSpecV1OrV2 = StrategyExecutionSpecV1 | ExplorationExecutionSpecV2
+class ResearchSourceRefV3(BaseModel):
+    """A cited research fact used to resolve an unfamiliar strategy term.
+
+    The source is evidence for *what a term means*, never a source of return or
+    recommendation numbers.  ``excerpt_digest`` deliberately identifies the exact
+    captured assertion without treating a mutable web page as an executable input.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str = Field(pattern=r"^source-[1-8]$")
+    title: str = Field(min_length=1, max_length=240)
+    url: str = Field(pattern=r"^https://")
+    claim: str = Field(min_length=1, max_length=600)
+    excerpt_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ResearchCandidateV3(BaseModel):
+    """One AOAI-researched, compiler-verifiable candidate before performance exists."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate_id: str = Field(pattern=r"^research-[a-z0-9][a-z0-9-]{0,62}$")
+    title: str = Field(min_length=1, max_length=160)
+    hypothesis: str = Field(min_length=1, max_length=800)
+    counter_hypothesis: str = Field(min_length=1, max_length=800)
+    entry_conditions: list[Condition] = Field(min_length=1, max_length=6)
+    exit_conditions: list[Condition] = Field(min_length=1, max_length=6)
+    required_metrics: list[str] = Field(min_length=1, max_length=20)
+    assumptions: list[str] = Field(min_length=1, max_length=10)
+    source_ids: list[str] = Field(min_length=1, max_length=8)
+
+
+class ResearchCandidateExecutionSpecV3(BaseModel):
+    """Sealed execution contract for an AI-researched unfamiliar strategy.
+
+    V3 is intentionally declarative: AOAI may research terminology and formulate
+    candidates, but it cannot inject Python, SQL, a data-source choice, or performance
+    figures.  The deterministic compiler and PostgreSQL/PIT loader remain the only
+    authorities for execution and results.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    classification: Literal["research_required"] = "research_required"
+    market: Literal["KRX"] = "KRX"
+    timeframe: Literal["daily"] = "daily"
+    research_schema_version: Literal["strategy-research-draft.v3"] = "strategy-research-draft.v3"
+    research_prompt_version: str = Field(min_length=1, max_length=100)
+    query_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    resolution_summary: str = Field(min_length=1, max_length=800)
+    research_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    capability_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sources: list[ResearchSourceRefV3] = Field(min_length=1, max_length=8)
+    # V3.0 executes one faithful researched rule. A later multi-candidate engine must
+    # not silently drop sealed rules before it can execute and report every one.
+    candidates: list[ResearchCandidateV3] = Field(min_length=1, max_length=1)
+
+    @model_validator(mode="after")
+    def source_and_candidate_references_are_complete(self) -> "ResearchCandidateExecutionSpecV3":
+        source_ids = [source.source_id for source in self.sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("research sources must be unique")
+        candidate_ids = [candidate.candidate_id for candidate in self.candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("research candidate ids must be unique")
+        known_sources = set(source_ids)
+        if any(not set(candidate.source_ids) <= known_sources for candidate in self.candidates):
+            raise ValueError("research candidates must reference sealed research sources")
+        return self
+
+    @property
+    def is_executable(self) -> bool:
+        return True
+
+
+ExecutionSpecV1OrV2 = (
+    StrategyExecutionSpecV1 | ExplorationExecutionSpecV2 | ResearchCandidateExecutionSpecV3
+)
 _EXECUTION_SPEC_ADAPTER = TypeAdapter(ExecutionSpecV1OrV2)
 
 
@@ -773,7 +860,16 @@ class CandidateBacktestResult(BaseModel):
     walk_forward: WalkForwardPolicyResult | None = None
 
 
-SignalAction = Literal["BUY", "HOLD", "DROP", "NO_RECOMMENDATION"]
+def _normalize_legacy_signal_action(value: Any) -> Any:
+    """Keep historical report reads compatible while emitting the standard SELL term."""
+
+    return "SELL" if value == "DROP" else value
+
+
+SignalAction = Annotated[
+    Literal["BUY", "HOLD", "SELL", "NO_RECOMMENDATION"],
+    BeforeValidator(_normalize_legacy_signal_action),
+]
 
 
 class SignalDecision(BaseModel):
@@ -1031,7 +1127,7 @@ class DailyDigestComparisonRow(BaseModel):
     total_return: float
     max_drawdown: float
     sharpe_ratio: float
-    status: Literal["주목", "유지", "관망", "근거 부족"]
+    status: Literal["주목", "유지", "매도", "근거 부족"]
 
 
 class DailyDigestStrategyCard(BaseModel):
@@ -1103,6 +1199,7 @@ class APIEnvelope(BaseModel):
     execution_spec_version: Literal[
         "strategy-execution-spec.v1",
         "exploration-execution-spec.v2",
+        "research-candidate-execution-spec.v3",
     ] | None = None
     execution_spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     debug_ref: str = Field(min_length=1)
@@ -1132,6 +1229,8 @@ class APIEnvelope(BaseModel):
             expected_version = (
                 EXPLORATION_EXECUTION_SPEC_VERSION_V2
                 if isinstance(self.execution_spec, ExplorationExecutionSpecV2)
+                else RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3
+                if isinstance(self.execution_spec, ResearchCandidateExecutionSpecV3)
                 else STRATEGY_EXECUTION_SPEC_VERSION_V1
             )
             if self.execution_spec_version != expected_version:
