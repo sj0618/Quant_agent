@@ -6,6 +6,39 @@ on:
       - main
     paths:
       - '**'
+  workflow_call:
+    inputs:
+      evidence_s_ref:
+        required: false
+        type: string
+      evidence_s_sha:
+        required: false
+        type: string
+      evidence_r_ref:
+        required: false
+        type: string
+      evidence_r_sha:
+        required: false
+        type: string
+      evidence_o_ref:
+        required: false
+        type: string
+      evidence_o_sha:
+        required: false
+        type: string
+      evidence_c_ref:
+        required: false
+        type: string
+      evidence_c_sha:
+        required: false
+        type: string
+      rollback_drill:
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
   workflow_dispatch:
     inputs:
       evidence_s_ref:
