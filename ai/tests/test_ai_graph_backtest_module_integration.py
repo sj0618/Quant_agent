@@ -136,8 +136,68 @@ def test_declared_raw_execution_row_cannot_fall_back_to_adjusted_prices() -> Non
         "raw_close": None, "raw_volume": 1_000.0, "raw_notional": None,
     }
 
-    with pytest.raises(ValueError, match="raw_execution_unavailable:2026-01-02/005930:raw_close,raw_notional"):
+    with pytest.raises(ValueError, match="raw_execution_unavailable:2026-01-02/005930:raw_close"):
         backtest_node._engine_market_rows([row])
+
+
+def test_raw_ohlcv_without_source_notional_runs_without_capacity_claim() -> None:
+    strategy = make_strategy("raw-without-notional", "Raw without notional")
+    candidate = CodeCandidate(
+        candidate_id="raw-without-notional-a",
+        variant="A",
+        code="""def build_signals(prices):
+    return [{"date": row["date"], "ticker": row["ticker"],
+             "action": "BUY" if row["date"] == "2026-01-02" else "HOLD",
+             "price": float(row["close"])} for row in prices]
+""",
+        validation_ok=True,
+    )
+    rows = [
+        {
+            "date": "2026-01-02", "ticker": "005930", "open": 100.0, "high": 101.0,
+            "low": 99.0, "close": 100.0, "volume": 1_000_000.0,
+            "raw_open": 90.0, "raw_high": 91.0, "raw_low": 89.0,
+            "raw_close": 90.0, "raw_volume": 1_000.0, "raw_notional": None,
+            "rsi": 20.0,
+        },
+        {
+            "date": "2026-01-05", "ticker": "005930", "open": 110.0, "high": 111.0,
+            "low": 109.0, "close": 110.0, "volume": 1_000_000.0,
+            "raw_open": 80.0, "raw_high": 81.0, "raw_low": 79.0,
+            "raw_close": 80.0, "raw_volume": 1_000.0, "raw_notional": None,
+            "rsi": 50.0,
+        },
+    ]
+
+    bars, _ = backtest_node._engine_market_rows(rows)
+    spec = backtest_node._engine_strategy_spec(
+        strategy,
+        candidate,
+        execution_capacity_enabled=backtest_node._execution_capacity_enabled(rows),
+    )
+    result = run_candidate_backtest(strategy, [candidate], price_rows=rows)
+    buys = [
+        event for event in result.engine_summary["execution_audit"]["recent_events"]
+        if event["side"] == "buy" and event["status"] == "executed"
+    ]
+
+    assert all(bar.raw_notional is None for bar in bars)
+    assert spec.backtest.execution_capacity.enabled is False
+    assert len(buys) == 1
+    assert buys[0]["price"] == pytest.approx(80.0 * 1.001)
+    assert result.engine_summary["execution_capacity"] == {
+        "enabled": False,
+        "status": "not_evaluated",
+        "reason_code": "raw_notional_source_missing_or_uncovered",
+        "detail": (
+            "Price execution used raw OHLCV, but participation-capacity checks were "
+            "not evaluated because source traded value is unavailable."
+        ),
+    }
+    assert (
+        "execution_capacity=not_evaluated(raw_notional_source_missing_or_uncovered)"
+        in result.engine_summary["performance_method_manifest"]["cost_tax_slippage_liquidity"]
+    )
 
 
 def test_generated_backtest_code_can_use_sorted_builtin() -> None:
