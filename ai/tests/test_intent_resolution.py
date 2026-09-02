@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from ai_graph.data_sources.db import PipelineDataBundle
 from ai_graph.graph import (
     _strategy_query,
     ambiguity_classifier_node,
@@ -18,9 +19,7 @@ from ai_graph.graph import (
 )
 from ai_graph.llm.base import LLMJsonRequest
 from ai_graph.llm.role_calls import resolve_strategy_intent
-from ai_graph.data_sources.db import PipelineDataBundle
 from ai_graph.schemas import AmbiguityCode, EnvelopeStatus
-
 
 RESOLVED = (
     "KOSPI·KOSDAQ 화학 업종에서 200일 이동평균 위에 있고 RSI(14)가 40 이하로 눌린 뒤 "
