@@ -71,7 +71,7 @@ class AnalysisJobRepository(Protocol):
     ) -> AnalysisJob:
         ...
 
-    def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
+    def list_jobs(self, *, limit: int = 100, user_id: str | None = None) -> list[AnalysisJob]:
         ...
 
 
@@ -198,8 +198,8 @@ class PersistentAnalysisJobStore:
             result_envelope=result_envelope,
         )
 
-    def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
-        return self._repository.list_jobs(limit=limit)
+    def list_jobs(self, *, limit: int = 100, user_id: str | None = None) -> list[AnalysisJob]:
+        return self._repository.list_jobs(limit=limit, user_id=user_id)
 
     def immutable_result_evidence(self, job_id: str) -> Any | None:
         if not isinstance(self._repository, ImmutableResultEvidenceRepository):

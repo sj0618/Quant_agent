@@ -190,3 +190,83 @@ def test_research_failure_reason_over_field_limit_stays_a_no_run_draft(monkeypat
     assert not draft.is_executable
     assert draft.unsupported_conditions
     assert all(len(item.reason) <= 240 for item in draft.unsupported_conditions)
+
+
+def _provider_failure_draft(monkeypatch):
+    from ai_graph import research_contract
+    from ai_graph.nodes.strategy_research import StrategyResearchError
+
+    def _raise_provider_failure(**_kwargs: object) -> None:
+        raise StrategyResearchError(
+            "strategy research provider is temporarily unavailable",
+            cause_code="research_provider_failure",
+        )
+
+    monkeypatch.setattr(research_contract, "_build_researched_draft", _raise_provider_failure)
+    return build_rule_draft(
+        query="유명한 퀀트전략으로 검증해줘",
+        user_id="user-1",
+        signer=_signer(),
+        use_llm=True,
+    )
+
+
+def test_a_research_provider_outage_asks_for_a_retry_not_a_rewrite(monkeypatch) -> None:
+    """A transient AOAI failure told the user their strategy could not be backtested
+    here and offered three unrelated ways to rewrite it."""
+
+    from ai_graph.research_contract import RESEARCH_PROVIDER_RETRY_MESSAGE
+
+    draft = _provider_failure_draft(monkeypatch)
+
+    assert draft.retry_only is True
+    assert draft.clarification_required is True
+    assert draft.is_executable is False
+    assert draft.explanation == RESEARCH_PROVIDER_RETRY_MESSAGE
+    # The strategy was never found unsupported; only the provider failed.
+    assert draft.unsupported_conditions == []
+    assert [choice.label for choice in draft.clarifications] == ["다시 시도"]
+
+
+def test_a_provider_outage_envelope_offers_one_retry_option(monkeypatch) -> None:
+    from ai_graph.api import _clarification_envelope
+    from ai_graph.research_contract import RESEARCH_PROVIDER_RETRY_MESSAGE
+    from ai_graph.schemas import EnvelopeStatus
+
+    draft = _provider_failure_draft(monkeypatch)
+
+    envelope = _clarification_envelope(
+        draft, query="유명한 퀀트전략으로 검증해줘", trace_id="trace-provider"
+    )
+
+    assert envelope.status is EnvelopeStatus.NEED_CLARIFICATION
+    assert envelope.retryable is True
+    assert envelope.user_payload.message == RESEARCH_PROVIDER_RETRY_MESSAGE
+    assert [option.label for option in envelope.user_payload.options] == ["다시 시도"]
+    assert "사용 가능한 지표로 조건 수정" not in envelope.model_dump_json()
+
+
+def test_a_capability_gap_keeps_its_own_wording_and_choices(monkeypatch) -> None:
+    from ai_graph import research_contract
+    from ai_graph.api import _clarification_envelope
+    from ai_graph.nodes.strategy_research import StrategyResearchError
+
+    def _raise_capability_gap(**_kwargs: object) -> None:
+        raise StrategyResearchError("cointegration_score is not a supported metric")
+
+    monkeypatch.setattr(research_contract, "_build_researched_draft", _raise_capability_gap)
+    draft = build_rule_draft(
+        query="공적분 페어 트레이딩으로 검증해줘",
+        user_id="user-1",
+        signer=_signer(),
+        use_llm=True,
+    )
+
+    envelope = _clarification_envelope(
+        draft, query="공적분 페어 트레이딩으로 검증해줘", trace_id="trace-gap"
+    )
+
+    assert draft.retry_only is False
+    assert draft.explanation == "전략 의미는 조사했지만 현재 서버가 같은 규칙으로 백테스트할 수 없습니다."
+    assert draft.unsupported_conditions
+    assert "사용 가능한 지표로 조건 수정" in envelope.model_dump_json()

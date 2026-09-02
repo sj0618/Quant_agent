@@ -639,20 +639,32 @@ class PostgresAnalysisJobRepository:
         self._save(job)
         return job
 
-    def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
+    def list_jobs(self, *, limit: int = 100, user_id: str | None = None) -> list[AnalysisJob]:
+        """Newest `limit` jobs, oldest-first; scoped to one owner when given.
+
+        The history view is per user, so the owner filter belongs in SQL. Reading every
+        user's newest rows and discarding the other owners' in Python detoasted ~100
+        whole job documents - each carrying its full result report - on every request,
+        and the read hit the statement timeout. `idx_ai_analysis_job_user_updated`
+        (migration 021) serves the scoped read directly.
+        """
+
+        owner_filter = "" if user_id is None else "WHERE user_id = %s"
+        params = (limit,) if user_id is None else (user_id, limit)
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT job_jsonb
                 FROM (
                     SELECT job_jsonb, updated_at
                     FROM app.ai_analysis_job
+                    {owner_filter}
                     ORDER BY updated_at DESC
                     LIMIT %s
                 ) AS recent_jobs
                 ORDER BY updated_at ASC
                 """,
-                (limit,),
+                params,
             ).fetchall()
         return self._decode_rows(rows)
 

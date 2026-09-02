@@ -607,11 +607,30 @@ def _clarification_envelope(outcome: RuleDraftV1, *, query: str, trace_id: str) 
     strategy options, which is not a question about anything the user said.
     """
 
-    prompt = build_clarification_prompt(classify_query(query), query)
     options = [
         ClarificationOption(label=choice.label, reason=choice.reason)
         for choice in outcome.clarifications
     ]
+    if outcome.retry_only:
+        # The research provider did not answer.  Nothing about the request was found
+        # unsupported, so a question about which strategy to pick - and three generic
+        # options for rewriting it - would be an answer to something the user never
+        # asked.  One action applies: run the same input again.
+        return APIEnvelope(
+            status=EnvelopeStatus.NEED_CLARIFICATION,
+            trace_id=trace_id,
+            user_payload=UserPayload(
+                headline="일시적인 오류로 분석을 시작하지 못했습니다.",
+                message=outcome.explanation,
+                next_actions=["잠시 후 같은 입력으로 다시 시도"],
+                question="잠시 후 같은 입력으로 다시 시도할까요?",
+                options=options[:1],
+                recommended=0,
+            ),
+            debug_ref=f"clarification:{trace_id}",
+            retryable=True,
+        )
+    prompt = build_clarification_prompt(classify_query(query), query)
     chosen = {option.label for option in options}
     options.extend(option for option in prompt["options"] if option.label not in chosen)
     next_actions = [
@@ -1847,10 +1866,10 @@ def create_app(
         limit: int = Query(default=100, ge=1, le=100),
         user_id: str = Depends(require_user),
     ) -> list[AnalysisJob]:
-        owned_jobs = (job for job in store.list_jobs(limit=100) if job.user_id == user_id)
+        owned_jobs = store.list_jobs(limit=limit, user_id=user_id)
         return [
             _public_job(job)
-            for job in sorted(owned_jobs, key=lambda job: job.updated_at, reverse=True)[:limit]
+            for job in sorted(owned_jobs, key=lambda job: job.updated_at, reverse=True)
         ]
 
     @app.post(
@@ -2706,9 +2725,7 @@ def _find_job_by_strategy(
     store: AnalysisJobStore, strategy_id: str, user_id: str
 ) -> AnalysisJob | None:
     normalized = strategy_id.strip().lower()
-    for job in reversed(store.list_jobs()):
-        if job.user_id != user_id:
-            continue
+    for job in reversed(store.list_jobs(user_id=user_id)):
         if not job.result or not job.result.strategy_spec:
             continue
         result_strategy_id = job.result.strategy_spec.strategy_id

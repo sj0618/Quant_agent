@@ -1005,6 +1005,29 @@ def test_analysis_job_api_list_honors_limit() -> None:
     assert [job["job_id"] for job in response.json()] == [second["job_id"]]
 
 
+def test_analysis_job_api_list_asks_the_store_for_one_owner_only() -> None:
+    """A Python-side owner filter made the durable read load every user's newest 100
+    job documents - result reports included - and time the statement out."""
+
+    store = InMemoryAnalysisJobStore()
+    seen: list[dict[str, object]] = []
+    inner = store.list_jobs
+
+    def _recording(*, limit: int = 100, user_id: str | None = None):
+        seen.append({"limit": limit, "user_id": user_id})
+        return inner(limit=limit, user_id=user_id)
+
+    store.list_jobs = _recording  # type: ignore[method-assign]
+    client = TestClient(create_app(store))
+    _ = client.post(ANALYSIS_JOBS_PATH, json={"query": "첫 번째 RSI 전략"})
+
+    response = client.get(f"{ANALYSIS_JOBS_PATH}?limit=50")
+
+    assert response.status_code == 200
+    assert seen and seen[-1]["limit"] == 50
+    assert seen[-1]["user_id"] is not None
+
+
 def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monkeypatch) -> None:
     for key in DATA_SOURCE_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)

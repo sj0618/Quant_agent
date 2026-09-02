@@ -126,3 +126,39 @@ DE migration 12, `compileall`·ruff(CI 선택 규칙) 통과, FE `npm run test`(
 - 배포 직후 두 번의 실측 실패로 기존 결함 2건을 추가로 고쳤다: (1) KST 자정~새벽 적재 사이 창 종료일이 시세 없는 세션이라 릴리스 매니페스트 거부 → 창 종료일을 마지막 적재 세션으로 캡(PR #88); (2) production에서 `AI_BACKTEST_CACHE_DIR` 미설정이면 백테스트 거부 → deploy가 `.run/backtest-cache`를 export(PR #89).
 - 최종: `RSI 30 이하일때 매수하고 70 이상일때 매도` → interpreting/code_generation/backtest/debate/finalizing 모두 succeeded, **53초에 ready**(기존: 875초 후 실패). `POST /api/v1/runs` 201 → `/complete` 200 → `app.strategy_email_report` 1행(sent) → `/api/v1/reports` 1건. 이메일 enqueue는 서버 `EMAIL_DELIVERY_ENABLED=false`라 정책상 skip.
 - 남은 여지: 53초 중 LLM 2회(리서치 컴파일·리포트 작성)가 ~20초. `AI_AOAI_TIMEOUT_SECONDS`/`AI_AOAI_MAX_RETRIES`를 운영 env로 더 조이거나 리포트 작성 호출을 축약하면 40초대 가능.
+
+## 8. 시연 준비 루프 (2026-09-03)
+
+§7.2의 53초 측정 이후, 실제 시연에 쓸 자연어 입력 10개를 배포 사이트에 직접 흘려 막힌 지점을 하나씩 고쳤다(배포 f4e412e → 7210cab).
+
+### 8.1 프로브 방법
+`node3_demo_probe.py`(저장소 밖): 합성 Google 사용자 + 실제 Redis 세션을 만들고 `POST /ai-api/analysis-jobs`로 폴링, ready면 선택적으로 `/api/v1/runs` + `/complete`까지 저장한 뒤 정리한다. 시연 입력 10개: RSI 30/70, 20/60일 이동평균 골든/데드크로스, MACD 골든/데드크로스, 볼린저 하단/중간선, 거래량 20일 평균 2배 후 5일 보유, 최근 3개월 모멘텀 상위 월간 교체, PER 10 이하, 반도체 섹터 RSI 30 이하, "유명한 퀀트전략", "안녕".
+
+### 8.2 배포 전/후
+| 구간 | 전(f4e412e) | 후(7210cab) |
+|---|---|---|
+| 리포트까지 완주 | 4/10(RSI, 거래량, 모멘텀, 유명한 퀀트전략) | 8/10 |
+| 나머지 6건 | clarification("먼저 어떤 후보 전략으로 구체화할까요?" + 범용 옵션 3개)에서 정지, "안녕"은 26초 소요 | "안녕"은 5.7초에 "어떤 투자 전략이나 매매 조건을 분석할까요?"로 응답; "유명한 퀀트전략"은 목표 기준 통과(OOS Sharpe 0.31, validated); 모멘텀 1건은 일시적 AOAI 장애("strategy research provider is temporarily unavailable")로 실패 |
+| 소요 시간 | - | ready 도달 52~78초(순차 부하). 단독 실행 스테이지 타임라인: interpreting 11~18초, code_generation 2~9초, backtest 20초(라운드 없음)~30초(2라운드), debate/report 11초 → 합계 55~58초 |
+
+### 8.3 원인과 수정
+- (i) sma60 부재 — compiler가 sma20/50/200만 알았다. 이제 sma{N}/ema{N}(2~250)을 종가에서 직접 계산하고(`ai/ai_graph/nodes/condition_compiler.py`) 패턴으로 리서처에 광고한다.
+- (ii) MACD 크로스 거부 — 문법에는 CROSS_ABOVE/CROSS_BELOW가 있었지만 `_compile_one`이 컴파일하지 않았다. 이제 임의의 두 지표에 대해 직전 봉 대비 반전으로 컴파일한다.
+- (iii) 볼린저 "검증 불가" — indicator-family 로딩이 원본 operand 이름(별칭 `bollinger_lower`, boolean 지표 `close_cross_above_sma20`)을 그대로 찾다 보니 변동성/추세 테이블을 한 번도 읽지 못했다. 이제 하나의 공유 operand 확장 `condition_metric_inputs`를 `ai/ai_graph/data_sources/db.py`의 `indicator_families_for_metrics`와 `ai/ai_graph/nodes/backtest_features.py`가 함께 쓴다. 같은 버그가 `close_above_sma_200` 규칙도 굶기고 있었다(거래 0건).
+- (iv) PER — `per`를 PIT 지표로 추가했다(raw_close / 최근 연간 EPS 이월, report_code 11011). EPS ≤ 0이면 미설정으로 둔다(분기 EPS는 3개월치라 그대로 나누면 PER이 4배씩 튄다). PBR은 아직 불가능(웨어하우스에 발행주식수/BPS 없음).
+- (v) 섹터 — `feature.wics_symbol_sector_history`(symbol_id, sector_name, valid_from, valid_to; 섹터명 26개; 반도체 = 166종목)를 구간 겹침으로 PIT 유니버스 CTE에 조인한다. 리서처는 allowed_sectors를 받고 그 안의 섹터명만 써야 한다(벗어나면 research_sector_dropped). 주의: WICS 행이 전부 2026-07-02부터 시작하는 단일 열린 구간이라 섹터 이력은 아직 진짜 point-in-time이 아니다.
+- (vi) holding_days / rebalance_interval_days(ResearchCandidateV3, `ai/ai_graph/schemas.py`) — 리서처가 "5일 뒤 매도"를 `close >= 0`(항상 참, 거래 717건)으로 흉내 내던 것을 없앴다. evaluator가 종목별 sessions_held를 추적해 정확히 청산하고, 교체매매는 기존 scheduled_rotation 경로를 재사용하며, validation이 항상 참인 exit을 repairable 오류로 거부한다.
+- (vii) 리서치 호출 전에 잡담을 짧게 처리하고(`ai/ai_graph/research_contract.py`) clarification 질문을 의도에 맞춰 고른다(`ai/ai_graph/api.py`).
+- (viii) 워크포워드 라운드: 폴드 평가를 (candidate, fold, pass) 단위로 메모이즈, 폴드 준비를 공유, 기존 프로세스 풀에서 병렬 실행, selection-width 디플레이션 항은 계속 게시하되 워크포워드에서는 더 이상 floor를 막지 않음, budget 25→30초(`ai/ai_graph/nodes/backtest.py`) — node3: backtest 노드 11.8초/0라운드 → 21.5~25.9초/1라운드, 전체 43~50초(mock LLM).
+- (ix) FE(`fe/src/api/quantAgentClient.ts`, `fe/src/features/app/OverviewTab.tsx`, `PerformanceTab.tsx`): 거부된 실행에서 "10.0 / 10" 대신 "보류", overview 타일과 차트 카드가 OOS 지표 세트를 읽음(라벨 "검증 구간(OOS) 누적 수익률", "Sharpe (Walk-forward OOS)"), 차트가 더 이상 마지막 5개 포인트로 잘리지 않음, 승률 부호 없음, 0 degradation 카드 숨김.
+
+### 8.4 node3 회귀
+병합된 스냅샷 기준: backtest_module 42 · service_db 57/3 skip · DE 12 · ai 959/11 skip · backend unit 409 · fe build+tests · Track C server integration 3 · Track 4 email server integration 1 — 전부 pass.
+
+### 8.5 UI 검증
+합성 세션(cookie `qa_session` + localStorage `quantagent.auth.session.v1`)을 발급해 확인했다: RSI·이동평균 교차 실행이 conclusion, 보류, OOS 타일, 전체 곡선(81 포인트, 날짜축 7개), reports 목록/상세를 그린다.
+
+### 8.6 남은 항목
+후속 PR에서 고치는 중: `GET /ai-api/analysis-jobs` 500(statement timeout — list_jobs가 전체 사용자의 job 100건을 JSON 통째로 읽어 Python에서 필터링), 워크포워드 실행이 ticker_actions 0건 발행(폴드가 엔진 결과를 보관하지 않음), 일시적 리서치 제공자 장애가 역량 부재처럼 범용 옵션 3개짜리 clarification으로 표시됨, wall budget 30→22초로 낮춰 60초 이내 유지. 운영 항목: node3에 EMAIL_*/Brevo 미설정(실제 발송 불가), 합성 사용자 `e2e-demo-*`/`e2e-ui-*`가 `app.analysis_result`에 남아있을 수 있음, `db_split.py`가 loader 함수의 stale한 사본을 갖고 있음(테스트 전용).
+
+<!-- post-deploy probe table: filled by the coordinator -->
