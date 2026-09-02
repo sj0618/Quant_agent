@@ -2303,7 +2303,7 @@ def available_indicator_metrics(conn: Any, *, as_of: date | None = None) -> list
     is offered to the language parser only when its warehouse JSONB key was observed.
     """
 
-    from ai_graph.nodes.condition_compiler import supported_metrics
+    from ai_graph.nodes.condition_compiler import runtime_derived_metrics, supported_metrics
 
     ceiling = as_of or datetime.now(KST).date()
     floor = ceiling - timedelta(days=SCREENING_DATE_LOOKBACK_DAYS)
@@ -2347,6 +2347,11 @@ def available_indicator_metrics(conn: Any, *, as_of: date | None = None) -> list
     for period in (20, 50, 200):
         if f"sma{period}" in observed:
             observed.update({f"close_above_sma_{period}", f"close_below_sma_{period}"})
+    # The loader calculates several metrics from the real OHLCV path after this
+    # catalog probe.  They do not appear as JSONB keys, so without this declaration
+    # the AOAI research node is falsely told that a valid request (for example,
+    # 1-month/3-month relative strength) cannot be backtested.
+    observed.update(runtime_derived_metrics(observed))
     compiler_metrics = set(supported_metrics())
     return sorted(observed & compiler_metrics)
 

@@ -4,6 +4,8 @@ import pytest
 
 from ai_graph.data_sources.db import available_indicator_metrics
 from ai_graph.llm.base import LLMJsonRequest
+from ai_graph.nodes.condition_compiler import untranslatable_conditions
+from ai_graph.nodes.strategy_research import research_strategy_execution_spec
 from ai_graph.research_contract import RuleDraftSigner, build_rule_draft
 from ai_graph.strategy_parser import StrategyParseError, parse_natural_language_strategy
 
@@ -188,9 +190,87 @@ def test_indicator_catalog_reads_bounded_postgres_windows() -> None:
 
     metrics = available_indicator_metrics(connection)
 
-    assert {"rsi", "sma20", "obv", "volume_ratio_20"}.issubset(metrics)
+    assert {
+        "rsi",
+        "sma20",
+        "obv",
+        "volume_ratio_20",
+        "relative_strength_20d",
+        "relative_strength_60d",
+    }.issubset(metrics)
     assert len(connection.calls) == 5
     assert all(
         "time >= %s::date AND time <= %s::date" in query
         for query, _ in connection.calls[:4]
     )
+
+
+def test_relative_strength_research_is_admitted_from_server_ohlcv_capability() -> None:
+    """Derived market-relative returns must reach the AOAI research vocabulary.
+
+    They are calculated from real price paths and the same-date universe at runtime,
+    not stored as a precomputed indicator JSONB key.
+    """
+
+    response = {
+        "resolution_summary": "1개월과 3개월 시장 대비 상대강도가 양수인 주도주를 검증합니다.",
+        "sources": [
+            {
+                "source_id": "source-1",
+                "title": "Relative strength definition",
+                "url": "https://example.com/relative-strength",
+                "claim": "상대강도는 같은 기간 시장 대비 초과수익률입니다.",
+            }
+        ],
+        "candidates": [
+            {
+                "candidate_id": "research-relative-strength-leader",
+                "title": "1개월·3개월 상대강도 주도주",
+                "hypothesis": "두 기간의 시장 대비 수익률이 양수인 종목은 추세 지속 후보가 될 수 있습니다.",
+                "counter_hypothesis": "강한 상대강도는 추세 반전 직전의 과열일 수 있습니다.",
+                "entry_conditions": [
+                    {
+                        "left": "relative_strength_20d",
+                        "operator": "gt",
+                        "right": 0,
+                        "universe_rank_pct": 0.2,
+                    },
+                    {
+                        "left": "relative_strength_60d",
+                        "operator": "gt",
+                        "right": 0,
+                        "universe_rank_pct": 0.2,
+                    },
+                ],
+                "exit_conditions": [
+                    {"left": "relative_strength_20d", "operator": "lte", "right": 0},
+                ],
+                "required_metrics": ["relative_strength_20d", "relative_strength_60d"],
+                "assumptions": [
+                    (
+                        "특정 섹터명이 없으므로 섹터 주도주는 KRX 가격 유니버스에서 "
+                        "1개월·3개월 상대강도 각각 상위 20%인 종목으로 운영 정의합니다."
+                    )
+                ],
+                "source_ids": ["source-1"],
+            }
+        ],
+    }
+    metrics = available_indicator_metrics(_CatalogConnection())
+
+    spec = research_strategy_execution_spec(
+        query="시장지수보다 최근 1개월·3개월 상대강도가 모두 높은 섹터 주도주를 찾아줘.",
+        available_metrics=metrics,
+        llm_client=_StructuredClient(response),
+    )
+
+    assert spec.candidates[0].required_metrics == [
+        "relative_strength_20d",
+        "relative_strength_60d",
+    ]
+    assert not untranslatable_conditions(spec.candidates[0].entry_conditions)
+    assert all(
+        condition.universe_rank_pct == pytest.approx(0.2)
+        for condition in spec.candidates[0].entry_conditions
+    )
+    assert "상위 20%" in spec.candidates[0].assumptions[0]

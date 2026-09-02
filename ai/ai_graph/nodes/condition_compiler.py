@@ -18,7 +18,7 @@ both read naturally.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from ai_graph.schemas import Condition, ConditionOperator
@@ -169,6 +169,26 @@ _BOOLEAN_EXPRESSIONS: dict[str, str] = {
     "close_cross_below_sma20": "(close < sma20 and closes[-2] >= sma20)",
 }
 
+# Some metrics are calculated from the price path after it is read from PostgreSQL,
+# rather than stored as a JSONB indicator key.  The admission catalog must advertise
+# these capabilities when their inputs are present.  Otherwise AOAI quite reasonably
+# concludes that a request such as "1개월·3개월 상대강도" is impossible even though the
+# backtest data source and compiler calculate it faithfully.
+_RUNTIME_DERIVED_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "volume_ratio_20": ("volume",),
+    "volume_ratio": ("volume",),
+    "close_to_sma20": ("close", "sma20"),
+    "close_to_sma200": ("close", "sma200"),
+    "high_252": ("high",),
+    "low_252": ("low",),
+    "breakout_high": ("close", "high"),
+    "breakout_high_20": ("close", "high"),
+    "close_below_lower_band_recent": ("close", "bb_lower"),
+    "close_cross_above_lower_band": ("close", "bb_lower"),
+    "close_cross_above_sma20": ("close", "sma20"),
+    "close_cross_below_sma20": ("close", "sma20"),
+}
+
 
 # Metrics derived from the bars the store already holds, rather than demanded of the
 # warehouse. OHLCV is fully loaded, so a rule phrased in terms of realised volatility,
@@ -285,6 +305,30 @@ def supported_metrics() -> list[str]:
             *_HISTORY,
         }
     )
+
+
+def runtime_derived_metrics(available_metrics: Iterable[str]) -> set[str]:
+    """Return compiler metrics calculated from already available server inputs.
+
+    This is a capability declaration, not a synthetic-data fallback.  For example,
+    the PostgreSQL loader calculates relative strength from each ticker's price path
+    and the same-date market universe; it never fabricates an indicator value.  The
+    declaration keeps the AOAI research prompt aligned with that executable path.
+    """
+
+    available = {canonical_metric(metric) for metric in available_metrics}
+    derived: set[str] = set()
+    for metric in supported_metrics():
+        spec = derived_series_spec(metric)
+        if spec is not None and spec[1] in available:
+            derived.add(metric)
+    for metric, requirements in _RUNTIME_DERIVED_REQUIREMENTS.items():
+        if set(requirements) <= available:
+            derived.add(metric)
+    for metric, (left, _operator, right) in _BOOLEAN_COMPARISONS.items():
+        if {canonical_metric(left), canonical_metric(right)} <= available:
+            derived.add(metric)
+    return derived
 
 
 # Names the generated build_signals already binds from the bar itself.
@@ -433,7 +477,17 @@ def _rank_filter(condition: Condition) -> tuple[str, float, bool] | None:
     if condition.universe_rank_pct is None:
         return None
     metric = canonical_metric(condition.left)
-    if metric not in _CURRENT and metric not in _FINANCIAL_METRICS:
+    # A rank cut is evaluated by PreparedFeatureStore against every name on the
+    # same date.  It can therefore use any current, financial, or price-path-derived
+    # metric that the structured evaluator exposes.  Keeping this narrower than
+    # ``_metric_series`` meant a sealed "relative-strength leader" rule was admitted
+    # by the research node but rejected by the compiler, even though the evaluator
+    # calculates the identical metric from the PIT OHLCV snapshot.
+    if (
+        metric not in _CURRENT
+        and metric not in _FINANCIAL_METRICS
+        and derived_series_spec(metric) is None
+    ):
         return None
     # gt/gte -> want the top of the distribution; lt/lte -> the bottom.
     top = condition.operator in {ConditionOperator.GT, ConditionOperator.GTE}
