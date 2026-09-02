@@ -224,6 +224,7 @@ h6 { font-size: 0.67em; }
 .strategy-strip__actions { display: flex; gap: 8px; }
 .strategy-strip__actions button, .export-button, .report-subbar button, .reports-page__head button, .score-filter button, .featured-report__actions button { border: 1px solid var(--line); border-radius: 6px; background: #fff; padding: 7px 12px; color: var(--ink); font-size: 12px; font-weight: 700; }
 .summary-grid, .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.metric-grid-note { color: var(--subdued); font-size: 11px; margin: 0 0 8px; }
 .summary-card div, .metric-card div:first-child { display: flex; justify-content: space-between; color: var(--subdued); font-size: 11px; }
 .summary-card strong, .metric-card > strong { display: block; margin-top: 12px; font-size: 28px; line-height: 1.4; }
 .summary-card p, .metric-card p { color: var(--muted); font-size: 11px; line-height: 1.5; margin-top: 8px; }

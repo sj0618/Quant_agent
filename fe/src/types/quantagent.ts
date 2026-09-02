@@ -220,6 +220,10 @@ export interface AIBacktestMetrics {
   in_sample_sharpe: number;
   out_sample_sharpe: number;
   degradation: number;
+  // Hold-out (walk-forward) drawdown. `max_drawdown` above spans the whole period including
+  // the candidate-selection history, so it is not an out-of-sample claim on its own - this
+  // sibling is what the recommendation gate and the equity curve actually judge against.
+  out_sample_max_drawdown?: number | null;
 }
 
 export interface AIBacktestEquityPoint {
@@ -473,6 +477,13 @@ export interface PerformanceSummary {
   dataQuality?: string[];
   benchmark?: AIBacktestBenchmark;
   metricDetails?: AIBacktestMetricDetail[];
+  /**
+   * Walk-forward out-of-sample max drawdown, already scaled to percent (e.g. -15.5), for the
+   * same selected candidate as `metrics`/`metricDetails` above. The overview chart card reads
+   * this instead of the whole-period `mdd` metric card so it never disagrees with the OOS
+   * equity curve it is drawn next to.
+   */
+  outOfSampleMaxDrawdown?: number | null;
   strategyExplanation?: AIStrategyExplanation | null;
   /** Caveats the backend attached to an otherwise-available result (e.g. a limited sample). */
   limitations?: string[];

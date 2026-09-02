@@ -19,6 +19,11 @@ interface OverviewTabProps {
 const CHART_INITIAL_ASSET = 1_000_000;
 const PERCENT_SCALE = 100;
 const PERCENT_DIGITS = 2;
+// The full out-of-sample curve routinely runs 60-90+ trading days; slicing to the last 5
+// points left one path with 5 dots while the headline return was computed over the whole
+// curve. Render the whole thing (PerformanceChart already thins its own x-axis labels) and
+// only cap for pathological cases.
+const CHART_POINT_LIMIT = 250;
 
 export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
   const featuredCandidates = overview.candidates.slice(0, 4);
@@ -26,7 +31,12 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
   const totalReturnMetric = metricByKey(overview, "totalReturn");
   const sharpeMetric = metricByKey(overview, "sharpe");
   const maxDrawdownMetric = metricByKey(overview, "mdd");
-  const chartPoints = overview.performance.equityCurve.slice(-5);
+  // The walk-forward out-of-sample Sharpe the recommendation gate actually judged against -
+  // when the backend sends it, it must replace the whole-period Sharpe card above so the
+  // tile and the gate's own verdict never disagree.
+  const oosSharpeMetric = metricByKey(overview, "out_sample_sharpe");
+  const oosMaxDrawdown = overview.performance.outOfSampleMaxDrawdown ?? null;
+  const chartPoints = overview.performance.equityCurve.slice(-CHART_POINT_LIMIT);
   const latestPoint = chartPoints[chartPoints.length - 1];
   const strategyReturn = latestPoint?.strategy;
   const benchmarkReturn = latestPoint?.benchmark;
@@ -88,18 +98,29 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
               },
           { label: "활성 신호", value: `${overview.passCount}건`, delta: undefined, caption: `BUY ${overview.buyCount} · HOLD ${overview.holdCount} · DROP ${overview.dropCount}` },
           {
-            label: "검증 누적 수익률",
-            value: insufficient ? "표본 부족" : totalReturnMetric?.value ?? (strategyReturn === undefined ? "—" : formatPercentValue(strategyReturn)),
+            // The chart card below plots this exact out-of-sample curve, so the tile reads
+            // it too - preferring the whole-period metric card here is what produced the
+            // "-11.97% vs -1.95%" disagreement between this tile and the chart.
+            label: "검증 구간(OOS) 누적 수익률",
+            value: insufficient
+              ? "표본 부족"
+              : strategyReturn !== undefined
+                ? formatPercentValue(strategyReturn)
+                : totalReturnMetric?.value ?? "—",
             delta: totalReturnMetric?.delta,
             caption: insufficient
               ? "신뢰도 기준 미달로 숫자를 표시하지 않습니다."
-              : totalReturnMetric?.caption ?? (benchmarkReturn === undefined ? "실제 수익률 곡선 기준" : `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`),
+              : strategyReturn !== undefined
+                ? "아래 차트와 동일한 검증 구간(OOS) 값입니다."
+                : totalReturnMetric?.caption ?? (benchmarkReturn === undefined ? "실제 수익률 곡선 기준" : `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`),
           },
           {
-            label: "Sharpe (Walk-forward)",
-            value: insufficient ? "표본 부족" : sharpeMetric?.value ?? "—",
+            label: "Sharpe (Walk-forward OOS)",
+            value: insufficient ? "표본 부족" : oosSharpeMetric?.value ?? sharpeMetric?.value ?? "—",
             delta: sharpeMetric?.delta,
-            caption: sharpeMetric?.caption ?? "AI 전략 검증 결과",
+            caption: insufficient
+              ? "신뢰도 기준 미달로 숫자를 표시하지 않습니다."
+              : oosSharpeMetric?.caption ?? sharpeMetric?.caption ?? "AI 전략 검증 결과",
           },
         ].map((item) => (
           <Card className="summary-card" key={item.label}>
@@ -191,7 +212,7 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
           </div>
           <div><span>초기 자산</span><strong>{formatCurrency(CHART_INITIAL_ASSET)}</strong></div>
           {hasBenchmarkSeries && benchmarkReturn !== undefined ? <div><span>{benchmarkLabel} 대비</span><strong>{formatPercentPoint(strategyReturn - benchmarkReturn)}</strong></div> : null}
-          <div><span>최대 낙폭</span><strong>{maxDrawdownMetric?.value ?? "-"}</strong></div>
+          <div><span>최대 낙폭</span><strong>{oosMaxDrawdown !== null ? formatPercentValue(oosMaxDrawdown) : maxDrawdownMetric?.value ?? "-"}</strong></div>
         </div>
         <PerformanceChart points={chartPoints} series={hasBenchmarkSeries ? ["benchmark", "strategy"] : ["strategy"]} />
         {overview.performance.limitations?.length ? (
