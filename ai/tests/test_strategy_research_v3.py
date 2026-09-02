@@ -333,10 +333,21 @@ def test_sealed_research_skips_non_authoritative_current_screening(
     captured: dict[str, object] = {}
 
     def stop_after_capture(
-        query: str, trace_id: str, *, screen_current: bool = True
+        query: str,
+        trace_id: str,
+        *,
+        screen_current: bool = True,
+        required_metrics: object | None = None,
+        requires_financials: object | None = None,
     ) -> object:
         captured.update(
-            {"query": query, "trace_id": trace_id, "screen_current": screen_current}
+            {
+                "query": query,
+                "trace_id": trace_id,
+                "screen_current": screen_current,
+                "required_metrics": required_metrics,
+                "requires_financials": requires_financials,
+            }
         )
         raise RuntimeError("data loader captured")
 
@@ -352,6 +363,8 @@ def test_sealed_research_skips_non_authoritative_current_screening(
         )
 
     assert captured["screen_current"] is False
+    assert set(captured["required_metrics"] or ()) == {"close", "high", "sma20"}
+    assert captured["requires_financials"] is False
 
 
 def test_data_plan_reads_the_sealed_ast_not_only_the_researcher_metric_summary() -> None:

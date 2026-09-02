@@ -9,6 +9,8 @@ the public surface stable.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from . import db_test as _impl
 from .db_test import *  # noqa: F401,F403 - re-export the benchmark public API
 from .db_test import (
@@ -26,7 +28,12 @@ class PostgresPipelineDataSource(_impl.PostgresPipelineDataSource):
 
 
 def load_pipeline_data_from_env(
-    query: str, trace_id: str, *, screen_current: bool = True
+    query: str,
+    trace_id: str,
+    *,
+    screen_current: bool = True,
+    required_metrics: Sequence[str] | None = None,
+    requires_financials: bool | None = None,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -35,5 +42,9 @@ def load_pipeline_data_from_env(
             query=query,
         )
     return PostgresPipelineDataSource(config).load(
-        query, trace_id, screen_current=screen_current
+        query,
+        trace_id,
+        screen_current=screen_current,
+        required_metrics=required_metrics,
+        requires_financials=requires_financials,
     )

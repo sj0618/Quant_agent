@@ -12,7 +12,7 @@ experiments.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .db import *  # noqa: F401,F403 - re-export the baseline public API
@@ -349,7 +349,12 @@ PostgresPipelineDataSource = FastPostgresPipelineDataSource
 
 
 def load_pipeline_data_from_env(
-    query: str, trace_id: str, *, screen_current: bool = True
+    query: str,
+    trace_id: str,
+    *,
+    screen_current: bool = True,
+    required_metrics: Sequence[str] | None = None,
+    requires_financials: bool | None = None,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -358,5 +363,9 @@ def load_pipeline_data_from_env(
             query=query,
         )
     return PostgresPipelineDataSource(config).load(
-        query, trace_id, screen_current=screen_current
+        query,
+        trace_id,
+        screen_current=screen_current,
+        required_metrics=required_metrics,
+        requires_financials=requires_financials,
     )

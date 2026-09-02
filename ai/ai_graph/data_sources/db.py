@@ -326,7 +326,13 @@ class PostgresPipelineDataSource:
         self.unavailable_indicator_families: tuple[str, ...] = ()
 
     def load(
-        self, query: str, trace_id: str, *, screen_current: bool = True
+        self,
+        query: str,
+        trace_id: str,
+        *,
+        screen_current: bool = True,
+        required_metrics: Sequence[str] | None = None,
+        requires_financials: bool | None = None,
     ) -> PipelineDataBundle:
         load_started = perf_counter()
         timings: dict[str, float] = {}
@@ -361,7 +367,15 @@ class PostgresPipelineDataSource:
                     "pit_calendar_unavailable",
                     "KRX trading-calendar sessions are unavailable for the fixed five-year backtest window",
                 )
-            indicator_families = indicator_families_for_query(query)
+            # V3 supplies the exact metrics from its sealed AST.  Falling back to the
+            # legacy query heuristic would pull every TA family even when the executed
+            # rule only needs price-derived relative strength.  Keep the legacy path
+            # unchanged for unsealed callers.
+            indicator_families = (
+                indicator_families_for_metrics(required_metrics, include_default=False)
+                if required_metrics is not None
+                else indicator_families_for_query(query)
+            )
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
             universe_descriptor: dict[str, Any] = {
@@ -388,7 +402,12 @@ class PostgresPipelineDataSource:
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     screening = executor.submit(self._screen_on_its_own_connection, query)
                     pit_market = self._load_pit_market(
-                        conn, backtest_window, query, indicator_families, timings
+                        conn,
+                        backtest_window,
+                        query,
+                        indicator_families,
+                        requires_financials,
+                        timings,
                     )
                     (
                         screening_candidates,
@@ -425,7 +444,12 @@ class PostgresPipelineDataSource:
             if screening_mode:
                 if pit_market is None:
                     pit_market = self._load_pit_market(
-                        conn, backtest_window, query, indicator_families, timings
+                        conn,
+                        backtest_window,
+                        query,
+                        indicator_families,
+                        requires_financials,
+                        timings,
                     )
                 (
                     tickers,
@@ -455,6 +479,9 @@ class PostgresPipelineDataSource:
                 tickers = [ticker]
                 symbol_info = self._fetch_symbol_info(conn, ticker)
                 price_rows_started = perf_counter()
+                fetch_kwargs: dict[str, Any] = {"timings": timings}
+                if requires_financials is not None:
+                    fetch_kwargs["requires_financials"] = requires_financials
                 price_rows, effective_lookback_days = self._fetch_price_rows(
                     conn,
                     tickers,
@@ -462,7 +489,7 @@ class PostgresPipelineDataSource:
                     query,
                     backtest_window,
                     indicator_families,
-                    timings=timings,
+                    **fetch_kwargs,
                 )
                 timings["price_rows_seconds"] = perf_counter() - price_rows_started
             else:
@@ -589,6 +616,10 @@ class PostgresPipelineDataSource:
                     INDICATOR_TABLES[family] for family in indicator_families
                 ],
                 "indicator_families": list(indicator_families),
+                "data_load_plan": {
+                    "required_metrics": sorted(required_metrics or ()),
+                    "requires_financials": requires_financials,
+                },
                 "unavailable_indicator_families": list(
                     self.unavailable_indicator_families
                 ),
@@ -663,6 +694,7 @@ class PostgresPipelineDataSource:
         window: Mapping[str, Any],
         query: str,
         indicator_families: Sequence[str],
+        requires_financials: bool | None,
         timings: dict[str, float],
     ) -> tuple[
         list[str],
@@ -687,6 +719,9 @@ class PostgresPipelineDataSource:
         self._set_statement_timeout(conn, self.config.backtest_statement_timeout_ms)
         started = perf_counter()
         try:
+            fetch_kwargs: dict[str, Any] = {"timings": timings}
+            if requires_financials is not None:
+                fetch_kwargs["requires_financials"] = requires_financials
             price_rows, effective_lookback_days = self._fetch_price_rows(
                 conn,
                 tickers,
@@ -694,7 +729,7 @@ class PostgresPipelineDataSource:
                 query,
                 window,
                 indicator_families,
-                timings=timings,
+                **fetch_kwargs,
             )
         finally:
             self._set_statement_timeout(conn)
@@ -1060,6 +1095,7 @@ class PostgresPipelineDataSource:
         window: Mapping[str, Any],
         indicator_families: Sequence[str] | None = None,
         *,
+        requires_financials: bool | None = None,
         timings: dict[str, float] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         del query
@@ -1091,7 +1127,10 @@ class PostgresPipelineDataSource:
         ).fetchall()
         timings["price_ohlcv_query_seconds"] = perf_counter() - ohlcv_started
         earliest_priced_date = min((_date_value(row["as_of_date"]) for row in rows), default=None)
-        families = indicator_families or tuple(INDICATOR_TABLES)
+        # An empty tuple is an explicit sealed plan with no warehouse TA dependency
+        # (for example relative strength derived from OHLCV).  Only ``None`` means the
+        # legacy caller did not provide a plan and still needs all families.
+        families = tuple(INDICATOR_TABLES) if indicator_families is None else indicator_families
         indicators_by_family: dict[str, dict[str, dict[date, Mapping[str, Any]]]] = {}
         unavailable_families: list[str] = []
         indicators_started = perf_counter()
@@ -1108,7 +1147,14 @@ class PostgresPipelineDataSource:
         self.unavailable_indicator_families = tuple(unavailable_families)
         timings["price_indicator_seconds"] = perf_counter() - indicators_started
         financials_started = perf_counter()
-        financials_by_ticker = self._fetch_financial_timeline(conn, ticker_list)
+        # Technical strategies do not need DART rows.  The legacy unspecified case
+        # preserves the old behavior; a sealed V3 plan can make this dependency
+        # explicit and avoid a full-universe filing scan before a price-only test.
+        financials_by_ticker = (
+            self._fetch_financial_timeline(conn, ticker_list)
+            if requires_financials is not False
+            else {}
+        )
         timings["price_financial_seconds"] = perf_counter() - financials_started
         conversion_started = perf_counter()
         price_rows = [
@@ -1573,7 +1619,12 @@ class PostgresPipelineDataSource:
 
 
 def load_pipeline_data_from_env(
-    query: str, trace_id: str, *, screen_current: bool = True
+    query: str,
+    trace_id: str,
+    *,
+    screen_current: bool = True,
+    required_metrics: Sequence[str] | None = None,
+    requires_financials: bool | None = None,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -1582,7 +1633,11 @@ def load_pipeline_data_from_env(
             query=query,
         )
     return PostgresPipelineDataSource(config).load(
-        query, trace_id, screen_current=screen_current
+        query,
+        trace_id,
+        screen_current=screen_current,
+        required_metrics=required_metrics,
+        requires_financials=requires_financials,
     )
 
 
@@ -2272,10 +2327,12 @@ def indicator_families_for_query(query: str) -> tuple[str, ...]:
     return tuple(INDICATOR_TABLES)
 
 
-def indicator_families_for_metrics(metrics: Sequence[str]) -> tuple[str, ...]:
+def indicator_families_for_metrics(
+    metrics: Sequence[str], *, include_default: bool = True
+) -> tuple[str, ...]:
     """The ta_* families needed to evaluate these condition metrics."""
 
-    families = set(ALWAYS_LOADED_FAMILIES)
+    families = set(ALWAYS_LOADED_FAMILIES) if include_default else set()
     for metric in metrics:
         family = INDICATOR_FAMILY_BY_METRIC.get(str(metric).strip().lower())
         if family is not None:

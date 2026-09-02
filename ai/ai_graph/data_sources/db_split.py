@@ -315,8 +315,19 @@ class PostgresPipelineDataSource:
         self.unavailable_indicator_families: tuple[str, ...] = ()
 
     def load(
-        self, query: str, trace_id: str, *, screen_current: bool = True
+        self,
+        query: str,
+        trace_id: str,
+        *,
+        screen_current: bool = True,
+        required_metrics: Sequence[str] | None = None,
+        requires_financials: bool | None = None,
     ) -> PipelineDataBundle:
+        # Keep the alternative source API compatible with the sealed V3 data plan.
+        # Its own projection planner is intentionally unchanged; this prevents a
+        # configured variant from failing merely because the primary source gained a
+        # plan-aware optional argument.
+        del required_metrics, requires_financials
         if self.config.load_mode == "screening_only":
             if not screen_current:
                 raise PipelineDataUnavailableError(
@@ -1431,7 +1442,12 @@ class PostgresPipelineDataSource:
 
 
 def load_pipeline_data_from_env(
-    query: str, trace_id: str, *, screen_current: bool = True
+    query: str,
+    trace_id: str,
+    *,
+    screen_current: bool = True,
+    required_metrics: Sequence[str] | None = None,
+    requires_financials: bool | None = None,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -1440,7 +1456,11 @@ def load_pipeline_data_from_env(
             query=query,
         )
     return PostgresPipelineDataSource(config).load(
-        query, trace_id, screen_current=screen_current
+        query,
+        trace_id,
+        screen_current=screen_current,
+        required_metrics=required_metrics,
+        requires_financials=requires_financials,
     )
 
 

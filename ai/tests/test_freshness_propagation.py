@@ -229,7 +229,9 @@ def test_data_node_withholds_recommendations_when_fresh_postgres_has_no_l4_evide
         data_availability={},
         metadata=_pipeline_metadata("fresh", reason="가격 데이터가 직전 개장일까지 적재돼 있습니다."),
     )
-    monkeypatch.setattr("ai_graph.graph.load_pipeline_data_from_env", lambda *_: bundle)
+    monkeypatch.setattr(
+        "ai_graph.graph.load_pipeline_data_from_env", lambda *_args, **_kwargs: bundle
+    )
 
     data = data_node({"user_query": "RSI가 30 이하인 KOSPI200", "trace_id": "l4-absent"})
 
