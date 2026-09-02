@@ -94,7 +94,11 @@ Time is expressed by dedicated fields, never by a condition. "N일 뒤 매도", 
 sessions per month (한 주 = 5, 분기 = 63). Never encode a time exit as an always-true
 condition such as ``close gte 0``; that sells on every bar and is rejected. A candidate
 whose only exit is time may return an empty ``exit_conditions`` array, as long as
-``holding_days`` is set.
+``holding_days`` is set. A request that states an entry rule but no exit rule at all
+(for example "RSI 30 이하 종목 매수") is still executable: set ``holding_days`` to 20
+(about one month), leave ``exit_conditions`` empty, and record the assumption
+"청산 조건이 없어 20거래일 보유 후 청산으로 가정" in ``assumptions``. A missing exit is
+never a reason to return no candidate.
 
 For every candidate, cite one or more sources you actually used. Candidate conditions
 are a historical research rule: entry must be non-empty, and exit must be non-empty
