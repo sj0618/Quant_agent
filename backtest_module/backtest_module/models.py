@@ -134,8 +134,6 @@ class RiskControls(BaseModel):
     stop_loss_pct: Union[float, None] = Field(default=0.08, gt=0.0, le=1.0)
     take_profit_pct: Union[float, None] = Field(default=None, gt=0.0)
     max_single_position_pct: float = Field(default=0.2, gt=0.0, le=1.0)
-    max_sector_weight_pct: float = Field(default=0.4, gt=0.0, le=1.0)
-    exclude_listing_risk: bool = True
 
 
 class WalkForwardConfig(BaseModel):
