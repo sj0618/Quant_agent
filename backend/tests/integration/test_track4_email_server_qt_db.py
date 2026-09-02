@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import os
 from dataclasses import replace
@@ -17,6 +16,7 @@ from app.schemas.email_delivery import EmailDeliverySendResult
 from app.services import email_delivery, email_unsubscribe, fe_contract_store
 from app.workers.email_delivery_worker import EmailDeliveryWorker
 from tests.integration.test_track_c_server_run_report_qt_db import (
+    _DELETE_UNPINNED_SYNTHETIC_USERS,
     API_ORIGIN,
     _completion_payload,
     _count,
@@ -131,11 +131,6 @@ async def _cleanup(context: dict[str, Any], identifiers: list[tuple[str, str, st
         "DELETE FROM app.email_digest_subscription WHERE user_id IN (CAST(:owner_id AS bigint), CAST(:intruder_id AS bigint))",
         {"owner_id": owner_id, "intruder_id": intruder_id},
     )
-    await _execute(
-        engine,
-        "DELETE FROM app.users WHERE user_id IN (CAST(:owner_id AS bigint), CAST(:intruder_id AS bigint))",
-        {"owner_id": owner_id, "intruder_id": intruder_id},
-    )
     for run_id, strategy_id, report_id in identifiers:
         params = {"run_id": run_id, "strategy_id": strategy_id, "report_id": report_id}
         for sql in (
@@ -150,9 +145,10 @@ async def _cleanup(context: dict[str, Any], identifiers: list[tuple[str, str, st
             "DELETE FROM app.strategy WHERE strategy_id = :strategy_id",
         ):
             await _execute(engine, sql, params)
+    # app.strategy.user_id references app.users, so the owned rows must be gone first.
     await _execute(
         engine,
-        "DELETE FROM app.users WHERE auth_provider = 'google' AND provider_user_id IN (:owner, :intruder)",
+        _DELETE_UNPINNED_SYNTHETIC_USERS,
         {"owner": context["owner_provider_id"], "intruder": context["intruder_provider_id"]},
     )
 
@@ -301,6 +297,7 @@ async def test_track4_email_report_server_qt_db() -> None:
                 "timeframe": "daily",
                 "requestPayload": {"source": SYNTHETIC_SOURCE, "case": "daily-disabled"},
             }
+            context["jobs"][daily_disabled_payload["aiJobId"]] = owner_id
             daily_disabled_ids = _run_identifiers(owner_id, daily_disabled_payload)
             identifiers.append(daily_disabled_ids)
             daily_disabled_run_id, _daily_disabled_strategy_id, daily_disabled_report_id = daily_disabled_ids
@@ -314,7 +311,7 @@ async def test_track4_email_report_server_qt_db() -> None:
                 f"/api/v1/runs/{daily_disabled_run_id}/complete",
                 cookies=owner_cookie,
                 headers=owner_headers,
-                json=_completion_payload(token=f"{context['token']}d"),
+                json=_completion_payload(ai_job_id=daily_disabled_payload["aiJobId"]),
             )
             assert daily_disabled_created.status_code == 201
             assert daily_disabled_completed.status_code == 200
@@ -340,6 +337,7 @@ async def test_track4_email_report_server_qt_db() -> None:
                 "timeframe": "daily",
                 "requestPayload": {"source": SYNTHETIC_SOURCE, "case": "eligible"},
             }
+            context["jobs"][first_create_payload["aiJobId"]] = owner_id
             first_ids = _run_identifiers(owner_id, first_create_payload)
             identifiers.append(first_ids)
             first_run_id, first_strategy_id, first_report_id = first_ids
@@ -372,7 +370,7 @@ async def test_track4_email_report_server_qt_db() -> None:
             assert subscribed.status_code == duplicate_subscription.status_code == intruder_subscription.status_code == 410
             assert subscribed.json()["error"]["code"] == "daily_digest_subscriptions_retired"
 
-            completion = _completion_payload(token=context["token"])
+            completion = _completion_payload(ai_job_id=first_create_payload["aiJobId"])
             completed = await client.post(
                 f"/api/v1/runs/{first_run_id}/complete",
                 cookies=owner_cookie,
@@ -385,13 +383,15 @@ async def test_track4_email_report_server_qt_db() -> None:
                 headers=owner_headers,
                 json=completion,
             )
-            conflicting = copy.deepcopy(completion)
-            conflicting["result"]["summary"] = "controlled conflicting summary"
+            # The body no longer carries the result: a second job id is the only way to
+            # ask for different content on an already-completed run.
+            conflicting_ai_job_id = f"{SYNTHETIC_SOURCE}:conflict:{context['token']}"
+            context["jobs"][conflicting_ai_job_id] = owner_id
             conflict = await client.post(
                 f"/api/v1/runs/{first_run_id}/complete",
                 cookies=owner_cookie,
                 headers=owner_headers,
-                json=conflicting,
+                json=_completion_payload(ai_job_id=conflicting_ai_job_id),
             )
             assert completed.status_code == replay_completed.status_code == 200
             assert completed.json()["created"] is True
@@ -612,6 +612,7 @@ async def test_track4_email_report_server_qt_db() -> None:
                 "timeframe": "daily",
                 "requestPayload": {"source": SYNTHETIC_SOURCE, "case": "suppressed"},
             }
+            context["jobs"][second_create_payload["aiJobId"]] = owner_id
             second_ids = _run_identifiers(owner_id, second_create_payload)
             identifiers.append(second_ids)
             second_run_id, _second_strategy_id, second_report_id = second_ids
@@ -625,7 +626,7 @@ async def test_track4_email_report_server_qt_db() -> None:
                 f"/api/v1/runs/{second_run_id}/complete",
                 cookies=owner_cookie,
                 headers=owner_headers,
-                json=_completion_payload(token=f"{context['token']}b"),
+                json=_completion_payload(ai_job_id=second_create_payload["aiJobId"]),
             )
             assert second_created.status_code == 201
             assert second_completed.status_code == 200
@@ -650,6 +651,7 @@ async def test_track4_email_report_server_qt_db() -> None:
                 "timeframe": "daily",
                 "requestPayload": {"source": SYNTHETIC_SOURCE, "case": "enqueue-rollback"},
             }
+            context["jobs"][rollback_create_payload["aiJobId"]] = owner_id
             rollback_ids = _run_identifiers(owner_id, rollback_create_payload)
             identifiers.append(rollback_ids)
             rollback_run_id, _rollback_strategy_id, rollback_report_id = rollback_ids
@@ -667,7 +669,7 @@ async def test_track4_email_report_server_qt_db() -> None:
                 f"/api/v1/runs/{rollback_run_id}/complete",
                 cookies=owner_cookie,
                 headers=owner_headers,
-                json=_completion_payload(token=f"{context['token']}r"),
+                json=_completion_payload(ai_job_id=rollback_create_payload["aiJobId"]),
             )
             context["app"].state.settings = context["settings"]
             assert failed_completion.status_code == 503
@@ -725,7 +727,8 @@ async def test_track4_email_report_server_qt_db() -> None:
         if intruder_session_id is not None:
             await context["store"].revoke_session(intruder_session_id)
         cleanup_counts = await _cleanup(context, identifiers)
-        assert cleanup_counts == {name: 0 for name in cleanup_counts}
+        # Only the owner row survives: it is pinned by the immutable analysis_result.
+        assert cleanup_counts == {**{name: 0 for name in cleanup_counts}, "users": 1}
         from app.db.session import dispose_db_engine
 
         await dispose_db_engine(context["auth_engine"])

@@ -54,3 +54,10 @@ cd backend && python -m pytest -q tests/unit/test_email_track4.py tests/unit/tes
   tests/unit/test_run_email_delivery_worker.py tests/unit/test_fe_contract_routes.py
 ```
 서버 DB를 쓰는 통합 테스트는 `TRACK4_EMAIL_SERVER_WRITE_INTEGRATION=1` opt-in(`tests/integration/test_track4_email_server_qt_db.py`).
+
+## 서버(qt_db) 통합 테스트 갱신 (2026-09-02)
+- `tests/integration/test_track_c_server_run_report_qt_db.py`·`test_track4_email_server_qt_db.py`는 요청 본문에 결과를 싣던 옛 계약을 전제하고 있어
+  현재 계약(완료 결과는 `analysis_job_store`의 job에서 읽고, `/runs`·`/complete`는 `aiJobId`만 받음)으로 다시 썼다. 가짜 job store에 `aiJobId → owner`를 등록해 쓴다.
+- node3 결과: track-c 3 passed, track4 1 passed(clean env + 운영 DSN). `reader` 계약(`ArchivedReportDetail`, extra=forbid)에는 `marketBrief`/`performance`가 없다.
+- **주의**: 완료 1건마다 `app.analysis_result`(immutable 트리거) 1행과 그 소유자 `app.users` 1행이 영구히 남는다(`ON DELETE RESTRICT`).
+  opt-in 통합 테스트와 운영 smoke는 그래서 완전 자가정리가 불가능하다 — 합성 사용자 행(`track2-report-remediation-*`, `e2e-smoke-*`)이 누적된다.

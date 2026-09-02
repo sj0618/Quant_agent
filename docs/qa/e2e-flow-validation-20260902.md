@@ -70,7 +70,13 @@ DE migration 12, `compileall`·ruff(CI 선택 규칙) 통과, FE `npm run test`(
 
 - 회귀: §2 수치. AI 스위트의 유일한 실패 `test_backtest_optimization.py::test_parallel_evaluation_stops_at_a_wave_boundary_when_cancelled`는
   변경 전 HEAD를 별도 worktree로 실행해도 동일하게 실패(Windows 프로세스 풀 취소 경로, CI 선택 목록 밖) → 이 변경과 무관.
-- 하네스 재실행·production-raw 시나리오·적대적 리뷰 결과: 아래 "검증 부록"에 기록.
+- 하네스 재실행(수정 후): happy 12/12, retry 10/10, duplicate 7/7, production-410 6/6(410 → 이제 503/404: 관리 admission만 남음), invalid-input 6/6,
+  persistent 13/13, **production-raw 10/10**(production 설정 + 결정론 파서로 bare query → ready → 201/200 → PENDING → 워커 → 스텁 POST → SENT; aiJobId 없음 422, 미지 job 404).
+- 적대적 리뷰(Fable, 보안·동시성): 차단 1건(`/trust` smoke) 포함 위 §4 반영. 소유권·CSRF·Origin·재큐잉 vs PROCESSING 클레임·CancelledError 처리·AI 엔벨로프 비노출은 "검증됨 안전".
+- **node3 서버(별도 checkout `~/mvp_sp1/e2e-check`, python3.11 venv, clean env)**: compileall·ruff CI 통과, backtest 42, service_db 57(+3 skip), DE 12,
+  **AI 872 passed/11 skipped(로컬 Windows 실패 1건도 Linux에서는 통과)**, **backend unit 408 passed**, FE `npm ci`+`npm run test` 통과.
+  주의: 서버 로그인 셸의 `~/.bashrc`가 운영 AUTH_/EMAIL_/AI_ 값을 export하므로 backend 설정 테스트는 반드시 `env -i`로 돌려야 한다(그렇지 않으면 27건이 환경 때문에 실패).
+- PR #86 CI(Python checks, Frontend checks, Offline release-trust gate, ai-logging) 모두 통과.
 
 ## 6. 남은 문제 · 외부 설정 · 수동 확인
 
