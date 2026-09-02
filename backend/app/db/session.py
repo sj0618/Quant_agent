@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -72,7 +71,7 @@ async def check_db(engine: Any) -> dict[str, Any]:
             result = await conn.execute(text("SELECT 1 AS ok"))
             value = result.scalar_one()
         return {"status": "ok", "check": "SELECT 1", "value": value}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise AppError(
             status_code=503,
             component="db",
@@ -90,7 +89,7 @@ async def fetch_all(engine: Any, sql: str, params: dict[str, Any] | None = None)
                 result = await conn.execute(text(sql), effective_params)
             with measure_report_database_span("fetch"):
                 return [dict(row) for row in result.mappings().all()]
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise AppError(
             status_code=503,
             component="db",
@@ -116,7 +115,7 @@ async def execute_one(engine: Any, sql: str, params: dict[str, Any] | None = Non
             result = await conn.execute(text(sql), effective_params)
             row = result.mappings().first()
             return dict(row) if row is not None else None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise AppError(
             status_code=503,
             component="db",
@@ -125,6 +124,3 @@ async def execute_one(engine: Any, sql: str, params: dict[str, Any] | None = Non
             details={"error": redact_secrets(f"{type(exc).__name__}: {exc}")},
         ) from exc
 
-
-def rows_from_mappings(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    return [dict(row) for row in rows]

@@ -9,7 +9,6 @@ from ai_graph.llm.base import LLMJsonRequest
 from ai_graph.llm.prompts import BACKTEST_CODE_SCHEMA_NAME
 from ai_graph.schemas import StrategySpec
 
-
 SAFE_RSI_CODE = '''def build_signals(prices):
     signals = []
     for row in prices:

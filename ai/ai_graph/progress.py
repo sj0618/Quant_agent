@@ -72,16 +72,6 @@ def activity_role(role: str) -> Iterator[None]:
         _ACTIVITY_ROLE.reset(token)
 
 
-def activity_listener_installed() -> bool:
-    """Whether anyone is consuming live activity.
-
-    The provider client only pays the cost of streaming when this is true; with no
-    listener there is nothing to show and the simpler request/response path is used.
-    """
-
-    return _ACTIVITY_REPORTER.get() is not None
-
-
 def report_activity(kind: str, **fields: Any) -> None:
     """Publish one live activity event, tagged with the current debate role.
 

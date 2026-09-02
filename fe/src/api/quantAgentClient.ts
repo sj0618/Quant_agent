@@ -32,8 +32,6 @@ import type {
   ReportSummary,
   SignalType,
   StageStatus,
-  StrategyReportDetail,
-  StrategyReportSummary,
   StrategySpec,
   Tone,
   TradingCandidate,
@@ -109,22 +107,6 @@ const EMPTY_WORKSPACE: AppOverview = {
   jobStatus: null,
 };
 
-interface StrategyDescriptionApiInput {
-  strategy_id: string;
-  name: string;
-  timeframe: string;
-  entry_summary: string;
-  exit_summary: string;
-  risk_summary: string;
-  tags: string[];
-}
-
-interface StrategyDescriptionApiResponse {
-  items: Array<{
-    strategy_id: string;
-    description: string;
-  }>;
-}
 
 class AIResponseError extends Error {
   constructor(
@@ -207,54 +189,6 @@ export async function getResearchAppendix(jobId: string): Promise<ResearchAppend
   return response.json() as Promise<ResearchAppendix>;
 }
 
-function buildStrategyDescriptionInput(strategy: StrategyReportSummary): StrategyDescriptionApiInput {
-  return {
-    strategy_id: strategy.id,
-    name: strategy.name,
-    timeframe: strategy.timeframe,
-    entry_summary: strategy.entrySummary,
-    exit_summary: strategy.exitSummary,
-    risk_summary: strategy.riskSummary,
-    tags: strategy.tags,
-  };
-}
-
-async function fetchStrategyDescriptionMap(strategies: StrategyReportSummary[]) {
-  if (strategies.length === 0) {
-    return {} as Record<string, string>;
-  }
-
-  try {
-    const response = await fetchAI(AI_ENDPOINTS.strategyDescriptions, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        strategies: strategies.map(buildStrategyDescriptionInput),
-      }),
-    });
-    await assertOk(response);
-
-    const payload = (await response.json()) as StrategyDescriptionApiResponse;
-    return payload.items.reduce<Record<string, string>>((current, item) => {
-      if (item.description.trim()) {
-        current[item.strategy_id] = item.description.trim();
-      }
-      return current;
-    }, {});
-  } catch (error) {
-    console.warn("전략 설명 AI 보강에 실패해 seed 설명을 사용합니다.", error);
-    return {};
-  }
-}
-
-async function hydrateStrategyDescriptions(strategies: StrategyReportSummary[]) {
-  const descriptionMap = await fetchStrategyDescriptionMap(strategies);
-  return strategies.map((strategy) => ({
-    ...strategy,
-    description: descriptionMap[strategy.id] ?? strategy.description,
-  }));
-}
-
 function normalizeEmailReportDetail(report: ReportDetail | null): ReportDetail | null {
   if (!report) {
     return null;
@@ -316,9 +250,6 @@ export function clearLatestAnalysisJob() {
   window.localStorage.removeItem(STORAGE_KEY_LATEST_ANALYSIS_JOB);
 }
 
-export function getLatestAnalysisJob(): AnalysisJob | null {
-  return readLatestAnalysisJob();
-}
 
 export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
   const trimmedQuery = query.trim();
@@ -534,35 +465,6 @@ export async function getEmailReportById(id: string): Promise<ReportDetail | nul
   );
 }
 
-export async function getReportStrategies(): Promise<StrategyReportSummary[]> {
-  const jobs = await listAnalysisJobs();
-  const strategies = jobs
-    .map(buildStrategyReportSummaryFromAnalysisJob)
-    .filter((strategy): strategy is StrategyReportSummary => strategy !== null)
-    .filter((strategy, index, all) => all.findIndex((candidate) => candidate.id === strategy.id) === index);
-  return hydrateStrategyDescriptions(strategies);
-}
-
-export async function getStrategyReportById(id: string): Promise<StrategyReportDetail | null> {
-  const jobs = (await listAnalysisJobs()).filter((job) => job.result?.strategy_spec?.strategy_id === id);
-  const strategy = jobs.length ? buildStrategyReportSummaryFromAnalysisJob(jobs[0]) : null;
-  if (!strategy) {
-    return null;
-  }
-  const [hydratedStrategy] = await hydrateStrategyDescriptions([strategy]);
-  const emailReports = jobs
-    .map(buildReportDetailFromAnalysisJob)
-    .filter((report): report is ReportDetail => report !== null);
-  return { strategy: hydratedStrategy, emailReports };
-}
-
-export async function getStrategyWorkspaceOverview(id: string): Promise<AppOverview | null> {
-  const latestJob = (await listAnalysisJobs()).find((job) => job.result?.strategy_spec?.strategy_id === id);
-  if (!latestJob) {
-    return null;
-  }
-  return mergeAnalysisJobIntoOverview(clone(EMPTY_WORKSPACE), latestJob);
-}
 
 function mapAIStrategySpec(strategy: AIStrategySpec, query: string): StrategySpec {
   const riskConstraints = Object.entries(strategy.risk_constraints).map(([key, value]) => `${key}: ${String(value)}`);
@@ -714,34 +616,6 @@ function buildWorkspaceReportDetailFromAnalysisJob(job: AnalysisJob): WorkspaceR
   };
 }
 
-function buildStrategyReportSummaryFromAnalysisJob(job: AnalysisJob): StrategyReportSummary | null {
-  const strategy = job.result?.strategy_spec;
-  const report = buildReportSummaryFromAnalysisJob(job);
-  if (!strategy || !report) {
-    return null;
-  }
-
-  const riskSummary = Object.entries(strategy.risk_constraints)
-    .map(([key, value]) => `${key}: ${String(value)}`)
-    .join(" · ");
-  return {
-    id: strategy.strategy_id,
-    name: strategy.name,
-    description: report.summary,
-    timeframe: TIMEFRAME_LABELS[strategy.timeframe] ?? strategy.timeframe,
-    entrySummary: describeConditions(strategy.entry_conditions),
-    exitSummary: describeConditions(strategy.exit_conditions),
-    riskSummary: riskSummary || "별도 리스크 제약 없음",
-    latestSentAt: report.sentAt,
-    latestReportDate: report.date,
-    latestStatus: report.status,
-    latestEmailReportId: report.id,
-    recommendationScore: report.recommendationScore,
-    signals: report.signals,
-    summary: report.summary,
-    tags: strategy.indicators,
-  };
-}
 
 function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null {
   const result = job.result;

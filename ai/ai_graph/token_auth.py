@@ -275,7 +275,7 @@ class AccountTokenQuota:
         """
 
         fingerprint = hashlib.sha256(
-            f"{token.token_id}\x00{token.user_id}\x00{idempotency_key}".encode("utf-8")
+            f"{token.token_id}\x00{token.user_id}\x00{idempotency_key}".encode()
         ).hexdigest()
         reservation_key = f"{self._key_prefix}:admission:{fingerprint}"
         result = await self._redis.eval(
@@ -347,7 +347,6 @@ class RequireUserIdentity:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or revoked API token",
             )
-        request.state.resolved_account_token = resolved
         return resolved
 
     def _resolve_resolver(self, request: Request) -> AccountTokenResolver | None:

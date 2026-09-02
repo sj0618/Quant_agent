@@ -84,6 +84,7 @@ from ai_graph.jobs import (
     run_job_sync,
 )
 from ai_graph.llm.role_calls import generate_strategy_description, research_screening_terms
+from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.quant_performance import sanitize_public_performance
 from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.research_contract import (
@@ -110,7 +111,6 @@ from ai_graph.research_eligibility import (
     ResearchRuntimeFacts,
     evaluate_research_eligibility,
 )
-from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.schemas import (
     SCHEMA_VERSION,
     APIEnvelope,
@@ -731,7 +731,7 @@ async def _dispatch_analysis_job_outbox(
                 events=events,
                 cancellations=cancellations,
             )
-        except Exception:  # noqa: BLE001 - settle a safe terminal failure; never strand a queued job.
+        except Exception:
             _logger.exception(
                 "analysis-job outbox runner escaped before terminal state: outbox_id=%s job_id=%s",
                 message.outbox_id,
@@ -756,7 +756,7 @@ async def _dispatch_analysis_job_outbox(
                         "분석 실행 중 내부 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
                     )
                 await run_in_threadpool(store.mark_analysis_job_outbox_delivered, message.outbox_id)
-            except Exception:  # noqa: BLE001 - a storage outage still needs lease recovery.
+            except Exception:
                 _logger.exception(
                     "could not settle escaped analysis-job outbox runner: outbox_id=%s job_id=%s",
                     message.outbox_id,
@@ -784,7 +784,7 @@ async def _dispatch_analysis_job_outbox(
                     "분석 실행이 완료 상태를 반환하지 못했습니다. 잠시 후 다시 시도해 주세요.",
                 )
                 await run_in_threadpool(store.mark_analysis_job_outbox_delivered, message.outbox_id)
-            except Exception:  # noqa: BLE001 - keep an unavailable store lease-recoverable.
+            except Exception:
                 _logger.exception(
                     "could not settle non-terminal analysis-job outbox runner: outbox_id=%s job_id=%s",
                     message.outbox_id,
@@ -831,7 +831,7 @@ async def _dispatch_research_appendix_outbox(
             continue
         try:
             payload = await run_in_threadpool(research_runner, job)
-        except Exception:  # noqa: BLE001 - the base report remains complete without the appendix.
+        except Exception:
             _logger.exception("asynchronous research appendix failed: job_id=%s", job.job_id)
             payload = None
         if payload is None:
@@ -2630,32 +2630,6 @@ def _find_job_by_strategy(
             continue
         result_strategy_id = job.result.strategy_spec.strategy_id
         if result_strategy_id == normalized or result_strategy_id.startswith(normalized):
-            return job
-    return None
-
-
-def _find_job_by_trace_or_debug_ref(
-    store: AnalysisJobStore, value: str, user_id: str
-) -> AnalysisJob | None:
-    normalized = value.strip()
-    for job in reversed(store.list_jobs()):
-        if job.user_id != user_id:
-            continue
-        if job.job_id == normalized or job.trace_id == normalized:
-            return job
-        if job.result and job.result.debug_ref == normalized:
-            return job
-    return None
-
-
-def _find_job_by_report_id(
-    store: AnalysisJobStore, report_id: str, user_id: str
-) -> AnalysisJob | None:
-    normalized = report_id.strip()
-    for job in reversed(store.list_jobs()):
-        if job.user_id != user_id:
-            continue
-        if getattr(job, "report_id", None) == normalized:
             return job
     return None
 

@@ -167,7 +167,7 @@ class DataSourceConfig(BaseModel):
     backtest_max_tickers: int = Field(default=DEFAULT_BACKTEST_MAX_TICKERS, gt=0)
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> "DataSourceConfig":
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> DataSourceConfig:
         env = environ or os.environ
         database_dsn, database_dsn_env = resolve_database_dsn_from_env(env)
         return cls(
@@ -823,9 +823,6 @@ class PostgresPipelineDataSource:
             "listing_provenance": SYMBOL_LISTING_HISTORY_TABLE,
             "security_type": "보통주",
         }
-
-    def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
-        return self._screen_with_relaxation(conn, query)[0]
 
     def _screen_via_llm(
         self, conn: Any, query: str
@@ -1750,7 +1747,6 @@ class PostgresPipelineDataSource:
         }
 
 
-
 def load_pipeline_data_from_env(
     query: str,
     trace_id: str,
@@ -2418,10 +2414,6 @@ INDICATOR_FAMILY_BY_METRIC: dict[str, str] = {
     **{alias: "volume" for alias in _VOLUME_KEYS},
     "bb_width": "volatility",
 }
-# Momentum carries RSI, which the report and several fallbacks read whether or not the
-# strategy names it, so it is never skipped.
-ALWAYS_LOADED_FAMILIES = frozenset({"momentum"})
-
 # Which warehouse keys each ta_* table is read for, so the query projects those columns
 # instead of returning whole indicator documents.
 _FAMILY_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
@@ -2462,6 +2454,11 @@ def indicator_families_for_query(query: str) -> tuple[str, ...]:
     return tuple(INDICATOR_TABLES)
 
 
+# Momentum carries RSI, which the report and several fallbacks read whether or not the
+# strategy names it, so it is never skipped.
+ALWAYS_LOADED_FAMILIES = frozenset({"momentum"})
+
+
 def indicator_families_for_metrics(
     metrics: Sequence[str], *, include_default: bool = True
 ) -> tuple[str, ...]:
@@ -2473,7 +2470,6 @@ def indicator_families_for_metrics(
         if family is not None:
             families.add(family)
     return tuple(family for family in INDICATOR_TABLES if family in families)
-
 # Warehouse indicator key -> the name a condition uses, applied to every backtest bar
 # so `sma20` on a bar means exactly what `sma20` meant in the screen.
 BACKTEST_INDICATOR_ALIASES: dict[str, str] = {
@@ -2530,7 +2526,7 @@ def available_indicator_metrics(conn: Any, *, as_of: date | None = None) -> list
         ).fetchone()
         if financial_row and financial_row.get("present"):
             observed.update({"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"})
-    except Exception:  # noqa: BLE001 - optional financial catalog must not hide TA metrics.
+    except Exception:
         _logger.info("financial indicator catalog is unavailable", exc_info=True)
     if successful_queries == 0:
         raise RuntimeError("indicator catalog could not be read")
@@ -2555,7 +2551,7 @@ def available_indicator_metrics_from_env() -> list[str] | None:
     if not config.database_dsn:
         return None
     source = PostgresPipelineDataSource(config)
-    with source._connect() as conn:  # noqa: SLF001 - shared adapter owns connection policy.
+    with source._connect() as conn:
         source._set_statement_timeout(conn)
         return available_indicator_metrics(conn)
 
@@ -3367,24 +3363,6 @@ def _find_metric_value(
         if parsed is not None:
             return parsed
     return None
-
-
-def _query_requires_rsi_oversold(query: str) -> bool:
-    lowered = query.lower()
-    return (
-        "rsi" in lowered
-        and ("30" in lowered or "과매도" in query)
-        and rsi_trade_rules(query).entry_side == "oversold"
-    )
-
-
-def _has_rsi_oversold_entry(price_rows: list[dict[str, Any]]) -> bool:
-    for row in price_rows:
-        for key in RSI_KEYS:
-            value = _optional_float_value(row.get(_metric_key(key)))
-            if value is not None and value <= RSI_OVERSOLD_THRESHOLD:
-                return True
-    return False
 
 
 def _metric_key(value: str) -> str:

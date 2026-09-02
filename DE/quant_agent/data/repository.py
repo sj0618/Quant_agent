@@ -128,9 +128,6 @@ class DataRepository:
             """
         )
 
-    def store_api_request_log(self, event: ApiRequestLog, run_id: UUID) -> None:
-        self.store_api_request_logs([event], run_id)
-
     def store_api_request_logs(self, events: list[ApiRequestLog], run_id: UUID) -> None:
         if not events:
             return

@@ -1,29 +1,32 @@
 from __future__ import annotations
 
-from hashlib import sha256
 import json
+from hashlib import sha256
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.llm import LLMClient, LLMClientError, create_llm_client, is_live_llm_provider
-from ai_graph.llm.mock import (
-    BOLLINGER_CANDIDATES,
-    BREAKOUT_VOLUME_CANDIDATES,
-    MOCK_BACKTEST_CODE_CANDIDATES,
-    MockBacktestCodeLLM,
-    RELATIVE_STRENGTH_CANDIDATES,
-    TREND_PULLBACK_CANDIDATES,
-    VALUE_QUALITY_CANDIDATES,
-)
 from ai_graph.llm.prompts import BacktestCodeLLMOutput, build_backtest_code_json_request
-from ai_graph.progress import activity_role, report_activity
+from ai_graph.nodes.condition_compiler import (
+    CompiledConditions,
+    compile_conditions,
+    compile_score_expression,
+    indicator_row_keys,
+    untranslatable_conditions,
+)
 from ai_graph.nodes.position_sizing import (
     DEFAULT_MAX_POSITIONS,
     applied_max_positions,
     available_ticker_count,
     max_position_pct_from_risk_constraints,
     requested_max_positions,
+)
+from ai_graph.progress import activity_role, report_activity
+from ai_graph.quant_strategy import (
+    AUTOMATIC_TOURNAMENT_PROFILES,
+    automatic_candidate_lookbacks,
+    automatic_candidate_profiles,
 )
 from ai_graph.schemas import (
     CandidateParameters,
@@ -32,18 +35,6 @@ from ai_graph.schemas import (
     StrategyIR,
     StrategySpec,
     StructuredProfile,
-)
-from ai_graph.nodes.condition_compiler import (
-    CompiledConditions,
-    compile_conditions,
-    compile_score_expression,
-    indicator_row_keys,
-    untranslatable_conditions,
-)
-from ai_graph.quant_strategy import (
-    AUTOMATIC_TOURNAMENT_PROFILES,
-    automatic_candidate_lookbacks,
-    automatic_candidate_profiles,
 )
 from ai_graph.security.ast_validator import validate_backtest_code
 from ai_graph.strategy_blueprint_catalog import (
@@ -55,13 +46,6 @@ from ai_graph.strategy_blueprint_catalog import (
     strategy_blueprint_catalog,
     strategy_blueprint_catalog_fingerprint,
 )
-
-
-MOCK_BACKTEST_CODE_LLM = MockBacktestCodeLLM()
-SAFE_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[0]
-CONSERVATIVE_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[1]
-SMOOTHED_RSI_CODE = MOCK_BACKTEST_CODE_CANDIDATES[2]
-
 
 # Kept small on purpose. Twelve threshold variants over 200 names × 10 years was slow
 # (interpreted Python per candidate) and, worse, invited overfitting - picking the best
@@ -554,64 +538,6 @@ def _validate_candidates(request: Loop3Request, code_candidates: list[str]) -> l
     return candidates
 
 
-def _candidate_violation_summaries(candidates: list[CodeCandidate]) -> list[str]:
-    return [
-        f"{candidate.candidate_id}: {'; '.join(candidate.violations)}"
-        for candidate in candidates
-        if candidate.violations
-    ]
-
-
-def _strategy_template_candidates(strategy: StrategySpec) -> list[str] | None:
-    strategy_id = strategy.strategy_id
-    if strategy_id.startswith("rsi_rebound"):
-        return list(MOCK_BACKTEST_CODE_CANDIDATES)
-    if strategy_id.startswith("breakout_volume_momentum"):
-        return list(BREAKOUT_VOLUME_CANDIDATES)
-    if strategy_id.startswith("bollinger"):
-        return list(BOLLINGER_CANDIDATES)
-    if strategy_id.startswith(
-        (
-            "value_quality",
-            "reasonable_growth",
-            "quality_growth",
-            "growth_momentum",
-            "asset_value_catalyst",
-            "margin_improvement",
-            "margin_inventory_quality",
-            "operating_profit_pullback",
-        )
-    ):
-        return list(VALUE_QUALITY_CANDIDATES)
-    if strategy_id.startswith(
-        (
-            "pullback",
-            "breakout_pullback",
-            "midterm_pullback",
-            "trend_rsi_volume_pullback",
-            "dividend_defensive",
-            "low_vol_defensive",
-            "rate_sensitive_income",
-            "fcf_recovery",
-        )
-    ):
-        return list(TREND_PULLBACK_CANDIDATES)
-    if strategy_id.startswith(
-        (
-            "relative_strength",
-            "earnings",
-            "oversold_quality",
-            "fx_exporter_revision",
-        )
-    ):
-        return list(RELATIVE_STRENGTH_CANDIDATES)
-    if strategy_id.startswith(
-        ("flow_accumulation", "short_covering_proxy", "gap_hold_momentum", "breakout_setup")
-    ):
-        return list(BREAKOUT_VOLUME_CANDIDATES)
-    return None
-
-
 def backtest_code_node(state: dict) -> dict:
     strategy_a = StrategySpec.model_validate(state["strategy_spec"])
     price_rows = state.get("price_rows") or []
@@ -1088,48 +1014,8 @@ def build_code_generation_plan(
     )
 
 
-def _candidate_code_pool(
-    llm_candidates: list[str],
-    strategy: StrategySpec,
-    plan: CodeGenerationPlan,
-    max_positions: int = DEFAULT_MAX_POSITIONS,
-) -> list[str]:
-    pool: list[str] = []
-    for code in llm_candidates:
-        if code not in pool:
-            pool.append(code)
-    for code in _generated_strategy_candidates(strategy, plan, max_positions):
-        if code not in pool:
-            pool.append(code)
-    if len(pool) < MIN_GENERATED_CANDIDATES:
-        for code in _deterministic_fallback_candidates(strategy, plan, max_positions):
-            if code not in pool:
-                pool.append(code)
-    return pool[:MAX_GENERATED_CANDIDATES]
-
-
-def _non_legacy_llm_candidates(
-    candidates: list[str], strategy: StrategySpec
-) -> tuple[list[str], int]:
-    legacy_templates = set(_strategy_template_candidates(strategy) or [])
-    filtered = [candidate for candidate in candidates if candidate not in legacy_templates]
-    return filtered, len(candidates) - len(filtered)
-
-
-def _deterministic_fallback_candidates(
-    strategy: StrategySpec,
-    plan: CodeGenerationPlan,
-    max_positions: int = DEFAULT_MAX_POSITIONS,
-) -> list[str]:
-    templates = _strategy_template_candidates(
-        strategy
-    ) or MOCK_BACKTEST_CODE_LLM.generate_backtest_candidates(strategy, "A")
-    generated = _generated_strategy_candidates(strategy, plan, max_positions)
-    return (generated + templates)[:MAX_GENERATED_CANDIDATES]
-
-
 def _render_condition_signal_code(
-    strategy: StrategySpec, compiled: "CompiledConditions", max_positions: int
+    strategy: StrategySpec, compiled: CompiledConditions, max_positions: int
 ) -> str:
     """build_signals whose entry test is the strategy's own compiled conditions.
 
@@ -1283,41 +1169,6 @@ def _render_condition_signal_code(
             held += 1
     return signals
 """
-
-
-def _generated_strategy_candidates(
-    strategy: StrategySpec,
-    plan: CodeGenerationPlan,
-    max_positions: int = DEFAULT_MAX_POSITIONS,
-) -> list[str]:
-    codes: list[str] = []
-    # If the strategy's conditions compile - a per-stock rule and/or cross-sectional
-    # cuts - trade exactly that first: it is the screen's own rule, not a generic
-    # profile. Conditions that do not compile fall through to the profiles.
-    compiled = compile_conditions(strategy.entry_conditions)
-    if compiled is not None:
-        codes.append(_render_condition_signal_code(strategy, compiled, max_positions))
-    profiles = _candidate_profiles(plan)
-    lookbacks = [*plan.lookbacks, 75, 100, 125, 150, 200, 252]
-    thresholds = [*plan.thresholds, 0.12, 0.18, 0.25, 0.35, 0.5, 0.75]
-    for index, profile in enumerate(profiles[:MAX_GENERATED_CANDIDATES]):
-        lookback = lookbacks[index % len(lookbacks)]
-        threshold = thresholds[index % len(thresholds)]
-        stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct))
-        take_profit = float(strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct))
-        codes.append(
-            _render_adaptive_signal_code(
-                strategy_id=strategy.strategy_id,
-                plan=plan,
-                profile=profile,
-                lookback=lookback,
-                threshold=threshold,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                max_positions=max_positions,
-            )
-        )
-    return codes
 
 
 def _candidate_profiles(plan: CodeGenerationPlan) -> list[StructuredProfile]:
@@ -1715,60 +1566,3 @@ def _selective_threshold(value: float, entry_feature: str, iteration: int) -> fl
         return max(0.015, value - 0.005 * iteration)
     return value + 0.03 * iteration
 
-
-def _self_improvement_grid_codes(
-    strategy: StrategySpec,
-    plan: CodeGenerationPlan,
-    iteration: int,
-    max_positions: int = DEFAULT_MAX_POSITIONS,
-) -> list[str]:
-    profiles = [
-        "volatility_breakout_hold",
-        "low_vol_momentum",
-        "cash_preserving_trend",
-        "return_to_volatility",
-        "quality_trend_hold",
-        "long_regime_momentum",
-    ]
-    lookbacks = [30, 45, 60, 90, 120, 180, 240]
-    thresholds = [0.02, 0.05, 0.08, 0.12, 0.18, 0.25, 0.35]
-    if plan.entry_feature == "rsi_rebound":
-        profiles = [
-            "cash_preserving_trend",
-            "rsi_trend_rebound",
-            "low_vol_momentum",
-            "quality_trend_hold",
-            "return_to_volatility",
-            "volatility_breakout_hold",
-        ]
-    if plan.entry_feature == "breakout_volume":
-        profiles = [
-            "volatility_breakout_hold",
-            "breakout_volume",
-            "low_vol_momentum",
-            "cash_preserving_trend",
-            "return_to_volatility",
-            "quality_trend_hold",
-        ]
-    offset = max(0, iteration - 1) * 2
-    codes: list[str] = []
-    for index, profile in enumerate(profiles):
-        for lookback in lookbacks[offset : offset + 4]:
-            threshold = thresholds[(index + lookback + iteration) % len(thresholds)]
-            codes.append(
-                _render_adaptive_signal_code(
-                    strategy_id=strategy.strategy_id,
-                    plan=plan,
-                    profile=profile,
-                    lookback=lookback,
-                    threshold=threshold,
-                    stop_loss=float(
-                        strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct)
-                    ),
-                    take_profit=float(
-                        strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct)
-                    ),
-                    max_positions=max_positions,
-                )
-            )
-    return codes
