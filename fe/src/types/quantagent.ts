@@ -314,9 +314,46 @@ export interface AIBacktestPerformance {
   strategy_explanation?: AIStrategyExplanation | null;
 }
 
+/**
+ * The AI API never hands the flat performance object straight to the wire: it wraps it
+ * in an availability envelope (Python `PerformanceAvailable` / `PerformanceUnavailable`)
+ * so a partial calculation can never be mistaken for a publishable result. `metrics`,
+ * `equity_curve`, `reliability` etc. live one level down, under `.performance`.
+ */
+export interface AIPerformanceAvailable {
+  availability: "available";
+  performance: AIBacktestPerformance;
+  method_manifest?: Record<string, unknown>;
+  limitations: string[];
+}
+
+export interface AIPerformanceUnavailable {
+  availability: "unavailable";
+  reason_code: string;
+  safe_facts?: Record<string, unknown>;
+}
+
+export type AIPerformanceEnvelope = AIPerformanceAvailable | AIPerformanceUnavailable;
+
 export interface AIRecommendationGate {
   validated: boolean;
   reason: string;
+  verification_complete?: boolean;
+  unmet_objective_criteria?: string[];
+  unmet_data_requirements?: string[];
+}
+
+export type AITickerActionType = "BUY" | "SELL" | "HOLD" | "WATCH";
+
+/** Per-stock verdict from the same backtest run that produced the performance figures. */
+export interface AITickerAction {
+  ticker: string;
+  name: string;
+  action: AITickerActionType;
+  reason: string;
+  as_of_date: string;
+  close?: number | null;
+  source_candidate_id?: string | null;
 }
 
 export interface AIUserPayload {
@@ -325,8 +362,9 @@ export interface AIUserPayload {
   next_actions: string[];
   candidate_cards: StrategyCandidateCard[];
   report: AIReportBundle | null;
-  performance?: AIBacktestPerformance | null;
+  performance?: AIPerformanceEnvelope | null;
   recommendation_gate?: AIRecommendationGate | null;
+  ticker_actions?: AITickerAction[];
   question?: string | null;
   options?: AIClarificationOption[];
   recommended?: number | null;
@@ -436,6 +474,8 @@ export interface PerformanceSummary {
   benchmark?: AIBacktestBenchmark;
   metricDetails?: AIBacktestMetricDetail[];
   strategyExplanation?: AIStrategyExplanation | null;
+  /** Caveats the backend attached to an otherwise-available result (e.g. a limited sample). */
+  limitations?: string[];
   disclaimer: string;
 }
 
@@ -478,6 +518,10 @@ export interface AppOverview {
   recentReports: ReportSummary[];
   envelope: AIEnvelope<{ active_tab: "overview" } | AIUserPayload, StrategySpec | AIStrategySpec | null> | null;
   jobStatus: AnalysisJobStatus | null;
+  /** Why `recommendation_gate.validated` is false, for display when the gate is not clear. */
+  recommendationGateReason: string | null;
+  /** `report.web_projection.sections[id=objective_floor].conclusion`, when the backend sends it. */
+  objectiveFloorConclusion: string | null;
 }
 
 export interface LandingSample {

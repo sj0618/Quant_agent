@@ -24,7 +24,10 @@ SCHEMA_VERSION = "ai-mvp.v1"
 
 SemanticParseStatus = Literal["ready", "needs_clarification", "failed"]
 SourceType = Literal["internal_db", "krx", "dart", "aoai_web_search", "analyst_evidence", "none"]
-FreshnessStatus = Literal["fresh", "stale", "unknown", "not_time_sensitive"]
+# "eod_current" is what a release source manifest actually writes for a load that has
+# every settled session - see source_manifest.RELEASE_FRESHNESS_VALUES. It was missing
+# here, so a fully current warehouse load was reported as "unknown" and withheld.
+FreshnessStatus = Literal["fresh", "eod_current", "stale", "unknown", "not_time_sensitive"]
 FailureCategory = Literal[
     "infrastructure_failure",
     "semantic_failure",
@@ -198,6 +201,9 @@ class FreshnessEvidence(BaseModel):
     reason: str = Field(min_length=1)
     source: str = Field(min_length=1)
     no_recommendation: bool
+    # Which recommended names an analyst report was found for. Supplementary evidence:
+    # it annotates a recommendation, it does not gate one.
+    l4_coverage: dict[str, list[str]] | None = None
 
 
 class FailureDiagnostic(BaseModel):
@@ -588,6 +594,8 @@ class L4Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     publisher: str = Field(min_length=1)
+    # Which name the report is about, so a multi-ticker fetch can be attached per stock.
+    ticker: str | None = None
     published_at: datetime
     retrieved_at: datetime
     freshness_days: int = Field(ge=0)

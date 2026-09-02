@@ -121,3 +121,8 @@ DE migration 12, `compileall`·ruff(CI 선택 규칙) 통과, FE `npm run test`(
 | **1년·상위 100 + 스크린 병렬** | **18.9s**(스크린 9.3s 병렬 포함) | **11.9s** | **31.3s** | 가격 24,250행 |
 
 실제 AOAI 호출(리서치 컴파일 + 리포트 작성 ≈ 15s)을 더하면 **약 45~50초**로 1분 목표 안. 운영 env로 `AI_AOAI_TIMEOUT_SECONDS`/`AI_AOAI_MAX_RETRIES`를 더 조이면 최악 케이스도 줄어든다.
+
+### 7.2 배포 사이트 실측 (2026-09-03 00:22 KST, 배포 0108590, 실제 AOAI + qt_db)
+- 배포 직후 두 번의 실측 실패로 기존 결함 2건을 추가로 고쳤다: (1) KST 자정~새벽 적재 사이 창 종료일이 시세 없는 세션이라 릴리스 매니페스트 거부 → 창 종료일을 마지막 적재 세션으로 캡(PR #88); (2) production에서 `AI_BACKTEST_CACHE_DIR` 미설정이면 백테스트 거부 → deploy가 `.run/backtest-cache`를 export(PR #89).
+- 최종: `RSI 30 이하일때 매수하고 70 이상일때 매도` → interpreting/code_generation/backtest/debate/finalizing 모두 succeeded, **53초에 ready**(기존: 875초 후 실패). `POST /api/v1/runs` 201 → `/complete` 200 → `app.strategy_email_report` 1행(sent) → `/api/v1/reports` 1건. 이메일 enqueue는 서버 `EMAIL_DELIVERY_ENABLED=false`라 정책상 skip.
+- 남은 여지: 53초 중 LLM 2회(리서치 컴파일·리포트 작성)가 ~20초. `AI_AOAI_TIMEOUT_SECONDS`/`AI_AOAI_MAX_RETRIES`를 운영 env로 더 조이거나 리포트 작성 호출을 축약하면 40초대 가능.

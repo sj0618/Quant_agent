@@ -70,6 +70,13 @@ def test_signal_node_public_contract_excludes_raw_internal_payload():
 
 @pytest.mark.parametrize("l4_evidence", [None, []])
 def test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence(l4_evidence) -> None:
+    """No analyst report is a missing footnote, not a missing decision.
+
+    The signal is a function of the backtest. Returning NO_RECOMMENDATION because an
+    optional corroborating source was empty threw away a validated backtest and left
+    the user with an empty ticker list; the absence is now stated in the bear case.
+    """
+
     decision = build_investment_signal(
         {"selected_candidate": {"metrics": {"sharpe_ratio": 1.4, "max_drawdown": -0.03}}},
         trace_id="trace-empty-evidence",
@@ -77,6 +84,8 @@ def test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence(l4_evidence) -
     )
 
     assert decision.l4_evidence == []
+    assert decision.action == "BUY"
+    assert any("애널리스트 리포트 근거 없음" in item for item in decision.bear_case)
     signal = signal_node(
         {
             "trace_id": "trace-missing-l4",
@@ -91,8 +100,36 @@ def test_empty_l4_evidence_does_not_fall_back_to_fixture_evidence(l4_evidence) -
     )["investment_signal"]
     risk = risk_manager_node({"investment_signal": signal})["risk"]
 
-    assert signal["action"] == "NO_RECOMMENDATION"
-    assert risk["signal"]["action"] == "NO_RECOMMENDATION"
+    assert signal["action"] == "BUY"
+    assert risk["signal"]["action"] in {"BUY", "HOLD"}
+
+
+def test_a_run_without_backtest_metrics_still_refuses_to_recommend() -> None:
+    decision = build_investment_signal({}, trace_id="trace-no-metrics", l4_evidence=[])
+
+    assert decision.action == "NO_RECOMMENDATION"
+    assert decision.confidence == 0.0
+    assert "백테스트" in decision.judge_reason
+
+
+def test_walk_forward_decisions_use_the_aggregate_not_the_selection_fold() -> None:
+    """The selected candidate carries its last fold's split, which selection saw."""
+
+    decision = build_investment_signal(
+        {
+            "selected_candidate": {"metrics": {"sharpe_ratio": 1.4, "max_drawdown": -0.01}},
+            "walk_forward": {
+                "status": "ready",
+                "aggregate_metrics": {"sharpe_ratio": -0.07, "max_drawdown": -0.16},
+            },
+        },
+        trace_id="trace-wf",
+        l4_evidence=[],
+    )
+
+    # DROP normalises to SELL on the public contract.
+    assert decision.action == "SELL"
+    assert "-0.07" in " ".join(decision.bull_case)
 
 
 def test_backtest_summary_excludes_generated_candidate_payloads():

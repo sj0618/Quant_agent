@@ -105,6 +105,8 @@ def test_analysis_job_and_api_envelope_public_fields_are_frozen() -> None:
         "reason",
         "source",
         "no_recommendation",
+        # Which recommended names have an analyst report. Reported, never a gate.
+        "l4_coverage",
     }
     assert set(user_payload) == USER_PAYLOAD_FIELDS
     performance = user_payload["performance"]

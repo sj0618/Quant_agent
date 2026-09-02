@@ -154,10 +154,11 @@ AI_BACKTEST_CANDIDATE_TIMEOUT_ENV = "AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS"
 DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 8.0
 AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
 DEFAULT_WALL_BUDGET_SECONDS = 25.0
-# Refinement runs only when the walk-forward sample is not READY, which after the
-# window-proportional policy means a window too short to evaluate on. One extra round is
-# a different parameter neighbourhood; a second buys little and costs the wall budget.
-MAX_SELF_IMPROVEMENT_ROUNDS = 1
+# Rounds of threshold-adjusted candidates tried when the acceptance floor is not cleared.
+# Each round proposes up to six distinct candidates and stops early once the floor clears
+# or the wall budget is spent, so this is a ceiling, not a cost every run pays.
+MAX_SELF_IMPROVEMENT_ROUNDS = 3
+SELF_IMPROVEMENT_CANDIDATES_PER_ROUND = 6
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
 BACKTEST_ENGINE_VERSION = "candidate-engine.v3"
 # v6 adds the source-notional capacity claim to persisted summaries. Cached v5
@@ -2383,23 +2384,39 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         all_candidates = candidates
         seen_candidates = {_candidate_identity(candidate) for candidate in all_candidates}
         fallback_reasons = list(state.get("backtest_code", {}).get("fallback_reasons", []))
-        # Refinement operates only on the selection data. Once real walk-forward
-        # evaluation is available, changing candidates after that evaluation would
-        # leak evaluation evidence into the search. Otherwise retain the automatic
-        # mode's established refinement budget.
-        self_improvement_rounds = (
-            0
-            if _walk_forward_sample(rows).status == READY_WALK_FORWARD
-            else MAX_SELF_IMPROVEMENT_ROUNDS
+        # Refinement operates only on the selection data: candidates are still chosen
+        # per fold on train/validation, so re-running the walk-forward with a wider set
+        # keeps the evaluation out of sample. It used to be skipped entirely once
+        # walk-forward was READY, which meant a run that missed the acceptance floor
+        # stopped at the first pass and reported the miss instead of trying to clear it.
+        # Each extra round widens the search, and `candidate_count` prices that in.
+        self_improvement_rounds = MAX_SELF_IMPROVEMENT_ROUNDS
+        rounds_run = 0
+        # Walk-forward re-evaluates every candidate over every fold, so a round costs
+        # roughly the first pass scaled by how many candidates it will carry. Starting a
+        # round that cannot finish inside the budget doubled a 34s live run to 76s.
+        # ponytail: first-pass average as the per-candidate cost - conservative, since it
+        # includes one-off session setup. Measure marginal cost if rounds get starved.
+        per_candidate_seconds = (time.perf_counter() - node_started) / max(
+            1, len(all_candidates)
         )
+        result = _apply_selection_correction(result, len(all_candidates))
+        floor_reasons = objective_floor_reasons(result)
         for iteration in range(1, self_improvement_rounds + 1):
+            if not floor_reasons:
+                break
             # The request-wide ceiling is checked here too, not only at node boundaries:
             # a self-improvement round can run for minutes, and stopping between rounds
             # keeps the candidates already evaluated instead of losing the node's work.
             raise_if_past_deadline()
-            if time.perf_counter() - node_started >= _wall_budget_seconds():
+            remaining = _wall_budget_seconds() - (time.perf_counter() - node_started)
+            projected = per_candidate_seconds * (
+                len(all_candidates) + SELF_IMPROVEMENT_CANDIDATES_PER_ROUND
+            )
+            if projected > remaining:
                 fallback_reasons.append(
-                    f"self-improvement stopped after exceeding {_wall_budget_seconds():g}s wall budget"
+                    f"self-improvement stopped: projected {projected:.1f}s round does not "
+                    f"fit the {remaining:.1f}s left of the {_wall_budget_seconds():g}s wall budget"
                 )
                 break
             proposed = generate_self_improvement_candidates(
@@ -2416,7 +2433,7 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                     continue
                 seen_candidates.add(identity)
                 improved.append(candidate)
-                if len(improved) >= 6:
+                if len(improved) >= SELF_IMPROVEMENT_CANDIDATES_PER_ROUND:
                     break
             if not improved:
                 fallback_reasons.append(
@@ -2440,9 +2457,18 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                 fallback_reasons=fallback_reasons,
                 _session=session,
             )
-            improved_score = _selected_objective_score(next_result)
-            if improved_score > _selected_objective_score(result):
+            rounds_run = iteration
+            next_result = _apply_selection_correction(next_result, len(all_candidates))
+            next_reasons = objective_floor_reasons(next_result)
+            # Keep the round that clears the floor, or the one that scores better on the
+            # selection data. Ranking rounds by their out-of-sample result would be a
+            # second argmax over the evaluation period, which is the bias this node
+            # spends the deflation term correcting.
+            if not next_reasons or _selected_objective_score(
+                next_result
+            ) > _selected_objective_score(result):
                 result = next_result
+                floor_reasons = next_reasons
                 report_activity(
                     "step",
                     label=f"자가개선 {iteration}차 완료",
@@ -2479,6 +2505,7 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                         else "bounded_candidate_refinement"
                     ),
                     "self_improvement_rounds_limit": self_improvement_rounds,
+                    "self_improvement_rounds_run": rounds_run,
                 },
             }
         )
@@ -2489,11 +2516,22 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         "backtest": result.model_dump(),
         "strategy_validated": _passes_objective_floor(result),
         # Published whether or not the floor is enforcing, so the reader can see what the
-        # acceptance check actually concluded rather than only its effect.
+        # acceptance check actually concluded rather than only its effect. The reader
+        # gets a verdict in both cases - which candidate cleared it, or the numbers that
+        # missed and by how much - never a blank section.
         "objective_floor": {
             "mode": validation_gate_mode(),
             "cleared": not floor_reasons,
             "reasons": floor_reasons,
+            "rounds_run": rounds_run,
+            "candidates_tried": len(all_candidates),
+            "metrics": _floor_metric_summary(result),
+            "conclusion": _objective_floor_conclusion(
+                result,
+                reasons=floor_reasons,
+                rounds_run=rounds_run,
+                candidates_tried=len(all_candidates),
+            ),
         },
     }
 
@@ -2511,24 +2549,46 @@ def _apply_selection_correction(
     metrics = result.selected_candidate.metrics
     if metrics is None:
         return result
-    observations = max(1, metrics.in_sample_observations)
-    adjusted = metrics.model_copy(
-        update={
-            "candidates_evaluated": max(1, candidate_count),
-            "selection_adjusted_sharpe": round(
-                metrics.in_sample_sharpe
-                - _expected_max_sharpe(candidate_count, observations),
-                METRIC_ROUND_DIGITS,
-            ),
-        }
-    )
-    return result.model_copy(
-        update={
-            "selected_candidate": result.selected_candidate.model_copy(
-                update={"metrics": adjusted}
-            )
-        }
-    )
+    walk_forward = getattr(result, "walk_forward", None)
+    aggregate = _ready_aggregate_metrics(result)
+    if aggregate is not None and aggregate.out_sample_sharpe is not None:
+        # Walk-forward has no in-sample Sharpe to deflate: `_walk_forward_aggregate_metrics`
+        # sets it to 0.0 because selection happened per fold on train/validation only.
+        # Subtracting the argmax bias from that zero produced a large negative number
+        # (measured: -2.84 on a one-year live run) that failed the floor structurally,
+        # whatever the strategy did. The number carrying the search bias here is the
+        # rolling out-of-sample aggregate, over the sessions it was measured on.
+        base = aggregate.out_sample_sharpe
+        observations = max(1, walk_forward.unique_evaluation_session_count)
+    else:
+        base = metrics.in_sample_sharpe
+        observations = max(1, metrics.in_sample_observations)
+    correction = {
+        "candidates_evaluated": max(1, candidate_count),
+        "selection_adjusted_sharpe": round(
+            base - _expected_max_sharpe(candidate_count, observations),
+            METRIC_ROUND_DIGITS,
+        ),
+    }
+    update: dict[str, Any] = {
+        "selected_candidate": result.selected_candidate.model_copy(
+            update={"metrics": metrics.model_copy(update=correction)}
+        )
+    }
+    if aggregate is not None:
+        # The public performance document reads the aggregate, so the search width has
+        # to be on it too - otherwise the headline says candidates_evaluated=1.
+        update["walk_forward"] = walk_forward.model_copy(
+            update={"aggregate_metrics": aggregate.model_copy(update=correction)}
+        )
+    return result.model_copy(update=update)
+
+
+def _ready_aggregate_metrics(result: CandidateBacktestResult) -> BacktestMetrics | None:
+    walk_forward = getattr(result, "walk_forward", None)
+    if walk_forward is None or getattr(walk_forward, "status", None) != "ready":
+        return None
+    return walk_forward.aggregate_metrics
 
 
 def _selected_candidate_detail(result: CandidateBacktestResult) -> str:
@@ -3918,6 +3978,29 @@ def _selection_signal_action_count(
     )
 
 
+def _floor_metrics(result: CandidateBacktestResult) -> BacktestMetrics:
+    """The metrics the acceptance floor judges, on the period selection never saw.
+
+    Without walk-forward that is the selected candidate's own hold-out. With it, the
+    selected candidate carries the last fold's train/validation split - a split selection
+    was performed on - while the rolling evaluation is the untouched result, so the floor
+    reads the aggregate instead of a number the search already optimised against.
+    """
+
+    metrics = _candidate_metrics(result.selected_candidate)
+    aggregate = _ready_aggregate_metrics(result)
+    if aggregate is None:
+        return metrics
+    return metrics.model_copy(
+        update={
+            "out_sample_sharpe": aggregate.out_sample_sharpe,
+            "out_sample_return": aggregate.out_sample_return,
+            "max_drawdown": aggregate.max_drawdown,
+            "selection_adjusted_sharpe": aggregate.selection_adjusted_sharpe,
+        }
+    )
+
+
 def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
     """Every acceptance-floor check this result did not clear.
 
@@ -3925,7 +4008,7 @@ def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
     nobody can audit while it is switched off, and the verdict is published either way.
     """
 
-    metrics = _candidate_metrics(result.selected_candidate)
+    metrics = _floor_metrics(result)
     trade_count = _summary_float_default(result.engine_summary, "effective_trade_count", 0.0)
     reasons: list[str] = []
     if trade_count < MIN_OBJECTIVE_TRADES:
@@ -3970,6 +4053,72 @@ def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
         _benchmark_objective_reasons(metrics, benchmark_return=primary.get("return"))
     )
     return reasons
+
+
+def _floor_metric_summary(result: CandidateBacktestResult) -> dict[str, Any]:
+    """The numbers the floor judged, published next to its verdict."""
+
+    metrics = _floor_metrics(result)
+    walk_forward = getattr(result, "walk_forward", None)
+    curve = (
+        walk_forward.equity_curve
+        if walk_forward is not None and walk_forward.equity_curve
+        else result.equity_curve
+    )
+    return {
+        "out_sample_sharpe": metrics.out_sample_sharpe,
+        "out_sample_return": metrics.out_sample_return,
+        "max_drawdown": metrics.max_drawdown,
+        "selection_adjusted_sharpe": metrics.selection_adjusted_sharpe,
+        "candidates_evaluated": metrics.candidates_evaluated,
+        "trade_count": _summary_float_default(
+            result.engine_summary, "effective_trade_count", 0.0
+        ),
+        "evaluation_session_count": (
+            walk_forward.unique_evaluation_session_count
+            if walk_forward is not None and walk_forward.status == "ready"
+            else None
+        ),
+        "evaluation_period": (
+            {"start": curve[0].date, "end": curve[-1].date} if curve else None
+        ),
+    }
+
+
+def _objective_floor_conclusion(
+    result: CandidateBacktestResult,
+    *,
+    reasons: Sequence[str],
+    rounds_run: int,
+    candidates_tried: int,
+) -> str:
+    """One sentence the reader can act on, whichever way the floor went.
+
+    A run that misses the floor still has to say what it found and why that is not
+    enough. Reporting "산출 안 함" for the same run that produced an equity curve and a
+    trade list is not a conclusion, it is a blank where the conclusion belongs.
+    """
+
+    summary = _floor_metric_summary(result)
+    sharpe = summary["out_sample_sharpe"]
+    numbers = " · ".join(
+        [
+            f"미사용 구간 Sharpe {sharpe:.2f}" if sharpe is not None else "미사용 구간 Sharpe 계산 불가",
+            f"최대 낙폭 {summary['max_drawdown']:.1%}",
+            f"거래 {summary['trade_count']:g}건",
+            f"후보 {candidates_tried}개 · 자가개선 {rounds_run}라운드",
+        ]
+    )
+    period = summary["evaluation_period"]
+    window = f"{period['start']}~{period['end']} 구간" if period else "검증 구간"
+    candidate_id = result.selected_candidate.candidate_id
+    if not reasons:
+        return f"목표 달성: 후보 {candidate_id} ({numbers}). {window}에서 수용 기준을 모두 통과했습니다."
+    return (
+        f"목표 미달: {rounds_run}라운드 {candidates_tried}후보 중 최선 후보 {candidate_id} — "
+        f"{'; '.join(reasons)}. {numbers}. "
+        f"이 규칙은 {window}에서 목표를 충족하지 못했습니다."
+    )
 
 
 def _passes_objective_floor(result: CandidateBacktestResult) -> bool:

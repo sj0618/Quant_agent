@@ -14,6 +14,36 @@ test("completed AI jobs never reuse demo performance numbers", async () => {
   assert.doesNotMatch(adapter, /\+92\.4/);
 });
 
+test("user_payload.performance is unwrapped from its availability envelope before use", async () => {
+  const adapter = await source("../src/api/quantAgentClient.ts");
+
+  // `user_payload.performance` is `{availability: "available", performance: {...}}` or
+  // `{availability: "unavailable", reason_code}` on the wire, never the flat metrics
+  // object directly - every reader must go through the unwrap helper or a completed job
+  // with a real backtest curve reads as if it had none.
+  assert.match(adapter, /function unwrapAIPerformance/);
+  assert.match(adapter, /unwrapAIPerformance\(job\.result\?\.user_payload\.performance\)/);
+  assert.match(adapter, /availability !== "available"/);
+  assert.doesNotMatch(adapter, /const aiPerformance = job\.result\?\.user_payload\.performance;/);
+});
+
+test("a missed objective floor still shows the real recommendation score, not a placeholder", async () => {
+  const overview = await source("../src/features/app/OverviewTab.tsx");
+
+  assert.doesNotMatch(overview, /산출 안 함/);
+  assert.match(overview, /백테스트 목표 기준 미달/);
+  assert.match(overview, /참고용/);
+  assert.match(overview, /overview\.performance\.limitations/);
+});
+
+test("ticker actions from the backtest render as reference picks even when the gate fails", async () => {
+  const adapter = await source("../src/api/quantAgentClient.ts");
+
+  assert.match(adapter, /function buildTradingCandidatesFromTickerActions/);
+  assert.match(adapter, /user_payload\.ticker_actions/);
+  assert.match(adapter, /참고용/);
+});
+
 test("benchmark series requires an available real curve and never a zero placeholder", async () => {
   const [adapter, overview, performance] = await Promise.all([
     source("../src/api/quantAgentClient.ts"),

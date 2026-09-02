@@ -44,7 +44,10 @@ from ai_graph.schemas import (
 )
 
 _RELIABILITY_SHORT_TERM_DAYS = 30
-_RELIABILITY_MIN_DAYS = 252
+# A calendar year of KRX sessions is ~243, not the 252 a US-style year assumes, so the
+# default one-year window could never reach "sufficient". 240 keeps a full year in and
+# still rejects a window that is materially short of one.
+_RELIABILITY_MIN_DAYS = 240
 
 _UNAVAILABLE_METRIC_REASON = "신뢰도 부족으로 공개 지표를 계산할 수 없습니다."
 _BENCHMARK_UNAVAILABLE_REASON = "신뢰도 부족으로 벤치마크를 표시하지 않습니다."
@@ -434,7 +437,9 @@ def _build_backtest_reliability(
         and trading_days < _RELIABILITY_MIN_DAYS
         and trading_days >= _RELIABILITY_SHORT_TERM_DAYS
     ):
-        warnings.append("PostgreSQL은 거래일 252일 이상일 때만 충분 조건을 충족합니다.")
+        warnings.append(
+            f"PostgreSQL은 거래일 {_RELIABILITY_MIN_DAYS}일 이상일 때만 충분 조건을 충족합니다."
+        )
     if trade_count < MIN_OBJECTIVE_TRADES:
         warnings.append(f"유효 거래 수가 기준 미달입니다. ({trade_count} < {MIN_OBJECTIVE_TRADES})")
 

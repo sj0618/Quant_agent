@@ -208,3 +208,124 @@ def test_a_ticker_whose_rows_end_mid_window_does_not_break_the_run(
     assert result.walk_forward is not None
     assert result.walk_forward.status == "ready"
     assert result.selected_candidate.metrics is not None
+
+
+def _backtest_state(strategy: StrategySpec, rows: list[dict[str, object]]) -> dict[str, object]:
+    generated = generate_loop3_candidates(
+        Loop3Request(
+            strategy=strategy,
+            variant="A",
+            trace_id="window-policy",
+            max_positions=4,
+            server_only=True,
+        )
+    )
+    return {
+        "strategy_spec": strategy.model_dump(),
+        "backtest_code": generated.model_dump(),
+        "price_rows": rows,
+    }
+
+
+def test_walk_forward_deflation_reads_the_out_of_sample_aggregate(
+    monkeypatch, tmp_path
+) -> None:
+    """Walk-forward has no in-sample Sharpe, so deflating one was a structural failure.
+
+    `_walk_forward_aggregate_metrics` pins in_sample_sharpe at 0.0 because selection ran
+    per fold on train/validation. Subtracting the expected best-of-N from that zero
+    produced a large negative number - measured at -2.84 on a one-year live run - and the
+    acceptance floor then failed on search width no matter what the strategy did.
+    """
+
+    strategy = _strategy()
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "deflation"))
+    rows = _price_rows()
+    candidates = _candidates(strategy)
+
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        result = backtest_node.run_candidate_backtest(strategy, candidates, _session=session)
+    corrected = backtest_node._apply_selection_correction(result, len(candidates))
+
+    walk_forward = corrected.walk_forward
+    aggregate = walk_forward.aggregate_metrics
+    assert walk_forward.status == "ready"
+    assert aggregate.in_sample_sharpe == 0.0
+    expected = round(
+        aggregate.out_sample_sharpe
+        - backtest_node._expected_max_sharpe(
+            len(candidates), walk_forward.unique_evaluation_session_count
+        ),
+        backtest_node.METRIC_ROUND_DIGITS,
+    )
+    assert aggregate.selection_adjusted_sharpe == expected
+    assert corrected.selected_candidate.metrics.selection_adjusted_sharpe == expected
+    # The search width now reaches the published document instead of reading as 1.
+    assert aggregate.candidates_evaluated == len(candidates)
+    # The floor judges the rolling evaluation, not the fold split selection was run on.
+    assert backtest_node._floor_metrics(corrected).out_sample_sharpe == (
+        aggregate.out_sample_sharpe
+    )
+
+
+def test_self_improvement_runs_when_the_floor_is_not_cleared_under_walk_forward(
+    monkeypatch, tmp_path
+) -> None:
+    """A missed floor now keeps searching instead of stopping at the first pass."""
+
+    strategy = _strategy()
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "rounds"))
+    output = backtest_node.backtest_node(_backtest_state(strategy, _price_rows()))
+
+    floor = output["objective_floor"]
+    assert floor["cleared"] is False
+    assert 1 <= floor["rounds_run"] <= backtest_node.MAX_SELF_IMPROVEMENT_ROUNDS
+    assert floor["candidates_tried"] > 3
+    assert output["backtest"]["execution_stats"]["self_improvement_rounds_run"] == (
+        floor["rounds_run"]
+    )
+    # A miss reports numbers, never a blank.
+    assert "목표 미달" in floor["conclusion"]
+    assert "미사용 구간 Sharpe" in floor["conclusion"]
+    assert floor["metrics"]["evaluation_session_count"] > 0
+    assert floor["metrics"]["evaluation_period"]["start"] < (
+        floor["metrics"]["evaluation_period"]["end"]
+    )
+    # The equity curve survives the miss, so the reader still gets the run.
+    assert output["backtest"]["walk_forward"]["equity_curve"]
+
+
+def test_self_improvement_stops_at_the_wall_budget_and_still_concludes(
+    monkeypatch, tmp_path
+) -> None:
+    strategy = _strategy()
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "budget"))
+    # 0 means "unset" to the reader, so use the smallest budget it accepts.
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WALL_BUDGET_ENV, "0.001")
+
+    output = backtest_node.backtest_node(_backtest_state(strategy, _price_rows()))
+
+    floor = output["objective_floor"]
+    assert floor["rounds_run"] == 0
+    assert floor["conclusion"]
+    assert any(
+        "wall budget" in reason for reason in output["backtest"]["fallback_reasons"]
+    )
+
+
+def test_a_cleared_floor_names_the_candidate_and_its_numbers(monkeypatch, tmp_path) -> None:
+    strategy = _strategy()
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "cleared"))
+    monkeypatch.setattr(backtest_node, "MIN_OBJECTIVE_TRADES", 0)
+    monkeypatch.setattr(backtest_node, "MIN_OBJECTIVE_SHARPE", -10.0)
+    monkeypatch.setattr(backtest_node, "MIN_SELECTION_ADJUSTED_SHARPE", -10.0)
+
+    output = backtest_node.backtest_node(_backtest_state(strategy, _price_rows()))
+
+    floor = output["objective_floor"]
+    assert floor["cleared"] is True
+    assert floor["reasons"] == []
+    # Clearing on the first pass must not spend the refinement budget.
+    assert floor["rounds_run"] == 0
+    assert floor["conclusion"].startswith("목표 달성: 후보 ")
+    assert "미사용 구간 Sharpe" in floor["conclusion"]
