@@ -741,9 +741,23 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         detail=f"조회할 데이터 항목 {len(data_requirements)}종을 확정했습니다.",
     )
     exploration = bool(state.get("exploration_policy"))
+    sealed_execution_spec = (
+        validate_execution_spec(state["execution_spec"])
+        if state.get("execution_spec") is not None
+        else None
+    )
+    # A current-date screener is presentation enrichment; it is not part of the
+    # historical PIT universe or the sealed rule that the backtest executes.  Running
+    # it alongside the full historical extraction made a researched broad-universe
+    # request spend two expensive PostgreSQL reads before it could produce a report.
+    # Keep it off the V3 execution critical path.  The report still derives its signal
+    # and ticker actions from the sealed rule and the terminal PostgreSQL snapshot.
+    skip_current_screen = exploration or isinstance(
+        sealed_execution_spec, ResearchCandidateExecutionSpecV3
+    )
     pipeline_data = (
         load_pipeline_data_from_env(query, state["trace_id"], screen_current=False)
-        if exploration
+        if skip_current_screen
         else load_pipeline_data_from_env(query, state["trace_id"])
     )
     if is_release_profile():

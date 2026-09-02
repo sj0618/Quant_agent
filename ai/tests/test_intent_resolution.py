@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from ai_graph.data_sources.db import PipelineDataBundle
 from ai_graph.graph import (
     _strategy_query,
     ambiguity_classifier_node,
@@ -19,7 +20,6 @@ from ai_graph.graph import (
 from ai_graph.llm.base import LLMJsonRequest
 from ai_graph.llm.role_calls import resolve_strategy_intent
 from ai_graph.schemas import AmbiguityCode, EnvelopeStatus
-
 
 RESOLVED = (
     "KOSPI·KOSDAQ 화학 업종에서 200일 이동평균 위에 있고 RSI(14)가 40 이하로 눌린 뒤 "
@@ -95,8 +95,19 @@ def test_vague_request_becomes_a_concrete_strategy_the_rest_of_the_graph_runs(
     assert _strategy_query({"user_query": "화학 관련주 사줘", **state}) == RESOLVED
 
 
-def test_resolved_strategy_is_what_gets_screened(live_intent) -> None:
+def test_resolved_strategy_is_what_gets_screened(
+    live_intent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unit test owns its data adapter; it must not start a live PostgreSQL read."""
+
     live_intent(_intent_payload())
+    monkeypatch.setattr(
+        "ai_graph.graph.load_pipeline_data_from_env",
+        lambda *_args, **_kwargs: PipelineDataBundle(
+            data_availability={}, metadata={"source": "unit-test"}
+        ),
+    )
 
     state: dict[str, Any] = {"user_query": "화학 관련주 사줘", "trace_id": "t"}
     state.update(ambiguity_classifier_node(state))
