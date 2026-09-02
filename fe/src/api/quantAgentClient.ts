@@ -1,5 +1,6 @@
 import { AI_ENDPOINTS, appConfig } from "../config/appConfig";
 import { backendRequest } from "./backendClient";
+import { createStrategyParsePayload } from "./strategyParsePayload";
 import { landingSample } from "../mocks/landing.mock";
 import { formatScoreValue, SCORE_SCALE, selectRecommendationConfidence } from "../utils/score";
 import { clearUserScopedStorage } from "../utils/userScopedStorage";
@@ -290,7 +291,7 @@ export async function reviewStrategy(query: string): Promise<ParseOutcome> {
   const parseResponse = await fetchAI(AI_ENDPOINTS.strategyParse, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ natural_language: normalizedQuery }),
+    body: JSON.stringify(createStrategyParsePayload(normalizedQuery)),
   });
   assertOk(parseResponse);
   const parsed = await parseResponse.json() as ParseOutcome;

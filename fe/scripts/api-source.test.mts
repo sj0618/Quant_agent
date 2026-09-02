@@ -2,6 +2,16 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
+import { createStrategyParsePayload } from "../src/api/strategyParsePayload.ts";
+
+test("strategy review payload remains compatible across an FE/AI rolling deployment", () => {
+  const query = "KRX 일봉에서 RSI 30 이하 진입, 70 이상 청산";
+
+  assert.deepEqual(createStrategyParsePayload(query), {
+    natural_language: query,
+    query,
+  });
+});
 
 test("workspace reports use completed analysis jobs and keep email snapshots separate", async () => {
   const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
@@ -51,6 +61,7 @@ test("review confirmation keeps the original natural-language context without ch
   assert.match(review, /\{ \.\.\.parsed, original_query: normalizedQuery \}/);
   assert.match(confirmation, /strategy_execution_spec: parsed\.strategy_execution_spec,/);
   assert.match(confirmation, /query: parsed\.original_query,/);
+  assert.match(review, /createStrategyParsePayload\(normalizedQuery\)/);
 });
 
 test("workspace discards a running job lost during a server restart", async () => {
