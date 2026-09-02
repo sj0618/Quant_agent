@@ -4,6 +4,7 @@ import pytest
 
 from ai_graph.data_sources.db import available_indicator_metrics
 from ai_graph.llm.base import LLMJsonRequest
+from ai_graph.nodes.condition_compiler import untranslatable_conditions
 from ai_graph.nodes.strategy_research import research_strategy_execution_spec
 from ai_graph.research_contract import RuleDraftSigner, build_rule_draft
 from ai_graph.strategy_parser import StrategyParseError, parse_natural_language_strategy
@@ -228,14 +229,29 @@ def test_relative_strength_research_is_admitted_from_server_ohlcv_capability() -
                 "hypothesis": "두 기간의 시장 대비 수익률이 양수인 종목은 추세 지속 후보가 될 수 있습니다.",
                 "counter_hypothesis": "강한 상대강도는 추세 반전 직전의 과열일 수 있습니다.",
                 "entry_conditions": [
-                    {"left": "relative_strength_20d", "operator": "gt", "right": 0},
-                    {"left": "relative_strength_60d", "operator": "gt", "right": 0},
+                    {
+                        "left": "relative_strength_20d",
+                        "operator": "gt",
+                        "right": 0,
+                        "universe_rank_pct": 0.2,
+                    },
+                    {
+                        "left": "relative_strength_60d",
+                        "operator": "gt",
+                        "right": 0,
+                        "universe_rank_pct": 0.2,
+                    },
                 ],
                 "exit_conditions": [
                     {"left": "relative_strength_20d", "operator": "lte", "right": 0},
                 ],
                 "required_metrics": ["relative_strength_20d", "relative_strength_60d"],
-                "assumptions": ["KRX 일봉과 같은 날짜의 전체 가격 유니버스를 사용합니다."],
+                "assumptions": [
+                    (
+                        "특정 섹터명이 없으므로 섹터 주도주는 KRX 가격 유니버스에서 "
+                        "1개월·3개월 상대강도 각각 상위 20%인 종목으로 운영 정의합니다."
+                    )
+                ],
                 "source_ids": ["source-1"],
             }
         ],
@@ -252,3 +268,9 @@ def test_relative_strength_research_is_admitted_from_server_ohlcv_capability() -
         "relative_strength_20d",
         "relative_strength_60d",
     ]
+    assert not untranslatable_conditions(spec.candidates[0].entry_conditions)
+    assert all(
+        condition.universe_rank_pct == pytest.approx(0.2)
+        for condition in spec.candidates[0].entry_conditions
+    )
+    assert "상위 20%" in spec.candidates[0].assumptions[0]

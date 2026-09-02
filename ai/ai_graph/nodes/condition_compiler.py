@@ -477,7 +477,17 @@ def _rank_filter(condition: Condition) -> tuple[str, float, bool] | None:
     if condition.universe_rank_pct is None:
         return None
     metric = canonical_metric(condition.left)
-    if metric not in _CURRENT and metric not in _FINANCIAL_METRICS:
+    # A rank cut is evaluated by PreparedFeatureStore against every name on the
+    # same date.  It can therefore use any current, financial, or price-path-derived
+    # metric that the structured evaluator exposes.  Keeping this narrower than
+    # ``_metric_series`` meant a sealed "relative-strength leader" rule was admitted
+    # by the research node but rejected by the compiler, even though the evaluator
+    # calculates the identical metric from the PIT OHLCV snapshot.
+    if (
+        metric not in _CURRENT
+        and metric not in _FINANCIAL_METRICS
+        and derived_series_spec(metric) is None
+    ):
         return None
     # gt/gte -> want the top of the distribution; lt/lte -> the bottom.
     top = condition.operator in {ConditionOperator.GT, ConditionOperator.GTE}

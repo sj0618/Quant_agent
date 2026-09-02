@@ -7,6 +7,7 @@ from backtest_module.performance import QUANTSTATS_REQUIRED_MESSAGE
 from ai_graph.nodes import backtest as backtest_node
 from ai_graph.nodes.backtest import run_candidate_backtest
 from ai_graph.nodes.backtest_code import Loop3Request, generate_loop3_candidates
+from ai_graph.nodes.backtest_features import PreparedFeatureStore, unavailable_condition_metrics
 from ai_graph.schemas import CodeCandidate, Condition, ConditionOperator, StrategySpec
 
 
@@ -43,6 +44,130 @@ def make_breakout_strategy() -> StrategySpec:
         risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
         confidence=0.8,
     )
+
+
+def make_relative_strength_leader_strategy() -> StrategySpec:
+    """A sealed researched rule, not a fallback momentum profile.
+
+    The request names no concrete sector.  Its visible, sealed interpretation is
+    therefore KRX-wide cross-sectional leadership: a stock must rank in the top 25%
+    of both 1- and 3-month market-relative returns.  This fixture exercises the exact
+    runtime path that turns those derived PIT price features into a structured trade.
+    """
+
+    return StrategySpec(
+        strategy_id="researched_relative_strength_leader",
+        name="1개월·3개월 상대강도 주도주",
+        market="KRX",
+        timeframe="daily",
+        entry_conditions=[
+            Condition(
+                left="relative_strength_20d",
+                operator=ConditionOperator.GTE,
+                right=0,
+                universe_rank_pct=0.25,
+            ),
+            Condition(
+                left="relative_strength_60d",
+                operator=ConditionOperator.GTE,
+                right=0,
+                universe_rank_pct=0.25,
+            ),
+        ],
+        exit_conditions=[
+            Condition(left="relative_strength_20d", operator=ConditionOperator.LTE, right=-1)
+        ],
+        indicators=["relative_strength_20d", "relative_strength_60d"],
+        risk_constraints={
+            "max_position_pct": 0.1,
+            "stop_loss_pct": 0.08,
+            "research_snapshot_hash": "a" * 64,
+        },
+        assumptions=[
+            (
+                "특정 섹터명이 없으므로 KRX 가격 유니버스에서 각 기간 상대강도 상위 25%를 "
+                "주도주 운영 정의로 사용합니다."
+            )
+        ],
+        selection_mode="user_defined",
+        confidence=1.0,
+    )
+
+
+def relative_strength_price_rows() -> list[dict[str, float | str]]:
+    """Four same-date price paths with one unambiguous 20d/60d leader."""
+
+    rows: list[dict[str, float | str]] = []
+    start = date(2025, 1, 1)
+    # The differing deterministic daily returns make 000004 the top name over both
+    # windows without injecting the tested relative-strength values into the rows.
+    daily_return_by_ticker = {
+        "000001": 0.0002,
+        "000002": 0.0005,
+        "000003": 0.0008,
+        "000004": 0.0012,
+    }
+    for day_index in range(96):
+        row_date = (start + timedelta(days=day_index)).isoformat()
+        for ticker, daily_return in daily_return_by_ticker.items():
+            close = 100.0 * ((1.0 + daily_return) ** day_index)
+            rows.append(
+                {
+                    "date": row_date,
+                    "ticker": ticker,
+                    "open": close * 0.999,
+                    "high": close * 1.002,
+                    "low": close * 0.998,
+                    "close": close,
+                    "volume": 1_000_000.0,
+                    "raw_notional": close * 1_000_000.0,
+                }
+            )
+    return rows
+
+
+def test_researched_relative_strength_leader_runs_as_its_sealed_rank_rule() -> None:
+    """Derived 20d/60d leadership must generate trades, never a generic fallback."""
+
+    strategy = make_relative_strength_leader_strategy()
+    rows = relative_strength_price_rows()
+    assert unavailable_condition_metrics(rows, [*strategy.entry_conditions, *strategy.exit_conditions]) == []
+
+    candidates = generate_loop3_candidates(
+        Loop3Request(
+            strategy=strategy,
+            variant="A",
+            trace_id="trace-relative-strength-leader",
+            server_only=True,
+        )
+    )
+    candidate = candidates.selected_candidate
+    assert candidate.parameters is not None
+    assert candidate.parameters.profile == "compiled_conditions"
+    assert candidate.strategy_ir is not None
+
+    actions = PreparedFeatureStore(rows).build_ranked_actions(
+        candidate.strategy_ir,
+        candidate.parameters,
+    )
+    bought_tickers = {
+        str(row["ticker"])
+        for row, action in zip(rows, actions.actions, strict=True)
+        if action == 1
+    }
+    assert bought_tickers == {"000004"}
+
+    result = run_candidate_backtest(
+        strategy,
+        candidates.candidates,
+        price_rows=rows,
+        _walk_forward_enabled=False,
+    )
+
+    assert result.selected_candidate.parameters is not None
+    assert result.selected_candidate.parameters.profile == "compiled_conditions"
+    assert result.engine_summary["buy_signal_count"] >= 1
+    assert result.engine_summary["execution_audit"]["executed_buy_count"] >= 1
 
 
 def test_backtest_node_metrics_are_computed_by_backtest_module_engine() -> None:
