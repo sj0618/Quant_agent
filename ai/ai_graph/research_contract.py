@@ -500,7 +500,7 @@ def build_rule_draft(
             unsupported_conditions=[
                 UnsupportedStrategyConditionV1(
                     condition="AI 연구 전략",
-                    reason=str(research_error)[:300],
+                    reason=str(research_error)[:240],
                 )
             ],
         )
@@ -564,7 +564,7 @@ def build_rule_draft(
                 unsupported_conditions=[
                     UnsupportedStrategyConditionV1(
                         condition="AI 연구 전략",
-                        reason=str(exc)[:300],
+                        reason=str(exc)[:240],
                     )
                 ],
             )

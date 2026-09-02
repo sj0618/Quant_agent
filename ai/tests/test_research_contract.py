@@ -168,3 +168,25 @@ def test_dev_preview_is_explicitly_limited_to_fixture_rendering() -> None:
 
     assert result.status == "dev_preview"
     assert result.reason_code == "development_fixture_only"
+
+
+def test_research_failure_reason_over_field_limit_stays_a_no_run_draft(monkeypatch) -> None:
+    # Regression: the no-run clarification path truncated the researcher error to 300
+    # characters while ``UnsupportedStrategyConditionV1.reason`` only allows 240, so any
+    # longer message raised a ValidationError *while building the message that reports
+    # the failure*.  That surfaced to users as an opaque "AI 파이프라인 계약 검증에
+    # 실패했습니다" instead of the intended clarification.
+    from ai_graph import research_contract
+    from ai_graph.nodes.strategy_research import StrategyResearchError
+
+    def _raise_long(**_kwargs: object) -> None:
+        raise StrategyResearchError("전략 연구 실패: " + "가" * 300)
+
+    monkeypatch.setattr(research_contract, "_build_researched_draft", _raise_long)
+
+    draft = build_rule_draft(query="fgdgd", user_id="user-1", signer=_signer(), use_llm=True)
+
+    assert draft.clarification_required
+    assert not draft.is_executable
+    assert draft.unsupported_conditions
+    assert all(len(item.reason) <= 240 for item in draft.unsupported_conditions)
