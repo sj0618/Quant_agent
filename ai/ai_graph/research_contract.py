@@ -300,14 +300,14 @@ class UnsupportedScopeV1(BaseModel):
     guidance: str = Field(min_length=1)
 
 
-ParseReviewV1 = Annotated[
+ParseOutcomeV1 = Annotated[
     RuleDraftV1 | ScopeRefusalV1 | UnsupportedScopeV1,
     Field(discriminator="kind"),
 ]
 
-# The new name makes the parse outcome's three states explicit without breaking older
-# callers that still import ``ParseReviewV1``.
-ParseOutcomeV1 = ParseReviewV1
+# ``ParseReviewV1`` is the retired name for the same three-state parse outcome, kept as a
+# back-compat alias for callers that still import it.
+ParseReviewV1 = ParseOutcomeV1
 
 
 class DraftTokenValidationError(ValueError):
