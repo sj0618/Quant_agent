@@ -176,19 +176,22 @@ def build_investment_signal(
     debate: dict[str, Any] | None = None,
 ) -> InvestmentSignalDecision:
     evidence = [L4Evidence.model_validate(item) for item in l4_evidence or []]
-    if not evidence:
+    metrics = _decision_metrics(backtest)
+    if not metrics:
+        # No backtest to reason from is the only thing that stops a decision. An absent
+        # analyst report does not: it is corroboration, not the evidence the signal is
+        # derived from, and treating it as a gate silently voided validated strategies
+        # on names KRX analysts simply do not cover.
         return InvestmentSignalDecision(
             action="NO_RECOMMENDATION",
             confidence=0.0,
-            bear_case=["추천을 뒷받침할 L4 근거가 없습니다."],
-            judge_reason="L4 근거가 없어 추천을 생성하지 않습니다.",
-            l4_evidence=[],
+            bear_case=["백테스트 지표가 없어 판단할 근거가 없습니다."],
+            judge_reason="백테스트 지표가 없어 추천을 생성하지 않습니다.",
+            l4_evidence=evidence,
         )
 
-    selected = backtest.get("selected_candidate") or {}
-    metrics = selected.get("metrics") or {}
-    sharpe = float(metrics.get("sharpe_ratio", 0.0))
-    drawdown = float(metrics.get("max_drawdown", 0.0))
+    sharpe = float(metrics.get("sharpe_ratio") or 0.0)
+    drawdown = float(metrics.get("max_drawdown") or 0.0)
     bull_case = [
         "Candidate-code backtest selected the best objective-score candidate.",
         f"Selected Sharpe ratio is {sharpe:.2f}.",
@@ -198,6 +201,8 @@ def build_investment_signal(
         "KIS foreign net-selling N-day cumulative flow is a required production adapter.",
         "English IB report search is optional in MVP and disabled by default.",
     ]
+    if not evidence:
+        bear_case.insert(0, "애널리스트 리포트 근거 없음: 백테스트 지표만으로 판단했습니다.")
     if debate:
         bull_summary = debate.get("bull", {}).get("summary")
         bear_summary = debate.get("bear", {}).get("summary")
@@ -225,6 +230,22 @@ def build_investment_signal(
         judge_reason=judge_reason,
         l4_evidence=evidence,
     )
+
+
+def _decision_metrics(backtest: dict[str, Any]) -> dict[str, Any]:
+    """The numbers the decision is made on, preferring the rolling out-of-sample ones.
+
+    Under walk-forward the selected candidate carries its last fold's selection metrics,
+    which selection already optimised against. The aggregate is the untouched result.
+    """
+
+    walk_forward = backtest.get("walk_forward") or {}
+    if walk_forward.get("status") == "ready" and walk_forward.get("aggregate_metrics"):
+        return dict(walk_forward["aggregate_metrics"])
+    selected = backtest.get("selected_candidate") or {}
+    return dict(selected.get("metrics") or {})
+
+
 def _matching_rules(
     rules: list[SignalCondition], logic: str, metrics: dict[str, float]
 ) -> list[str]:

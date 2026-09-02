@@ -1355,9 +1355,9 @@ def _l4_source(universe, candidates, captured):
         def _fetch_macro_status(self, _conn):
             return {}
 
-        def _fetch_l4_evidence(self, _conn, ticker, trace_id):
-            captured.append(ticker)
-            return [{"ticker": ticker, "trace_id": trace_id}]
+        def _fetch_l4_evidence(self, _conn, tickers, trace_id):
+            captured.extend(tickers)
+            return [{"ticker": ticker, "trace_id": trace_id} for ticker in tickers]
 
     return L4Source(DataSourceConfig(database_dsn="postgresql://fake/fake"))
 
@@ -1386,8 +1386,10 @@ def test_l4_evidence_is_fetched_for_the_recommended_name_not_the_lowest_pit_code
     # The look-ahead contract is untouched: the traded ticker is still the PIT member.
     assert bundle.metadata["ticker"] == "000020"
     assert bundle.metadata["recommendation_ticker"] == "005930"
-    assert captured == ["005930"]
+    # Every recommended name is fetched, not just the first, plus the traded member.
+    assert captured == ["005930", "000020"]
     assert bundle.metadata["l4_evidence_ticker"] == "005930"
+    assert bundle.metadata["l4_evidence_tickers"] == ["005930", "000020"]
     assert bundle.l4_evidence[0]["ticker"] == "005930"
 
 
@@ -1409,6 +1411,7 @@ def test_l4_evidence_falls_back_to_the_traded_ticker_without_a_recommendation() 
     assert bundle.metadata["ticker"] == "000020"
     assert captured == ["000020"]
     assert bundle.metadata["l4_evidence_ticker"] == "000020"
+    assert bundle.metadata["l4_evidence_tickers"] == ["000020"]
 
 
 def test_single_ticker_load_keeps_l4_evidence_on_that_ticker() -> None:
@@ -1421,6 +1424,7 @@ def test_single_ticker_load_keeps_l4_evidence_on_that_ticker() -> None:
     assert bundle.metadata["recommendation_ticker"] is None
     assert captured == ["005930"]
     assert bundle.metadata["l4_evidence_ticker"] == "005930"
+    assert bundle.metadata["l4_evidence_tickers"] == ["005930"]
 
 
 def test_official_benchmark_absence_is_reported_without_failing_the_load() -> None:

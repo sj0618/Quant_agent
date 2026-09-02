@@ -6,9 +6,9 @@ import pytest
 
 from ai_graph.data_sources import PipelineDataBundle
 from ai_graph.freshness import (
+    annotate_l4_coverage,
     build_freshness_evidence,
     classify_source_freshness,
-    withhold_recommendations_without_l4_evidence,
 )
 from ai_graph.graph import _recommendation_gate, _ticker_actions, data_node
 from ai_graph.nodes.report import build_report_bundle
@@ -178,49 +178,62 @@ def test_stale_load_still_withholds_recommendations() -> None:
 
 
 @pytest.mark.parametrize("l4_evidence", [None, []])
-def test_missing_l4_evidence_withholds_recommendations_even_when_price_data_is_fresh(
+def test_missing_l4_evidence_no_longer_withholds_a_fresh_recommendation(
     l4_evidence: list[dict[str, object]] | None,
 ) -> None:
-    evidence = withhold_recommendations_without_l4_evidence(
+    """An absent analyst report is missing corroboration, not a stale price feed.
+
+    KRX small caps have no analyst coverage at all, so gating on L4 voided every
+    recommendation the backtest had actually validated: the live run came back with
+    ticker_actions=[] and "L4 근거가 없어 추천을 생성하지 않습니다" while the price data
+    was current to the last settled session.
+    """
+
+    evidence = annotate_l4_coverage(
         build_freshness_evidence(
             _pipeline_metadata("fresh", reason="가격 데이터가 직전 개장일까지 적재돼 있습니다.")
         ),
         l4_evidence=l4_evidence,
+        tickers=["005930"],
     )
 
     assert evidence.status == "fresh"
-    assert evidence.no_recommendation is True
-    assert "L4" in evidence.reason
-    gate = _recommendation_gate({"freshness_evidence": evidence.model_dump()})
-    assert gate is not None
-    assert gate.validated is False
-    assert gate.reason == evidence.reason
-    assert _ticker_actions(
-        {
-            "freshness_evidence": evidence.model_dump(),
-            "backtest": {"ticker_actions": [_ticker_action()]},
-        },
-        [],
-    ) == []
+    assert evidence.no_recommendation is False
+    assert evidence.l4_coverage == {
+        "tickers_with_evidence": [],
+        "tickers_without": ["005930"],
+    }
+    # Freshness is no longer the thing forcing validated=False; with no backtest to
+    # judge, the gate abstains rather than refusing.
+    assert _recommendation_gate({"freshness_evidence": evidence.model_dump()}) is None
+    assert [
+        action.ticker
+        for action in _ticker_actions(
+            {
+                "freshness_evidence": evidence.model_dump(),
+                "backtest": {"ticker_actions": [_ticker_action()]},
+            },
+            [],
+        )
+    ] == ["005930"]
 
-    report = build_report_bundle(
-        make_strategy(),
-        RiskDecision(
-            signal=SignalDecision(
-                action="NO_RECOMMENDATION",
-                confidence=0.0,
-                judge_reason=evidence.reason,
-            )
-        ),
-        data={"pipeline_data_source": _pipeline_metadata("fresh")},
-        l4_evidence=l4_evidence,
+
+def test_l4_coverage_lists_the_names_an_analyst_report_was_found_for() -> None:
+    evidence = annotate_l4_coverage(
+        build_freshness_evidence(_pipeline_metadata("fresh")),
+        l4_evidence=[{"ticker": "005930"}, {"ticker": "005930"}],
+        tickers=["005930", "000660"],
     )
-    assert "NO_RECOMMENDATION" in report.web_projection.summary
-    assert "NO_RECOMMENDATION" in report.email_projection.summary
+
+    assert evidence.l4_coverage == {
+        "tickers_with_evidence": ["005930"],
+        "tickers_without": ["000660"],
+    }
+    assert evidence.no_recommendation is False
 
 
 @pytest.mark.parametrize("l4_evidence", [None, []])
-def test_data_node_withholds_recommendations_when_fresh_postgres_has_no_l4_evidence(
+def test_data_node_still_recommends_when_fresh_postgres_has_no_l4_evidence(
     monkeypatch,
     l4_evidence: list[dict[str, object]] | None,
 ) -> None:
@@ -236,10 +249,25 @@ def test_data_node_withholds_recommendations_when_fresh_postgres_has_no_l4_evide
     data = data_node({"user_query": "RSI가 30 이하인 KOSPI200", "trace_id": "l4-absent"})
 
     assert data["freshness_evidence"]["status"] == "fresh"
-    assert data["freshness_evidence"]["no_recommendation"] is True
-    assert "L4" in data["freshness_evidence"]["reason"]
+    assert data["freshness_evidence"]["no_recommendation"] is False
+    assert data["freshness_evidence"]["l4_coverage"]["tickers_with_evidence"] == []
     assert "l4_evidence" in data
     assert data["l4_evidence"] == []
+
+
+def test_eod_current_manifest_is_reported_as_eod_current_not_unknown() -> None:
+    """`eod_current` is what a release manifest writes; it was not a known status.
+
+    Falling through to "unknown" put the live run in NO_RECOMMENDATION_STATUSES, so a
+    warehouse load carrying every settled session withheld its own recommendations.
+    """
+
+    evidence = build_freshness_evidence(_pipeline_metadata("eod_current", reason=""))
+
+    assert evidence.status == "eod_current"
+    assert evidence.as_of == date(2026, 8, 20)
+    assert evidence.no_recommendation is False
+    assert _recommendation_gate({"freshness_evidence": evidence.model_dump()}) is None
 
 
 def test_evidence_reports_the_date_the_data_actually_reaches() -> None:

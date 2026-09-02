@@ -15,9 +15,11 @@ import type {
   AIEnvelopeStatus,
   AIJobStage,
   AIJobStageStatus,
+  AIPerformanceEnvelope,
   AIReportBundle,
   AIRiskAdjustment,
   AIStrategySpec,
+  AITickerAction,
   AnalysisJob,
   AnalysisJobStatus,
   AnalysisStage,
@@ -105,6 +107,8 @@ const EMPTY_WORKSPACE: AppOverview = {
   recentReports: [],
   envelope: null,
   jobStatus: null,
+  recommendationGateReason: null,
+  objectiveFloorConclusion: null,
 };
 
 
@@ -368,6 +372,10 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
     recentReports,
     envelope: result ?? base.envelope,
     jobStatus: buildWorkspaceJobStatus(job),
+    recommendationGateReason: result ? result.user_payload.recommendation_gate?.reason ?? null : base.recommendationGateReason,
+    objectiveFloorConclusion: result?.user_payload.report
+      ? extractObjectiveFloorConclusion(result.user_payload.report)
+      : base.objectiveFloorConclusion,
   };
 }
 
@@ -645,10 +653,57 @@ function buildReportDetailFromAnalysisJob(job: AnalysisJob): ReportDetail | null
   };
 }
 
+const TICKER_ACTION_SIGNAL: Record<AITickerAction["action"], SignalType | undefined> = {
+  BUY: "BUY",
+  SELL: "DROP",
+  HOLD: "HOLD",
+  // WATCH is a screened name the backtest did not act on - it gets no BUY/HOLD/DROP badge.
+  WATCH: undefined,
+};
+
+/**
+ * Per-stock BUY/SELL/HOLD/WATCH from the same backtest run that produced the performance
+ * figures. Preferred over the DB-screening candidate cards below because it carries an
+ * actual verdict and reason per ticker, not just "this row matched the screen". It is not
+ * gated on `recommendation_gate.validated` - the backend already withholds it when the
+ * underlying data was insufficient - so a strategy that misses its objective floor still
+ * shows what the backtest did with each name, labelled as reference only.
+ */
+function buildTradingCandidatesFromTickerActions(job: AnalysisJob): TradingCandidate[] {
+  const result = job.result;
+  const actions = result?.user_payload.ticker_actions;
+  if (!result || !actions?.length) {
+    return [];
+  }
+  const referenceOnly = !(result.user_payload.recommendation_gate?.validated ?? true);
+  return actions.map((action) => ({
+    id: action.ticker,
+    ticker: action.ticker,
+    name: action.name,
+    sector: "",
+    signal: TICKER_ACTION_SIGNAL[action.action],
+    price: action.close == null ? "—" : `${new Intl.NumberFormat(APP_LOCALE).format(action.close)}원`,
+    rationale: referenceOnly ? `${action.reason} · 참고용` : action.reason,
+    evidence: [
+      {
+        provider: "QuantAgent 백테스트",
+        title: `${action.action} 판정`,
+        date: action.as_of_date,
+        summary: action.reason,
+      },
+    ],
+    riskReasons: [],
+  } satisfies TradingCandidate));
+}
+
 function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandidate[] {
   const result = job.result;
   if (!result) {
     return [];
+  }
+  const tickerActions = buildTradingCandidatesFromTickerActions(job);
+  if (tickerActions.length) {
+    return tickerActions;
   }
   // These names came out of a DB screen, so what is known about each one is which rules it
   // matched. The strategy's single action and the candidate card's confidence describe the
@@ -682,8 +737,36 @@ function buildTradingCandidatesFromAnalysisJob(job: AnalysisJob): TradingCandida
   );
 }
 
+/**
+ * The AI API never sends the flat performance object directly: `user_payload.performance`
+ * is an availability envelope (`{availability: "available", performance: {...}}` or
+ * `{availability: "unavailable", reason_code}`). Every reader of that field must unwrap it
+ * first, or it reads as present-but-empty and the UI reports no backtest at all even though
+ * one ran. Returns null for the unavailable variant (and for anything malformed).
+ */
+function unwrapAIPerformance(
+  payload: AIPerformanceEnvelope | null | undefined,
+): { performance: AIBacktestPerformance; limitations: string[] } | null {
+  if (!payload) {
+    return null;
+  }
+  // Defensive: tolerate an already-flat payload (older cached job, or a contract change)
+  // so a shape drift degrades gracefully instead of hiding a real result.
+  if ("metrics" in payload) {
+    return { performance: payload as unknown as AIBacktestPerformance, limitations: [] };
+  }
+  if (payload.availability !== "available") {
+    return null;
+  }
+  return {
+    performance: payload.performance,
+    limitations: parseStringList(payload.limitations),
+  };
+}
+
 function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: PerformanceSummary): PerformanceSummary {
-  const aiPerformance = job.result?.user_payload.performance;
+  const unwrapped = unwrapAIPerformance(job.result?.user_payload.performance);
+  const aiPerformance = unwrapped?.performance;
   const selectedMetrics = aiPerformance?.metrics ?? null;
   if (!aiPerformance || !selectedMetrics) {
     return job.result?.status === "ready"
@@ -723,6 +806,7 @@ function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: Perf
     metricDetails,
     strategyExplanation: aiPerformance.strategy_explanation ?? null,
     macroEvents: [],
+    limitations: unwrapped?.limitations ?? [],
     disclaimer: buildPerformanceDisclaimer(
       aiPerformance.selected_candidate_id,
       reliability,
@@ -982,6 +1066,20 @@ function extractFinalSignal(report: AIReportBundle) {
   const items = signalSection?.items;
   if (isRecord(items) && isSignalType(items.action)) {
     return { action: items.action, confidence: numberFromRecord(items, "confidence") };
+  }
+  return null;
+}
+
+/**
+ * The acceptance-floor verdict, read defensively: `objective_floor` is a report-only
+ * section another lane is still adding (`conclusion`, `cleared`, `rounds`,
+ * `candidates_tried`), so an older or unrelated job simply has no such section yet.
+ */
+function extractObjectiveFloorConclusion(report: AIReportBundle): string | null {
+  const section = report.web_projection.sections.find((item) => stringFromRecord(item, "id") === "objective_floor");
+  const items = section?.items;
+  if (isRecord(items) && typeof items.conclusion === "string" && items.conclusion.trim()) {
+    return items.conclusion;
   }
   return null;
 }

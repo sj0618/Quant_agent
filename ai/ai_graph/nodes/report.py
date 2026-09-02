@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from time import perf_counter
 from typing import Any
 
 from ai_graph.exploration_policy import ExplorationPolicyV2
 from ai_graph.freshness import (
+    annotate_l4_coverage,
     build_freshness_evidence,
-    withhold_recommendations_without_l4_evidence,
 )
 from ai_graph.llm.role_calls import RoleDebatePayload, generate_report_writeup
 from ai_graph.quant_performance import project_public_performance
@@ -19,6 +20,7 @@ from ai_graph.schemas import (
     BaseReportV2,
     ExplorationCandidateResultV2,
     ExplorationExecutionSpecV2,
+    FreshnessEvidence,
     ReportBundle,
     ReportProjection,
     RiskDecision,
@@ -27,6 +29,19 @@ from ai_graph.schemas import (
     validate_execution_spec,
 )
 from ai_graph.strategy_blueprint_catalog import strategy_blueprint_catalog
+
+
+def _freshness_evidence(
+    data: dict[str, Any], l4_evidence: list[dict[str, Any]] | None
+) -> FreshnessEvidence:
+    """The same decision the data node published, rebuilt from the same manifest."""
+
+    pipeline = data.get("pipeline_data_source") or {}
+    return annotate_l4_coverage(
+        build_freshness_evidence(pipeline),
+        l4_evidence=l4_evidence,
+        tickers=(pipeline.get("l4_evidence_tickers") or ()) if isinstance(pipeline, Mapping) else (),
+    )
 
 
 def build_report_bundle(
@@ -87,10 +102,7 @@ def build_report_bundle(
     if citations:
         sections.append({"id": "citations", "title": "출처", "items": citations})
     if data:
-        freshness_evidence = withhold_recommendations_without_l4_evidence(
-            build_freshness_evidence(data.get("pipeline_data_source")),
-            l4_evidence=l4_evidence,
-        )
+        freshness_evidence = _freshness_evidence(data, l4_evidence)
         sections.insert(
             3,
             {
@@ -188,10 +200,7 @@ def build_report_bundle(
             {
                 "id": "freshness",
                 "title": "데이터 freshness",
-                "items": withhold_recommendations_without_l4_evidence(
-                    build_freshness_evidence(data.get("pipeline_data_source")),
-                    l4_evidence=l4_evidence,
-                ).model_dump(mode="json"),
+                "items": _freshness_evidence(data, l4_evidence).model_dump(mode="json"),
             }
         )
     if citations:

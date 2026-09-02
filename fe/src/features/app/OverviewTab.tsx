@@ -40,6 +40,9 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
     && chartPoints.some((point) => Number.isFinite(point.benchmark));
   const insufficient = overview.performance.reliability?.status === "insufficient";
   const candidateCounts = countScoredSignals(overview.candidates);
+  // The acceptance-floor's own conclusion sentence, when the backend sends one, is more
+  // specific than the gate's short reason code - prefer it, falling back to the reason.
+  const gateNote = overview.objectiveFloorConclusion ?? overview.recommendationGateReason;
 
   return (
     <div className="workspace-content">
@@ -77,7 +80,12 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
         {[
           validated
             ? { label: "오늘의 권장도", value: overview.recommendationScore, delta: overview.recommendationDelta, caption: "최종 신호 등급 · BUY 8.2 / HOLD 6.8 / DROP 6.4" }
-            : { label: "오늘의 권장도", value: "산출 안 함", delta: undefined, caption: "백테스트 목표 기준 미달" },
+            : {
+                label: "오늘의 권장도",
+                value: overview.recommendationScore,
+                delta: undefined,
+                caption: gateNote ? `백테스트 목표 기준 미달 · 참고용 · ${gateNote}` : "백테스트 목표 기준 미달 · 참고용",
+              },
           { label: "활성 신호", value: `${overview.passCount}건`, delta: undefined, caption: `BUY ${overview.buyCount} · HOLD ${overview.holdCount} · DROP ${overview.dropCount}` },
           {
             label: "검증 누적 수익률",
@@ -186,6 +194,9 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
           <div><span>최대 낙폭</span><strong>{maxDrawdownMetric?.value ?? "-"}</strong></div>
         </div>
         <PerformanceChart points={chartPoints} series={hasBenchmarkSeries ? ["benchmark", "strategy"] : ["strategy"]} />
+        {overview.performance.limitations?.length ? (
+          <p className="card-foot">{overview.performance.limitations.join(" ")}</p>
+        ) : null}
       </Card> : (
         <Card className="performance-empty">
           <strong>누적 수익률을 표시할 수 없습니다</strong>

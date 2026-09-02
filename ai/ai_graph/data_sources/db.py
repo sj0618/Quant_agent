@@ -69,6 +69,8 @@ MAX_BACKTEST_LOOKBACK_YEARS = 3
 DEFAULT_BACKTEST_UNIVERSE_MAX_TICKERS = 100
 UNIVERSE_RANKING_SESSIONS = 60
 DEFAULT_L4_EVIDENCE_LIMIT = 5
+# Per-ticker report cut times this many names in one query. Ten is what a report lists.
+L4_EVIDENCE_MAX_TICKERS = 10
 # A broad screen can match many names, but recommendations never define historical
 # membership. They are presentation output only.
 DEFAULT_BACKTEST_MAX_TICKERS = 20
@@ -606,7 +608,12 @@ class PostgresPipelineDataSource:
             )
             recommendation_ticker = recommended[0] if recommended else None
             l4_evidence_ticker = recommendation_ticker or ticker
-            l4_evidence = self._fetch_l4_evidence(conn, l4_evidence_ticker, trace_id)
+            # Every name the report will recommend, capped so one query stays cheap, plus
+            # the traded PIT member.
+            l4_evidence_tickers = list(
+                dict.fromkeys([*recommended[:L4_EVIDENCE_MAX_TICKERS], ticker])
+            )
+            l4_evidence = self._fetch_l4_evidence(conn, l4_evidence_tickers, trace_id)
             macro_status = self._fetch_macro_status(conn)
             macro_snapshot = self._fetch_macro_snapshot(conn, price_rows)
             official_benchmark = self._fetch_official_benchmark(conn, backtest_window)
@@ -774,6 +781,7 @@ class PostgresPipelineDataSource:
                 "dart_date_only_effective_policy": "next_krx_session_v1",
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_ticker": l4_evidence_ticker,
+                "l4_evidence_tickers": l4_evidence_tickers,
                 "l4_evidence_rows": len(l4_evidence),
                 "official_benchmark": _official_benchmark_status(official_benchmark),
                 "universe_source": universe_descriptor["source"],
@@ -1696,7 +1704,19 @@ class PostgresPipelineDataSource:
             }
         return values_by_ticker
 
-    def _fetch_l4_evidence(self, conn: Any, ticker: str, trace_id: str) -> list[dict[str, Any]]:
+    def _fetch_l4_evidence(
+        self, conn: Any, tickers: Sequence[str], trace_id: str
+    ) -> list[dict[str, Any]]:
+        """Analyst reports for every recommended name, not just the first one.
+
+        One round trip with a per-ticker cut: fetching only `tickers[0]` meant a report
+        list that described one stock out of ten, and an empty result for a name with no
+        coverage used to withhold the whole recommendation.
+        """
+
+        wanted = [str(ticker).strip() for ticker in tickers if str(ticker).strip()]
+        if not wanted:
+            return []
         rows = conn.execute(
             """
             SELECT
@@ -1709,12 +1729,27 @@ class PostgresPipelineDataSource:
                 author,
                 source_payload_hash,
                 created_at
-            FROM raw.analyst_report_summary
-            WHERE ticker = %s
-            ORDER BY report_date DESC, created_at DESC
-            LIMIT %s
+            FROM (
+                SELECT
+                    report_date,
+                    ticker,
+                    company_name,
+                    summary,
+                    opinion,
+                    institution,
+                    author,
+                    source_payload_hash,
+                    created_at,
+                    row_number() OVER (
+                        PARTITION BY ticker ORDER BY report_date DESC, created_at DESC
+                    ) AS ticker_rank
+                FROM raw.analyst_report_summary
+                WHERE ticker = ANY(%s)
+            ) ranked
+            WHERE ticker_rank <= %s
+            ORDER BY ticker, report_date DESC, created_at DESC
             """,
-            [ticker, self.config.l4_evidence_limit],
+            [wanted, self.config.l4_evidence_limit],
         ).fetchall()
         return [_l4_evidence_from_report(row, trace_id) for row in rows]
 
@@ -3481,6 +3516,7 @@ def _l4_evidence_from_report(row: Mapping[str, Any], trace_id: str) -> dict[str,
     author = row.get("author") or "author unavailable"
     return {
         "publisher": str(publisher),
+        "ticker": str(row.get("ticker") or "") or None,
         "published_at": published_at,
         "retrieved_at": retrieved_at,
         "freshness_days": freshness_days,

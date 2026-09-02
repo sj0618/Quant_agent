@@ -35,9 +35,9 @@ from ai_graph.exploration_policy import (
     validate_exploration_spec_against_policy,
 )
 from ai_graph.freshness import (
+    annotate_l4_coverage,
     build_freshness_evidence,
     freshness_status_from_metadata,
-    withhold_recommendations_without_l4_evidence,
 )
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
@@ -55,6 +55,7 @@ from ai_graph.nodes.backtest import (
     WALK_FORWARD_TRAIN_MONTHS,
     WALK_FORWARD_VALIDATION_MONTHS,
     _benchmark_objective_reasons,
+    _floor_metrics,
     _summary_float_default,
     backtest_node,
 )
@@ -784,9 +785,10 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         screening_candidates=pipeline_data.screening_candidates,
         sector=semantic_slots.sector,
     )
-    freshness_evidence = withhold_recommendations_without_l4_evidence(
+    freshness_evidence = annotate_l4_coverage(
         build_freshness_evidence(pipeline_data.metadata),
         l4_evidence=pipeline_data.l4_evidence,
+        tickers=pipeline_data.metadata.get("l4_evidence_tickers") or (),
     )
     output: dict[str, Any] = {
         "semantic_slots": semantic_slots.model_dump(),
@@ -1365,7 +1367,7 @@ def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
             if validated
             else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
         )
-    sections = [base, *_universe_split_disclosure(state)]
+    sections = [base, *_objective_floor_conclusion(state), *_universe_split_disclosure(state)]
     ambiguity = state.get("ambiguity") or {}
     assumptions = [
         str(item).strip() for item in ambiguity.get("assumptions", []) if str(item).strip()
@@ -1374,6 +1376,16 @@ def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
         listed = "\n".join(f"- {item}" for item in assumptions[:5])
         sections.append(f"지정하지 않으신 부분은 이렇게 정해서 진행했습니다:\n{listed}")
     return "\n\n".join(sections)
+
+
+def _objective_floor_conclusion(state: QuantAgentState) -> list[str]:
+    """The acceptance floor's verdict, in the message rather than only in the report."""
+
+    floor = state.get("objective_floor") or {}
+    if not isinstance(floor, Mapping):
+        return []
+    conclusion = str(floor.get("conclusion") or "").strip()
+    return [conclusion] if conclusion else []
 
 
 def _universe_split_disclosure(state: QuantAgentState) -> list[str]:
@@ -3783,7 +3795,10 @@ def _recommendation_gate(
         )
 
     reasons = _objective_gate_reasons(
-        selected.metrics,
+        # The same numbers the acceptance floor judged: under walk-forward the selected
+        # candidate carries its last fold's split, which selection was run on. Reading
+        # that here let the gate publish 검증됨 for a run the floor had failed.
+        _floor_metrics(backtest),
         backtest.engine_summary,
         selection_mode=backtest.strategy_a.selection_mode,
         benchmark_return=backtest.backtest_payload.get("benchmark_return"),

@@ -8,7 +8,9 @@ from typing import Any
 
 from ai_graph.schemas import FreshnessEvidence, FreshnessStatus
 
-KNOWN_FRESHNESS_STATUSES = frozenset({"fresh", "stale", "unknown", "not_time_sensitive"})
+KNOWN_FRESHNESS_STATUSES = frozenset(
+    {"fresh", "eod_current", "stale", "unknown", "not_time_sensitive"}
+)
 NO_RECOMMENDATION_STATUSES = frozenset({"stale", "unknown"})
 
 
@@ -95,6 +97,8 @@ def build_freshness_evidence(
         reason = "source freshness 한계를 확인할 수 없어 추천을 생성하지 않습니다."
     elif status == "not_time_sensitive":
         reason = "이 입력은 시간 민감도가 없어 freshness 제한을 적용하지 않습니다."
+    elif status == "eod_current":
+        reason = "가격 데이터가 직전 개장일 종가까지 적재돼 있습니다."
     else:
         reason = "source as-of가 설정된 freshness 한계 안에 있습니다."
 
@@ -111,19 +115,38 @@ def build_freshness_evidence(
     )
 
 
-def withhold_recommendations_without_l4_evidence(
+def annotate_l4_coverage(
     evidence: FreshnessEvidence,
     *,
     l4_evidence: Sequence[Mapping[str, Any]] | None,
+    tickers: Sequence[str] | None = None,
 ) -> FreshnessEvidence:
-    """Keep a fresh source honest when it has no L4 support for a recommendation."""
+    """Record which recommended names have an analyst report behind them.
 
-    if l4_evidence:
-        return evidence
+    This used to withhold every recommendation when no L4 report was found, which
+    nullified a quantitatively validated strategy over an optional corroborating
+    source: KRX small caps simply have no analyst coverage, and the run then returned
+    an empty ticker list with a "L4 근거가 없어" reason while the price data was
+    perfectly current. Analyst reports are supplementary evidence; the backtest is what
+    validates the rule, so coverage is now reported rather than enforced. Only the
+    price/PIT source itself (stale or unknown) can still withhold.
+    """
+
+    with_evidence = sorted(
+        {
+            ticker
+            for item in l4_evidence or ()
+            if (ticker := str(item.get("ticker") or "").strip())
+        }
+    )
+    requested = [str(ticker).strip() for ticker in tickers or () if str(ticker).strip()]
+    without = sorted({ticker for ticker in requested if ticker not in with_evidence})
     return evidence.model_copy(
         update={
-            "no_recommendation": True,
-            "reason": "L4 근거가 없어 추천을 생성하지 않습니다.",
+            "l4_coverage": {
+                "tickers_with_evidence": with_evidence,
+                "tickers_without": without,
+            }
         }
     )
 
