@@ -1,7 +1,7 @@
 """Run the real isolated-staging acceptance gate without exposing credentials.
 
 The gate is deliberately an external client: it measures the actual browser contract
-(``parse -> confirmed job -> terminal report``) and verifies immutable PostgreSQL
+(``natural language -> job -> terminal report``) and verifies immutable PostgreSQL
 evidence through a small allow-listed operator projection.  It does not know a DSN,
 read shell profiles, or target the public production host.
 """
@@ -13,7 +13,6 @@ import math
 import os
 import sys
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 from urllib.parse import urlparse
@@ -33,6 +32,16 @@ RUN_COUNT = 3
 RUN_DEADLINE_SECONDS = 30.0
 POLL_INTERVAL_SECONDS = 0.25
 RSI_EXECUTION_SPEC_VERSION = "strategy-execution-spec.v1"
+# A direct browser submission may resolve an explicit rule deterministically (V1) or
+# through the live AOAI research contract (V3).  The staging gate verifies the sealed
+# immutable result either way; treating V3 as a failure would make the release gate
+# reject the very unfamiliar-strategy path it is supposed to exercise.
+ADMITTED_EXECUTION_SPEC_VERSIONS = frozenset(
+    {
+        RSI_EXECUTION_SPEC_VERSION,
+        "research-candidate-execution-spec.v3",
+    }
+)
 GENERIC_RSI_QUERY = (
     "KRX 일봉에서 RSI(14)가 30 이하이면 매수하고 70 이상이면 매도하는 전략을 "
     "최근 3년 구간에서 수수료와 슬리피지를 반영해 검증해줘."
@@ -141,18 +150,13 @@ def _run_once(
 ) -> RunEvidence:
     started = float(clock())
     auth_headers = {"Authorization": f"Bearer {config.account_token}"}
-    draft = _json_response(
-        client.post(
-            f"{config.api_base_url}/api/strategies/parse",
-            headers=auth_headers,
-            json={"natural_language": GENERIC_RSI_QUERY},
-        ),
-        "RSI strategy parse",
-    )
-    payload = _confirmed_rsi_job_payload(draft)
     created = _json_response(
-        client.post(f"{config.api_base_url}/analysis-jobs", headers=auth_headers, json=payload),
-        "confirmed analysis job admission",
+        client.post(
+            f"{config.api_base_url}/analysis-jobs",
+            headers=auth_headers,
+            json={"query": GENERIC_RSI_QUERY},
+        ),
+        "natural-language analysis job admission",
         expected_status=201,
     )
     job_id = _nonempty(created.get("job_id"), "analysis job id")
@@ -181,23 +185,32 @@ def _run_once(
     )
     if operator.get("job_id") != job_id or operator.get("immutable_trigger_present") is not True:
         raise StagingGateError("completed job has no verified immutable result link")
-    if operator.get("execution_spec_version") != RSI_EXECUTION_SPEC_VERSION:
-        raise StagingGateError("analysis job was not admitted through the versioned RSI parse contract")
+    execution_spec_version = str(operator.get("execution_spec_version") or "")
+    if execution_spec_version not in ADMITTED_EXECUTION_SPEC_VERSIONS:
+        raise StagingGateError(
+            "analysis job was not admitted through a supported sealed execution contract"
+        )
     execution_spec_hash = _sha256(operator.get("execution_spec_hash"), "execution spec hash")
     if operator.get("source") != "postgres" or operator.get("as_of") != report["as_of"]:
         raise StagingGateError("immutable result provenance does not match the terminal report")
     observations = _positive_int(operator.get("observations"), "observations")
     candidate_count = _positive_int(operator.get("candidate_count"), "candidate count")
     if candidate_count != report["candidate_count"]:
-        raise StagingGateError("immutable result candidate count does not match the terminal report")
-    successful_aoai_calls = _positive_int(operator.get("successful_aoai_calls"), "successful AOAI calls")
+        raise StagingGateError(
+            "immutable result candidate count does not match the terminal report"
+        )
+    successful_aoai_calls = _positive_int(
+        operator.get("successful_aoai_calls"), "successful AOAI calls"
+    )
     elapsed = float(clock()) - started
     if elapsed > RUN_DEADLINE_SECONDS:
-        raise StagingGateError("parse-to-immutable-report pipeline exceeded the 30-second acceptance budget")
+        raise StagingGateError(
+            "parse-to-immutable-report pipeline exceeded the 30-second acceptance budget"
+        )
     return RunEvidence(
         job_id=job_id,
         elapsed_seconds=round(elapsed, 3),
-        execution_spec_version=RSI_EXECUTION_SPEC_VERSION,
+        execution_spec_version=execution_spec_version,
         execution_spec_hash=execution_spec_hash,
         as_of=str(report["as_of"]),
         observations=observations,
@@ -211,23 +224,6 @@ def _run_once(
         analysis_result_id=_nonempty(operator.get("analysis_result_id"), "analysis result id"),
         manifest_hash=_sha256(operator.get("manifest_hash"), "manifest hash"),
     )
-
-
-def _confirmed_rsi_job_payload(draft: Mapping[str, Any]) -> dict[str, Any]:
-    if draft.get("kind") != "rule_draft" or draft.get("is_executable") is not True:
-        raise StagingGateError("RSI parse did not produce an executable strategy draft")
-    if draft.get("clarification_required") is True or draft.get("unsupported_conditions"):
-        raise StagingGateError("RSI parse requested clarification or omitted a condition")
-    if draft.get("spec_version") != RSI_EXECUTION_SPEC_VERSION:
-        raise StagingGateError("RSI parse did not produce the current execution spec version")
-    spec = _object(draft.get("strategy_execution_spec"), "RSI execution spec")
-    return {
-        "parse_token": _nonempty(draft.get("parse_token"), "RSI parse token"),
-        "client_idempotency_key": str(uuid.uuid4()),
-        "spec_version": RSI_EXECUTION_SPEC_VERSION,
-        "spec_hash": _sha256(draft.get("spec_hash"), "RSI execution spec hash"),
-        "strategy_execution_spec": dict(spec),
-    }
 
 
 def _seal_workspace_report(client: httpx.Client, config: StagingGateConfig, job_id: str) -> None:
@@ -278,15 +274,27 @@ def _validate_terminal_report(job: Mapping[str, Any]) -> dict[str, str | int | f
     measured = _object(performance.get("performance"), "measured performance")
     _nonempty(measured.get("selected_candidate_id"), "selected candidate id")
     metrics = _object(measured.get("metrics"), "measured performance metrics")
-    values = {name: _finite_number(metrics.get(name), f"measured {name}") for name in ("total_return", "max_drawdown", "sharpe_ratio")}
-    candidate_count = _positive_int(metrics.get("candidates_evaluated"), "evaluated candidate count")
+    values = {
+        name: _finite_number(metrics.get(name), f"measured {name}")
+        for name in ("total_return", "max_drawdown", "sharpe_ratio")
+    }
+    candidate_count = _positive_int(
+        metrics.get("candidates_evaluated"), "evaluated candidate count"
+    )
     limitations = performance.get("limitations")
-    if not isinstance(limitations, list) or not all(isinstance(item, str) and item.strip() for item in limitations):
+    if not isinstance(limitations, list) or not all(
+        isinstance(item, str) and item.strip() for item in limitations
+    ):
         raise StagingGateError("terminal report omits performance limitations contract")
-    projection = _object(_object(payload.get("report"), "beginner report").get("web_projection"), "web report projection")
+    projection = _object(
+        _object(payload.get("report"), "beginner report").get("web_projection"),
+        "web report projection",
+    )
     _nonempty(projection.get("title"), "report title")
     _nonempty(projection.get("summary"), "report summary")
-    section_ids = {section.get("id") for section in _object_list(projection.get("sections"), "report sections")}
+    section_ids = {
+        section.get("id") for section in _object_list(projection.get("sections"), "report sections")
+    }
     if not {"performance", "risk"}.issubset(section_ids):
         raise StagingGateError("report sections omit performance or risk limits")
     return {
@@ -301,10 +309,25 @@ def _validate_terminal_report(job: Mapping[str, Any]) -> dict[str, str | int | f
 
 
 def _has_required_method_evidence(method: Mapping[str, Any]) -> bool:
-    required_text = ("start_date", "end_date", "cost_tax_slippage_liquidity", "historical_simulation_warning")
-    if any(not isinstance(method.get(name), str) or not method[name].strip() for name in required_text):
+    required_text = (
+        "start_date",
+        "end_date",
+        "cost_tax_slippage_liquidity",
+        "historical_simulation_warning",
+    )
+    if any(
+        not isinstance(method.get(name), str) or not method[name].strip() for name in required_text
+    ):
         return False
-    return all(isinstance(method.get(name), int) and not isinstance(method[name], bool) and method[name] >= 0 for name in ("observations", "trades")) and method["observations"] > 0
+    return (
+        all(
+            isinstance(method.get(name), int)
+            and not isinstance(method[name], bool)
+            and method[name] >= 0
+            for name in ("observations", "trades")
+        )
+        and method["observations"] > 0
+    )
 
 
 def _required(source: Mapping[str, str], key: str) -> str:
@@ -324,7 +347,9 @@ def _https_base_url(value: str, context: str) -> str:
     return base_url
 
 
-def _json_response(response: httpx.Response, context: str, *, expected_status: int = 200) -> Mapping[str, Any]:
+def _json_response(
+    response: httpx.Response, context: str, *, expected_status: int = 200
+) -> Mapping[str, Any]:
     if response.status_code != expected_status:
         reason = _safe_http_failure_reason(response)
         suffix = f" ({reason})" if reason else ""
@@ -397,14 +422,24 @@ def _sha256(value: Any, context: str) -> str:
 
 
 def _finite_number(value: Any, context: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+    ):
         raise StagingGateError(f"terminal report omits {context}")
     return float(value)
 
 
 def main() -> int:
     evidence = run_gate(StagingGateConfig.from_env())
-    print(json.dumps({"run_count": len(evidence), "runs": [item.__dict__ for item in evidence]}, ensure_ascii=False, sort_keys=True))
+    print(
+        json.dumps(
+            {"run_count": len(evidence), "runs": [item.__dict__ for item in evidence]},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

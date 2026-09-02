@@ -28,6 +28,7 @@ from ai_graph.exploration_policy import ExplorationPolicyUnavailableError
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.llm import LLMClientError, LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
 from ai_graph.llm.concurrency_gate import AOAIGateBusyError
+from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.progress import (
     AnalysisCancelled,
     AnalysisDeadlineExceeded,
@@ -1380,6 +1381,38 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
                 if stale
                 else "failure:exploration_policy_unavailable"
             ],
+        )
+    research_failure = next(
+        (error for error in exception_chain if isinstance(error, StrategyResearchError)),
+        None,
+    )
+    if isinstance(research_failure, StrategyResearchError):
+        if research_failure.cause_code == "research_provider_failure":
+            subcause = "strategy_research_provider_failure"
+            message = "AI 리서치 제공자가 일시적으로 응답하지 않았습니다. 잠시 후 다시 시도해 주세요."
+            retryable = True
+            category = "infrastructure_failure"
+        elif research_failure.cause_code == "research_resolution_invalid_after_repair":
+            subcause = "strategy_research_contract_invalid"
+            message = (
+                "AI 리서치가 전략 의미를 실행 규칙으로 완성하지 못했습니다. "
+                "입력 형식 문제가 아니며, 같은 요청을 다시 시도할 수 있습니다."
+            )
+            retryable = True
+            category = "semantic_failure"
+        else:
+            subcause = "strategy_research_contract_invalid"
+            message = "AI 리서치가 실행 가능한 전략 계약을 만들지 못했습니다. 잠시 후 다시 시도해 주세요."
+            retryable = True
+            category = "semantic_failure"
+        return FailureDiagnostic(
+            category=category,
+            subcause=subcause,
+            failure_stage=failure_stage,
+            owner="ai_graph",
+            retryable=retryable,
+            safe_message=message,
+            evidence_refs=[f"failure:{subcause}"],
         )
     # Provider and data adapters expose stable typed causes.  Public diagnostics must
     # use those causes, never arbitrary provider/database text that can both misclassify

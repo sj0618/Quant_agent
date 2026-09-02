@@ -270,7 +270,7 @@ def test_isolated_staging_evidence_probe_requires_the_operator_token_and_project
     monkeypatch.setenv("AI_AUDIT_GATE_B_DEPLOYMENT_REVISION", "a" * 40)
     evidence = {
         "job_id": "job-1",
-        "execution_spec_version": "strategy-execution-spec.v1",
+        "execution_spec_version": "research-candidate-execution-spec.v3",
         "execution_spec_hash": "b" * 64,
         "analysis_result_id": "result-1",
         "manifest_hash": "c" * 64,
@@ -664,33 +664,82 @@ def test_ready_release_accepts_raw_natural_language_and_seals_it_server_side(
 ) -> None:
     monkeypatch.setenv("APP_ENV", "production")
     _configure_live_provider(monkeypatch)
-    client = TestClient(
-        create_app(
-            job_store_runtime=_persistent_job_store_runtime(),
-            analysis_runner=lambda _query, trace_id: _ready_envelope(trace_id),
-            readiness_migration_probe=lambda: True,
-            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
-        )
+    monkeypatch.setattr("ai_graph.api._production_runtime", lambda: True)
+    research_requests = []
+
+    class _ResearchClient:
+        def generate_json(self, request):
+            research_requests.append(request)
+            return {
+                "resolution_summary": "돈치안 돌파를 일봉 검증 규칙으로 정규화했습니다.",
+                "sources": [
+                    {
+                        "source_id": "source-1",
+                        "title": "Donchian definition",
+                        "url": "https://example.test/donchian",
+                        "claim": "돈치안 채널은 최근 가격 범위를 활용하는 추세 규칙입니다.",
+                    }
+                ],
+                "candidates": [
+                    {
+                        "candidate_id": "research-donchian-breakout-20",
+                        "title": "20일 돈치안 돌파",
+                        "hypothesis": "상단 돌파 뒤 추세 지속을 검증합니다.",
+                        "counter_hypothesis": "강한 하락 추세에서는 반등이 지연될 수 있습니다.",
+                        "entry_conditions": [{"left": "close", "operator": "gte", "right": "high", "window": 20, "aggregate": "max", "scale": 0.995}],
+                        "exit_conditions": [{"left": "close", "operator": "lte", "right": "sma20"}],
+                        "required_metrics": ["close", "high", "sma20"],
+                        "assumptions": ["다음 거래일 체결을 가정합니다."],
+                        "source_ids": ["source-1"],
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        "ai_graph.nodes.strategy_research.create_llm_client",
+        lambda **_kwargs: _ResearchClient(),
     )
+    import ai_graph.api as api_module
+
+    original_runner_builder = api_module._build_analysis_runner_with_audit
+    deferred_resolvers = []
+
+    def capture_runner_builder(*args, **kwargs):
+        deferred_resolvers.append(kwargs.get("rule_draft_resolver"))
+        return original_runner_builder(*args, **kwargs)
+
+    monkeypatch.setattr(api_module, "_build_analysis_runner_with_audit", capture_runner_builder)
+    app = create_app(
+        job_store_runtime=_persistent_job_store_runtime(),
+        analysis_runner=lambda _query, trace_id: _ready_envelope(trace_id),
+        readiness_migration_probe=lambda: True,
+        rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        indicator_catalog_resolver=lambda: ["close", "high", "sma20"],
+    )
+    app.state.strategy_parser_uses_llm = True
+    client = TestClient(app)
 
     response = client.post(
         ANALYSIS_JOBS_PATH,
-        json={"query": "RSI 30 이하 진입, RSI 70 이상 청산 전략"},
+        json={"query": "돈치안 채널 돌파 전략으로 검증해줘"},
     )
 
     assert response.status_code == 201
     job_id = response.json()["job_id"]
     persisted = _poll_job(client, job_id)
     assert persisted["result"]["status"] == "ready", persisted
-    # The browser supplies one human-readable query only. The server creates and
-    # consumes the short-lived parse nonce inside the durable admission path, so a
-    # stale client-side token cannot cause the 409 replay failure that this route
-    # replaced.
-    # The execution spec, not this text, is the authority for the backtest.  Keeping
-    # the original request gives the later AOAI Research node the user's actual
-    # strategy context while the signed contract still prevents it from changing the
+    # The browser supplies one human-readable query only. The server returns a durable
+    # job id before V3 research starts, so a slow research call cannot cause the old
+    # client-side parse-token handoff or its 409 replay failure.
+    # The sealed execution spec, not this text, is the authority for the backtest.
+    # Keeping the original request gives the later AOAI Research node the user's
+    # actual strategy context while the sealed contract still prevents it from changing
     # entry/exit rules.
-    assert persisted["query"] == "RSI 30 이하 진입, RSI 70 이상 청산 전략"
+    assert persisted["query"] == "돈치안 채널 돌파 전략으로 검증해줘"
+    assert len(deferred_resolvers) == 1
+    assert deferred_resolvers[0] is not None
+    assert len(research_requests) == 1
+    assert research_requests[0].task_type == "strategy_research_resolution"
 
 
 def test_core_execution_keeps_restart_reconciliation_for_prior_process_jobs(
@@ -1021,18 +1070,6 @@ def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monk
 
     assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in create_response.text
     assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in poll_response.text
-
-    # Out-of-scope assets are rejected before a job, audit, provider, or data-source
-    # path can start.  The former queued "rejected" job retained prohibited input.
-    rejected_response = client.post(ANALYSIS_JOBS_PATH, json={"query": "옵션 양매도 전략 만들어줘"})
-    assert rejected_response.status_code == 422
-    rejected_payload = rejected_response.json()
-    assert rejected_payload["kind"] == "unsupported_scope"
-    assert rejected_payload["reason_code"] == "unsupported_asset_family"
-    assert "job_id" not in rejected_payload
-    assert "trace_id" not in rejected_payload
-
-    assert MOCK_PROVIDER_CREDENTIAL_SENTINEL not in rejected_response.text
 
 def test_spec_strategy_parse_returns_a_signed_rule_review_without_creating_a_job(
     offline_test_environment: "OfflineTestEnvironment",

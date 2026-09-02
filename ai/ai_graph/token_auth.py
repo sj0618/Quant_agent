@@ -112,8 +112,8 @@ class PostgresAccountTokenResolver:
                 return None
             if self._record_usage:
                 # Only written on a cache miss, so a hot token costs one write per cache
-                # TTL rather than one per request. The preflight resolver below disables
-                # this bookkeeping so a refused request remains mutation-free.
+                # TTL rather than one per request. The read-only identity resolver
+                # below disables this bookkeeping until an analysis job is accepted.
                 try:
                     await conn.execute(
                         "UPDATE app.ai_account_token SET last_used_at = now() WHERE token_id = %s",
@@ -395,12 +395,12 @@ class RequireUserIdentityWithinQuota:
         return cached
 
 
-class RequirePreflightIdentityReadOnly:
+class RequireAuthenticatedIdentityReadOnly:
     """Authenticate a request without token-usage, cache, or quota mutation.
 
-    The protected analysis routes call :meth:`consume_quota_after_preflight` only after
-    the deterministic scope check accepts the request. A refusal therefore cannot spend
-    an account token allowance or trigger the normal token resolver's bookkeeping.
+    The protected analysis routes call :meth:`consume_quota_after_admission` only after
+    they create or find a durable job. A malformed or unavailable request therefore
+    cannot spend an account token allowance or trigger normal resolver bookkeeping.
     """
 
     def __init__(
@@ -426,17 +426,17 @@ class RequirePreflightIdentityReadOnly:
                 detail="Invalid or revoked API token",
             )
         # Request-local state is not persisted and lets the route charge only accepted
-        # bearer requests after the policy boundary.
-        request.state.preflight_account_token = resolved
+        # bearer requests after durable admission.
+        request.state.authenticated_account_token = resolved
         return resolved.user_id
 
-    async def consume_quota_after_preflight(
+    async def consume_quota_after_admission(
         self,
         request: Request,
         *,
         idempotency_key: str | None = None,
     ) -> None:
-        token = getattr(request.state, "preflight_account_token", None)
+        token = getattr(request.state, "authenticated_account_token", None)
         if not isinstance(token, ResolvedAccountToken):
             return
         quota = self._resolve_quota(request)
@@ -446,10 +446,10 @@ class RequirePreflightIdentityReadOnly:
     def _resolve_resolver(self, request: Request) -> AccountTokenResolver | None:
         if self._token_resolver is not None:
             return self._token_resolver
-        cached = getattr(request.app.state, "preflight_account_token_resolver", None)
+        cached = getattr(request.app.state, "read_only_account_token_resolver", None)
         if cached is None:
             cached = build_read_only_account_token_resolver_from_env()
-            request.app.state.preflight_account_token_resolver = cached
+            request.app.state.read_only_account_token_resolver = cached
         return cached
 
     def _resolve_quota(self, request: Request) -> AccountTokenQuota | None:
@@ -500,7 +500,7 @@ def build_account_token_resolver_from_env(
 def build_read_only_account_token_resolver_from_env(
     env: Mapping[str, str] | None = None,
 ) -> AccountTokenResolver | None:
-    """Build the preflight token resolver without cache or token-usage writes."""
+    """Build the read-only token resolver without cache or token-usage writes."""
 
     source = environ if env is None else env
     if not auth_enabled(source):

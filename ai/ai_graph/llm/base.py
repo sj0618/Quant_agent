@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -48,6 +48,17 @@ class LLMJsonRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_output_tokens: int | None = Field(default=None, ge=1)
     enable_web_search: bool = False
+    # Streaming is useful when the client can surface token/search progress.  Some
+    # Azure web-search deployments, however, buffer those events until the research
+    # tool has finished.  A request that needs a bounded structured research contract
+    # can opt into one ordinary Responses completion instead of mistaking that quiet
+    # but healthy provider work for a dead stream.
+    stream_response: bool = True
+    # Reasoning tokens share max_output_tokens with visible structured output.  Nodes
+    # that have a latency budget can set an explicit, model-supported effort instead
+    # of relying on a deployment default that may consume the whole result budget.
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = None
+    max_tool_calls: int | None = Field(default=None, ge=1)
     task_type: str | None = None
     prompt_template_name: str | None = None
     prompt_version: str | None = None

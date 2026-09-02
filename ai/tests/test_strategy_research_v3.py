@@ -88,6 +88,9 @@ def test_unknown_strategy_uses_web_research_then_seals_the_researched_conditions
     assert len(client.requests) == 1
     request = client.requests[0]
     assert request.enable_web_search is True
+    assert request.stream_response is False
+    assert request.reasoning_effort == "low"
+    assert request.max_tool_calls == 1
     assert request.task_type == "strategy_research_resolution"
     assert "Do not create Python, SQL" in request.system_prompt
 
@@ -101,6 +104,100 @@ def test_researcher_cannot_replace_an_unsupported_strategy_with_a_catalogue_rule
             available_metrics=["sma20"],
             llm_client=client,
         )
+
+
+def test_researcher_normalizes_provider_display_label_aliases_without_touching_conditions() -> None:
+    response = _donchian_response()
+    response["sources"][0]["source_name"] = response["sources"][0].pop("title")
+    response["candidates"][0]["strategy_name"] = response["candidates"][0].pop("title")
+
+    spec = research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=_ResearchClient(response),
+    )
+
+    assert spec.sources[0].title == "Donchian channel definition"
+    assert spec.candidates[0].title == "20일 돈치안 상단 돌파"
+    assert spec.candidates[0].entry_conditions[0].left == "close"
+
+
+def test_researcher_derives_only_display_titles_when_provider_omits_them() -> None:
+    response = _donchian_response()
+    response["sources"][0].pop("title")
+    response["candidates"][0].pop("title")
+
+    spec = research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=_ResearchClient(response),
+    )
+
+    assert spec.sources[0].title == "example.com"
+    assert spec.candidates[0].title == "돈치안 채널 돌파 전략으로 검증해줘 — 검증 후보"
+    assert spec.candidates[0].entry_conditions[0].left == "close"
+
+
+def test_researcher_normalizes_provider_only_identifiers_without_touching_conditions() -> None:
+    response = _donchian_response()
+    response["sources"][0]["source_id"] = "web-source-abc"
+    response["candidates"][0]["candidate_id"] = "donchian_breakout"
+    response["candidates"][0]["source_ids"] = ["web-source-abc"]
+
+    spec = research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=_ResearchClient(response),
+    )
+
+    assert spec.sources[0].source_id == "source-1"
+    assert spec.candidates[0].candidate_id == "research-candidate-1"
+    assert spec.candidates[0].source_ids == ["source-1"]
+    assert spec.candidates[0].entry_conditions[0].left == "close"
+
+
+def test_researcher_normalizes_unambiguous_rank_percentage_to_fraction() -> None:
+    response = _donchian_response()
+    response["candidates"][0]["entry_conditions"][0]["universe_rank_pct"] = 20
+
+    spec = research_strategy_execution_spec(
+        query="상위 20% 돈치안 돌파 종목을 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=_ResearchClient(response),
+    )
+
+    assert spec.candidates[0].entry_conditions[0].universe_rank_pct == 0.2
+
+
+def test_researcher_normalizes_market_relative_comparison_to_excess_return_threshold() -> None:
+    response = _donchian_response(required_metrics=["relative_strength_20d", "market_relative_strength_20d", "sma20"])
+    response["candidates"][0]["entry_conditions"] = [
+        {
+            "left": "relative_strength_20d",
+            "operator": "gt",
+            "right": "market_relative_strength_20d",
+            "universe_rank_pct": 20,
+        }
+    ]
+    response["candidates"][0]["exit_conditions"] = [
+        {
+            "left": "relative_strength_20d",
+            "operator": "lte",
+            "right": "market_relative_strength_20d",
+        }
+    ]
+
+    spec = research_strategy_execution_spec(
+        query="시장지수보다 최근 1개월 상대강도가 높은 주도주를 검증해줘",
+        available_metrics=["close", "sma20", "relative_strength_20d"],
+        llm_client=_ResearchClient(response),
+    )
+
+    candidate = spec.candidates[0]
+    assert candidate.entry_conditions[0].right == 0
+    assert candidate.entry_conditions[0].universe_rank_pct == 0.2
+    assert candidate.exit_conditions[0].right == 0
+    assert candidate.required_metrics == ["relative_strength_20d", "sma20"]
 
 
 def test_researcher_repairs_one_invalid_structured_candidate_then_seals_v3() -> None:

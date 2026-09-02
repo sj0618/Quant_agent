@@ -78,6 +78,10 @@ FailureSubcause = Literal[
     "aoai_http_4xx",
     "aoai_http_5xx",
     "aoai_http_error",
+    # The pre-backtest V3 research contract has its own typed terminal causes. They
+    # distinguish provider availability from a response that could not be compiled.
+    "strategy_research_provider_failure",
+    "strategy_research_contract_invalid",
     "parser_low_confidence",
     "source_conflict",
     "data_required",

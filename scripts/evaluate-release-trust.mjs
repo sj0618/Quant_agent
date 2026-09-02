@@ -50,10 +50,14 @@ export function createOfflineTestEnvironment(source = process.env) {
     delete environment[key];
   }
   for (const key of Object.keys(environment)) {
-    if (/^AI_LLM_[A-Z0-9_]+_(?:API_KEY|ENDPOINT|RESPONSES_URL|URL)$/u.test(key)) {
+    // Role-specific AOAI configuration can override the global provider settings.
+    // Remove the full role namespace in this offline gate instead of trying to keep a
+    // suffix allow-list in sync with provider additions.
+    if (key.startsWith("AI_LLM_") && key !== "AI_LLM_PROVIDER") {
       delete environment[key];
     }
   }
+  environment.AI_LLM_PROVIDER = "mock";
   // Backtest evaluations persist candidate outcomes. A stale local failure must not
   // make this release gate fail after its dependency is restored, nor may a caller
   // choose a cache populated by a different revision. The OS temp directory is
@@ -179,7 +183,7 @@ export function buildReleaseTrustChecks({
         "ai/tests/test_staging_pipeline_gate.py",
         "ai/tests/test_llm_aoai.py",
         "ai/tests/test_live_provider_fail_closed.py",
-        "ai/tests/test_research_request_preflight.py",
+        "ai/tests/test_strategy_research_v3.py",
         "ai/tests/test_research_contract.py",
         "ai/tests/test_research_contract_api.py",
       ],
