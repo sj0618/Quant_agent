@@ -586,39 +586,6 @@ export interface DailyDigestReport {
   footer: string[];
 }
 
-export interface StrategyReportSummary {
-  id: string;
-  name: string;
-  description: string;
-  timeframe: string;
-  entrySummary: string;
-  exitSummary: string;
-  riskSummary: string;
-  latestSentAt: string;
-  latestReportDate: string;
-  latestStatus: ReportDeliveryStatus;
-  latestEmailReportId: string;
-  recommendationScore: string;
-  signals: Record<SignalType, number>;
-  summary: string;
-  tags: string[];
-}
-
-export interface StrategyReportDetail {
-  strategy: StrategyReportSummary;
-  emailReports: ReportDetail[];
-}
-
-export interface EmailDigestHistoryEntry {
-  id: string;
-  reportId?: string;
-  strategyId?: string;
-  strategyName: string;
-  reportDate: string;
-  sentAt: string;
-  status: ReportDeliveryStatus;
-  title: string;
-}
 
 export interface ReportDetail extends ReportSummary {
   recipient: string | null;
