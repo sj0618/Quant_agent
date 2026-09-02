@@ -5,8 +5,8 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
 from psycopg import OperationalError
+from pydantic import ValidationError
 
 if TYPE_CHECKING:
     from offline_test_environment import OfflineTestEnvironment
@@ -23,9 +23,9 @@ from ai_graph.api import (
     HEALTH_PATH,
     OPENAPI_URL,
     READINESS_PATH,
-    ParseStrategyRequest,
     SPEC_STRATEGY_PARSE_PATH,
     STRATEGY_DESCRIPTIONS_PATH,
+    ParseStrategyRequest,
     create_app,
 )
 from ai_graph.audit import NoOpAuditSink, RecordingAuditSink, begin_model_call, finish_model_call
