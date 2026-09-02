@@ -767,9 +767,6 @@ class PostgresPipelineDataSource:
             "security_type": "보통주",
         }
 
-    def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
-        return self._screen_with_relaxation(conn, query)[0]
-
     def _screen_via_llm(
         self, conn: Any, query: str
     ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:

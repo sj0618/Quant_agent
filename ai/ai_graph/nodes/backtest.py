@@ -3203,10 +3203,7 @@ def _split_sharpes(
 
 
 def _compound_returns(daily_returns: Sequence[float]) -> float:
-    equity = 1.0
-    for daily_return in daily_returns:
-        equity *= 1.0 + daily_return
-    return equity - 1.0
+    return math.prod((1.0 + daily_return for daily_return in daily_returns), start=1.0) - 1.0
 
 
 def _walk_forward_split_policy(price_rows: Sequence[Mapping[str, Any]]) -> _SplitPolicy:
