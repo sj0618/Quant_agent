@@ -3908,7 +3908,7 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
 
 
 # Public performance helpers are sourced from quant_performance for a stable behavior contract.
-from ai_graph.quant_performance import (  # noqa: F401
+from ai_graph.quant_performance import (  # noqa: E402, F401
     _metric_detail,
     build_public_backtest_performance,
     project_public_performance,
