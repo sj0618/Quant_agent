@@ -144,8 +144,11 @@ class FakeScreeningConnection:
                 }
                 for row in self.frame_rows
             ])
-        if "FROM mart.common_stock_universe_asof" in query and "SELECT DISTINCT symbol" in query:
-            return FakeResult(rows=[{"symbol": row["ticker"]} for row in self.frame_rows])
+        if "WITH window_members AS" in query and "SELECT DISTINCT sm.symbol" in query:
+            return FakeResult(rows=[
+                {"symbol": row["ticker"], "window_member_count": len(self.frame_rows)}
+                for row in self.frame_rows
+            ])
         if "mart.dart_financial_asof" in query:
             return FakeResult(rows=[])
         if "MKTCAP" in query:
@@ -164,11 +167,6 @@ class FakeScreeningConnection:
                 for row in self.frame_rows
             ]
             return FakeResult(rows=rows)
-        if "WITH bounds AS" in query:
-            # The backtest universe, ranked by traded value as of the backtest start.
-            return FakeResult(rows=[
-                {"symbol": row["ticker"], "as_of": AS_OF} for row in self.frame_rows
-            ])
         if "FROM feature.kis_adjusted_ohlcv_daily" in query and "adj_open" in query:
             return FakeResult(rows=[
                 {
@@ -706,7 +704,7 @@ def test_postgres_data_source_loads_common_server_pipeline_inputs() -> None:
     assert bundle.metadata["price_source"] == "feature.kis_adjusted_ohlcv_daily"
     assert "feature.ta_momentum_ticker_daily" in bundle.metadata["indicator_sources"]
     assert bundle.metadata["l4_evidence_source"] == "raw.analyst_report_summary"
-    assert bundle.metadata["backtest_window_policy_id"] == "krx_pit_common_stock_5y_kst_settled_session_v2"
+    assert bundle.metadata["backtest_window_policy_id"] == "krx_pit_common_stock_1y_kst_settled_session_v3"
     assert any(row.get("rsi", 100) <= RSI_OVERSOLD_THRESHOLD for row in bundle.price_rows)
 
 
@@ -1120,21 +1118,31 @@ def test_backtest_universe_is_lifecycle_pit_bounded_to_fixed_window() -> None:
 
     assert universe == ["000660"]
     assert descriptor == {
-        "selection": "lifecycle_pit_common_stock_window",
+        "selection": "lifecycle_pit_common_stock_window_top_traded",
         "as_of_start": "2021-08-12",
         "as_of_end": "2026-08-11",
         "session_count": 1_229,
         "member_count": 1,
-        "source": "mart.common_stock_universe_asof",
+        "window_member_count": 1,
+        "excluded_member_count": 0,
+        "ranking_metric": "avg_traded_value_adj_close_x_adj_volume",
+        "ranking_sessions": 60,
+        "ranking_window_end": "2021-08-12",
+        "max_tickers": 100,
+        "source": "core.symbol_listing_history",
         "listing_provenance": "core.symbol_listing_history",
+        "delisting_policy": "official-event-then-final-close-v1",
+        "delisted_during_window": "kept_until_final_session",
         "security_type": "보통주",
     }
 
     universe_query = next(
-        query for query, _ in conn.calls if "FROM mart.common_stock_universe_asof" in query
+        query for query, _ in conn.calls if "WITH window_members AS" in query
     )
     assert "MKTCAP" not in universe_query
-    assert "symbol_master" not in universe_query
+    # symbol_master is joined only for the lifecycle bound. A present-day listing filter
+    # there would delete every delisted name from history - that is the bias, not a fix.
+    assert "sm.listing_status" not in universe_query
     assert "kis_adjusted_feature_frame_asof" not in universe_query
 
 
@@ -1148,10 +1156,11 @@ def test_backtest_universe_uses_explicit_as_of_window_not_current_date() -> None
 
     query, params = next(
         (query, params) for query, params in conn.calls
-        if "FROM mart.common_stock_universe_asof" in query
+        if "WITH window_members AS" in query
     )
     assert "CURRENT_DATE" not in query
-    assert params == [window["start"], window["end"]]
+    assert params["window_start"] == window["start"]
+    assert params["window_end"] == window["end"]
 
 
 def test_backtest_universe_does_not_expand_with_current_recommendations() -> None:
@@ -1196,7 +1205,7 @@ def test_backtest_universe_excludes_current_screening_candidates() -> None:
         {"start": date(2021, 8, 12), "end": date(2026, 8, 11), "session_count": 1_229},
     )
     assert universe == ["000660"]
-    assert descriptor["selection"] == "lifecycle_pit_common_stock_window"
+    assert descriptor["selection"] == "lifecycle_pit_common_stock_window_top_traded"
 
     from ai_graph.data_sources.db import _backtest_ticker_pool
 
@@ -1265,8 +1274,8 @@ def test_load_never_trades_a_current_screening_candidate() -> None:
 
         def _fetch_backtest_universe(self, _conn, _window):
             return ["000660"], {
-                "selection": "lifecycle_pit_common_stock_window",
-                "source": "mart.common_stock_universe_asof",
+                "selection": "lifecycle_pit_common_stock_window_top_traded",
+                "source": "core.symbol_listing_history",
             }
 
         def _fetch_symbol_info_map(self, _conn, tickers):
@@ -1327,8 +1336,8 @@ def _l4_source(universe, candidates, captured):
 
         def _fetch_backtest_universe(self, _conn, _window):
             return list(universe), {
-                "selection": "lifecycle_pit_common_stock_window",
-                "source": "mart.common_stock_universe_asof",
+                "selection": "lifecycle_pit_common_stock_window_top_traded",
+                "source": "core.symbol_listing_history",
             }
 
         def _fetch_symbol_info_map(self, _conn, tickers):
@@ -1511,9 +1520,10 @@ def test_fixed_window_uses_kst_calendar_sessions_and_manifest_values() -> None:
     class Connection:
         def __init__(self) -> None:
             self.query = ""
+            self.params: object = None
 
-        def execute(self, query: str) -> FakeResult:
-            self.query = query
+        def execute(self, query: str, params: object = None) -> FakeResult:
+            self.query, self.params = query, params
             return FakeResult(row={
                 "session_start": date(2021, 8, 12),
                 "session_end": date(2026, 8, 11),
@@ -1526,7 +1536,9 @@ def test_fixed_window_uses_kst_calendar_sessions_and_manifest_values() -> None:
 
     assert window == {"start": date(2021, 8, 12), "end": date(2026, 8, 11), "session_count": 1_229}
     assert "Asia/Seoul" in connection.query
-    assert "INTERVAL '5 years'" in connection.query
+    # The length is bound, never interpolated, and defaults to one year.
+    assert "make_interval(years => %s)" in connection.query
+    assert connection.params == [1]
     assert "feature.kis_adjusted_ohlcv_daily" not in connection.query
 
 
@@ -1536,9 +1548,10 @@ def test_window_ends_on_the_last_closed_session_not_todays() -> None:
     class Connection:
         def __init__(self) -> None:
             self.query = ""
+            self.params: object = None
 
-        def execute(self, query: str) -> FakeResult:
-            self.query = query
+        def execute(self, query: str, params: object = None) -> FakeResult:
+            self.query, self.params = query, params
             return FakeResult(row={
                 "session_start": date(2021, 8, 12),
                 "session_end": date(2026, 8, 11),
@@ -1572,11 +1585,12 @@ def test_future_append_cannot_expand_the_bounded_pit_universe() -> None:
     universe, descriptor = source._fetch_backtest_universe(connection, window)
     assert universe == ["000001", "000002"]
     assert descriptor["member_count"] == 2
-    assert "mart.common_stock_universe_asof" in connection.query
+    assert "core.symbol_listing_history" in connection.query
     assert "MKTCAP" not in connection.query
-    assert "symbol_master" not in connection.query
+    assert "sm.listing_status" not in connection.query
     assert "kis_adjusted_feature_frame_asof" not in connection.query
-    assert connection.params == [window["start"], window["end"]]
+    assert connection.params["window_start"] == window["start"]
+    assert connection.params["window_end"] == window["end"]
 
 
 def test_date_only_dart_filing_is_not_visible_until_next_session() -> None:

@@ -1223,17 +1223,30 @@ def test_walk_forward_completeness_uses_full_engine_curve_not_public_sample() ->
     assert set(returns) == targets
 
 
-def test_walk_forward_policy_fails_closed_at_23_folds_and_479_sessions() -> None:
-    twenty_three_folds = _monthly_sessions(39, sessions_per_month=20)
-    four_seventy_nine_sessions = _monthly_sessions(40, sessions_per_month=20)[:-1]
+def test_walk_forward_policy_fails_closed_below_its_own_window_minimums() -> None:
+    """Each tier still fails closed - the minimums moved, they did not disappear.
 
-    assert backtest_node._walk_forward_sample(twenty_three_folds).valid_fold_count == 23
+    41+ months keeps the five-year contract, so a 25-fold sample with only 475 unique
+    evaluation sessions is short of the 480 it has always required.
+    """
+
+    four_seventy_five_sessions = _monthly_sessions(41, sessions_per_month=19)
+    five_folds = _monthly_sessions(21, sessions_per_month=20)
+    two_folds = _monthly_sessions(10, sessions_per_month=20)
+
+    assert backtest_node._walk_forward_sample(four_seventy_five_sessions).valid_fold_count == 25
     assert (
-        backtest_node._walk_forward_sample(twenty_three_folds).status
+        backtest_node._walk_forward_sample(four_seventy_five_sessions).status
         == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
     )
+    assert backtest_node._walk_forward_sample(five_folds).valid_fold_count == 5
     assert (
-        backtest_node._walk_forward_sample(four_seventy_nine_sessions).status
+        backtest_node._walk_forward_sample(five_folds).status
+        == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
+    )
+    assert backtest_node._walk_forward_sample(two_folds).valid_fold_count == 2
+    assert (
+        backtest_node._walk_forward_sample(two_folds).status
         == backtest_node.INSUFFICIENT_WALK_FORWARD_SAMPLE
     )
 

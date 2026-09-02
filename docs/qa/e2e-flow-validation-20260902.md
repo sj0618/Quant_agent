@@ -77,6 +77,11 @@ DE migration 12, `compileall`·ruff(CI 선택 규칙) 통과, FE `npm run test`(
   **AI 872 passed/11 skipped(로컬 Windows 실패 1건도 Linux에서는 통과)**, **backend unit 408 passed**, FE `npm ci`+`npm run test` 통과.
   주의: 서버 로그인 셸의 `~/.bashrc`가 운영 AUTH_/EMAIL_/AI_ 값을 export하므로 backend 설정 테스트는 반드시 `env -i`로 돌려야 한다(그렇지 않으면 27건이 환경 때문에 실패).
 - PR #86 CI(Python checks, Frontend checks, Offline release-trust gate, ai-logging) 모두 통과.
+- qt_db 통합 테스트(opt-in, node3, clean env + 운영 DSN): track-c 3 passed, track4(email outbox → 워커 → 가짜 provider → SENT/재시도/취소) 1 passed.
+- **배포**: PR #86 머지 → `Deploy to SSH Server` 성공(run 33639267553). node3 `/ai-api/api-status.deployment_revision = 608b2f1`(머지 커밋), job_store persistent,
+  `/readiness`·`/ai-api/readiness` ready, 공개 라우트 `/`·`/terms`·`/me/email-reports/{id}` 200, `/trust`·미지 경로 404,
+  배포 로그에 `email worker disabled (EMAIL_DELIVERY_WORKER_ENABLED != true)`(게이트 정상 동작, 운영 env 미설정이라 워커 미기동).
+- 배포 사이트 smoke(실제 AOAI + qt_db, 합성 사용자): 결과는 아래 "배포 사이트 smoke" 절.
 
 ## 6. 남은 문제 · 외부 설정 · 수동 확인
 
@@ -92,3 +97,27 @@ DE migration 12, `compileall`·ruff(CI 선택 규칙) 통과, FE `npm run test`(
    `EMAIL_PROVIDER=resend` 사용 불가; 두 실행 스펙 클래스 계층 통합은 리팩터링 과제; 서버 로그가 배포마다 truncate됨;
    런타임 env가 `~/.bashrc`에 있어 비로그인 셸에서는 보이지 않음.
 5. 배포는 PR → main 머지로 자동 실행된다. 이 변경은 production 쓰기 경로를 다시 열므로 머지 전 사람의 승인이 필요하다.
+
+## 7. 2차 작업: 실행 시간 1분 목표 (2026-09-02 저녁)
+
+배포 후 실사용 job(job_490c3cc69941)이 Data 노드 **875초·RSS 21GB** 뒤 Backtest 노드에서 `raw_execution_unavailable`로 실패했다. 프로파일(node3 실측):
+- Data 노드는 PIT 종목 1,717개 × **5년**(1,222세션) × TA 4패밀리 × DART를 dict 190만 개(≈10KB/행)로 적재했다. 12개월만 돌려도 115초/4.1GB.
+- 스크리닝은 이미 DB 단일 날짜 조회(9초)라 가설 1은 사실상 구현돼 있었고, 지표도 `feature.ta_*`에서 읽는다(가설 3). 실제 지렛대는 **창 길이(가설 2)와 종목 수**였다.
+- `mart.common_stock_universe_asof`의 기반인 `core.symbol_security_type_history`가 2026-08-11부터만 있어 과거 날짜엔 멤버가 0 → "PIT 유니버스"가 사실상 오늘 상장 종목이었다(생존자 편향 존재).
+- 워크포워드 검증은 24폴드·480세션(≈41개월)을 요구해 1년 창에서는 폴드 0개로 실패한다.
+
+변경:
+- `AI_BACKTEST_LOOKBACK_YEARS`(기본 1, 최대 3), `AI_BACKTEST_UNIVERSE_MAX_TICKERS`(기본 200). 유니버스는 상장이력+보통주 분류가 **창과 겹치는** 종목(창 중간 상장폐지 포함) 중 **창 시작 직전 60세션 거래대금 상위 N**을 DB에서 랭킹. 현재 신호 스크린은 `listing_status='listed'`만.
+- raw 시세 없는 행은 INNER JOIN으로 적재하지 않음(백테스트 크래시 원인 제거). V1 명시 규칙은 필요한 지표 패밀리만 읽고 DART는 건너뜀.
+- 워크포워드 정책을 창 길이에 비례(≤15개월: 1/6/1/1, 최소 3폴드·60세션; 16~40개월: 1/12/3/1, `max(6, months-17)`폴드; ≥41개월: 기존). 후보 타임아웃 8초, 노드 예산 25초, 자기개선 최대 1라운드, 폴드 경계에서 취소·데드라인 검사.
+- AOAI 클라이언트 기본 timeout 120→45초, 재시도 2→1(호출당 최악 90초 → 운영 env로 더 낮출 수 있음: `AI_AOAI_TIMEOUT_SECONDS`, `AI_AOAI_MAX_RETRIES`).
+- 실측(node3 DB, 1년·상위 200): 유니버스 2.4~2.9초, 가격(raw inner join) 1.1초(48,512행), momentum 지표 0.9초(41,789행). 로컬 백테스트 노드 200종목×250세션 3후보 ≈12초(서버 ≈6초). LLM은 Data 이후 순차 2회(리서치 컴파일, 리포트 작성) ≈15초.
+
+### 7.1 node3 실측(실제 웨어하우스, LLM은 mock) — 최종
+| 버전 | Data | Backtest | 합계 | 비고 |
+|---|---|---|---|---|
+| 배포 608b2f1(5년·전체 1,717종) | 875s | 실패(56s) | 실패 | RSS 21GB |
+| 1년·상위 200 | 32.1s | 25.1s | 58.1s | RSS 577MB, 오늘자 스크린 9s 직렬 |
+| **1년·상위 100 + 스크린 병렬** | **18.9s**(스크린 9.3s 병렬 포함) | **11.9s** | **31.3s** | 가격 24,250행 |
+
+실제 AOAI 호출(리서치 컴파일 + 리포트 작성 ≈ 15s)을 더하면 **약 45~50초**로 1분 목표 안. 운영 env로 `AI_AOAI_TIMEOUT_SECONDS`/`AI_AOAI_MAX_RETRIES`를 더 조이면 최악 케이스도 줄어든다.
