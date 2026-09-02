@@ -69,8 +69,8 @@ def offline_test_environment(
     import ai_graph.graph as graph_module
     import ai_graph.llm.aoai as aoai_module
 
-    def offline_loader(query: str, trace_id: str) -> Any:
-        return data_source_module.load_pipeline_data_from_env(query, trace_id)
+    def offline_loader(query: str, trace_id: str, **kwargs: Any) -> Any:
+        return data_source_module.load_pipeline_data_from_env(query, trace_id, **kwargs)
 
     monkeypatch.setattr(graph_module, "load_pipeline_data_from_env", offline_loader)
     monkeypatch.setattr(

@@ -755,11 +755,19 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
     skip_current_screen = exploration or isinstance(
         sealed_execution_spec, ResearchCandidateExecutionSpecV3
     )
-    pipeline_data = (
-        load_pipeline_data_from_env(query, state["trace_id"], screen_current=False)
-        if skip_current_screen
-        else load_pipeline_data_from_env(query, state["trace_id"])
-    )
+    if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3):
+        required_metrics = _sealed_v3_condition_metrics(sealed_execution_spec)
+        pipeline_data = load_pipeline_data_from_env(
+            query,
+            state["trace_id"],
+            screen_current=False,
+            required_metrics=tuple(sorted(required_metrics)),
+            requires_financials=bool(required_metrics & _FUNDAMENTAL_CONDITION_METRICS),
+        )
+    elif skip_current_screen:
+        pipeline_data = load_pipeline_data_from_env(query, state["trace_id"], screen_current=False)
+    else:
+        pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
     if is_release_profile():
         raw_required_tickers = pipeline_data.metadata.get("tickers", ())
         required_tickers = (
@@ -835,6 +843,33 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
     return output
 
 
+_FUNDAMENTAL_CONDITION_METRICS = frozenset(
+    {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"}
+)
+
+
+def _sealed_v3_condition_metrics(spec: ResearchCandidateExecutionSpecV3) -> set[str]:
+    """Return every metric the sealed V3 AST actually evaluates.
+
+    The model's ``required_metrics`` summary is useful documentation, but it must not
+    be allowed to omit an operand that the compiler will later use.  The data loader
+    receives this concrete set so a relative-strength rule does not load unrelated
+    RSI, volatility, volume, and DART histories before backtesting.
+    """
+
+    metrics = {
+        canonical_metric(metric)
+        for candidate in spec.candidates
+        for metric in candidate.required_metrics
+    }
+    for candidate in spec.candidates:
+        for condition in [*candidate.entry_conditions, *candidate.exit_conditions]:
+            metrics.add(canonical_metric(condition.left))
+            if isinstance(condition.right, str):
+                metrics.add(canonical_metric(condition.right))
+    return metrics
+
+
 def _data_requirements_from_sealed_spec(
     raw_spec: Mapping[str, Any] | ExecutionSpecV1OrV2 | None,
     *,
@@ -852,20 +887,7 @@ def _data_requirements_from_sealed_spec(
     spec = validate_execution_spec(raw_spec)
     if not isinstance(spec, ResearchCandidateExecutionSpecV3):
         return fallback
-    metrics = {
-        canonical_metric(metric)
-        for candidate in spec.candidates
-        for metric in candidate.required_metrics
-    }
-    # ``required_metrics`` is an explanatory declaration from the researcher, not an
-    # authority to omit an operand.  Derive the load plan from the actual sealed AST
-    # as well, so a malformed/under-declared answer cannot make the loader prepare a
-    # different feature set from the one the compiler will execute.
-    for candidate in spec.candidates:
-        for condition in [*candidate.entry_conditions, *candidate.exit_conditions]:
-            metrics.add(canonical_metric(condition.left))
-            if isinstance(condition.right, str):
-                metrics.add(canonical_metric(condition.right))
+    metrics = _sealed_v3_condition_metrics(spec)
     requirements: list[DataRequirement] = []
     technical_metrics = metrics - {
         "roe",
@@ -887,7 +909,7 @@ def _data_requirements_from_sealed_spec(
                 evidence_ref="data-plan:v3-ohlcv-ta",
             )
         )
-    if metrics & {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"}:
+    if metrics & _FUNDAMENTAL_CONDITION_METRICS:
         requirements.append(
             DataRequirement(
                 family="fundamentals",

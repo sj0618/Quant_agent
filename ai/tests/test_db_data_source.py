@@ -28,6 +28,7 @@ from ai_graph.data_sources.db import (
     _prev_rsi_sql,
     _relative_strength,
     _screening_matcher,
+    indicator_families_for_metrics,
     load_pipeline_data_from_env,
     classify_research_runtime_failure,
     research_runtime_facts_from_bundle,
@@ -1591,6 +1592,15 @@ def test_raw_source_missing_has_reason_coded_no_fill_capability() -> None:
     assert capabilities["reason_code"] == "raw_ohlcv_source_missing_or_uncovered"
 
 
+def test_sealed_price_path_plan_does_not_force_unrelated_indicator_families() -> None:
+    """Relative strength is derived from PIT OHLCV, not an RSI fallback table."""
+
+    assert indicator_families_for_metrics(
+        ["relative_strength_20d", "relative_strength_60d"], include_default=False
+    ) == ()
+    assert indicator_families_for_metrics(["sma20"], include_default=False) == ("trend",)
+
+
 def test_price_loader_projects_raw_notional_without_adjusted_fill() -> None:
     class Connection:
         def __init__(self) -> None:
@@ -1616,9 +1626,17 @@ def test_price_loader_projects_raw_notional_without_adjusted_fill() -> None:
 
     source = PostgresPipelineDataSource(DataSourceConfig(database_dsn="postgresql://example"))
     connection = Connection()
+    dart_reads: list[list[str]] = []
+
+    def _unexpected_dart_read(_conn, tickers):
+        dart_reads.append(list(tickers))
+        return {}
+
+    source._fetch_financial_timeline = _unexpected_dart_read  # type: ignore[method-assign]
     rows, _ = source._fetch_price_rows(
         connection, ["000660"], {"000660": {}}, "RSI",
         {"start": AS_OF, "end": AS_OF, "session_count": 1}, (),
+        requires_financials=False,
     )
 
     assert rows[0]["raw_close"] == 113.0
@@ -1626,6 +1644,7 @@ def test_price_loader_projects_raw_notional_without_adjusted_fill() -> None:
     assert "NULL::numeric AS raw_notional" in connection.price_sql
     assert "JOIN core.symbol_master sm" in connection.price_sql
     assert "JOIN mart.common_stock_universe_asof" not in connection.price_sql
+    assert dart_reads == []
 
 
 def test_raw_capability_requires_every_execution_row_not_any_row() -> None:
