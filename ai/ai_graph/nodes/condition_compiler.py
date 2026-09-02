@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from typing import Any
 
 from ai_graph.schemas import Condition, ConditionOperator
 

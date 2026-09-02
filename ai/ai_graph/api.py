@@ -83,6 +83,7 @@ from ai_graph.jobs import (
     run_job_sync,
 )
 from ai_graph.llm.role_calls import generate_strategy_description, research_screening_terms
+from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.quant_performance import sanitize_public_performance
 from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.research_contract import (
@@ -109,7 +110,6 @@ from ai_graph.research_eligibility import (
     ResearchRuntimeFacts,
     evaluate_research_eligibility,
 )
-from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.schemas import (
     SCHEMA_VERSION,
     APIEnvelope,
