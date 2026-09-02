@@ -157,8 +157,15 @@ async def _check_redis_master(settings: Any) -> dict[str, object]:
         raise ConfigurationError("Redis readiness check failed")
     client = redis_asyncio.from_url(settings.redis_url_value, decode_responses=True)
     try:
-        await client.ping()
-        replication = await client.info("replication")
+        try:
+            await client.ping()
+            replication = await client.info("replication")
+        except ConfigurationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an unreachable Redis is a config problem, not a crash.
+            # Without this the operator saw a raw redis traceback (with the host in it)
+            # instead of the sanitized readiness message every other failure uses.
+            raise ConfigurationError("Redis readiness check failed") from exc
         role = str(replication.get("role") or "").strip().lower()
         database = int(client.connection_pool.connection_kwargs.get("db") or 0)
         if role != "master" or database != 11:

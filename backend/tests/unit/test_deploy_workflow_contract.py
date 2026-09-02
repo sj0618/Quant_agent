@@ -171,6 +171,24 @@ def test_every_readiness_gate_invocation_selects_a_profile():
     assert "$APP_DIR/scripts/readiness-semantic-gate.mjs" not in health
 
 
+def test_email_worker_start_is_gated_and_points_at_the_ai_venv():
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "print(str(load_settings().email_delivery_worker_enabled).lower())" in workflow
+    assert 'if [ "$email_worker_enabled" = "true" ]; then' in workflow
+    assert "WARNING: email worker check failed" in workflow
+    assert '"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start' in workflow
+    assert '"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" check' in workflow
+    assert '"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop' in workflow
+    assert 'QUANTAGENT_BACKEND_PYTHON="$APP_DIR/ai/.venv/bin/python"' in workflow
+    assert "email worker disabled (EMAIL_DELIVERY_WORKER_ENABLED != true)" in workflow
+
+    start_idx = workflow.index('"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start')
+    ai_ready_idx = workflow.index('"deployed-ai-api-readiness" ai')
+    fe_wait_idx = workflow.index('wait_for_url "Frontend gateway"')
+    assert ai_ready_idx < start_idx < fe_wait_idx
+
+
 def test_public_ai_readiness_smoke_uses_the_ai_dependency_set():
     smoke = SMOKE_WORKFLOW.read_text(encoding="utf-8")
 

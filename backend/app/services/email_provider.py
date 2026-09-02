@@ -172,6 +172,9 @@ class BrevoEmailProvider:
         if message.correlation_id:
             headers["X-QuantAgent-Correlation-Id"] = message.correlation_id
         headers["X-QuantAgent-Template"] = f"{message.template_name}/{message.template_version}"
+        # Brevo sandbox mode is an HTTP request header on the API call, not a custom message header.
+        if provider_name == BREVO_PROVIDER_NAME and self.settings.email_brevo_sandbox_mode:
+            headers[BREVO_SANDBOX_HEADER] = BREVO_SANDBOX_VALUE
         return headers
 
     def _request_payload(self, message: EmailDeliveryMessage, *, provider_name: str) -> dict[str, Any]:
@@ -181,8 +184,6 @@ class BrevoEmailProvider:
         if message.correlation_id:
             headers["X-QuantAgent-Correlation-Id"] = message.correlation_id
         if provider_name == BREVO_PROVIDER_NAME:
-            if self.settings.email_brevo_sandbox_mode:
-                headers[BREVO_SANDBOX_HEADER] = BREVO_SANDBOX_VALUE
             return {
                 "sender": {
                     "name": self.settings.email_from_name,

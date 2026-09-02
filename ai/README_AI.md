@@ -235,3 +235,33 @@ PY
 | 실제 market data adapter와 백테스트 엔진 연결 | `AI_DATABASE_DSN` 설정 시 KIS 수정주가/TA feature를 읽어 `backtest_module` 엔진 입력으로 사용 | 로컬 fixture·매핑·configured-DB fail-closed 테스트 통과. 공용 DB live 성공 검증은 DSN 필요 |
 | AOAI `LLMClient` 구현과 prompt/schema contract test | `ai_graph/llm` provider interface, mock client, AOAI Responses thin client, env factory, backtest-code prompt schema | `httpx.MockTransport` unit test와 prompt/schema fallback test 통과. live AOAI는 `AI_AOAI_LIVE_TEST=1` opt-in |
 | FE와 envelope field freeze 후 contract test 공유 | `AnalysisJob`, `APIEnvelope`, report projection, OpenAPI route/component contract tests | `tests/contracts/*` 통과 |
+
+## 2026-09-02 E2E 검증에서 확인한 사실 (자연어 입력 → 리포트 → 이메일)
+
+### 운영 raw-query 경로가 1초 만에 실패하던 원인
+- 배포 FE는 `POST /analysis-jobs`에 `{"query": ...}`만 보낸다. production에서는 admission 시점이 아니라
+  job 안에서 `research_contract.build_rule_draft`가 실행 스펙을 봉인하고(`api.py` `_build_analysis_runner_with_audit`),
+  그 결과를 `graph.run_analysis(execution_spec=...)`에 넘긴다.
+- `ai_graph.research_contract`와 `ai_graph.schemas`는 **같은 JSON 모양의 V1/V2 실행 스펙 클래스를 각자 정의**한다
+  (`research_contract.CanonicalRuleV1` = 그 모듈의 `StrategyExecutionSpecV1`, 두 모듈이 각각 `ExecutionSpecV1OrV2` union을 가짐).
+  봉인된 `CanonicalRuleV1` 인스턴스를 `schemas.validate_execution_spec`의 TypeAdapter에 넣으면 pydantic이 외래 클래스로
+  보고 `model_type` ValidationError를 내고, `jobs.classify_failure`가 이를 `contract_shape_error`로 분류했다.
+  서버 `app.ai_analysis_job` 20건 중 9건이 이 경로로 노드 하나 실행되지 않고 실패했다(예: "RSI 30 이하일때 매수하고 70 이상일때 매도").
+- 고친 방법: `schemas.validate_execution_spec`은 자기 클래스가 아닌 BaseModel을 `model_dump(mode="json")`으로 한 번 돌려 검증하고,
+  runner도 dict로 넘긴다. 회귀 테스트는 `tests/test_raw_query_job_path.py`. **규칙: 두 모듈 경계는 객체가 아니라 JSON dict로 건넌다.**
+  두 클래스 계층을 하나로 합치는 리팩터링은 범위 밖으로 남겨 두었다.
+
+### 함께 바뀐 동작
+- job 안 파싱이 실행 불가(clarification_required / unsupported_conditions / 후보 없음)이면 job은 실패가 아니라
+  `result.status == need_clarification`으로 **완료**된다(question, options 3개, candidate_cards 3개). `debug_ref`는 `clarification:<trace_id>`.
+  provider/schema 자체 오류는 여전히 `StrategyResearchError`로 실패한다.
+- `CreateAnalysisJobRequest.query`는 공백만 있으면 422, 최대 2000자. `/api/strategies/parse`의 `query`/`natural_language`도 2000자.
+- 실패한 job의 `stages[]`는 실제로 멈춘 단계를 `failed`로 표시한다(이전엔 항상 `finalizing`만 실패로 표시).
+- `AI_ANALYSIS_QUEUE_WAIT_SECONDS` 기본값 600 → 1860 (job deadline 1800보다 길어야 한다는 주석대로).
+
+### 로컬 재현 방법
+```bash
+AUTH_ENABLED=0 AI_LLM_PROVIDER=mock AI_JOB_STORE=memory AI_AUDIT_SINK=noop \
+  python -m pytest -q ai/tests/test_raw_query_job_path.py
+```
+`AI_LLM_PROVIDER=mock`이라도 명시적 RSI 규칙은 결정론 파서를 타므로 운영과 같은 코드 경로가 실행된다.

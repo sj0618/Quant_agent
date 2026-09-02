@@ -80,7 +80,10 @@ export function createProductionGateway({ target = "http://127.0.0.1:18001" } = 
 
     const upstream = requestUpstream(
       upstreamUrl,
-      { method: request.method, headers, timeout: 15_000 },
+      // The AI analysis SSE stream keepalive-pings every 15s (ai/ai_graph/api.py
+      // ANALYSIS_EVENT_KEEPALIVE_SECONDS); a 15s gateway timeout races that keepalive and
+      // can drop a still-live stream, so this must stay comfortably above it.
+      { method: request.method, headers, timeout: 65_000 },
       (upstreamResponse) => {
         response.writeHead(
           upstreamResponse.statusCode ?? 502,

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { AsyncState } from "../components/common/AsyncState";
 import { Tabs, type TabItem } from "../components/common/Tabs";
 import { AppLayout } from "../components/layout/AppLayout";
+import { BackendApiError } from "../api/backendClient";
 import {
   clearLatestAnalysisJob,
   completeAnalysisRun,
@@ -433,6 +434,13 @@ export function AppPage() {
         const run = await createAnalysisRun(persistable);
         await completeAnalysisRun(run.id, persistable);
       } catch (error) {
+        // A 410 public_create_retired means the save endpoint itself was retired server
+        // side: retrying on every future poll would just repeat the same permanent
+        // failure and keep flashing the save-failed banner, so treat it as terminal and
+        // leave the job marked persisted.
+        if (error instanceof BackendApiError && error.status === 410 && error.code === "public_create_retired") {
+          return;
+        }
         // Retry on the next result rather than on a loop - a failed save must not block
         // the workspace the user is already looking at.
         persistedJobIdsRef.current.delete(persistable.job_id);

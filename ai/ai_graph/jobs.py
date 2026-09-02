@@ -752,14 +752,22 @@ class InMemoryAnalysisJobStore:
         reasons = list(fallback_reasons) if fallback_reasons is not None else job.fallback_reasons
         result = result_envelope or _failure_envelope(job, error_message)
         result = result.model_copy(update={"status": EnvelopeStatus.FAILED})
+        # Hardcoding FINALIZING marked interpreting..debate as succeeded for a run that
+        # never left interpreting, which sent every reader to the wrong end of the
+        # pipeline. Report where it actually stopped.
+        failed_stage = (
+            result.failure_cause.failure_stage
+            if result.failure_cause is not None
+            else job.polling_stage
+        )
         job = job.model_copy(
             update={
                 "status": AnalysisJobStatus.FAILED,
-                "polling_stage": Stage.FINALIZING,
+                "polling_stage": failed_stage,
                 "updated_at": failed_at,
                 "completed_at": failed_at,
                 "stages": _stage_progresses(
-                    Stage.FINALIZING,
+                    failed_stage,
                     AnalysisJobStatus.FAILED,
                     failed_at,
                     message=error_message,

@@ -279,6 +279,8 @@ class Settings(BaseSettings):
     )
     email_unsubscribe_base_url: str | None = Field(default=None, alias="EMAIL_UNSUBSCRIBE_BASE_URL")
     email_max_attempts: int = Field(default=5, alias="EMAIL_MAX_ATTEMPTS", ge=1)
+    # Explicit resend re-queues a terminal delivery only after this cooldown.
+    email_resend_cooldown_seconds: int = Field(default=600, alias="EMAIL_RESEND_COOLDOWN_SECONDS", ge=0)
     email_retry_base_seconds: int = Field(default=30, alias="EMAIL_RETRY_BASE_SECONDS", ge=1)
     email_claim_ttl_seconds: int = Field(default=300, alias="EMAIL_CLAIM_TTL_SECONDS", ge=1)
     email_request_timeout_seconds: float = Field(default=10.0, alias="EMAIL_REQUEST_TIMEOUT_SECONDS", gt=0)
@@ -1031,6 +1033,7 @@ class Settings(BaseSettings):
             "email_unsubscribe_token_ttl_seconds": self.email_unsubscribe_token_ttl_seconds,
             "email_unsubscribe_base_url": self.email_unsubscribe_base_url,
             "email_max_attempts": self.email_max_attempts,
+            "email_resend_cooldown_seconds": self.email_resend_cooldown_seconds,
             "email_retry_base_seconds": self.email_retry_base_seconds,
             "email_claim_ttl_seconds": self.email_claim_ttl_seconds,
             "email_request_timeout_seconds": self.email_request_timeout_seconds,

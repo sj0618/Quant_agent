@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from app.core.config import Settings
 from app.core.errors import AppError
-from app.db.email_outbox import build_email_delivery_idempotency_key, create_or_get_delivery
+from app.db.email_outbox import build_email_delivery_idempotency_key, create_or_get_delivery, requeue_delivery
 from app.schemas.email_delivery import (
     DEFAULT_EMAIL_DELIVERY_TRIGGER_TYPE,
     DEFAULT_EMAIL_TEMPLATE_NAME,
@@ -342,3 +342,64 @@ async def create_report_completed_delivery(
         "template": template,
         "delivery": delivery,
     }
+
+
+REQUEUEABLE_SUBMISSION_STATUSES = {"SENT", "FAILED", "CANCELLED"}
+
+
+def resolve_resend_action(delivery: dict[str, Any] | None) -> str:
+    """Decide what an explicit resend must do with the deterministic delivery row.
+
+    ``queued`` a new row was inserted, ``requeue`` the terminal row must be reset to
+    PENDING, ``noop`` a pending/retry/processing delivery is already on its way.
+    """
+
+    if delivery is None:
+        return "unavailable"
+    if delivery.get("created"):
+        return "queued"
+    status = str(delivery.get("submission_status") or delivery.get("status") or "").upper()
+    return "requeue" if status in REQUEUEABLE_SUBMISSION_STATUSES else "noop"
+
+
+async def resend_report_completed_delivery(
+    db: AsyncEngine | AsyncConnection,
+    *,
+    settings: Settings,
+    user_id: str | int,
+    report_id: str,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """Explicit resend: unlike the completion trigger this re-queues a terminal delivery."""
+
+    result = await create_report_completed_delivery(
+        db,
+        settings=settings,
+        user_id=user_id,
+        report_id=report_id,
+        correlation_id=correlation_id,
+    )
+    action = resolve_resend_action(result["delivery"])
+    if action == "requeue":
+        request = result["request"]
+        requeued = await requeue_delivery(
+            db,
+            delivery_id=str(result["delivery"]["delivery_id"]),
+            recipient_email=request.recipient_email if request is not None else None,
+            payload_json=request.payload_json if request is not None else None,
+            cooldown_seconds=settings.email_resend_cooldown_seconds,
+        )
+        # A concurrent worker/resend may have moved the row out of a terminal state
+        # first, or the last send is younger than the resend cooldown.
+        action = "queued" if requeued is not None else "noop"
+        if requeued is not None:
+            result = {**result, "delivery": requeued}
+    emit_email_event(
+        logger,
+        "resend_requested",
+        report_id=report_id,
+        trigger_type=DEFAULT_EMAIL_DELIVERY_TRIGGER_TYPE,
+        result=action,
+        reused=bool(result["delivery"] and not result["delivery"].get("created")),
+    )
+    return {**result, "resend_action": action}

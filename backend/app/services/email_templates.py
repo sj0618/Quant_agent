@@ -22,7 +22,9 @@ def _public_report_url(public_base_url: str, report_id: str) -> str:
     parsed = urlsplit(base)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
         raise ValueError("public_base_url must be an absolute http(s) URL without credentials")
-    return f"{base}/reports/{quote(report_id, safe='')}"
+    # /reports/:id is the FE archive route that resolves AI job ids; the emailed report
+    # lives on the owner-scoped email report screen.
+    return f"{base}/me/email-reports/{quote(report_id, safe='')}"
 
 
 def render_report_completed_template(

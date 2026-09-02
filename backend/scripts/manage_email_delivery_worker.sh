@@ -5,7 +5,13 @@ ACTION="${1:-}"
 BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$(cd "$BACKEND_DIR/.." && pwd)"
 RUN_DIR="${QUANTAGENT_RUN_DIR:-$APP_DIR/.run}"
-PYTHON="${QUANTAGENT_BACKEND_PYTHON:-$BACKEND_DIR/.venv/bin/python}"
+if [[ -n "${QUANTAGENT_BACKEND_PYTHON:-}" ]]; then
+  PYTHON="$QUANTAGENT_BACKEND_PYTHON"
+elif [[ -x "$BACKEND_DIR/.venv/bin/python" ]]; then
+  PYTHON="$BACKEND_DIR/.venv/bin/python"
+else
+  PYTHON="$APP_DIR/ai/.venv/bin/python"
+fi
 LAUNCHER="$BACKEND_DIR/scripts/run_email_delivery_worker.py"
 PID_FILE="$RUN_DIR/email-worker.pid"
 LOG_FILE="$RUN_DIR/email-worker.log"

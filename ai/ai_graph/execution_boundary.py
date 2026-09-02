@@ -72,15 +72,26 @@ APPROVED_EXECUTION_BOUNDARIES: tuple[ExecutionBoundary, ...] = (
         write_allowed=False,
     ),
     ExecutionBoundary(
-        boundary_id="public-analysis-run-create",
-        kind="public_create",
+        boundary_id="authenticated-analysis-run-create",
+        kind="authenticated_job_create",
         method="POST",
         path="/api/v1/runs",
-        owner="none",
-        auth="none",
-        failure_delivery="410_feature_disabled_with_read_only_alternative",
-        allowed=False,
-        write_allowed=False,
+        owner="quantagent_backend_contract",
+        auth="authenticated_session_csrf_and_owned_completed_job",
+        failure_delivery="typed_owner_scoped_persistence_failure",
+        allowed=True,
+        write_allowed=True,
+    ),
+    ExecutionBoundary(
+        boundary_id="authenticated-analysis-run-complete",
+        kind="authenticated_job_create",
+        method="POST",
+        path="/api/v1/runs/{run_id}/complete",
+        owner="quantagent_backend_contract",
+        auth="authenticated_session_csrf_and_owned_completed_job",
+        failure_delivery="typed_owner_scoped_persistence_failure",
+        allowed=True,
+        write_allowed=True,
     ),
     ExecutionBoundary(
         boundary_id="public-research-job-create",
@@ -108,7 +119,7 @@ APPROVED_EXECUTION_BOUNDARIES: tuple[ExecutionBoundary, ...] = (
         boundary_id="historical-report-read",
         kind="read_only_projection",
         method="GET",
-        path="/api/reports/{report_id}",
+        path="/api/v1/reports/{report_id}",
         owner="ux_verification_lead",
         auth="existing_authenticated_user",
         failure_delivery="stale_or_unavailable_reason_with_next_action",
@@ -174,8 +185,8 @@ def validate_execution_boundaries(
 
     if public_create_allowed != 0:
         errors.append("public create boundary count must be zero")
-    if authenticated_job_create_allowed != 1:
-        errors.append("exactly one authenticated job create boundary must be allowed")
+    if authenticated_job_create_allowed < 1:
+        errors.append("at least one authenticated job create boundary must be allowed")
     for boundary in authenticated_job_creates:
         if boundary.method != "POST" or not boundary.write_allowed:
             errors.append(f"authenticated job create boundary is not writable: {boundary.boundary_id}")

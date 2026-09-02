@@ -177,7 +177,25 @@ class EmailDeliveryWorker:
         stopping_emitted = False
         try:
             while True:
-                processed = await self.run_once()
+                try:
+                    processed = await self.run_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Includes AppError: the DB layer wraps driver failures into
+                    # AppError(db_query_failed), and a DB blip must not stop the loop.
+                    # Startup/config problems are raised by validate_startup() before it.
+                    emit_email_event(
+                        self.logger,
+                        "worker_error",
+                        worker_id=self.state.worker_id,
+                        reason_code="run_once_failed",
+                        error_code=type(exc).__name__,
+                    )
+                    if self.stop_event.is_set():
+                        break
+                    await asyncio.sleep(self.state.poll_interval_seconds)
+                    continue
                 if self.stop_event.is_set():
                     if not stopping_emitted:
                         emit_email_event(
@@ -219,7 +237,7 @@ class EmailDeliveryWorker:
         shutdown_deadline: float | None,
     ) -> None:
         if shutdown_deadline is None:
-            await self._process_claim(claim)
+            await self._process_claim_guarded(claim)
             return
 
         loop = asyncio.get_running_loop()
@@ -227,7 +245,7 @@ class EmailDeliveryWorker:
         if remaining <= 0:
             return
         try:
-            await asyncio.wait_for(self._process_claim(claim), timeout=remaining)
+            await asyncio.wait_for(self._process_claim_guarded(claim), timeout=remaining)
         except asyncio.TimeoutError:
             emit_email_event(
                 self.logger,
@@ -238,6 +256,35 @@ class EmailDeliveryWorker:
                 trigger_type=str(claim.get("trigger_type")),
                 reason_code="shutdown_grace_expired",
             )
+
+    async def _process_claim_guarded(self, claim: dict[str, Any]) -> None:
+        """Keep one broken claim (driver/DB failure included) from killing the worker loop."""
+
+        try:
+            await self._process_claim(claim)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await self._handle_claim_lost(claim, exc)
+            try:
+                await email_outbox.mark_retry_pending(
+                    self.engine,
+                    delivery_id=str(claim.get("delivery_id")),
+                    claim_token=str(claim.get("claim_token")),
+                    available_at=_now() + timedelta(seconds=self._calculate_retry_delay(int(claim.get("attempt_count") or 0))),
+                    error_code="unexpected_worker_error",
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:  # noqa: BLE001
+                emit_email_event(
+                    self.logger,
+                    "claim_lost",
+                    worker_id=self.state.worker_id,
+                    delivery_id=str(claim.get("delivery_id")),
+                    report_id=str(claim.get("report_id")),
+                    trigger_type=str(claim.get("trigger_type")),
+                    reason_code="claim_release_failed",
+                )
 
     async def _process_claim(self, claim: dict[str, Any]) -> None:
         delivery_id = str(claim["delivery_id"])
@@ -424,7 +471,7 @@ class EmailDeliveryWorker:
         code = str(getattr(exc, "code", type(exc).__name__))
         await self._mark_failed(claim, reason_code=code, error_message=str(exc))
 
-    async def _handle_claim_lost(self, claim: dict[str, Any], exc: AppError) -> None:
+    async def _handle_claim_lost(self, claim: dict[str, Any], exc: Exception) -> None:
         emit_email_event(
             self.logger,
             "claim_lost",

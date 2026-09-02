@@ -289,6 +289,7 @@ export function StrategyInputPanel({
             aria-label="자연어 전략"
             className="min-w-0 flex-1 bg-transparent text-xs text-[#edeff4] outline-none placeholder:text-subdued disabled:text-subdued"
             disabled={inputDisabled}
+            maxLength={2000}
             onChange={(event) => setDraft(event.target.value)}
             placeholder={running ? "분석이 진행 중입니다" : "전략을 자연어로 입력하세요"}
             required

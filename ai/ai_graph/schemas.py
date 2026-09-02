@@ -544,8 +544,26 @@ _EXECUTION_SPEC_ADAPTER = TypeAdapter(ExecutionSpecV1OrV2)
 
 
 def validate_execution_spec(raw: Any) -> ExecutionSpecV1OrV2:
-    """Decode either admitted contract at one shared boundary."""
+    """Decode either admitted contract at one shared boundary.
 
+    ``ai_graph.research_contract`` declares its own V1/V2 model classes with the
+    same JSON shape as the ones above (``CanonicalRuleV1`` is its
+    ``StrategyExecutionSpecV1``).  A sealed instance from that module is a foreign
+    class to this TypeAdapter, so pydantic rejects it with ``model_type`` even
+    though the data is valid.  Round-tripping any other BaseModel through its JSON
+    form keeps the two class families from meeting.  Unifying the two hierarchies
+    is a larger refactor and is deliberately not attempted here.
+    """
+
+    if isinstance(raw, BaseModel) and not isinstance(
+        raw,
+        (
+            StrategyExecutionSpecV1,
+            ExplorationExecutionSpecV2,
+            ResearchCandidateExecutionSpecV3,
+        ),
+    ):
+        raw = raw.model_dump(mode="json")
     return _EXECUTION_SPEC_ADAPTER.validate_python(raw)
 
 

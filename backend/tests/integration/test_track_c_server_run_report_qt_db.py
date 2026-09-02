@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import copy
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -14,7 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
 from app.api.routes import fe_contract
-from app.core.errors import register_exception_handlers
+from app.core.errors import AppError, register_exception_handlers
 from app.db import user_queries
 from app.db.session import create_db_engine, create_trading_data_db_engine, dispose_db_engine
 from app.services import fe_contract_store
@@ -162,6 +163,60 @@ def _synthetic_identity(role: str, token: str) -> GoogleIdentity:
     )
 
 
+class _StoredAnalysisResult:
+    """Shape ``fe_contract._completed_analysis_payload`` reads off a completed job."""
+
+    def __init__(self, ai_job_id: str) -> None:
+        self._ai_job_id = ai_job_id
+
+    def model_dump(self, *, mode: str) -> dict[str, Any]:
+        assert mode == "json"
+        return {
+            "status": "ready",
+            "strategy_spec": {"strategy_id": f"{SYNTHETIC_PREFIX}:spec:{self._ai_job_id}"},
+            "user_payload": {
+                "recommendation_gate": {"validated": True, "source": SYNTHETIC_PREFIX},
+                "performance": {"sharpe_ratio": 0.28, "total_return": 0.0123},
+                "report": {
+                    "web_projection": {
+                        "title": f"{SYNTHETIC_PREFIX} report {self._ai_job_id}",
+                        "summary": f"{SYNTHETIC_PREFIX} summary {self._ai_job_id}",
+                        # Only allow-listed section ids survive into the reader projection.
+                        "sections": [
+                            {
+                                "id": "reproduction_contract",
+                                "title": "reproduction contract",
+                                "items": {
+                                    "contract_version": "integration-v1",
+                                    "input_hash": self._ai_job_id,
+                                },
+                            }
+                        ],
+                    }
+                },
+            },
+        }
+
+
+class _FakeAnalysisJobStore:
+    """Register ``jobs[ai_job_id] = owner_user_id``; unknown ids resolve to ``None`` (404)."""
+
+    def __init__(self) -> None:
+        self.jobs: dict[str, str] = {}
+
+    def get_job(self, ai_job_id: str) -> SimpleNamespace | None:
+        owner_id = self.jobs.get(ai_job_id)
+        if owner_id is None:
+            return None
+        return SimpleNamespace(
+            job_id=ai_job_id,
+            user_id=owner_id,
+            status="completed",
+            result=_StoredAnalysisResult(ai_job_id),
+            completed_at=datetime(2099, 1, 1, tzinfo=UTC),
+        )
+
+
 async def _database_identity(engine: Any) -> dict[str, Any]:
     row = await _fetch_one(
         engine,
@@ -211,6 +266,7 @@ async def _prepare_context() -> dict[str, Any]:
     intruder = await user_queries.upsert_google_user(auth_engine, intruder_identity)
 
     fake_redis = FakeRedis()
+    job_store = _FakeAnalysisJobStore()
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(fe_contract.router)
@@ -218,9 +274,11 @@ async def _prepare_context() -> dict[str, Any]:
     app.state.redis_client = fake_redis
     app.state.db_engine = auth_engine
     app.state.trading_data_db_engine = trading_engine
+    app.state.analysis_job_store = job_store
     app.state.startup_config_error = None
     app.state.startup_redis_error = None
     return {
+        "jobs": job_store.jobs,
         "settings": settings,
         "auth_engine": auth_engine,
         "trading_engine": trading_engine,
@@ -257,11 +315,10 @@ async def _cleanup(
         await _execute(engine, sql, params)
 
     for target_engine in (context["trading_engine"], context["auth_engine"]):
-        await _execute(
-            target_engine,
-            "DELETE FROM app.users WHERE auth_provider = 'google' AND provider_user_id IN (:owner, :intruder)",
-            {"owner": context["owner_provider_id"], "intruder": context["intruder_provider_id"]},
-        )
+        await _execute(target_engine, _DELETE_UNPINNED_SYNTHETIC_USERS, {
+            "owner": context["owner_provider_id"],
+            "intruder": context["intruder_provider_id"],
+        })
     return await _identifier_counts(
         engine,
         provider_user_id=context["owner_provider_id"],
@@ -271,33 +328,24 @@ async def _cleanup(
     )
 
 
-def _completion_payload(*, token: str, invalid_candidate: bool = False) -> dict[str, Any]:
-    return {
-        "status": "completed",
-        "completedAt": "2099-01-01T00:00:00Z",
-        "result": {
-            "title": f"{SYNTHETIC_PREFIX} report {token}",
-            "summary": f"{SYNTHETIC_PREFIX} summary {token}",
-            "backtestSummary": {"periodReturn": "0.0123", "tradeCount": 1, "metricsVersion": "integration-v1"},
-            "backtestMetricDetail": {"compareJson": {"source": SYNTHETIC_PREFIX}, "rollingReturnsJson": []},
-            "candidates": [
-                {
-                    "ticker": f"T2{token[:6]}",
-                    "signal": "BUY",
-                    "confidence": 2 if invalid_candidate else "0.8",
-                    "rationale": "controlled integration payload",
-                }
-            ],
-            "news": [
-                {
-                    "rank": 1,
-                    "title": f"{SYNTHETIC_PREFIX} news {token}",
-                    "tone": "neutral",
-                    "summary": "controlled integration payload",
-                }
-            ],
-        },
-    }
+# Completion writes one app.analysis_result row, which carries a BEFORE DELETE/UPDATE
+# "immutable" trigger and pins its owner through fk_analysis_result_user ON DELETE
+# RESTRICT.  A synthetic user that completed a run therefore survives cleanup by design;
+# every other synthetic row is removable.
+_DELETE_UNPINNED_SYNTHETIC_USERS = """
+    DELETE FROM app.users
+    WHERE auth_provider = 'google'
+      AND provider_user_id IN (:owner, :intruder)
+      AND NOT EXISTS (
+          SELECT 1 FROM app.analysis_result AS ar WHERE ar.user_id = users.user_id
+      )
+"""
+
+
+def _completion_payload(*, ai_job_id: str) -> dict[str, Any]:
+    """The completion body carries only the job reference; the result comes from the job store."""
+
+    return {"aiJobId": ai_job_id}
 
 
 @pytest.mark.skipif(not _enabled(), reason=f"{OPT_IN_ENV}=1 is required for controlled qt_db DML")
@@ -319,6 +367,11 @@ async def test_track_c_server_run_report_qt_db() -> None:
             "timeframe": "daily",
             "requestPayload": {"seed": token, "source": SYNTHETIC_PREFIX},
         }
+        ai_job_id = create_payload["aiJobId"]
+        # A different job id carries a different stored result: the completion conflict path.
+        conflict_ai_job_id = f"{SYNTHETIC_PREFIX}:job-conflict:{token}"
+        context["jobs"][ai_job_id] = owner_id
+        context["jobs"][conflict_ai_job_id] = owner_id
         run_id = fe_contract_store._analysis_run_uuid(owner_id, create_payload)  # type: ignore[attr-defined]
         strategy_id = fe_contract_store._analysis_run_strategy_uuid(owner_id, create_payload)  # type: ignore[attr-defined]
         report_id, _ = fe_contract_store._analysis_completion_report_id(run_id)  # type: ignore[attr-defined]
@@ -384,7 +437,7 @@ async def test_track_c_server_run_report_qt_db() -> None:
                 spec = json.loads(spec)
             assert spec["provenance"]["source"] == "track-c-run-request"
 
-            completion = _completion_payload(token=token)
+            completion = _completion_payload(ai_job_id=ai_job_id)
             completed = await client.post(
                 f"/api/v1/runs/{run_id}/complete",
                 cookies={context["settings"].auth_session_cookie_name: owner_session_id},
@@ -397,24 +450,22 @@ async def test_track_c_server_run_report_qt_db() -> None:
                 headers={"Origin": API_ORIGIN, "X-CSRF-Token": owner_csrf},
                 json=completion,
             )
-            conflict_payload = copy.deepcopy(completion)
-            conflict_payload["result"]["summary"] = "conflicting controlled payload"
             conflict = await client.post(
                 f"/api/v1/runs/{run_id}/complete",
                 cookies={context["settings"].auth_session_cookie_name: owner_session_id},
                 headers={"Origin": API_ORIGIN, "X-CSRF-Token": owner_csrf},
-                json=conflict_payload,
+                json=_completion_payload(ai_job_id=conflict_ai_job_id),
             )
             assert completed.status_code == 200, completed.text
-            assert completed.json() == {"runId": run_id, "reportId": report_id, "status": "completed", "created": True}
+            assert completed.json()["runId"] == run_id
+            assert completed.json()["reportId"] == report_id
+            assert completed.json()["status"] == "completed"
+            assert completed.json()["created"] is True
+            assert completed.json()["analysisResultId"]
             assert replay_completed.status_code == 200, replay_completed.text
-            assert replay_completed.json() == {
-                "runId": run_id,
-                "reportId": report_id,
-                "status": "completed",
-                "created": False,
-            }
+            assert replay_completed.json() == {**completed.json(), "created": False}
             assert conflict.status_code == 409, conflict.text
+            assert conflict.json()["error"]["code"] == "run_already_completed"
 
             peak = await _identifier_counts(
                 context["trading_engine"],
@@ -423,7 +474,20 @@ async def test_track_c_server_run_report_qt_db() -> None:
                 run_id=run_id,
                 report_id=report_id,
             )
-            assert peak == {name: 1 for name in peak}
+            # Candidates/news/backtest artifacts are no longer request-body derived: the
+            # job-store payload carries only the web projection, gate and performance.
+            assert peak == {
+                "users": 1,
+                "strategy": 1,
+                "strategy_report_profile": 1,
+                "backtest_run": 1,
+                "ai_backtest_report": 1,
+                "backtest_summary": 0,
+                "backtest_metric_detail": 0,
+                "strategy_email_report": 1,
+                "strategy_email_report_candidate": 0,
+                "strategy_email_report_news": 0,
+            }
 
             owner_list = await client.get(
                 "/api/v1/reports?limit=100",
@@ -442,9 +506,15 @@ async def test_track_c_server_run_report_qt_db() -> None:
             assert "content" not in next(item for item in owner_list.json()["items"] if item["id"] == report_id)
             assert owner_detail.status_code == 200
             assert owner_detail.json()["id"] == report_id
+            assert owner_detail.json()["runId"] == run_id
+            # ArchivedReportDetail is an allowlist: no marketBrief/performance/content leaks,
+            # only the two vetted evidence sections carried by the stored web projection.
             assert "content" not in owner_detail.json()
-            assert owner_detail.json()["marketBrief"]
-            assert owner_detail.json()["performance"]["metrics"]
+            assert "marketBrief" not in owner_detail.json()
+            assert "performance" not in owner_detail.json()
+            assert [section["id"] for section in owner_detail.json()["contentSections"]] == [
+                "reproduction_contract"
+            ]
             assert intruder_detail.status_code == 404
 
             await _execute(
@@ -475,7 +545,8 @@ async def test_track_c_server_run_report_qt_db() -> None:
             await context["store"].revoke_session(intruder_session_id)
         if strategy_id and run_id and report_id:
             cleanup_counts = await _cleanup(context, strategy_id=strategy_id, run_id=run_id, report_id=report_id)
-            assert cleanup_counts == {name: 0 for name in cleanup_counts}
+            # Only the owner row survives: it is pinned by the immutable analysis_result.
+            assert cleanup_counts == {**{name: 0 for name in cleanup_counts}, "users": 1}
         await dispose_db_engine(context["auth_engine"])
         await dispose_db_engine(context["trading_engine"])
         print(
@@ -494,11 +565,16 @@ async def test_track_c_server_run_report_qt_db() -> None:
 
 @pytest.mark.skipif(not _enabled(), reason=f"{OPT_IN_ENV}=1 is required for controlled qt_db DML")
 @pytest.mark.asyncio
-async def test_track_c_server_completion_transaction_rolls_back() -> None:
+async def test_track_c_server_completion_transaction_rolls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     context = await _prepare_context()
     token = context["token"]
     owner_id = context["owner_id"]
-    create_payload = {"query": f"{SYNTHETIC_PREFIX} rollback {token}", "requestPayload": {"seed": token}}
+    create_payload = {
+        "query": f"{SYNTHETIC_PREFIX} rollback {token}",
+        "aiJobId": f"{SYNTHETIC_PREFIX}:job-rollback:{token}",
+        "requestPayload": {"seed": token},
+    }
+    context["jobs"][create_payload["aiJobId"]] = owner_id
     run_id = fe_contract_store._analysis_run_uuid(owner_id, create_payload)  # type: ignore[attr-defined]
     strategy_id = fe_contract_store._analysis_run_strategy_uuid(owner_id, create_payload)  # type: ignore[attr-defined]
     report_id, _ = fe_contract_store._analysis_completion_report_id(run_id)  # type: ignore[attr-defined]
@@ -519,11 +595,26 @@ async def test_track_c_server_completion_transaction_rolls_back() -> None:
                 "SELECT strategy_id, status, ended_at FROM app.backtest_run WHERE run_id = :run_id",
                 {"run_id": run_id},
             )
+
+            async def _fail_mid_transaction(*_args: Any, **_kwargs: Any) -> dict[str, int]:
+                raise AppError(
+                    status_code=503,
+                    component="reports",
+                    code="controlled_failure",
+                    message="controlled failure",
+                )
+
+            # Last write inside complete_analysis_run_from_db's single engine.begin() block.
+            monkeypatch.setattr(
+                fe_contract_store,
+                "_persist_completion_report_children",
+                _fail_mid_transaction,
+            )
             failed = await client.post(
                 f"/api/v1/runs/{run_id}/complete",
                 cookies={context["settings"].auth_session_cookie_name: session_id},
                 headers={"Origin": API_ORIGIN, "X-CSRF-Token": csrf},
-                json=_completion_payload(token=token, invalid_candidate=True),
+                json=_completion_payload(ai_job_id=create_payload["aiJobId"]),
             )
             after_run = await _fetch_one(
                 context["trading_engine"],
@@ -596,20 +687,17 @@ async def test_track_c_server_legacy_null_strategy_completion() -> None:
                 "snapshot": json.dumps({"query": run_config["query"]}),
             },
         )
+        # The legacy run config has no aiJobId, so the mismatch guard is skipped and the
+        # completion still resolves its content from the job store.
+        legacy_ai_job_id = f"{SYNTHETIC_PREFIX}:job-legacy:{token}"
+        context["jobs"][legacy_ai_job_id] = owner_id
         session_id, csrf = await context["store"].create_session(user_id=owner_id)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=context["app"]), base_url=API_ORIGIN) as client:
             response = await client.post(
                 f"/api/v1/runs/{run_id}/complete",
                 cookies={context["settings"].auth_session_cookie_name: session_id},
                 headers={"Origin": API_ORIGIN, "X-CSRF-Token": csrf},
-                json={
-                    "status": "completed",
-                    "completedAt": "2099-01-02T00:00:00Z",
-                    "result": {
-                        "title": f"{SYNTHETIC_PREFIX} legacy report {token}",
-                        "summary": f"{SYNTHETIC_PREFIX} legacy summary {token}",
-                    },
-                },
+                json=_completion_payload(ai_job_id=legacy_ai_job_id),
             )
             assert response.status_code == 200, response.text
             row = await _fetch_one(
@@ -633,7 +721,8 @@ async def test_track_c_server_legacy_null_strategy_completion() -> None:
         if session_id is not None:
             await context["store"].revoke_session(session_id)
         cleanup_counts = await _cleanup(context, strategy_id=strategy_id, run_id=run_id, report_id=report_id)
-        assert cleanup_counts == {name: 0 for name in cleanup_counts}
+        # Only the owner row survives: it is pinned by the immutable analysis_result.
+        assert cleanup_counts == {**{name: 0 for name in cleanup_counts}, "users": 1}
         await dispose_db_engine(context["auth_engine"])
         await dispose_db_engine(context["trading_engine"])
         print(

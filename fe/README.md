@@ -111,3 +111,14 @@ npm run test
 ```
 
 `npm run test`는 Node 기본 회귀 검사, `tsc -b --pretty false`, `vite build`를 순차 실행합니다.
+
+## 2026-09-02 E2E 검증 메모
+
+- `/app`는 분석이 `ready`가 되면 `POST /api/v1/runs` → `/runs/{id}/complete`로 서비스 DB에 결과를 저장하고, 이 완료가 리포트 이메일 enqueue 지점이다.
+  production에서 두 route가 410이던 문제는 백엔드에서 해제됐다. FE는 혹시 다시 410 `public_create_retired`가 오면 재시도·배너 없이 종료한다.
+- `/me`의 이메일 이력 타임라인에 `다시 보내기` 버튼이 생겼다(`POST /api/v1/reports/{id}/resend`, 202=재큐잉, 204=이미 대기 중, 409=발송 불가).
+- 자연어 입력은 2000자로 제한된다(서버 `CreateAnalysisJobRequest.query`와 동일).
+- `/dev/email-template` 개발용 라우트와 `EmailTemplatePreviewPage`는 제품 번들에서 제거됐다(퇴역 목록 OD-07).
+  `DailyDigestEmail.tsx`/mock은 `scripts/generate-daily-digest-email.mjs`가 쓰므로 남겨 두었다.
+- `scripts/production-gateway.mjs`의 upstream timeout을 15초 → 65초로 올렸다. AI SSE keepalive가 15초 간격이라 스트림이 끊길 수 있었다.
+- 백엔드 hosted-pages 정책에서 `trust`를 뺐다. FE에 `/trust` 화면이 없어 404 정책과 라우트 표가 어긋나 있었다.

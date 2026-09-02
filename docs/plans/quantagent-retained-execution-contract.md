@@ -18,17 +18,18 @@
 
 | 경계 ID | method | path | owner | auth | failure 전달 | 허용 | write |
 |---|---|---|---|---|---|---:|---:|
-| public-analysis-create | POST | `/analysis-jobs` | none | none | 410 feature-disabled + read-only alternative | 아니오 | 아니오 |
+| authenticated-analysis-job-create | POST | `/analysis-jobs` | quantagent_analysis_service | authenticated_session_and_deferred_quota_charge | typed readiness/parse admission failure | 예 | 예 |
 | public-daily-digest-create | POST | `/ai/daily-digest` | none | none | 410 feature-disabled + read-only alternative | 아니오 | 아니오 |
-| public-analysis-run-create | POST | `/api/v1/runs` | none | none | 410 feature-disabled + read-only alternative | 아니오 | 아니오 |
+| authenticated-analysis-run-create | POST | `/api/v1/runs` | quantagent_backend_contract | authenticated_session_csrf_and_owned_completed_job | typed owner-scoped persistence failure (401/403/404/409/422) | 예 | 예 |
+| authenticated-analysis-run-complete | POST | `/api/v1/runs/{run_id}/complete` | quantagent_backend_contract | authenticated_session_csrf_and_owned_completed_job | typed owner-scoped persistence failure (401/403/404/409/422) | 예 | 예 |
 | public-research-job-create | POST | `/api/research/jobs` | none | none | 410 feature-disabled + read-only alternative | 아니오 | 아니오 |
 | internal-release-evaluator | POST | `/internal/evaluator/analysis` | data_ai_trust_lead | local_ci_or_approved_operator | evaluator FAIL + control board blocker | 예 | 예 |
-| historical-report-read | GET | `/api/reports/{report_id}` | ux_verification_lead | existing_authenticated_user | stale/unavailable reason + next action | 예 | 아니오 |
+| historical-report-read | GET | `/api/v1/reports/{report_id}` | ux_verification_lead | existing_authenticated_user | stale/unavailable reason + next action | 예 | 아니오 |
 
 ## QA 계약
 
 - 공개 create 허용 건수는 `0`이다.
-- 허용된 실행 writer는 internal evaluator 하나뿐이다.
+- 허용된 실행 writer는 internal evaluator와, 이미 완료된 소유 job을 영속화하는 인증 writer(`POST /analysis-jobs`, `POST /api/v1/runs`, `POST /api/v1/runs/{run_id}/complete`)뿐이다. 어느 것도 비인증 신규 생성이 아니다.
 - 과거 report read에는 `owner`, `auth`, `failure 전달`이 모두 있어야 한다.
 - read-only projection은 GET만 사용하며 생성·완료·삭제 writer를 포함하지 않는다.
 - evaluator 실패는 사용자 화면에 raw 오류를 노출하지 않고 CI 실패와 control board blocker로 전달한다.
@@ -47,3 +48,14 @@
 ## 후속 구현 경계
 
 이 문서는 실행 경계를 승인하는 계약이다. 실제 API route를 비활성화하거나 evaluator 인증을 연결하는 구현은 이 표의 경계·owner·failure 전달을 바꾸지 않고 별도 작업으로 수행한다.
+
+## 2026-09-02 갱신: 인증 영속화 writer 복구
+
+47ae545는 `POST /api/v1/runs`와 `POST /api/v1/runs/{run_id}/complete`를 production에서 410 `public_create_retired`로 닫았다.
+그 뒤 94b3afe가 `POST /analysis-jobs`를 `authenticated-analysis-job-create`로 다시 허용했고, 9e616bf 계열의 FE(`fe/src/pages/AppPage.tsx`)는
+분석이 끝날 때마다 두 backend writer를 호출한다. 머지 순서 때문에 backend writer만 닫힌 채 남아, production에서
+`complete_analysis_run_from_db`(`app.strategy_email_report`의 유일한 writer이자 유일한 이메일 enqueue)가 한 번도 실행되지 않았다.
+
+이 갱신은 두 경로를 **공개 신규 생성이 아니라 "소유한 완료 job의 영속화"** 로 재분류해 허용한다. 두 route는
+session + CSRF를 통과한 뒤, payload의 `aiJobId`가 호출자 소유의 완료된 job인지 확인한 다음에만 DB에 쓴다.
+`aiJobId`가 없으면 422, 없는 job이면 404, 미완료 job이면 409로 거절한다. 공개 create 허용 건수는 여전히 `0`이다.
