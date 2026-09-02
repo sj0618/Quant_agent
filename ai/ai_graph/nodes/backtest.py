@@ -153,7 +153,7 @@ AI_BACKTEST_CANDIDATE_TIMEOUT_ENV = "AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS"
 # rolling evaluation is several times more expensive.
 DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 8.0
 AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
-DEFAULT_WALL_BUDGET_SECONDS = 25.0
+DEFAULT_WALL_BUDGET_SECONDS = 30.0
 # Rounds of threshold-adjusted candidates tried when the acceptance floor is not cleared.
 # Each round proposes up to six distinct candidates and stops early once the floor clears
 # or the wall budget is spent, so this is a ceiling, not a cost every run pays.
@@ -351,10 +351,20 @@ def _performance_method_manifest(
         "end_date": dates[-1] if dates else "unavailable",
         "eod_basis": "input_ohlcv_eod_dates",
         "initial_capital": float(engine_summary.get("initial_capital") or 0.0),
+        # A cadence is only claimed when the rule actually rebalances on a schedule;
+        # an event-driven rule trades when its conditions fire, and reporting a
+        # 21-day cadence for it described a strategy that was never run.
         "rebalance_timing": (
             f"every_{parameters.rebalance_interval_days}_trading_days"
+            if parameters is not None and _rebalances_on_a_schedule(candidate)
+            else "signal_driven"
             if parameters is not None
             else "engine_default"
+        ),
+        "holding_period": (
+            f"{candidate.strategy_ir.holding_days}_trading_days"
+            if candidate.strategy_ir is not None and candidate.strategy_ir.holding_days
+            else "rule_exit_only"
         ),
         "fill_timing": str(
             engine_summary.get("execution_timing") or MISSING_EXECUTION_ASSUMPTION
@@ -371,6 +381,15 @@ def _performance_method_manifest(
         "execution_version": "ai_graph_backtest_engine.v1",
         "historical_simulation_warning": "Historical simulation is not a guarantee of future returns.",
     }
+
+
+def _rebalances_on_a_schedule(candidate: CodeCandidate) -> bool:
+    """Whether this candidate's rule only re-selects on rotation dates."""
+
+    return (
+        candidate.strategy_ir is not None
+        and candidate.strategy_ir.execution_mode == "scheduled_rotation"
+    )
 
 
 def _is_user_rule(candidate: Any) -> bool:
@@ -682,6 +701,69 @@ class _CandidateTaskResult:
 
 
 @dataclass(frozen=True)
+class _FoldEngineTask:
+    """One candidate on one fold: either its selection pass or its evaluation pass.
+
+    Only session labels travel to the worker. The rows themselves are already there as
+    `_WORKER_PRICE_ROWS`, and shipping a fold's slice per task would cost more than the
+    engine run it feeds.
+    """
+
+    candidate: Mapping[str, Any]
+    context_sessions: tuple[str, ...]
+    engine_sessions: tuple[str, ...]
+    tradable_sessions: tuple[str, ...]
+    targets: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _FoldEngineOutcome:
+    metrics: BacktestMetrics | None = None
+    returns: dict[str, float] | None = None
+    fills: tuple[dict[str, Any], ...] = ()
+    ledger: dict[str, Any] | None = None
+
+
+class _FoldPrepCache:
+    """Row slices and engine prep for the fold and pass currently being evaluated.
+
+    Every task in a batch is the same fold and the same pass, so one entry holds all the
+    reuse there is; a second would only pin another fold's feature store, and this runs
+    two-up on a 2 vCPU node.
+    """
+
+    def __init__(self) -> None:
+        self.key: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self.context_rows: list[Mapping[str, Any]] = []
+        self.engine_rows: list[Mapping[str, Any]] = []
+        self.store: PreparedFeatureStore | None = None
+        self.prepared: EnginePreparedMarketData | None = None
+
+    def load(
+        self,
+        strategy: AIStrategySpec,
+        rows: Sequence[Mapping[str, Any]],
+        task: _FoldEngineTask,
+    ) -> None:
+        key = (task.context_sessions, task.engine_sessions)
+        if self.key == key:
+            return
+        self.clear()
+        self.context_rows = _rows_for_sessions(rows, task.context_sessions)
+        self.engine_rows = _rows_for_sessions(rows, task.engine_sessions)
+        self.store = PreparedFeatureStore(self.context_rows, rows_are_sorted=True)
+        self.prepared = _fold_prepared_market(strategy, self.engine_rows)
+        self.key = key
+
+    def clear(self) -> None:
+        self.key = None
+        self.context_rows = []
+        self.engine_rows = []
+        self.store = None
+        self.prepared = None
+
+
+@dataclass(frozen=True)
 class _BenchmarkContext:
     daily_returns: tuple[float, ...]
     selection_days: int
@@ -807,6 +889,15 @@ _WORKER_PRICE_ROWS: Sequence[Mapping[str, Any]] | None = None
 _WORKER_PREPARED_MARKET: EnginePreparedMarketData | None = None
 _WORKER_FEATURE_STORE: PreparedFeatureStore | None = None
 _WORKER_BENCHMARK_CONTEXT: _BenchmarkContext | None = None
+# Cleared with the rows it was built from, so a fold key can never resolve against a
+# different universe.
+_WORKER_FOLD_PREP = _FoldPrepCache()
+_FOLD_PREPARATION_CANDIDATE = CodeCandidate(
+    candidate_id="prepare",
+    variant="A",
+    code="def build_signals(prices):\n    return []\n",
+    validation_ok=True,
+)
 
 
 def _initialize_candidate_worker(
@@ -823,6 +914,15 @@ def _initialize_candidate_worker(
     _WORKER_PREPARED_MARKET = prepared_market
     _WORKER_FEATURE_STORE = feature_store
     _WORKER_BENCHMARK_CONTEXT = benchmark_context
+    _WORKER_FOLD_PREP.clear()
+
+
+def _fold_engine_worker(task: _FoldEngineTask) -> _FoldEngineOutcome:
+    if _WORKER_STRATEGY is None or _WORKER_PRICE_ROWS is None:
+        raise RuntimeError("candidate worker was not initialized")
+    return _fold_engine_outcome(
+        _WORKER_STRATEGY, _WORKER_PRICE_ROWS, task, _WORKER_FOLD_PREP
+    )
 
 
 def _evaluate_candidate_worker(
@@ -1075,6 +1175,12 @@ class _CandidateBacktestSession:
         self.preparation_seconds = time.perf_counter() - prep_started
         self._base_feature_estimated_bytes = self.feature_store.stats().estimated_bytes
         self._cache: dict[tuple[str, bool, str], _CandidateEvaluation] = {}
+        # (candidate identity, fold, pass) -> reduced fold result. Survives a
+        # self-improvement round, so a round only pays for its new candidates.
+        self._fold_cache: dict[tuple[Any, ...], _FoldEngineOutcome] = {}
+        self._fold_prep = _FoldPrepCache()
+        self.fold_engine_runs = 0
+        self.fold_cache_hits = 0
         self._action_cache: dict[str, Sequence[int]] = {}
         self._score_cache: dict[str, Sequence[float]] = {}
         self._worker_feature_bytes: dict[int, int] = {}
@@ -1094,6 +1200,7 @@ class _CandidateBacktestSession:
         self.close()
 
     def close(self) -> None:
+        self._fold_prep.clear()
         if self._executor is not None:
             self._executor.shutdown(wait=True, cancel_futures=True)
             self._executor = None
@@ -1236,14 +1343,56 @@ class _CandidateBacktestSession:
             for candidate in candidates
         ]
 
-    def _evaluate_parallel(
-        self,
-        tasks: list[
-            tuple[Mapping[str, Any], Sequence[int] | None, Sequence[float] | None, str]
-        ],
-        candidates: list[CodeCandidate],
-        worker_count: int,
-    ) -> list[_CandidateTaskResult]:
+    def run_fold_engines(
+        self, tasks: Sequence[tuple[tuple[Any, ...], _FoldEngineTask]]
+    ) -> list[_FoldEngineOutcome]:
+        """Fold engine runs, memoized per (candidate, fold, pass) and run on the pool.
+
+        A self-improvement round re-runs the whole walk-forward with a wider candidate
+        set, and every round used to re-evaluate every candidate over every fold: round
+        three of a six-per-round search paid for 21 candidates instead of the 6 it added.
+        The per-fold argmax is still recomputed over the full set - only the engine runs
+        behind it are cached.
+        """
+
+        missing = [(key, task) for key, task in tasks if key not in self._fold_cache]
+        self.fold_cache_hits += len(tasks) - len(missing)
+        if missing:
+            worker_count = (
+                self._executor_workers
+                if self._executor is not None
+                else _fold_worker_count(len(missing))
+            )
+            if worker_count > 1:
+                outcomes = self._map_fold_tasks([task for _, task in missing], worker_count)
+            else:
+                outcomes = [
+                    _fold_engine_outcome(self.strategy, self.price_rows, task, self._fold_prep)
+                    for _, task in missing
+                ]
+            self.fold_engine_runs += len(missing)
+            for (key, _), outcome in zip(missing, outcomes, strict=True):
+                self._fold_cache[key] = outcome
+        return [self._fold_cache[key] for key, _ in tasks]
+
+    def _map_fold_tasks(
+        self, tasks: Sequence[_FoldEngineTask], worker_count: int
+    ) -> list[_FoldEngineOutcome]:
+        executor = self._ensure_executor(worker_count)
+        futures = [executor.submit(_fold_engine_worker, task) for task in tasks]
+        remaining = deadline_remaining_seconds()
+        # Read back in submission order: which candidate a fold selects must not depend
+        # on which worker happened to finish first.
+        timeout = None if remaining is None else max(1.0, remaining)
+        try:
+            return [future.result(timeout=timeout) for future in futures]
+        except BaseException:
+            self._terminate_executor()
+            for future in futures:
+                future.cancel()
+            raise
+
+    def _ensure_executor(self, worker_count: int) -> ProcessPoolExecutor:
         if self._executor is not None and self._executor_workers != worker_count:
             self._executor.shutdown(wait=True, cancel_futures=True)
             self._executor = None
@@ -1263,7 +1412,18 @@ class _CandidateBacktestSession:
                 ),
             )
             self._executor_workers = worker_count
-        futures = [self._executor.submit(_evaluate_candidate_worker, task) for task in tasks]
+        return self._executor
+
+    def _evaluate_parallel(
+        self,
+        tasks: list[
+            tuple[Mapping[str, Any], Sequence[int] | None, Sequence[float] | None, str]
+        ],
+        candidates: list[CodeCandidate],
+        worker_count: int,
+    ) -> list[_CandidateTaskResult]:
+        executor = self._ensure_executor(worker_count)
+        futures = [executor.submit(_evaluate_candidate_worker, task) for task in tasks]
         timeout = _candidate_timeout_seconds()
         # Collect completed work immediately. Previously a slow first submission hid
         # already-finished later candidates and caused all of them to be marked timed
@@ -1384,8 +1544,29 @@ class _CandidateBacktestSession:
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "disk_cache_bytes_written": self.disk_cache_bytes_written,
+            "fold_engine_runs": self.fold_engine_runs,
+            "fold_cache_hits": self.fold_cache_hits,
             "rounds": list(self.evaluation_rounds),
         }
+
+
+def _fold_worker_count(task_count: int) -> int:
+    """Workers for a batch of fold engine runs.
+
+    `_candidate_worker_count` gates on total work items because a full-window candidate
+    run is one pass over every row. A fold task is a whole engine run of its own -
+    measured at ~1s on production - so the row-count gate would send every round of a
+    six-candidate search down the serial path. The spawn rule still applies: Windows
+    stays serial unless an operator opts into the memory trade-off.
+    """
+
+    if task_count <= 1:
+        return 1
+    if "fork" not in get_all_start_methods() and not _truthy_env(
+        AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV
+    ):
+        return 1
+    return max(1, min(task_count, _configured_worker_limit(), os.cpu_count() or 1))
 
 
 def _candidate_worker_count(candidate_count: int, *, row_count: int = 0) -> int:
@@ -1852,20 +2033,22 @@ def run_candidate_backtest(
         raise ValueError("at least one candidate is required")
 
     rows = _session.price_rows if _session is not None else _price_rows(price_rows)
-    sample = _walk_forward_sample(rows)
-    if _walk_forward_enabled and sample.status == READY_WALK_FORWARD:
-        return _run_walk_forward_candidate_backtest(
-            strategy_a,
-            candidates,
-            rows,
-            feature_coverage=feature_coverage,
-            fallback_reasons=fallback_reasons,
-            benchmark_context=(
-                _session.benchmark_context if _session is not None else None
-            ),
-        )
     owns_session = _session is None
     session = _session or _CandidateBacktestSession(strategy_a, rows)
+    sample = _walk_forward_sample(rows)
+    if _walk_forward_enabled and sample.status == READY_WALK_FORWARD:
+        try:
+            return _run_walk_forward_candidate_backtest(
+                strategy_a,
+                candidates,
+                rows,
+                feature_coverage=feature_coverage,
+                fallback_reasons=fallback_reasons,
+                session=session,
+            )
+        finally:
+            if owns_session:
+                session.close()
     enriched_candidates: list[CodeCandidate] = []
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
     equity_curves_by_candidate: dict[str, list[BacktestEquityPoint]] = {}
@@ -2003,14 +2186,43 @@ def _rows_for_sessions(
     )
 
 
+def _fold_prepared_market(
+    strategy: AIStrategySpec, engine_rows: Sequence[Mapping[str, Any]]
+):
+    """Engine market data for a fold, built once for every candidate that runs on it.
+
+    `prepare_market_data` reads the spec only through `required_metric_names`, and every
+    candidate spec here carries the same two generated-signal rules, so the result does
+    not vary by candidate - which is why the session already shares one prepared market
+    across the whole non-walk-forward run. Measured on production this and the row
+    conversion feeding it were 38% of a fold engine run.
+    """
+
+    ohlcv_rows, metric_rows = _engine_market_rows(engine_rows)
+    spec = _engine_strategy_spec(
+        strategy,
+        _FOLD_PREPARATION_CANDIDATE,
+        available_ticker_count=_available_ticker_count(engine_rows),
+        execution_capacity_enabled=_execution_capacity_enabled(engine_rows),
+    )
+    return prepare_engine_market_data(
+        spec, ohlcv_rows=ohlcv_rows, metric_rows=metric_rows,
+        config=EngineBacktestRunConfig(initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL, write_outputs=False, talib=EngineTalibIndicatorConfig(enabled=False, mode="none"), metrics_mode="selection"),
+        inputs_normalized=True,
+    )
+
+
 def _fold_engine(
     strategy: AIStrategySpec,
     candidate: CodeCandidate,
     context_rows: Sequence[Mapping[str, Any]],
     engine_rows: Sequence[Mapping[str, Any]],
     tradable_sessions: set[str],
+    *,
+    store: PreparedFeatureStore | None = None,
+    prepared: EnginePreparedMarketData | None = None,
 ):
-    store = PreparedFeatureStore(context_rows, rows_are_sorted=True)
+    store = store if store is not None else PreparedFeatureStore(context_rows, rows_are_sorted=True)
     action_map = {
         (str(row.get("date")), str(row.get("ticker", "")).zfill(6)): action
         for row, action in zip(
@@ -2019,24 +2231,53 @@ def _fold_engine(
             strict=True,
         )
     }
-    ohlcv_rows, metric_rows = _engine_market_rows(engine_rows)
-    spec = _engine_strategy_spec(
-        strategy,
-        candidate,
-        available_ticker_count=_available_ticker_count(engine_rows),
-        execution_capacity_enabled=_execution_capacity_enabled(engine_rows),
-    )
-    prepared = prepare_engine_market_data(
-        spec, ohlcv_rows=ohlcv_rows, metric_rows=metric_rows,
-        config=EngineBacktestRunConfig(initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL, write_outputs=False, talib=EngineTalibIndicatorConfig(enabled=False, mode="none"), metrics_mode="selection"),
-        inputs_normalized=True,
-    )
+    if prepared is None:
+        prepared = _fold_prepared_market(strategy, engine_rows)
     actions = [
         action_map.get((str(row.date), str(row.ticker).zfill(6)), HOLD_SIGNAL_VALUE)
         if str(row.date) in tradable_sessions else HOLD_SIGNAL_VALUE
         for row in prepared.ohlcv_rows
     ]
     return _run_candidate_backtest(strategy, candidate, engine_rows, prepared_market=prepared, generated_actions=actions, metrics_mode="selection")
+
+
+def _fold_engine_outcome(
+    strategy: AIStrategySpec,
+    rows: Sequence[Mapping[str, Any]],
+    task: _FoldEngineTask,
+    prep: _FoldPrepCache,
+) -> _FoldEngineOutcome:
+    """One fold engine run, reduced to what the walk-forward aggregate reads.
+
+    The engine result never leaves this function: it carries the full equity curve and
+    order audit, and pickling those back from a worker costs more than the run itself.
+    `prep` is owned by whoever holds the rows, so a session tuple can only ever resolve
+    against the universe it was sliced from.
+    """
+
+    prep.load(strategy, rows, task)
+    engine = _fold_engine(
+        strategy,
+        CodeCandidate.model_validate(task.candidate),
+        prep.context_rows,
+        prep.engine_rows,
+        set(task.tradable_sessions),
+        store=prep.store,
+        prepared=prep.prepared,
+    )
+    if not task.targets:
+        if not getattr(engine, "equity_curve", None):
+            return _FoldEngineOutcome()
+        return _FoldEngineOutcome(metrics=_metrics_from_engine_result(engine))
+    target_set = set(task.targets)
+    returns = _complete_target_returns(engine, target_set)
+    if returns is None:
+        return _FoldEngineOutcome()
+    return _FoldEngineOutcome(
+        returns=returns,
+        fills=tuple(_full_target_fills(engine, target_set)),
+        ledger=_storage_execution_ledger(engine),
+    )
 
 
 def _complete_target_returns(
@@ -2084,10 +2325,10 @@ def _run_walk_forward_candidate_backtest(
     *,
     feature_coverage: Mapping[str, Any] | None,
     fallback_reasons: Sequence[str] | None,
-    benchmark_context: _BenchmarkContext | None = None,
+    session: _CandidateBacktestSession,
 ) -> CandidateBacktestResult:
     if any(candidate.representation != "structured" for candidate in candidates):
-        result = run_candidate_backtest(strategy, candidates, price_rows=rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons, _walk_forward_enabled=False)
+        result = run_candidate_backtest(strategy, candidates, price_rows=rows, feature_coverage=feature_coverage, fallback_reasons=fallback_reasons, _session=session, _walk_forward_enabled=False)
         masked = result.selected_candidate.model_copy(update={"metrics": _mask_unavailable_walk_forward_metrics(result.selected_candidate.metrics, UNSAFE_WALK_FORWARD_CANDIDATE)})
         return _attach_walk_forward_artifact(
             result.model_copy(
@@ -2117,6 +2358,16 @@ def _run_walk_forward_candidate_backtest(
     deduped = 0
     selected: CodeCandidate | None = None
     policy = _walk_forward_split_policy(rows)
+    tradable_candidates = [candidate for candidate in candidates if candidate.validation_ok]
+    # One dump and one identity per candidate, not one per fold per pass.
+    payloads = {
+        candidate.candidate_id: candidate.model_dump(mode="python")
+        for candidate in tradable_candidates
+    }
+    identities = {
+        candidate.candidate_id: _candidate_identity(candidate)
+        for candidate in tradable_candidates
+    }
     for fold in policy.folds:
         # Rolling evaluation is the one stretch of this node with no round boundary in
         # it: a wide window runs every fold back to back. Check at the fold boundary so
@@ -2125,23 +2376,27 @@ def _run_walk_forward_candidate_backtest(
         raise_if_cancelled()
         raise_if_past_deadline()
         selection_sessions = (*fold.warmup_sessions, *fold.train_sessions, *fold.validation_sessions)
-        selection_rows = _rows_for_sessions(rows, selection_sessions)
         # Selection engine sees warmup for features, but warmup orders are HOLD.
-        eligible: list[CodeCandidate] = []
-        for proposed in candidates:
-            if not proposed.validation_ok:
-                continue
-            selection_engine = _fold_engine(
-                strategy,
-                proposed,
-                selection_rows,
-                selection_rows,
-                set((*fold.train_sessions, *fold.validation_sessions)),
-            )
-            if not getattr(selection_engine, "equity_curve", None):
-                continue
-            metrics = _metrics_from_engine_result(selection_engine)
-            eligible.append(proposed.model_copy(update={"metrics": metrics}))
+        selection_tradable = (*fold.train_sessions, *fold.validation_sessions)
+        selection_outcomes = session.run_fold_engines(
+            [
+                (
+                    ("select", identities[proposed.candidate_id], fold.fold_index),
+                    _FoldEngineTask(
+                        candidate=payloads[proposed.candidate_id],
+                        context_sessions=selection_sessions,
+                        engine_sessions=selection_sessions,
+                        tradable_sessions=selection_tradable,
+                    ),
+                )
+                for proposed in tradable_candidates
+            ]
+        )
+        eligible = [
+            proposed.model_copy(update={"metrics": outcome.metrics})
+            for proposed, outcome in zip(tradable_candidates, selection_outcomes, strict=True)
+            if outcome.metrics is not None
+        ]
         if not eligible:
             continue
         own = [candidate for candidate in eligible if _is_user_rule(candidate)]
@@ -2152,43 +2407,39 @@ def _run_walk_forward_candidate_backtest(
         if not targets:
             continue
         target_set = set(targets)
-        context_rows = _rows_for_sessions(rows, (*selection_sessions, *targets))
-        # Fresh engine gets bridge + target only; actions retain all causal feature history.
-        engine_rows = _rows_for_sessions(rows, (*fold.validation_sessions[-1:], *targets))
-        fold_results: dict[str, tuple[dict[str, float], Any]] = {}
-        eligible_by_id = {item.candidate_id: item for item in eligible}
-        evaluation_candidates = [
-            eligible_by_id.get(proposed.candidate_id, proposed)
-            for proposed in candidates
-            if proposed.validation_ok
-        ]
-        for evaluation_candidate in evaluation_candidates:
-            candidate_engine = _fold_engine(
-                strategy,
-                evaluation_candidate,
-                context_rows,
-                engine_rows,
-                target_set,
-            )
-            candidate_returns = _complete_target_returns(candidate_engine, target_set)
-            if candidate_returns is not None:
-                fold_results[evaluation_candidate.candidate_id] = (
-                    candidate_returns,
-                    candidate_engine,
+        evaluation_outcomes = session.run_fold_engines(
+            [
+                (
+                    ("evaluate", identities[proposed.candidate_id], fold.fold_index, targets),
+                    _FoldEngineTask(
+                        candidate=payloads[proposed.candidate_id],
+                        context_sessions=(*selection_sessions, *targets),
+                        # Fresh engine gets bridge + target only; actions retain all
+                        # causal feature history.
+                        engine_sessions=(*fold.validation_sessions[-1:], *targets),
+                        tradable_sessions=targets,
+                        targets=targets,
+                    ),
                 )
+                for proposed in tradable_candidates
+            ]
+        )
+        fold_results = {
+            proposed.candidate_id: outcome
+            for proposed, outcome in zip(tradable_candidates, evaluation_outcomes, strict=True)
+            if outcome.returns is not None
+        }
         selected_result = fold_results.get(candidate.candidate_id)
         if selected_result is None:
             continue
-        target_returns, evaluation_engine = selected_result
         claimed.update(target_set)
-        returns_by_session.update(target_returns)
-        fills.extend(_full_target_fills(evaluation_engine, target_set))
-        evaluation_ledgers.append(_storage_execution_ledger(evaluation_engine))
-        for candidate_id, (candidate_returns, candidate_engine) in fold_results.items():
-            returns_by_candidate[candidate_id].update(candidate_returns)
-            fills_by_candidate[candidate_id].extend(
-                _full_target_fills(candidate_engine, target_set)
-            )
+        returns_by_session.update(selected_result.returns or {})
+        fills.extend(selected_result.fills)
+        if selected_result.ledger is not None:
+            evaluation_ledgers.append(selected_result.ledger)
+        for candidate_id, outcome in fold_results.items():
+            returns_by_candidate[candidate_id].update(outcome.returns or {})
+            fills_by_candidate[candidate_id].extend(outcome.fills)
             folds_by_candidate[candidate_id] += 1
         selected = candidate
         digest = sha256(json.dumps({"fold": fold.fold_index, "candidate": _candidate_identity(candidate), "train": fold.train_sessions, "validation": fold.validation_sessions}, sort_keys=True).encode()).hexdigest()
@@ -2201,9 +2452,9 @@ def _run_walk_forward_candidate_backtest(
     daily_returns = {session: returns_by_session[session] for session in ordered_sessions}
     equity = 1.0
     curve: list[BacktestEquityPoint] = []
-    for session in ordered_sessions:
-        equity *= 1.0 + daily_returns[session]
-        curve.append(BacktestEquityPoint(date=session, cumulative_return=round(equity - 1.0, METRIC_ROUND_DIGITS)))
+    for evaluation_session in ordered_sessions:
+        equity *= 1.0 + daily_returns[evaluation_session]
+        curve.append(BacktestEquityPoint(date=evaluation_session, cumulative_return=round(equity - 1.0, METRIC_ROUND_DIGITS)))
     if selected is None:
         raise ValueError("walk-forward produced no complete evaluation fold")
     costs = sum(
@@ -2308,11 +2559,12 @@ def _run_walk_forward_candidate_backtest(
         backtest_payload=_backtest_payload(
             strategy,
             rows,
-            benchmark_context=benchmark_context or _build_benchmark_context(rows),
+            benchmark_context=session.benchmark_context,
         ),
         feature_coverage=dict(feature_coverage or {}),
         fallback_reasons=list(fallback_reasons or ()),
         execution_stats={
+            **session.execution_stats(),
             "walk_forward": True,
             "evaluation_sessions": len(claimed),
         },
@@ -2392,13 +2644,15 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         # Each extra round widens the search, and `candidate_count` prices that in.
         self_improvement_rounds = MAX_SELF_IMPROVEMENT_ROUNDS
         rounds_run = 0
-        # Walk-forward re-evaluates every candidate over every fold, so a round costs
-        # roughly the first pass scaled by how many candidates it will carry. Starting a
-        # round that cannot finish inside the budget doubled a 34s live run to 76s.
-        # ponytail: first-pass average as the per-candidate cost - conservative, since it
-        # includes one-off session setup. Measure marginal cost if rounds get starved.
-        per_candidate_seconds = (time.perf_counter() - node_started) / max(
-            1, len(all_candidates)
+        # A round now only evaluates the candidates it adds - `session.run_fold_engines`
+        # memoises every (candidate, fold) pair - and spreads them over the worker pool,
+        # so its cost is the marginal per-candidate cost, not the whole set again.
+        # Starting a round that cannot finish inside the budget doubled a 34s live run
+        # to 76s, so the projection still has to be there.
+        per_candidate_seconds = (
+            (time.perf_counter() - node_started)
+            / max(1, len(all_candidates))
+            / _fold_worker_count(SELF_IMPROVEMENT_CANDIDATES_PER_ROUND)
         )
         result = _apply_selection_correction(result, len(all_candidates))
         floor_reasons = objective_floor_reasons(result)
@@ -2410,9 +2664,7 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
             # keeps the candidates already evaluated instead of losing the node's work.
             raise_if_past_deadline()
             remaining = _wall_budget_seconds() - (time.perf_counter() - node_started)
-            projected = per_candidate_seconds * (
-                len(all_candidates) + SELF_IMPROVEMENT_CANDIDATES_PER_ROUND
-            )
+            projected = per_candidate_seconds * SELF_IMPROVEMENT_CANDIDATES_PER_ROUND
             if projected > remaining:
                 fallback_reasons.append(
                     f"self-improvement stopped: projected {projected:.1f}s round does not "
@@ -2449,6 +2701,7 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                 label=f"목표 미달 · 자가개선 {iteration}차",
                 detail=f"신규 임계값 조정 후보 {len(improved)}개 평가 (누적 {len(all_candidates)}개)",
             )
+            round_started = time.perf_counter()
             next_result = run_candidate_backtest(
                 strategy_a,
                 all_candidates,
@@ -2458,6 +2711,9 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                 _session=session,
             )
             rounds_run = iteration
+            # The first-pass estimate carries one-off session setup and the first pass's
+            # own parallelism. Once a round has actually run, price the next one off it.
+            per_candidate_seconds = (time.perf_counter() - round_started) / len(improved)
             next_result = _apply_selection_correction(next_result, len(all_candidates))
             next_reasons = objective_floor_reasons(next_result)
             # Keep the round that clears the floor, or the one that scores better on the
@@ -4032,13 +4288,22 @@ def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
     # trading at random cleared a +16.2% best-of-six against a -3.7% average.
     # `candidates_evaluated` is 1 until the correction is applied, which leaves this
     # term at in_sample_sharpe and changes no single-candidate behaviour.
-    if metrics.selection_adjusted_sharpe is None:
-        reasons.append("탐색 폭 보정 Sharpe 를 계산하지 못했습니다")
-    elif metrics.selection_adjusted_sharpe < MIN_SELECTION_ADJUSTED_SHARPE:
-        reasons.append(
-            f"탐색 폭 보정 Sharpe {metrics.selection_adjusted_sharpe:.2f} 가 "
-            f"기준 {MIN_SELECTION_ADJUSTED_SHARPE:g} 에 미달합니다"
-        )
+    #
+    # Under walk-forward it is published but does not gate. Each fold already picks its
+    # candidate on train/validation alone, so the rolling aggregate is an out-of-sample
+    # estimate and deflating it charges the same search twice - self-defeating, because
+    # the deflation grows with every round the floor sends the node to run. Measured:
+    # widening 3 -> 15 candidates moved the term from -1.57 to -3.19 while the
+    # out-of-sample Sharpe did not move at all, so no amount of searching could clear a
+    # floor that the searching itself lowered.
+    if _ready_aggregate_metrics(result) is None:
+        if metrics.selection_adjusted_sharpe is None:
+            reasons.append("탐색 폭 보정 Sharpe 를 계산하지 못했습니다")
+        elif metrics.selection_adjusted_sharpe < MIN_SELECTION_ADJUSTED_SHARPE:
+            reasons.append(
+                f"탐색 폭 보정 Sharpe {metrics.selection_adjusted_sharpe:.2f} 가 "
+                f"기준 {MIN_SELECTION_ADJUSTED_SHARPE:g} 에 미달합니다"
+            )
 
     strategy = getattr(result, "strategy_a", None)
     if getattr(strategy, "selection_mode", "standard") != "automatic":

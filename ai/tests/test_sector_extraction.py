@@ -66,10 +66,12 @@ def test_get_known_sectors_uses_injected_connection() -> None:
 
     assert sectors == ["반도체", "화학"]
     assert len(conn.calls) == 1
-    assert "DISTINCT sm.sector" in conn.calls[0]
-    assert "FROM mart.common_stock_universe_asof u" in conn.calls[0]
-    assert "max(as_of_date)" in conn.calls[0]
-    assert "JOIN core.symbol_master sm" in conn.calls[0]
+    # Read from the WICS membership history, which is also what the PIT backtest
+    # universe is restricted with. Offering a sector name from anywhere else would let
+    # research seal a sector the universe filter then matches nobody for.
+    assert "DISTINCT sector_name" in conn.calls[0]
+    assert "FROM feature.wics_symbol_sector_history" in conn.calls[0]
+    assert "common_stock_universe_asof" not in conn.calls[0]
 
 
 def test_get_known_sectors_caches_within_ttl(monkeypatch) -> None:

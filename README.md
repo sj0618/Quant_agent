@@ -128,9 +128,9 @@ SERVICE_DB_ARCHIVE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgr
 |---|---|---|
 | `AI_ANALYSIS_MAX_CONCURRENCY` | `1` | 동시에 실행할 분석 수. 2 vCPU 단일 프로세스 노드에서 분석 한 건도 다년 PIT 행·백테스트 워커를 함께 사용하므로, 기본값은 하나의 job만 실행하고 나머지는 큐에 둔다. 부하·메모리·회복력 측정을 마친 뒤에만 명시적으로 높일 수 있다. |
 | `AI_ANALYSIS_QUEUE_WAIT_SECONDS` | `1860` | 슬롯을 기다리는 한도. 분석 1건의 wall budget보다 길게 둬서, 한 건 뒤에 선 잡이 차례를 받게 한다 |
-| `AI_BACKTEST_WORKERS` | `2` | 분석 **1건**이 후보 평가에 쓸 프로세스 풀 워커 수. 실제 워커 수는 `min(후보 수, 이 값, os.cpu_count())`이고, 후보×행 수가 250,000 미만이면 직렬(1)로 떨어진다. 분석 **여러 건**에 걸친 워커 합계에는 상한이 없다 |
+| `AI_BACKTEST_WORKERS` | `2` | 분석 **1건**이 후보 평가에 쓸 프로세스 풀 워커 수. 실제 워커 수는 `min(후보 수, 이 값, os.cpu_count())`이고, 후보×행 수가 250,000 미만이면 직렬(1)로 떨어진다. walk-forward의 fold 평가는 fold 하나가 그 자체로 엔진 1회 실행(측정 약 1초)이라 이 행 수 조건을 적용하지 않고 `min(작업 수, 이 값, os.cpu_count())`만 쓴다. 어느 쪽이든 fork가 없는 OS(Windows)에서는 `AI_BACKTEST_ALLOW_SPAWN_PARALLEL` 없이는 직렬이다. 분석 **여러 건**에 걸친 워커 합계에는 상한이 없다 |
 | `AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS` | `8` | 워커 wave 하나가 후보 평가에 쓸 수 있는 시간. 1년 창(200종·약 250세션)에서 후보 1개는 측정상 2초 미만이므로 이 값은 작업 예산이 아니라 hang 감지선이다. `AI_BACKTEST_LOOKBACK_YEARS=3`처럼 창을 넓히면 올려야 한다 |
-| `AI_BACKTEST_WALL_BUDGET_SECONDS` | `25` | 백테스트 노드가 self-improvement 라운드를 **더 시작할지** 판단하는 상한. 라운드는 수용 기준(objective floor)을 통과하지 못했을 때만, 최대 3회까지 돈다. 라운드 사이에서만 검사하되 이번엔 **예상 비용**으로 판단한다 — 1차 통과 시간을 후보 수로 나눈 값에 다음 라운드의 후보 수를 곱해, 남은 예산에 들어가지 않으면 시작하지 않는다(측정: 100종·243세션 1년 창에서 후보 1개당 약 4.1초, 후보 9개 라운드 약 37초). walk-forward가 READY여도 라운드는 돈다 |
+| `AI_BACKTEST_WALL_BUDGET_SECONDS` | `30` | 백테스트 노드가 self-improvement 라운드를 **더 시작할지** 판단하는 상한. 라운드는 수용 기준(objective floor)을 통과하지 못했을 때만, 최대 3회(라운드당 후보 6개)까지 돈다. 라운드 사이에서만 검사하되 **예상 비용**으로 판단한다 — walk-forward는 (후보, fold) 쌍을 세션에 memoize하므로 라운드 비용은 **새 후보분만**이다. 1차 통과 시간을 후보 수와 워커 수로 나눈 값에 라운드의 새 후보 수를 곱해 남은 예산에 들어가는지 보고, 1라운드가 돈 뒤에는 그 라운드의 실측 한계비용으로 다시 계산한다. walk-forward가 READY여도 라운드는 돈다 |
 
 상한을 넘은 잡은 **거절이 아니라 대기**한다. 클라이언트는 이미 큐잉된 잡을 폴링하고
 있으므로 기다림이 새로 드는 비용이 아니고, 1분 뒤면 처리할 수 있는 일을 거절하는 편이

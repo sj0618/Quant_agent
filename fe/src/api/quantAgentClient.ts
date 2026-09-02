@@ -49,6 +49,11 @@ const DECIMAL_DISPLAY_DIGITS = 2;
 const AI_REQUEST_TIMEOUT_MS = 1_200_000;
 const STORAGE_KEY_LATEST_ANALYSIS_JOB = "quantagent.latest-analysis-job.v1";
 const AI_REPORT_ID_PREFIX = "ai-job:";
+// A numeric grade on a run the gate rejected reads as an endorsement the system never gave.
+// "보류" is itself the conclusion - never blank, never a raw score - and both places that
+// format a recommendation score (the overview tile and every report summary) share it so
+// the rule cannot drift between components.
+const RECOMMENDATION_SCORE_HOLD_LABEL = "보류";
 const TIMEFRAME_LABELS: Record<string, string> = {
   daily: "매일 분석",
   weekly: "매주 분석",
@@ -354,11 +359,16 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
   const recommendationConfidence = result?.strategy_spec
     ? selectRecommendationConfidence(finalSignal?.confidence, result.strategy_spec.confidence)
     : null;
+  const gateValidated = result?.user_payload.recommendation_gate?.validated ?? true;
 
   return {
     ...base,
     strategy,
-    recommendationScore: recommendationConfidence === null ? base.recommendationScore : formatScore(recommendationConfidence),
+    recommendationScore: recommendationConfidence === null
+      ? base.recommendationScore
+      : gateValidated
+        ? formatScore(recommendationConfidence)
+        : RECOMMENDATION_SCORE_HOLD_LABEL,
     recommendationDelta: result ? formatStatusDelta(result.status) : base.recommendationDelta,
     passCount: result ? signals.BUY + signals.HOLD + signals.DROP : base.passCount,
     buyCount: result ? signals.BUY : base.buyCount,
@@ -585,6 +595,7 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
   const confidence = result.strategy_spec
     ? selectRecommendationConfidence(signal?.confidence, result.strategy_spec.confidence)
     : signal?.confidence;
+  const gateValidated = result.user_payload.recommendation_gate?.validated ?? true;
   const date = new Date(job.updated_at);
   return {
     id: latestAnalysisReportId(job.job_id),
@@ -596,7 +607,11 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
     summary: report.web_projection.summary,
     status: "draft",
     strategyName: result.strategy_spec?.name ?? result.user_payload.headline,
-    recommendationScore: confidence === null || confidence === undefined ? formatEnvelopeStatus(result.status) : formatScoreValue(confidence),
+    recommendationScore: confidence === null || confidence === undefined
+      ? formatEnvelopeStatus(result.status)
+      : gateValidated
+        ? formatScoreValue(confidence)
+        : RECOMMENDATION_SCORE_HOLD_LABEL,
     signals: signalCounts(signal?.action ?? null),
     marketSnapshot: [
       { label: "AI 상태", value: formatEnvelopeStatus(result.status), tone: toneForStatus(result.status) },
@@ -790,6 +805,16 @@ function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: Perf
   const comparison = isInsufficient
     ? []
     : buildAIComparisonRows(selectedMetrics, aiPerformance.engine_summary);
+  // The overview screen must not show two disagreeing max-drawdown numbers (the walk-forward
+  // out-of-sample curve on the chart vs. the selected candidate's whole-period card below).
+  // `out_sample_max_drawdown` is the OOS sibling of the whole-period `max_drawdown` already
+  // used by the metric cards - carry it separately so the chart card can read the OOS figure
+  // the gate itself judged against.
+  const outOfSampleMaxDrawdown = !isInsufficient
+    && typeof selectedMetrics.out_sample_max_drawdown === "number"
+    && Number.isFinite(selectedMetrics.out_sample_max_drawdown)
+    ? ratioToPercent(selectedMetrics.out_sample_max_drawdown)
+    : null;
 
   return {
     ...fallback,
@@ -804,6 +829,7 @@ function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: Perf
     dataQuality: parseStringList(aiPerformance.data_quality),
     benchmark: benchmark ?? undefined,
     metricDetails,
+    outOfSampleMaxDrawdown,
     strategyExplanation: aiPerformance.strategy_explanation ?? null,
     macroEvents: [],
     limitations: unwrapped?.limitations ?? [],
@@ -841,10 +867,15 @@ function buildUnavailableAiPerformanceSummary(
 function buildAIMetricCardsFromDetails(details: AIBacktestMetricDetail[]): BacktestMetric[] {
   return details
     .filter((detail) => detail.is_available && detail.value !== null && Number.isFinite(detail.value))
+    // Zero degradation almost always means "no in/out-of-sample comparison was possible",
+    // not "the strategy held up perfectly" - a bare 0.00% card reads as the latter.
+    .filter((detail) => !(detail.key === "degradation" && detail.value === 0))
     .map((detail) => ({
       key: metricCardKey(detail.key),
       label: detail.label,
-      value: detail.unit === "percent" ? formatPercent(detail.value as number) : formatDecimal(detail.value as number),
+      value: detail.unit === "percent"
+        ? formatPercent(detail.value as number, detail.key !== "win_rate")
+        : formatDecimal(detail.value as number),
       tone: toneForPublicMetric(detail.key, detail.value as number),
       caption: detail.plain_explanation,
       plainExplanation: detail.plain_explanation,
@@ -877,7 +908,7 @@ function buildAIMetricCards(selected: AIBacktestMetrics, engineSummary?: Record<
     {
       key: "winRate",
       label: "Win Rate",
-      value: formatPercent(selected.win_rate),
+      value: formatPercent(selected.win_rate, false),
       tone: selected.win_rate >= 0.5 ? "positive" : selected.win_rate >= 0.4 ? "neutral" : "negative",
       caption: "체결 거래 중 수익 거래 비율입니다.",
     },
@@ -1125,9 +1156,9 @@ function ratioToPercent(value: number) {
   return Number((value * PERCENT_SCALE).toFixed(PERCENT_DISPLAY_DIGITS));
 }
 
-function formatPercent(value: number) {
+function formatPercent(value: number, signed = true) {
   const percent = ratioToPercent(value);
-  const prefix = percent > 0 ? "+" : "";
+  const prefix = signed && percent > 0 ? "+" : "";
   return `${prefix}${percent.toFixed(PERCENT_DISPLAY_DIGITS)}%`;
 }
 

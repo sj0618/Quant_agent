@@ -8,8 +8,11 @@ from typing import Any, Sequence
 AI_SECTOR_CACHE_TTL_SECONDS_ENV = "AI_SECTOR_CACHE_TTL_SECONDS"
 DEFAULT_SECTOR_CACHE_TTL_SECONDS = 300
 
-CANDIDATE_POOL_VIEW = "mart.common_stock_universe_asof"
-SECTOR_SOURCE_TABLE = "core.symbol_master"
+# The WICS membership intervals the PIT backtest universe is restricted with. Read from
+# the same table so a sector the research node is offered is always one the universe
+# filter can actually resolve; a name that only exists in the current-day symbol master
+# would be accepted by the researcher and then match nobody.
+SECTOR_SOURCE_TABLE = "feature.wics_symbol_sector_history"
 
 # Static fallback for offline/fixture mode — mirrors the WICS taxonomy documented in
 # DE/docs/data_engineering_runbook.md (26 sectors ingested via DE/scripts/ingest_wics_sectors.py).
@@ -84,13 +87,10 @@ def get_known_sectors(conn: Any | None = None) -> list[str]:
 
 def _fetch_sectors(conn: Any | None) -> list[str]:
     query = f"""
-        SELECT DISTINCT sm.sector
-        FROM {CANDIDATE_POOL_VIEW} u
-        JOIN {SECTOR_SOURCE_TABLE} sm
-          ON sm.symbol = u.symbol
-        WHERE u.as_of_date = (SELECT max(as_of_date) FROM {CANDIDATE_POOL_VIEW})
-          AND sm.sector IS NOT NULL
-        ORDER BY sm.sector
+        SELECT DISTINCT sector_name AS sector
+        FROM {SECTOR_SOURCE_TABLE}
+        WHERE sector_name IS NOT NULL
+        ORDER BY sector_name
     """
     try:
         if conn is not None:

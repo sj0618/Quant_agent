@@ -18,14 +18,18 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from ai_graph.llm import LLMClient, LLMClientError, LLMJsonRequest, create_llm_client
 from ai_graph.nodes.condition_compiler import (
+    MOVING_AVERAGE_VOCABULARY,
     canonical_metric,
+    moving_average_spec,
     supported_metrics,
     untranslatable_conditions,
 )
 from ai_graph.schemas import (
     Condition,
+    ConditionOperator,
     ResearchCandidateExecutionSpecV3,
     ResearchCandidateV3,
     ResearchSourceRefV3,
@@ -58,8 +62,13 @@ one or more ``universe_rank_pct`` entry conditions and state the universe plus c
 ``assumptions``. If a request refers to sector leadership but does not name a particular
 sector, a KRX-wide cross-sectional leader definition is allowed only when that
 operationalization is explicitly disclosed in ``assumptions``; never describe it as a
-within-sector ranking. If a particular sector is named but no point-in-time sector
-universe is supplied, return no candidate rather than dropping the sector constraint.
+within-sector ranking. A named sector IS supported as a point-in-time universe filter:
+set the candidate's ``sector`` field to the exact WICS label from ``allowed_sectors``
+that covers the requested industry, and the backtest universe is restricted to the
+members of that sector during the tested window before any condition is applied. Do not
+express the sector as a condition - it is a universe constraint, not a metric. If the
+requested industry has no covering label in ``allowed_sectors``, return no candidate
+rather than dropping the sector constraint or approximating it with another label.
 ``universe_rank_pct`` uses a decimal fraction from 0 to 1: top 20% is 0.20.
 ``relative_strength_Nd`` is the stock's N-day return minus the same-date PIT priced
 KRX common-stock universe's mean N-day return. It is a disclosed broad-market proxy,
@@ -70,9 +79,18 @@ distinction in ``assumptions``. If the request requires a named official index a
 such index metric is in the supplied vocabulary, return no candidate rather than
 silently treating the proxy as that index.
 
+Time is expressed by dedicated fields, never by a condition. "N일 뒤 매도", "N일 보유",
+"N일 후 청산" and equivalents are ``holding_days``: N trading sessions. "한 달마다 교체",
+"월간 리밸런싱", "매달 재선정" and equivalents are ``rebalance_interval_days``: 21
+sessions per month (한 주 = 5, 분기 = 63). Never encode a time exit as an always-true
+condition such as ``close gte 0``; that sells on every bar and is rejected. A candidate
+whose only exit is time may return an empty ``exit_conditions`` array, as long as
+``holding_days`` is set.
+
 For every candidate, cite one or more sources you actually used. Candidate conditions
-are a historical research rule: entry and exit arrays must both be non-empty. Use only
-the supplied metric names (aliases are allowed only if listed). A metric-to-metric cross
+are a historical research rule: entry must be non-empty, and exit must be non-empty
+unless ``holding_days`` states the exit. Use only the supplied metric names (aliases
+are allowed only if listed). A metric-to-metric cross
 uses cross_above/cross_below; a range uses between [low, high]; rolling conditions use
 window plus aggregate; use universe_rank_pct only for cross-sectional entry selection.
 If the strategy needs unsupported data or semantics, return no candidates and explain
@@ -80,8 +98,17 @@ the missing capability in resolution_summary rather than changing the strategy.
 
 Return every required JSON field. Each source must include source_id, title, url, and
 claim. Each candidate must include candidate_id, title, hypothesis,
-counter_hypothesis, non-empty entry_conditions and exit_conditions, required_metrics,
-assumptions, and source_ids. Titles are display labels only; never omit them.
+counter_hypothesis, non-empty entry_conditions, exit_conditions (empty only with
+holding_days), required_metrics, assumptions, and source_ids. Add holding_days or
+rebalance_interval_days only when the request states a holding period or a
+rebalance cadence. Add ``sector`` only when the request names an industry.
+Titles are display labels only; never omit them.
+
+Fundamentals available as metrics are point-in-time DART figures: ``per`` (the bar's
+as-reported close divided by the annual EPS filed as of that date, unset for a company
+with EPS <= 0), ``roe``, ``debt_to_equity``, ``operating_margin``, ``operating_income``
+and ``revenue``. Use them for valuation and quality rules when they appear in
+``allowed_metrics``. There is no book-value or PBR metric in this deployment.
 
 Interactive latency budget: use exactly one web source and exactly one candidate. Keep
 resolution_summary to two short sentences, and each claim, hypothesis,
@@ -125,10 +152,15 @@ class _CandidateDraft(BaseModel):
     hypothesis: str = Field(min_length=1, max_length=800)
     counter_hypothesis: str = Field(min_length=1, max_length=800)
     entry_conditions: list[Condition] = Field(min_length=1, max_length=6)
-    exit_conditions: list[Condition] = Field(min_length=1, max_length=6)
+    # Empty only when holding_days states the exit; `_validate_candidate` refuses a
+    # rule with neither, so "no exit at all" is still rejected.
+    exit_conditions: list[Condition] = Field(default_factory=list, max_length=6)
+    holding_days: int | None = Field(default=None, ge=1, le=250)
+    rebalance_interval_days: int | None = Field(default=None, ge=5, le=63)
     required_metrics: list[str] = Field(min_length=1, max_length=20)
     assumptions: list[str] = Field(min_length=1, max_length=10)
     source_ids: list[str] = Field(min_length=1, max_length=8)
+    sector: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class _ResearchResponse(BaseModel):
@@ -154,13 +186,15 @@ def research_strategy_execution_spec(
     """
 
     allowed = _allowed_metrics(available_metrics)
+    sectors = tuple(get_known_sectors())
     client = llm_client or create_llm_client(role="STRATEGY_RESEARCH")
-    request = _request(query=query, allowed_metrics=allowed)
+    request = _request(query=query, allowed_metrics=allowed, allowed_sectors=sectors)
     try:
         return _seal_research_response(
             client.generate_json(request),
             query=query,
             allowed_metrics=allowed,
+            allowed_sectors=sectors,
         )
     except _RepairableStrategyResearchError as first_error:
         # Structured-output validation errors are different from provider failures:
@@ -171,6 +205,7 @@ def research_strategy_execution_spec(
         repair_request = _repair_request(
             query=query,
             allowed_metrics=allowed,
+            allowed_sectors=sectors,
             failure=first_error,
         )
         try:
@@ -178,6 +213,7 @@ def research_strategy_execution_spec(
                 client.generate_json(repair_request),
                 query=query,
                 allowed_metrics=allowed,
+                allowed_sectors=sectors,
             )
         except _RepairableStrategyResearchError as repair_error:
             raise StrategyResearchError(
@@ -204,6 +240,7 @@ def _seal_research_response(
     *,
     query: str,
     allowed_metrics: Sequence[str],
+    allowed_sectors: Sequence[str] = (),
 ) -> ResearchCandidateExecutionSpecV3:
     try:
         response = _ResearchResponse.model_validate(
@@ -223,7 +260,13 @@ def _seal_research_response(
     source_ids = {source.source_id for source in response.sources}
     candidates: list[ResearchCandidateV3] = []
     for candidate in response.candidates:
-        _validate_candidate(candidate, allowed_metrics=allowed_metrics, source_ids=source_ids)
+        _validate_candidate(
+            candidate,
+            allowed_metrics=allowed_metrics,
+            source_ids=source_ids,
+            allowed_sectors=allowed_sectors,
+            query=query,
+        )
         candidates.append(ResearchCandidateV3.model_validate(candidate.model_dump()))
 
     sources = [
@@ -486,11 +529,14 @@ def _normalize_market_relative_thresholds(candidate: dict[str, object]) -> dict[
     return normalized
 
 
-def _request(*, query: str, allowed_metrics: Sequence[str]) -> LLMJsonRequest:
+def _request(
+    *, query: str, allowed_metrics: Sequence[str], allowed_sectors: Sequence[str]
+) -> LLMJsonRequest:
     schema = _ResearchResponse.model_json_schema()
     context = {
         "natural_language_request": query,
         "allowed_metrics": list(allowed_metrics),
+        "allowed_sectors": list(allowed_sectors),
         "condition_grammar": {
             "operators": [
                 "lt",
@@ -507,7 +553,12 @@ def _request(*, query: str, allowed_metrics: Sequence[str]) -> LLMJsonRequest:
                 "Condition supports optional window, aggregate(max|min|avg|sum|last), "
                 "scale, consecutive, and universe_rank_pct. For a leadership or rank "
                 "constraint, universe_rank_pct must appear on the corresponding entry "
-                "condition and assumptions must name the selected universe and cutoff."
+                "condition and assumptions must name the selected universe and cutoff. "
+                # Listing ~500 moving-average names would dominate the prompt; the
+                # compiler accepts the family by pattern instead.
+                f"In addition to allowed_metrics, {MOVING_AVERAGE_VOCABULARY}. A golden "
+                "or dead cross between any two of these metrics is expressed as "
+                "cross_above/cross_below with the other metric name as right."
             ),
         },
     }
@@ -521,6 +572,8 @@ def _request(*, query: str, allowed_metrics: Sequence[str]) -> LLMJsonRequest:
             "counter_hypothesis",
             "entry_conditions",
             "exit_conditions",
+            "holding_days",
+            "rebalance_interval_days",
             "required_metrics",
             "assumptions",
             "source_ids",
@@ -529,6 +582,7 @@ def _request(*, query: str, allowed_metrics: Sequence[str]) -> LLMJsonRequest:
     prompt_context = {
         "natural_language_request": query,
         "allowed_metrics": list(allowed_metrics),
+        "allowed_sectors": list(allowed_sectors),
         "condition_grammar": context["condition_grammar"],
     }
     return LLMJsonRequest(
@@ -571,6 +625,7 @@ def _repair_request(
     *,
     query: str,
     allowed_metrics: Sequence[str],
+    allowed_sectors: Sequence[str],
     failure: StrategyResearchError,
 ) -> LLMJsonRequest:
     """Ask for one compiler-grounded correction without replaying model prose.
@@ -584,6 +639,7 @@ def _repair_request(
     context = {
         "natural_language_request": query,
         "allowed_metrics": list(allowed_metrics),
+        "allowed_sectors": list(allowed_sectors),
         "previous_validation_failure": {
             "code": failure.cause_code,
             "message": str(failure)[:500],
@@ -650,6 +706,8 @@ def _validate_candidate(
     *,
     allowed_metrics: Iterable[str],
     source_ids: set[str],
+    allowed_sectors: Iterable[str] = (),
+    query: str = "",
 ) -> None:
     allowed = set(allowed_metrics)
     if not set(candidate.source_ids) <= source_ids:
@@ -657,6 +715,7 @@ def _validate_candidate(
             f"{candidate.candidate_id}: unknown research source reference",
             cause_code="research_source_reference_invalid",
         )
+    _validate_candidate_sector(candidate, allowed_sectors=allowed_sectors, query=query)
     required = {canonical_metric(metric) for metric in candidate.required_metrics}
     referenced = {
         canonical_metric(condition.left)
@@ -667,7 +726,13 @@ def _validate_candidate(
         for condition in [*candidate.entry_conditions, *candidate.exit_conditions]
         if isinstance(condition.right, str)
     )
-    unsupported_metrics = sorted((required | referenced) - allowed)
+    # sma{N}/ema{N} are admitted by pattern rather than by 500 catalogue entries: they
+    # are derived from the closes every bar carries, so no warehouse column gates them.
+    unsupported_metrics = sorted(
+        metric
+        for metric in (required | referenced) - allowed
+        if moving_average_spec(metric) is None
+    )
     if unsupported_metrics:
         raise _RepairableStrategyResearchError(
             f"{candidate.candidate_id}: unsupported metrics: {', '.join(unsupported_metrics)}",
@@ -681,6 +746,76 @@ def _validate_candidate(
         raise _RepairableStrategyResearchError(
             f"{candidate.candidate_id}: unsupported execution semantics: {', '.join(unsupported_conditions)}",
             cause_code="research_semantics_unsupported",
+        )
+    vacuous = [
+        condition.description or condition.left
+        for condition in candidate.exit_conditions
+        if _is_always_true(condition)
+    ]
+    if vacuous:
+        raise _RepairableStrategyResearchError(
+            f"{candidate.candidate_id}: exit condition is always true and sells on every "
+            f"bar: {', '.join(vacuous)}. Use holding_days for a time exit.",
+            cause_code="research_exit_condition_vacuous",
+        )
+    if not candidate.exit_conditions and candidate.holding_days is None:
+        raise _RepairableStrategyResearchError(
+            f"{candidate.candidate_id}: rule states no exit; give exit_conditions or holding_days",
+            cause_code="research_exit_missing",
+        )
+
+
+# Series a KRX bar can never make negative, so comparing one against 0 states nothing.
+_NON_NEGATIVE_METRICS = frozenset(
+    {"open", "high", "low", "close", "volume", "traded_value"}
+)
+
+
+def _is_always_true(condition: Condition) -> bool:
+    """Whether a condition holds on every bar, whatever the market did.
+
+    The observed failure was `close gte 0` standing in for "sell after 5 days": it
+    matched on the first bar of every position and turned the rule into 717 trades.
+    """
+
+    if canonical_metric(condition.left) not in _NON_NEGATIVE_METRICS:
+        return False
+    if not isinstance(condition.right, (int, float)) or isinstance(condition.right, bool):
+        return False
+    right = float(condition.right)
+    if condition.operator is ConditionOperator.GTE:
+        return right <= 0.0
+    if condition.operator is ConditionOperator.GT:
+        return right < 0.0
+    return False
+
+
+def _validate_candidate_sector(
+    candidate: _CandidateDraft,
+    *,
+    allowed_sectors: Iterable[str],
+    query: str,
+) -> None:
+    """The sealed sector must be a real WICS label, and must not be silently dropped.
+
+    Both directions matter. An invented label would restrict the universe to nobody, and
+    a candidate that quietly omits the sector the request named would be backtested
+    against the whole market - the substitution the refusal this replaces was guarding
+    against. Either way the model gets its one bounded repair turn before the run stops.
+    """
+
+    sectors = tuple(allowed_sectors)
+    if candidate.sector is not None and candidate.sector not in sectors:
+        raise _RepairableStrategyResearchError(
+            f"{candidate.candidate_id}: unsupported sector: {candidate.sector}",
+            cause_code="research_sector_unsupported",
+        )
+    requested = extract_sector_from_query(query, sectors) if sectors and query else None
+    if requested is not None and candidate.sector != requested:
+        raise _RepairableStrategyResearchError(
+            f"{candidate.candidate_id}: request names the '{requested}' sector; "
+            "the candidate must carry it as its sector universe constraint",
+            cause_code="research_sector_dropped",
         )
 
 

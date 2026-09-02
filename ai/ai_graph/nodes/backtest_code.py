@@ -244,6 +244,7 @@ def _normalized_strategy_ir(
 ) -> StrategyIR:
     """Preserve screening semantics even when a model omits or rewrites conditions."""
 
+    timing = _sealed_timing(strategy)
     base = StrategyIR(
         strategy_id=strategy.strategy_id,
         entry_feature=plan.entry_feature,
@@ -251,6 +252,7 @@ def _normalized_strategy_ir(
         proxy_feature=plan.proxy_feature,
         entry_conditions=strategy.entry_conditions,
         exit_conditions=strategy.exit_conditions,
+        **timing,
     )
     if proposed is None or proposed.strategy_id != strategy.strategy_id:
         return base
@@ -258,8 +260,28 @@ def _normalized_strategy_ir(
         update={
             "entry_conditions": strategy.entry_conditions,
             "exit_conditions": strategy.exit_conditions,
+            **timing,
         }
     )
+
+
+def _sealed_timing(strategy: StrategySpec) -> dict[str, object]:
+    """Time exit and rebalance cadence a researched V3 candidate sealed, if any.
+
+    Only the researched path may set these: the exploration policy also carries a
+    `rebalance_interval_days` constraint, and that one is a portfolio parameter, not
+    a statement that the rule itself only trades on rotation dates.
+    """
+
+    if not _is_researched_strategy(strategy):
+        return {}
+    timing: dict[str, object] = {}
+    holding_days = strategy.risk_constraints.get("holding_days")
+    if holding_days is not None:
+        timing["holding_days"] = int(holding_days)
+    if strategy.risk_constraints.get("rebalance_interval_days") is not None:
+        timing["execution_mode"] = "scheduled_rotation"
+    return timing
 
 
 def _normalized_parameter_sets(
@@ -484,6 +506,8 @@ def _render_structured_reference_code(
     threshold = {float(parameters.threshold)!r}
     max_positions = {parameters.max_positions}
     rebalance_interval_days = {parameters.rebalance_interval_days}
+    execution_mode = {strategy_ir.execution_mode!r}
+    holding_days = {strategy_ir.holding_days!r}
     trailing_stop_pct = {float(parameters.trailing_stop_pct)!r}
     medium_momentum_weight = {float(parameters.medium_momentum_weight)!r}
     strategy_id = {strategy_ir.strategy_id!r}

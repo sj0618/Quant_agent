@@ -781,7 +781,7 @@ def test_empty_screen_is_not_re_run_and_backtest_still_uses_its_own_universe(
             return [], {"relaxation_rounds": 3}
 
         def _fetch_backtest_universe(
-            self, _conn: object, window: dict[str, object]
+            self, _conn: object, window: dict[str, object], _sector: str | None = None
         ) -> tuple[list[str], dict[str, object]]:
             assert window["start"] == date(2021, 7, 30)
             return ["000660"], {"selection": "stub", "source": "mart.common_stock_universe_asof"}
@@ -1119,6 +1119,11 @@ def test_backtest_universe_is_lifecycle_pit_bounded_to_fixed_window() -> None:
     assert universe == ["000660"]
     assert descriptor == {
         "selection": "lifecycle_pit_common_stock_window_top_traded",
+        # Unrestricted: an unnamed sector must leave the descriptor saying so rather
+        # than omitting the field, so a reader can tell "whole market" from "unknown".
+        "sector": None,
+        "sector_source": None,
+        "sector_membership": None,
         "as_of_start": "2021-08-12",
         "as_of_end": "2026-08-11",
         "session_count": 1_229,
@@ -1272,7 +1277,7 @@ def test_load_never_trades_a_current_screening_candidate() -> None:
             }
             return [candidate], {"relaxation_rounds": 0, "relaxed": False}
 
-        def _fetch_backtest_universe(self, _conn, _window):
+        def _fetch_backtest_universe(self, _conn, _window, _sector=None):
             return ["000660"], {
                 "selection": "lifecycle_pit_common_stock_window_top_traded",
                 "source": "core.symbol_listing_history",
@@ -1334,7 +1339,7 @@ def _l4_source(universe, candidates, captured):
         def _screen_with_relaxation(self, _conn, _query):
             return list(candidates), {"relaxation_rounds": 0, "relaxed": False}
 
-        def _fetch_backtest_universe(self, _conn, _window):
+        def _fetch_backtest_universe(self, _conn, _window, _sector=None):
             return list(universe), {
                 "selection": "lifecycle_pit_common_stock_window_top_traded",
                 "source": "core.symbol_listing_history",

@@ -92,11 +92,18 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
       ) : null}
 
       {performance.metrics.length ? (
-        <section className="metric-grid">
-          {performance.metrics.map((metric) => (
-            <MetricCard key={metric.key} metric={metric} />
-          ))}
-        </section>
+        <>
+          {/* These cards span the selected candidate's whole backtest period, including the
+              history used to pick it - the overview tab's tiles show the walk-forward
+              out-of-sample slice instead, so the two screens can show different numbers for
+              the same-sounding metric without one of them being "wrong". */}
+          <p className="metric-grid-note">선택 후보 전체 구간 기준</p>
+          <section className="metric-grid">
+            {performance.metrics.map((metric) => (
+              <MetricCard key={metric.key} metric={metric} />
+            ))}
+          </section>
+        </>
       ) : (
         <Card className="performance-empty">
           <strong>표시할 성과 수치가 없습니다</strong>

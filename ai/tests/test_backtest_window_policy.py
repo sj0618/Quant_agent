@@ -9,7 +9,10 @@ one-year input now reaches READY with real numbers.
 
 from __future__ import annotations
 
+import os
 from datetime import date, timedelta
+
+import pytest
 
 from ai_graph.nodes import backtest as backtest_node
 from ai_graph.nodes.backtest_code import Loop3Request, generate_loop3_candidates
@@ -275,6 +278,9 @@ def test_self_improvement_runs_when_the_floor_is_not_cleared_under_walk_forward(
 
     strategy = _strategy()
     monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "rounds"))
+    # Nothing this fixture can produce clears a Sharpe of 5, so the floor stays missed
+    # for every round and the node has to keep searching and still conclude.
+    monkeypatch.setattr(backtest_node, "MIN_OBJECTIVE_SHARPE", 5.0)
     output = backtest_node.backtest_node(_backtest_state(strategy, _price_rows()))
 
     floor = output["objective_floor"]
@@ -329,3 +335,159 @@ def test_a_cleared_floor_names_the_candidate_and_its_numbers(monkeypatch, tmp_pa
     assert floor["rounds_run"] == 0
     assert floor["conclusion"].startswith("목표 달성: 후보 ")
     assert "미사용 구간 Sharpe" in floor["conclusion"]
+
+
+def test_a_self_improvement_round_only_pays_for_its_new_candidates(
+    monkeypatch, tmp_path
+) -> None:
+    """Rounds used to re-run every candidate over every fold.
+
+    Walk-forward evaluates each candidate on each fold twice - a selection pass and an
+    evaluation pass - and a round that widens the search re-ran all of them. Measured on
+    production that was ~4.1s per candidate per round, so a six-candidate round could
+    never fit the wall budget. The per-fold argmax still sees every candidate; only the
+    engine runs behind it are memoized.
+    """
+
+    strategy = _strategy()
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "memoized"))
+    rows = _price_rows()
+    first = _candidates(strategy)
+    generated = _backtest_state(strategy, rows)["backtest_code"]
+    added = backtest_node.generate_self_improvement_candidates(
+        strategy,
+        generated["code_plan"],
+        start_index=len(first) + 1,
+        iteration=1,
+        max_positions=4,
+    )[:2]
+    assert added
+
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        backtest_node.run_candidate_backtest(strategy, first, _session=session)
+        first_pass = session.fold_engine_runs
+        assert first_pass > 0
+
+        # The same set again is entirely cached: not one new engine run.
+        backtest_node.run_candidate_backtest(strategy, first, _session=session)
+        assert session.fold_engine_runs == first_pass
+        assert session.fold_cache_hits == first_pass
+
+        backtest_node.run_candidate_backtest(strategy, [*first, *added], _session=session)
+        round_runs = session.fold_engine_runs - first_pass
+
+    assert round_runs > 0
+    # A wider round costs less than the first pass did, even though it carries more
+    # candidates - the marginal cost per new candidate is no worse than the first pass's.
+    assert round_runs < first_pass
+    assert round_runs / len(added) <= first_pass / len(first)
+
+
+@pytest.mark.skipif((os.cpu_count() or 1) < 2, reason="needs two cores to run a pool")
+def test_parallel_fold_evaluation_matches_the_serial_result(monkeypatch, tmp_path) -> None:
+    """Fold results must not depend on which worker finished first."""
+
+    strategy = _strategy()
+    rows = _price_rows()
+    candidates = _candidates(strategy)
+
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "serial"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "1")
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        serial = backtest_node.run_candidate_backtest(strategy, candidates, _session=session)
+        assert session._executor is None
+
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "parallel"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "2")
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV, "1")
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        parallel = backtest_node.run_candidate_backtest(strategy, candidates, _session=session)
+        assert session._executor_workers == 2
+
+    assert parallel.selected_candidate.candidate_id == serial.selected_candidate.candidate_id
+    assert parallel.walk_forward.daily_returns == serial.walk_forward.daily_returns
+    assert parallel.walk_forward.aggregate_metrics == serial.walk_forward.aggregate_metrics
+    assert [
+        selection.selection_hash for selection in parallel.walk_forward.fold_selections
+    ] == [selection.selection_hash for selection in serial.walk_forward.fold_selections]
+
+
+def test_search_width_deflation_is_published_but_does_not_gate_under_walk_forward(
+    monkeypatch, tmp_path
+) -> None:
+    """The deflation term is self-defeating once selection is already per fold.
+
+    Every fold picks its candidate on train/validation alone, so the rolling aggregate is
+    an out-of-sample estimate and subtracting the expected best-of-N charges the same
+    search twice. Worse, the term grows with every round the floor itself asks for -
+    widening 3 to 15 candidates moved it from -1.57 to -3.19 with the out-of-sample
+    Sharpe unchanged. It stays on the report; it no longer decides.
+    """
+
+    strategy = _strategy()
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "deflation-gate"))
+    rows = _price_rows()
+    candidates = _candidates(strategy)
+
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        rolling = backtest_node.run_candidate_backtest(strategy, candidates, _session=session)
+        held_out = backtest_node.run_candidate_backtest(
+            strategy, candidates, _session=session, _walk_forward_enabled=False
+        )
+    rolling = backtest_node._apply_selection_correction(rolling, 15)
+    held_out = backtest_node._apply_selection_correction(held_out, 15)
+
+    # Unreachable by anything either path can produce, so only the gating changes.
+    monkeypatch.setattr(backtest_node, "MIN_SELECTION_ADJUSTED_SHARPE", 99.0)
+    assert rolling.walk_forward.status == "ready"
+    assert backtest_node._floor_metrics(rolling).selection_adjusted_sharpe is not None
+    assert backtest_node._floor_metric_summary(rolling)["candidates_evaluated"] == 15
+    assert not any(
+        "탐색 폭 보정" in reason for reason in backtest_node.objective_floor_reasons(rolling)
+    )
+    # Without walk-forward the hold-out is the only out-of-sample number there is, and
+    # the winner of a 15-wide argmax still has to beat what 15 tries of noise would give.
+    assert held_out.walk_forward is None or held_out.walk_forward.status != "ready"
+    assert any(
+        "탐색 폭 보정" in reason for reason in backtest_node.objective_floor_reasons(held_out)
+    )
+
+
+def test_shared_fold_prep_matches_building_it_per_candidate(monkeypatch, tmp_path) -> None:
+    """The fold's engine prep is built once and reused by every candidate on that fold.
+
+    `prepare_market_data` reads the spec only through `required_metric_names`, and every
+    generated candidate carries the same two generated-signal rules - which is why the
+    session already shares one prepared market across a whole non-walk-forward run. This
+    pins that: the shared prep has to give the candidate the same run its own would.
+    """
+
+    strategy = _strategy()
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "fold-prep"))
+    rows = _price_rows()
+    policy = backtest_node._walk_forward_split_policy(rows)
+    fold = policy.folds[0]
+    sessions = (*fold.warmup_sessions, *fold.train_sessions, *fold.validation_sessions)
+    fold_rows = backtest_node._rows_for_sessions(rows, sessions)
+    tradable = {*fold.train_sessions, *fold.validation_sessions}
+    candidate = _candidates(strategy)[0]
+
+    per_candidate = backtest_node._fold_engine(
+        strategy, candidate, fold_rows, fold_rows, tradable
+    )
+    shared = backtest_node._fold_engine(
+        strategy,
+        candidate,
+        fold_rows,
+        fold_rows,
+        tradable,
+        prepared=backtest_node._fold_prepared_market(strategy, fold_rows),
+    )
+
+    assert per_candidate.equity_curve
+    assert [(point.date, point.daily_return) for point in shared.equity_curve] == [
+        (point.date, point.daily_return) for point in per_candidate.equity_curve
+    ]
+    assert backtest_node._metrics_from_engine_result(
+        shared
+    ) == backtest_node._metrics_from_engine_result(per_candidate)

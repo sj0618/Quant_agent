@@ -342,6 +342,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
         required_metrics: object | None = None,
         requires_financials: object | None = None,
         compact_price_rows: bool = False,
+        sector: str | None = None,
     ) -> object:
         captured.update(
             {

@@ -102,3 +102,58 @@ test("generated strategies stay visible as pre-backtest blueprints with derivati
   assert.match(performance, /blueprint\.why_generated/);
   assert.match(performance, /indicator\.customization/);
 });
+
+test("a recommendation score never shows a numeric grade for a run the gate rejected", async () => {
+  const adapter = await source("../src/api/quantAgentClient.ts");
+
+  // One shared label, used at both places that turn a confidence into a recommendation
+  // score, so "10.0 / 10" can never be printed for a strategy the gate marked unvalidated -
+  // and the fallback is a conclusion ("보류"), never a blank string or "산출 안 함".
+  assert.match(adapter, /const RECOMMENDATION_SCORE_HOLD_LABEL = "보류";/);
+  assert.doesNotMatch(adapter, /산출 안 함/);
+  const holdLabelUses = adapter.match(/RECOMMENDATION_SCORE_HOLD_LABEL/g) ?? [];
+  assert.ok(holdLabelUses.length >= 3, "expected the shared label declared once and used at both score builders");
+  assert.match(adapter, /gateValidated\s*=\s*result\?\.user_payload\.recommendation_gate\?\.validated\s*\?\?\s*true/);
+  assert.match(adapter, /gateValidated\s*=\s*result\.user_payload\.recommendation_gate\?\.validated\s*\?\?\s*true/);
+});
+
+test("overview total return and Sharpe tiles read the same out-of-sample figures as the chart", async () => {
+  const overview = await source("../src/features/app/OverviewTab.tsx");
+
+  assert.match(overview, /검증 구간\(OOS\) 누적 수익률/);
+  assert.match(overview, /Sharpe \(Walk-forward OOS\)/);
+  // The total-return tile must prefer the chart's own `strategyReturn` (the out-of-sample
+  // equity curve) over the whole-period metric card - that priority inversion is what let
+  // the tile disagree with the chart in the first place.
+  assert.match(overview, /strategyReturn !== undefined\s*\n?\s*\?\s*formatPercentValue\(strategyReturn\)\s*\n?\s*:\s*totalReturnMetric\?\.value/);
+  assert.match(overview, /metricByKey\(overview, "out_sample_sharpe"\)/);
+  assert.match(overview, /overview\.performance\.outOfSampleMaxDrawdown/);
+});
+
+test("overview chart renders the full out-of-sample curve, not just the last 5 points", async () => {
+  const overview = await source("../src/features/app/OverviewTab.tsx");
+
+  const capMatch = overview.match(/CHART_POINT_LIMIT\s*=\s*(\d+)/);
+  assert.ok(capMatch, "expected a named point cap for the overview equity curve");
+  const cap = Number(capMatch![1]);
+  // An 81-point out-of-sample curve (a typical walk-forward window) must not be truncated
+  // down to the 5-point stub the tile used to draw.
+  assert.ok(cap > 81, `cap (${cap}) must exceed a typical 81-point OOS curve so it isn't truncated`);
+  assert.match(overview, /equityCurve\.slice\(-CHART_POINT_LIMIT\)/);
+  assert.doesNotMatch(overview, /equityCurve\.slice\(-5\)/);
+});
+
+test("win rate never carries a +/- sign and a zero degradation card is hidden", async () => {
+  const adapter = await source("../src/api/quantAgentClient.ts");
+
+  assert.match(adapter, /formatPercent\(detail\.value as number, detail\.key !== "win_rate"\)/);
+  assert.match(adapter, /formatPercent\(selected\.win_rate, false\)/);
+  assert.match(adapter, /detail\.key === "degradation" && detail\.value === 0/);
+  assert.match(adapter, /function formatPercent\(value: number, signed = true\)/);
+});
+
+test("the performance tab's metric cards are captioned as whole-period, selected-candidate numbers", async () => {
+  const performance = await source("../src/features/app/PerformanceTab.tsx");
+
+  assert.match(performance, /선택 후보 전체 구간 기준/);
+});
