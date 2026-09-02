@@ -1,5 +1,6 @@
 import { AI_ENDPOINTS, appConfig } from "../config/appConfig";
 import { backendRequest } from "./backendClient";
+import { publicAiResponseFailure } from "./aiResponseFailure";
 import { createStrategyParsePayload } from "./strategyParsePayload";
 import { landingSample } from "../mocks/landing.mock";
 import { formatScoreValue, SCORE_SCALE, selectRecommendationConfidence } from "../utils/score";
@@ -127,8 +128,12 @@ interface StrategyDescriptionApiResponse {
 }
 
 class AIResponseError extends Error {
-  constructor(readonly status: number) {
-    super(`AI 서버 응답 실패: ${status}`);
+  constructor(
+    readonly status: number,
+    readonly reasonCode: string | null = null,
+    message: string | null = null,
+  ) {
+    super(message ?? `AI 서버 응답 실패: ${status}`);
   }
 }
 
@@ -254,12 +259,23 @@ function requireAiApiBaseUrl() {
   return appConfig.aiApiBaseUrl;
 }
 
-function assertOk(response: Response) {
+async function assertOk(response: Response) {
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) {
       clearUserScopedStorage();
     }
-    throw new AIResponseError(response.status);
+    let payload: unknown = null;
+    try {
+      payload = await response.clone().json();
+    } catch {
+      // A non-JSON gateway error is still represented by its HTTP status.
+    }
+    const failure = publicAiResponseFailure(response.status, payload);
+    console.warn("AI API request rejected", {
+      status: response.status,
+      reasonCode: failure.reasonCode,
+    });
+    throw new AIResponseError(response.status, failure.reasonCode, failure.message);
   }
 }
 
@@ -293,7 +309,7 @@ export async function reviewStrategy(query: string): Promise<ParseOutcome> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(createStrategyParsePayload(normalizedQuery)),
   });
-  assertOk(parseResponse);
+  await assertOk(parseResponse);
   const parsed = await parseResponse.json() as ParseOutcome;
   return parsed.kind === "rule_draft"
     ? { ...parsed, original_query: normalizedQuery }
@@ -329,7 +345,7 @@ export async function createConfirmedAnalysisJob(parsed: RuleDraftOutcome): Prom
       query: parsed.original_query,
     }),
   });
-  assertOk(response);
+  await assertOk(response);
   const job = await response.json() as AnalysisJob;
   saveLatestAnalysisJob(job);
   return job;
@@ -347,7 +363,7 @@ export interface ResearchAppendix {
 
 export async function getResearchAppendix(jobId: string): Promise<ResearchAppendix> {
   const response = await fetchAI(AI_ENDPOINTS.analysisJobResearchAppendix(jobId));
-  assertOk(response);
+  await assertOk(response);
   return response.json() as Promise<ResearchAppendix>;
 }
 
@@ -376,7 +392,7 @@ async function fetchStrategyDescriptionMap(strategies: StrategyReportSummary[]) 
         strategies: strategies.map(buildStrategyDescriptionInput),
       }),
     });
-    assertOk(response);
+    await assertOk(response);
 
     const payload = (await response.json()) as StrategyDescriptionApiResponse;
     return payload.items.reduce<Record<string, string>>((current, item) => {
@@ -478,7 +494,7 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query: trimmedQuery }),
   });
-  assertOk(response);
+  await assertOk(response);
 
   const job = (await response.json()) as AnalysisJob;
   saveLatestAnalysisJob(job);
@@ -487,7 +503,7 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
 
 export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
   const response = await fetchAI(AI_ENDPOINTS.analysisJobCancel(jobId), { method: "POST" });
-  assertOk(response);
+  await assertOk(response);
 
   const job = (await response.json()) as AnalysisJob;
   saveLatestAnalysisJob(job);
@@ -496,7 +512,7 @@ export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
 
 async function requestAnalysisJob(jobId: string): Promise<AnalysisJob> {
   const response = await fetchAI(AI_ENDPOINTS.analysisJob(jobId));
-  assertOk(response);
+  await assertOk(response);
 
   return (await response.json()) as AnalysisJob;
 }
@@ -509,7 +525,7 @@ export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
 
 async function listAnalysisJobs(limit = 100): Promise<AnalysisJob[]> {
   const response = await fetchAI(`${AI_ENDPOINTS.analysisJobs}?limit=${limit}`);
-  assertOk(response);
+  await assertOk(response);
   return (await response.json()) as AnalysisJob[];
 }
 

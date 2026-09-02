@@ -5,6 +5,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from psycopg import OperationalError
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ from ai_graph.api import (
     HEALTH_PATH,
     OPENAPI_URL,
     READINESS_PATH,
+    ParseStrategyRequest,
     SPEC_STRATEGY_PARSE_PATH,
     STRATEGY_DESCRIPTIONS_PATH,
     create_app,
@@ -449,6 +451,47 @@ def test_ready_release_accepts_parse_bound_core_natural_language_job(
 
     assert response.status_code == 201
     assert response.json()["job_id"]
+
+
+def test_parse_request_keeps_rolling_aliases_equivalent_and_rejects_ambiguity() -> None:
+    """A rolling deployment may send either alias, but never two different rules."""
+
+    strategy = "KRX 일봉에서 RSI 30 이하 진입, 70 이상 청산"
+    assert ParseStrategyRequest(natural_language=strategy).request_text == strategy
+    assert ParseStrategyRequest(query=strategy).request_text == strategy
+    assert ParseStrategyRequest(natural_language=strategy, query=strategy).request_text == strategy
+
+    with pytest.raises(ValidationError, match="natural_language and query must match"):
+        ParseStrategyRequest(natural_language=strategy, query="MACD 골든크로스 전략")
+
+
+def test_parse_strategy_http_contract_accepts_rolling_aliases_and_rejects_conflicts() -> None:
+    """The actual FastAPI admission route, not just its Pydantic model, is stable."""
+
+    strategy = "RSI 30 이하 진입, RSI 70 이상 청산 전략"
+    client = TestClient(
+        create_app(
+            InMemoryAnalysisJobStore(),
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    )
+
+    natural = client.post(SPEC_STRATEGY_PARSE_PATH, json={"natural_language": strategy})
+    query = client.post(SPEC_STRATEGY_PARSE_PATH, json={"query": strategy})
+    dual = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": strategy, "query": strategy},
+    )
+    conflict = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": strategy, "query": "MACD 골든크로스 전략"},
+    )
+
+    assert [response.status_code for response in (natural, query, dual)] == [200, 200, 200]
+    assert all(response.json()["kind"] == "rule_draft" for response in (natural, query, dual))
+    assert all(response.json()["is_executable"] is True for response in (natural, query, dual))
+    assert conflict.status_code == 422
+    assert "natural_language and query must match" in conflict.text
 
 
 def test_live_v3_parse_uses_the_server_metric_catalog_before_sealing(

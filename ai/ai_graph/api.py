@@ -337,7 +337,15 @@ class ParseStrategyRequest(BaseModel):
 
     @model_validator(mode="after")
     def require_query_text(self) -> ParseStrategyRequest:
-        if not self.request_text:
+        natural_language = (self.natural_language or "").strip()
+        query = (self.query or "").strip()
+        # During a rolling FE/AI deploy the browser sends both aliases.  Treat a
+        # disagreement as a request-contract error instead of silently choosing
+        # one wording and researching a different strategy from the one the user
+        # submitted.
+        if natural_language and query and natural_language != query:
+            raise ValueError("natural_language and query must match when both are provided")
+        if not (natural_language or query):
             raise ValueError("natural_language or query is required")
         return self
 

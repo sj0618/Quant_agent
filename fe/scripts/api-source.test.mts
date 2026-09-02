@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
+import { publicAiResponseFailure } from "../src/api/aiResponseFailure.ts";
 import { createStrategyParsePayload } from "../src/api/strategyParsePayload.ts";
 
 test("strategy review payload remains compatible across an FE/AI rolling deployment", () => {
@@ -11,6 +12,36 @@ test("strategy review payload remains compatible across an FE/AI rolling deploym
     natural_language: query,
     query,
   });
+});
+
+test("strategy parse failures retain a safe diagnosis without echoing strategy input", () => {
+  const validation = publicAiResponseFailure(422, {
+    detail: [{ type: "string_too_short", loc: ["body", "natural_language"], input: "secret strategy text" }],
+  });
+  assert.equal(validation.reasonCode, "request_validation_failed");
+  assert.match(validation.message ?? "", /natural_language/);
+  assert.doesNotMatch(validation.message ?? "", /secret strategy text/);
+
+  const scope = publicAiResponseFailure(422, {
+    reason_code: "unsupported_scope",
+    explanation: "원문 전략을 포함한 미등록 상세 오류",
+  });
+  assert.deepEqual(scope, {
+    reasonCode: "unsupported_scope",
+    message: "이 전략은 현재 전략 검증 범위에서 지원하지 않습니다.",
+  });
+
+  const personalized = publicAiResponseFailure(422, {
+    detail: { reason_code: "personalized_investment_request", message: "unsafe upstream text" },
+  });
+  assert.equal(personalized.reasonCode, "personalized_investment_request");
+  assert.match(personalized.message ?? "", /개인 보유·계좌·주문/);
+  assert.doesNotMatch(personalized.message ?? "", /unsafe upstream text/);
+
+  const unsafeDetail = publicAiResponseFailure(503, {
+    detail: "provider trace contains secret strategy text",
+  });
+  assert.doesNotMatch(unsafeDetail.message ?? "", /provider trace|secret strategy text/);
 });
 
 test("workspace reports use completed analysis jobs and keep email snapshots separate", async () => {

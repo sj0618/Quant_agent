@@ -59,6 +59,8 @@ jobs:
           ai/tests/test_ai_graph_backtest_module_integration.py
           ai/tests/test_graph_e2e.py
           ai/tests/test_api.py
+          ai/tests/test_strategy_parser.py
+          ai/tests/test_staging_pipeline_gate.py
           ai/tests/test_llm_concurrency_gate.py
           ai/tests/test_token_auth.py
           ai/tests/contracts
@@ -73,6 +75,7 @@ jobs:
           python -m pytest -q
           backend/tests/unit/test_main_smoke.py
           backend/tests/unit/test_auth_config.py
+          backend/tests/unit/test_combined_main.py
           backend/tests/unit/test_auth_core.py
           backend/tests/unit/test_auth_routes.py
           backend/tests/unit/test_fe_contract_routes.py
