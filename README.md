@@ -158,16 +158,21 @@ self-improvement 라운드 **사이**에서만 검사되고, 라운드 자체의
 anyio 워커 풀에서 돌기 때문에, 분석이 몰리면 liveness가 타임아웃해 바깥에서는 서비스가
 죽은 것으로 보인다.
 
-## 수용 기준 게이트: 지금은 report-only
+## 수용 기준 게이트: dev report-only, release enforced
 
 백테스트 수용 기준(미사용 구간 Sharpe·최대 낙폭·최소 거래 수·탐색 폭 보정 Sharpe,
-그리고 automatic 전략의 공식 TR 벤치마크 비교)은 **현재 판정만 하고 막지 않는다.**
-제품이 테스트 단계라 모든 전략이 결과를 들고 돌아오게 하기 위한 것이다.
+그리고 automatic 전략의 공식 TR 벤치마크 비교)은 **기본값이 런타임 프로필에 따라 갈린다.**
+dev 프로필은 **report-only** 로, 모든 전략이 결과를 들고 돌아오게 판정만 하고 막지 않는다.
+release 프로필(`AI_RELEASE_PROFILE` 또는 `APP_ENV` 가 `release`/`production`)은 **enforced**
+가 기본이라, 운영이 report-only 바닥을 조용히 배포하지 않는다. 어느 쪽 기본값이든
+`AI_VALIDATION_GATES` 로 양방향 재정의할 수 있다.
 
-| 환경변수 | 기본값 | 뜻 |
-|---|---|---|
-| `AI_VALIDATION_GATES` | `report_only` | 판정은 하되 `strategy_validated` 를 끄지 않음 |
-| | `enforced` | 기준 미달이면 실제로 검증 보류 |
+| 조건 | 결과 기본값 |
+|---|---|
+| dev 프로필, `AI_VALIDATION_GATES` 미설정 | `report_only` |
+| release 프로필(`APP_ENV=release`/`production` 등), 미설정 | `enforced` |
+| `AI_VALIDATION_GATES=report_only` | 판정은 하되 `strategy_validated` 를 끄지 않음(재정의) |
+| `AI_VALIDATION_GATES=enforced` | 기준 미달이면 실제로 검증 보류(재정의) |
 
 **평가는 계속 돈다.** 판정 사유는 리포트의 `수용 기준 판정 (참고)` 섹션으로 나가고,
 로그에도 남는다. "잠시 꺼둔다"며 삭제한 게이트는 나중에 기억으로 다시 써야 하고,

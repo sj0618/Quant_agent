@@ -1,0 +1,16 @@
+# Normalize line endings so CRLF drift cannot break offline release-trust gates
+# or ruff import ordering across contributors and CI runners.
+* text=auto eol=lf
+
+# Keep binary and archive assets untouched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.xlsx binary
+*.xls binary
+*.zip binary
+*.gz binary
+*.parquet binary
