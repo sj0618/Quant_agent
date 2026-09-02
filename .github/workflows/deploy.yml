@@ -551,6 +551,10 @@ jobs:
             chmod 600 "$AUDIT_SECRET_FILE"
             export APP_ENV=production
             export AI_JOB_STORE=persistent
+            # The backtest evaluation cache must be a persistent directory under the
+            # release profile (a /tmp fallback is refused by the AI service).
+            mkdir -p "$APP_DIR/.run/backtest-cache"
+            export AI_BACKTEST_CACHE_DIR="$APP_DIR/.run/backtest-cache"
             export AI_AUDIT_PRODUCTION_ENABLED=1
             export AI_AUDIT_SINK=postgres
             export AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET
@@ -942,6 +946,10 @@ jobs:
 
             export APP_ENV=production
             export AI_JOB_STORE=persistent
+            # The backtest evaluation cache must be a persistent directory under the
+            # release profile (a /tmp fallback is refused by the AI service).
+            mkdir -p "$APP_DIR/.run/backtest-cache"
+            export AI_BACKTEST_CACHE_DIR="$APP_DIR/.run/backtest-cache"
 
             # A deployment rollback restores source files, not runtime environment.
             # Recreate the same authorized audit session used by deploy_release so a
