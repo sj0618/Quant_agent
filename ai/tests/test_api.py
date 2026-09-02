@@ -261,6 +261,10 @@ def test_api_status_exposes_data_source_without_dsn_value(monkeypatch) -> None:
     assert data_source["price_source"] == "feature.kis_adjusted_ohlcv_daily"
     assert response.json()["job_store"]["active_mode"] == "memory"
     assert "secret" not in str(response.json()["job_store"])
+    audit = response.json()["audit"]
+    assert audit["sink"] == "noop"
+    assert audit["admission_authorized"] is False
+    assert audit["failure_count"] >= 0
 
 
 def test_isolated_staging_evidence_probe_requires_the_operator_token_and_projects_no_bodies(

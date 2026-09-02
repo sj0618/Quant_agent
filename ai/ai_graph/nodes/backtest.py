@@ -2652,8 +2652,11 @@ def _engine_market_rows(
                 else _finite_float(raw_notional, "raw_notional")
             )
         else:
-            # Synthetic callers that predate the raw loader retain one self-consistent
-            # series. Warehouse rows declare raw fields and therefore never reach here.
+            # Price-only V3 plans explicitly use the official adjusted OHLCV series for
+            # both signals and fills.  That is a source-backed execution basis, not a
+            # fabricated raw quote; raw notional remains absent so capacity is not
+            # claimed. Legacy fixture callers without a basis retain their historical
+            # self-consistent fallback.
             close = _finite_float(raw["close"], "close")
             open_price = _finite_float(raw.get("open", close), "open")
             high = _finite_float(raw.get("high", max(open_price, close)), "high")

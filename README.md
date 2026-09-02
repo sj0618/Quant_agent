@@ -126,7 +126,7 @@ SERVICE_DB_ARCHIVE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgr
 
 | 환경변수 | 기본값 | 뜻 |
 |---|---|---|
-| `AI_ANALYSIS_MAX_CONCURRENCY` | `4` | 동시에 실행할 분석 수. AOAI 게이트의 성장 상한(8)보다 낮게 둔 값이다 — 분석 1건이 프로바이더 호출을 여러 번 내므로. 다만 그 게이트는 capacity `2`에서 시작해 정상 응답 10회마다 한 단계씩만 올라가므로, `8`은 평상시 운용값이 아니라 천장이다. 이 기본값은 CPU 축을 보지 않는다 — [동시성 상한 재검토](docs/plans/analysis-concurrency-cap-review-20260824.md) 참조 |
+| `AI_ANALYSIS_MAX_CONCURRENCY` | `1` | 동시에 실행할 분석 수. 2 vCPU 단일 프로세스 노드에서 분석 한 건도 다년 PIT 행·백테스트 워커를 함께 사용하므로, 기본값은 하나의 job만 실행하고 나머지는 큐에 둔다. 부하·메모리·회복력 측정을 마친 뒤에만 명시적으로 높일 수 있다. |
 | `AI_ANALYSIS_QUEUE_WAIT_SECONDS` | `600` | 슬롯을 기다리는 한도. 분석 1건의 wall budget보다 길게 둬서, 한 건 뒤에 선 잡이 차례를 받게 한다 |
 | `AI_BACKTEST_WORKERS` | `2` | 분석 **1건**이 후보 평가에 쓸 프로세스 풀 워커 수. 실제 워커 수는 `min(후보 수, 이 값, os.cpu_count())`이고, 후보×행 수가 250,000 미만이면 직렬(1)로 떨어진다. 분석 **여러 건**에 걸친 워커 합계에는 상한이 없다 |
 

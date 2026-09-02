@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from hashlib import sha256
@@ -106,6 +107,54 @@ def build_pipeline_extract_snapshot(
     }
 
 
+def compute_pipeline_extract_hash(
+    *,
+    price_rows: Sequence[Mapping[str, Any]],
+    screening_candidates: Sequence[Mapping[str, Any]],
+    l4_evidence: Sequence[Mapping[str, Any]],
+    macro_snapshot: Mapping[str, Any] | None,
+    data_availability: Mapping[str, Any],
+    required_tickers: Sequence[str] = (),
+) -> str:
+    """Hash the same pipeline extract without materialising a duplicate large dict.
+
+    PostgreSQL adapters can return multi-million-row PIT payloads. Building a second
+    ``list(price_rows)`` snapshot merely to hash it doubles peak memory and spends a
+    second long JSON canonicalisation pass. This emits the exact canonical JSON shape
+    of :func:`build_pipeline_extract_snapshot` incrementally, so the digest remains
+    byte-for-byte equivalent to :func:`compute_extract_hash`.
+    """
+
+    digest = sha256()
+
+    def write(value: Any) -> None:
+        digest.update(_canonical_json(_canonicalize(value)).encode("utf-8"))
+
+    def write_sequence(items: Sequence[Mapping[str, Any]]) -> None:
+        digest.update(b"[")
+        for index, item in enumerate(items):
+            if index:
+                digest.update(b",")
+            write(item)
+        digest.update(b"]")
+
+    normalized_tickers = sorted({str(ticker).zfill(6) for ticker in required_tickers})
+    digest.update(b'{"data_availability":')
+    write(dict(data_availability))
+    digest.update(b',"l4_evidence":')
+    write_sequence(l4_evidence)
+    digest.update(b',"macro_snapshot":')
+    write(dict(macro_snapshot) if macro_snapshot is not None else None)
+    digest.update(b',"price_rows":')
+    write_sequence(price_rows)
+    digest.update(b',"required_tickers":')
+    write(normalized_tickers)
+    digest.update(b',"screening_candidates":')
+    write_sequence(screening_candidates)
+    digest.update(b"}")
+    return digest.hexdigest()
+
+
 def compute_snapshot_id(
     *,
     source: str,
@@ -155,12 +204,18 @@ def build_source_manifest(
     freshness: str,
     lineage_refs: Sequence[str] = (),
     source_version: str | None = None,
-    extract_snapshot: Mapping[str, Any],
+    extract_snapshot: Mapping[str, Any] | None = None,
+    extract_hash: str | None = None,
 ) -> ReleaseSourceManifest:
     """Build a stable manifest from adapter facts and the returned data extract."""
 
     normalized_refs = sorted({str(ref) for ref in lineage_refs if str(ref).strip()})
-    extract_hash = compute_extract_hash(extract_snapshot)
+    if (extract_snapshot is None) == (extract_hash is None):
+        raise ValueError("supply exactly one of extract_snapshot or extract_hash")
+    if extract_snapshot is not None:
+        extract_hash = compute_extract_hash(extract_snapshot)
+    if not isinstance(extract_hash, str) or re.fullmatch(LINEAGE_HASH_PATTERN, extract_hash) is None:
+        raise ValueError("extract_hash must be a lowercase SHA-256 digest")
     snapshot_id = compute_snapshot_id(
         source=source,
         as_of=as_of,
@@ -230,6 +285,8 @@ def validate_release_metadata(
     metadata: Mapping[str, Any] | None,
     *,
     extract_snapshot: Mapping[str, Any] | None = None,
+    loaded_extract_hash: str | None = None,
+    currentness_snapshot: Mapping[str, Any] | None = None,
 ) -> tuple[str, ...]:
     """Validate manifest, adapter metadata, and the concrete loaded extract.
 
@@ -261,11 +318,22 @@ def validate_release_metadata(
     source_version = metadata.get("source_snapshot_version")
     if source_version != manifest.source_version:
         errors.append("source manifest source_version does not match adapter metadata")
-    if extract_snapshot is None:
+    if extract_snapshot is not None and loaded_extract_hash is not None:
+        errors.append("release extract snapshot and precomputed hash cannot both be supplied")
+        return tuple(errors)
+    if extract_snapshot is not None:
+        actual_extract_hash = compute_extract_hash(extract_snapshot)
+    elif isinstance(loaded_extract_hash, str) and re.fullmatch(
+        LINEAGE_HASH_PATTERN, loaded_extract_hash
+    ):
+        # The PostgreSQL adapter computes this digest directly from the concrete
+        # payload before returning its bundle. Rebuilding the identical multi-year
+        # universe snapshot here allocated and canonicalised millions of rows a second
+        # time, despite no graph node mutating that bundle between the two checks.
+        actual_extract_hash = loaded_extract_hash
+    else:
         errors.append("release extract snapshot is missing")
         return tuple(errors)
-
-    actual_extract_hash = compute_extract_hash(extract_snapshot)
     if actual_extract_hash != manifest.extract_hash:
         errors.append("source manifest extract_hash does not match loaded data")
     expected_snapshot_id = compute_snapshot_id(
@@ -278,7 +346,18 @@ def validate_release_metadata(
     )
     if expected_snapshot_id != manifest.snapshot_id:
         errors.append("source manifest snapshot_id does not match loaded data")
-    errors.extend(_ticker_currentness_errors(extract_snapshot, expected_as_of=manifest.as_of))
+    # The adapter can supply a compact current-session projection alongside the
+    # precomputed full-extract digest.  This preserves an independent check that every
+    # current ticker has the declared latest bar without canonicalising millions of
+    # historical PIT rows for a second time in the graph.
+    if extract_snapshot is not None:
+        currentness_snapshot = extract_snapshot
+    if currentness_snapshot is None:
+        currentness_snapshot = {
+            "required_tickers": metadata.get("current_snapshot_tickers", ()),
+            "price_rows": metadata.get("current_snapshot_price_rows", ()),
+        }
+    errors.extend(_ticker_currentness_errors(currentness_snapshot, expected_as_of=manifest.as_of))
     return tuple(errors)
 
 

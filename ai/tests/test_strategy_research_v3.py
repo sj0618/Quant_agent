@@ -6,6 +6,7 @@ import pytest
 
 from ai_graph.llm.base import LLMJsonRequest, LLMTimeoutError
 from ai_graph.nodes.strategy_research import (
+    RELATIVE_STRENGTH_PROXY_DISCLOSURE,
     StrategyResearchError,
     research_strategy_execution_spec,
 )
@@ -198,6 +199,7 @@ def test_researcher_normalizes_market_relative_comparison_to_excess_return_thres
     assert candidate.entry_conditions[0].universe_rank_pct == 0.2
     assert candidate.exit_conditions[0].right == 0
     assert candidate.required_metrics == ["relative_strength_20d", "sma20"]
+    assert RELATIVE_STRENGTH_PROXY_DISCLOSURE in candidate.assumptions
 
 
 def test_researcher_repairs_one_invalid_structured_candidate_then_seals_v3() -> None:
@@ -339,6 +341,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
         screen_current: bool = True,
         required_metrics: object | None = None,
         requires_financials: object | None = None,
+        compact_price_rows: bool = False,
     ) -> object:
         captured.update(
             {
@@ -347,6 +350,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
                 "screen_current": screen_current,
                 "required_metrics": required_metrics,
                 "requires_financials": requires_financials,
+                "compact_price_rows": compact_price_rows,
             }
         )
         raise RuntimeError("data loader captured")
@@ -365,6 +369,9 @@ def test_sealed_research_skips_non_authoritative_current_screening(
     assert captured["screen_current"] is False
     assert set(captured["required_metrics"] or ()) == {"close", "high", "sma20"}
     assert captured["requires_financials"] is False
+    # A moving-average condition has a warehouse TA family, so it must not take the
+    # OHLCV-only projection reserved for relative-strength price paths.
+    assert captured["compact_price_rows"] is False
 
 
 def test_data_plan_reads_the_sealed_ast_not_only_the_researcher_metric_summary() -> None:
