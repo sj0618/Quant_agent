@@ -1,0 +1,197 @@
+name: Recover backend and frontend
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployed_revision:
+        description: Full SHA of the release already running on the server
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quant-agent-runtime-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover-current-release:
+    name: Restart current backend and frontend release
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout recovery verifier
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p 30233 quant-agent.kro.kr >> ~/.ssh/known_hosts
+
+      - name: Restart only the current backend and frontend processes
+        run: |
+          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr bash -s -- "${{ inputs.deployed_revision }}" <<'REMOTE'
+          set -euo pipefail
+
+          DEPLOYMENT_REVISION="$1"
+          if ! printf '%s' "$DEPLOYMENT_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "deployed revision must be a 40-character lowercase SHA"
+            exit 2
+          fi
+
+          # Load the already-provisioned runtime configuration without printing it.
+          if [ -f "$HOME/.bashrc" ]; then
+            set +u
+            source "$HOME/.bashrc" >/dev/null 2>&1 || true
+            set -u
+          fi
+
+          APP_DIR="$HOME/mvp_sp1/quant-proj"
+          RUN_DIR="$APP_DIR/.run"
+          SECRET_DIR="$HOME/.config/quantagent"
+          PYTHON="$APP_DIR/ai/.venv/bin/python"
+          READINESS_CHECKER="$APP_DIR/scripts/readiness-semantic-gate.mjs"
+
+          test -x "$PYTHON"
+          test -f "$APP_DIR/combined_main.py"
+          test -f "$APP_DIR/fe/scripts/production-gateway.mjs"
+          test -f "$READINESS_CHECKER"
+          command -v node >/dev/null
+          mkdir -p "$RUN_DIR"
+
+          # Recovery does not create, change, or reveal credentials.  It only
+          # reuses the protected runtime files created by the successful deploy.
+          AUDIT_SECRET_FILE="$RUN_DIR/ai-audit-admission.secret"
+          RULE_DRAFT_SECRET_FILE="$SECRET_DIR/ai-rule-draft-hmac.secret"
+          test -s "$AUDIT_SECRET_FILE"
+          test -s "$RULE_DRAFT_SECRET_FILE"
+
+          export APP_ENV=production
+          export AI_JOB_STORE=persistent
+          export AI_AUDIT_PRODUCTION_ENABLED=1
+          export AI_AUDIT_SINK=postgres
+          export AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET
+          AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET="$(tr -d '\r\n' < "$AUDIT_SECRET_FILE")"
+          export AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION=server-v1
+          export AI_AUDIT_GATE_B_ADMISSION_AUDIENCE=quantagent.ai.audit
+          export AI_AUDIT_GATE_B_EVIDENCE_ID=production-recovery
+          export AI_AUDIT_GATE_B_DEPLOYMENT_REVISION="$DEPLOYMENT_REVISION"
+          export AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE=active
+          export AI_RULE_DRAFT_HMAC_SECRET
+          AI_RULE_DRAFT_HMAC_SECRET="$(tr -d '\r\n' < "$RULE_DRAFT_SECRET_FILE")"
+          export AI_RULE_DRAFT_HMAC_KEY_VERSION=server-v1
+          export AI_AUDIT_GATE_B_ADMISSION_TOKEN
+          AI_AUDIT_GATE_B_ADMISSION_TOKEN="$("$PYTHON" - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import os
+          import time
+
+          def encode(value):
+              raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+              return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+          now = time.time()
+          key_version = os.environ["AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION"]
+          header = {"alg": "HS256", "key_version": key_version}
+          claims = {
+              "audience": os.environ["AI_AUDIT_GATE_B_ADMISSION_AUDIENCE"],
+              "deployment_revision": os.environ["AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"],
+              "evidence_id": os.environ["AI_AUDIT_GATE_B_EVIDENCE_ID"],
+              "expiry": now + 365 * 24 * 60 * 60,
+              "issued_at": now - 1,
+              "key_version": key_version,
+          }
+          signing_input = f"{encode(header)}.{encode(claims)}"
+          signature = hmac.new(
+              os.environ["AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET"].encode(),
+              signing_input.encode("ascii"),
+              hashlib.sha256,
+          ).digest()
+          print(f"{signing_input}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}")
+          PY
+          )"
+
+          stop_port() {
+            local port="$1"
+            local pids
+            for _ in $(seq 1 5); do
+              pids="$(ss -H -ltnp "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)"
+              [ -z "$pids" ] && return 0
+              for pid in $pids; do kill "$pid" 2>/dev/null || true; done
+              sleep 1
+            done
+            pids="$(ss -H -ltnp "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)"
+            for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+            sleep 1
+            [ -z "$(ss -H -ltnp "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' || true)" ]
+          }
+
+          wait_for_url() {
+            local label="$1"
+            local url="$2"
+            for _ in $(seq 1 30); do
+              if curl -fsS --connect-timeout 3 --max-time 8 "$url" >/dev/null 2>&1; then
+                echo "$label ready"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "$label did not become ready"
+            return 1
+          }
+
+          wait_for_readiness() {
+            local label="$1"
+            local url="$2"
+            local profile="$3"
+            local body
+            body="$(mktemp "$RUN_DIR/recovery-readiness.XXXXXX")"
+            trap 'rm -f "$body"; trap - RETURN' RETURN
+            for _ in $(seq 1 30); do
+              if curl -fsS --connect-timeout 3 --max-time 8 -o "$body" "$url" >/dev/null 2>&1 && \
+                node "$READINESS_CHECKER" --label "$label" --profile "$profile" < "$body"; then
+                echo "$label ready"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "$label did not become ready"
+            return 1
+          }
+
+          # Kill only the two managed application listeners. No database, schema,
+          # migration, application source, or data operation is part of recovery.
+          pkill -TERM -f "$PYTHON -m uvicorn combined_main:app" 2>/dev/null || true
+          sleep 2
+          pkill -KILL -f "$PYTHON -m uvicorn combined_main:app" 2>/dev/null || true
+          stop_port 18001
+          stop_port 18000
+          rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
+
+          cd "$APP_DIR"
+          nohup "$PYTHON" -m uvicorn combined_main:app --host 0.0.0.0 --port 18001 --workers 1 > "$RUN_DIR/combined.log" 2>&1 &
+          echo "$!" > "$RUN_DIR/combined.pid"
+
+          cd "$APP_DIR/fe"
+          nohup env COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18001" HOST="127.0.0.1" PORT="18000" node scripts/production-gateway.mjs > "$RUN_DIR/fe.log" 2>&1 &
+          echo "$!" > "$RUN_DIR/fe.pid"
+
+          wait_for_url "combined-health" "http://127.0.0.1:18001/combined-health"
+          wait_for_readiness "backend-readiness" "http://127.0.0.1:18001/readiness" backend
+          "$PYTHON" -c 'import json, urllib.request; assert json.load(urllib.request.urlopen("http://127.0.0.1:18001/ai-api/api-status", timeout=8))["job_store"]["active_mode"] == "persistent"; print("persistent-job-store ready")'
+          wait_for_readiness "ai-api-readiness" "http://127.0.0.1:18001/ai-api/readiness" ai
+          wait_for_url "frontend-gateway" "http://127.0.0.1:18000/"
+          REMOTE
+
+      - name: Verify public reverse proxy endpoints
+        run: |
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr/ >/dev/null
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr/ai-api/api-status >/dev/null
+          echo "public backend and frontend endpoints are reachable"
