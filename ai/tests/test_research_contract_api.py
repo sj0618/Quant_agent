@@ -241,12 +241,14 @@ def test_confirmed_execution_spec_is_compiled_without_reinterpretation(
     )
 
     strategy = graph_module.StrategySpec.model_validate(result["strategy_spec"])
-    assert [(condition.left, condition.operator.value, condition.right) for condition in strategy.entry_conditions] == [
-        ("rsi", "lte", 30)
-    ]
-    assert [(condition.left, condition.operator.value, condition.right) for condition in strategy.exit_conditions] == [
-        ("sma20", "gte", 100)
-    ]
+    assert [
+        (condition.left, condition.operator.value, condition.right)
+        for condition in strategy.entry_conditions
+    ] == [("rsi", "lte", 30)]
+    assert [
+        (condition.left, condition.operator.value, condition.right)
+        for condition in strategy.exit_conditions
+    ] == [("sma20", "gte", 100)]
 
 
 def test_tampered_parse_spec_creates_no_primary_job_or_runner_side_effect() -> None:
@@ -451,7 +453,9 @@ def test_data_evidence_probe_is_hidden_token_gated_and_has_no_job_side_effects(m
     assert calls == []
 
 
-def test_confirmed_rule_executes_only_when_activation_is_explicit_and_then_projects_unavailable() -> None:
+def test_confirmed_rule_executes_only_when_activation_is_explicit_and_then_projects_unavailable() -> (
+    None
+):
     calls: list[str] = []
     client, store = _client(execution_enabled=True, calls=calls)
     draft = _parse_executable_draft(client)
@@ -463,7 +467,11 @@ def test_confirmed_rule_executes_only_when_activation_is_explicit_and_then_proje
 
     assert response.status_code == 201
     accepted = response.json()
-    assert accepted == {"kind": "research_job_accepted", "job_id": accepted["job_id"], "status": "queued"}
+    assert accepted == {
+        "kind": "research_job_accepted",
+        "job_id": accepted["job_id"],
+        "status": "queued",
+    }
     assert len(store.jobs) == 1
     assert len(calls) == 1
     assert "RSI가 30 이하이고" not in calls[0]
@@ -496,24 +504,25 @@ def test_execution_remains_fail_closed_until_explicit_activation() -> None:
     assert calls == []
 
 
-def test_scope_refusal_stays_before_signing_or_execution() -> None:
+def test_strategy_parse_does_not_refuse_personal_wording_before_interpretation() -> None:
     calls: list[str] = []
     client, store = _client(execution_enabled=True, calls=calls)
 
     response = client.post(
         SPEC_STRATEGY_PARSE_PATH,
-        json={"natural_language": "내 보유 종목을 지금 팔아줘"},
+        json={
+            "natural_language": "내 보유 종목을 RSI가 30 이하일 때 진입하고 70 이상일 때 청산하는 전략으로 검토해줘"
+        },
     )
 
-    assert response.status_code == 422
-    assert response.json()["kind"] == "scope_refusal"
-    assert "내 보유" not in response.text
+    assert response.status_code == 200
+    assert response.json()["kind"] == "rule_draft"
     assert store.jobs == {}
     assert calls == []
 
 
 class _ReadOnlyTokenResolver:
-    """Records the one identity read the preflight boundary is allowed to perform."""
+    """Records the one identity read the admission boundary is allowed to perform."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -587,36 +596,19 @@ def test_durable_idempotent_retry_does_not_consume_bearer_quota_again() -> None:
     assert quota.idempotency_keys == ["quota-retry-key-123456"]
 
 
-def test_scope_refusal_transport_performs_only_identity_read_before_all_writes(
+def test_strategy_parse_transport_accepts_input_after_identity_read_without_creating_a_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A public 422 must be returned before every signer/job/audit/runner boundary.
-
-    The token lookup is deliberately the lone permitted call: it is read-only and keeps
-    refusal responses scoped to an authenticated caller without spending quota.
-    """
-
-    import ai_graph.api as api_module
+    """Parsing an input is read-only with respect to job and quota state."""
 
     calls: list[str] = []
     store = InMemoryAnalysisJobStore()
     token_resolver = _ReadOnlyTokenResolver()
     quota = _QuotaSpy()
 
-    def forbidden(name: str):
-        def fail(*_args, **_kwargs):
-            calls.append(name)
-            raise AssertionError(f"refused request reached {name}")
-
-        return fail
-
-    monkeypatch.setattr(store, "create_job", forbidden("job_store"))
-    monkeypatch.setattr(api_module, "build_rule_draft", forbidden("signer"))
-    monkeypatch.setattr(api_module, "_build_analysis_runner_with_audit", forbidden("audit_runner"))
-
     app = create_app(
         store,
-        analysis_runner=forbidden("runner"),
+        analysis_runner=lambda query, trace_id: (calls.append(query), _ready_envelope(trace_id))[1],
         session_resolver=DisabledSessionResolver(),
         account_token_resolver=token_resolver,
         account_token_quota=quota,
@@ -627,12 +619,14 @@ def test_scope_refusal_transport_performs_only_identity_read_before_all_writes(
 
     response = client.post(
         SPEC_STRATEGY_PARSE_PATH,
-        json={"natural_language": "내 계좌에 맞는 종목을 골라줘"},
+        json={
+            "natural_language": "내 계좌라는 표현이 있어도 RSI가 30 이하일 때 진입하고 70 이상일 때 청산하는 전략을 검토해줘"
+        },
         headers={"Authorization": "Bearer read-only-token"},
     )
 
-    assert response.status_code == 422
-    assert response.json()["kind"] == "scope_refusal"
+    assert response.status_code == 200
+    assert response.json()["kind"] == "rule_draft"
     assert token_resolver.calls == 1
     assert quota.calls == 0
     assert calls == []

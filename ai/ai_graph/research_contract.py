@@ -280,34 +280,10 @@ class RuleDraftV1(BaseModel):
         return self
 
 
-class ScopeRefusalV1(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    kind: Literal["scope_refusal"] = "scope_refusal"
-    reason_code: Literal["personalized_investment_request"]
-    explanation: str = Field(min_length=1)
-    general_example: str = Field(min_length=1)
-    guidance: str = Field(min_length=1)
-
-
-class UnsupportedScopeV1(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    kind: Literal["unsupported_scope"] = "unsupported_scope"
-    reason_code: Literal["unsupported_asset_family"]
-    explanation: str = Field(min_length=1)
-    general_example: str = Field(min_length=1)
-    guidance: str = Field(min_length=1)
-
-
-ParseReviewV1 = Annotated[
-    RuleDraftV1 | ScopeRefusalV1 | UnsupportedScopeV1,
-    Field(discriminator="kind"),
-]
-
-# The new name makes the parse outcome's three states explicit without breaking older
-# callers that still import ``ParseReviewV1``.
-ParseOutcomeV1 = ParseReviewV1
+# ``ParseReviewV1`` remains an import-compatible name while all strategy inputs now
+# advance to one RuleDraftV1 outcome instead of being keyword-refused before research.
+ParseReviewV1 = RuleDraftV1
+ParseOutcomeV1 = RuleDraftV1
 
 
 class DraftTokenValidationError(ValueError):

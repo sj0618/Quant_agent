@@ -23,6 +23,7 @@ test("offline environment removes live settings and forces local test modes", ()
     AI_AOAI_API_KEY: "must-not-propagate",
     AI_DATABASE_DSN: "postgresql://must-not-propagate",
     AI_LLM_DIGEST_API_KEY: "role-secret-must-not-propagate",
+    AI_LLM_BACKTEST_CODE_MODEL: "role-model-must-not-propagate",
     AUTH_ENABLED: "1",
     AI_LLM_PROVIDER: "aoai",
     AI_BACKTEST_CACHE_DIR: "/stale/other-revision-cache",
@@ -32,6 +33,7 @@ test("offline environment removes live settings and forces local test modes", ()
   assert.equal(environment.AI_AOAI_API_KEY, undefined);
   assert.equal(environment.AI_DATABASE_DSN, undefined);
   assert.equal(environment.AI_LLM_DIGEST_API_KEY, undefined);
+  assert.equal(environment.AI_LLM_BACKTEST_CODE_MODEL, undefined);
   assert.equal(environment.AUTH_ENABLED, "0");
   assert.equal(environment.AI_LLM_PROVIDER, "mock");
   assert.match(environment.AI_BACKTEST_CACHE_DIR, /quantagent-release-trust-/u);
@@ -189,7 +191,7 @@ test("release trust includes API, screen, metric, and backend contract gates", (
     "backend-auth-report-and-deploy-contracts",
     "frontend-production-build-and-contracts",
   ]);
-  assert.ok(checks[0].args.includes("ai/tests/test_research_request_preflight.py"));
+  assert.ok(checks[0].args.includes("ai/tests/test_strategy_research_v3.py"));
   assert.ok(checks[1].args.includes("backtest_module/tests/test_backtest.py"));
   assert.ok(checks[3].args.includes("backend/tests/unit/test_auth_routes.py"));
   assert.ok(

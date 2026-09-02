@@ -3,16 +3,6 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { clearUserScopedStorage, USER_SCOPED_STORAGE_KEYS } from "../src/utils/userScopedStorage.ts";
 import { publicAiResponseFailure } from "../src/api/aiResponseFailure.ts";
-import { createStrategyParsePayload } from "../src/api/strategyParsePayload.ts";
-
-test("strategy review payload remains compatible across an FE/AI rolling deployment", () => {
-  const query = "KRX 일봉에서 RSI 30 이하 진입, 70 이상 청산";
-
-  assert.deepEqual(createStrategyParsePayload(query), {
-    natural_language: query,
-    query,
-  });
-});
 
 test("strategy parse failures retain a safe diagnosis without echoing strategy input", () => {
   const validation = publicAiResponseFailure(422, {
@@ -21,22 +11,6 @@ test("strategy parse failures retain a safe diagnosis without echoing strategy i
   assert.equal(validation.reasonCode, "request_validation_failed");
   assert.match(validation.message ?? "", /natural_language/);
   assert.doesNotMatch(validation.message ?? "", /secret strategy text/);
-
-  const scope = publicAiResponseFailure(422, {
-    reason_code: "unsupported_scope",
-    explanation: "원문 전략을 포함한 미등록 상세 오류",
-  });
-  assert.deepEqual(scope, {
-    reasonCode: "unsupported_scope",
-    message: "이 전략은 현재 전략 검증 범위에서 지원하지 않습니다.",
-  });
-
-  const personalized = publicAiResponseFailure(422, {
-    detail: { reason_code: "personalized_investment_request", message: "unsafe upstream text" },
-  });
-  assert.equal(personalized.reasonCode, "personalized_investment_request");
-  assert.match(personalized.message ?? "", /개인 보유·계좌·주문/);
-  assert.doesNotMatch(personalized.message ?? "", /unsafe upstream text/);
 
   const unsafeDetail = publicAiResponseFailure(503, {
     detail: "provider trace contains secret strategy text",
@@ -66,7 +40,7 @@ test("workspace restores the latest server analysis on a fresh browser", async (
   assert.match(source, /setAnalysisJobs\(\(jobs\) => \(jobs\.length \? jobs : \[latestJob\]\)\)/);
 });
 
-test("workspace delegates parse-bound admission to the server in one request", async () => {
+test("workspace directly queues a natural-language strategy job", async () => {
   const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
   const createJob = clientSource.slice(
     clientSource.indexOf("export async function createAnalysisJob"),
@@ -74,25 +48,19 @@ test("workspace delegates parse-bound admission to the server in one request", a
   );
   assert.match(createJob, /fetchAI\(AI_ENDPOINTS\.analysisJobs/);
   assert.match(createJob, /JSON\.stringify\(\{ query: trimmedQuery \}\)/);
-  assert.doesNotMatch(createJob, /fetchAI\(AI_ENDPOINTS\.strategyParse/);
+  assert.doesNotMatch(createJob, /strategyParse/);
   assert.doesNotMatch(createJob, /parse_token:/);
 });
 
-test("review confirmation keeps the original natural-language context without changing the sealed rule", async () => {
-  const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
-  const review = clientSource.slice(
-    clientSource.indexOf("export async function reviewStrategy"),
-    clientSource.indexOf("export interface ResearchAppendix"),
-  );
-  const confirmation = clientSource.slice(
-    clientSource.indexOf("export async function createConfirmedAnalysisJob"),
-    clientSource.indexOf("export interface ResearchAppendix"),
-  );
+test("workspace does not require an RSI-style condition confirmation before a job", async () => {
+  const [clientSource, appSource] = await Promise.all([
+    readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8"),
+  ]);
 
-  assert.match(review, /\{ \.\.\.parsed, original_query: normalizedQuery \}/);
-  assert.match(confirmation, /strategy_execution_spec: parsed\.strategy_execution_spec,/);
-  assert.match(confirmation, /query: parsed\.original_query,/);
-  assert.match(review, /createStrategyParsePayload\(normalizedQuery\)/);
+  assert.doesNotMatch(clientSource, /reviewStrategy|createConfirmedAnalysisJob|strategyParsePayload/);
+  assert.doesNotMatch(appSource, /StrategyDraftConfirmation|pendingDraft|handleConfirmDraft/);
+  assert.match(appSource, /const job = await createAnalysisJob\(query\)/);
 });
 
 test("workspace discards a running job lost during a server restart", async () => {

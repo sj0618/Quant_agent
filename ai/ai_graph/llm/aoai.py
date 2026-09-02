@@ -169,12 +169,14 @@ class AOAIResponsesClient:
         total_tokens: int | None = None
         physical_before = self.physical_http_post_count
         try:
-            # Always stream, even when no activity listener is installed. A non-streamed
-            # Responses request does not expose when generation starts, so it cannot
-            # enforce a response-start timeout independently from response completion.
-            payload, retry_count, direct_body, provider_request_id = (
-                self._stream_with_retries(request)
-            )
+            # Most interactive nodes stream so the workspace can show provider
+            # activity.  The pre-backtest web-research node deliberately requests a
+            # bounded ordinary completion: some Azure deployments buffer search events
+            # until the tool returns, which made a healthy request look silent and get
+            # retried into a timeout.  The job itself remains asynchronous and
+            # observable through its durable stage state.
+            execute = self._stream_with_retries if request.stream_response else self._non_stream_with_retries
+            payload, retry_count, direct_body, provider_request_id = execute(request)
             if direct_body is not None:
                 try:
                     payload = json.loads(direct_body)
@@ -400,6 +402,116 @@ class AOAIResponsesClient:
 
         raise _typed_provider_failure(last_error, retry_count=retry_count) from last_error
 
+    def _non_stream_with_retries(
+        self, request: LLMJsonRequest
+    ) -> tuple[dict[str, Any] | None, int, str | None, str | None]:
+        """Send one bounded Responses completion without requiring SSE progress.
+
+        Web search can legally take several seconds before emitting a meaningful stream
+        event.  This path keeps the exact schema, retry, capacity, audit, and provider
+        compatibility behaviour of the streamed client, but waits for its final JSON
+        response rather than treating missing interim events as an outage.
+        """
+
+        body = self._request_body(request)
+        body["stream"] = False
+        headers = {"Content-Type": "application/json", "api-key": self.api_key}
+        max_posts = self.max_retries + MAX_COMPATIBILITY_ADJUSTMENTS + 1
+        last_error: Exception | None = None
+        retry_count = 0
+        compatibility_adjustments: list[str] = []
+        pending_backoff: tuple[int, httpx.Response | None] | None = None
+
+        for _ in range(max_posts):
+            if pending_backoff is not None:
+                backoff_attempt, backoff_response = pending_backoff
+                pending_backoff = None
+                _sleep_before_retry(
+                    self.retry_backoff_seconds, backoff_attempt, backoff_response
+                )
+            attempt_started = time.perf_counter()
+            client = self._http_client or httpx.Client(timeout=self.timeout_seconds)
+            owns_client = self._http_client is None
+            try:
+                with self._concurrency_gate.acquire_slot():
+                    response = client.post(
+                        self.responses_url,
+                        headers=headers,
+                        json=body,
+                        timeout=self.timeout_seconds,
+                    )
+                self.physical_http_post_count += 1
+                self._observe_provider_capacity(response)
+                self.last_call_timings = {
+                    "first_header_seconds": round(time.perf_counter() - attempt_started, 6),
+                    "first_meaningful_text_seconds": None,
+                    "compatibility_adjustments": list(compatibility_adjustments),
+                }
+                if response.status_code >= 400:
+                    if _unsupported_parameter(response, "temperature"):
+                        compatibility_adjustments.append("temperature")
+                        self._temperature_supported = False
+                        _remember_unsupported(self._compatibility_cache_key, "temperature")
+                        body.pop("temperature", None)
+                        continue
+                    if _unsupported_parameter(response, "service_tier"):
+                        compatibility_adjustments.append("service_tier")
+                        self._service_tier_supported = False
+                        _remember_unsupported(self._compatibility_cache_key, "service_tier")
+                        body.pop("service_tier", None)
+                        continue
+                    if "text" in body:
+                        compatibility_adjustments.append("structured_outputs")
+                        self._structured_outputs_supported = False
+                        _remember_unsupported(self._compatibility_cache_key, "structured_outputs")
+                        body.pop("text", None)
+                        continue
+                    if (
+                        response.status_code in RETRYABLE_STATUS_CODES
+                        and retry_count < self.max_retries
+                    ):
+                        pending_backoff = (retry_count, response)
+                        retry_count += 1
+                        continue
+                    response.raise_for_status()
+                try:
+                    payload = response.json()
+                except json.JSONDecodeError as exc:
+                    last_error = LLMResponseParseError(
+                        "AOAI non-stream response body is not valid JSON"
+                    )
+                    if retry_count < self.max_retries:
+                        pending_backoff = (retry_count, None)
+                        retry_count += 1
+                        continue
+                    raise last_error from exc
+                if not isinstance(payload, dict):
+                    last_error = LLMResponseParseError("AOAI non-stream response is not an object")
+                    if retry_count < self.max_retries:
+                        pending_backoff = (retry_count, None)
+                        retry_count += 1
+                        continue
+                    raise last_error
+                self.last_call_timings["first_meaningful_text_seconds"] = round(
+                    time.perf_counter() - attempt_started, 6
+                )
+                return payload, retry_count, None, _provider_request_id(payload, response)
+            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                last_error = exc
+                if not _should_retry(exc) or retry_count >= self.max_retries:
+                    break
+                _sleep_before_retry(
+                    self.retry_backoff_seconds,
+                    retry_count,
+                    exc.response if isinstance(exc, httpx.HTTPStatusError) else None,
+                )
+                retry_count += 1
+            finally:
+                if owns_client:
+                    client.close()
+
+        raise _typed_provider_failure(last_error, retry_count=retry_count) from last_error
+
     def _observe_provider_capacity(self, response: httpx.Response) -> None:
         """Report what this response says about remaining deployment capacity.
 
@@ -523,6 +635,10 @@ class AOAIResponsesClient:
             body["service_tier"] = self.service_tier
         if request.max_output_tokens is not None:
             body["max_output_tokens"] = request.max_output_tokens
+        if request.reasoning_effort is not None:
+            body["reasoning"] = {"effort": request.reasoning_effort}
+        if request.max_tool_calls is not None:
+            body["max_tool_calls"] = request.max_tool_calls
         if request.enable_web_search:
             body["tools"] = [{"type": self.web_search_tool_type}]
         if request.response_schema is not None and self._structured_outputs_supported:

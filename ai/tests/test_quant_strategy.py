@@ -380,11 +380,9 @@ def test_original_vague_request_survives_a_concrete_interpreter_rewrite() -> Non
 
 
 def test_automatic_profile_is_reported_as_the_intended_rule() -> None:
-    # Phrased as a research request rather than "추천해줘": run_analysis goes through
-    # classify_research_request, which refuses action-imperative prompts on purpose
-    # (see test_research_request_preflight). Automatic mode is the default for any
-    # free-form request, so the wording here does not have to carry the word
-    # "추천" to reach the automatic path - and this test is about rule provenance.
+    # Automatic mode is the default for any free-form request. Generic recommendation
+    # wording is a valid product input; this test verifies the resulting rule
+    # provenance rather than an obsolete keyword refusal path.
     envelope = run_analysis(
         "사람들이 많이 쓰는 검증된 퀀트 전략을 자동으로 선택해 검토해 주세요",
         trace_id="automatic-profile-provenance",

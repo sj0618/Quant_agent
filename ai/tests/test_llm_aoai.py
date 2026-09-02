@@ -83,6 +83,47 @@ def test_aoai_client_parses_direct_json_payload() -> None:
     assert result == {"candidates": ["a", "b", "c"], "fallback_reasons": []}
 
 
+def test_aoai_client_can_use_a_bounded_non_stream_completion() -> None:
+    """Web research may be healthy even when Azure buffers SSE tool events."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["stream"] is False
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_json(
+        make_request().model_copy(update={"stream_response": False})
+    ) == {"message": "ok"}
+
+
+def test_aoai_client_sends_bounded_reasoning_and_tool_budgets() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["reasoning"] == {"effort": "low"}
+        assert body["max_tool_calls"] == 1
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_json(
+        make_request().model_copy(
+            update={"reasoning_effort": "low", "max_tool_calls": 1, "stream_response": False}
+        )
+    ) == {"message": "ok"}
+
+
 def test_aoai_client_parses_output_text_json_payload() -> None:
     client = make_client(
         {"output_text": json.dumps({"candidates": ["a", "b", "c"], "fallback_reasons": []})}

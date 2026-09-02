@@ -5,7 +5,7 @@ import { AppLayout } from "../components/layout/AppLayout";
 import {
   clearLatestAnalysisJob,
   completeAnalysisRun,
-  createConfirmedAnalysisJob,
+  createAnalysisJob,
   createAnalysisRun,
   aiResponseStatus,
   cancelAnalysisJob,
@@ -13,16 +13,13 @@ import {
   getWorkspaceTemplate,
   mergeAnalysisJobIntoOverview,
   refreshLatestAnalysisJob,
-  reviewStrategy,
   saveLatestAnalysisJob,
-  type RuleDraftOutcome,
 } from "../api/quantAgentClient";
 import { useAnalysisActivity, type ActivityState } from "../api/analysisActivity";
 import { DebateActivityPanel } from "../features/app/DebateActivityPanel";
 import { OverviewTab } from "../features/app/OverviewTab";
 import { PerformanceTab } from "../features/app/PerformanceTab";
 import { StrategyInputPanel } from "../features/app/StrategyInputPanel";
-import { StrategyDraftConfirmation } from "../features/app/StrategyDraftConfirmation";
 import { TradingInfoTab } from "../features/app/TradingInfoTab";
 import { ExplorationBaseReport } from "../features/reports/ExplorationBaseReport";
 import { useAsyncData } from "../hooks/useAsyncData";
@@ -258,8 +255,6 @@ export function AppPage() {
   const { data, loading, error } = useAsyncData(getWorkspaceTemplate, []);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>(getInitialTab);
   const [analysisJobs, setAnalysisJobs] = useState<AnalysisJob[]>([]);
-  const [pendingDraft, setPendingDraft] = useState<RuleDraftOutcome | null>(null);
-  const [confirmingDraft, setConfirmingDraft] = useState(false);
   const [conversationHistory, setConversationHistory] = useState<WorkspaceConversation[]>(readConversationHistory);
   const [pendingAnalysis, setPendingAnalysis] = useState<PendingAnalysis | null>(null);
   const [progressNow, setProgressNow] = useState(Date.now());
@@ -514,8 +509,6 @@ export function AppPage() {
     }
     clearLatestAnalysisJob();
     setAnalysisJobs([]);
-    setPendingDraft(null);
-    setConfirmingDraft(false);
     setPendingAnalysis(null);
     setCancelError(null);
   };
@@ -546,26 +539,9 @@ export function AppPage() {
       ...conversation.jobs.filter((job) => !job.result).map((job) => job.job_id),
     ]);
     setAnalysisJobs(conversation.jobs);
-    setPendingDraft(null);
-    setConfirmingDraft(false);
     setCancelError(null);
     setActiveTab("overview");
     setMobilePane("result");
-  };
-
-  const handleConfirmDraft = async () => {
-    if (!pendingDraft) return;
-    setConfirmingDraft(true);
-    setCancelError(null);
-    try {
-      const job = await createConfirmedAnalysisJob(pendingDraft);
-      setAnalysisJobs((jobs) => [...jobs, job]);
-      setPendingDraft(null);
-    } catch (error) {
-      setCancelError(error instanceof Error ? error.message : "백테스트 요청을 처리할 수 없습니다.");
-    } finally {
-      setConfirmingDraft(false);
-    }
   };
 
   return (
@@ -614,7 +590,7 @@ export function AppPage() {
               setCancelError(error instanceof Error ? error.message : "분석 중단 요청에 실패했습니다.");
             }
           }}
-          running={Boolean(runningJob) || Boolean(pendingAnalysis) || confirmingDraft}
+          running={Boolean(runningJob) || Boolean(pendingAnalysis)}
           onNewConversation={handleNewConversation}
           onAnalyze={async (query) => {
             // A brand-new strategy starts a brand-new conversation; answering a
@@ -630,11 +606,12 @@ export function AppPage() {
             // phone the user would otherwise stare at a chat that looks like it did nothing.
             setMobilePane("result");
             try {
-              const review = await reviewStrategy(query);
-              if (review.kind !== "rule_draft") {
-                throw new Error(review.explanation);
-              }
-              setPendingDraft(review);
+              const job = await createAnalysisJob(query);
+              setAnalysisJobs((jobs) => [...jobs, job]);
+            } catch (error) {
+              setCancelError(
+                error instanceof Error ? error.message : "전략 검증 요청을 처리할 수 없습니다.",
+              );
             } finally {
               setPendingAnalysis(null);
             }
@@ -643,13 +620,7 @@ export function AppPage() {
           strategy={panelStrategy}
         />
         <main className={`workspace-main${mobilePane === "result" ? "" : " workspace-pane-hidden"}`}>
-          {pendingDraft ? (
-            <StrategyDraftConfirmation
-              confirming={confirmingDraft}
-              draft={pendingDraft}
-              onConfirm={() => void handleConfirmDraft()}
-            />
-          ) : canRenderWorkspace ? (
+          {canRenderWorkspace ? (
             <>
               {showGateWarning && recommendationGate ? (
                 <div className="warning-box" role="alert">

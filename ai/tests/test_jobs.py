@@ -14,8 +14,10 @@ from ai_graph.jobs import (
     AnalysisJobStatus,
     InMemoryAnalysisJobStore,
     JobStoreConfigurationError,
+    classify_failure,
     create_analysis_job_store_from_env,
 )
+from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.research_eligibility import PerformanceAvailable, PerformanceMethodManifest
 from ai_graph.schemas import (
     APIEnvelope,
@@ -42,6 +44,20 @@ def _ready_envelope(trace_id: str) -> APIEnvelope:
         debug_ref=f"debug:{trace_id}",
         retryable=False,
     )
+
+
+def test_strategy_research_failure_keeps_its_typed_subcause() -> None:
+    diagnostic = classify_failure(
+        StrategyResearchError(
+            "strategy research provider is temporarily unavailable",
+            cause_code="research_provider_failure",
+        ),
+        stage="interpreting",
+    )
+
+    assert diagnostic.category == "infrastructure_failure"
+    assert diagnostic.subcause == "strategy_research_provider_failure"
+    assert diagnostic.failure_stage == "interpreting"
 
 
 def _completed_backtest_envelope(trace_id: str) -> APIEnvelope:

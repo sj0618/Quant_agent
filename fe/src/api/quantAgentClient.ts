@@ -1,7 +1,6 @@
 import { AI_ENDPOINTS, appConfig } from "../config/appConfig";
 import { backendRequest } from "./backendClient";
 import { publicAiResponseFailure } from "./aiResponseFailure";
-import { createStrategyParsePayload } from "./strategyParsePayload";
 import { landingSample } from "../mocks/landing.mock";
 import { formatScoreValue, SCORE_SCALE, selectRecommendationConfidence } from "../utils/score";
 import { clearUserScopedStorage } from "../utils/userScopedStorage";
@@ -137,112 +136,6 @@ class AIResponseError extends Error {
   }
 }
 
-interface StrategyExecutionSpecV1 {
-  market: "KRX";
-  timeframe: "daily";
-  entry_conditions: Array<{ metric: string; comparator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne"; value: number; lookback: number; role: "entry" }>;
-  exit_conditions: Array<{ metric: string; comparator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne"; value: number; lookback: number; role: "exit" }>;
-}
-
-interface ExplorationExecutionSpecV2 {
-  classification: "exploratory_return_seeking";
-  market: "KRX";
-  timeframe: "daily";
-  policy_version: string;
-  policy_hash: string;
-  catalog_version: string;
-  catalog_hash: string;
-  candidates: Array<{ catalog_id: string; execution_signature: string }>;
-}
-
-interface ResearchConditionV3 {
-  left: string;
-  operator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne" | "between" | "cross_above" | "cross_below";
-  right: number | string | number[];
-  window?: number | null;
-  aggregate?: "max" | "min" | "avg" | "sum" | "last" | null;
-  scale?: number | null;
-  consecutive?: number | null;
-  universe_rank_pct?: number | null;
-}
-
-export interface ResearchCandidateExecutionSpecV3 {
-  classification: "research_required";
-  market: "KRX";
-  timeframe: "daily";
-  research_schema_version: "strategy-research-draft.v3";
-  research_prompt_version: string;
-  resolution_summary: string;
-  research_snapshot_hash: string;
-  capability_hash: string;
-  sources: Array<{ source_id: string; title: string; url: string; claim: string; excerpt_digest: string }>;
-  candidates: Array<{
-    candidate_id: string;
-    title: string;
-    hypothesis: string;
-    counter_hypothesis: string;
-    entry_conditions: ResearchConditionV3[];
-    exit_conditions: ResearchConditionV3[];
-    required_metrics: string[];
-    assumptions: string[];
-    source_ids: string[];
-  }>;
-}
-
-export interface ExplorationReviewV2 {
-  classification: "exploratory_return_seeking";
-  research_hypothesis: string;
-  opposing_hypothesis: string;
-  market: "KRX";
-  period: string;
-  available_metrics: string[];
-  defaults: string[];
-  alternatives: string[];
-  candidate_reasons: Array<{ catalog_id: string; title: string; reason: string; required_data: string[] }>;
-  limitations: string[];
-  policy_version: string;
-  policy_hash: string;
-  catalog_version: string;
-  catalog_hash: string;
-}
-
-export interface RuleDraftOutcome {
-  kind: "rule_draft";
-  market: "KRX";
-  timeframe: "daily";
-  entry_conditions: StrategyExecutionSpecV1["entry_conditions"];
-  exit_conditions: StrategyExecutionSpecV1["exit_conditions"];
-  unsupported_conditions: Array<{ condition: string; reason: string }>;
-  clarification_required: boolean;
-  explanation: string;
-  indicator_selections: Array<{ metric: string; reason: string }>;
-  editable_summary: string;
-  clarifications: Array<{ label: string; reason: string }>;
-  is_executable: boolean;
-  exploration?: ExplorationReviewV2 | null;
-  strategy_execution_spec?: StrategyExecutionSpecV1 | ExplorationExecutionSpecV2 | ResearchCandidateExecutionSpecV3;
-  spec_version?: "strategy-execution-spec.v1" | "exploration-execution-spec.v2" | "research-candidate-execution-spec.v3";
-  spec_hash?: string;
-  parse_token?: string;
-  /**
-   * Browser-local context retained after the review response.  It is not an
-   * execution authority: the signed execution spec below remains the only rule
-   * the server can backtest.  Sending this back at confirmation lets the
-   * research and report nodes explain the user's actual wording instead of an
-   * internal canonical summary.
-   */
-  original_query?: string;
-}
-
-export type ParseOutcome = RuleDraftOutcome | { kind: "scope_refusal" | "unsupported_scope"; explanation: string };
-
-export class StrategyClarificationRequiredError extends Error {
-  constructor(outcome: RuleDraftOutcome) {
-    const choices = outcome.clarifications.map((item) => `- ${item.label}: ${item.reason}`).join("\n");
-    super([outcome.editable_summary, choices].filter(Boolean).join("\n"));
-  }
-}
-
 /** HTTP status behind a failed AI call, or null if it never reached the server. */
 export function aiResponseStatus(error: unknown): number | null {
   return error instanceof AIResponseError ? error.status : null;
@@ -296,59 +189,6 @@ async function fetchAI(path: string, init: RequestInit = {}) {
   } finally {
     window.clearTimeout(timeoutId);
   }
-}
-
-/** Parse only; no job is created until the caller confirms the returned draft. */
-export async function reviewStrategy(query: string): Promise<ParseOutcome> {
-  const normalizedQuery = query.trim();
-  if (!normalizedQuery) {
-    throw new Error("분석할 자연어 전략을 입력하세요.");
-  }
-  const parseResponse = await fetchAI(AI_ENDPOINTS.strategyParse, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(createStrategyParsePayload(normalizedQuery)),
-  });
-  await assertOk(parseResponse);
-  const parsed = await parseResponse.json() as ParseOutcome;
-  return parsed.kind === "rule_draft"
-    ? { ...parsed, original_query: normalizedQuery }
-    : parsed;
-}
-
-/** Queue only a server-validated draft that the user has explicitly confirmed. */
-export async function createConfirmedAnalysisJob(parsed: RuleDraftOutcome): Promise<AnalysisJob> {
-  if (
-    !parsed.is_executable
-    || parsed.clarification_required
-    || parsed.unsupported_conditions.length > 0
-    || !parsed.strategy_execution_spec
-    || !parsed.spec_version
-    || !parsed.spec_hash
-    || !parsed.parse_token
-  ) {
-    throw new StrategyClarificationRequiredError(parsed);
-  }
-
-  const response = await fetchAI(AI_ENDPOINTS.analysisJobs, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      parse_token: parsed.parse_token,
-      client_idempotency_key: crypto.randomUUID(),
-      spec_version: parsed.spec_version,
-      spec_hash: parsed.spec_hash,
-      strategy_execution_spec: parsed.strategy_execution_spec,
-      // The sealed spec is authoritative for execution.  This original text is
-      // carried only as auditable/reporting context, so Research never has to
-      // reconstruct the request from an internal rule summary.
-      query: parsed.original_query,
-    }),
-  });
-  await assertOk(response);
-  const job = await response.json() as AnalysisJob;
-  saveLatestAnalysisJob(job);
-  return job;
 }
 
 export interface ResearchAppendix {
