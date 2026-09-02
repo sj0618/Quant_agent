@@ -1,5 +1,7 @@
 import { AI_ENDPOINTS, appConfig } from "../config/appConfig";
 import { backendRequest } from "./backendClient";
+import { publicAiResponseFailure } from "./aiResponseFailure";
+import { createStrategyParsePayload } from "./strategyParsePayload";
 import { landingSample } from "../mocks/landing.mock";
 import { formatScoreValue, SCORE_SCALE, selectRecommendationConfidence } from "../utils/score";
 import { clearUserScopedStorage } from "../utils/userScopedStorage";
@@ -126,8 +128,12 @@ interface StrategyDescriptionApiResponse {
 }
 
 class AIResponseError extends Error {
-  constructor(readonly status: number) {
-    super(`AI 서버 응답 실패: ${status}`);
+  constructor(
+    readonly status: number,
+    readonly reasonCode: string | null = null,
+    message: string | null = null,
+  ) {
+    super(message ?? `AI 서버 응답 실패: ${status}`);
   }
 }
 
@@ -147,6 +153,40 @@ interface ExplorationExecutionSpecV2 {
   catalog_version: string;
   catalog_hash: string;
   candidates: Array<{ catalog_id: string; execution_signature: string }>;
+}
+
+interface ResearchConditionV3 {
+  left: string;
+  operator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne" | "between" | "cross_above" | "cross_below";
+  right: number | string | number[];
+  window?: number | null;
+  aggregate?: "max" | "min" | "avg" | "sum" | "last" | null;
+  scale?: number | null;
+  consecutive?: number | null;
+  universe_rank_pct?: number | null;
+}
+
+export interface ResearchCandidateExecutionSpecV3 {
+  classification: "research_required";
+  market: "KRX";
+  timeframe: "daily";
+  research_schema_version: "strategy-research-draft.v3";
+  research_prompt_version: string;
+  resolution_summary: string;
+  research_snapshot_hash: string;
+  capability_hash: string;
+  sources: Array<{ source_id: string; title: string; url: string; claim: string; excerpt_digest: string }>;
+  candidates: Array<{
+    candidate_id: string;
+    title: string;
+    hypothesis: string;
+    counter_hypothesis: string;
+    entry_conditions: ResearchConditionV3[];
+    exit_conditions: ResearchConditionV3[];
+    required_metrics: string[];
+    assumptions: string[];
+    source_ids: string[];
+  }>;
 }
 
 export interface ExplorationReviewV2 {
@@ -180,10 +220,18 @@ export interface RuleDraftOutcome {
   clarifications: Array<{ label: string; reason: string }>;
   is_executable: boolean;
   exploration?: ExplorationReviewV2 | null;
-  strategy_execution_spec?: StrategyExecutionSpecV1 | ExplorationExecutionSpecV2;
-  spec_version?: "strategy-execution-spec.v1" | "exploration-execution-spec.v2";
+  strategy_execution_spec?: StrategyExecutionSpecV1 | ExplorationExecutionSpecV2 | ResearchCandidateExecutionSpecV3;
+  spec_version?: "strategy-execution-spec.v1" | "exploration-execution-spec.v2" | "research-candidate-execution-spec.v3";
   spec_hash?: string;
   parse_token?: string;
+  /**
+   * Browser-local context retained after the review response.  It is not an
+   * execution authority: the signed execution spec below remains the only rule
+   * the server can backtest.  Sending this back at confirmation lets the
+   * research and report nodes explain the user's actual wording instead of an
+   * internal canonical summary.
+   */
+  original_query?: string;
 }
 
 export type ParseOutcome = RuleDraftOutcome | { kind: "scope_refusal" | "unsupported_scope"; explanation: string };
@@ -211,12 +259,23 @@ function requireAiApiBaseUrl() {
   return appConfig.aiApiBaseUrl;
 }
 
-function assertOk(response: Response) {
+async function assertOk(response: Response) {
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) {
       clearUserScopedStorage();
     }
-    throw new AIResponseError(response.status);
+    let payload: unknown = null;
+    try {
+      payload = await response.clone().json();
+    } catch {
+      // A non-JSON gateway error is still represented by its HTTP status.
+    }
+    const failure = publicAiResponseFailure(response.status, payload);
+    console.warn("AI API request rejected", {
+      status: response.status,
+      reasonCode: failure.reasonCode,
+    });
+    throw new AIResponseError(response.status, failure.reasonCode, failure.message);
   }
 }
 
@@ -248,11 +307,13 @@ export async function reviewStrategy(query: string): Promise<ParseOutcome> {
   const parseResponse = await fetchAI(AI_ENDPOINTS.strategyParse, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ natural_language: normalizedQuery }),
+    body: JSON.stringify(createStrategyParsePayload(normalizedQuery)),
   });
-  assertOk(parseResponse);
+  await assertOk(parseResponse);
   const parsed = await parseResponse.json() as ParseOutcome;
-  return parsed;
+  return parsed.kind === "rule_draft"
+    ? { ...parsed, original_query: normalizedQuery }
+    : parsed;
 }
 
 /** Queue only a server-validated draft that the user has explicitly confirmed. */
@@ -278,9 +339,13 @@ export async function createConfirmedAnalysisJob(parsed: RuleDraftOutcome): Prom
       spec_version: parsed.spec_version,
       spec_hash: parsed.spec_hash,
       strategy_execution_spec: parsed.strategy_execution_spec,
+      // The sealed spec is authoritative for execution.  This original text is
+      // carried only as auditable/reporting context, so Research never has to
+      // reconstruct the request from an internal rule summary.
+      query: parsed.original_query,
     }),
   });
-  assertOk(response);
+  await assertOk(response);
   const job = await response.json() as AnalysisJob;
   saveLatestAnalysisJob(job);
   return job;
@@ -298,7 +363,7 @@ export interface ResearchAppendix {
 
 export async function getResearchAppendix(jobId: string): Promise<ResearchAppendix> {
   const response = await fetchAI(AI_ENDPOINTS.analysisJobResearchAppendix(jobId));
-  assertOk(response);
+  await assertOk(response);
   return response.json() as Promise<ResearchAppendix>;
 }
 
@@ -327,7 +392,7 @@ async function fetchStrategyDescriptionMap(strategies: StrategyReportSummary[]) 
         strategies: strategies.map(buildStrategyDescriptionInput),
       }),
     });
-    assertOk(response);
+    await assertOk(response);
 
     const payload = (await response.json()) as StrategyDescriptionApiResponse;
     return payload.items.reduce<Record<string, string>>((current, item) => {
@@ -429,7 +494,7 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query: trimmedQuery }),
   });
-  assertOk(response);
+  await assertOk(response);
 
   const job = (await response.json()) as AnalysisJob;
   saveLatestAnalysisJob(job);
@@ -438,7 +503,7 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
 
 export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
   const response = await fetchAI(AI_ENDPOINTS.analysisJobCancel(jobId), { method: "POST" });
-  assertOk(response);
+  await assertOk(response);
 
   const job = (await response.json()) as AnalysisJob;
   saveLatestAnalysisJob(job);
@@ -447,7 +512,7 @@ export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
 
 async function requestAnalysisJob(jobId: string): Promise<AnalysisJob> {
   const response = await fetchAI(AI_ENDPOINTS.analysisJob(jobId));
-  assertOk(response);
+  await assertOk(response);
 
   return (await response.json()) as AnalysisJob;
 }
@@ -460,7 +525,7 @@ export async function getAnalysisJob(jobId: string): Promise<AnalysisJob> {
 
 async function listAnalysisJobs(limit = 100): Promise<AnalysisJob[]> {
   const response = await fetchAI(`${AI_ENDPOINTS.analysisJobs}?limit=${limit}`);
-  assertOk(response);
+  await assertOk(response);
   return (await response.json()) as AnalysisJob[];
 }
 

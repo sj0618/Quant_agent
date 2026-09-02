@@ -11,9 +11,14 @@ async function listen(server: ReturnType<typeof createServer>) {
   return address.port;
 }
 
-async function fetchFrom(port: number, path: string, headers: Record<string, string> = {}) {
+async function fetchFrom(
+  port: number,
+  path: string,
+  headers: Record<string, string> = {},
+  { method = "GET", body }: { method?: string; body?: string } = {},
+) {
   return new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
-    const clientRequest = request({ host: "127.0.0.1", port, path, headers }, (response) => {
+    const clientRequest = request({ host: "127.0.0.1", port, path, method, headers }, (response) => {
       let body = "";
       response.setEncoding("utf8");
       response.on("data", (chunk) => {
@@ -22,7 +27,7 @@ async function fetchFrom(port: number, path: string, headers: Record<string, str
       response.on("end", () => resolve({ statusCode: response.statusCode ?? 0, body }));
     });
     clientRequest.once("error", reject);
-    clientRequest.end();
+    clientRequest.end(body);
   });
 }
 
@@ -61,6 +66,51 @@ test("production gateway forwards the backend's real 404 and proxy headers", asy
   assert.equal(receivedForwardedProto["/trust"], "http");
   assert.equal(receivedForwardedFor["/missing"], "198.51.100.9");
   assert.equal(receivedForwardedFor["/trust"], "127.0.0.1");
+});
+
+test("production gateway preserves the strategy-parser POST path and JSON body", async (t) => {
+  let received: { method?: string; path?: string; contentType?: string; body?: string } = {};
+  const upstream = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      received = {
+        method: request.method,
+        path: request.url,
+        contentType: request.headers["content-type"],
+        body,
+      };
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end('{"kind":"rule_draft"}');
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const gateway = createProductionGateway({ target: `http://127.0.0.1:${upstreamPort}` });
+  const gatewayPort = await listen(gateway);
+  t.after(() => gateway.close());
+  t.after(() => upstream.close());
+
+  const payload = JSON.stringify({
+    natural_language: "KRX 일봉에서 RSI 30 이하 진입, 70 이상 청산",
+    query: "KRX 일봉에서 RSI 30 이하 진입, 70 이상 청산",
+  });
+  const response = await fetchFrom(
+    gatewayPort,
+    "/ai-api/api/strategies/parse",
+    { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) },
+    { method: "POST", body: payload },
+  );
+
+  assert.deepEqual(response, { statusCode: 200, body: '{"kind":"rule_draft"}' });
+  assert.deepEqual(received, {
+    method: "POST",
+    path: "/ai-api/api/strategies/parse",
+    contentType: "application/json",
+    body: payload,
+  });
 });
 
 test("production gateway refuses non-loopback upstreams", () => {

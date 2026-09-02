@@ -327,6 +327,19 @@ def _deterministic_parse(query: str, metrics: Sequence[str]) -> StrategyParseRes
                 )
                 continue
             found.append(condition)
+            # Korean natural language commonly omits a repeated indicator name:
+            # "RSI가 30 이하일 때 진입하고 70 이상일 때 청산".  The second
+            # clause is still an RSI condition, not a missing user parameter.  Keep
+            # this bounded to an immediately joined, action-labelled clause so a
+            # later unrelated number can never be adopted as an indicator threshold.
+            found.extend(
+                _implicit_metric_continuations(
+                    text=text,
+                    threshold_end=match.end() + threshold_match.end(),
+                    metric=metric_key,
+                    lookback=lookback or 14,
+                )
+            )
     # The old shorthand has no role words: interpret low threshold first and high
     # threshold second, which preserves the public RSI regression contract.
     if found and not re.search(r"매수|진입|entry|매도|종료|exit|청산", text, re.IGNORECASE):
@@ -417,6 +430,54 @@ def _condition_window(text: str, end: int) -> str:
     window = text[end : end + 100]
     boundary = re.search(r"(?:그리고|이고|하고|,|;)", window)
     return window[: boundary.start()] if boundary else window
+
+
+_IMPLICIT_METRIC_CONTINUATION = re.compile(
+    r"(?:그리고|이고|하고|,|;)\s*"
+    r"(?:가|는|은|이)?\s*"
+    r"(?P<value>-?\d+(?:\.\d+)?)\s*"
+    r"(?P<comparator>이하|미만|이상|초과|below|under|above|over|<=|>=|<|>)\s*"
+    r"(?:일\s*때|이면|인\s*경우|일\s*경우)?\s*"
+    r"(?P<action>매수|진입|entry|buy|매도|종료|청산|exit|sell)",
+    re.IGNORECASE,
+)
+
+
+def _implicit_metric_continuations(
+    *,
+    text: str,
+    threshold_end: int,
+    metric: str,
+    lookback: int,
+) -> list[StrategyConditionV1]:
+    """Infer only adjacent, action-labelled thresholds that omit a repeated metric."""
+
+    tail = text[threshold_end : threshold_end + 160]
+    conditions: list[StrategyConditionV1] = []
+    for match in _IMPLICIT_METRIC_CONTINUATION.finditer(tail):
+        comparator_word = match.group("comparator").lower()
+        comparator = (
+            "lte"
+            if comparator_word in {"이하", "미만", "below", "under", "<=", "<"}
+            else "gte"
+        )
+        action = match.group("action").lower()
+        role: Literal["entry", "exit"] = (
+            "entry" if action in {"매수", "진입", "entry", "buy"} else "exit"
+        )
+        condition = StrategyConditionV1(
+            metric=metric,
+            comparator=comparator,
+            value=float(match.group("value")),
+            lookback=lookback,
+            role=role,
+        )
+        try:
+            _validate_metric_value(condition)
+        except ValueError:
+            continue
+        conditions.append(condition)
+    return conditions
 
 
 __all__ = [

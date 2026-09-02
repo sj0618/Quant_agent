@@ -160,6 +160,27 @@ def test_gate_requires_a_real_successful_aoai_call() -> None:
         run_gate(_config(), client=client, clock=lambda: 1.0, sleep=lambda _seconds: None)
 
 
+def test_gate_reports_parse_validation_field_without_echoing_strategy_text() -> None:
+    response = httpx.Response(
+        422,
+        json={
+            "detail": [
+                {
+                    "loc": ["body", "natural_language"],
+                    "msg": "field required",
+                    "input": "secret strategy text",
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(StagingGateError) as error:
+        staging_pipeline_gate._json_response(response, "strategy parse")
+
+    assert "request_validation:natural_language" in str(error.value)
+    assert "secret strategy text" not in str(error.value)
+
+
 @pytest.mark.parametrize("url_key", ["AI_STAGING_AI_API_BASE_URL", "AI_STAGING_BACKEND_API_BASE_URL"])
 def test_gate_rejects_the_public_host_before_any_job_is_created(url_key: str) -> None:
     env = {

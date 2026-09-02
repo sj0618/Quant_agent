@@ -82,6 +82,45 @@ def test_live_parser_keeps_an_unambiguous_korean_rsi_pair_out_of_the_provider() 
     assert client.requests == []
 
 
+def test_non_live_parser_carries_rsi_across_a_natural_korean_exit_clause() -> None:
+    """Beginners should not need to repeat "RSI" before the exit threshold."""
+
+    result = parse_natural_language_strategy(
+        "KRX 일봉에서 RSI가 30 이하일 때 진입하고 70 이상일 때 청산하는 전략을 최근 1년 구간으로 백테스트해줘.",
+        available_metrics=["rsi", "sma20"],
+        use_llm=False,
+    )
+
+    assert [(item.metric, item.comparator, item.value) for item in result.entry_conditions] == [
+        ("rsi", "lte", 30.0)
+    ]
+    assert [(item.metric, item.comparator, item.value) for item in result.exit_conditions] == [
+        ("rsi", "gte", 70.0)
+    ]
+    assert result.clarification_required is False
+
+
+def test_live_parser_keeps_a_natural_korean_rsi_exit_pair_out_of_the_provider() -> None:
+    """The normal beginner wording must not add an avoidable AOAI dependency."""
+
+    client = _StructuredClient(_payload())
+    result = parse_natural_language_strategy(
+        "KRX 일봉에서 RSI가 30 이하일 때 진입하고 70 이상일 때 청산하는 전략을 최근 1년 구간으로 백테스트해줘.",
+        available_metrics=["rsi", "sma20"],
+        llm_client=client,
+        use_llm=True,
+    )
+
+    assert [(item.metric, item.comparator, item.value) for item in result.entry_conditions] == [
+        ("rsi", "lte", 30.0)
+    ]
+    assert [(item.metric, item.comparator, item.value) for item in result.exit_conditions] == [
+        ("rsi", "gte", 70.0)
+    ]
+    assert result.clarification_required is False
+    assert client.requests == []
+
+
 def test_live_json_schema_errors_never_become_a_parseable_rule() -> None:
     client = _StructuredClient({**_payload(), "unexpected": True})
 

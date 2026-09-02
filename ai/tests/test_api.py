@@ -1,9 +1,11 @@
+import json
 from datetime import date
 from typing import TYPE_CHECKING
 from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from psycopg import OperationalError
 
 if TYPE_CHECKING:
@@ -21,11 +23,12 @@ from ai_graph.api import (
     HEALTH_PATH,
     OPENAPI_URL,
     READINESS_PATH,
+    ParseStrategyRequest,
     SPEC_STRATEGY_PARSE_PATH,
     STRATEGY_DESCRIPTIONS_PATH,
     create_app,
 )
-from ai_graph.audit import NoOpAuditSink, RecordingAuditSink
+from ai_graph.audit import NoOpAuditSink, RecordingAuditSink, begin_model_call, finish_model_call
 from ai_graph.audit_postgres import _create_test_audit_sink
 from ai_graph.jobs import (
     AnalysisJobStatus,
@@ -448,6 +451,47 @@ def test_ready_release_accepts_parse_bound_core_natural_language_job(
 
     assert response.status_code == 201
     assert response.json()["job_id"]
+
+
+def test_parse_request_keeps_rolling_aliases_equivalent_and_rejects_ambiguity() -> None:
+    """A rolling deployment may send either alias, but never two different rules."""
+
+    strategy = "KRX 일봉에서 RSI 30 이하 진입, 70 이상 청산"
+    assert ParseStrategyRequest(natural_language=strategy).request_text == strategy
+    assert ParseStrategyRequest(query=strategy).request_text == strategy
+    assert ParseStrategyRequest(natural_language=strategy, query=strategy).request_text == strategy
+
+    with pytest.raises(ValidationError, match="natural_language and query must match"):
+        ParseStrategyRequest(natural_language=strategy, query="MACD 골든크로스 전략")
+
+
+def test_parse_strategy_http_contract_accepts_rolling_aliases_and_rejects_conflicts() -> None:
+    """The actual FastAPI admission route, not just its Pydantic model, is stable."""
+
+    strategy = "RSI 30 이하 진입, RSI 70 이상 청산 전략"
+    client = TestClient(
+        create_app(
+            InMemoryAnalysisJobStore(),
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    )
+
+    natural = client.post(SPEC_STRATEGY_PARSE_PATH, json={"natural_language": strategy})
+    query = client.post(SPEC_STRATEGY_PARSE_PATH, json={"query": strategy})
+    dual = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": strategy, "query": strategy},
+    )
+    conflict = client.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={"natural_language": strategy, "query": "MACD 골든크로스 전략"},
+    )
+
+    assert [response.status_code for response in (natural, query, dual)] == [200, 200, 200]
+    assert all(response.json()["kind"] == "rule_draft" for response in (natural, query, dual))
+    assert all(response.json()["is_executable"] is True for response in (natural, query, dual))
+    assert conflict.status_code == 422
+    assert "natural_language and query must match" in conflict.text
 
 
 def test_live_v3_parse_uses_the_server_metric_catalog_before_sealing(
@@ -1020,6 +1064,116 @@ def test_spec_strategy_parse_returns_a_signed_rule_review_without_creating_a_job
     assert "최근 52주 신고가" not in create_response.text
     assert store.jobs == {}
     assert sink.sessions == ()
+
+
+def test_v3_strategy_parse_records_prompt_response_and_sealed_spec_audit(monkeypatch) -> None:
+    """A pre-job V3 parse must be just as debuggable as a dispatched job.
+
+    The production AOAI client records the full request/response itself.  This test
+    models that client and proves the API binds it to the newly created parse audit
+    session rather than leaving ``begin_model_call`` without a session.
+    """
+
+    class AuditedResearchClient:
+        def generate_json(self, request):
+            call_id = begin_model_call(
+                task_type=request.task_type or request.schema_name,
+                provider="test",
+                model_name="test-research-model",
+                system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt,
+                variables_jsonb=request.variables_jsonb,
+                prompt_template_name=request.prompt_template_name,
+                prompt_version=request.prompt_version,
+                temperature=request.temperature,
+                response_schema_name=request.schema_name,
+                web_search_used=request.enable_web_search,
+            )
+            payload = {
+                "resolution_summary": "돈치안 상단 돌파를 KRX 일봉 추세 규칙으로 정규화했습니다.",
+                "sources": [
+                    {
+                        "source_id": "source-1",
+                        "title": "Donchian channel",
+                        "url": "https://example.test/donchian",
+                        "claim": "최근 고가 범위 돌파는 추세 추종 가설로 검증할 수 있습니다.",
+                    }
+                ],
+                "candidates": [
+                    {
+                        "candidate_id": "research-donchian-breakout-20",
+                        "title": "20일 돈치안 상단 돌파",
+                        "hypothesis": "상단 돌파 뒤 추세 지속을 검증합니다.",
+                        "counter_hypothesis": "횡보장에서는 거짓 돌파가 늘 수 있습니다.",
+                        "entry_conditions": [
+                            {
+                                "left": "close",
+                                "operator": "gte",
+                                "right": "high",
+                                "window": 20,
+                                "aggregate": "max",
+                                "scale": 0.995,
+                            }
+                        ],
+                        "exit_conditions": [
+                            {"left": "close", "operator": "lte", "right": "sma20"}
+                        ],
+                        "required_metrics": ["close", "high", "sma20"],
+                        "assumptions": ["다음 거래일 체결을 가정합니다."],
+                        "source_ids": ["source-1"],
+                    }
+                ],
+            }
+            finish_model_call(
+                call_id,
+                status="succeeded",
+                assistant_response=json.dumps(payload, ensure_ascii=False),
+                model_name="test-research-model",
+            )
+            return payload
+
+    monkeypatch.setattr(
+        "ai_graph.nodes.strategy_research.create_llm_client",
+        lambda **_kwargs: AuditedResearchClient(),
+    )
+    sink = RecordingAuditSink()
+    app = create_app(
+        InMemoryAnalysisJobStore(),
+        audit_sink=_create_test_audit_sink(sink),
+        rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        indicator_catalog_resolver=lambda: ["sma20"],
+    )
+    # The test client is an approved stand-in for the configured live parser; the
+    # audit contract itself is provider independent.
+    app.state.strategy_parser_uses_llm = True
+    response = TestClient(app).post(
+        SPEC_STRATEGY_PARSE_PATH,
+        json={
+            "natural_language": "돈치안 채널 돌파 전략으로 검증해줘",
+            "client_request_id": "parse-audit-client-1",
+        },
+    )
+
+    assert response.status_code == 200
+    review = response.json()
+    assert review["is_executable"] is True
+    assert review["spec_version"] == "research-candidate-execution-spec.v3"
+    assert review["spec_hash"]
+    assert len(sink.sessions) == 1
+    session = sink.sessions[0]
+    assert session.correlation.entrypoint == "api.strategy_parse"
+    assert session.correlation.client_request_id == "parse-audit-client-1"
+    assert [(record.agent_name, record.status) for record in session.agent_executions] == [
+        ("Strategy Research", "succeeded")
+    ]
+    assert [record.task_type for record in session.model_calls] == [
+        "strategy_research_resolution"
+    ]
+    assert all(record.execution_id is not None for record in session.model_calls)
+    assert len(session.prompt_logs) == 1
+    assert session.agent_executions[0].output_jsonb["spec_hash"] == review["spec_hash"]
+    assert session.buffered_events[-1].kind == "finalization"
+    assert session.buffered_events[-1].status == "completed"
 
 
 def test_strategy_descriptions_endpoint_returns_strategy_only_copy() -> None:

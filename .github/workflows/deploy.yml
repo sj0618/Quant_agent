@@ -535,43 +535,12 @@ jobs:
                 'from app.core.config import load_settings; settings = load_settings(); assert settings.is_production, "APP_ENV must be production"; assert settings.auth_enabled, "AUTH_ENABLED must be true"; assert settings.auth_cookie_secure, "AUTH_COOKIE_SECURE must be true"; assert settings.google_redirect_uri == "https://qt-agent.kro.kr/auth/google/callback", "GOOGLE_REDIRECT_URI mismatch"; assert "https://qt-agent.kro.kr" in settings.allowed_origins, "AUTH_ALLOWED_ORIGINS mismatch"; assert settings.auth_trusted_proxy_headers, "AUTH_TRUSTED_PROXY_HEADERS must be true"; assert set(settings.trusted_proxy_hosts) == {"127.0.0.1", "::1"}, "AUTH_TRUSTED_PROXY_HOSTS mismatch"'
             )
 
-            "$APP_DIR/ai/.venv/bin/python" - "$APP_DIR" <<'PY'
-          import os
-          import sys
-          from pathlib import Path
-
-          import psycopg
-
-          from ai_graph.data_sources.db import resolve_database_dsn_from_env
-
-          app_dir = Path(sys.argv[1])
-          dsn, _ = resolve_database_dsn_from_env()
-          if not dsn:
-              raise RuntimeError("database DSN is required for AI audit migrations")
-          with psycopg.connect(dsn, autocommit=True) as conn:
-              for name in (
-                  "011_app_ai_backtest_erd.sql",
-                  "013_ai_runtime_logging.sql",
-                  "014_create_report_email_tables.sql",
-                  "015_ai_backtest_execution_process_identity.sql",
-                  "016_ai_backtest_idempotency.sql",
-                  "017_add_notification_settings_to_users.sql",
-                  "018_create_email_delivery_outbox.sql",
-                  "019_ai_prompt_response_summary.sql",
-                  "020_ai_account_tokens.sql",
-                  "021_ai_analysis_jobs.sql",
-                  "022_immutable_analysis_results.sql",
-                  "023_archive_undecodable_analysis_jobs.sql",
-                  "024_parse_bound_analysis_job_admission.sql",
-                  "025_exploration_policy_v2.sql",
-              ):
-                  conn.execute(
-                      (app_dir / "service_db" / "migrations" / name).read_text(
-                          encoding="utf-8"
-                      )
-                  )
-                  print(f"applied {name}")
-          PY
+            # Schema/ETL ownership belongs to the DB release lane.  Application
+            # deploys must never execute migrations or mutate production data;
+            # the persistent-store migration_revision readiness check below
+            # fails closed and rolls this release back if DB prerequisites are
+            # not already present.
+            echo "Database migrations are verified by readiness; no DDL runs in application deploy."
 
             umask 077
             AUDIT_SECRET_FILE="$RUN_DIR/ai-audit-admission.secret"

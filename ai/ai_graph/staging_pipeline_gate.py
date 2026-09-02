@@ -326,11 +326,43 @@ def _https_base_url(value: str, context: str) -> str:
 
 def _json_response(response: httpx.Response, context: str, *, expected_status: int = 200) -> Mapping[str, Any]:
     if response.status_code != expected_status:
-        raise StagingGateError(f"{context} returned HTTP {response.status_code}")
+        reason = _safe_http_failure_reason(response)
+        suffix = f" ({reason})" if reason else ""
+        raise StagingGateError(f"{context} returned HTTP {response.status_code}{suffix}")
     try:
         return _object(response.json(), context)
     except ValueError as exc:
         raise StagingGateError(f"{context} did not return JSON") from exc
+
+
+def _safe_http_failure_reason(response: httpx.Response) -> str | None:
+    """Extract a route/code hint without echoing user input or upstream details."""
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+
+    for key in ("reason_code", "code"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:96]
+
+    detail = payload.get("detail")
+    if not isinstance(detail, list):
+        return None
+    for item in detail:
+        if not isinstance(item, Mapping):
+            continue
+        location = item.get("loc")
+        if not isinstance(location, list):
+            continue
+        fields = [part for part in location if isinstance(part, str) and part != "body"]
+        if fields:
+            return f"request_validation:{'.'.join(fields[:3])}"
+    return "request_validation"
 
 
 def _object(value: Any, context: str) -> Mapping[str, Any]:

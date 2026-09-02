@@ -1531,6 +1531,22 @@ def test_date_only_dart_filing_is_not_visible_until_next_session() -> None:
     assert rows[1]["roe"] == 0.1
 
 
+def test_db_split_date_only_dart_filing_uses_the_same_next_session_policy() -> None:
+    from ai_graph.data_sources.db_split import _attach_pointintime_financials as attach_from_split_source
+
+    rows = [
+        {"ticker": "005930", "date": "2026-05-20"},
+        {"ticker": "005930", "date": "2026-05-21"},
+    ]
+    attach_from_split_source(
+        rows,
+        {"005930": [{"filed": date(2026, 5, 20), "ratios": {"roe": 0.1}}]},
+    )
+
+    assert "roe" not in rows[0]
+    assert rows[1]["roe"] == 0.1
+
+
 def test_price_rows_separate_adjusted_and_raw_fields_when_raw_is_available() -> None:
     row = default_frame_row(
         as_of_date=AS_OF,

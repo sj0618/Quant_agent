@@ -17,14 +17,17 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ai_graph.llm import LLMClient, LLMClientError, LLMJsonRequest, create_llm_client
-from ai_graph.nodes.condition_compiler import canonical_metric, supported_metrics, untranslatable_conditions
+from ai_graph.nodes.condition_compiler import (
+    canonical_metric,
+    supported_metrics,
+    untranslatable_conditions,
+)
 from ai_graph.schemas import (
     Condition,
     ResearchCandidateExecutionSpecV3,
     ResearchCandidateV3,
     ResearchSourceRefV3,
 )
-
 
 STRATEGY_RESEARCH_PROMPT_VERSION = "v3"
 STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v3"
@@ -54,6 +57,19 @@ the missing capability in resolution_summary rather than changing the strategy.
 
 class StrategyResearchError(ValueError):
     """A researched strategy cannot be faithfully compiled in this deployment."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cause_code: str = "research_resolution_unavailable",
+    ) -> None:
+        super().__init__(message)
+        self.cause_code = cause_code
+
+
+class _RepairableStrategyResearchError(StrategyResearchError):
+    """A structured response violated the contract and may be repaired once."""
 
 
 class _SourceDraft(BaseModel):
@@ -102,21 +118,74 @@ def research_strategy_execution_spec(
     """
 
     allowed = _allowed_metrics(available_metrics)
+    client = llm_client or create_llm_client(role="STRATEGY_RESEARCH")
     request = _request(query=query, allowed_metrics=allowed)
     try:
-        payload = (llm_client or create_llm_client(role="STRATEGY_RESEARCH")).generate_json(request)
+        return _seal_research_response(
+            client.generate_json(request),
+            query=query,
+            allowed_metrics=allowed,
+        )
+    except _RepairableStrategyResearchError as first_error:
+        # Structured-output validation errors are different from provider failures:
+        # AOAI responded successfully, but omitted a compiler requirement or selected
+        # an unsupported metric.  Give it one explicitly bounded correction turn with
+        # the same capability catalogue.  A second invalid result is terminal; retry
+        # loops would turn a bad response into an unbounded latency/cost failure.
+        repair_request = _repair_request(
+            query=query,
+            allowed_metrics=allowed,
+            failure=first_error,
+        )
+        try:
+            return _seal_research_response(
+                client.generate_json(repair_request),
+                query=query,
+                allowed_metrics=allowed,
+            )
+        except _RepairableStrategyResearchError as repair_error:
+            raise StrategyResearchError(
+                f"strategy research remained unexecutable after one bounded repair: {repair_error}",
+                cause_code="research_resolution_invalid_after_repair",
+            ) from repair_error
+        except LLMClientError as exc:
+            raise StrategyResearchError(
+                "strategy research provider failed during bounded repair",
+                cause_code="research_provider_failure",
+            ) from exc
+    except LLMClientError as exc:
+        # Transport, timeout, and provider HTTP errors already have their own bounded
+        # retry policy in the AOAI client.  Do not conceal those faults behind a second
+        # semantic prompt: operators need a truthful provider subcause in the audit log.
+        raise StrategyResearchError(
+            "strategy research provider is temporarily unavailable",
+            cause_code="research_provider_failure",
+        ) from exc
+
+
+def _seal_research_response(
+    payload: object,
+    *,
+    query: str,
+    allowed_metrics: Sequence[str],
+) -> ResearchCandidateExecutionSpecV3:
+    try:
         response = _ResearchResponse.model_validate(payload)
-    except LLMClientError:
-        raise
     except (ValidationError, ValueError, TypeError) as exc:
-        raise StrategyResearchError("strategy research did not produce a valid structured result") from exc
+        raise _RepairableStrategyResearchError(
+            "strategy research did not produce a valid structured result",
+            cause_code="research_response_schema_invalid",
+        ) from exc
 
     if not response.candidates:
-        raise StrategyResearchError(response.resolution_summary)
+        raise _RepairableStrategyResearchError(
+            response.resolution_summary,
+            cause_code="research_candidate_missing",
+        )
     source_ids = {source.source_id for source in response.sources}
     candidates: list[ResearchCandidateV3] = []
     for candidate in response.candidates:
-        _validate_candidate(candidate, allowed_metrics=allowed, source_ids=source_ids)
+        _validate_candidate(candidate, allowed_metrics=allowed_metrics, source_ids=source_ids)
         candidates.append(ResearchCandidateV3.model_validate(candidate.model_dump()))
 
     sources = [
@@ -126,7 +195,7 @@ def research_strategy_execution_spec(
         )
         for source in response.sources
     ]
-    capability = sorted(allowed)
+    capability = sorted(allowed_metrics)
     snapshot = {
         "query_digest": _digest(query),
         "prompt_version": STRATEGY_RESEARCH_PROMPT_VERSION,
@@ -188,6 +257,56 @@ def _request(*, query: str, allowed_metrics: Sequence[str]) -> LLMJsonRequest:
     )
 
 
+def _repair_request(
+    *,
+    query: str,
+    allowed_metrics: Sequence[str],
+    failure: StrategyResearchError,
+) -> LLMJsonRequest:
+    """Ask for one compiler-grounded correction without replaying model prose.
+
+    The failure description names the violated capability only.  We intentionally do
+    not feed the prior response back verbatim: the original request and web content
+    are untrusted data, and a fresh structured answer is easier to validate and audit.
+    """
+
+    schema = _ResearchResponse.model_json_schema()
+    context = {
+        "natural_language_request": query,
+        "allowed_metrics": list(allowed_metrics),
+        "previous_validation_failure": {
+            "code": failure.cause_code,
+            "message": str(failure)[:500],
+        },
+    }
+    return LLMJsonRequest(
+        schema_name=STRATEGY_RESEARCH_SCHEMA_NAME,
+        system_prompt=(
+            f"{STRATEGY_RESEARCH_SYSTEM_PROMPT}\n\n"
+            "This is the one permitted repair attempt. Return a fresh, faithful "
+            "candidate using only the supplied grammar and metrics. Do not mention "
+            "the repair, invent unavailable inputs, or return prose outside the schema."
+        ),
+        user_prompt=json.dumps(
+            {
+                "instruction": "Repair the validation failure and return only the structured strategy-research result.",
+                "expected_json_schema": schema,
+                "untrusted_quoted_context": context,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        temperature=0.0,
+        max_output_tokens=1400,
+        enable_web_search=True,
+        task_type="strategy_research_resolution_repair",
+        prompt_template_name="strategy_research_resolution_repair",
+        prompt_version=STRATEGY_RESEARCH_PROMPT_VERSION,
+        response_schema=schema,
+        variables_jsonb={"untrusted_quoted_context": context, "expected_json_schema": schema},
+    )
+
+
 def _allowed_metrics(available_metrics: Sequence[str] | None) -> tuple[str, ...]:
     compiler_vocabulary = {canonical_metric(metric) for metric in supported_metrics()}
     if available_metrics is None:
@@ -221,7 +340,10 @@ def _validate_candidate(
 ) -> None:
     allowed = set(allowed_metrics)
     if not set(candidate.source_ids) <= source_ids:
-        raise StrategyResearchError(f"{candidate.candidate_id}: unknown research source reference")
+        raise _RepairableStrategyResearchError(
+            f"{candidate.candidate_id}: unknown research source reference",
+            cause_code="research_source_reference_invalid",
+        )
     required = {canonical_metric(metric) for metric in candidate.required_metrics}
     referenced = {
         canonical_metric(condition.left)
@@ -234,16 +356,18 @@ def _validate_candidate(
     )
     unsupported_metrics = sorted((required | referenced) - allowed)
     if unsupported_metrics:
-        raise StrategyResearchError(
-            f"{candidate.candidate_id}: unsupported metrics: {', '.join(unsupported_metrics)}"
+        raise _RepairableStrategyResearchError(
+            f"{candidate.candidate_id}: unsupported metrics: {', '.join(unsupported_metrics)}",
+            cause_code="research_metric_unsupported",
         )
     unsupported_conditions = [
         *untranslatable_conditions(candidate.entry_conditions),
         *untranslatable_conditions(candidate.exit_conditions, allow_rank_filters=False),
     ]
     if unsupported_conditions:
-        raise StrategyResearchError(
-            f"{candidate.candidate_id}: unsupported execution semantics: {', '.join(unsupported_conditions)}"
+        raise _RepairableStrategyResearchError(
+            f"{candidate.candidate_id}: unsupported execution semantics: {', '.join(unsupported_conditions)}",
+            cause_code="research_semantics_unsupported",
         )
 
 
