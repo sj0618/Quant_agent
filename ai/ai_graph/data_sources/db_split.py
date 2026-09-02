@@ -2610,8 +2610,8 @@ def _attach_pointintime_financials(
 ) -> None:
     """Forward-fill each trading day with the most recent filing available by that date.
 
-    Point-in-time: a day sees only filings whose receipt date is on or before it, so the
-    backtest never reads a number that had not yet been disclosed. Rows are grouped by
+    Point-in-time: a date-only filing becomes available on the next KRX session, so the
+    backtest never assigns an after-close disclosure to that same session. Rows are grouped by
     ticker and walked in date order, advancing a pointer through that ticker's filings -
     O(rows + filings), not a per-row scan.
     """
@@ -2629,7 +2629,7 @@ def _attach_pointintime_financials(
         current: dict[str, float] = {}
         for row in rows:
             row_date = _date_value(row.get("date"))
-            while pointer < len(filings) and filings[pointer]["filed"] <= row_date:
+            while pointer < len(filings) and filings[pointer]["filed"] < row_date:
                 current = filings[pointer]["ratios"]
                 pointer += 1
             for metric, value in current.items():
