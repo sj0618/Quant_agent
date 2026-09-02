@@ -219,8 +219,22 @@ async def create_or_get_delivery(db: Any, request: EmailDeliveryCreateRequest) -
     return {**_row_to_delivery(row), "created": created, "reused": not created}
 
 
-async def requeue_delivery(db: Any, *, delivery_id: str, now: datetime | None = None) -> dict[str, Any] | None:
-    """Re-queue a terminal delivery for an explicit resend. Returns None when it is not terminal."""
+async def requeue_delivery(
+    db: Any,
+    *,
+    delivery_id: str,
+    recipient_email: str | None = None,
+    payload_json: dict[str, Any] | None = None,
+    cooldown_seconds: int = 0,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Re-queue a terminal delivery for an explicit resend.
+
+    Returns None when the row is not terminal or its last event is younger than
+    ``cooldown_seconds`` (an unthrottled resend button would otherwise be a send loop).
+    The fresh recipient and rendered payload replace the stored ones so a changed
+    address or template is what actually goes out.
+    """
 
     effective_now = now or _now()
     row = await execute_one(
@@ -228,10 +242,12 @@ async def requeue_delivery(db: Any, *, delivery_id: str, now: datetime | None = 
         """
         UPDATE app.email_delivery_history
         SET status = 'draft', error_message = NULL, sent_at = NULL, provider_message_id = NULL,
+            recipient_email = COALESCE(CAST(:recipient_email AS text), recipient_email),
             metadata_jsonb = metadata_jsonb || jsonb_build_object(
                 'submission_status', 'PENDING',
                 'attempt_count', 0,
                 'available_at', CAST(:now AS timestamptz),
+                'payload', COALESCE(CAST(:payload_json AS jsonb), metadata_jsonb -> 'payload'),
                 'claim_token', NULL, 'claim_expires_at', NULL, 'claimed_by', NULL,
                 'provider_submission_status', NULL, 'provider_delivery_status', NULL,
                 'provider_status_checked_at', NULL, 'provider_event_at', NULL,
@@ -239,10 +255,19 @@ async def requeue_delivery(db: Any, *, delivery_id: str, now: datetime | None = 
                 'last_event_at', CAST(:now AS timestamptz)
             )
         WHERE delivery_id = CAST(:delivery_id AS uuid)
-          AND metadata_jsonb ->> 'submission_status' IN ('SENT', 'FAILED', 'CANCELLED')
+          AND COALESCE(metadata_jsonb ->> 'submission_status', upper(status)) IN ('SENT', 'FAILED', 'CANCELLED')
+          AND COALESCE(
+                CAST(metadata_jsonb ->> 'last_event_at' AS timestamptz), sent_at, created_at
+              ) <= CAST(:now AS timestamptz) - CAST(:cooldown_seconds AS integer) * interval '1 second'
         RETURNING *
         """,
-        {"delivery_id": delivery_id, "now": effective_now},
+        {
+            "delivery_id": delivery_id,
+            "recipient_email": recipient_email,
+            "payload_json": json.dumps(payload_json, ensure_ascii=False) if payload_json is not None else None,
+            "cooldown_seconds": max(0, int(cooldown_seconds)),
+            "now": effective_now,
+        },
     )
     return _row_to_delivery(row) if row is not None else None
 

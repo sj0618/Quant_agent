@@ -510,9 +510,7 @@ jobs:
               local exit_status="$1"
               trap - ERR
             echo "Restore deploy snapshot on failure"
-            if [ "${EMAIL_DELIVERY_WORKER_ENABLED:-false}" = "true" ]; then
-              "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
-            fi
+            "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
             stop_listeners_on_port 18001
             stop_listeners_on_port 18000
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
@@ -715,12 +713,17 @@ jobs:
                 'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
             wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "deployed-ai-api-readiness" ai
 
-            if [ "${EMAIL_DELIVERY_WORKER_ENABLED:-false}" = "true" ]; then
+            # The flag is read through Settings so it may live in .env or the shell env.
+            email_worker_enabled="$(cd "$APP_DIR" && "$APP_DIR/ai/.venv/bin/python" -c 'from app.core.config import load_settings; print(str(load_settings().email_delivery_worker_enabled).lower())' 2>/dev/null || echo false)"
+            if [ "$email_worker_enabled" = "true" ]; then
               "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
               QUANTAGENT_BACKEND_PYTHON="$APP_DIR/ai/.venv/bin/python" \
                 "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start
-              QUANTAGENT_BACKEND_PYTHON="$APP_DIR/ai/.venv/bin/python" \
-                "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" check
+              # Email readiness must not roll back a healthy web release; it is reported, not enforced.
+              if ! QUANTAGENT_BACKEND_PYTHON="$APP_DIR/ai/.venv/bin/python" \
+                "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" check; then
+                echo "WARNING: email worker check failed; see $RUN_DIR/email-worker.log and /health email_* fields"
+              fi
             else
               echo "email worker disabled (EMAIL_DELIVERY_WORKER_ENABLED != true)"
             fi
@@ -743,7 +746,7 @@ jobs:
             test "$unknown_route_status" = "404"
             test -s "$unknown_route_html"
             rm -f "$unknown_route_html"
-            curl -fsS "http://127.0.0.1:18000/trust" >/dev/null
+            curl -fsS "http://127.0.0.1:18000/terms" >/dev/null
 
             auth_headers="$(mktemp "$RUN_DIR/google-auth-smoke.headers.XXXXXX")"
             auth_body="$(mktemp "$RUN_DIR/google-auth-smoke.body.XXXXXX")"

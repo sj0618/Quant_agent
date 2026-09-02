@@ -29,6 +29,12 @@ resend(202) → 재발송` 전 구간이 통과했다. 재시도(500 → RETRY_P
 - 메일 링크: `{EMAIL_PUBLIC_BASE_URL}/reports/{uuid5}`는 FE가 AI job id(`ai-job:...`)로만 해석해 열리지 않았다.
   `/me/email-reports/{report_id}`(백엔드 제공 소유자 리포트 화면)로 바꿨다.
 - `run_email_delivery_worker.py --check`: Redis 연결 실패 시 raw traceback 대신 `Redis readiness check failed`로 종료한다.
+- 재발송 보호(적대적 리뷰 반영): 재큐잉은 마지막 이벤트 후 `EMAIL_RESEND_COOLDOWN_SECONDS`(기본 600초)가 지나야 하고,
+  재큐잉 시 수신자 주소와 렌더된 본문을 최신 값으로 갱신한다(주소 변경 후 재발송이 영원히 `recipient_changed`로 취소되던 문제).
+  `submission_status` 메타데이터가 없는 레거시 행은 `status` 컬럼으로 판정한다.
+- 워커 루프: `AppError`(DB 계층이 드라이버 오류를 `db_query_failed`로 감싼다)도 루프를 죽이지 않고 `worker_error` 후 poll 간격만큼 대기한다.
+- hosted-pages 정책: 메일 링크 대상 `/me/email-reports/{id}`를 200 SPA 라우트로 등록했다(이전엔 404 상태의 셸).
+- 배포: `/trust` smoke를 `/terms`로 바꿨다(`/trust`는 FE 화면이 없어 404 정책으로 옮김). 워커 시작 여부는 `Settings.email_delivery_worker_enabled`로 읽고, `check` 실패는 경고만 남긴다.
 
 ## 운영 전제 (코드가 아니라 설정)
 - `DATABASE_URL`과 `TRADING_DATA_DATABASE_URL`은 같은 `qt_db`를 가리켜야 한다. 완료 경로는 trading engine으로 이메일 행을 쓰고,

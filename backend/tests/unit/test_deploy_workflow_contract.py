@@ -174,7 +174,9 @@ def test_every_readiness_gate_invocation_selects_a_profile():
 def test_email_worker_start_is_gated_and_points_at_the_ai_venv():
     workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
 
-    assert 'if [ "${EMAIL_DELIVERY_WORKER_ENABLED:-false}" = "true" ]; then' in workflow
+    assert "print(str(load_settings().email_delivery_worker_enabled).lower())" in workflow
+    assert 'if [ "$email_worker_enabled" = "true" ]; then' in workflow
+    assert "WARNING: email worker check failed" in workflow
     assert '"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start' in workflow
     assert '"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" check' in workflow
     assert '"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop' in workflow

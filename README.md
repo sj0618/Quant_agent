@@ -208,7 +208,8 @@ release 프로필(`AI_RELEASE_PROFILE` 또는 `APP_ENV` 가 `release`/`productio
 
 이메일 발송은 기본적으로 꺼져 있다(`EMAIL_DELIVERY_ENABLED=false`). 배포(`deploy.yml`)는
 `EMAIL_DELIVERY_WORKER_ENABLED=true` 일 때만 이메일 워커를 시작/재시작하고, `false` 이거나
-미설정이면 아무것도 하지 않는다. 두 값 모두 원격 서버의 배포 셸(SSH 로그인 셸)에서
+미설정이면 아무것도 하지 않는다. 값은 backend `Settings`(`.env` 또는 셸 env)로 읽고, 워커 `check` 실패는
+배포를 롤백하지 않고 경고로만 남긴다(`/health`의 `email_*` 필드와 `.run/email-worker.log`로 확인). 두 값 모두 원격 서버의 배포 셸(SSH 로그인 셸)에서
 보여야 하므로 `~/.bashrc` export 나 `~/mvp_sp1/quant-proj/.env` 에 있어야 한다 — 워크플로 자체는
 이 값을 주입하지 않는다.
 
@@ -229,6 +230,7 @@ release 프로필(`AI_RELEASE_PROFILE` 또는 `APP_ENV` 가 `release`/`productio
 - `DATABASE_URL` / `TRADING_DATA_DATABASE_URL` (동일 `qt_db`, non-loopback 호스트)
 - `REDIS_URL` (logical DB 11)
 - `EMAIL_MAX_ATTEMPTS` (기본 5)
+- `EMAIL_RESEND_COOLDOWN_SECONDS` (기본 600) — `/api/v1/reports/{id}/resend`가 이미 발송/실패/취소된 배송을 다시 큐에 넣을 수 있는 최소 간격. 그 안의 재요청은 204(무동작)
 
 실제 발송(`EMAIL_ROLLOUT_MODE=production`)은 위와 동일하되 `BREVO_SANDBOX_MODE=false` 여야
 한다. 검증 규칙은 `backend/app/core/config.py` 의 롤아웃 validator(~779-830줄)를 그대로

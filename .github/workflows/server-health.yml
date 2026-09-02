@@ -137,7 +137,7 @@ jobs:
           test "$unknown_route_status" = "404"
           test -s "$unknown_route_html"
           rm -f "$unknown_route_html"
-          check_http "Frontend public route" "http://127.0.0.1:$FE_PORT/trust"
+          check_http "Frontend public route" "http://127.0.0.1:$FE_PORT/terms"
 
           if command -v git >/dev/null 2>&1 && git -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
             printf 'deployed revision: %s\n' "$(git -C "$APP_DIR" rev-parse --short HEAD)"

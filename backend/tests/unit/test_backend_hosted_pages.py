@@ -88,7 +88,10 @@ def test_known_frontend_routes_use_spa_fallback(frontend_dist: Path, monkeypatch
     assert set(static_routes) == configured_static_routes - {"/auth/google/callback"}
     responses = {route: client.get(route, follow_redirects=False) for route in static_routes}
     report_detail = client.get("/reports/report-123")
+    email_report_detail = client.get("/me/email-reports/report-123")
     asset = client.get("/assets/app.js")
+    # The delivery email links here; it must be served with 200 like the workspace report.
+    assert email_report_detail.status_code == 200
 
     # /login and /app deliberately have authentication-specific routes; every other
     # public React route must remain in lockstep with FRONTEND_EXACT_ROUTES.

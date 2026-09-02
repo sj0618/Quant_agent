@@ -70,10 +70,13 @@ def _is_known_frontend_route(full_path: str) -> bool:
     normalized = full_path.strip("/")
     if normalized in FRONTEND_EXACT_ROUTES:
         return True
-    if not normalized.startswith("reports/"):
-        return False
-    report_id = normalized.removeprefix("reports/")
-    return bool(report_id) and "/" not in report_id
+    # Two id-carrying routes: the workspace report and the emailed report the
+    # delivery email links to (/me/email-reports/{id}).
+    for prefix in ("reports/", "me/email-reports/"):
+        if normalized.startswith(prefix):
+            report_id = normalized.removeprefix(prefix)
+            return bool(report_id) and "/" not in report_id
+    return False
 
 
 @router.get("/login", include_in_schema=False)

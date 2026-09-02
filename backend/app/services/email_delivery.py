@@ -381,8 +381,16 @@ async def resend_report_completed_delivery(
     )
     action = resolve_resend_action(result["delivery"])
     if action == "requeue":
-        requeued = await requeue_delivery(db, delivery_id=str(result["delivery"]["delivery_id"]))
-        # A concurrent worker/resend may have moved the row out of a terminal state first.
+        request = result["request"]
+        requeued = await requeue_delivery(
+            db,
+            delivery_id=str(result["delivery"]["delivery_id"]),
+            recipient_email=request.recipient_email if request is not None else None,
+            payload_json=request.payload_json if request is not None else None,
+            cooldown_seconds=settings.email_resend_cooldown_seconds,
+        )
+        # A concurrent worker/resend may have moved the row out of a terminal state
+        # first, or the last send is younger than the resend cooldown.
         action = "queued" if requeued is not None else "noop"
         if requeued is not None:
             result = {**result, "delivery": requeued}

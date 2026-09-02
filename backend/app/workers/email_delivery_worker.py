@@ -179,9 +179,12 @@ class EmailDeliveryWorker:
             while True:
                 try:
                     processed = await self.run_once()
-                except (AppError, asyncio.CancelledError):
+                except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
+                    # Includes AppError: the DB layer wraps driver failures into
+                    # AppError(db_query_failed), and a DB blip must not stop the loop.
+                    # Startup/config problems are raised by validate_startup() before it.
                     emit_email_event(
                         self.logger,
                         "worker_error",
