@@ -26,7 +26,7 @@ from ai_graph.data_sources import (
     load_pipeline_data_from_env,
     screening_data_families,
 )
-from ai_graph.data_sources.db import BACKTEST_EVALUATION_YEARS
+from ai_graph.data_sources.db import BACKTEST_EVALUATION_YEARS, indicator_families_for_metrics
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.exploration_policy import (
@@ -128,7 +128,6 @@ from ai_graph.schemas import (
 )
 from ai_graph.strategy_blueprint_catalog import strategy_blueprint_catalog
 from ai_graph.source_manifest import (
-    build_pipeline_extract_snapshot,
     is_release_profile,
     validate_release_metadata,
 )
@@ -757,33 +756,29 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
     )
     if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3):
         required_metrics = _sealed_v3_condition_metrics(sealed_execution_spec)
+        requires_financials = bool(required_metrics & _FUNDAMENTAL_CONDITION_METRICS)
+        compact_price_rows = not requires_financials and not indicator_families_for_metrics(
+            tuple(sorted(required_metrics)), include_default=False
+        )
         pipeline_data = load_pipeline_data_from_env(
             query,
             state["trace_id"],
             screen_current=False,
             required_metrics=tuple(sorted(required_metrics)),
-            requires_financials=bool(required_metrics & _FUNDAMENTAL_CONDITION_METRICS),
+            requires_financials=requires_financials,
+            compact_price_rows=compact_price_rows,
         )
     elif skip_current_screen:
         pipeline_data = load_pipeline_data_from_env(query, state["trace_id"], screen_current=False)
     else:
         pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
     if is_release_profile():
-        raw_required_tickers = pipeline_data.metadata.get("tickers", ())
-        required_tickers = (
-            raw_required_tickers
-            if isinstance(raw_required_tickers, Sequence) and not isinstance(raw_required_tickers, str)
-            else ()
-        )
         manifest_errors = validate_release_metadata(
             pipeline_data.metadata,
-            extract_snapshot=build_pipeline_extract_snapshot(
-                price_rows=pipeline_data.price_rows,
-                screening_candidates=pipeline_data.screening_candidates,
-                l4_evidence=pipeline_data.l4_evidence,
-                macro_snapshot=pipeline_data.macro_snapshot,
-                data_availability=pipeline_data.data_availability,
-                required_tickers=required_tickers,
+            loaded_extract_hash=(
+                str(pipeline_data.metadata["loaded_extract_hash"])
+                if pipeline_data.metadata.get("loaded_extract_hash") is not None
+                else None
             ),
         )
         if manifest_errors:

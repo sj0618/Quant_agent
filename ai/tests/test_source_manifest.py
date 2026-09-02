@@ -9,7 +9,9 @@ from ai_graph.graph import run_analysis
 from ai_graph.source_manifest import (
     build_pipeline_extract_snapshot,
     build_source_manifest,
+    compute_extract_hash,
     compute_lineage_hash,
+    compute_pipeline_extract_hash,
     is_release_profile,
     validate_release_metadata,
     validate_source_manifest,
@@ -57,6 +59,26 @@ def test_source_manifest_contains_required_fields_and_matching_lineage_hash() ->
     assert len(manifest.lineage_hash) == 64
     assert manifest.lineage_hash == compute_lineage_hash(manifest)
     assert validate_source_manifest(manifest, release_profile=True) == ()
+
+
+def test_incremental_pipeline_extract_hash_matches_materialized_snapshot() -> None:
+    """The memory-saving release path must bind exactly the same payload."""
+
+    arguments = {
+        "price_rows": [
+            {"ticker": "000001", "date": "2026-08-20", "close": 100},
+            {"ticker": "000002", "date": "2026-08-20", "close": 120},
+        ],
+        "screening_candidates": [{"ticker": "000002", "score": 0.8}],
+        "l4_evidence": [{"ticker": "000002", "report_id": "report-1"}],
+        "macro_snapshot": {"usd_krw": 1350.0},
+        "data_availability": {"price_ta": True, "source": "postgres"},
+        "required_tickers": ("000002", "2"),
+    }
+
+    snapshot = build_pipeline_extract_snapshot(**arguments)
+
+    assert compute_pipeline_extract_hash(**arguments) == compute_extract_hash(snapshot)
 
 
 def test_missing_manifest_fields_are_rejected_for_release() -> None:
@@ -131,6 +153,39 @@ def test_release_rejects_a_valid_new_manifest_for_other_loaded_data() -> None:
     assert manifest_for_other_data.lineage_hash == compute_lineage_hash(manifest_for_other_data)
     assert "source manifest extract_hash does not match loaded data" in errors
     assert "source manifest snapshot_id does not match loaded data" in errors
+
+
+def test_precomputed_extract_hash_uses_current_snapshot_not_historical_delistings() -> None:
+    """PIT members that delisted before ``as_of`` remain backtest rows, not freshness failures."""
+
+    extract = build_pipeline_extract_snapshot(
+        price_rows=[
+            {"ticker": "000001", "date": "2024-01-02", "close": 100},
+            {"ticker": "000002", "date": "2026-08-20", "close": 120},
+        ],
+        screening_candidates=[],
+        l4_evidence=[],
+        macro_snapshot=None,
+        data_availability={"source": "postgres", "price_ta": True},
+        required_tickers=("000002",),
+    )
+    manifest = build_source_manifest(
+        source="postgres",
+        as_of=date(2026, 8, 20),
+        freshness="eod_current",
+        lineage_refs=["mart.common_stock_universe_asof", "feature.kis_adjusted_ohlcv_daily"],
+        source_version="krx-pit-v2",
+        extract_snapshot=extract,
+    )
+    metadata = _release_metadata(manifest) | {
+        "current_snapshot_tickers": ["000002"],
+        "current_snapshot_price_rows": [{"ticker": "000002", "date": "2026-08-20"}],
+    }
+
+    assert validate_release_metadata(
+        metadata,
+        loaded_extract_hash=manifest.extract_hash,
+    ) == ()
 
 
 def test_release_profile_fails_before_fixture_analysis_can_return_a_result(

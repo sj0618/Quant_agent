@@ -17,7 +17,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from ai_graph.immutable_snapshot import build_snapshot_bundle
 from ai_graph.quant_strategy import rsi_trade_rules
 from ai_graph.research_eligibility import ResearchRuntimeFacts
-from ai_graph.source_manifest import build_pipeline_extract_snapshot, build_source_manifest
+from ai_graph.source_manifest import (
+    build_pipeline_extract_snapshot,
+    build_source_manifest,
+    compute_pipeline_extract_hash,
+)
 
 from .sectors import extract_sector_from_query, get_known_sectors
 
@@ -47,7 +51,10 @@ TRADING_DAYS_PER_YEAR = 252
 # number of bars: the manifest records the resolved sessions for reproducibility.
 BACKTEST_EVALUATION_YEARS = 5
 DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * BACKTEST_EVALUATION_YEARS
-BACKTEST_WINDOW_POLICY_ID = "krx_pit_common_stock_5y_kst_session_v1"
+# The resolver anchors the window on the last completed KST trading session.  The
+# previous identifier omitted that settlement guarantee even though consumers and
+# regression contracts already require the versioned settled-session policy.
+BACKTEST_WINDOW_POLICY_ID = "krx_pit_common_stock_5y_kst_settled_session_v2"
 DEFAULT_L4_EVIDENCE_LIMIT = 5
 # A broad screen can match many names, but recommendations never define historical
 # membership. They are presentation output only.
@@ -333,6 +340,7 @@ class PostgresPipelineDataSource:
         screen_current: bool = True,
         required_metrics: Sequence[str] | None = None,
         requires_financials: bool | None = None,
+        compact_price_rows: bool = False,
     ) -> PipelineDataBundle:
         load_started = perf_counter()
         timings: dict[str, float] = {}
@@ -376,6 +384,14 @@ class PostgresPipelineDataSource:
                 if required_metrics is not None
                 else indicator_families_for_query(query)
             )
+            # Relative-strength-only V3 candidates derive their features from OHLCV.
+            # They do not need raw-capacity fields, display fields, or any TA/DART
+            # payload on every historical bar. Legacy callers remain unchanged.
+            compact_execution_rows = bool(
+                compact_price_rows
+                and not indicator_families
+                and requires_financials is False
+            )
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
             universe_descriptor: dict[str, Any] = {
@@ -408,6 +424,7 @@ class PostgresPipelineDataSource:
                         indicator_families,
                         requires_financials,
                         timings,
+                        compact_price_rows=compact_execution_rows,
                     )
                     (
                         screening_candidates,
@@ -450,6 +467,7 @@ class PostgresPipelineDataSource:
                         indicator_families,
                         requires_financials,
                         timings,
+                        compact_price_rows=compact_execution_rows,
                     )
                 (
                     tickers,
@@ -482,6 +500,8 @@ class PostgresPipelineDataSource:
                 fetch_kwargs: dict[str, Any] = {"timings": timings}
                 if requires_financials is not None:
                     fetch_kwargs["requires_financials"] = requires_financials
+                if compact_execution_rows:
+                    fetch_kwargs["compact_price_rows"] = True
                 price_rows, effective_lookback_days = self._fetch_price_rows(
                     conn,
                     tickers,
@@ -528,6 +548,22 @@ class PostgresPipelineDataSource:
             str(row.get("date") or row.get("time") or row.get("as_of_date") or "")
             for row in price_rows
         }
+        current_snapshot_price_rows = [
+            {
+                "ticker": str(row.get("ticker") or "").zfill(6),
+                "date": str(row.get("date") or row.get("time") or row.get("as_of_date") or ""),
+            }
+            for row in price_rows
+            if str(row.get("date") or row.get("time") or row.get("as_of_date") or "")
+            == research_as_of
+        ]
+        current_snapshot_tickers = sorted(
+            {
+                str(row["ticker"]).zfill(6)
+                for row in current_snapshot_price_rows
+                if str(row["ticker"]).strip()
+            }
+        )
         # The end session comes from core.trading_calendar inside this same connection;
         # data is current only when the returned price rows actually cover that session.
         price_covers_session = research_as_of in price_dates
@@ -540,13 +576,15 @@ class PostgresPipelineDataSource:
         data_availability = _data_availability_for_query(
             query, source="postgres", available=capability_availability
         )
-        extract_snapshot = build_pipeline_extract_snapshot(
+        extract_hash = compute_pipeline_extract_hash(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
             l4_evidence=l4_evidence,
             macro_snapshot=macro_snapshot,
             data_availability=data_availability,
-            required_tickers=tickers,
+            # Historical PIT members include delisted names by design.  Currentness
+            # only asks which rows must exist on the declared latest session.
+            required_tickers=current_snapshot_tickers,
         )
         source_manifest = build_source_manifest(
             source="postgres",
@@ -564,7 +602,7 @@ class PostgresPipelineDataSource:
                 ),
             ],
             source_version=BACKTEST_WINDOW_POLICY_ID,
-            extract_snapshot=extract_snapshot,
+            extract_hash=extract_hash,
         )
         immutable_snapshot_bundle = build_snapshot_bundle(
             as_of=research_as_of,
@@ -602,9 +640,12 @@ class PostgresPipelineDataSource:
                 "source_snapshot_as_of": research_as_of,
                 "source_snapshot_freshness": source_freshness,
                 "source_snapshot_version": BACKTEST_WINDOW_POLICY_ID,
+                "loaded_extract_hash": source_manifest.extract_hash,
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
                 "tickers": tickers,
+                "current_snapshot_tickers": current_snapshot_tickers,
+                "current_snapshot_price_rows": current_snapshot_price_rows,
                 "recommended_tickers": recommended,
                 "recommendation_ticker": recommended[0] if recommended else None,
                 "backtest_universe": universe_descriptor,
@@ -619,6 +660,10 @@ class PostgresPipelineDataSource:
                 "data_load_plan": {
                     "required_metrics": sorted(required_metrics or ()),
                     "requires_financials": requires_financials,
+                    "compact_price_rows": compact_execution_rows,
+                    "execution_price_basis": (
+                        "official_adjusted_ohlcv" if compact_execution_rows else "raw_ohlcv"
+                    ),
                 },
                 "unavailable_indicator_families": list(
                     self.unavailable_indicator_families
@@ -636,9 +681,17 @@ class PostgresPipelineDataSource:
                 "backtest_session_count": backtest_window["session_count"],
                 "universe_provenance": SYMBOL_LISTING_HISTORY_TABLE,
                 "raw_price_provenance": {
-                    "raw_ohlcv_source": "core.ohlcv_daily",
+                    "raw_ohlcv_source": None if compact_execution_rows else "core.ohlcv_daily",
                     "raw_notional_source": None,
                     "adjusted_signal_source": KIS_ADJUSTED_OHLCV_TABLE,
+                    "execution_price_source": (
+                        KIS_ADJUSTED_OHLCV_TABLE
+                        if compact_execution_rows
+                        else "core.ohlcv_daily"
+                    ),
+                    "execution_price_basis": (
+                        "official_adjusted_ohlcv" if compact_execution_rows else "raw_ohlcv"
+                    ),
                 },
                 "raw_price_capabilities": raw_price_capabilities,
                 "dart_date_only_effective_policy": "next_krx_session_v1",
@@ -696,6 +749,8 @@ class PostgresPipelineDataSource:
         indicator_families: Sequence[str],
         requires_financials: bool | None,
         timings: dict[str, float],
+        *,
+        compact_price_rows: bool = False,
     ) -> tuple[
         list[str],
         dict[str, Any],
@@ -722,6 +777,8 @@ class PostgresPipelineDataSource:
             fetch_kwargs: dict[str, Any] = {"timings": timings}
             if requires_financials is not None:
                 fetch_kwargs["requires_financials"] = requires_financials
+            if compact_price_rows:
+                fetch_kwargs["compact_price_rows"] = True
             price_rows, effective_lookback_days = self._fetch_price_rows(
                 conn,
                 tickers,
@@ -1096,11 +1153,31 @@ class PostgresPipelineDataSource:
         indicator_families: Sequence[str] | None = None,
         *,
         requires_financials: bool | None = None,
+        compact_price_rows: bool = False,
         timings: dict[str, float] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         del query
         timings = {} if timings is None else timings
         ticker_list = list(tickers)
+        if compact_price_rows and hasattr(conn, "cursor"):
+            # psycopg's dict-row factory would first materialise several million
+            # dictionaries and then the adapter would build a second list of compact
+            # rows. Stream tuple rows directly into the execution representation.
+            # This retains the sealed price-only execution basis without materialising
+            # a second set of database dictionaries before the feature engine sees it.
+            compact_started = perf_counter()
+            price_rows = self._fetch_compact_price_rows(conn, ticker_list, window)
+            compact_elapsed = perf_counter() - compact_started
+            self.unavailable_indicator_families = ()
+            # The compact cursor streams the query and conversion together.  Keep that
+            # fact explicit instead of reporting artificial zero-duration phases.
+            timings["price_ohlcv_query_seconds"] = compact_elapsed
+            timings["price_compact_stream_seconds"] = compact_elapsed
+            timings["price_indicator_seconds"] = 0.0
+            timings["price_financial_seconds"] = 0.0
+            timings["price_row_conversion_seconds"] = compact_elapsed
+            timings["price_financial_attach_seconds"] = 0.0
+            return price_rows, int(window["session_count"])
         ohlcv_started = perf_counter()
         rows = conn.execute(
             f"""
@@ -1119,11 +1196,18 @@ class PostgresPipelineDataSource:
               ON sm.symbol = p.ticker
             LEFT JOIN core.ohlcv_daily raw
               ON raw.symbol_id = sm.symbol_id AND raw.trade_date = p.time
+             -- Keep the raw hypertable's time predicate explicit.  The equality to
+             -- p.time alone prevents Timescale chunk pruning and made a five-year
+             -- PIT request scan every raw OHLCV chunk before returning its first row.
+             AND raw.trade_date BETWEEN %s::date AND %s::date
             WHERE p.ticker = ANY(%s)
               AND p.time BETWEEN %s::date AND %s::date
-            ORDER BY p.ticker, p.time
+            -- PreparedFeatureStore operates date-by-date for cross-sectional rules.
+            -- Returning the database rows in that same order avoids sorting the full
+            -- PIT universe again in Python before each analysis.
+            ORDER BY p.time, p.ticker
             """,
-            [ticker_list, window["start"], window["end"]],
+            [window["start"], window["end"], ticker_list, window["start"], window["end"]],
         ).fetchall()
         timings["price_ohlcv_query_seconds"] = perf_counter() - ohlcv_started
         earliest_priced_date = min((_date_value(row["as_of_date"]) for row in rows), default=None)
@@ -1157,22 +1241,71 @@ class PostgresPipelineDataSource:
         )
         timings["price_financial_seconds"] = perf_counter() - financials_started
         conversion_started = perf_counter()
-        price_rows = [
-            _price_row_from_feature_frame_record(
-                _feature_frame_row_from_sources(
-                    row,
-                    {family: by_ticker.get(str(row.get("ticker") or "").zfill(6), {})
-                     for family, by_ticker in indicators_by_family.items()},
-                    symbol_info_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
+        if compact_price_rows:
+            # A non-streaming adapter (normally a test double) has already supplied
+            # source raw OHLCV. Preserve it rather than changing its declared
+            # execution basis; the real compact cursor below uses its separately
+            # disclosed official-adjusted basis.
+            price_rows = [_compact_price_row_from_source(row) for row in rows]
+        else:
+            price_rows = [
+                _price_row_from_feature_frame_record(
+                    _feature_frame_row_from_sources(
+                        row,
+                        {
+                            family: by_ticker.get(str(row.get("ticker") or "").zfill(6), {})
+                            for family, by_ticker in indicators_by_family.items()
+                        },
+                        symbol_info_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
+                    )
                 )
-            )
-            for row in rows
-        ]
+                for row in rows
+            ]
         timings["price_row_conversion_seconds"] = perf_counter() - conversion_started
         attach_started = perf_counter()
-        _attach_pointintime_financials(price_rows, financials_by_ticker)
+        if not compact_price_rows:
+            _attach_pointintime_financials(price_rows, financials_by_ticker)
         timings["price_financial_attach_seconds"] = perf_counter() - attach_started
         return price_rows, int(window["session_count"])
+
+    def _fetch_compact_price_rows(
+        self,
+        conn: Any,
+        tickers: Sequence[str],
+        window: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Stream the minimal accurate OHLCV payload for a sealed price-only plan."""
+
+        from psycopg.rows import tuple_row
+
+        price_rows: list[dict[str, Any]] = []
+        append = price_rows.append
+        # A named cursor is server-side in psycopg.  An unnamed cursor buffers the
+        # entire result during ``execute`` before ``fetchmany`` runs, which made a
+        # 1.9M-row PIT payload look hung even though the database query itself was
+        # fast.  Streaming keeps memory bounded and lets the job report real progress.
+        with conn.cursor(name="ai_compact_price_rows", row_factory=tuple_row) as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    p.time, p.ticker,
+                    p.adj_open, p.adj_high, p.adj_low, p.adj_close, p.adj_volume
+                FROM {KIS_ADJUSTED_OHLCV_TABLE} p
+                WHERE p.ticker = ANY(%s)
+                  AND p.time BETWEEN %s::date AND %s::date
+                -- The feature engine's date ranges and rank filters require a
+                -- date-major stream.  This changes only transport order, never the
+                -- PIT universe or the rows available to a condition.
+                ORDER BY p.time, p.ticker
+                """,
+                [list(tickers), window["start"], window["end"]],
+            )
+            # A larger server-side batch amortises cursor round trips without keeping
+            # the full PIT universe in the driver's result buffer.
+            while batch := cursor.fetchmany(131_072):
+                for row in batch:
+                    append(_compact_price_row_from_tuple(row))
+        return price_rows
 
     def _fetch_financial_timeline(
         self, conn: Any, tickers: Sequence[str]
@@ -1625,6 +1758,7 @@ def load_pipeline_data_from_env(
     screen_current: bool = True,
     required_metrics: Sequence[str] | None = None,
     requires_financials: bool | None = None,
+    compact_price_rows: bool = False,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -1638,6 +1772,7 @@ def load_pipeline_data_from_env(
         screen_current=screen_current,
         required_metrics=required_metrics,
         requires_financials=requires_financials,
+        compact_price_rows=compact_price_rows,
     )
 
 
@@ -3074,6 +3209,63 @@ def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, An
     if rsi is not None:
         price_row["rsi"] = rsi
     return price_row
+
+
+def _compact_price_row_from_source(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the lossless execution subset for a sealed OHLCV-only plan.
+
+    ``open`` through ``volume`` remain the adjusted signal series.  ``raw_*`` fields
+    remain source rows for execution.  We intentionally do not derive traded value or
+    add placeholder indicator/financial fields: a missing feature must remain missing
+    rather than change the strategy that was sealed.
+    """
+
+    return {
+        "date": _date_value(row["as_of_date"]).isoformat(),
+        "ticker": str(row["ticker"]).zfill(6),
+        "open": _float_value(row["open"]),
+        "high": _float_value(row["high"]),
+        "low": _float_value(row["low"]),
+        "close": _float_value(row["close"]),
+        "volume": _float_value(row["volume"]),
+        "raw_open": _optional_float_value(row.get("raw_open")),
+        "raw_high": _optional_float_value(row.get("raw_high")),
+        "raw_low": _optional_float_value(row.get("raw_low")),
+        "raw_close": _optional_float_value(row.get("raw_close")),
+        "raw_volume": _optional_float_value(row.get("raw_volume")),
+        "raw_notional": _optional_float_value(row.get("raw_notional")),
+    }
+
+
+def _compact_price_row_from_tuple(row: Sequence[Any]) -> dict[str, Any]:
+    """Convert one streamed PostgreSQL tuple without allocating an intermediate mapping.
+
+    This deliberately uses KIS's official adjusted OHLCV for both signals and fills.
+    It is not a raw-price substitute: the compact plan declares this execution basis
+    explicitly and disables capacity claims when source traded value is absent.  That
+    avoids a multi-million-row raw-table join for a price-only strategy while retaining
+    one internally consistent, source-provided series.
+    """
+
+    (
+        as_of_date,
+        ticker,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        volume,
+    ) = row
+    return {
+        "date": _date_value(as_of_date).isoformat(),
+        "ticker": str(ticker).zfill(6),
+        "open": _float_value(open_price),
+        "high": _float_value(high_price),
+        "low": _float_value(low_price),
+        "close": _float_value(close_price),
+        "volume": _float_value(volume),
+        "execution_price_basis": "official_adjusted_ohlcv",
+    }
 
 
 def _feature_frame_row_from_sources(

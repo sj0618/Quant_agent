@@ -31,10 +31,11 @@ _logger = logging.getLogger(__name__)
 AI_ANALYSIS_MAX_CONCURRENCY_ENV = "AI_ANALYSIS_MAX_CONCURRENCY"
 AI_ANALYSIS_QUEUE_WAIT_SECONDS_ENV = "AI_ANALYSIS_QUEUE_WAIT_SECONDS"
 
-# Below the AOAI gate's own capacity (8), because one analysis issues several provider
-# calls: letting more analyses run than the provider gate can serve just moves the queue
-# to a place with less context about what is waiting.
-DEFAULT_MAX_CONCURRENCY = 4
+# The production node has 2 vCPUs and a single-process service. One analysis can hold
+# a multi-year PIT universe and use backtest workers, so the safe default is one; an
+# operator may raise it explicitly after sizing the host. Queuing preserves accepted
+# jobs instead of letting four full extracts compete until the process is killed.
+DEFAULT_MAX_CONCURRENCY = 1
 # Longer than a single analysis's wall budget, so a job queued behind one full run still
 # gets its turn instead of failing while a slot was about to free up.
 DEFAULT_QUEUE_WAIT_SECONDS = 600.0

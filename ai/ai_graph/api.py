@@ -34,11 +34,12 @@ from ai_graph.audit import (
     AuditSession,
     AuditSink,
     NoOpAuditSink,
+    audit_failure_count,
     bind_audit_context,
     create_audit_correlation,
     report_audit_failure,
 )
-from ai_graph.audit_postgres import resolve_audit_sink
+from ai_graph.audit_postgres import audit_sink_runtime_status, resolve_audit_sink
 from ai_graph.auth import RequireAuthenticatedUser, SessionResolver
 from ai_graph.data_sources.db import (
     ANALYST_REPORT_TABLE,
@@ -550,6 +551,16 @@ class JobStoreStatus(BaseModel):
     fallback_reason: str | None
 
 
+class AuditStatus(BaseModel):
+    """Secret-free evidence that analysis traces can be persisted."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    sink: Literal["postgres", "noop"]
+    admission_authorized: bool
+    failure_count: int = Field(ge=0)
+
+
 class APIStatusResponse(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
@@ -559,6 +570,7 @@ class APIStatusResponse(BaseModel):
     openapi_url: str
     data_source: DataSourceStatus
     job_store: JobStoreStatus
+    audit: AuditStatus
     endpoints: list[EndpointStatus]
     deployment_revision: str | None = None
 
@@ -1276,6 +1288,7 @@ def create_app(
 
     @app.get(API_STATUS_PATH, response_model=APIStatusResponse, tags=["System"])
     def api_status() -> APIStatusResponse:
+        audit_sink, audit_admission_authorized = audit_sink_runtime_status(app.state.audit_sink)
         return APIStatusResponse(
             service=API_TITLE,
             schema_version=SCHEMA_VERSION,
@@ -1283,6 +1296,11 @@ def create_app(
             openapi_url=OPENAPI_URL,
             data_source=_data_source_status(),
             job_store=_job_store_status(runtime),
+            audit=AuditStatus(
+                sink=audit_sink,
+                admission_authorized=audit_admission_authorized,
+                failure_count=audit_failure_count(),
+            ),
             endpoints=_endpoint_statuses(production_runtime=_production_runtime()),
             deployment_revision=(environ.get(DEPLOYMENT_REVISION_ENV) or "").strip() or None,
         )

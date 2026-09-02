@@ -926,6 +926,64 @@ jobs:
             export APP_ENV=production
             export AI_JOB_STORE=persistent
 
+            # A deployment rollback restores source files, not runtime environment.
+            # Recreate the same authorized audit session used by deploy_release so a
+            # restored V3 job keeps its trace and agent events.  The protected key is
+            # reused from RUN_DIR and never printed or placed in the release archive.
+            umask 077
+            AUDIT_SECRET_FILE="$RUN_DIR/ai-audit-admission.secret"
+            if [ ! -s "$AUDIT_SECRET_FILE" ]; then
+              openssl rand -hex 32 > "$AUDIT_SECRET_FILE"
+            fi
+            chmod 600 "$AUDIT_SECRET_FILE"
+            export AI_AUDIT_PRODUCTION_ENABLED=1
+            export AI_AUDIT_SINK=postgres
+            export AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET
+            AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET="$(tr -d '\r\n' < "$AUDIT_SECRET_FILE")"
+            export AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION=server-v1
+            export AI_AUDIT_GATE_B_ADMISSION_AUDIENCE=quantagent.ai.audit
+            export AI_AUDIT_GATE_B_EVIDENCE_ID=production-deployment-rollback
+            export AI_AUDIT_GATE_B_DEPLOYMENT_REVISION="$DEPLOYMENT_REVISION"
+            export AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE=active
+            export AI_AUDIT_GATE_B_ADMISSION_TOKEN
+            AI_AUDIT_GATE_B_ADMISSION_TOKEN="$("$APP_DIR/ai/.venv/bin/python" - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import os
+          import time
+
+          def encode(value):
+              raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+              return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+          now = time.time()
+          key_version = os.environ["AI_AUDIT_GATE_B_ADMISSION_HMAC_KEY_VERSION"]
+          header = {"alg": "HS256", "key_version": key_version}
+          claims = {
+              "audience": os.environ["AI_AUDIT_GATE_B_ADMISSION_AUDIENCE"],
+              "deployment_revision": os.environ[
+                  "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
+              ],
+              "evidence_id": os.environ["AI_AUDIT_GATE_B_EVIDENCE_ID"],
+              "expiry": now + 365 * 24 * 60 * 60,
+              "issued_at": now - 1,
+              "key_version": key_version,
+          }
+          signing_input = f"{encode(header)}.{encode(claims)}"
+          signature = hmac.new(
+              os.environ["AI_AUDIT_GATE_B_ADMISSION_HMAC_SECRET"].encode(),
+              signing_input.encode("ascii"),
+              hashlib.sha256,
+          ).digest()
+          print(
+              f"{signing_input}."
+              f"{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}"
+          )
+          PY
+            )"
+
             RULE_DRAFT_SECRET_FILE="$SECRET_DIR/ai-rule-draft-hmac.secret"
             if [ ! -s "$RULE_DRAFT_SECRET_FILE" ]; then
               umask 077
@@ -935,6 +993,14 @@ jobs:
             export AI_RULE_DRAFT_HMAC_SECRET
             AI_RULE_DRAFT_HMAC_SECRET="$(tr -d '\r\n' < "$RULE_DRAFT_SECRET_FILE")"
             export AI_RULE_DRAFT_HMAC_KEY_VERSION=server-v1
+
+            "$APP_DIR/ai/.venv/bin/python" - <<'PY'
+          from ai_graph.audit_postgres import AuthorizedAuditSink, create_audit_sink_from_env
+
+          if not isinstance(create_audit_sink_from_env(), AuthorizedAuditSink):
+              raise RuntimeError("production rollback audit admission was not authorized")
+          print("production rollback audit admission authorized")
+          PY
 
             cd "$APP_DIR"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \

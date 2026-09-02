@@ -322,12 +322,13 @@ class PostgresPipelineDataSource:
         screen_current: bool = True,
         required_metrics: Sequence[str] | None = None,
         requires_financials: bool | None = None,
+        compact_price_rows: bool = False,
     ) -> PipelineDataBundle:
         # Keep the alternative source API compatible with the sealed V3 data plan.
         # Its own projection planner is intentionally unchanged; this prevents a
         # configured variant from failing merely because the primary source gained a
         # plan-aware optional argument.
-        del required_metrics, requires_financials
+        del required_metrics, requires_financials, compact_price_rows
         if self.config.load_mode == "screening_only":
             if not screen_current:
                 raise PipelineDataUnavailableError(
@@ -1448,6 +1449,7 @@ def load_pipeline_data_from_env(
     screen_current: bool = True,
     required_metrics: Sequence[str] | None = None,
     requires_financials: bool | None = None,
+    compact_price_rows: bool = False,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -1461,6 +1463,7 @@ def load_pipeline_data_from_env(
         screen_current=screen_current,
         required_metrics=required_metrics,
         requires_financials=requires_financials,
+        compact_price_rows=compact_price_rows,
     )
 
 

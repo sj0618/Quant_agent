@@ -20,6 +20,7 @@ from ai_graph.data_sources.db import (
     RSI_OVERSOLD_THRESHOLD,
     ScreeningThresholds,
     _attach_pointintime_financials,
+    _compact_price_row_from_tuple,
     _raw_price_capabilities,
     _price_row_from_feature_frame_record,
     _relaxed_thresholds,
@@ -317,6 +318,66 @@ def test_feature_frame_record_maps_prices_and_rsi_metric() -> None:
     assert price_row["rsi"] == 28.5
 
 
+def test_compact_price_stream_is_date_major_for_cross_sectional_features() -> None:
+    """The loader must not trigger a second full-universe Python sort.
+
+    ``PreparedFeatureStore`` evaluates rank filters by date, while it keeps each
+    ticker's indices in their original order.  A date-major SQL stream satisfies both
+    invariants: the date ranges are contiguous and every individual ticker remains
+    chronological.
+    """
+
+    class Cursor:
+        def __init__(self) -> None:
+            self.query = ""
+            self._batches = [
+                [
+                    (date(2026, 5, 20), "000001", 10, 11, 9, 10, 100),
+                    (date(2026, 5, 20), "000002", 20, 21, 19, 20, 200),
+                ],
+                [(date(2026, 5, 21), "000001", 11, 12, 10, 11, 120)],
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, _params) -> None:
+            self.query = query
+
+        def fetchmany(self, _size):
+            return self._batches.pop(0) if self._batches else []
+
+    class Connection:
+        def __init__(self) -> None:
+            self.created: Cursor | None = None
+
+        def cursor(self, **_kwargs):
+            self.created = Cursor()
+            return self.created
+
+    source = PostgresPipelineDataSource(
+        DataSourceConfig(database_dsn="postgresql://test", database_dsn_env=AI_DATABASE_DSN_ENV)
+    )
+    connection = Connection()
+
+    rows = source._fetch_compact_price_rows(
+        connection,
+        ["000001", "000002"],
+        {"start": date(2026, 5, 20), "end": date(2026, 5, 21)},
+    )
+
+    assert connection.created is not None
+    assert "ORDER BY p.time, p.ticker" in connection.created.query
+    assert [(row["date"], row["ticker"]) for row in rows] == [
+        ("2026-05-20", "000001"),
+        ("2026-05-20", "000002"),
+        ("2026-05-21", "000001"),
+    ]
+
+
 def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
     class Result:
         def __init__(
@@ -432,7 +493,7 @@ def test_postgres_data_source_sets_statement_timeout_with_set_config() -> None:
         if "WHERE p.ticker = ANY(%s)" in query
     )
     assert "p.time BETWEEN %s::date AND %s::date" in price_query
-    assert "ORDER BY p.ticker, p.time" in price_query
+    assert "ORDER BY p.time, p.ticker" in price_query
 
 
 def test_postgres_data_source_broad_screening_uses_screening_candidates() -> None:
@@ -1667,6 +1728,31 @@ def test_raw_capability_requires_every_execution_row_not_any_row() -> None:
         "date": "2026-01-05", "ticker": "000001",
         "missing_fields": ["raw_open", "raw_high", "raw_low", "raw_close", "raw_volume"],
     }]
+
+
+def test_compact_tuple_row_keeps_source_execution_fields_without_synthesis() -> None:
+    row = _compact_price_row_from_tuple(
+        (
+            AS_OF,
+            "000660",
+            Decimal("100"),
+            Decimal("105"),
+            Decimal("99"),
+            Decimal("103"),
+            Decimal("1000"),
+        )
+    )
+
+    assert row == {
+        "date": AS_OF.isoformat(),
+        "ticker": "000660",
+        "open": 100.0,
+        "high": 105.0,
+        "low": 99.0,
+        "close": 103.0,
+        "volume": 1000.0,
+        "execution_price_basis": "official_adjusted_ohlcv",
+    }
 
 
 def test_release_profile_refuses_to_serve_the_local_fixture_bundle(monkeypatch) -> None:

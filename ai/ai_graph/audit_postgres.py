@@ -674,6 +674,20 @@ def resolve_audit_sink(
     report_audit_failure("unapproved_audit_sink")
     return NoOpAuditSink()
 
+
+def audit_sink_runtime_status(sink: AuditSink) -> tuple[Literal["postgres", "noop"], bool]:
+    """Return a secret-free audit projection for operator readiness endpoints.
+
+    The result intentionally answers only whether this process has an authorized
+    PostgreSQL writer *right now*.  It does not open a database connection, reveal a
+    DSN, token, or admission claims, and cannot turn a no-op sink into a writer.
+    """
+
+    if not isinstance(sink, AuthorizedAuditSink):
+        return "noop", False
+    return "postgres", sink._writer.capability_guard.permits_write()
+
+
 def is_authorized_audit_session(candidate: object) -> bool:
     return not isinstance(candidate, _PostgresAuditSession) or getattr(candidate, "_capability", None) is _AUDIT_WRITER_CAPABILITY
 
@@ -929,6 +943,7 @@ __all__ = [
     "AI_AUDIT_SINK_ENV",
     "AI_AUDIT_STATEMENT_TIMEOUT_MS_ENV",
     "AuthorizedAuditSink",
+    "audit_sink_runtime_status",
     "create_audit_sink_from_env",
     "resolve_audit_sink",
 ]

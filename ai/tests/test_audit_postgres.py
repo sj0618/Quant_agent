@@ -27,6 +27,7 @@ from ai_graph.audit_postgres import (
     _authorized_sink,
     _create_test_audit_sink,
     _new_raw_audit_admission,
+    audit_sink_runtime_status,
     create_audit_sink_from_env,
 )
 from ai_graph.api import create_app
@@ -37,6 +38,25 @@ _AUDIT_ADMISSION_KEY_VERSION = "test-v1"
 _AUDIT_ADMISSION_AUDIENCE = "quantagent.ai.audit"
 _AUDIT_ADMISSION_EVIDENCE_ID = "gate-b-evidence-001"
 _AUDIT_ADMISSION_REVISION = "revision-9"
+
+
+@pytest.fixture(autouse=True)
+def _use_mock_provider_for_audit_unit_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep this S-tier audit suite independent from an operator's AOAI shell.
+
+    Live provider behavior is covered by its separately opt-in staging harness. These
+    tests exercise audit admission and persistence with deterministic graph outputs;
+    allowing a developer's sourced provider configuration to escape into the suite
+    makes the result depend on DNS and can spend provider capacity unexpectedly.
+    """
+
+    monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
+    # The persistence sink below is supplied explicitly with a fake connector. The
+    # analysis graph must therefore take its documented fixture data boundary rather
+    # than inheriting an operator's real warehouse DSN from the test process.
+    for name in ("AI_DATABASE_DSN", "QUANT_DB_DSN", "DATABASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+
 
 def _create_test_persistent_sink(
     dsn: str,
@@ -358,6 +378,15 @@ def test_sink_factory_requires_signed_gate_b_admission_before_issuing_persistent
     sink = create_audit_sink_from_env(_audit_sink_env())
     assert isinstance(sink, AuthorizedAuditSink)
     assert "postgresql://preferred" not in repr(sink)
+
+
+def test_audit_status_projection_discloses_no_secret_or_admission_claim() -> None:
+    environment = _audit_sink_env()
+    environment["AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE"] = "active"
+    sink = create_audit_sink_from_env(environment)
+
+    assert audit_sink_runtime_status(sink) == ("postgres", True)
+    assert audit_sink_runtime_status(NoOpAuditSink()) == ("noop", False)
 
 @pytest.mark.parametrize("app_env", ["production", "prod", "staging", "stage"])
 def test_postgres_sink_and_admission_are_hard_disabled_without_explicit_enable(
