@@ -122,3 +122,9 @@ npm run test
   `DailyDigestEmail.tsx`/mock은 `scripts/generate-daily-digest-email.mjs`가 쓰므로 남겨 두었다.
 - `scripts/production-gateway.mjs`의 upstream timeout을 15초 → 65초로 올렸다. AI SSE keepalive가 15초 간격이라 스트림이 끊길 수 있었다.
 - 백엔드 hosted-pages 정책에서 `trust`를 뺐다. FE에 `/trust` 화면이 없어 404 정책과 라우트 표가 어긋나 있었다.
+
+## Overview 지표 표시 규칙 (2026-09-03)
+
+- **OOS 타일 vs 후보 카드**: `/app` Overview의 추천 타일과 차트 카드는 워크포워드 out-of-sample 지표(`out_sample_*`)를 읽는다 — "검증 구간(OOS) 누적 수익률", "Sharpe (Walk-forward OOS)"로 라벨링한다. Performance 탭의 후보별 카드는 선택된 후보의 전체 구간(탐색에 쓰인 기간 포함) 숫자를 그대로 유지하고 "선택 후보 전체 구간 기준" 캡션을 붙인다(`src/features/app/PerformanceTab.tsx`). 이름이 비슷해도 두 화면이 다른 숫자를 보여줄 수 있고, 그건 버그가 아니다.
+- **"보류"**: `recommendation_gate.validated`가 아니면 추천 점수는 "10.0 / 10" 같은 등급 대신 항상 "보류"로 표시한다(`src/api/quantAgentClient.ts`의 `RECOMMENDATION_SCORE_HOLD_LABEL`). 추천 타일, 최근 리포트 카드, 리포트 목록이 같은 상수를 공유해 컴포넌트 사이에 규칙이 어긋나지 않는다.
+- **차트 포인트 상한**: equity curve는 최근 250포인트(`CHART_POINT_LIMIT`, `src/features/app/OverviewTab.tsx`)까지 그린다 — 예전에 마지막 5포인트로 자르던 것과 달리 이제는 비정상적으로 긴 곡선만 자른다.

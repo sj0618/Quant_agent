@@ -4,7 +4,8 @@ from datetime import date, timedelta
 
 import pytest
 
-from ai_graph.llm.base import LLMJsonRequest, LLMTimeoutError
+from ai_graph.llm.base import LLMConnectionError, LLMJsonRequest, LLMTimeoutError
+from ai_graph.nodes import strategy_research
 from ai_graph.nodes.strategy_research import (
     RELATIVE_STRENGTH_PROXY_DISCLOSURE,
     StrategyResearchError,
@@ -231,7 +232,9 @@ def test_researcher_repairs_one_invalid_structured_candidate_then_seals_v3() -> 
     assert repair_context["previous_validation_failure"]["code"] == "research_metric_unsupported"
 
 
-def test_researcher_does_not_spend_a_semantic_repair_on_provider_timeout() -> None:
+def test_researcher_does_not_spend_a_semantic_repair_on_provider_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(strategy_research, "STRATEGY_RESEARCH_RETRY_BACKOFF_SECONDS", 0.0)
+
     class TimeoutResearchClient:
         def __init__(self) -> None:
             self.requests: list[LLMJsonRequest] = []
@@ -249,7 +252,38 @@ def test_researcher_does_not_spend_a_semantic_repair_on_provider_timeout() -> No
         )
 
     assert raised.value.cause_code == "research_provider_failure"
-    assert len(client.requests) == 1
+    # Two transport attempts, and not one semantic repair turn: a timeout is not a
+    # response to correct.
+    assert [request.task_type for request in client.requests] == [
+        "strategy_research_resolution",
+        "strategy_research_resolution",
+    ]
+
+
+def test_researcher_survives_one_transport_failure(monkeypatch) -> None:
+    """One live research request in ten failed on transport, costing the whole run."""
+
+    monkeypatch.setattr(strategy_research, "STRATEGY_RESEARCH_RETRY_BACKOFF_SECONDS", 0.0)
+
+    class FlakyResearchClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, request: LLMJsonRequest) -> dict:
+            self.calls += 1
+            if self.calls == 1:
+                raise LLMConnectionError("connection reset by peer")
+            return _donchian_response()
+
+    client = FlakyResearchClient()
+    spec = research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=client,
+    )
+
+    assert client.calls == 2
+    assert spec.candidates[0].candidate_id == "research-donchian-breakout-20"
 
 
 def test_researcher_can_seal_a_range_rule_when_the_compiler_supports_it() -> None:

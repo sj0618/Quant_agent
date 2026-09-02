@@ -153,7 +153,11 @@ AI_BACKTEST_CANDIDATE_TIMEOUT_ENV = "AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS"
 # rolling evaluation is several times more expensive.
 DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 8.0
 AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
-DEFAULT_WALL_BUDGET_SECONDS = 30.0
+# The whole analysis has a 60s product limit. Measured on the deployed site: research
+# 11-18s, code generation 2-9s, debate/report ~11s, leaving this node ~25s. At 30 two
+# self-improvement rounds fit and ready runs landed at 61-78s; at 22 the node stays at or
+# under ~25s and at most one round starts when its projected cost fits.
+DEFAULT_WALL_BUDGET_SECONDS = 22.0
 # Rounds of threshold-adjusted candidates tried when the acceptance floor is not cleared.
 # Each round proposes up to six distinct candidates and stops early once the floor clears
 # or the wall budget is spent, so this is a ceiling, not a cost every run pays.
@@ -2457,6 +2461,18 @@ def _run_walk_forward_candidate_backtest(
         curve.append(BacktestEquityPoint(date=evaluation_session, cumulative_return=round(equity - 1.0, METRIC_ROUND_DIGITS)))
     if selected is None:
         raise ValueError("walk-forward produced no complete evaluation fold")
+    # Today's per-stock verdict, which the folds cannot supply: they are memoized down to
+    # metrics/returns/fills/ledger, so no engine result with last-bar signals survives
+    # them and every researched run published `ticker_actions: 0`. One full-window run of
+    # the *selected* rule - the same rule the folds validated - is the cheapest faithful
+    # source. Performance stays the out-of-sample aggregate; only the verdict comes from
+    # here. A verdict that cannot be produced must not void an otherwise complete run.
+    try:
+        ticker_actions = session.evaluate([selected])[0].ticker_actions
+    except AnalysisCancelled:
+        raise
+    except Exception:  # noqa: BLE001 - display-only; the walk-forward result stands.
+        ticker_actions = []
     costs = sum(
         sum(
             float(fill.get(key, 0.0) or 0.0)
@@ -2554,6 +2570,7 @@ def _run_walk_forward_candidate_backtest(
         candidates=candidates,
         selected_candidate=selected,
         equity_curve=curve,
+        ticker_actions=ticker_actions,
         engine_summary=engine_summary,
         engine_summaries_by_candidate=engine_summaries_by_candidate,
         backtest_payload=_backtest_payload(

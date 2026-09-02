@@ -297,3 +297,30 @@ AUTH_ENABLED=0 AI_LLM_PROVIDER=mock AI_JOB_STORE=memory AI_AUDIT_SINK=noop \
   python -m pytest -q ai/tests/test_raw_query_job_path.py
 ```
 `AI_LLM_PROVIDER=mock`이라도 명시적 RSI 규칙은 결정론 파서를 타므로 운영과 같은 코드 경로가 실행된다.
+
+## 전략 문법과 워크포워드 실행 세부 (2026-09-03)
+
+배포 사이트에 실제 시연 입력을 흘려 막힌 지점을 고치면서 넓어진 실행 가능 문법과 V3 후보 타이밍 필드, 자기개선 라운드 실행 방식을 정리한다. 경과는 `docs/qa/e2e-flow-validation-20260902.md` §8.
+
+### 지표·크로스·PER·섹터
+- `sma{N}` / `ema{N}`: N은 2~250 어떤 정수든 된다(`ai_graph/nodes/condition_compiler.py` `moving_average_spec`). 웨어하우스가 발행하는 sma20/50/200은 그 컬럼을 그대로 쓰고, 나머지 창은 종가 시계열에서 즉석 계산한다 — "20일선이 60일선을 상향 돌파"의 sma60이 그 경우다.
+- `cross_above` / `cross_below`: 임의의 두 지표 사이에 정의된다(`_compile_cross`). 직전 봉과 비교해 부호가 뒤집혔는지로 컴파일하며, MACD 골든/데드크로스와 이동평균 교차가 같은 경로를 탄다. 지표의 전일 값이 없으면(NaN) 교차를 근사하지 않고 보수적으로 거짓 처리한다.
+- `per`: `raw_close / 최근 연간 EPS(report_code 11011, forward-fill)`로 PIT 지표에 추가했다(`ai_graph/data_sources/db.py`). EPS ≤ 0이면 값을 비워 둔다 — 분기 EPS(3개월치)를 그대로 나누면 PER이 4배씩 튄다. PBR은 아직 불가능(발행주식수/BPS가 웨어하우스에 없음).
+- 섹터: `feature.wics_symbol_sector_history`(symbol_id, sector_name, valid_from, valid_to)를 구간 겹침으로 PIT 유니버스 CTE에 조인한다. 섹터명은 26개(예: 반도체 = 166종목). 리서처는 `allowed_sectors`를 받아 그 안에서만 sector를 써야 하며, 벗어나면 `research_sector_dropped`로 거부한다. 현재 모든 WICS 행이 2026-07-02부터 시작하는 단일 열린 구간이라 섹터 이력은 아직 진짜 point-in-time이 아니다.
+- 공유 지점: 어떤 operand(별칭 `bollinger_lower`, boolean 지표 `close_cross_above_sma20` 포함)가 실제로 어떤 raw 지표를 필요로 하는지는 `condition_metric_inputs`(`condition_compiler.py`) 한 곳에서만 계산하고, `db.py`의 `indicator_families_for_metrics`와 `nodes/backtest_features.py`가 그 결과로 로드할 지표 패밀리를 정한다. 예전에는 이 확장이 없어 볼린저·`close_above_sma_200`류 조건이 지표를 한 번도 못 읽고 "검증 불가"로 떨어졌다.
+
+### V3 후보의 타이밍 필드
+`ResearchCandidateV3`(`ai_graph/schemas.py`)에 `holding_days`(1~250)와 `rebalance_interval_days`(5~63, 기본 21 ≈ 한 달)가 있다.
+- `holding_days`: 진입 후 N세션 뒤 무조건 청산. `exit_conditions`가 비어 있어도 되지만 둘 중 하나는 있어야 한다(`rule_states_an_exit` 검증).
+- `rebalance_interval_days`: `execution_mode="scheduled_rotation"`일 때 의미가 있고, 그 간격마다 진입 규칙을 다시 평가해 더 이상 만족하지 않는 보유 종목을 교체한다.
+- 이전에는 "5일 뒤 매도"를 표현할 방법이 없어 `close >= 0`(항상 참)으로 흉내 냈고, 매 봉마다 팔아 거래 717건이 나왔다. 지금은 evaluator가 종목별 `sessions_held`를 추적해 정확히 N세션 뒤 청산하고, validation이 항상 참인 exit을 repairable 오류로 거부한다.
+
+### 잡담은 리서치 호출 전에 끝낸다
+`classify_query`가 `AmbiguityCode.NO_STRATEGY_INTENT`로 분류하면(`research_contract.py`, `api.py`) 리서치 호출 없이 "어떤 투자 전략이나 매매 조건을 분석할까요?" 질문으로 바로 끝낸다. "안녕"은 예전에 "automatic"으로 분류돼 ~26초짜리 web-grounded V3 리서치를 태우고도 범용 옵션 3개짜리 clarification으로 끝났다.
+
+### 워크포워드 자기개선: 메모이제이션과 병렬 실행
+자기개선 라운드는 후보를 늘려 워크포워드 전체를 다시 돌리는데, 예전에는 라운드마다 모든 후보를 모든 폴드에 다시 채점했다(6개씩 늘어나는 3라운드가 21개 분량을 지불). 지금은 `nodes/backtest.py`의 세션이 폴드 엔진 실행을 `(candidate, fold, pass)` 키로 캐시해서, 새 라운드는 새로 추가된 후보만 실제로 돌린다. 폴드 준비(시세, feature store, prepared market)는 폴드당 한 번만 만들어 워커 간에 공유하고, 폴드 태스크는 기존 `ProcessPoolExecutor`에서 순서 무관하게 실행된다. selection-width 디플레이션 항은 여전히 게시되지만 워크포워드에서는 더 이상 floor를 막지 않는다 — 폴드마다 이미 train/validation만으로 후보를 뽑으므로 롤링 OOS 집계 자체가 out-of-sample이고, 디플레이션까지 걸면 같은 탐색을 두 번 벌주는 셈이 된다.
+
+env 노브(모두 `nodes/backtest.py`): `AI_BACKTEST_WORKERS`, `AI_BACKTEST_ALLOW_SPAWN_PARALLEL`, `AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS`, `AI_BACKTEST_WALL_BUDGET_SECONDS`(기본 22초). node3 실측: backtest 노드 11.8초/0라운드 → 21.5~25.9초/1라운드, 전체 43~50초(mock LLM).
+
+> 주의: `condition_compiler`가 만드는 `build_signals` 소스는 감사·표시용으로 생성되는 템플릿일 뿐, 실제로 백테스트를 실행하는 evaluator가 아니다. 실행은 `nodes/backtest_features.py`의 `PreparedFeatureStore`(`_base_condition_matches` 등)가 담당한다.

@@ -58,6 +58,10 @@ RULE_DRAFT_CONTRACT_HASH = hashlib.sha256(
 _LEGACY_RULE_DRAFT_CONTRACT_HASH = hashlib.sha256(
     b"quantagent-research-only-preflight-v1"
 ).hexdigest()
+RESEARCH_PROVIDER_FAILURE_CAUSE = "research_provider_failure"
+RESEARCH_PROVIDER_RETRY_MESSAGE = (
+    "AI 연구 제공자가 일시적으로 응답하지 않았습니다. 잠시 후 같은 입력으로 다시 시도해 주세요."
+)
 RULE_DRAFT_HMAC_SECRET_ENV = "AI_RULE_DRAFT_HMAC_SECRET"
 RULE_DRAFT_HMAC_KEY_VERSION_ENV = "AI_RULE_DRAFT_HMAC_KEY_VERSION"
 DEFAULT_RULE_DRAFT_TTL_SECONDS = 600
@@ -216,6 +220,10 @@ class RuleDraftV1(BaseModel):
     exploration: ExplorationReviewV2 | None = None
     editable_summary: str = Field(min_length=1, max_length=500)
     clarifications: list[ClarificationChoiceV1] = Field(default_factory=list, max_length=3)
+    # A research *provider* outage is not a capability gap.  The public envelope reads
+    # this to offer one retry instead of asking the user to rewrite a strategy that was
+    # never found unsupported.
+    retry_only: bool = False
     is_executable: bool
     authoring_method: Literal["deterministic", "llm"] = "deterministic"
     schema_version: Literal[RULE_DRAFT_SCHEMA_VERSION] = RULE_DRAFT_SCHEMA_VERSION
@@ -444,6 +452,35 @@ class InMemoryDraftNonceRegistry:
             return True
 
 
+def _no_run_parse(error: StrategyResearchError) -> StrategyParseResultV1:
+    """The no-run review for a research failure that cannot be turned into a backtest.
+
+    A provider that did not answer is a different fact from a strategy this deployment
+    cannot express.  Reporting the outage as "전략 의미는 조사했지만 ... 백테스트할 수
+    없습니다" told the user their request was unsupported and offered three unrelated
+    ways to rewrite it, when the only useful action was to try the same input again.
+    """
+
+    if getattr(error, "cause_code", "") == RESEARCH_PROVIDER_FAILURE_CAUSE:
+        return StrategyParseResultV1(
+            clarification_required=True,
+            explanation=RESEARCH_PROVIDER_RETRY_MESSAGE,
+        )
+    # Do not replace a strategy that the researcher/compiler cannot express with a
+    # catalogue or RSI proxy.  Name the capability gap while keeping the raw request
+    # out of the public contract.
+    return StrategyParseResultV1(
+        clarification_required=True,
+        explanation="전략 의미는 조사했지만 현재 서버가 같은 규칙으로 백테스트할 수 없습니다.",
+        unsupported_conditions=[
+            UnsupportedStrategyConditionV1(
+                condition="AI 연구 전략",
+                reason=str(error)[:240],
+            )
+        ],
+    )
+
+
 def build_rule_draft(
     *,
     query: str,
@@ -519,16 +556,7 @@ def build_rule_draft(
         )
 
     if research_error is not None:
-        parsed = StrategyParseResultV1(
-            clarification_required=True,
-            explanation="전략 의미는 조사했지만 현재 서버가 같은 규칙으로 백테스트할 수 없습니다.",
-            unsupported_conditions=[
-                UnsupportedStrategyConditionV1(
-                    condition="AI 연구 전략",
-                    reason=str(research_error)[:240],
-                )
-            ],
-        )
+        parsed = _no_run_parse(research_error)
         authoring_method = "llm"
     else:
         # A syntactically explicit condition does not need a second AOAI call before
@@ -580,19 +608,8 @@ def build_rule_draft(
                 now=now,
             )
         except StrategyResearchError as exc:
-            # Do not replace a strategy that the researcher/compiler cannot express
-            # with a catalogue or RSI proxy.  The no-run draft names the capability
-            # gap while keeping the raw request out of the public contract.
-            parsed = StrategyParseResultV1(
-                clarification_required=True,
-                explanation="전략 의미는 조사했지만 현재 서버가 같은 규칙으로 백테스트할 수 없습니다.",
-                unsupported_conditions=[
-                    UnsupportedStrategyConditionV1(
-                        condition="AI 연구 전략",
-                        reason=str(exc)[:240],
-                    )
-                ],
-            )
+            research_error = exc
+            parsed = _no_run_parse(exc)
     if not research_requested and exploration_policy is not None and (
         parsed.clarification_required
         or parsed.unsupported_conditions
@@ -607,7 +624,20 @@ def build_rule_draft(
             now=now,
         )
     rule = _canonical_rule_from_parse(parsed)
-    clarifications = _clarifications_for(rule, parsed)
+    retry_only = (
+        research_error is not None
+        and getattr(research_error, "cause_code", "") == RESEARCH_PROVIDER_FAILURE_CAUSE
+    )
+    clarifications = (
+        [
+            ClarificationChoiceV1(
+                label="다시 시도",
+                reason="같은 입력으로 다시 실행합니다.",
+            )
+        ]
+        if retry_only
+        else _clarifications_for(rule, parsed)
+    )
     executable = bool(
         rule
         and rule.is_executable
@@ -629,6 +659,7 @@ def build_rule_draft(
         canonical_rule=rule,
         editable_summary=_editable_summary(rule),
         clarifications=clarifications,
+        retry_only=retry_only,
         is_executable=executable,
         authoring_method=authoring_method,
         policy_hash=RULE_DRAFT_CONTRACT_HASH,

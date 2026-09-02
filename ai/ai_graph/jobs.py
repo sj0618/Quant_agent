@@ -259,7 +259,7 @@ class AnalysisJobStore(Protocol):
     ) -> AnalysisJob:
         ...
 
-    def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
+    def list_jobs(self, *, limit: int = 100, user_id: str | None = None) -> list[AnalysisJob]:
         ...
 
 
@@ -784,8 +784,13 @@ class InMemoryAnalysisJobStore:
         self.jobs[job_id] = job
         return job
 
-    def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
-        return list(self.jobs.values())[-limit:]
+    def list_jobs(self, *, limit: int = 100, user_id: str | None = None) -> list[AnalysisJob]:
+        owned = [
+            job
+            for job in self.jobs.values()
+            if user_id is None or job.user_id == user_id
+        ]
+        return owned[-limit:]
 
     def create(self, query: str) -> AnalysisJob:
         return self.create_job(query)

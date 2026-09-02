@@ -435,3 +435,53 @@ def test_admission_rereads_idempotency_after_a_concurrent_nonce_consume() -> Non
     assert admission.job.job_id == winner.job_id
     assert connection.idempotency_reads == 2
     assert not any("INSERT INTO app.ai_analysis_job" in query for query in connection.queries)
+
+
+def test_history_listing_filters_by_owner_in_sql() -> None:
+    """The 500 was a statement timeout: every user's newest 100 documents, then a
+    Python owner filter. The owner belongs in the WHERE clause."""
+
+    captured: dict[str, object] = {}
+
+    class _CapturingConnection:
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+
+        def execute(self, query, params=None):
+            captured["query"] = str(query)
+            captured["params"] = params
+            return _Rows([])
+
+    repo = PostgresAnalysisJobRepository(
+        "postgresql://example",
+        connector=lambda *_args, **_kwargs: _CapturingConnection(),
+    )
+
+    repo.list_jobs(limit=50, user_id="user-1")
+
+    assert "WHERE user_id = %s" in str(captured["query"])
+    assert "ORDER BY updated_at DESC" in str(captured["query"])
+    assert captured["params"] == ("user-1", 50)
+
+
+def test_history_listing_without_an_owner_still_reads_every_row() -> None:
+    captured: dict[str, object] = {}
+
+    class _CapturingConnection:
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+
+        def execute(self, query, params=None):
+            captured["query"] = str(query)
+            captured["params"] = params
+            return _Rows([])
+
+    repo = PostgresAnalysisJobRepository(
+        "postgresql://example",
+        connector=lambda *_args, **_kwargs: _CapturingConnection(),
+    )
+
+    repo.list_jobs(limit=7)
+
+    assert "WHERE user_id" not in str(captured["query"])
+    assert captured["params"] == (7,)

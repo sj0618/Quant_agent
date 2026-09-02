@@ -213,6 +213,34 @@ def test_a_ticker_whose_rows_end_mid_window_does_not_break_the_run(
     assert result.selected_candidate.metrics is not None
 
 
+def test_a_walk_forward_run_still_publishes_todays_per_stock_verdict(
+    monkeypatch, tmp_path
+) -> None:
+    """Folds are memoized down to metrics/returns/fills, so no engine result with
+    last-bar signals survives them and every researched run published
+    `ticker_actions: 0`. The selected rule gets one full-window run for its verdict."""
+
+    strategy = _strategy()
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "verdict"))
+    # rsi 25 never clears the 70 exit, so 000001 is bought and still held on the last bar.
+    rows = _price_rows(constant_rsi={0: 25.0})
+    last_session = max(str(row["date"]) for row in rows)
+
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        result = backtest_node.run_candidate_backtest(
+            strategy, _candidates(strategy), _session=session
+        )
+
+    assert result.walk_forward is not None
+    assert result.walk_forward.status == "ready"
+    assert result.ticker_actions
+    assert {action.as_of_date for action in result.ticker_actions} == {last_session}
+    assert {action.action for action in result.ticker_actions} <= {"BUY", "SELL", "HOLD"}
+    assert {action.source_candidate_id for action in result.ticker_actions} == {
+        result.selected_candidate.candidate_id
+    }
+
+
 def _backtest_state(strategy: StrategySpec, rows: list[dict[str, object]]) -> dict[str, object]:
     generated = generate_loop3_candidates(
         Loop3Request(

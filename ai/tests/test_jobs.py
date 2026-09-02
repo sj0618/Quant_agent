@@ -345,9 +345,9 @@ class RecordingRepository:
             result_envelope=result_envelope,
         )
 
-    def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
+    def list_jobs(self, *, limit: int = 100, user_id: str | None = None) -> list[AnalysisJob]:
         self.calls.append("list_jobs")
-        return self.inner.list_jobs(limit=limit)
+        return self.inner.list_jobs(limit=limit, user_id=user_id)
 
 
 def test_persistent_job_store_delegates_to_repository_contract() -> None:
