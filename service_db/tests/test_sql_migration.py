@@ -380,7 +380,7 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
             "( " + _normalized(body) + " ) IS TRUE",
         )
 
-    def test_archive_migration_is_registered_everywhere_it_has_to_run(self):
+    def test_archive_migration_is_registered_in_the_database_release_lane(self):
         verifier = load_replay_verifier()
         self.assertIn(ARCHIVE_MIGRATION, verifier.FIXED_MIGRATIONS)
         self.assertIn("ai_analysis_job_legacy", verifier.OWNED_RELATIONS["r"])
@@ -389,7 +389,12 @@ class ServiceDbSqlMigrationTests(unittest.TestCase):
         deploy = (SERVICE_DB_ROOT.parents[0] / ".github/workflows/deploy.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn(ARCHIVE_MIGRATION, deploy)
+        # Application deploys must not execute DB DDL. The DB release lane owns this
+        # migration, while application deploy checks the already-applied revision
+        # through readiness before it starts serving jobs.
+        self.assertNotIn(ARCHIVE_MIGRATION, deploy)
+        self.assertIn("Database migrations are verified by readiness", deploy)
+        self.assertIn("no DDL runs in application deploy", deploy)
 
 
 @unittest.skipUnless(
