@@ -371,3 +371,24 @@ def test_disabled_rollout_fails_before_any_outbox_mutation(monkeypatch):
     with pytest.raises(AppError) as blocked:
         asyncio.run(worker.run_once())
     assert blocked.value.code == "email_rollout_disabled"
+
+
+def test_redis_check_reports_an_unreachable_redis_as_a_configuration_error(monkeypatch):
+    """`--check` must fail with the sanitized message, not a raw redis traceback."""
+
+    from redis import asyncio as redis_asyncio
+
+    class _UnreachableClient:
+        connection_pool = SimpleNamespace(connection_kwargs={"db": 11})
+
+        async def ping(self):
+            raise ConnectionError("connection refused (host redacted in message)")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(redis_asyncio, "from_url", lambda *_args, **_kwargs: _UnreachableClient())
+    settings = SimpleNamespace(redis_url_value="redis://example.invalid:6379/11")
+
+    with pytest.raises(ConfigurationError, match="Redis readiness check failed"):
+        asyncio.run(worker_script._check_redis_master(settings))

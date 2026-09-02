@@ -510,6 +510,9 @@ jobs:
               local exit_status="$1"
               trap - ERR
             echo "Restore deploy snapshot on failure"
+            if [ "${EMAIL_DELIVERY_WORKER_ENABLED:-false}" = "true" ]; then
+              "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
+            fi
             stop_listeners_on_port 18001
             stop_listeners_on_port 18000
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
@@ -711,6 +714,17 @@ jobs:
               | "$APP_DIR/ai/.venv/bin/python" -c \
                 'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
             wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "deployed-ai-api-readiness" ai
+
+            if [ "${EMAIL_DELIVERY_WORKER_ENABLED:-false}" = "true" ]; then
+              "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
+              QUANTAGENT_BACKEND_PYTHON="$APP_DIR/ai/.venv/bin/python" \
+                "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start
+              QUANTAGENT_BACKEND_PYTHON="$APP_DIR/ai/.venv/bin/python" \
+                "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" check
+            else
+              echo "email worker disabled (EMAIL_DELIVERY_WORKER_ENABLED != true)"
+            fi
+
             wait_for_url "Frontend gateway" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
             frontend_html="$(mktemp "$RUN_DIR/frontend-smoke.XXXXXX")"
             if ! curl -fsS -o "$frontend_html" "http://127.0.0.1:18000/"; then

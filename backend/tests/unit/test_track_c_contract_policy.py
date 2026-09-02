@@ -37,7 +37,10 @@ def test_track_ac_contract_metadata_updates_classified_openapi_operations():
     assert schema["paths"]["/api/v1/runs"]["post"]["x-quantagent-owner"] == "backend"
     assert schema["paths"]["/api/v1/runs"]["post"]["x-quantagent-csrf-required-for-unsafe"] is True
     assert schema["paths"]["/api/v1/runs/{run_id}"]["get"]["x-quantagent-implementation"] == "db-backed"
-    assert schema["paths"]["/api/v1/runs/{run_id}/complete"]["post"]["x-quantagent-fe-live-allowed"] is False
+    assert schema["paths"]["/api/v1/runs"]["post"]["x-quantagent-fe-live-allowed"] is True
+    assert schema["paths"]["/api/v1/runs"]["post"]["x-quantagent-production-ready"] is True
+    assert schema["paths"]["/api/v1/runs/{run_id}/complete"]["post"]["x-quantagent-fe-live-allowed"] is True
+    assert schema["paths"]["/api/v1/runs/{run_id}/complete"]["post"]["x-quantagent-production-ready"] is True
     assert schema["paths"]["/api/v1/me/notifications"]["patch"]["x-quantagent-csrf-required-for-unsafe"] is True
     assert schema["paths"]["/api/v1/me/email-deliveries"]["get"]["x-quantagent-auth-required"] is True
     assert schema["paths"]["/api/v1/me/email-reports/{report_id}"]["get"]["x-quantagent-production-ready"] is True

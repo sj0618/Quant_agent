@@ -1,5 +1,4 @@
-import { Suspense, lazy, useEffect, useState } from "react";
-import { AsyncState } from "./components/common/AsyncState";
+import { useEffect, useState } from "react";
 import { AppPage } from "./pages/AppPage";
 import { AuthCallbackPage } from "./pages/AuthCallbackPage";
 import { AuthRequiredPage } from "./pages/AuthRequiredPage";
@@ -21,12 +20,6 @@ import {
   sanitizeReturnTo,
 } from "./config/routes";
 import type { AuthSession } from "./types/auth";
-
-// 이 페이지만 react-dom/server 를 끌어오기 때문에(발송용 HTML 문자열 렌더) 별도 chunk 로 떼어낸다.
-// 정적 import 로 두면 실사용자 메인 번들이 190kB 커진다.
-const EmailTemplatePreviewPage = lazy(() =>
-  import("./pages/EmailTemplatePreviewPage").then((module) => ({ default: module.EmailTemplatePreviewPage })),
-);
 
 function normalizePath(pathname: string) {
   return pathname.replace(/\/+$/, "") || "/";
@@ -106,14 +99,6 @@ function AppRoutes() {
 
   if (path === ROUTES.unsubscribe) {
     return <UnsubscribePage />;
-  }
-
-  if (path === ROUTES.emailTemplatePreview) {
-    return (
-      <Suspense fallback={<AsyncState title="이메일 템플릿을 불러오는 중입니다" tone="loading" />}>
-        <EmailTemplatePreviewPage />
-      </Suspense>
-    );
   }
 
   if (protectedRoute && !session) {

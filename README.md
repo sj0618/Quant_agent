@@ -127,7 +127,7 @@ SERVICE_DB_ARCHIVE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgr
 | 환경변수 | 기본값 | 뜻 |
 |---|---|---|
 | `AI_ANALYSIS_MAX_CONCURRENCY` | `1` | 동시에 실행할 분석 수. 2 vCPU 단일 프로세스 노드에서 분석 한 건도 다년 PIT 행·백테스트 워커를 함께 사용하므로, 기본값은 하나의 job만 실행하고 나머지는 큐에 둔다. 부하·메모리·회복력 측정을 마친 뒤에만 명시적으로 높일 수 있다. |
-| `AI_ANALYSIS_QUEUE_WAIT_SECONDS` | `600` | 슬롯을 기다리는 한도. 분석 1건의 wall budget보다 길게 둬서, 한 건 뒤에 선 잡이 차례를 받게 한다 |
+| `AI_ANALYSIS_QUEUE_WAIT_SECONDS` | `1860` | 슬롯을 기다리는 한도. 분석 1건의 wall budget보다 길게 둬서, 한 건 뒤에 선 잡이 차례를 받게 한다 |
 | `AI_BACKTEST_WORKERS` | `2` | 분석 **1건**이 후보 평가에 쓸 프로세스 풀 워커 수. 실제 워커 수는 `min(후보 수, 이 값, os.cpu_count())`이고, 후보×행 수가 250,000 미만이면 직렬(1)로 떨어진다. 분석 **여러 건**에 걸친 워커 합계에는 상한이 없다 |
 
 상한을 넘은 잡은 **거절이 아니라 대기**한다. 클라이언트는 이미 큐잉된 잡을 폴링하고
@@ -203,6 +203,44 @@ release 프로필(`AI_RELEASE_PROFILE` 또는 `APP_ENV` 가 `release`/`productio
 매니저로 N개를 띄우는 방식은 탐지되지 않는다 — 그 경우에는 이 문서가 계약의 전부다.
 
 부하가 이 한계를 넘으면 워커를 늘리는 것이 아니라 위 상태들을 먼저 외부화해야 한다.
+
+## 이메일 발송 운영 계약
+
+이메일 발송은 기본적으로 꺼져 있다(`EMAIL_DELIVERY_ENABLED=false`). 배포(`deploy.yml`)는
+`EMAIL_DELIVERY_WORKER_ENABLED=true` 일 때만 이메일 워커를 시작/재시작하고, `false` 이거나
+미설정이면 아무것도 하지 않는다. 두 값 모두 원격 서버의 배포 셸(SSH 로그인 셸)에서
+보여야 하므로 `~/.bashrc` export 나 `~/mvp_sp1/quant-proj/.env` 에 있어야 한다 — 워크플로 자체는
+이 값을 주입하지 않는다.
+
+허용목록(allowlist) 테스트 발송에 필요한 최소 환경변수:
+
+- `EMAIL_DELIVERY_ENABLED=true`
+- `EMAIL_REPORT_COMPLETED_TRIGGER_ENABLED=true` (리포트 완료 트리거로 발송하려는 경우)
+- `EMAIL_DELIVERY_WORKER_ENABLED=true` (배포 시 워커를 띄우려는 경우)
+- `EMAIL_ROLLOUT_MODE=allowlist`
+- `EMAIL_LOCAL_RECIPIENT_ALLOWLIST` (허용 수신자 목록, 비어있으면 안 됨)
+- `EMAIL_PROVIDER=brevo`
+- `BREVO_API_KEY`
+- `BREVO_SENDER_EMAIL` (`@qt-agent.kro.kr` 도메인 필수)
+- `BREVO_SENDER_NAME`
+- `BREVO_SANDBOX_MODE` (필요시)
+- `EMAIL_PUBLIC_BASE_URL` (https, non-local 호스트)
+- `EMAIL_UNSUBSCRIBE_ENABLED=true` + `EMAIL_UNSUBSCRIBE_SIGNING_SECRET` + `EMAIL_UNSUBSCRIBE_BASE_URL`
+- `DATABASE_URL` / `TRADING_DATA_DATABASE_URL` (동일 `qt_db`, non-loopback 호스트)
+- `REDIS_URL` (logical DB 11)
+- `EMAIL_MAX_ATTEMPTS` (기본 5)
+
+실제 발송(`EMAIL_ROLLOUT_MODE=production`)은 위와 동일하되 `BREVO_SANDBOX_MODE=false` 여야
+한다. 검증 규칙은 `backend/app/core/config.py` 의 롤아웃 validator(~779-830줄)를 그대로
+따른다 — 하나라도 빠지면 설정 로드 시점에 `ValueError` 로 fail-closed 된다.
+
+워커 명령(`backend/scripts/manage_email_delivery_worker.sh`):
+
+- `check` — Redis DB 11 / 발송 준비 상태를 검사 (`run_email_delivery_worker.py --check --require-send-ready`)
+- `start` / `stop` / `status` — 루프 워커(`--loop`)를 기동/종료/조회
+- 파이썬 인터프리터는 `QUANTAGENT_BACKEND_PYTHON` 이 있으면 그것을, 없으면
+  `backend/.venv/bin/python` 이 있으면 그것을, 둘 다 없으면 `ai/.venv/bin/python` 을 쓴다.
+  배포 서버는 `backend/.venv` 가 없으므로 실질적으로 `ai/.venv` 를 쓴다.
 
 ## 참고
 - AI 상세 실행/테스트 가드: `ai/README_AI.md`

@@ -1591,7 +1591,12 @@ def test_failed_analysis_job_returns_error_contract() -> None:
     assert failed_job["result"]["failure_cause"]["subcause"] == "unknown"
     assert "runner failed" not in failed_job["result"]["user_payload"]["message"]
     assert failed_job["result"]["debug_ref"].startswith("job-error:")
-    assert failed_job["stages"][-1]["status"] == "failed"
+    # The runner dies before the graph leaves the first stage, so that is the stage
+    # marked failed - the later ones never ran and stay queued.
+    failed_stage = failed_job["result"]["failure_cause"]["failure_stage"]
+    stages = {progress["stage"]: progress["status"] for progress in failed_job["stages"]}
+    assert stages[failed_stage] == "failed"
+    assert stages["finalizing"] == "queued"
 
 
 def test_database_connection_failure_has_a_safe_retryable_envelope(

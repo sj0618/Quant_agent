@@ -6,11 +6,7 @@ from fastapi import APIRouter, Query, Request, status
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
-from app.api.contract_policy import (
-    api_status_endpoints,
-    fe_live_allowlist,
-    raise_retired_public_create,
-)
+from app.api.contract_policy import api_status_endpoints, fe_live_allowlist
 from app.api.routes import email_reports
 from app.api.routes.auth import get_session_cookie, get_session_store
 from app.core.errors import AppError
@@ -181,14 +177,19 @@ async def get_api_status(request: Request) -> dict[str, Any]:
 
 @router.post("/runs", status_code=status.HTTP_201_CREATED)
 async def create_analysis_run(request: Request, payload: TrackCRunRequest) -> dict[str, Any]:
-    if getattr(get_runtime_settings(request), "is_production", False):
-        raise_retired_public_create(
-            boundary_id="public-analysis-run-create",
-            method="POST",
-            path="/api/v1/runs",
-        )
     await _require_track_c_csrf(request)
     user_id = await _require_current_user_id(request)
+    ai_job_id = payload.aiJobId or payload.ai_job_id
+    if not ai_job_id:
+        raise AppError(
+            status_code=422,
+            component="analysis_runs",
+            code="request_validation_failed",
+            message="aiJobId is required to persist an analysis run",
+            details={"field": "aiJobId"},
+        )
+    # Persist an existing completed job the caller owns; never create a run from raw input.
+    await _completed_analysis_payload(request, user_id=user_id, ai_job_id=ai_job_id)
     engine = get_trading_data_engine(request)
     identity_source_engine = get_db_engine(request)
     return await fe_contract_store.create_analysis_run_from_db(
@@ -217,12 +218,6 @@ async def get_analysis_run(request: Request, run_id: str) -> dict[str, Any]:
 
 @router.post("/runs/{run_id}/complete")
 async def complete_analysis_run(request: Request, run_id: str, payload: TrackCRunCompletionRequest) -> dict[str, Any]:
-    if getattr(get_runtime_settings(request), "is_production", False):
-        raise_retired_public_create(
-            boundary_id="public-analysis-run-complete",
-            method="POST",
-            path="/api/v1/runs/{run_id}/complete",
-        )
     await _require_track_c_csrf(request)
     user_id = await _require_current_user_id(request)
     engine = get_trading_data_engine(request)

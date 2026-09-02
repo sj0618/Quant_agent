@@ -27,7 +27,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from ai_graph.audit import (
@@ -58,7 +58,11 @@ from ai_graph.exploration_policy import (
     load_active_exploration_policy_from_env,
     validate_exploration_spec_against_policy,
 )
-from ai_graph.graph import run_analysis
+from ai_graph.graph import (
+    build_clarification_prompt,
+    run_analysis,
+    strategy_candidate_cards,
+)
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
 from ai_graph.job_store_persistent import (
@@ -84,7 +88,6 @@ from ai_graph.jobs import (
     run_job_sync,
 )
 from ai_graph.llm.role_calls import generate_strategy_description, research_screening_terms
-from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.quant_performance import sanitize_public_performance
 from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.research_contract import (
@@ -113,7 +116,9 @@ from ai_graph.research_eligibility import (
 )
 from ai_graph.schemas import (
     SCHEMA_VERSION,
+    AmbiguityCode,
     APIEnvelope,
+    ClarificationOption,
     EnvelopeStatus,
     FailureDiagnostic,
     ReportBundle,
@@ -220,7 +225,7 @@ class CreateAnalysisJobRequest(BaseModel):
         },
     )
 
-    query: str | None = Field(default=None, min_length=1)
+    query: str | None = Field(default=None, min_length=1, max_length=2000)
     parse_token: str | None = Field(default=None, min_length=32)
     client_idempotency_key: str | None = Field(default=None, min_length=16, max_length=200)
     spec_version: (
@@ -233,6 +238,22 @@ class CreateAnalysisJobRequest(BaseModel):
     ) = None
     spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     strategy_execution_spec: ExecutionSpecV1OrV2 | None = None
+
+    @field_validator("query")
+    @classmethod
+    def require_query_text(cls, value: str | None) -> str | None:
+        """Whitespace is not a strategy request.
+
+        Rejecting it here keeps a blank submission from spending a quota slot and
+        creating a durable job that can only end in a clarification.
+        """
+
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            raise ValueError("query must not be blank")
+        return text
 
     @model_validator(mode="after")
     def require_one_admission_shape(self) -> CreateAnalysisJobRequest:
@@ -333,8 +354,8 @@ class ParseStrategyRequest(BaseModel):
     # Ignore retired request keys from older frontends during the rolling deploy.
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
 
-    natural_language: str | None = Field(default=None, min_length=1)
-    query: str | None = Field(default=None, min_length=1)
+    natural_language: str | None = Field(default=None, min_length=1, max_length=2000)
+    query: str | None = Field(default=None, min_length=1, max_length=2000)
     market: str | None = None
     strategy_id: str | None = None
     selected_clarification_option_id: str | None = None
@@ -575,6 +596,40 @@ class APIStatusResponse(BaseModel):
     deployment_revision: str | None = None
 
 
+def _clarification_envelope(outcome: RuleDraftV1, *, query: str, trace_id: str) -> APIEnvelope:
+    """The NEED_CLARIFICATION contract for a parse that cannot run as asked.
+
+    Reuses the graph's clarification builder so the browser sees one shape: a
+    question, exactly three options, and three candidate cards.
+    """
+
+    prompt = build_clarification_prompt(AmbiguityCode.INPUT_AMBIGUOUS, query)
+    options = [
+        ClarificationOption(label=choice.label, reason=choice.reason)
+        for choice in outcome.clarifications
+    ]
+    chosen = {option.label for option in options}
+    options.extend(option for option in prompt["options"] if option.label not in chosen)
+    next_actions = [
+        f"{item.condition}: {item.reason}" for item in outcome.unsupported_conditions
+    ]
+    return APIEnvelope(
+        status=EnvelopeStatus.NEED_CLARIFICATION,
+        trace_id=trace_id,
+        user_payload=UserPayload(
+            headline="추가 확인이 필요합니다.",
+            message=outcome.explanation,
+            next_actions=next_actions or ["후보 카드 중 하나 선택", "시장/기간/조건 보강"],
+            candidate_cards=strategy_candidate_cards(query)[:3],
+            question=prompt["question"],
+            options=options[:3],
+            recommended=prompt["recommended"],
+        ),
+        debug_ref=f"clarification:{trace_id}",
+        retryable=True,
+    )
+
+
 def _build_analysis_runner_with_audit(
     analysis_runner: AnalysisRunner,
     *,
@@ -620,10 +675,27 @@ def _build_analysis_runner_with_audit(
                 or outcome.strategy_execution_spec is None
                 or outcome.spec_hash is None
             ):
-                raise StrategyResearchError(
-                    "strategy research did not produce an executable contract",
-                    cause_code="research_resolution_unavailable",
+                # A parse that needs the user to decide something is not a failure.
+                # Failing the job here showed a red error for a question the browser
+                # already knows how to render, so return the same NEED_CLARIFICATION
+                # contract the graph produces for an unusable query instead.
+                # StrategyResearchError still propagates for provider/schema faults.
+                _record_step(
+                    session,
+                    "strategy_research_clarification_required",
+                    message="strategy research needs user clarification",
                 )
+                envelope = _clarification_envelope(outcome, query=query, trace_id=trace_id)
+                _record_finalization(
+                    session,
+                    "completed",
+                    message="analysis runner completed with status=need_clarification",
+                    metadata_jsonb={
+                        "debug_ref": envelope.debug_ref,
+                        "public_trace_id": envelope.trace_id,
+                    },
+                )
+                return envelope
             resolved_execution_spec = outcome.strategy_execution_spec
             resolved_execution_spec_hash = outcome.spec_hash
             _record_step(
@@ -631,6 +703,13 @@ def _build_analysis_runner_with_audit(
                 "strategy_research_resolution_completed",
                 message="sealed strategy research contract attached to analysis",
             )
+        # ``ai_graph.research_contract`` and ``ai_graph.schemas`` each declare their
+        # own V1/V2 execution-spec classes for the same JSON shape, so an instance
+        # sealed by one module is a foreign class to the other's validator and
+        # pydantic rejects it outright.  Hand the graph the JSON form so the two
+        # class families never meet.  (Unifying them is a larger refactor.)
+        if isinstance(resolved_execution_spec, BaseModel):
+            resolved_execution_spec = resolved_execution_spec.model_dump(mode="json")
         with bind_audit_context(session):
             if analysis_runner is run_analysis:
                 return run_analysis(

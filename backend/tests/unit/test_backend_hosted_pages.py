@@ -77,7 +77,6 @@ def test_known_frontend_routes_use_spa_fallback(frontend_dist: Path, monkeypatch
         "/terms",
         "/privacy",
         "/disclaimer",
-        "/trust",
         "/unsubscribe",
     ]
     frontend_routes_source = (Path(__file__).resolve().parents[3] / "fe" / "src" / "config" / "routes.ts").read_text(

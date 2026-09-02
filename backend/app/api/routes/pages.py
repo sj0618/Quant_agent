@@ -28,7 +28,6 @@ FRONTEND_EXACT_ROUTES = frozenset(
         "terms",
         "privacy",
         "disclaimer",
-        "trust",
         "unsubscribe",
     }
 )

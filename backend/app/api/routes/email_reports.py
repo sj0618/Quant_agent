@@ -167,7 +167,7 @@ async def get_my_email_report(request: Request, report_id: str) -> dict[str, Any
 async def resend_report_email(request: Request, report_id: str) -> Response:
     await _require_csrf(request)
     user = await _current_user(request)
-    result = await email_delivery.create_report_completed_delivery(
+    result = await email_delivery.resend_report_completed_delivery(
         get_db_engine(request),
         settings=get_runtime_settings(request),
         user_id=str(user["id"]),
@@ -181,7 +181,8 @@ async def resend_report_email(request: Request, report_id: str) -> Response:
             message="Report resend delivery is unavailable",
             details={"reportId": report_id},
         )
-    return Response(status_code=204)
+    # 202: this call queued a send. 204: a pending/processing delivery is already on its way.
+    return Response(status_code=202 if result["resend_action"] == "queued" else 204)
 
 
 @router.get("/unsubscribe", response_model=UnsubscribeInspectionResponse)

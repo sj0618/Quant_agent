@@ -42,6 +42,44 @@ def _create_session(app, user_id: str = "user-1") -> tuple[str, str]:
     return asyncio.run(AuthSessionStore(app.state.redis_client, app.state.settings).create_session(user_id=user_id))
 
 
+class _StoredResult:
+    def model_dump(self, *, mode: str):
+        assert mode == "json"
+        return {
+            "status": "ready",
+            "strategy_spec": {"strategy_id": "strategy-1"},
+            "user_payload": {
+                "recommendation_gate": {"validated": True},
+                "performance": {"sharpe_ratio": 0.28},
+                "report": {
+                    "web_projection": {
+                        "title": "Stored report",
+                        "summary": "Stored summary",
+                        "sections": [{"title": "Section", "summary": "Body"}],
+                    }
+                },
+            },
+        }
+
+
+def _install_completed_job_store(app, *, job_id: str = "job-1", user_id: str = "user-1") -> None:
+    """Owner-scoped completed job the persistence writers must find before writing."""
+
+    app.state.analysis_job_store = SimpleNamespace(
+        get_job=lambda requested_id: (
+            SimpleNamespace(
+                job_id=requested_id,
+                user_id=user_id,
+                status="completed",
+                result=_StoredResult(),
+                completed_at=datetime(2026, 8, 3, tzinfo=UTC),
+            )
+            if requested_id == job_id
+            else None
+        )
+    )
+
+
 def test_track_c_api_status_exposes_only_track_c_contract_endpoints():
     client, _app = make_client()
 
@@ -60,36 +98,63 @@ def test_track_c_api_status_exposes_only_track_c_contract_endpoints():
     }
 
 
-def test_production_public_writers_are_retired_before_auth_or_storage_access():
-    client, _app = make_client(valid_settings(APP_ENV="production"))
+def test_production_run_persistence_requires_auth_and_an_owned_completed_job(monkeypatch):
+    """47ae545 retired these writers in production; they are the only report/email persistence path."""
 
-    for method, path, payload in (
-        ("POST", "/api/v1/runs", {"query": "RSI 30"}),
-        ("POST", "/api/v1/runs/run-1/complete", {"aiJobId": "job-1"}),
-    ):
-        response = client.request(method, path, json=payload)
+    client, app = make_client(valid_settings(APP_ENV="production", AUTH_CSRF_REQUIRED=True))
+    _install_completed_job_store(app)
+    session_id, csrf_token = _create_session(app, user_id="user-1")
+    cookies = {app.state.settings.auth_session_cookie_name: session_id}
+    headers = {"Origin": API_ORIGIN, "X-CSRF-Token": csrf_token}
 
-        assert response.status_code == 410
-        assert response.json()["error"] == {
-            "component": "contract",
-            "code": "public_create_retired",
-            "message": "새 분석 생성은 제공하지 않습니다. 보관된 읽기 전용 결과만 조회할 수 있습니다.",
-            "details": {
-                "boundaryId": (
-                    "public-analysis-run-create"
-                    if path == "/api/v1/runs"
-                    else "public-analysis-run-complete"
-                ),
-                "method": "POST",
-                "path": "/api/v1/runs" if path == "/api/v1/runs" else "/api/v1/runs/{run_id}/complete",
-                "readOnlyAlternative": "/api/v1/reports",
-                "schemaVersion": "execution-boundary.v1",
-            },
-        }
+    async def fake_create(engine, *, user_id: str, payload: dict[str, object], identity_source_engine=None):
+        return {"id": "run-1", "status": "queued", "createdAt": "2026-07-20T00:00:00Z"}
+
+    async def fake_complete(engine, *, user_id: str, run_id: str, payload, identity_source_engine=None, email_settings=None):
+        return {"runId": run_id, "reportId": "report-1", "status": "completed", "created": True}
+
+    monkeypatch.setattr(fe_contract.fe_contract_store, "create_analysis_run_from_db", fake_create)
+    monkeypatch.setattr(fe_contract.fe_contract_store, "complete_analysis_run_from_db", fake_complete)
+
+    unauthenticated = client.post("/api/v1/runs", headers=headers, json={"aiJobId": "job-1"})
+    created = client.post("/api/v1/runs", cookies=cookies, headers=headers, json={"aiJobId": "job-1"})
+    completed = client.post(
+        "/api/v1/runs/run-1/complete", cookies=cookies, headers=headers, json={"aiJobId": "job-1"}
+    )
+
+    # Session-less caller is rejected by CSRF/auth, not by a blanket 410.
+    assert unauthenticated.status_code == 403
+    assert unauthenticated.json()["error"]["code"] == "csrf_invalid"
+    assert created.status_code == 201
+    assert created.json()["id"] == "run-1"
+    assert completed.status_code == 200
+    assert completed.json()["reportId"] == "report-1"
+
+
+def test_create_run_rejects_a_payload_without_an_owned_completed_job(monkeypatch):
+    client, app = make_client()
+    _install_completed_job_store(app)
+    session_id, csrf_token = _create_session(app, user_id="user-1")
+    cookies = {app.state.settings.auth_session_cookie_name: session_id}
+    headers = {"Origin": API_ORIGIN, "X-CSRF-Token": csrf_token}
+
+    async def store_must_not_be_called(*_args, **_kwargs):
+        raise AssertionError("create run must not write without an owned completed job")
+
+    monkeypatch.setattr(fe_contract.fe_contract_store, "create_analysis_run_from_db", store_must_not_be_called)
+
+    missing_job_id = client.post("/api/v1/runs", cookies=cookies, headers=headers, json={"query": "RSI 30"})
+    unknown_job = client.post("/api/v1/runs", cookies=cookies, headers=headers, json={"aiJobId": "job-404"})
+
+    assert missing_job_id.status_code == 422
+    assert missing_job_id.json()["error"]["code"] == "request_validation_failed"
+    assert unknown_job.status_code == 404
+    assert unknown_job.json()["error"]["code"] == "analysis_job_not_found"
 
 
 def test_track_c_create_run_requires_csrf_and_uses_trading_data_engine(monkeypatch):
     client, app = make_client()
+    _install_completed_job_store(app)
     session_id, csrf_token = _create_session(app, user_id="user-1")
     observed: dict[str, object] = {}
 
@@ -106,7 +171,12 @@ def test_track_c_create_run_requires_csrf_and_uses_trading_data_engine(monkeypat
         "/api/v1/runs",
         cookies={app.state.settings.auth_session_cookie_name: session_id},
         headers={"Origin": API_ORIGIN, "X-CSRF-Token": csrf_token},
-        json={"query": "RSI 30", "strategyId": "strategy-1", "requestPayload": {"seed": "alpha"}},
+        json={
+            "query": "RSI 30",
+            "strategyId": "strategy-1",
+            "aiJobId": "job-1",
+            "requestPayload": {"seed": "alpha"},
+        },
     )
 
     assert response.status_code == 201
@@ -132,7 +202,7 @@ def test_track_c_create_run_rejects_missing_csrf(monkeypatch):
         "/api/v1/runs",
         cookies={app.state.settings.auth_session_cookie_name: session_id},
         headers={"Origin": API_ORIGIN},
-        json={"query": "RSI 30"},
+        json={"query": "RSI 30", "aiJobId": "job-1"},
     )
 
     assert response.status_code == 403

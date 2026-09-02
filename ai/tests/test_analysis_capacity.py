@@ -195,3 +195,12 @@ def test_liveness_endpoints_do_not_share_the_analysis_worker_pool() -> None:
     assert set(endpoints) == {HEALTH_PATH, READINESS_PATH}
     for path, endpoint in endpoints.items():
         assert inspect.iscoroutinefunction(endpoint), f"{path} must not occupy a worker thread"
+
+
+def test_default_queue_wait_outlasts_one_analysis_deadline() -> None:
+    """A job queued behind a full run must not time out before that run can."""
+
+    from ai_graph.analysis_capacity import DEFAULT_QUEUE_WAIT_SECONDS
+    from ai_graph.jobs import DEFAULT_JOB_DEADLINE_SECONDS
+
+    assert DEFAULT_QUEUE_WAIT_SECONDS >= DEFAULT_JOB_DEADLINE_SECONDS

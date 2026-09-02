@@ -80,7 +80,7 @@ def test_report_template_escapes_user_content_and_includes_unsubscribe():
 
     assert "<script>" not in rendered.html_body
     assert "&lt;script&gt;" in rendered.html_body
-    assert "report%2F1" in rendered.html_body
+    assert "/me/email-reports/report%2F1" in rendered.html_body
     assert "Unsubscribe" in rendered.text_body
 
     with pytest.raises(ValueError):

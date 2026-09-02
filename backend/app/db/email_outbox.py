@@ -219,6 +219,34 @@ async def create_or_get_delivery(db: Any, request: EmailDeliveryCreateRequest) -
     return {**_row_to_delivery(row), "created": created, "reused": not created}
 
 
+async def requeue_delivery(db: Any, *, delivery_id: str, now: datetime | None = None) -> dict[str, Any] | None:
+    """Re-queue a terminal delivery for an explicit resend. Returns None when it is not terminal."""
+
+    effective_now = now or _now()
+    row = await execute_one(
+        db,
+        """
+        UPDATE app.email_delivery_history
+        SET status = 'draft', error_message = NULL, sent_at = NULL, provider_message_id = NULL,
+            metadata_jsonb = metadata_jsonb || jsonb_build_object(
+                'submission_status', 'PENDING',
+                'attempt_count', 0,
+                'available_at', CAST(:now AS timestamptz),
+                'claim_token', NULL, 'claim_expires_at', NULL, 'claimed_by', NULL,
+                'provider_submission_status', NULL, 'provider_delivery_status', NULL,
+                'provider_status_checked_at', NULL, 'provider_event_at', NULL,
+                'provider_status_source', NULL, 'safe_failure_category', NULL,
+                'last_event_at', CAST(:now AS timestamptz)
+            )
+        WHERE delivery_id = CAST(:delivery_id AS uuid)
+          AND metadata_jsonb ->> 'submission_status' IN ('SENT', 'FAILED', 'CANCELLED')
+        RETURNING *
+        """,
+        {"delivery_id": delivery_id, "now": effective_now},
+    )
+    return _row_to_delivery(row) if row is not None else None
+
+
 async def release_expired_claims(
     db: Any,
     *,

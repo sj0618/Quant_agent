@@ -37,8 +37,11 @@ AI_ANALYSIS_QUEUE_WAIT_SECONDS_ENV = "AI_ANALYSIS_QUEUE_WAIT_SECONDS"
 # jobs instead of letting four full extracts compete until the process is killed.
 DEFAULT_MAX_CONCURRENCY = 1
 # Longer than a single analysis's wall budget, so a job queued behind one full run still
-# gets its turn instead of failing while a slot was about to free up.
-DEFAULT_QUEUE_WAIT_SECONDS = 600.0
+# gets its turn instead of failing while a slot was about to free up. That budget is
+# ``jobs.DEFAULT_JOB_DEADLINE_SECONDS`` (1800s); this stayed at 600s and made a queued
+# job fail before the run ahead of it could even hit its own deadline. `jobs` imports
+# this module, so the ceiling is restated here rather than imported.
+DEFAULT_QUEUE_WAIT_SECONDS = 1_860.0
 
 CAPACITY_TIMEOUT_MESSAGE = (
     "분석 대기열이 가득 차 시간 안에 실행하지 못했습니다. 잠시 후 다시 시도해 주세요."
