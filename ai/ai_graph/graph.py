@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from hashlib import sha256
 from time import perf_counter
-from typing import Any, Literal
+from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -30,8 +29,8 @@ from ai_graph.data_sources.db import BACKTEST_EVALUATION_YEARS
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.exploration_policy import (
-    ExplorationPolicyV2,
     ExplorationPolicyUnavailableError,
+    ExplorationPolicyV2,
     load_exploration_policy_from_env,
     validate_exploration_spec_against_policy,
 )
@@ -47,34 +46,23 @@ from ai_graph.llm.role_calls import (
 )
 from ai_graph.memory import AnalysisMemory
 from ai_graph.nodes.backtest import (
-    BENCHMARK_LABEL,
-    BENCHMARK_METHOD,
-    BENCHMARK_WARNING,
     MAX_OBJECTIVE_DRAWDOWN,
-    METRIC_ROUND_DIGITS,
     MIN_OBJECTIVE_SHARPE,
     MIN_OBJECTIVE_TRADES,
-    _annualized_return,
-    _benchmark_objective_reasons,
-    _calmar_ratio,
-    _equal_weight_benchmark_curve,
-    _is_numeric_metric,
-    _price_rows,
-    _profit_factor,
-    _public_engine_summary,
-    _summary_float_default,
     WALK_FORWARD_EVALUATION_MONTHS,
+    WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
     WALK_FORWARD_ROLL_MONTHS,
     WALK_FORWARD_TRAIN_MONTHS,
     WALK_FORWARD_VALIDATION_MONTHS,
-    WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
+    _benchmark_objective_reasons,
+    _summary_float_default,
     backtest_node,
 )
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.backtest_features import unavailable_condition_metrics
 from ai_graph.nodes.condition_compiler import canonical_metric, untranslatable_conditions
-from ai_graph.nodes.research_compile import compile_research
 from ai_graph.nodes.report import report_node
+from ai_graph.nodes.research_compile import compile_research
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
 from ai_graph.progress import (
@@ -83,7 +71,6 @@ from ai_graph.progress import (
     report_activity,
     report_node_stage,
 )
-from ai_graph.quant_explanations import metric_explanation, metric_registry_provenance
 from ai_graph.quant_strategy import (
     classify_strategy_request,
     infer_automatic_strategy_preferences,
@@ -92,13 +79,12 @@ from ai_graph.quant_strategy import (
 )
 from ai_graph.research_eligibility import PerformanceAvailable, PerformanceUnavailable
 from ai_graph.schemas import (
+    EXPLORATION_EXECUTION_SPEC_VERSION_V2,
+    RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3,
+    STRATEGY_EXECUTION_SPEC_VERSION_V1,
     AmbiguityCode,
     APIEnvelope,
-    BacktestBenchmark,
-    BacktestEquityPoint,
     BacktestMetrics,
-    BacktestPerformance,
-    BacktestReliability,
     CandidateBacktestResult,
     ClarificationOption,
     Condition,
@@ -108,31 +94,26 @@ from ai_graph.schemas import (
     EvidenceRef,
     ExecutionSpecV1OrV2,
     ExplorationExecutionSpecV2,
-    ResearchCandidateExecutionSpecV3,
     InternalPayload,
-    PublicMetricDetail,
-    PublicMetricProvenance,
     RecommendationGate,
+    ResearchCandidateExecutionSpecV3,
     ScreeningMatch,
     SemanticSlots,
     SourceUsage,
     StrategyCandidateCard,
     StrategyExecutionSpecV1,
     StrategySpec,
-    STRATEGY_EXECUTION_SPEC_VERSION_V1,
-    EXPLORATION_EXECUTION_SPEC_VERSION_V2,
-    RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3,
     TickerAction,
     canonical_execution_spec_digest,
     validate_execution_spec,
 )
-from ai_graph.strategy_blueprint_catalog import strategy_blueprint_catalog
 from ai_graph.source_manifest import (
     build_pipeline_extract_snapshot,
     is_release_profile,
     validate_release_metadata,
 )
 from ai_graph.state import QuantAgentState
+from ai_graph.strategy_blueprint_catalog import strategy_blueprint_catalog
 
 _logger = logging.getLogger(__name__)
 
@@ -149,7 +130,6 @@ NODE_SEQUENCE = (
     "Report",
 )
 _NODE_ERROR_RECORDED: ContextVar[bool] = ContextVar("node_error_recorded", default=False)
-_PUBLIC_METRIC_UNAVAILABLE_REASON = "metric unavailable in this analysis window"
 _BENCHMARK_UNAVAILABLE_REASON = (
     "benchmark curve requires at least one non-empty trading date and valid closes"
 )
@@ -1396,51 +1376,6 @@ def _universe_split_disclosure(state: QuantAgentState) -> list[str]:
             "백테스트 거래 대상에서 제외됐습니다."
         )
     return lines
-
-
-def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> None:
-    """Note how this run turned out, for the next analysis of the same strategy."""
-
-    memory = AnalysisMemory.from_env()
-    if not memory.enabled:
-        return
-    strategy = state.get("strategy_spec") or {}
-    strategy_id = str(strategy.get("strategy_id") or "")
-    if not strategy_id:
-        return
-
-    data = state.get("data") or {}
-    pipeline = data.get("pipeline_data_source") or {}
-    relaxation = pipeline.get("screening_relaxation") or {}
-    availability = data.get("data_availability") or {}
-    performance = (
-        project_public_performance(
-            state.get("backtest"),
-            price_rows=state.get("price_rows"),
-            pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
-        )
-        or {}
-    )
-    payload = performance.performance if isinstance(performance, PerformanceAvailable) else None
-    metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
-
-    try:
-        memory.record(
-            strategy_id,
-            query=str(state.get("user_query") or ""),
-            outcome=status.value,
-            candidate_count=len(data.get("screening_candidates") or []),
-            metrics=metrics or {},
-            relaxation_rounds=int(relaxation.get("relaxation_rounds") or 0),
-            unmet_requirements=[
-                str(item.get("label"))
-                for item in availability.get("unsupported_capabilities") or []
-            ],
-            note=(state.get("strategy_revision") or {}).get("rationale"),
-        )
-    except Exception:
-        # Memory is an optimisation; never let it take down a completed analysis.
-        _logger.warning("could not record analysis memory", exc_info=True)
 
 
 def classify_query(query: str) -> AmbiguityCode:
@@ -3594,25 +3529,6 @@ def build_internal_payload(state: QuantAgentState) -> InternalPayload:
     )
 
 
-def build_public_backtest_performance(  # noqa: F811
-    backtest: Mapping[str, Any] | None,
-) -> BacktestPerformance | None:
-    if not backtest:
-        return None
-
-    result = CandidateBacktestResult.model_validate(backtest)
-    if result.selected_candidate.metrics is None:
-        return None
-    return BacktestPerformance(
-        selected_candidate_id=result.selected_candidate.candidate_id,
-        metrics=result.selected_candidate.metrics,
-        equity_curve=result.equity_curve,
-        # Public jobs are polled and persisted as JSON. Keep that durable document small;
-        # detailed QuantStats arrays stay in the internal/debug backtest artifacts.
-        engine_summary=_public_engine_summary(result.engine_summary),
-    )
-
-
 def _ticker_actions(
     state: QuantAgentState,
     cards: list[StrategyCandidateCard],
@@ -3716,25 +3632,6 @@ def _slots_full_reason(backtest: Mapping[str, Any]) -> str | None:
     )
 
 
-def _recommendation_gate(state: QuantAgentState) -> RecommendationGate | None:
-    """Gate today's picks on the backtest of the strategy that produced them.
-
-    Returns None when there was no backtest to gate against (no picks, or the backtest
-    node never ran). Otherwise validated mirrors whether the backtest cleared the
-    objective floor, so a strategy that failed history is not dressed up as a buy list.
-    """
-
-    if state.get("backtest") is None:
-        return None
-    validated = bool(state.get("strategy_validated"))
-    reason = (
-        "백테스트가 목표 기준(샤프·MDD·벤치마크 초과)을 충족했습니다."
-        if validated
-        else "백테스트가 목표 기준(샤프·MDD·벤치마크 초과)에 미달해 참고용입니다."
-    )
-    return RecommendationGate(validated=validated, reason=reason)
-
-
 def _status_for_category(category: AmbiguityCode) -> EnvelopeStatus:
     if category == AmbiguityCode.READY:
         return EnvelopeStatus.READY
@@ -3787,50 +3684,6 @@ def _route_after_research(state: QuantAgentState) -> str:
 
 def _trace_id(value: str) -> str:
     return sha256(value.encode("utf-8")).hexdigest()[:16]
-
-
-def _pipeline_source(
-    pipeline_data_source: Mapping[str, Any] | None,
-) -> Literal["fixture", "postgres", "unknown"]:
-    if not isinstance(pipeline_data_source, Mapping):
-        return "unknown"
-    source = pipeline_data_source.get("source")
-    if source in {"fixture", "postgres"}:
-        return source
-    return "unknown"
-
-
-def build_public_backtest_performance(  # noqa: F811
-    backtest: Mapping[str, Any] | None,
-    *,
-    price_rows: Sequence[Mapping[str, Any]] | None = None,
-    pipeline_data_source: Mapping[str, Any] | None = None,
-) -> BacktestPerformance | None:
-    if not backtest:
-        return None
-
-    result = CandidateBacktestResult.model_validate(backtest)
-    if result.selected_candidate.metrics is None:
-        return None
-
-    normalized_rows = _price_rows(price_rows)
-    source = _pipeline_source(pipeline_data_source)
-    reliability = _build_backtest_reliability(result, normalized_rows, source=source)
-    benchmark = _build_public_benchmark(normalized_rows)
-    return BacktestPerformance(
-        selected_candidate_id=result.selected_candidate.candidate_id,
-        metrics=result.selected_candidate.metrics,
-        equity_curve=result.equity_curve,
-        engine_summary=_public_engine_summary(result.engine_summary),
-        reliability=reliability,
-        data_quality=_build_data_quality(reliability),
-        benchmark=benchmark,
-        metric_details=_build_public_metric_details(
-            result,
-            price_rows=normalized_rows,
-            benchmark=benchmark,
-        ),
-    )
 
 
 def _minimum_input_gaps(performance: PerformanceUnavailable) -> list[str]:
@@ -4054,207 +3907,9 @@ def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> N
         _logger.warning("could not record analysis memory", exc_info=True)
 
 
-def _build_backtest_reliability(
-    result: CandidateBacktestResult,
-    price_rows: Sequence[Mapping[str, Any]],
-    *,
-    source: Literal["fixture", "postgres", "unknown"],
-) -> BacktestReliability:
-    row_count = len(price_rows)
-    dates = sorted({str(row.get("date")) for row in price_rows if row.get("date") is not None})
-    trading_days = len(dates)
-    ticker_count = len(
-        {
-            str(row.get("ticker") or "005930").zfill(6)
-            for row in price_rows
-            if row.get("ticker") is not None
-        }
-    )
-    trade_count = int(_summary_float_default(result.engine_summary, "effective_trade_count", 0.0))
-    reasons: list[str] = []
-    warnings: list[str] = []
-
-    if row_count == 0:
-        reasons.append("가격 행이 없습니다.")
-    if trading_days < _RELIABILITY_WARN_UNTIL_DAYS:
-        reasons.append("거래일 수가 너무 적어 통계 신뢰도가 낮습니다.")
-    elif trading_days < _RELIABILITY_SUFFICIENT_DAYS:
-        warnings.append("거래일 수가 90일 미만으로 품질이 제한적입니다.")
-    if ticker_count < _RELIABILITY_MIN_TICKERS:
-        reasons.append("티커 수가 2개 미만입니다.")
-    if source == "fixture" and row_count <= 4 and ticker_count == 1:
-        reasons.append("기본 fixture 샘플(4개 행/1종목)에서는 안정적 통계 산출이 제한됩니다.")
-    if trade_count < MIN_OBJECTIVE_TRADES:
-        warnings.append(
-            f"실제 거래 횟수 {trade_count}회로 MIN_OBJECTIVE_TRADES={MIN_OBJECTIVE_TRADES} 미만입니다."
-        )
-
-    if reasons:
-        status = "insufficient"
-    elif warnings:
-        status = "limited"
-    else:
-        status = "sufficient"
-
-    return BacktestReliability(
-        source=source,
-        status=status,
-        row_count=row_count,
-        ticker_count=ticker_count,
-        trading_days=trading_days,
-        history_start=dates[0] if dates else None,
-        history_end=dates[-1] if dates else None,
-        trade_count=trade_count,
-        reasons=reasons,
-        warnings=warnings,
-    )
-
-
-def _build_data_quality(reliability: BacktestReliability) -> list[str]:
-    quality = [
-        f"source:{reliability.source}",
-        f"rows:{reliability.row_count}",
-        f"tickers:{reliability.ticker_count}",
-        f"trading_days:{reliability.trading_days}",
-        f"trades:{reliability.trade_count}",
-    ]
-    if reliability.status == "insufficient":
-        quality.append("신뢰도: 불충분")
-    elif reliability.status == "limited":
-        quality.append("신뢰도: 제한적")
-    else:
-        quality.append("신뢰도: 충분")
-    return quality
-
-
-def _build_public_benchmark(price_rows: Sequence[Mapping[str, Any]]) -> BacktestBenchmark:
-    curve, total_return = _equal_weight_benchmark_curve(price_rows)
-    if not curve:
-        return BacktestBenchmark(
-            label=BENCHMARK_LABEL,
-            method=BENCHMARK_METHOD,
-            warning=BENCHMARK_WARNING,
-            total_return=None,
-            cumulative_curve=[],
-            is_available=False,
-            unavailable_reason=_BENCHMARK_UNAVAILABLE_REASON,
-        )
-    return BacktestBenchmark(
-        label=BENCHMARK_LABEL,
-        method=BENCHMARK_METHOD,
-        warning=BENCHMARK_WARNING,
-        total_return=total_return,
-        cumulative_curve=curve,
-        is_available=True,
-        unavailable_reason=None,
-    )
-
-
-def _build_public_metric_details(
-    result: CandidateBacktestResult,
-    *,
-    price_rows: Sequence[Mapping[str, Any]],
-    benchmark: BacktestBenchmark,
-) -> list[PublicMetricDetail]:
-    metrics = result.selected_candidate.metrics
-    if metrics is None:
-        return []
-
-    trading_days = len({str(row.get("date")) for row in price_rows if row.get("date") is not None})
-    equity_returns = _equity_returns(result.equity_curve)
-    benchmark_return = benchmark.total_return if benchmark.is_available else None
-    cagr = _annualized_return(metrics.total_return, trading_days=trading_days)
-    calmar = _calmar_ratio(cagr, metrics.max_drawdown)
-
-    values: dict[str, float | None] = {
-        "total_return": metrics.total_return,
-        "cagr": cagr,
-        "annualized_volatility": _annualized_volatility(equity_returns),
-        "sharpe_ratio": metrics.sharpe_ratio,
-        "sortino_ratio": _sortino_ratio(cagr, equity_returns),
-        "max_drawdown": metrics.max_drawdown,
-        "calmar_ratio": calmar,
-        "win_rate": metrics.win_rate,
-        "profit_factor": _profit_factor(result.engine_summary),
-        "benchmark_return": benchmark_return,
-        "excess_return": (
-            metrics.total_return - benchmark_return
-            if _is_numeric_metric(benchmark_return)
-            else None
-        ),
-        "in_sample_sharpe": metrics.in_sample_sharpe,
-        "out_sample_sharpe": metrics.out_sample_sharpe,
-        "degradation": metrics.degradation,
-    }
-
-    return [_metric_detail(key, values.get(key)) for key in _METRIC_DETAIL_KEYS]
-
-
-def _metric_detail(key: str, value: float | None) -> PublicMetricDetail:
-    explanation = metric_explanation(key)
-    registry = metric_registry_provenance(key)
-    is_available = _is_numeric_metric(value)
-    return PublicMetricDetail(
-        key=key,
-        label=explanation["label"],
-        value=round(float(value), METRIC_ROUND_DIGITS) if is_available else None,
-        unit=explanation["unit"],
-        is_available=is_available,
-        unavailable_reason=None if is_available else _UNAVAILABLE_METRIC_REASON,
-        plain_explanation=explanation["plain_explanation"],
-        why_used=explanation["why_used"],
-        caution=explanation["caution"],
-        source_refs=list(explanation.get("source_refs", [])),
-        registry_version=registry["registry_version"],
-        provenance=PublicMetricProvenance(
-            implementation_path=registry["implementation_path"],
-            implementation_ref=registry["implementation_ref"],
-            implementation_hash=registry["implementation_hash"],
-        ),
-    )
-
-
-def _equity_returns(equity_curve: Sequence[BacktestEquityPoint]) -> list[float]:
-    if len(equity_curve) < 2:
-        return []
-    returns: list[float] = []
-    for previous, current in zip(equity_curve, equity_curve[1:]):
-        previous_value = previous.cumulative_return + 1.0
-        current_value = current.cumulative_return + 1.0
-        if previous_value == 0.0:
-            return []
-        returns.append(current_value / previous_value - 1.0)
-    return returns
-
-
-def _annualized_volatility(returns: Sequence[float]) -> float | None:
-    if len(returns) < 2:
-        return None
-    mean_return = sum(returns) / len(returns)
-    variance = sum((value - mean_return) ** 2 for value in returns) / (len(returns) - 1)
-    if variance <= 0.0:
-        return 0.0
-    return math.sqrt(variance) * math.sqrt(252.0)
-
-
-def _sortino_ratio(total_return: float, returns: Sequence[float]) -> float | None:
-    if len(returns) < 2:
-        return None
-    downside = [value for value in returns if value < 0.0]
-    if not downside:
-        return None
-    downside_mean = sum(downside) / len(downside)
-    downside_variance = sum((value - downside_mean) ** 2 for value in downside) / len(downside)
-    if downside_variance <= 0.0:
-        return None
-    downside_std = math.sqrt(downside_variance) * math.sqrt(252.0)
-    if downside_std == 0.0:
-        return None
-    return total_return / downside_std
-
-
 # Public performance helpers are sourced from quant_performance for a stable behavior contract.
-from ai_graph.quant_performance import (  # noqa: E402, F401, F811
+from ai_graph.quant_performance import (  # noqa: F401
+    _metric_detail,
     build_public_backtest_performance,
     project_public_performance,
 )
