@@ -37,6 +37,22 @@ test("workspace delegates parse-bound admission to the server in one request", a
   assert.doesNotMatch(createJob, /parse_token:/);
 });
 
+test("review confirmation keeps the original natural-language context without changing the sealed rule", async () => {
+  const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+  const review = clientSource.slice(
+    clientSource.indexOf("export async function reviewStrategy"),
+    clientSource.indexOf("export interface ResearchAppendix"),
+  );
+  const confirmation = clientSource.slice(
+    clientSource.indexOf("export async function createConfirmedAnalysisJob"),
+    clientSource.indexOf("export interface ResearchAppendix"),
+  );
+
+  assert.match(review, /\{ \.\.\.parsed, original_query: normalizedQuery \}/);
+  assert.match(confirmation, /strategy_execution_spec: parsed\.strategy_execution_spec,/);
+  assert.match(confirmation, /query: parsed\.original_query,/);
+});
+
 test("workspace discards a running job lost during a server restart", async () => {
   const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
 

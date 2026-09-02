@@ -218,6 +218,14 @@ export interface RuleDraftOutcome {
   spec_version?: "strategy-execution-spec.v1" | "exploration-execution-spec.v2" | "research-candidate-execution-spec.v3";
   spec_hash?: string;
   parse_token?: string;
+  /**
+   * Browser-local context retained after the review response.  It is not an
+   * execution authority: the signed execution spec below remains the only rule
+   * the server can backtest.  Sending this back at confirmation lets the
+   * research and report nodes explain the user's actual wording instead of an
+   * internal canonical summary.
+   */
+  original_query?: string;
 }
 
 export type ParseOutcome = RuleDraftOutcome | { kind: "scope_refusal" | "unsupported_scope"; explanation: string };
@@ -286,7 +294,9 @@ export async function reviewStrategy(query: string): Promise<ParseOutcome> {
   });
   assertOk(parseResponse);
   const parsed = await parseResponse.json() as ParseOutcome;
-  return parsed;
+  return parsed.kind === "rule_draft"
+    ? { ...parsed, original_query: normalizedQuery }
+    : parsed;
 }
 
 /** Queue only a server-validated draft that the user has explicitly confirmed. */
@@ -312,6 +322,10 @@ export async function createConfirmedAnalysisJob(parsed: RuleDraftOutcome): Prom
       spec_version: parsed.spec_version,
       spec_hash: parsed.spec_hash,
       strategy_execution_spec: parsed.strategy_execution_spec,
+      // The sealed spec is authoritative for execution.  This original text is
+      // carried only as auditable/reporting context, so Research never has to
+      // reconstruct the request from an internal rule summary.
+      query: parsed.original_query,
     }),
   });
   assertOk(response);
