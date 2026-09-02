@@ -187,7 +187,10 @@ class _FakeConnection:
                     rows.append({"report_id": report_id, "analysis_result_id": report.get("analysis_result_id")})
             return _FakeResult(rows)
 
-        if normalized.startswith("select report_id, run_id, user_id, analysis_result_id, summary, report_jsonb from app.ai_backtest_report"):
+        # Both the replay guard and _validate_completion_replay read this row, with and
+        # without analysis_result_id in the column list. Matching only one of the two
+        # shapes silently starves the other of rows and disarms its conflict check.
+        if normalized.startswith("select report_id, run_id, user_id,") and "from app.ai_backtest_report" in normalized:
             report_id = params["report_id"]
             row = self.engine.ai_backtest_reports.get(report_id)
             return _FakeResult([row] if row is not None else [])
@@ -527,6 +530,164 @@ async def test_track_c_component_integration_complete_analysis_run_replays_and_c
     assert sum(1 for entry in engine.write_log if "insert into app.strategy_email_report" in str(entry["sql"]).lower()) == 1
 
 
+def _ai_job_run_payload(seed: str, ai_job_id: str) -> dict[str, object]:
+    return {
+        "query": "RSI 30",
+        "strategyId": "strategy-1",
+        "aiJobId": ai_job_id,
+        "requestPayload": {"aiJobId": ai_job_id, "query": "RSI 30", "seed": seed},
+    }
+
+
+def _ai_job_completion(ai_job_id: str, result: dict[str, object]) -> dict[str, object]:
+    return {"status": "completed", "aiJobId": ai_job_id, "result": {**result, "aiJobId": ai_job_id}}
+
+
+@pytest.mark.asyncio
+async def test_track_c_completion_replay_for_same_ai_job_survives_result_schema_drift(monkeypatch):
+    # The AI result schema gains fields between deploys, so the snapshot the server
+    # re-derives on a replay no longer matches the one persisted at first save. Completion
+    # is idempotent per (user, aiJobId): that drift must not 409 and must not rewrite the
+    # immutable analysis_result / report rows.
+    engine = TrackCFakeEngine()
+    _install_state_readers(monkeypatch, engine)
+
+    run = await fe_contract_store.create_analysis_run_from_db(
+        engine, user_id="42", payload=_ai_job_run_payload("drift", "ai-job-1")
+    )
+    created = await fe_contract_store.complete_analysis_run_from_db(
+        engine,
+        user_id="42",
+        run_id=run["id"],
+        payload=_ai_job_completion("ai-job-1", {"title": "Report", "summary": "Summary"}),
+    )
+    report_id = created["reportId"]
+    before = copy.deepcopy(
+        {
+            "run": engine.backtest_runs[run["id"]],
+            "ai_report": engine.ai_backtest_reports[report_id],
+            "email_report": engine.strategy_email_reports[report_id],
+            "analysis_results": engine.analysis_results,
+        }
+    )
+    writes_before = len(engine.write_log)
+
+    replayed = await fe_contract_store.complete_analysis_run_from_db(
+        engine,
+        user_id="42",
+        run_id=run["id"],
+        payload=_ai_job_completion(
+            "ai-job-1",
+            {
+                "title": "Report",
+                "summary": "Summary",
+                "strategySpec": {"holdingDays": 5, "rebalanceIntervalDays": 20},
+                "performance": {"outSampleMaxDrawdown": -0.12},
+            },
+        ),
+    )
+
+    assert created["created"] is True
+    assert replayed == {
+        "runId": run["id"],
+        "reportId": report_id,
+        "analysisResultId": created["analysisResultId"],
+        "status": "completed",
+        "created": False,
+    }
+    assert engine.backtest_runs[run["id"]] == before["run"]
+    assert engine.ai_backtest_reports[report_id] == before["ai_report"]
+    assert engine.strategy_email_reports[report_id] == before["email_report"]
+    assert engine.analysis_results == before["analysis_results"]
+    replay_writes = [
+        entry for entry in engine.write_log[writes_before:]
+        if not " ".join(str(entry["sql"]).split()).lower().startswith("select")
+    ]
+    assert replay_writes == []
+
+
+@pytest.mark.asyncio
+async def test_track_c_completion_replay_still_backfills_a_partially_linked_run(monkeypatch):
+    # The replay short-circuit must not skip the idempotent analysis_result_id backfills
+    # while any of the three rows is still unlinked - a run left half-linked by a partial
+    # migration would otherwise take the short-circuit forever and never heal.
+    engine = TrackCFakeEngine()
+    _install_state_readers(monkeypatch, engine)
+
+    run = await fe_contract_store.create_analysis_run_from_db(
+        engine, user_id="42", payload=_ai_job_run_payload("partial", "ai-job-1")
+    )
+    completion = _ai_job_completion("ai-job-1", {"title": "Report", "summary": "Summary"})
+    created = await fe_contract_store.complete_analysis_run_from_db(
+        engine, user_id="42", run_id=run["id"], payload=completion
+    )
+    report_id = created["reportId"]
+    engine.ai_backtest_reports[report_id]["analysis_result_id"] = None
+    engine.strategy_email_reports[report_id]["analysis_result_id"] = None
+
+    replayed = await fe_contract_store.complete_analysis_run_from_db(
+        engine, user_id="42", run_id=run["id"], payload=completion
+    )
+
+    assert replayed["created"] is False
+    assert engine.ai_backtest_reports[report_id]["analysis_result_id"] == created["analysisResultId"]
+    assert engine.strategy_email_reports[report_id]["analysis_result_id"] == created["analysisResultId"]
+    assert len(engine.analysis_results) == 1
+
+
+@pytest.mark.asyncio
+async def test_track_c_completion_for_a_different_ai_job_still_conflicts(monkeypatch):
+    engine = TrackCFakeEngine()
+    _install_state_readers(monkeypatch, engine)
+
+    run = await fe_contract_store.create_analysis_run_from_db(
+        engine, user_id="42", payload=_ai_job_run_payload("conflict", "ai-job-1")
+    )
+    await fe_contract_store.complete_analysis_run_from_db(
+        engine,
+        user_id="42",
+        run_id=run["id"],
+        payload=_ai_job_completion("ai-job-1", {"title": "Report", "summary": "Summary"}),
+    )
+
+    with pytest.raises(AppError) as exc:
+        await fe_contract_store.complete_analysis_run_from_db(
+            engine,
+            user_id="42",
+            run_id=run["id"],
+            payload=_ai_job_completion("ai-job-2", {"title": "Report", "summary": "Summary"}),
+        )
+
+    assert exc.value.status_code == 409
+    assert len(engine.analysis_results) == 1
+
+
+@pytest.mark.asyncio
+async def test_track_c_completion_replay_stays_scoped_to_the_owning_user(monkeypatch):
+    engine = TrackCFakeEngine()
+    _install_state_readers(monkeypatch, engine)
+
+    run = await fe_contract_store.create_analysis_run_from_db(
+        engine, user_id="42", payload=_ai_job_run_payload("scope", "ai-job-1")
+    )
+    await fe_contract_store.complete_analysis_run_from_db(
+        engine,
+        user_id="42",
+        run_id=run["id"],
+        payload=_ai_job_completion("ai-job-1", {"title": "Report", "summary": "Summary"}),
+    )
+
+    with pytest.raises(AppError) as exc:
+        await fe_contract_store.complete_analysis_run_from_db(
+            engine,
+            user_id="43",
+            run_id=run["id"],
+            payload=_ai_job_completion("ai-job-1", {"title": "Report", "summary": "Summary"}),
+        )
+
+    assert exc.value.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_track_c_legacy_completed_rows_with_null_result_id_replay_and_backfill(monkeypatch):
     engine = TrackCFakeEngine()
@@ -596,6 +757,9 @@ async def test_track_c_legacy_completed_rows_with_null_result_id_reject_changed_
         )
 
     assert exc.value.status_code == 409
+    # Pins the conflict to _validate_completion_replay rather than a later site: that is
+    # the check the replay short-circuit must sit in front of, not behind.
+    assert exc.value.message == "Analysis run is already completed with different content"
     assert engine.backtest_runs[run["id"]]["analysis_result_id"] is None
     assert engine.ai_backtest_reports[report_id]["analysis_result_id"] is None
     assert engine.strategy_email_reports[report_id]["analysis_result_id"] is None
