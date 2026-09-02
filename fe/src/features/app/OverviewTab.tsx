@@ -156,7 +156,7 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
           </div>
           {featuredCandidates.length ? featuredCandidates.map((candidate) => (
             <SignalCard candidate={candidate} compact key={candidate.id} />
-          )) : <p>현재 AI 응답에는 종목별 추천 데이터가 없습니다.</p>}
+          )) : <p>오늘은 규칙에 해당하는 종목이 없습니다 (신호 0건). 백테스트 결론과 성과는 위 카드에서 확인할 수 있습니다.</p>}
           <div className="card-foot">
             {overview.candidates.length ? <>신호는 매일 08:00 자동 갱신됩니다 <a href={`${ROUTES.app}?tab=trading`}>전체 종목 정보 보기 →</a></> : "실데이터 소스 연결 시 종목별 신호가 표시됩니다."}
           </div>
