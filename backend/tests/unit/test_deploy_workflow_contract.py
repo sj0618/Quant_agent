@@ -230,3 +230,14 @@ def test_failure_rollback_restores_ai_readiness_runtime():
     assert "npm ci" not in rollback
     assert "npm run build" not in rollback
     assert "stop_listeners_on_port() {" not in rollback
+
+
+def test_deploy_exports_a_persistent_backtest_cache_dir_before_starting_the_ai_service():
+    """Under APP_ENV=production the AI service refuses to run backtests without it."""
+
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+
+    assert 'export AI_BACKTEST_CACHE_DIR="$APP_DIR/.run/backtest-cache"' in workflow
+    assert workflow.index('export AI_BACKTEST_CACHE_DIR="$APP_DIR/.run/backtest-cache"') < workflow.index(
+        'nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app'
+    )
