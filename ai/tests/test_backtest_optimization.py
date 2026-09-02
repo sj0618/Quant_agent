@@ -1372,3 +1372,26 @@ def test_disk_cache_requires_a_directory_under_a_release_profile(monkeypatch, tm
     # An explicit directory is accepted even under a release profile.
     monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path))
     assert backtest_node._DiskEvaluationCache().root == tmp_path
+
+
+def test_parallel_evaluation_stops_at_a_wave_boundary_when_cancelled(
+    monkeypatch, tmp_path
+) -> None:
+    # T2-3: a cancel is honoured at the wave boundary, so evaluation raises instead
+    # of running every queued candidate wave to completion.
+    from ai_graph.progress import AnalysisCancelled, cancellation_check
+
+    strategy = _strategy()
+    rows = _rows(days=45)
+    candidates = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="cancel-wave")
+    ).candidates
+    # SERIAL_EVALUATION_WORK_ITEMS=0 + >1 worker forces the parallel wave path
+    # (round_worker_count == 1 would run in-process and never reach _evaluate_parallel).
+    monkeypatch.setattr(backtest_node, "SERIAL_EVALUATION_WORK_ITEMS", 0)
+    monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "cancel-wave"))
+    monkeypatch.setenv(backtest_node.AI_BACKTEST_WORKERS_ENV, "2")
+
+    with backtest_node._CandidateBacktestSession(strategy, rows) as session:
+        with cancellation_check(lambda: True), pytest.raises(AnalysisCancelled):
+            session.evaluate(candidates)

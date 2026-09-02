@@ -30,7 +30,9 @@ from ai_graph.nodes.position_sizing import (
     required_max_position_pct,
 )
 from ai_graph.progress import (
+    AnalysisCancelled,
     deadline_remaining_seconds,
+    raise_if_cancelled,
     raise_if_past_deadline,
     report_activity,
 )
@@ -1201,6 +1203,15 @@ class _CandidateBacktestSession:
         }
         pending: set[Future[_CandidateTaskResult]] = set(futures)
         while pending:
+            # Stop before the next wave when the run was cancelled, so a cancel does
+            # not have to wait for every already-queued candidate to finish.
+            try:
+                raise_if_cancelled()
+            except AnalysisCancelled:
+                self._terminate_executor()
+                for unresolved in pending:
+                    unresolved.cancel()
+                raise
             remaining_seconds = deadline - time.perf_counter()
             if remaining_seconds <= 0:
                 break
