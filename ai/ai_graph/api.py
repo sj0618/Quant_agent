@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from os import environ
 from threading import Lock
+from time import perf_counter
 from typing import ClassVar, Literal
 
 from fastapi import (
@@ -68,8 +69,8 @@ from ai_graph.jobs import (
     PERSISTENT_JOB_STORE_MODE,
     AnalysisJob,
     AnalysisJobOutboxStore,
-    AnalysisJobStore,
     AnalysisJobStatus,
+    AnalysisJobStore,
     AnalysisRunner,
     CancellationRegistry,
     JobStoreConfigurationError,
@@ -91,11 +92,12 @@ from ai_graph.preflight import (
 from ai_graph.quant_performance import sanitize_public_performance
 from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.research_contract import (
+    EXPLORATION_EXECUTION_SPEC_VERSION,
+    RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION,
+    STRATEGY_EXECUTION_SPEC_VERSION,
     CanonicalRuleV1,
     DraftConflictV1,
     DraftTokenValidationError,
-    EXPLORATION_EXECUTION_SPEC_VERSION,
-    RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION,
     ExecutionSpecV1OrV2,
     ExplorationExecutionSpecV2,
     InMemoryDraftNonceRegistry,
@@ -104,7 +106,6 @@ from ai_graph.research_contract import (
     ResearchResultV1,
     RuleDraftSigner,
     RuleDraftV1,
-    STRATEGY_EXECUTION_SPEC_VERSION,
     ScopeRefusalV1,
     UnsupportedScopeV1,
     build_rule_draft,
@@ -123,9 +124,9 @@ from ai_graph.schemas import (
     EnvelopeStatus,
     FailureDiagnostic,
     ReportBundle,
+    ResearchCandidateExecutionSpecV3,
     Stage,
     UserPayload,
-    ResearchCandidateExecutionSpecV3,
 )
 from ai_graph.scope_review import review_research_scope
 from ai_graph.single_process import enforce_single_process
@@ -909,6 +910,130 @@ def _record_finalization(
         report_audit_failure("record_finalization")
 
 
+def _rule_draft_audit_metadata(outcome: RuleDraftV1) -> dict[str, object]:
+    """Return the parse result identifiers needed to join audit rows to a job.
+
+    The AOAI client records the complete prompt and response in the model/prompt
+    audit tables while it is bound to this session.  This smaller agent-execution
+    record is deliberately an index: it lets an operator locate the exact model
+    calls and the sealed execution contract without duplicating the raw prompt in
+    every audit table.
+    """
+
+    return {
+        "kind": outcome.kind,
+        "is_executable": outcome.is_executable,
+        "authoring_method": outcome.authoring_method,
+        "spec_version": outcome.spec_version,
+        "spec_hash": outcome.spec_hash,
+        "clarification_required": outcome.clarification_required,
+    }
+
+
+def _build_rule_draft_with_audit(
+    *,
+    audit_sink: AuditSink | None,
+    trace_id: str,
+    entrypoint: str,
+    feature: str,
+    client_request_id: str | None,
+    query: str,
+    user_id: str,
+    signer: RuleDraftSigner,
+    available_metrics: list[str] | tuple[str, ...] | None,
+    use_llm: bool,
+    exploration_policy: ActiveExplorationPolicyV2 | None,
+) -> RuleDraftV1:
+    """Build a V3 draft inside a durable audit context.
+
+    V3 research happens before a job exists, which used to leave AOAI calls with no
+    active audit session.  Keeping this boundary separate from job execution makes
+    the parse-stage prompt/response, provider failure, repaired response, and sealed
+    spec hash observable in ``AI_DATABASE_DSN`` without treating a parse as a job.
+    """
+
+    session = _open_request_audit_session(
+        audit_sink,
+        trace_id=trace_id,
+        entrypoint=entrypoint,
+        feature=feature,
+        client_request_id=client_request_id,
+        user_id=user_id,
+    )
+    _record_step(session, "strategy_research_resolution_started", message="strategy parse started")
+    execution_id = None
+    try:
+        execution_id = session.start_agent_execution(
+            "Strategy Research",
+            step_name="strategy_research_resolution",
+            input_jsonb={
+                "query_digest": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                "use_llm": use_llm,
+                "available_metric_count": len(available_metrics or ()),
+            },
+        )
+    except Exception:  # noqa: BLE001 - audit writes must not block an otherwise valid parse.
+        report_audit_failure("start_agent_execution")
+
+    started = perf_counter()
+    try:
+        with bind_audit_context(session, execution_id):
+            outcome = build_rule_draft(
+                query=query,
+                user_id=user_id,
+                signer=signer,
+                available_metrics=available_metrics,
+                use_llm=use_llm,
+                exploration_policy=exploration_policy,
+            )
+    except Exception as exc:
+        latency_ms = (perf_counter() - started) * 1_000
+        if execution_id is not None:
+            try:
+                session.finish_agent_execution(
+                    execution_id,
+                    status="failed",
+                    output_jsonb={},
+                    error_message=f"{type(exc).__name__} during strategy research resolution",
+                    latency_ms=latency_ms,
+                )
+            except Exception:  # noqa: BLE001 - audit writes must not block an otherwise valid parse.
+                report_audit_failure("finish_agent_execution")
+        _record_error(
+            session,
+            "strategy_research_resolution",
+            error_type=type(exc).__name__,
+            message=f"{type(exc).__name__} during strategy research resolution",
+        )
+        _record_finalization(session, "failed", message="strategy parse failed")
+        raise
+
+    latency_ms = (perf_counter() - started) * 1_000
+    metadata = _rule_draft_audit_metadata(outcome)
+    if execution_id is not None:
+        try:
+            session.finish_agent_execution(
+                execution_id,
+                status="succeeded",
+                output_jsonb=metadata,
+                latency_ms=latency_ms,
+            )
+        except Exception:  # noqa: BLE001 - audit writes must not block an otherwise valid parse.
+            report_audit_failure("finish_agent_execution")
+    _record_step(
+        session,
+        "strategy_research_resolution_completed",
+        message=("sealed V3 execution spec" if outcome.is_executable else "research resolution unavailable"),
+    )
+    _record_finalization(
+        session,
+        "completed",
+        message="strategy parse completed",
+        metadata_jsonb=metadata,
+    )
+    return outcome
+
+
 def create_app(
     job_store: AnalysisJobStore | None = None,
     *,
@@ -1351,17 +1476,29 @@ def create_app(
                 # Production never gets a V2 catalogue fallback.  A complete V1
                 # rule remains executable without AOAI; every incomplete or unknown
                 # idea must wait for V3 research instead of being silently replaced.
-                outcome = build_rule_draft(
-                    query=request.query,
-                    user_id=user_id,
-                    signer=signer,
-                    available_metrics=available_metrics,
-                    # Automatic/underspecified requests are the V3 research path. A
-                    # live provider must resolve their meaning before the execution
-                    # spec is sealed; a catalogue profile is not a substitute.
-                    use_llm=app.state.strategy_parser_uses_llm,
-                    exploration_policy=exploration_policy,
-                )
+                if app.state.strategy_parser_uses_llm:
+                    outcome = _build_rule_draft_with_audit(
+                        audit_sink=app.state.audit_sink,
+                        trace_id=f"parse-{uuid.uuid4()}",
+                        entrypoint="api.analysis_jobs.parse",
+                        feature="strategy_research_resolution",
+                        client_request_id=request.client_idempotency_key,
+                        query=request.query,
+                        user_id=user_id,
+                        signer=signer,
+                        available_metrics=available_metrics,
+                        use_llm=True,
+                        exploration_policy=exploration_policy,
+                    )
+                else:
+                    outcome = build_rule_draft(
+                        query=request.query,
+                        user_id=user_id,
+                        signer=signer,
+                        available_metrics=available_metrics,
+                        use_llm=False,
+                        exploration_policy=exploration_policy,
+                    )
                 if not outcome.is_executable:
                     return _legacy_parse_required_response(outcome)
                 spec = outcome.strategy_execution_spec
@@ -1738,14 +1875,29 @@ def create_app(
                 exploration_policy = app.state.exploration_policy_resolver()
             except Exception:  # noqa: BLE001 - optional incomplete-request fallback.
                 exploration_policy = None
-        outcome = build_rule_draft(
-            query=request.request_text,
-            user_id=user_id,
-            signer=signer,
-            available_metrics=available_metrics,
-            use_llm=app.state.strategy_parser_uses_llm,
-            exploration_policy=exploration_policy,
-        )
+        if app.state.strategy_parser_uses_llm:
+            outcome = _build_rule_draft_with_audit(
+                audit_sink=app.state.audit_sink,
+                trace_id=f"parse-{uuid.uuid4()}",
+                entrypoint="api.strategy_parse",
+                feature="strategy_research_resolution",
+                client_request_id=request.client_request_id,
+                query=request.request_text,
+                user_id=user_id,
+                signer=signer,
+                available_metrics=available_metrics,
+                use_llm=True,
+                exploration_policy=exploration_policy,
+            )
+        else:
+            outcome = build_rule_draft(
+                query=request.request_text,
+                user_id=user_id,
+                signer=signer,
+                available_metrics=available_metrics,
+                use_llm=False,
+                exploration_policy=exploration_policy,
+            )
         if outcome.is_executable:
             if _production_runtime():
                 readiness = _core_execution_readiness(

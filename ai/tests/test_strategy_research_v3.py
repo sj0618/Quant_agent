@@ -4,7 +4,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from ai_graph.llm.base import LLMJsonRequest
+from ai_graph.llm.base import LLMJsonRequest, LLMTimeoutError
 from ai_graph.nodes.strategy_research import (
     StrategyResearchError,
     research_strategy_execution_spec,
@@ -101,6 +101,56 @@ def test_researcher_cannot_replace_an_unsupported_strategy_with_a_catalogue_rule
             available_metrics=["sma20"],
             llm_client=client,
         )
+
+
+def test_researcher_repairs_one_invalid_structured_candidate_then_seals_v3() -> None:
+    invalid = _donchian_response(required_metrics=["cointegration_score"])
+    repaired = _donchian_response()
+
+    class SequencedResearchClient:
+        def __init__(self) -> None:
+            self.requests: list[LLMJsonRequest] = []
+            self._responses = [invalid, repaired]
+
+        def generate_json(self, request: LLMJsonRequest) -> dict:
+            self.requests.append(request)
+            return self._responses.pop(0)
+
+    client = SequencedResearchClient()
+    spec = research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=client,
+    )
+
+    assert spec.candidates[0].candidate_id == "research-donchian-breakout-20"
+    assert [request.task_type for request in client.requests] == [
+        "strategy_research_resolution",
+        "strategy_research_resolution_repair",
+    ]
+    repair_context = client.requests[1].variables_jsonb["untrusted_quoted_context"]
+    assert repair_context["previous_validation_failure"]["code"] == "research_metric_unsupported"
+
+
+def test_researcher_does_not_spend_a_semantic_repair_on_provider_timeout() -> None:
+    class TimeoutResearchClient:
+        def __init__(self) -> None:
+            self.requests: list[LLMJsonRequest] = []
+
+        def generate_json(self, request: LLMJsonRequest) -> dict:
+            self.requests.append(request)
+            raise LLMTimeoutError("provider timed out")
+
+    client = TimeoutResearchClient()
+    with pytest.raises(StrategyResearchError) as raised:
+        research_strategy_execution_spec(
+            query="돈치안 채널 돌파 전략으로 검증해줘",
+            available_metrics=["sma20"],
+            llm_client=client,
+        )
+
+    assert raised.value.cause_code == "research_provider_failure"
+    assert len(client.requests) == 1
 
 
 def test_researcher_can_seal_a_range_rule_when_the_compiler_supports_it() -> None:
@@ -208,6 +258,59 @@ def test_researched_strategy_backtests_only_its_sealed_condition_candidate() -> 
     }
     assert result.strategy_ir.entry_conditions == spec.candidates[0].entry_conditions
     assert result.strategy_ir.exit_conditions == spec.candidates[0].exit_conditions
+
+
+def test_researched_v3_candidate_reaches_backtest_module_without_python_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock the complete V3 compiler → real engine hand-off.
+
+    A researched candidate may never fall through to executable generated Python or a
+    generic profile.  The conditions become vector actions, then the authoritative
+    ``backtest_module`` engine receives those actions and computes the result.
+    """
+
+    from ai_graph.graph import _strategy_spec_from_execution_spec
+    from ai_graph.nodes import backtest as backtest_node
+    from ai_graph.nodes.backtest_code import Loop3Request, generate_loop3_candidates
+
+    spec = research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=_ResearchClient(_donchian_response()),
+    )
+    strategy = _strategy_spec_from_execution_spec(spec)
+    generated = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="trace-v3-engine", server_only=True)
+    )
+    candidate = generated.candidates[0]
+    engine_calls = []
+    actual_run = backtest_node.run_engine_backtest
+
+    def capture_engine(*args, **kwargs):
+        engine_calls.append((args, kwargs))
+        return actual_run(*args, **kwargs)
+
+    def python_fallback_must_not_run(*_args, **_kwargs):
+        raise AssertionError("researched V3 candidate must not execute Python fallback code")
+
+    monkeypatch.setattr(backtest_node, "run_engine_backtest", capture_engine)
+    monkeypatch.setattr(backtest_node, "_execute_candidate_code", python_fallback_must_not_run)
+    # This contract asserts the engine call itself, so a prior test's on-disk result
+    # cache must not bypass the execution boundary.
+    monkeypatch.setattr(backtest_node._DiskEvaluationCache, "load", lambda *_args: None)
+
+    result = backtest_node.run_candidate_backtest(strategy, [candidate])
+
+    assert result.selected_candidate.parameters is not None
+    assert result.selected_candidate.parameters.profile == "compiled_conditions"
+    assert candidate.strategy_ir is not None
+    assert candidate.strategy_ir.entry_conditions == spec.candidates[0].entry_conditions
+    assert candidate.strategy_ir.exit_conditions == spec.candidates[0].exit_conditions
+    assert len(engine_calls) >= 1
+    # ``generated_actions`` are the direct, deterministic evaluation of the sealed
+    # AST. The engine only sees those actions; it does not receive a free-form prompt.
+    assert engine_calls[0][1]["generated_actions"] is not None
 
 
 def test_historical_missing_sealed_metric_stops_before_backtest_code_generation() -> None:

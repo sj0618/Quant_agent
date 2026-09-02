@@ -149,6 +149,40 @@ interface ExplorationExecutionSpecV2 {
   candidates: Array<{ catalog_id: string; execution_signature: string }>;
 }
 
+interface ResearchConditionV3 {
+  left: string;
+  operator: "lt" | "lte" | "gt" | "gte" | "eq" | "ne" | "between" | "cross_above" | "cross_below";
+  right: number | string | number[];
+  window?: number | null;
+  aggregate?: "max" | "min" | "avg" | "sum" | "last" | null;
+  scale?: number | null;
+  consecutive?: number | null;
+  universe_rank_pct?: number | null;
+}
+
+export interface ResearchCandidateExecutionSpecV3 {
+  classification: "research_required";
+  market: "KRX";
+  timeframe: "daily";
+  research_schema_version: "strategy-research-draft.v3";
+  research_prompt_version: string;
+  resolution_summary: string;
+  research_snapshot_hash: string;
+  capability_hash: string;
+  sources: Array<{ source_id: string; title: string; url: string; claim: string; excerpt_digest: string }>;
+  candidates: Array<{
+    candidate_id: string;
+    title: string;
+    hypothesis: string;
+    counter_hypothesis: string;
+    entry_conditions: ResearchConditionV3[];
+    exit_conditions: ResearchConditionV3[];
+    required_metrics: string[];
+    assumptions: string[];
+    source_ids: string[];
+  }>;
+}
+
 export interface ExplorationReviewV2 {
   classification: "exploratory_return_seeking";
   research_hypothesis: string;
@@ -180,8 +214,8 @@ export interface RuleDraftOutcome {
   clarifications: Array<{ label: string; reason: string }>;
   is_executable: boolean;
   exploration?: ExplorationReviewV2 | null;
-  strategy_execution_spec?: StrategyExecutionSpecV1 | ExplorationExecutionSpecV2;
-  spec_version?: "strategy-execution-spec.v1" | "exploration-execution-spec.v2";
+  strategy_execution_spec?: StrategyExecutionSpecV1 | ExplorationExecutionSpecV2 | ResearchCandidateExecutionSpecV3;
+  spec_version?: "strategy-execution-spec.v1" | "exploration-execution-spec.v2" | "research-candidate-execution-spec.v3";
   spec_hash?: string;
   parse_token?: string;
 }

@@ -28,8 +28,8 @@ from ai_graph.exploration_policy import (
     ActiveExplorationPolicyV2,
     select_exploration_templates,
 )
-from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.nodes.strategy_research import StrategyResearchError, research_strategy_execution_spec
+from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.schemas import (
     RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3,
     ResearchCandidateExecutionSpecV3,
@@ -138,7 +138,7 @@ class ExplorationExecutionSpecV2(BaseModel):
     candidates: list[ExplorationCandidateRefV2] = Field(min_length=2, max_length=10)
 
     @model_validator(mode="after")
-    def candidate_ids_are_unique(self) -> "ExplorationExecutionSpecV2":
+    def candidate_ids_are_unique(self) -> ExplorationExecutionSpecV2:
         ids = [candidate.catalog_id for candidate in self.candidates]
         if len(ids) != len(set(ids)):
             raise ValueError("exploration candidates must be unique")
@@ -470,8 +470,16 @@ def build_rule_draft(
     """Make a bounded natural-language rule review without retaining raw input."""
 
     research_requested = _research_resolution_enabled(use_llm)
+    request_mode = classify_strategy_request(query)
     research_error: StrategyResearchError | None = None
-    if classify_strategy_request(query) == "automatic" and research_requested:
+    # A live V3 researcher is the semantic authority for every request that is not
+    # already an explicit, compiler-shaped rule.  Previously a named strategy first
+    # paid for the legacy ``strategy_parse`` model call, received an inevitably thin
+    # generic parse, then paid again for V3 research.  That made the common unknown
+    # strategy path slower and created a second failure point without adding evidence.
+    # Concrete conditions still get the fast deterministic parser below; incomplete
+    # concrete input falls through to this same V3 path with its full context.
+    if request_mode != "user_defined" and research_requested:
         try:
             return _build_researched_draft(
                 query=query,
@@ -486,7 +494,7 @@ def build_rule_draft(
             # provider/schema exception that callers turn into a 500 or an admission.
             research_error = exc
     if (
-        classify_strategy_request(query) == "automatic"
+        request_mode == "automatic"
         and exploration_policy is not None
         and research_error is None
     ):
@@ -511,7 +519,14 @@ def build_rule_draft(
         )
         authoring_method = "llm"
     else:
-        parser_uses_llm = use_llm if use_llm is not None else _live_parser_enabled()
+        # A syntactically explicit condition does not need a second AOAI call before
+        # compiler validation.  This deterministic pass recognizes supported rules
+        # immediately; if it cannot faithfully normalize the input we make exactly
+        # one V3 research-resolution call below instead of asking a generic parser to
+        # guess and then researching the same request again.
+        parser_uses_llm = False if research_requested else (
+            use_llm if use_llm is not None else _live_parser_enabled()
+        )
         authoring_method = "llm" if parser_uses_llm else "deterministic"
         try:
             parsed = parse_natural_language_strategy(
