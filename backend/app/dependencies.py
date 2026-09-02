@@ -33,10 +33,6 @@ def get_db_engine(request: Request) -> Any:
     return engine
 
 
-def get_stock_universe_engine(request: Request) -> Any | None:
-    return getattr(request.app.state, "trading_data_db_engine", None)
-
-
 def get_trading_data_engine(request: Request) -> Any:
     engine = getattr(request.app.state, "trading_data_db_engine", None)
     if engine is None:

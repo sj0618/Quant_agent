@@ -76,7 +76,7 @@ def _coerce_bigint_user_id(user_id: str | int) -> int:
 def _coerce_limit(limit: int) -> int:
     try:
         value = int(limit)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise AppError(
             status_code=422,
             component=REPORT_STORE_COMPONENT,
@@ -109,7 +109,7 @@ def _decode_cursor(raw_cursor: str | None) -> tuple[str, str] | None:
     padded = raw_cursor.strip() + "=" * (-len(raw_cursor.strip()) % 4)
     try:
         payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise AppError(
             status_code=400,
             component=REPORT_STORE_COMPONENT,
@@ -257,8 +257,6 @@ def _report_score_text(value: Any) -> str:
     return f"{numeric:.1f}"
 
 
-
-
 def _report_strategy_label(row: dict[str, Any], run_config: dict[str, Any]) -> str | None:
     strategy_name = _optional_text(_first_non_empty(row.get("strategy_name"), _config_value(run_config, "strategyName", "strategy_name")))
     if strategy_name is None:
@@ -304,9 +302,7 @@ def _report_weekday_text(value: Any, fallback_date: Any = None) -> str:
                 candidate = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
             except Exception:  # noqa: BLE001
                 return ""
-        if isinstance(candidate, datetime):
-            normalized = candidate.strftime("%A").lower()
-        elif isinstance(candidate, date):
+        if isinstance(candidate, datetime) or isinstance(candidate, date):
             normalized = candidate.strftime("%A").lower()
         else:
             return ""
@@ -450,14 +446,6 @@ def _format_percent_value(value: Any, *, signed: bool = False) -> str | None:
     display = numeric * 100 if abs(numeric) <= 1.5 else numeric
     prefix = "+" if signed and display > 0 else ""
     return f"{prefix}{display:.1f}%"
-
-
-def _format_ratio_value(value: Any) -> str | None:
-    numeric = _numeric(value)
-    if numeric is None:
-        text = _optional_text(value)
-        return text
-    return f"{numeric:.2f}"
 
 
 def _report_performance_payload(row: dict[str, Any]) -> dict[str, Any]:

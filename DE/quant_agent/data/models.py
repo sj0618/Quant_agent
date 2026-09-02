@@ -83,19 +83,6 @@ class LineageEvent:
 
 
 @dataclass(frozen=True)
-class IngestionRun:
-    run_id: UUID
-    dag_id: str
-    task_id: str
-    source_id: str
-    started_at: datetime
-    status: str
-    params: dict[str, Any]
-    ended_at: datetime | None = None
-    error_message: str | None = None
-
-
-@dataclass(frozen=True)
 class OhlcvIngestionResult:
     run_id: UUID
     source: str

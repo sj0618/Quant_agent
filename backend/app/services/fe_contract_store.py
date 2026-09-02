@@ -10,12 +10,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.errors import AppError
-from app.db import existing_report_queries
+from app.db import existing_report_queries, user_queries
 from app.db.session import _sql_params_with_bigint_user_id, fetch_all, fetch_one
-from app.db import user_queries
 
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 REPORT_CONTENT_SCHEMA_VERSION = existing_report_queries.REPORT_CONTENT_SCHEMA_VERSION
@@ -655,26 +653,6 @@ async def _resolve_run_strategy(
     }
 
 
-def _analysis_run_trace_uuid(user_id: str, payload: dict[str, Any]) -> UUID | None:
-    request_payload = _mapping_dict(_first_non_empty(payload.get("requestPayload"), payload.get("request_payload")))
-    candidate = _non_empty_text(
-        _first_non_empty(
-            payload.get("aiJobId"),
-            payload.get("ai_job_id"),
-            request_payload.get("traceId"),
-            request_payload.get("trace_id"),
-            request_payload.get("aiJobId"),
-            request_payload.get("ai_job_id"),
-        )
-    )
-    if not candidate:
-        return None
-    try:
-        return UUID(candidate)
-    except ValueError:
-        return uuid5(NAMESPACE_URL, f"quantagent:analysis-run-trace:{user_id.strip()}:{candidate}")
-
-
 def _analysis_run_config_value(config: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in config and config[key] is not None:
@@ -852,16 +830,6 @@ def _analysis_run_ai_job_mismatch(*, run_id: str, expected_ai_job_id: str, recei
         code="run_already_completed",
         message="Analysis run completion payload references a different AI job",
         details={"runId": run_id, "expectedAiJobId": expected_ai_job_id, "receivedAiJobId": received_ai_job_id},
-    )
-
-
-def _analysis_run_already_completed(*, run_id: str, report_id: str, message: str) -> NoReturn:
-    raise AppError(
-        status_code=409,
-        component="analysis_runs",
-        code="run_already_completed",
-        message=message,
-        details={"runId": run_id, "reportId": report_id},
     )
 
 
@@ -1462,204 +1430,6 @@ async def get_reader_report_from_db(engine: Any, report_id: str, *, user_id: str
     """Browser archive projection; internal callers retain ``get_report_from_db``."""
 
     return await existing_report_queries.get_reader_report(engine, report_id, user_id=user_id)
-
-
-async def _persist_server_report(
-    engine: Any,
-    *,
-    user_id: str,
-    run_id: str,
-    title: str,
-    summary: str,
-    content: dict[str, Any] | None,
-    status: str = "sent",
-    strategy_id: str | None = None,
-    published_at: str | None = None,
-    report_id: str | None = None,
-) -> dict[str, Any]:
-    normalized_user_id = _coerce_bigint_user_id(user_id)
-    if not title.strip():
-        raise AppError(
-            status_code=422,
-            component="reports",
-            code="request_validation_failed",
-            message="Report title is required",
-            details={"field": "title"},
-        )
-    if not summary.strip():
-        raise AppError(
-            status_code=422,
-            component="reports",
-            code="request_validation_failed",
-            message="Report summary is required",
-            details={"field": "summary"},
-        )
-
-    run = await existing_report_queries.get_analysis_run(engine, run_id, user_id=str(normalized_user_id))
-    if run is None:
-        raise AppError(
-            status_code=404,
-            component="analysis_runs",
-            code="run_not_found",
-            message="Analysis run was not found",
-            details={"runId": run_id},
-        )
-    resolved_strategy_id = _non_empty_text(_first_non_empty(strategy_id, run.get("strategyId")))
-    if resolved_strategy_id is None:
-        raise AppError(
-            status_code=422,
-            component="analysis_runs",
-            code="strategy_resolution_failed",
-            message="A valid strategy is required before persisting a report",
-            details={"runId": run_id},
-        )
-
-    normalized_status = _report_status_for_server(status)
-    if normalized_status not in {"sent", "draft", "failed", "resent"}:
-        raise AppError(
-            status_code=422,
-            component="reports",
-            code="request_validation_failed",
-            message="Report status is invalid",
-            details={"status": status},
-        )
-
-    report_id = report_id or _analysis_completion_report_id(run_id)[0]
-    completed_at_iso = _non_empty_text(published_at)
-    completed_at_dt = datetime.fromisoformat(completed_at_iso.replace("Z", "+00:00")) if completed_at_iso else datetime.now(UTC)
-    report_date = completed_at_dt.date()
-    content_document = content or _analysis_completion_content(title=title, summary=summary, sections=[], result_snapshot={})
-    serialized_content = _canonical_json_text(content_document)
-
-    report_row_params = {
-        "report_id": report_id,
-        "strategy_id": resolved_strategy_id,
-        "backtest_run_id": run_id,
-        "ai_report_id": str(_analysis_completion_report_id(run_id)[1]),
-        "report_date": report_date,
-        "weekday": completed_at_dt.strftime("%A"),
-        "sent_at": completed_at_dt,
-        "title": title,
-        "summary": summary,
-        "status": normalized_status,
-        "market_snapshot": json.dumps([], ensure_ascii=False),
-        "market_brief": summary,
-        "market_context": None,
-        "conclusion": summary,
-        "signal_axes_jsonb": json.dumps([], ensure_ascii=False),
-        "performance_jsonb": json.dumps({}, ensure_ascii=False),
-        "cost_notes": json.dumps([], ensure_ascii=False),
-        "content_md": serialized_content,
-        "content_html": serialized_content,
-        "created_at": completed_at_dt,
-        "updated_at": completed_at_dt,
-    }
-
-    async with engine.begin() as connection:
-        await connection.execute(
-            text(
-                """
-                UPDATE app.backtest_run
-                SET
-                    strategy_id = COALESCE(strategy_id, :strategy_id),
-                    status = 'completed',
-                    ended_at = COALESCE(ended_at, :ended_at),
-                    error_message = NULL
-                WHERE run_id = :run_id
-                  AND user_id = CAST(:user_id AS bigint)
-                """
-            ),
-            {
-                "strategy_id": report_row_params["strategy_id"],
-                "ended_at": completed_at_dt,
-                "run_id": run_id,
-                "user_id": normalized_user_id,
-            },
-        )
-
-        await connection.execute(
-            text(
-                """
-                INSERT INTO app.strategy_email_report (
-                    report_id,
-                    strategy_id,
-                    backtest_run_id,
-                    ai_report_id,
-                    report_date,
-                    weekday,
-                    sent_at,
-                    title,
-                    summary,
-                    status,
-                    market_snapshot,
-                    market_brief,
-                    market_context,
-                    conclusion,
-                    signal_axes_jsonb,
-                    performance_jsonb,
-                    cost_notes,
-                    content_md,
-                    content_html,
-                    created_at,
-                    updated_at
-                ) VALUES (
-                    :report_id,
-                    :strategy_id,
-                    :backtest_run_id,
-                    :ai_report_id,
-                    :report_date,
-                    :weekday,
-                    CAST(:sent_at AS timestamptz),
-                    :title,
-                    :summary,
-                    :status,
-                    CAST(:market_snapshot AS jsonb),
-                    :market_brief,
-                    :market_context,
-                    :conclusion,
-                    CAST(:signal_axes_jsonb AS jsonb),
-                    CAST(:performance_jsonb AS jsonb),
-                    CAST(:cost_notes AS jsonb),
-                    :content_md,
-                    :content_html,
-                    :created_at,
-                    :updated_at
-                )
-                ON CONFLICT (report_id) DO UPDATE SET
-                    strategy_id = EXCLUDED.strategy_id,
-                    backtest_run_id = EXCLUDED.backtest_run_id,
-                    ai_report_id = EXCLUDED.ai_report_id,
-                    report_date = EXCLUDED.report_date,
-                    weekday = EXCLUDED.weekday,
-                    sent_at = EXCLUDED.sent_at,
-                    title = EXCLUDED.title,
-                    summary = EXCLUDED.summary,
-                    status = EXCLUDED.status,
-                    market_snapshot = EXCLUDED.market_snapshot,
-                    market_brief = EXCLUDED.market_brief,
-                    market_context = EXCLUDED.market_context,
-                    conclusion = EXCLUDED.conclusion,
-                    signal_axes_jsonb = EXCLUDED.signal_axes_jsonb,
-                    performance_jsonb = EXCLUDED.performance_jsonb,
-                    cost_notes = EXCLUDED.cost_notes,
-                    content_md = EXCLUDED.content_md,
-                    content_html = EXCLUDED.content_html,
-                    updated_at = EXCLUDED.updated_at
-                """
-            ),
-            report_row_params,
-        )
-
-    report = await existing_report_queries.get_report(engine, report_id, user_id=str(normalized_user_id))
-    if report is None:
-        raise AppError(
-            status_code=503,
-            component="reports",
-            code="report_not_found",
-            message="Report could not be created",
-            details={"reportId": report_id},
-        )
-    return report
 
 
 async def _persist_ai_backtest_report(

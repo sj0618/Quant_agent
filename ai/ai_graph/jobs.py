@@ -41,10 +41,10 @@ from ai_graph.research_eligibility import PerformanceAvailable
 from ai_graph.schemas import (
     APIEnvelope,
     EnvelopeStatus,
+    ExecutionSpecV1OrV2,
     FailureDiagnostic,
     Stage,
     StageStatus,
-    ExecutionSpecV1OrV2,
     UserPayload,
     validate_execution_spec,
 )
@@ -278,10 +278,6 @@ AnalysisRunner = Callable[[str, str], APIEnvelope]
 PersistentStoreFactory = Callable[[object], AnalysisJobStore]
 
 
-class AnalysisHistoryReadOnlyError(RuntimeError):
-    """Raised when a retired surface tried to add a row to the analysis history."""
-
-
 class ParseBoundAdmissionError(RuntimeError):
     """A closed failure from the durable parse-token/job admission boundary."""
 
@@ -391,120 +387,6 @@ class AnalysisJobOutboxStore(Protocol):
         """Whether a queued job has a pending or leased durable dispatch record."""
 
         ...
-
-
-class ReadOnlyAnalysisJobStore:
-    """Keeps the analysis history readable while no surface may add to it.
-
-    The legacy raw-analysis route and the confirmed-research route are the only two
-    callers that create jobs, and both already refuse before they get here. This wrapper
-    exists so that the guarantee is structural rather than a property of route review:
-    a new consumer added later cannot quietly start writing history again.
-
-    Only creation is refused. Reads pass through, and so does restart reconciliation,
-    which moves rows a dead process left RUNNING into a terminal state. Blocking that
-    would leave those rows spinning forever and make readiness fail, and it would be a
-    different thing from what is being retired: reconciliation finishes existing history,
-    it does not open new history. Nothing here deletes a stored result.
-    """
-
-    def __init__(self, store: AnalysisJobStore) -> None:
-        self._store = store
-        # Keep the selected backing-store identity visible to readiness and API
-        # diagnostics; this wrapper changes the write policy, not persistence mode.
-        self.store_mode = store.store_mode
-
-    def create_job(
-        self,
-        request_text: str,
-        *,
-        user_id: str | None = None,
-        strategy_id: str | None = None,
-        run_id: str | None = None,
-        fallback_reasons: Sequence[str] | None = None,
-        execution_spec_version: str | None = None,
-        execution_spec_hash: str | None = None,
-        execution_spec: ExecutionSpecV1OrV2 | None = None,
-        client_idempotency_key: str | None = None,
-    ) -> AnalysisJob:
-        raise AnalysisHistoryReadOnlyError(
-            "analysis history is read-only: no enabled surface may create an analysis job"
-        )
-
-    def get_job(self, job_id: str) -> AnalysisJob | None:
-        return self._store.get_job(job_id)
-
-    def update_job_status(
-        self,
-        job_id: str,
-        status: AnalysisJobStatus | str,
-        polling_stage: Stage | str,
-        *,
-        fallback_reasons: Sequence[str] | None = None,
-        error_message: str | None = None,
-        message: str | None = None,
-    ) -> AnalysisJob:
-        return self._store.update_job_status(
-            job_id,
-            status,
-            polling_stage,
-            fallback_reasons=fallback_reasons,
-            error_message=error_message,
-            message=message,
-        )
-
-    def complete_job(
-        self,
-        job_id: str,
-        result_envelope: APIEnvelope,
-        *,
-        fallback_reasons: Sequence[str] | None = None,
-    ) -> AnalysisJob:
-        return self._store.complete_job(
-            job_id,
-            result_envelope,
-            fallback_reasons=fallback_reasons,
-        )
-
-    def fail_job(
-        self,
-        job_id: str,
-        error_message: str,
-        *,
-        fallback_reasons: Sequence[str] | None = None,
-        result_envelope: APIEnvelope | None = None,
-    ) -> AnalysisJob:
-        return self._store.fail_job(
-            job_id,
-            error_message,
-            fallback_reasons=fallback_reasons,
-            result_envelope=result_envelope,
-        )
-
-    def list_jobs(self, *, limit: int = 100) -> list[AnalysisJob]:
-        return self._store.list_jobs(limit=limit)
-
-    def list_jobs_for_reconciliation(self, *, limit: int = 500) -> Any:
-        if isinstance(self._store, RestartReconciliationStore):
-            return self._store.list_jobs_for_reconciliation(limit=limit)
-        return self._store.list_jobs(limit=limit)
-
-    def force_fail_undecodable_job(
-        self,
-        job_id: str,
-        *,
-        error_message: str,
-        reason: str,
-    ) -> bool:
-        if not isinstance(self._store, RestartReconciliationStore):
-            raise JobStoreConfigurationError(
-                "ReadOnlyAnalysisJobStore has no backing support for undecodable-job reconciliation."
-            )
-        return self._store.force_fail_undecodable_job(
-            job_id,
-            error_message=error_message,
-            reason=reason,
-        )
 
 
 class JobStoreConfigurationError(RuntimeError):
@@ -735,7 +617,7 @@ class InMemoryAnalysisJobStore:
     ) -> AnalysisJob:
         now = datetime.now(UTC)
         job_id = f"job_{uuid4().hex[:12]}"
-        trace_id = sha256(f"{request_text}:{now.isoformat()}".encode("utf-8")).hexdigest()[:16]
+        trace_id = sha256(f"{request_text}:{now.isoformat()}".encode()).hexdigest()[:16]
         normalized_execution_spec = (
             validate_execution_spec(execution_spec.model_dump(mode="json"))
             if execution_spec is not None
@@ -1203,29 +1085,6 @@ def _event_count(events: ExecutionEvents) -> int:
 def _ledger_source(ledger: Mapping[str, Any]) -> dict[str, Any]:
     return {key: ledger.get(key, []) for key in ("signals", "order_audit", "fills", "positions", "trades", "equity")}
 
-def _execution_events_from_backtest(audit_events: Sequence[Mapping[str, Any]], equity_curve: Sequence[Any], occurred_at: datetime) -> ExecutionEvents:
-    signals: list[ExecutionEvent] = []
-    orders: list[ExecutionEvent] = []
-    fills: list[ExecutionEvent] = []
-    positions: list[ExecutionEvent] = []
-    trades: list[ExecutionEvent] = []
-    for index, event in enumerate(audit_events):
-        status = str(event.get("status") or "unknown")
-        execution_event = _audit_execution_event(event, f"audit:{index}", _event_timestamp(event.get("date"), occurred_at))
-        if status == "submitted":
-            signals.append(execution_event)
-            orders.append(execution_event)
-        if status == "executed":
-            fills.append(execution_event)
-            positions.append(execution_event)
-            trades.append(execution_event)
-    equity = [
-        ExecutionEvent(event_id=f"equity:{index}", occurred_at=_event_timestamp(getattr(point, "date", None), occurred_at), requested_qty=0, filled_qty=0, reason="equity_mark", document=_safe_document(point.model_dump(mode="json") if hasattr(point, "model_dump") else {}))
-        for index, point in enumerate(equity_curve)
-    ]
-    return ExecutionEvents(signals=signals, orders=orders, fills=fills, positions=positions, trades=trades, equity=equity)
-
-
 def _audit_execution_event(event: Mapping[str, Any], event_id: str, occurred_at: datetime) -> ExecutionEvent:
     requested = _nonnegative_float(event.get("requested_quantity", event.get("quantity")))
     filled = _nonnegative_float(event.get("filled_quantity"))
@@ -1233,7 +1092,6 @@ def _audit_execution_event(event: Mapping[str, Any], event_id: str, occurred_at:
         filled = requested
     costs = {name: _nonnegative_float(event.get(name)) for name in ("commission_cost", "tax_cost", "slippage_cost") if event.get(name) is not None}
     return ExecutionEvent(event_id=event_id, occurred_at=occurred_at, requested_qty=requested, filled_qty=filled, reason=str(event.get("reason") or event.get("status") or "engine_execution"), component_costs=costs, document=_safe_document(event))
-
 
 
 def _policy_hashes(

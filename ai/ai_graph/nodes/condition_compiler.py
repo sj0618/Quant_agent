@@ -545,19 +545,6 @@ def _margin_expression(condition: Condition) -> str | None:
     )
 
 
-def compile_entry_expression(conditions: Sequence[Condition]) -> str | None:
-    """Back-compat: the per-stock expression only, or None if a rank cut is present.
-
-    Callers that cannot apply cross-sectional cuts fall back to templates when one
-    appears, rather than silently dropping it.
-    """
-
-    compiled = compile_conditions(conditions)
-    if compiled is None or compiled.rank_filters:
-        return None
-    return compiled.per_stock
-
-
 def _compile_one(condition: Condition) -> str | None:
     flag = condition.left.strip().lower()
     expression = _BOOLEAN_EXPRESSIONS.get(flag)
@@ -681,14 +668,3 @@ def _series_value(metric: str, window: int | None, aggregate: str | None) -> str
         return metric
     return _CURRENT.get(metric)
 
-
-def conditions_from_metadata(raw: Sequence[Any]) -> list[Condition]:
-    """Validate raw condition dicts (from screening metadata) into Conditions, dropping bad ones."""
-
-    out: list[Condition] = []
-    for item in raw or []:
-        try:
-            out.append(Condition.model_validate(item))
-        except Exception:
-            continue
-    return out
