@@ -203,6 +203,38 @@ PY
 | in-memory debug/job store | `AI_JOB_STORE=memory` |
 | persistent gate | `AI_JOB_STORE=persistent`는 `/api-status`에서 requested/active/fallback로 추적 |
 
+## PIT 유니버스: 1년 창 + 거래대금 상위 200종
+
+> 멤버십은 `core.symbol_listing_history`(상장 구간) + `core.symbol_security_type_history`(보통주 분류)의 **창과 겹치는 구간**으로 정한다. `mart.common_stock_universe_asof` 뷰는 security-type 이력이 2026-08-11부터만 있어 그 이전 날짜에는 멤버를 하나도 돌려주지 않았고, 그래서 "5년 PIT 유니버스"가 사실상 오늘 상장 종목이었다(생존자 편향).
+
+Data 노드는 5년치 전체 PIT 보통주(1,717종)를 올렸다. 그 한 건이 875초·21GB였고,
+Backtest 노드는 raw 체결가가 없는 bar에서 `raw_execution_unavailable`로 죽었다.
+좁힌 기준은 세 가지다.
+
+- **창 길이**: `AI_BACKTEST_LOOKBACK_YEARS`(기본 1, `1~3` clamp). 마지막 완료 KST
+  세션이 끝점이고, 길이는 정책 id `krx_pit_common_stock_{N}y_kst_settled_session_v3`에
+  실린다. 짧게 읽었다는 사실이 매니페스트에 남지 않으면 재현이 아니라 그냥 다른 실행이다.
+- **유니버스 상한**: `AI_BACKTEST_UNIVERSE_MAX_TICKERS`(기본 200).
+  `mart.common_stock_universe_asof`에서 창에 속한 멤버를 모두 후보로 두되,
+  **창 시작 시점에서 끝나는 60세션**의 평균 거래대금(`adj_close × adj_volume`)으로
+  DB가 순위를 매겨 상위 N종만 적재한다. 랭킹·상한은 SQL 한 문장(CTE)에서 끝나고,
+  descriptor에 `window_member_count` / `excluded_member_count`가 남는다.
+- **raw 체결가**: `core.ohlcv_daily` 조인을 LEFT → INNER로 바꿨다. 엔진이 어차피
+  거부하는 bar를 굳이 적재해 feature frame까지 끌고 갈 이유가 없다.
+
+**왜 생존편향이 아닌가.** 잘라낸 기준은 "지금 상장돼 있는가"가 아니라 "창이 시작되기
+전에 얼마나 거래됐는가"다.
+
+- 창 **안에서** 상장폐지된 종목은 유니버스에 남는다. 가격 조인이 날짜 기준이라 폐지일까지의
+  행을 그대로 갖고, 폐지 처리는 기존 정책(`official-event-then-final-close-v1`)을 따른다.
+- 랭킹 구간이 창 **시작 시점에서 끝나므로**, 창 안에서 무슨 일이 있었는지는 선정에
+  쓰이지 않는다. 창 안 수익률로 순위를 매기면 결과가 자기 유니버스를 고르게 된다.
+- `core.symbol_master.listing_status` 필터는 **당일 스크리닝/추천에만** 건다. 오늘 살 수
+  없는 종목을 추천하지 않기 위한 것이고, 같은 술어를 과거 유니버스에 걸면 그게 바로
+  생존편향이다.
+- 남는 한계: 창 시작 **이후** 신규 상장된 종목은 사전 거래대금이 없어 정렬 최후위
+  (`NULLS LAST`)로 밀린다. 상한이 덜 찼을 때만 들어온다.
+
 ## backtest execution_timing 및 privacy 범위
 - `backtest_module`은 현재 `execution_timing='next_open'`만 지원한다.
   - `next_close`는 현재 사양에서 값 검증 실패/예외(`ValueError`)로 처리된다.

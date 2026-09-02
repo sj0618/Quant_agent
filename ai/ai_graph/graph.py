@@ -734,16 +734,22 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
     skip_current_screen = exploration or isinstance(
         sealed_execution_spec, ResearchCandidateExecutionSpecV3
     )
-    if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3):
-        required_metrics = _sealed_v3_condition_metrics(sealed_execution_spec)
+    required_metrics = _sealed_condition_metrics(sealed_execution_spec)
+    if required_metrics is not None:
         requires_financials = bool(required_metrics & _FUNDAMENTAL_CONDITION_METRICS)
-        compact_price_rows = not requires_financials and not indicator_families_for_metrics(
-            tuple(sorted(required_metrics)), include_default=False
+        # Only a sealed V3 price-path plan may take the OHLCV-only projection.  V1
+        # executes on raw prices and its report reads the full frame.
+        compact_price_rows = (
+            isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
+            and not requires_financials
+            and not indicator_families_for_metrics(
+                tuple(sorted(required_metrics)), include_default=False
+            )
         )
         pipeline_data = load_pipeline_data_from_env(
             query,
             state["trace_id"],
-            screen_current=False,
+            screen_current=not skip_current_screen,
             required_metrics=tuple(sorted(required_metrics)),
             requires_financials=requires_financials,
             compact_price_rows=compact_price_rows,
@@ -821,6 +827,26 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
 _FUNDAMENTAL_CONDITION_METRICS = frozenset(
     {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"}
 )
+
+
+def _sealed_condition_metrics(spec: object) -> set[str] | None:
+    """Every metric a sealed spec's conditions evaluate, or None when there is no plan.
+
+    A V1 spec is what the production FE path seals for an explicit rule ("RSI 30 이하
+    매수"), and it was reaching the loader with no plan at all - so an RSI rule loaded all
+    four TA families and every DART filing for the whole universe before backtesting a
+    single momentum column.  Its conditions name their metrics as concretely as V3's AST
+    does; there is no reason to read them any less precisely.
+    """
+
+    if isinstance(spec, ResearchCandidateExecutionSpecV3):
+        return _sealed_v3_condition_metrics(spec)
+    if isinstance(spec, StrategyExecutionSpecV1):
+        return {
+            canonical_metric(condition.metric)
+            for condition in [*spec.entry_conditions, *spec.exit_conditions]
+        }
+    return None
 
 
 def _sealed_v3_condition_metrics(spec: ResearchCandidateExecutionSpecV3) -> set[str]:

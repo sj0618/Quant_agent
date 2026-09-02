@@ -22,9 +22,9 @@ from ai_graph.progress import report_activity
 
 
 RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504})
-DEFAULT_TIMEOUT_SECONDS = 120.0
+DEFAULT_TIMEOUT_SECONDS = 45.0
 DEFAULT_RESPONSE_START_TIMEOUT_SECONDS = 10.0
-DEFAULT_MAX_RETRIES = 2
+DEFAULT_MAX_RETRIES = 1
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.25
 DEFAULT_SERVICE_TIER = "priority"
 # Used when a 429 arrives without a Retry-After header, and as the cap when it has one.

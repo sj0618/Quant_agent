@@ -129,6 +129,8 @@ SERVICE_DB_ARCHIVE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgr
 | `AI_ANALYSIS_MAX_CONCURRENCY` | `1` | 동시에 실행할 분석 수. 2 vCPU 단일 프로세스 노드에서 분석 한 건도 다년 PIT 행·백테스트 워커를 함께 사용하므로, 기본값은 하나의 job만 실행하고 나머지는 큐에 둔다. 부하·메모리·회복력 측정을 마친 뒤에만 명시적으로 높일 수 있다. |
 | `AI_ANALYSIS_QUEUE_WAIT_SECONDS` | `1860` | 슬롯을 기다리는 한도. 분석 1건의 wall budget보다 길게 둬서, 한 건 뒤에 선 잡이 차례를 받게 한다 |
 | `AI_BACKTEST_WORKERS` | `2` | 분석 **1건**이 후보 평가에 쓸 프로세스 풀 워커 수. 실제 워커 수는 `min(후보 수, 이 값, os.cpu_count())`이고, 후보×행 수가 250,000 미만이면 직렬(1)로 떨어진다. 분석 **여러 건**에 걸친 워커 합계에는 상한이 없다 |
+| `AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS` | `8` | 워커 wave 하나가 후보 평가에 쓸 수 있는 시간. 1년 창(200종·약 250세션)에서 후보 1개는 측정상 2초 미만이므로 이 값은 작업 예산이 아니라 hang 감지선이다. `AI_BACKTEST_LOOKBACK_YEARS=3`처럼 창을 넓히면 올려야 한다 |
+| `AI_BACKTEST_WALL_BUDGET_SECONDS` | `25` | 백테스트 노드가 self-improvement 라운드를 **더 시작할지** 판단하는 상한. 라운드 사이에서만 검사되므로 이미 시작한 라운드를 자르지는 않는다. walk-forward 표본이 READY면 라운드 자체가 0회라 이 값은 걸리지 않는다 |
 
 상한을 넘은 잡은 **거절이 아니라 대기**한다. 클라이언트는 이미 큐잉된 잡을 폴링하고
 있으므로 기다림이 새로 드는 비용이 아니고, 1분 뒤면 처리할 수 있는 일을 거절하는 편이
@@ -137,6 +139,18 @@ SERVICE_DB_ARCHIVE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgr
 
 대기에는 한도가 있다. 창 안에 슬롯을 못 받은 잡은 재시도를 안내하며 실패한다.
 영원히 파킹된 스레드는 큐가 애초에 막으려던 그 고갈로 되돌아가는 길이다.
+
+### 백테스트 데이터 범위
+
+슬롯을 나누는 것만으로는 부족하다. 분석 **한 건**이 5년치 전체 PIT 유니버스(1,717종,
+가격 320만 행, TA 4계열, DART 타임라인)를 올리면 그 한 건만으로 875초·21GB를 쓴다.
+그래서 얼마나 읽을지 자체에 상한을 둔다. 두 값 모두 매니페스트에 기록되므로
+좁게 읽은 실행도 재현 가능하다.
+
+| 환경변수 | 기본값 | 뜻 |
+|---|---|---|
+| `AI_BACKTEST_LOOKBACK_YEARS` | `1` | 마지막 완료 KST 세션에서 거슬러 올라가는 백테스트 창의 길이(년). `1~3`으로 clamp 되며, 범위 밖 값은 배포를 죽이는 대신 잘린다. 창 길이는 정책 id(`krx_pit_common_stock_{N}y_kst_settled_session_v3`)에 그대로 실린다 |
+| `AI_BACKTEST_UNIVERSE_MAX_TICKERS` | `200` | 백테스트가 적재할 PIT 보통주 상한. 창 **시작 직전** 60세션의 평균 거래대금(`adj_close × adj_volume`)으로 순위를 매겨 상위 N종만 남긴다. 창 시작 이전 정보만 쓰므로 look-ahead가 아니고, 창 안에서 상장폐지된 종목은 그대로 남는다(생존편향 방지) |
 
 ### 요청 전역 deadline
 

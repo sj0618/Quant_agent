@@ -60,7 +60,7 @@ reason, source, 각 시계열 세션 수, 월 수)만 실린다.
 `_CandidateBacktestSession(official_benchmark=...)` → `_build_benchmark_context`.
 
 ### 조회 창
-- TR 레벨: 백테스트 창(`BACKTEST_WINDOW_POLICY_ID = krx_pit_common_stock_5y_kst_settled_session_v2`)의
+- TR 레벨: 백테스트 창(`BACKTEST_WINDOW_POLICY_ID = krx_pit_common_stock_{N}y_kst_settled_session_v3 (N = AI_BACKTEST_LOOKBACK_YEARS, 기본 1)`)의
   `start..end`.
 - 월별 비중: 창 시작월의 **한 달 전**부터 창 종료월까지. 첫 거래월이 그 앞 달의 비중을
   필요로 하기 때문이다.

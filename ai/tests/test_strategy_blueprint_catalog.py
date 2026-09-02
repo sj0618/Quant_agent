@@ -302,7 +302,13 @@ def test_all_catalog_rules_complete_the_real_next_open_backtest_engine() -> None
         for index, item in enumerate(strategy_blueprint_catalog(), start=1)
     ]
 
-    result = run_candidate_backtest(strategy, candidates, price_rows=rows)
+    # This asserts the per-candidate engine path: every catalog rule runs and produces
+    # metrics. Rolling walk-forward reports its candidates through fold aggregates
+    # instead, and whether these rows meet its sample minimum now depends on the loaded
+    # window (see `walk_forward_policy_for`), which is not what this test is about.
+    result = run_candidate_backtest(
+        strategy, candidates, price_rows=rows, _walk_forward_enabled=False
+    )
     completed = [
         candidate
         for candidate in result.candidates

@@ -43,18 +43,31 @@ AI_DB_CONNECT_TIMEOUT_SECONDS_ENV = "AI_DB_CONNECT_TIMEOUT_SECONDS"
 AI_DB_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_STATEMENT_TIMEOUT_MS"
 AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS"
 AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
+AI_BACKTEST_LOOKBACK_YEARS_ENV = "AI_BACKTEST_LOOKBACK_YEARS"
+AI_BACKTEST_UNIVERSE_MAX_TICKERS_ENV = "AI_BACKTEST_UNIVERSE_MAX_TICKERS"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
-# Backtests always use the five calendar years ending at the most recent KRX session
-# known at the KST cutoff.  This is deliberately a calendar window, not a tunable
-# number of bars: the manifest records the resolved sessions for reproducibility.
+# The backtest window is a calendar window ending at the most recent settled KRX
+# session, not a number of bars: the manifest records the resolved sessions for
+# reproducibility.  The walk-forward exploration policy (V2) contracts on five years of
+# history and `run_analysis` compares this constant to the sealed policy's
+# `history_years`; the window the loader actually reads is a separate, tunable decision
+# - see backtest_lookback_years.
 BACKTEST_EVALUATION_YEARS = 5
 DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * BACKTEST_EVALUATION_YEARS
-# The resolver anchors the window on the last completed KST trading session.  The
-# previous identifier omitted that settlement guarantee even though consumers and
-# regression contracts already require the versioned settled-session policy.
-BACKTEST_WINDOW_POLICY_ID = "krx_pit_common_stock_5y_kst_settled_session_v2"
+# A five-year full-universe read is 3.2M price rows plus four TA families, which cost
+# the production node 875s and ~21GB RSS for a single request.  One year is the default
+# because it is what the 60-second budget affords; three is the ceiling, past which the
+# node runs out of memory rather than time.
+DEFAULT_BACKTEST_LOOKBACK_YEARS = 1
+MIN_BACKTEST_LOOKBACK_YEARS = 1
+MAX_BACKTEST_LOOKBACK_YEARS = 3
+# The PIT window holds every common stock that was ever a member (1,717 over five
+# years).  Loading all of them is what made the read unaffordable, so it is capped by
+# liquidity measured *before* the window - see _fetch_backtest_universe.
+DEFAULT_BACKTEST_UNIVERSE_MAX_TICKERS = 200
+UNIVERSE_RANKING_SESSIONS = 60
 DEFAULT_L4_EVIDENCE_LIMIT = 5
 # A broad screen can match many names, but recommendations never define historical
 # membership. They are presentation output only.
@@ -165,6 +178,14 @@ class DataSourceConfig(BaseModel):
         default=DEFAULT_DB_BACKTEST_STATEMENT_TIMEOUT_MS, gt=0
     )
     backtest_max_tickers: int = Field(default=DEFAULT_BACKTEST_MAX_TICKERS, gt=0)
+    backtest_lookback_years: int = Field(
+        default=DEFAULT_BACKTEST_LOOKBACK_YEARS,
+        ge=MIN_BACKTEST_LOOKBACK_YEARS,
+        le=MAX_BACKTEST_LOOKBACK_YEARS,
+    )
+    backtest_universe_max_tickers: int = Field(
+        default=DEFAULT_BACKTEST_UNIVERSE_MAX_TICKERS, gt=0
+    )
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> DataSourceConfig:
@@ -191,6 +212,23 @@ class DataSourceConfig(BaseModel):
             backtest_max_tickers=_int_env(
                 env, AI_BACKTEST_MAX_TICKERS_ENV, DEFAULT_BACKTEST_MAX_TICKERS
             ),
+            # Clamped rather than rejected: an out-of-range value in a deployment env
+            # must not take the whole service down, and the manifest records the years
+            # actually used either way.
+            backtest_lookback_years=min(
+                MAX_BACKTEST_LOOKBACK_YEARS,
+                max(
+                    MIN_BACKTEST_LOOKBACK_YEARS,
+                    _int_env(
+                        env, AI_BACKTEST_LOOKBACK_YEARS_ENV, DEFAULT_BACKTEST_LOOKBACK_YEARS
+                    ),
+                ),
+            ),
+            backtest_universe_max_tickers=_int_env(
+                env,
+                AI_BACKTEST_UNIVERSE_MAX_TICKERS_ENV,
+                DEFAULT_BACKTEST_UNIVERSE_MAX_TICKERS,
+            ),
         )
 
 
@@ -207,6 +245,18 @@ def is_release_profile() -> bool:
     """
 
     return (os.environ.get(RELEASE_PROFILE_ENV) or "").strip().lower() in RELEASE_PROFILE_VALUES
+
+
+def backtest_window_policy_id(lookback_years: int) -> str:
+    """The versioned identifier of the window policy an extract was produced under.
+
+    The window length is configuration now, so it has to be part of the identifier: a
+    manifest that says only "settled session" cannot tell a one-year extract from a
+    five-year one, and two runs with different lookbacks would otherwise claim the same
+    reproducibility contract.
+    """
+
+    return f"krx_pit_common_stock_{lookback_years}y_kst_settled_session_v3"
 
 
 class PipelineDataUnavailableError(ValueError):
@@ -540,6 +590,7 @@ class PostgresPipelineDataSource:
             # Capabilities were probed up front; nothing since then can change them.
 
         research_as_of = backtest_window["end"].isoformat()
+        window_policy_id = backtest_window_policy_id(self.config.backtest_lookback_years)
         required_families = {"price_ta", "pit_universe", *indicator_families}
         available_families = set(required_families)
         if self.unavailable_indicator_families:
@@ -601,7 +652,7 @@ class PostgresPipelineDataSource:
                     else []
                 ),
             ],
-            source_version=BACKTEST_WINDOW_POLICY_ID,
+            source_version=window_policy_id,
             extract_hash=extract_hash,
         )
         immutable_snapshot_bundle = build_snapshot_bundle(
@@ -639,7 +690,7 @@ class PostgresPipelineDataSource:
                 "immutable_snapshot_bundle": immutable_snapshot_bundle.model_dump(mode="json"),
                 "source_snapshot_as_of": research_as_of,
                 "source_snapshot_freshness": source_freshness,
-                "source_snapshot_version": BACKTEST_WINDOW_POLICY_ID,
+                "source_snapshot_version": window_policy_id,
                 "loaded_extract_hash": source_manifest.extract_hash,
                 "dsn_env": self.config.database_dsn_env,
                 "ticker": ticker,
@@ -675,7 +726,7 @@ class PostgresPipelineDataSource:
                 "screening_candidates": len(screening_candidates),
                 "screening_relaxation": screening_relaxation,
                 "backtest_lookback_days": effective_lookback_days,
-                "backtest_window_policy_id": BACKTEST_WINDOW_POLICY_ID,
+                "backtest_window_policy_id": window_policy_id,
                 "backtest_start_session": backtest_window["start"].isoformat(),
                 "backtest_end_session": backtest_window["end"].isoformat(),
                 "backtest_session_count": backtest_window["session_count"],
@@ -683,6 +734,9 @@ class PostgresPipelineDataSource:
                 "raw_price_provenance": {
                     "raw_ohlcv_source": None if compact_execution_rows else "core.ohlcv_daily",
                     "raw_notional_source": None,
+                    # Bars without a raw execution price are not loaded at all, so the
+                    # returned rows are exactly the ones the engine can execute on.
+                    "raw_execution_join": None if compact_execution_rows else "inner_required",
                     "adjusted_signal_source": KIS_ADJUSTED_OHLCV_TABLE,
                     "execution_price_source": (
                         KIS_ADJUSTED_OHLCV_TABLE
@@ -802,25 +856,101 @@ class PostgresPipelineDataSource:
     def _fetch_backtest_universe(
         self, conn: Any, window: Mapping[str, Any]
     ) -> tuple[list[str], dict[str, Any]]:
-        """Return the lifecycle-backed common-stock universe for the fixed PIT window."""
+        """The lifecycle PIT common-stock universe for the window, capped by liquidity.
+
+        Every member of the window stays a candidate, including names that were delisted
+        later on - dropping those is exactly the survivorship bias this universe exists to
+        avoid, and the price join is by date so a name delisted mid-window keeps its rows
+        up to its last session (delisting policy: official-event-then-final-close-v1).
+
+        What is capped is how many of them are loaded. The rank is average traded value
+        (adj_close * adj_volume) over the `UNIVERSE_RANKING_SESSIONS` sessions *ending at
+        the window start*, so the selection uses only information that existed before the
+        first bar the strategy trades - ranking inside the window would let the outcome
+        pick its own universe. Ranking and capping happen in the database; returning all
+        1,717 members to sort them in Python would defeat the point.
+
+        ponytail: a name first listed after the window start has no pre-window traded
+        value and sorts last (NULLS LAST), so it is only included when the cap is not
+        already full. Rank on a forward-rolling window if mid-window IPOs need to compete.
+        """
+
         rows = conn.execute(
             f"""
-            SELECT DISTINCT symbol
-            FROM {PIT_UNIVERSE_VIEW}
-            WHERE as_of_date BETWEEN %s::date AND %s::date
-            ORDER BY symbol
+            WITH window_members AS (
+                -- Point-in-time lifecycle membership straight from the history tables:
+                -- any KOSPI/KOSDAQ common-stock listing interval that overlaps the window,
+                -- so a name delisted *during* the window is a member (survivorship-safe)
+                -- while a listing that ended before the window is not.  The mart PIT
+                -- view is not used here: its security-type history only starts on
+                -- 2026-08-11, so for earlier dates it returns nobody and a "PIT universe"
+                -- silently collapses into today's listed names.
+                SELECT DISTINCT sm.symbol
+                FROM {SYMBOL_LISTING_HISTORY_TABLE} h
+                JOIN {SYMBOL_MASTER_TABLE} sm ON sm.symbol_id = h.symbol_id
+                JOIN core.symbol_security_type_history sh
+                  ON sh.symbol_id = h.symbol_id
+                 AND sh.valid_from <= %(window_end)s::date
+                 AND (sh.valid_to IS NULL OR sh.valid_to >= %(window_start)s::date)
+                WHERE h.listing_status = 'listed'
+                  AND h.market IN ('KOSPI', 'KOSDAQ')
+                  AND sh.security_type = '보통주'
+                  AND h.valid_from <= %(window_end)s::date
+                  AND (h.valid_to IS NULL OR h.valid_to >= %(window_start)s::date)
+            ), ranking_sessions AS (
+                SELECT trade_date
+                FROM core.trading_calendar
+                WHERE is_open AND trade_date <= %(window_start)s::date
+                ORDER BY trade_date DESC
+                LIMIT %(ranking_sessions)s
+            ), ranking_window AS (
+                SELECT min(trade_date) AS floor_date, max(trade_date) AS ceil_date
+                FROM ranking_sessions
+            ), live_members AS (
+                SELECT symbol FROM window_members
+            ), ranked AS (
+                SELECT l.symbol, avg(p.adj_close * p.adj_volume) AS traded_value
+                FROM live_members l
+                CROSS JOIN ranking_window w
+                LEFT JOIN {KIS_ADJUSTED_OHLCV_TABLE} p
+                  ON p.ticker = l.symbol
+                 AND p.time BETWEEN w.floor_date AND w.ceil_date
+                GROUP BY l.symbol
+            )
+            SELECT symbol,
+                   (SELECT count(*) FROM window_members) AS window_member_count
+            FROM ranked
+            ORDER BY traded_value DESC NULLS LAST, symbol
+            LIMIT %(cap)s
             """,
-            [window["start"], window["end"]],
+            {
+                "window_start": window["start"],
+                "window_end": window["end"],
+                "ranking_sessions": UNIVERSE_RANKING_SESSIONS,
+                "cap": self.config.backtest_universe_max_tickers,
+            },
         ).fetchall()
-        universe = [str(row["symbol"]).zfill(6) for row in rows]
+        universe = sorted(str(row["symbol"]).zfill(6) for row in rows)
+        window_member_count = max(
+            (int(row.get("window_member_count") or 0) for row in rows),
+            default=len(universe),
+        )
         return universe, {
-            "selection": "lifecycle_pit_common_stock_window",
+            "selection": "lifecycle_pit_common_stock_window_top_traded",
             "as_of_start": window["start"].isoformat(),
             "as_of_end": window["end"].isoformat(),
             "session_count": window["session_count"],
             "member_count": len(universe),
-            "source": PIT_UNIVERSE_VIEW,
+            "window_member_count": window_member_count,
+            "excluded_member_count": max(window_member_count - len(universe), 0),
+            "ranking_metric": "avg_traded_value_adj_close_x_adj_volume",
+            "ranking_sessions": UNIVERSE_RANKING_SESSIONS,
+            "ranking_window_end": window["start"].isoformat(),
+            "max_tickers": self.config.backtest_universe_max_tickers,
+            "source": SYMBOL_LISTING_HISTORY_TABLE,
             "listing_provenance": SYMBOL_LISTING_HISTORY_TABLE,
+            "delisting_policy": "official-event-then-final-close-v1",
+            "delisted_during_window": "kept_until_final_session",
             "security_type": "보통주",
         }
 
@@ -1191,7 +1321,11 @@ class PostgresPipelineDataSource:
             FROM {KIS_ADJUSTED_OHLCV_TABLE} p
             JOIN core.symbol_master sm
               ON sm.symbol = p.ticker
-            LEFT JOIN core.ohlcv_daily raw
+            -- INNER, not LEFT: the execution engine refuses a bar without raw OHLCV
+            -- ("raw_execution_unavailable"), so an adjusted-only bar can only be loaded,
+            -- carried through the feature frame and then crash the backtest. Dropping it
+            -- here is the same PIT decision made one layer earlier and for free.
+            JOIN core.ohlcv_daily raw
               ON raw.symbol_id = sm.symbol_id AND raw.trade_date = p.time
              -- Keep the raw hypertable's time predicate explicit.  The equality to
              -- p.time alone prevents Timescale chunk pruning and made a five-year
@@ -1388,7 +1522,13 @@ class PostgresPipelineDataSource:
         return timelines
 
     def _resolve_backtest_window(self, conn: Any) -> dict[str, Any] | None:
-        """Resolve the five-year window ending on the last completed KST session."""
+        """Resolve the configured lookback window ending on the last completed KST session.
+
+        The length is `config.backtest_lookback_years` (AI_BACKTEST_LOOKBACK_YEARS), bound
+        as an interval rather than interpolated so the statement stays a fixed parameterised
+        text.  The manifest records the resolved sessions and the policy id carries the
+        years, so a shorter window is reproducible rather than merely cheaper.
+        """
         row = conn.execute(
             """
             WITH cutoff AS (
@@ -1401,13 +1541,15 @@ class PostgresPipelineDataSource:
                 FROM core.trading_calendar c
                 CROSS JOIN cutoff
                 WHERE c.is_open
-                  AND c.trade_date BETWEEN cutoff.session_end - INTERVAL '5 years' AND cutoff.session_end
+                  AND c.trade_date BETWEEN cutoff.session_end - make_interval(years => %s)
+                                       AND cutoff.session_end
             )
             SELECT min(trade_date) AS session_start,
                    max(trade_date) AS session_end,
                    count(*) AS session_count
             FROM sessions
-            """
+            """,
+            [self.config.backtest_lookback_years],
         ).fetchone()
         if not row or not row.get("session_start") or not row.get("session_end"):
             return None
@@ -2652,6 +2794,10 @@ def _feature_frame_sql(date_param: str) -> str:
         LEFT JOIN volume_frame
           ON volume_frame.ticker = bars.ticker AND volume_frame.time = bars.time
         WHERE (bars.quality_flags->>'adjusted_price_method') = '{KIS_ADJUSTED_PRICE_METHOD}'
+          -- Today's screen is a recommendation, so it must not offer a name that is no
+          -- longer listed. The historical PIT universe deliberately does not apply this
+          -- predicate; applying it there is what survivorship bias is.
+          AND sm.listing_status = 'listed'
     """
 
 

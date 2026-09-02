@@ -81,6 +81,10 @@ BENCHMARK_WARNING = AUXILIARY_BENCHMARK_WARNING
 # Candidates are selected using only the first 70% of the history. The final 30%
 # is a hold-out, not a rolling walk-forward validation.
 BACKTEST_SPLIT_FRACTION = 0.7
+# The five-year contract. These stay exported at their original values because the
+# sealed V2 exploration policy is validated against them in `graph.run_analysis`; the
+# geometry a run actually uses comes from `walk_forward_policy_for`, which scales it to
+# how much history was loaded (see AI_BACKTEST_LOOKBACK_YEARS).
 WALK_FORWARD_WARMUP_MONTHS = 1
 WALK_FORWARD_TRAIN_MONTHS = 12
 WALK_FORWARD_VALIDATION_MONTHS = 3
@@ -89,6 +93,13 @@ WALK_FORWARD_ROLL_MONTHS = 1
 WALK_FORWARD_MIN_VALID_FOLDS = 24
 WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS = 24
 WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS = 480
+# Window tier boundaries, in distinct months present in the price rows. A one-year
+# window cannot fill a single 17-month fold, so the fixed geometry above produces zero
+# folds there and a three-year window produces folds but never enough of them - both
+# mask every out-of-sample metric. Below 41 months the geometry and its minimums scale
+# to what the window can actually supply.
+WALK_FORWARD_SHORT_WINDOW_MAX_MONTHS = 15
+WALK_FORWARD_FULL_WINDOW_MIN_MONTHS = 41
 # Kept as an internal spelling for callers that imported the old constant.
 WALK_FORWARD_MIN_SESSIONS = WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS
 INSUFFICIENT_WALK_FORWARD_SAMPLE = "INSUFFICIENT_WALK_FORWARD_SAMPLE"
@@ -136,12 +147,17 @@ AI_BACKTEST_WORKERS_ENV = "AI_BACKTEST_WORKERS"
 DEFAULT_BACKTEST_WORKERS = 2
 AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV = "AI_BACKTEST_ALLOW_SPAWN_PARALLEL"
 AI_BACKTEST_CANDIDATE_TIMEOUT_ENV = "AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS"
-DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 180.0
+# Measured on the one-year default input (200 tickers x ~250 sessions, 48k rows): a
+# candidate costs ~1.7s on a 2x-slower Windows box, so eight seconds is a hang detector,
+# not a work budget. Both are env-overridable for the opt-in three-year window, whose
+# rolling evaluation is several times more expensive.
+DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 8.0
 AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
-DEFAULT_WALL_BUDGET_SECONDS = 540.0
-# A small, bounded second refinement lets the search test a different parameter
-# neighbourhood while the hold-out remains unavailable to selection.
-MAX_SELF_IMPROVEMENT_ROUNDS = 2
+DEFAULT_WALL_BUDGET_SECONDS = 25.0
+# Refinement runs only when the walk-forward sample is not READY, which after the
+# window-proportional policy means a window too short to evaluate on. One extra round is
+# a different parameter neighbourhood; a second buys little and costs the wall budget.
+MAX_SELF_IMPROVEMENT_ROUNDS = 1
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
 BACKTEST_ENGINE_VERSION = "candidate-engine.v3"
 # v6 adds the source-notional capacity claim to persisted summaries. Cached v5
@@ -690,10 +706,50 @@ class _WalkForwardFold:
 
 
 @dataclass(frozen=True)
+class WalkForwardPolicy:
+    """Fold geometry and acceptance minimums, scaled to the loaded history."""
+
+    tier: str
+    warmup_months: int
+    train_months: int
+    validation_months: int
+    evaluation_months: int
+    roll_months: int
+    min_valid_folds: int
+    min_unique_evaluation_months: int
+    min_unique_evaluation_sessions: int
+
+    @property
+    def label(self) -> str:
+        return (
+            f"warmup_{self.warmup_months}m_train_{self.train_months}m"
+            f"_validation_{self.validation_months}m"
+            f"_evaluation_{self.evaluation_months}m_roll_{self.roll_months}m"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"policy": self.label, **vars(self)}
+
+
+FIVE_YEAR_WALK_FORWARD_POLICY = WalkForwardPolicy(
+    tier="full_window",
+    warmup_months=WALK_FORWARD_WARMUP_MONTHS,
+    train_months=WALK_FORWARD_TRAIN_MONTHS,
+    validation_months=WALK_FORWARD_VALIDATION_MONTHS,
+    evaluation_months=WALK_FORWARD_EVALUATION_MONTHS,
+    roll_months=WALK_FORWARD_ROLL_MONTHS,
+    min_valid_folds=WALK_FORWARD_MIN_VALID_FOLDS,
+    min_unique_evaluation_months=WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS,
+    min_unique_evaluation_sessions=WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
+)
+
+
+@dataclass(frozen=True)
 class _SplitPolicy:
     warmup_sessions: tuple[str, ...]
     folds: tuple[_WalkForwardFold, ...]
     final_lockbox_sessions: tuple[str, ...]
+    walk_forward: WalkForwardPolicy = FIVE_YEAR_WALK_FORWARD_POLICY
 
 
 @dataclass(frozen=True)
@@ -703,6 +759,7 @@ class _WalkForwardSample:
     unique_evaluation_month_count: int
     unique_evaluation_session_count: int
     status: str
+    policy: WalkForwardPolicy = FIVE_YEAR_WALK_FORWARD_POLICY
 
 
 @dataclass(frozen=True)
@@ -2060,6 +2117,12 @@ def _run_walk_forward_candidate_backtest(
     selected: CodeCandidate | None = None
     policy = _walk_forward_split_policy(rows)
     for fold in policy.folds:
+        # Rolling evaluation is the one stretch of this node with no round boundary in
+        # it: a wide window runs every fold back to back. Check at the fold boundary so
+        # a cancel or an expired request deadline is honoured within a fold's cost
+        # instead of after the whole walk-forward.
+        raise_if_cancelled()
+        raise_if_past_deadline()
         selection_sessions = (*fold.warmup_sessions, *fold.train_sessions, *fold.validation_sessions)
         selection_rows = _rows_for_sessions(rows, selection_sessions)
         # Selection engine sees warmup for features, but warmup orders are HOLD.
@@ -2131,7 +2194,8 @@ def _run_walk_forward_candidate_backtest(
         selections.append(WalkForwardFoldSelection(fold_index=fold.fold_index, selection_hash=digest, candidate_id=candidate.candidate_id, evaluation_sessions=list(targets)))
 
     months = {session[:7] for session in returns_by_session}
-    ready = len(selections) >= WALK_FORWARD_MIN_VALID_FOLDS and len(months) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS and len(returns_by_session) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS and len(returns_by_session) == len(claimed)
+    window = policy.walk_forward
+    ready = len(selections) >= window.min_valid_folds and len(months) >= window.min_unique_evaluation_months and len(returns_by_session) >= window.min_unique_evaluation_sessions and len(returns_by_session) == len(claimed)
     ordered_sessions = sorted(returns_by_session) if ready else []
     daily_returns = {session: returns_by_session[session] for session in ordered_sessions}
     equity = 1.0
@@ -2156,9 +2220,9 @@ def _run_walk_forward_candidate_backtest(
         candidate_returns = returns_by_candidate[proposed.candidate_id]
         candidate_months = {session[:7] for session in candidate_returns}
         candidate_ready = bool(
-            folds_by_candidate[proposed.candidate_id] >= WALK_FORWARD_MIN_VALID_FOLDS
-            and len(candidate_months) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS
-            and len(candidate_returns) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS
+            folds_by_candidate[proposed.candidate_id] >= window.min_valid_folds
+            and len(candidate_months) >= window.min_unique_evaluation_months
+            and len(candidate_returns) >= window.min_unique_evaluation_sessions
             and len(candidate_returns) == len(claimed)
         )
         candidate_fills = fills_by_candidate[proposed.candidate_id]
@@ -3209,6 +3273,52 @@ def _compound_returns(daily_returns: Sequence[float]) -> float:
     return math.prod((1.0 + daily_return for daily_return in daily_returns), start=1.0) - 1.0
 
 
+def walk_forward_policy_for(
+    price_rows: Sequence[Mapping[str, Any]] | int,
+) -> WalkForwardPolicy:
+    """Pick the fold geometry the loaded window can actually fill.
+
+    Accepts price rows or a month count. At or above 41 months the five-year contract
+    is returned unchanged, so nothing about the long-window behaviour moves.
+    """
+
+    months = (
+        price_rows
+        if isinstance(price_rows, int)
+        else len(
+            {str(row["date"])[:7] for row in price_rows if row.get("date") is not None}
+        )
+    )
+    if months <= WALK_FORWARD_SHORT_WINDOW_MAX_MONTHS:
+        return WalkForwardPolicy(
+            tier="short_window",
+            warmup_months=1,
+            train_months=6,
+            validation_months=1,
+            evaluation_months=1,
+            roll_months=1,
+            min_valid_folds=3,
+            min_unique_evaluation_months=3,
+            min_unique_evaluation_sessions=60,
+        )
+    if months < WALK_FORWARD_FULL_WINDOW_MIN_MONTHS:
+        # One fold consumes 17 months, so `months - 17` is every fold the window can
+        # build; six is the floor below which a rolling estimate says nothing.
+        folds = max(6, months - 17)
+        return WalkForwardPolicy(
+            tier="medium_window",
+            warmup_months=1,
+            train_months=12,
+            validation_months=3,
+            evaluation_months=1,
+            roll_months=1,
+            min_valid_folds=folds,
+            min_unique_evaluation_months=folds,
+            min_unique_evaluation_sessions=20 * folds,
+        )
+    return FIVE_YEAR_WALK_FORWARD_POLICY
+
+
 def _walk_forward_split_policy(price_rows: Sequence[Mapping[str, Any]]) -> _SplitPolicy:
     sessions_by_month: dict[str, list[str]] = defaultdict(list)
     for session in sorted(
@@ -3216,24 +3326,21 @@ def _walk_forward_split_policy(price_rows: Sequence[Mapping[str, Any]]) -> _Spli
     ):
         sessions_by_month[session[:7]].append(session)
     months = tuple(sorted(sessions_by_month))
+    window = walk_forward_policy_for(len(months))
     warmup_sessions = tuple(
         session
-        for month in months[:WALK_FORWARD_WARMUP_MONTHS]
+        for month in months[: window.warmup_months]
         for session in sessions_by_month[month]
     )
     folds: list[_WalkForwardFold] = []
-    span = (
-        WALK_FORWARD_TRAIN_MONTHS
-        + WALK_FORWARD_VALIDATION_MONTHS
-        + WALK_FORWARD_EVALUATION_MONTHS
-    )
-    for start in range(0, len(months) - (span + WALK_FORWARD_WARMUP_MONTHS) + 1, WALK_FORWARD_ROLL_MONTHS):
-        warmup_months = months[start : start + WALK_FORWARD_WARMUP_MONTHS]
-        train_start = start + WALK_FORWARD_WARMUP_MONTHS
-        train_months = months[train_start : train_start + WALK_FORWARD_TRAIN_MONTHS]
-        validation_start = train_start + WALK_FORWARD_TRAIN_MONTHS
-        validation_months = months[validation_start : validation_start + WALK_FORWARD_VALIDATION_MONTHS]
-        evaluation_months = months[validation_start + WALK_FORWARD_VALIDATION_MONTHS : validation_start + WALK_FORWARD_VALIDATION_MONTHS + WALK_FORWARD_EVALUATION_MONTHS]
+    span = window.train_months + window.validation_months + window.evaluation_months
+    for start in range(0, len(months) - (span + window.warmup_months) + 1, window.roll_months):
+        warmup_months = months[start : start + window.warmup_months]
+        train_start = start + window.warmup_months
+        train_months = months[train_start : train_start + window.train_months]
+        validation_start = train_start + window.train_months
+        validation_months = months[validation_start : validation_start + window.validation_months]
+        evaluation_months = months[validation_start + window.validation_months : validation_start + window.validation_months + window.evaluation_months]
         fold = _WalkForwardFold(
             fold_index=len(folds),
             warmup_sessions=tuple(session for month in warmup_months for session in sessions_by_month[month]),
@@ -3248,19 +3355,21 @@ def _walk_forward_split_policy(price_rows: Sequence[Mapping[str, Any]]) -> _Spli
         warmup_sessions=warmup_sessions,
         folds=tuple(folds),
         final_lockbox_sessions=final_lockbox_sessions,
+        walk_forward=window,
     )
 
 
 def _walk_forward_sample(price_rows: Sequence[Mapping[str, Any]]) -> _WalkForwardSample:
     sessions = {str(row.get("date")) for row in price_rows if row.get("date") is not None}
     policy = _walk_forward_split_policy(price_rows)
+    window = policy.walk_forward
     evaluation_sessions = [session for fold in policy.folds for session in fold.evaluation_sessions]
     unique_evaluation_sessions = set(evaluation_sessions)
     evaluation_months = {session[:7] for session in unique_evaluation_sessions}
     meets_minimum = (
-        len(policy.folds) >= WALK_FORWARD_MIN_VALID_FOLDS
-        and len(evaluation_months) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS
-        and len(unique_evaluation_sessions) >= WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS
+        len(policy.folds) >= window.min_valid_folds
+        and len(evaluation_months) >= window.min_unique_evaluation_months
+        and len(unique_evaluation_sessions) >= window.min_unique_evaluation_sessions
     )
     return _WalkForwardSample(
         session_count=len(sessions),
@@ -3268,22 +3377,27 @@ def _walk_forward_sample(price_rows: Sequence[Mapping[str, Any]]) -> _WalkForwar
         unique_evaluation_month_count=len(evaluation_months),
         unique_evaluation_session_count=len(unique_evaluation_sessions),
         status=READY_WALK_FORWARD if meets_minimum else INSUFFICIENT_WALK_FORWARD_SAMPLE,
+        policy=window,
     )
 
 
 def _walk_forward_metadata(
     sample: _WalkForwardSample, policy: _SplitPolicy | None = None
 ) -> dict[str, Any]:
+    window = sample.policy
     return {
-        "policy": "warmup_1m_train_12m_validation_3m_evaluation_1m_roll_1m",
+        "policy": window.label,
+        # The geometry is window-proportional, so a report cannot read the minimums off
+        # a fixed contract any more - they travel with the result.
+        "walk_forward_policy": window.as_dict(),
         "session_count": sample.session_count,
         "valid_fold_count": sample.valid_fold_count,
         "unique_evaluation_month_count": sample.unique_evaluation_month_count,
         "unique_evaluation_session_count": sample.unique_evaluation_session_count,
         "minimums": {
-            "unique_evaluation_sessions": WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
-            "valid_folds": WALK_FORWARD_MIN_VALID_FOLDS,
-            "unique_evaluation_months": WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS,
+            "unique_evaluation_sessions": window.min_unique_evaluation_sessions,
+            "valid_folds": window.min_valid_folds,
+            "unique_evaluation_months": window.min_unique_evaluation_months,
         },
         "status": sample.status,
         # QV-OOS-01 asks for the seed behind candidate selection. There is none to
