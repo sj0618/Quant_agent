@@ -1553,12 +1553,22 @@ class PostgresPipelineDataSource:
         years, so a shorter window is reproducible rather than merely cheaper.
         """
         row = conn.execute(
-            """
+            f"""
             WITH cutoff AS (
-                SELECT max(trade_date) AS session_end
-                FROM core.trading_calendar
-                WHERE is_open
-                  AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
+                -- The window ends on the last completed KST session THAT HAS PRICES.
+                -- Between KST midnight and the morning ingestion the calendar already
+                -- names yesterday as complete while no bar for it exists yet; ending the
+                -- window there made every run in that gap "stale" and the release
+                -- profile rejected the extract (no rows on the declared as_of).
+                SELECT LEAST(
+                    (
+                        SELECT max(trade_date)
+                        FROM core.trading_calendar
+                        WHERE is_open
+                          AND trade_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')::date
+                    ),
+                    (SELECT max(time)::date FROM {KIS_ADJUSTED_OHLCV_TABLE})
+                ) AS session_end
             ), sessions AS (
                 SELECT c.trade_date
                 FROM core.trading_calendar c
