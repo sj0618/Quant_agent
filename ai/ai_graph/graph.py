@@ -736,6 +736,14 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         sealed_execution_spec, ResearchCandidateExecutionSpecV3
     )
     required_metrics = _sealed_condition_metrics(sealed_execution_spec)
+    # A sealed sector is a universe constraint, not a condition: it restricts PIT
+    # membership before any rule runs. Read from the spec rather than re-derived from
+    # the query so the backtest trades exactly the universe research resolved.
+    sealed_sector = (
+        sealed_execution_spec.candidates[0].sector
+        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
+        else None
+    )
     if required_metrics is not None:
         requires_financials = bool(required_metrics & _FUNDAMENTAL_CONDITION_METRICS)
         # Only a sealed V3 price-path plan may take the OHLCV-only projection.  V1
@@ -754,9 +762,12 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
             required_metrics=tuple(sorted(required_metrics)),
             requires_financials=requires_financials,
             compact_price_rows=compact_price_rows,
+            sector=sealed_sector,
         )
     elif skip_current_screen:
-        pipeline_data = load_pipeline_data_from_env(query, state["trace_id"], screen_current=False)
+        pipeline_data = load_pipeline_data_from_env(
+            query, state["trace_id"], screen_current=False, sector=sealed_sector
+        )
     else:
         pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
     if is_release_profile():
@@ -827,7 +838,9 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
 
 
 _FUNDAMENTAL_CONDITION_METRICS = frozenset(
-    {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"}
+    # `per` belongs here even though it is priced per bar: its EPS comes from the same
+    # DART filings, so a per-only rule still has to load them.
+    {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue", "per"}
 )
 
 
@@ -1022,6 +1035,19 @@ def _strategy_spec_from_execution_spec(
                 "research_snapshot_hash": execution_spec.research_snapshot_hash,
                 "research_capability_hash": execution_spec.capability_hash,
                 "research_candidate_id": candidate.candidate_id,
+                # The sealed rule's time exit and rebalance cadence travel with the
+                # other execution constraints; backtest_code reads them back into the
+                # StrategyIR and CandidateParameters the engine actually runs.
+                **(
+                    {"holding_days": candidate.holding_days}
+                    if candidate.holding_days is not None
+                    else {}
+                ),
+                **(
+                    {"rebalance_interval_days": candidate.rebalance_interval_days}
+                    if candidate.rebalance_interval_days is not None
+                    else {}
+                ),
             },
             assumptions=[
                 *candidate.assumptions,

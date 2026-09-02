@@ -60,6 +60,7 @@ from ai_graph.exploration_policy import (
 )
 from ai_graph.graph import (
     build_clarification_prompt,
+    classify_query,
     run_analysis,
     strategy_candidate_cards,
 )
@@ -116,7 +117,6 @@ from ai_graph.research_eligibility import (
 )
 from ai_graph.schemas import (
     SCHEMA_VERSION,
-    AmbiguityCode,
     APIEnvelope,
     ClarificationOption,
     EnvelopeStatus,
@@ -600,10 +600,14 @@ def _clarification_envelope(outcome: RuleDraftV1, *, query: str, trace_id: str) 
     """The NEED_CLARIFICATION contract for a parse that cannot run as asked.
 
     Reuses the graph's clarification builder so the browser sees one shape: a
-    question, exactly three options, and three candidate cards.
+    question, up to three options, and three candidate cards.
+
+    The question follows why the draft stopped, not a fixed category: a greeting was
+    being answered with "먼저 어떤 후보 전략으로 구체화할까요?" and three unrelated
+    strategy options, which is not a question about anything the user said.
     """
 
-    prompt = build_clarification_prompt(AmbiguityCode.INPUT_AMBIGUOUS, query)
+    prompt = build_clarification_prompt(classify_query(query), query)
     options = [
         ClarificationOption(label=choice.label, reason=choice.reason)
         for choice in outcome.clarifications

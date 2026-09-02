@@ -32,6 +32,7 @@ from ai_graph.nodes.strategy_research import StrategyResearchError, research_str
 from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.schemas import (
     RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3,
+    AmbiguityCode,
     ResearchCandidateExecutionSpecV3,
 )
 from ai_graph.strategy_parser import (
@@ -455,6 +456,30 @@ def build_rule_draft(
     exploration_policy: ActiveExplorationPolicyV2 | None = None,
 ) -> RuleDraftV1:
     """Make a bounded natural-language rule review without retaining raw input."""
+
+    # Imported here for the same reason ``_live_parser_enabled`` is: the graph is a
+    # heavyweight module and this contract must stay importable on its own.
+    from ai_graph.graph import build_clarification_prompt, classify_query
+
+    if classify_query(query) is AmbiguityCode.NO_STRATEGY_INTENT:
+        # "안녕" is not a strategy request. It used to be classified "automatic" and
+        # spend ~26s on a web-grounded V3 research call before the API showed the
+        # INPUT_AMBIGUOUS question "먼저 어떤 후보 전략으로 구체화할까요?" with three
+        # generic strategy options - an answer to a question nobody asked. Ask what to
+        # analyse instead, before anything is spent.
+        prompt = build_clarification_prompt(AmbiguityCode.NO_STRATEGY_INTENT, query)
+        signed = signer.issue(rule=None, user_id=user_id, now=now)
+        return RuleDraftV1(
+            clarification_required=True,
+            explanation=str(prompt["question_reason"]),
+            canonical_rule=None,
+            editable_summary=str(prompt["question"]),
+            is_executable=False,
+            authoring_method="deterministic",
+            policy_hash=RULE_DRAFT_CONTRACT_HASH,
+            expires_at=signed.expires_at,
+            draft_token=signed.token,
+        )
 
     research_requested = _research_resolution_enabled(use_llm)
     request_mode = classify_strategy_request(query)

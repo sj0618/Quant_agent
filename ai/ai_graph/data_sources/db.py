@@ -108,6 +108,10 @@ TA_VOLUME_TICKER_TABLE = "feature.ta_volume_ticker_daily"
 PIT_UNIVERSE_VIEW = "mart.common_stock_universe_asof"
 SYMBOL_LISTING_HISTORY_TABLE = "core.symbol_listing_history"
 SYMBOL_MASTER_TABLE = "core.symbol_master"
+# WICS sector membership as intervals, keyed by symbol_id like the listing history, so a
+# sector-restricted universe can be built with the same overlap test the lifecycle
+# universe already uses instead of asking what sector a name is in *today*.
+WICS_SECTOR_HISTORY_TABLE = "feature.wics_symbol_sector_history"
 ANALYST_REPORT_TABLE = "raw.analyst_report_summary"
 BOK_MACRO_VIEW = "mart.bok_macro_asof"
 # Official KRX total-return index levels and the published KOSPI/KOSDAQ split. The
@@ -136,6 +140,9 @@ DART_ACCOUNTS = {
     "operating_income": "dart_OperatingIncomeLoss",
     "eps": "ifrs-full_BasicEarningsLossPerShare",
 }
+# DART 사업보고서 (annual). The other report codes are quarterly/half-year filings whose
+# EPS covers only that period; see _fetch_financial_timeline for why PER reads this one.
+DART_ANNUAL_REPORT_CODE = "11011"
 
 TICKER_PATTERN = re.compile(r"\b\d{6}\b")
 RSI_KEYS = ("rsi", "RSI", "rsi_14", "RSI_14", "talib_rsi_14", "TA_RSI_14")
@@ -393,6 +400,7 @@ class PostgresPipelineDataSource:
         required_metrics: Sequence[str] | None = None,
         requires_financials: bool | None = None,
         compact_price_rows: bool = False,
+        sector: str | None = None,
     ) -> PipelineDataBundle:
         load_started = perf_counter()
         timings: dict[str, float] = {}
@@ -477,6 +485,7 @@ class PostgresPipelineDataSource:
                         requires_financials,
                         timings,
                         compact_price_rows=compact_execution_rows,
+                        sector=sector,
                     )
                     (
                         screening_candidates,
@@ -516,6 +525,7 @@ class PostgresPipelineDataSource:
                                 requires_financials,
                                 timings,
                                 compact_price_rows=compact_execution_rows,
+                                sector=sector,
                             )
                             (
                                 screening_candidates,
@@ -540,6 +550,7 @@ class PostgresPipelineDataSource:
                         requires_financials,
                         timings,
                         compact_price_rows=compact_execution_rows,
+                        sector=sector,
                     )
                 (
                     tickers,
@@ -836,6 +847,7 @@ class PostgresPipelineDataSource:
         timings: dict[str, float],
         *,
         compact_price_rows: bool = False,
+        sector: str | None = None,
     ) -> tuple[
         list[str],
         dict[str, Any],
@@ -846,12 +858,17 @@ class PostgresPipelineDataSource:
         """Load the fixed historical universe and price rows independently of screening."""
 
         started = perf_counter()
-        tickers, universe_descriptor = self._fetch_backtest_universe(conn, window)
+        tickers, universe_descriptor = self._fetch_backtest_universe(conn, window, sector)
         timings["universe_seconds"] = perf_counter() - started
         if not tickers:
             raise PipelineDataUnavailableError(
-                "pit_universe_empty",
-                "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window",
+                "pit_sector_universe_empty" if sector else "pit_universe_empty",
+                (
+                    f"no PIT KOSPI/KOSDAQ common stock was in the '{sector}' WICS sector "
+                    "during the fixed window"
+                    if sector
+                    else "PIT KOSPI/KOSDAQ common-stock membership has no coverage in the fixed window"
+                ),
             )
         started = perf_counter()
         symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
@@ -885,7 +902,7 @@ class PostgresPipelineDataSource:
         )
 
     def _fetch_backtest_universe(
-        self, conn: Any, window: Mapping[str, Any]
+        self, conn: Any, window: Mapping[str, Any], sector: str | None = None
     ) -> tuple[list[str], dict[str, Any]]:
         """The lifecycle PIT common-stock universe for the window, capped by liquidity.
 
@@ -904,6 +921,12 @@ class PostgresPipelineDataSource:
         ponytail: a name first listed after the window start has no pre-window traded
         value and sorts last (NULLS LAST), so it is only included when the cap is not
         already full. Rank on a forward-rolling window if mid-window IPOs need to compete.
+
+        `sector` restricts membership to one WICS sector, tested the same way the
+        lifecycle membership is - a sector interval that OVERLAPS the window, not the
+        sector a name sits in today. A name that left the sector mid-window is still a
+        member for the part of the window it was in it, which is the same
+        survivorship-safe choice the listing overlap makes.
         """
 
         rows = conn.execute(
@@ -928,6 +951,17 @@ class PostgresPipelineDataSource:
                   AND sh.security_type = '보통주'
                   AND h.valid_from <= %(window_end)s::date
                   AND (h.valid_to IS NULL OR h.valid_to >= %(window_start)s::date)
+                  AND (
+                      %(sector)s::text IS NULL
+                      OR EXISTS (
+                          SELECT 1
+                          FROM {WICS_SECTOR_HISTORY_TABLE} w
+                          WHERE w.symbol_id = h.symbol_id
+                            AND w.sector_name = %(sector)s
+                            AND w.valid_from <= %(window_end)s::date
+                            AND (w.valid_to IS NULL OR w.valid_to >= %(window_start)s::date)
+                      )
+                  )
             ), ranking_sessions AS (
                 SELECT trade_date
                 FROM core.trading_calendar
@@ -959,6 +993,7 @@ class PostgresPipelineDataSource:
                 "window_end": window["end"],
                 "ranking_sessions": UNIVERSE_RANKING_SESSIONS,
                 "cap": self.config.backtest_universe_max_tickers,
+                "sector": sector,
             },
         ).fetchall()
         universe = sorted(str(row["symbol"]).zfill(6) for row in rows)
@@ -967,7 +1002,14 @@ class PostgresPipelineDataSource:
             default=len(universe),
         )
         return universe, {
-            "selection": "lifecycle_pit_common_stock_window_top_traded",
+            "selection": (
+                "lifecycle_pit_common_stock_window_top_traded_sector_restricted"
+                if sector
+                else "lifecycle_pit_common_stock_window_top_traded"
+            ),
+            "sector": sector,
+            "sector_source": WICS_SECTOR_HISTORY_TABLE if sector else None,
+            "sector_membership": "wics_interval_overlapping_window" if sector else None,
             "as_of_start": window["start"].isoformat(),
             "as_of_end": window["end"].isoformat(),
             "session_count": window["session_count"],
@@ -1481,6 +1523,16 @@ class PostgresPipelineDataSource:
         NOT available_from - that column is the warehouse load date (mostly 2026-06), so
         joining on it would hide every filing before the load and make the whole backtest
         look-ahead or empty.
+
+        EPS is read only from the annual report (report_code 11011). DART's
+        ``BasicEarningsLossPerShare`` on a quarterly filing is that quarter's figure, so
+        forward-filling whichever filing happened to be newest would make PER jump by
+        roughly 4x every time a name moved between an annual and a quarterly report and
+        `per <= 10` would depend on the reporting calendar rather than on valuation.
+
+        ponytail: annual EPS is up to 15 months stale before the next 사업보고서 lands.
+        Build a real TTM EPS if that staleness starts to matter - it needs the quarterly
+        figures lined up against the annual one, which is more than a column.
         """
 
         rows = conn.execute(
@@ -1494,17 +1546,19 @@ class PostgresPipelineDataSource:
                     {_dart_amount('liabilities')} AS liabilities,
                     {_dart_amount('profit_loss')} AS profit_loss,
                     {_dart_amount('revenue')} AS revenue,
-                    {_dart_amount('operating_income')} AS operating_income
+                    {_dart_amount('operating_income')} AS operating_income,
+                    CASE WHEN report_code = %s THEN {_dart_amount('eps')} END AS annual_eps
                 FROM {DART_FINANCIAL_TABLE}
                 WHERE symbol = ANY(%s)
                   AND left(accounts_jsonb->'ifrs-full_Equity'->'raw'->>'rcept_no', 8) ~ '^[0-9]{{8}}$'
             )
-            SELECT symbol, filed, equity, liabilities, profit_loss, revenue, operating_income
+            SELECT symbol, filed, equity, liabilities, profit_loss, revenue,
+                   operating_income, annual_eps
             FROM filings
             WHERE filed IS NOT NULL
             ORDER BY symbol, filed
             """,
-            [list(tickers)],
+            [DART_ANNUAL_REPORT_CODE, list(tickers)],
         ).fetchall()
 
         timelines: dict[str, list[dict[str, Any]]] = {}
@@ -1528,8 +1582,24 @@ class PostgresPipelineDataSource:
             if revenue is not None:
                 ratios["revenue"] = revenue
             timelines.setdefault(ticker, []).append(
-                {"filed": _date_value(row["filed"]), "ratios": ratios}
+                {
+                    "filed": _date_value(row["filed"]),
+                    "ratios": ratios,
+                    "annual_eps": _optional_float_value(row.get("annual_eps")),
+                }
             )
+
+        # The forward-fill replaces the whole ratio dict at each filing, so an annual EPS
+        # would be dropped by the next quarterly report. Carry the last one seen forward
+        # here instead, where the filings are already in date order.
+        for filings in timelines.values():
+            last_eps: float | None = None
+            for filing in filings:
+                annual_eps = filing.pop("annual_eps", None)
+                if annual_eps is not None:
+                    last_eps = annual_eps
+                if last_eps is not None:
+                    filing["ratios"]["eps"] = last_eps
 
         # Consecutive-rise counts for "N quarters of rising revenue/profit" strategies.
         # Sequential (each filing vs the one before), not year-over-year: we don't carry
@@ -1965,6 +2035,7 @@ def load_pipeline_data_from_env(
     required_metrics: Sequence[str] | None = None,
     requires_financials: bool | None = None,
     compact_price_rows: bool = False,
+    sector: str | None = None,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -1979,6 +2050,7 @@ def load_pipeline_data_from_env(
         required_metrics=required_metrics,
         requires_financials=requires_financials,
         compact_price_rows=compact_price_rows,
+        sector=sector,
     )
 
 
@@ -2672,13 +2744,23 @@ ALWAYS_LOADED_FAMILIES = frozenset({"momentum"})
 def indicator_families_for_metrics(
     metrics: Sequence[str], *, include_default: bool = True
 ) -> tuple[str, ...]:
-    """The ta_* families needed to evaluate these condition metrics."""
+    """The ta_* families needed to evaluate these condition metrics.
+
+    A condition metric is not always a warehouse column: `bollinger_lower` is a spelling
+    of `bb_lower`, and `close_cross_above_sma20` is a rule over close and sma20. Looking
+    the raw name up found no family, so the trend table was never read and the sealed
+    rule was then reported as unverifiable. Expand each name into the row metrics it is
+    actually evaluated from - the same expansion the evaluator uses - before the lookup.
+    """
+
+    from ai_graph.nodes.condition_compiler import condition_metric_inputs
 
     families = set(ALWAYS_LOADED_FAMILIES) if include_default else set()
     for metric in metrics:
-        family = INDICATOR_FAMILY_BY_METRIC.get(str(metric).strip().lower())
-        if family is not None:
-            families.add(family)
+        for operand in condition_metric_inputs(str(metric)):
+            family = INDICATOR_FAMILY_BY_METRIC.get(operand)
+            if family is not None:
+                families.add(family)
     return tuple(family for family in INDICATOR_TABLES if family in families)
 # Warehouse indicator key -> the name a condition uses, applied to every backtest bar
 # so `sma20` on a bar means exactly what `sma20` meant in the screen.
@@ -2735,7 +2817,12 @@ def available_indicator_metrics(conn: Any, *, as_of: date | None = None) -> list
             [ceiling, ceiling],
         ).fetchone()
         if financial_row and financial_row.get("present"):
-            observed.update({"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"})
+            # `per` is not a filed figure: the loader divides each bar's as-reported close
+            # by the annual EPS from the same filings these are read from, so it is
+            # available exactly when they are.
+            observed.update(
+                {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue", "per"}
+            )
     except Exception:
         _logger.info("financial indicator catalog is unavailable", exc_info=True)
     if successful_queries == 0:
@@ -3321,6 +3408,13 @@ def _attach_pointintime_financials(
     backtest never reads a number that had not yet been disclosed. Rows are grouped by
     ticker and walked in date order, advancing a pointer through that ticker's filings -
     O(rows + filings), not a per-row scan.
+
+    PER is the only metric derived here rather than carried from the filing, because it
+    needs the bar's own price. It divides the *as-reported* close by the as-reported
+    annual EPS - the adjusted close is restated for later splits and dividends while the
+    filed EPS is not, so pairing them would drift a name's history away from the PER a
+    reader could have computed on the day. EPS <= 0 leaves PER unset, so `per <= 10`
+    can never match a loss-maker through a negative ratio.
     """
 
     by_ticker: dict[str, list[dict[str, Any]]] = {}
@@ -3343,6 +3437,12 @@ def _attach_pointintime_financials(
                 pointer += 1
             for metric, value in current.items():
                 row.setdefault(metric, value)
+            eps = current.get("eps")
+            close = _optional_float_value(row.get("raw_close"))
+            if close is None:
+                close = _optional_float_value(row.get("close"))
+            if eps and eps > 0 and close is not None:
+                row.setdefault("per", close / eps)
 
 
 def _raw_price_capabilities(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

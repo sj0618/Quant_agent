@@ -351,10 +351,20 @@ def _performance_method_manifest(
         "end_date": dates[-1] if dates else "unavailable",
         "eod_basis": "input_ohlcv_eod_dates",
         "initial_capital": float(engine_summary.get("initial_capital") or 0.0),
+        # A cadence is only claimed when the rule actually rebalances on a schedule;
+        # an event-driven rule trades when its conditions fire, and reporting a
+        # 21-day cadence for it described a strategy that was never run.
         "rebalance_timing": (
             f"every_{parameters.rebalance_interval_days}_trading_days"
+            if parameters is not None and _rebalances_on_a_schedule(candidate)
+            else "signal_driven"
             if parameters is not None
             else "engine_default"
+        ),
+        "holding_period": (
+            f"{candidate.strategy_ir.holding_days}_trading_days"
+            if candidate.strategy_ir is not None and candidate.strategy_ir.holding_days
+            else "rule_exit_only"
         ),
         "fill_timing": str(
             engine_summary.get("execution_timing") or MISSING_EXECUTION_ASSUMPTION
@@ -371,6 +381,15 @@ def _performance_method_manifest(
         "execution_version": "ai_graph_backtest_engine.v1",
         "historical_simulation_warning": "Historical simulation is not a guarantee of future returns.",
     }
+
+
+def _rebalances_on_a_schedule(candidate: CodeCandidate) -> bool:
+    """Whether this candidate's rule only re-selects on rotation dates."""
+
+    return (
+        candidate.strategy_ir is not None
+        and candidate.strategy_ir.execution_mode == "scheduled_rotation"
+    )
 
 
 def _is_user_rule(candidate: Any) -> bool:

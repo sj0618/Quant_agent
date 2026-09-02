@@ -81,8 +81,11 @@ def test_non_executable_outcome_asks_instead_of_failing() -> None:
     assert finished.result is not None
     payload = finished.result.user_payload
     assert finished.result.status == EnvelopeStatus.NEED_CLARIFICATION
-    assert payload.question
-    assert len(payload.options) == 3
+    # A greeting is answered by asking what to analyse. It used to be answered with
+    # "먼저 어떤 후보 전략으로 구체화할까요?" and three generic strategy options, which
+    # is a question about nothing the user said.
+    assert payload.question == "어떤 투자 전략이나 매매 조건을 분석할까요?"
+    assert payload.options == []
     assert len(payload.candidate_cards) == 3
     assert payload.report is None
     assert payload.performance is None

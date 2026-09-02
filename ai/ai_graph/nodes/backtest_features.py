@@ -18,6 +18,7 @@ from ai_graph.nodes.condition_compiler import (
     boolean_comparison,
     boolean_window_rule,
     canonical_metric,
+    condition_metric_inputs,
     derived_ratio,
     derived_series_spec,
     percent_scale,
@@ -74,16 +75,17 @@ def unavailable_condition_metrics(
 
 
 def _condition_metric_names(condition: Condition) -> tuple[str, ...]:
-    comparison = boolean_comparison(condition.left)
-    if comparison is not None:
-        return (comparison[0], comparison[2])
-    window_rule = boolean_window_rule(condition.left)
-    if window_rule is not None:
-        return ("close", window_rule[0])
-    values = [condition.left]
+    """Judge a condition by the operands it evaluates, not by its label.
+
+    `close_cross_above_sma20` is a rule over close and sma20, not a column any bar
+    carries; looking it up as a metric found nothing and reported the whole condition
+    unavailable even when both of its inputs were present.
+    """
+
+    values = list(condition_metric_inputs(condition.left))
     if isinstance(condition.right, str):
-        values.append(condition.right)
-    return tuple(values)
+        values.extend(condition_metric_inputs(condition.right))
+    return tuple(dict.fromkeys(values))
 
 READY = 0
 AVERAGE = 1
@@ -796,8 +798,9 @@ class PreparedFeatureStore:
     ) -> RankedActions:
         actions = array("b", [0]) * len(self.rows)
         scores = self._empty_scores()
-        # in_position, entry_price, highest_close_since_entry
+        # in_position, entry_price, highest_close_since_entry, sessions_held
         states: dict[str, list[float | bool]] = {}
+        holding_days = strategy_ir.holding_days
         entry_conditions = [
             item for item in strategy_ir.entry_conditions if item.universe_rank_pct is None
         ]
@@ -815,10 +818,11 @@ class PreparedFeatureStore:
             for index in range(start, end):
                 ticker = self.tickers[index]
                 close = self.close[index]
-                state = states.setdefault(ticker, [False, 0.0, 0.0])
+                state = states.setdefault(ticker, [False, 0.0, 0.0, 0.0])
                 in_position = bool(state[0])
                 if in_position:
                     state[2] = max(float(state[2]), close)
+                    state[3] = float(state[3]) + 1.0
                 matches_entry = all(
                     self._condition_matches(condition, index)
                     for condition in entry_conditions
@@ -852,7 +856,11 @@ class PreparedFeatureStore:
                     trailing_stop = float(state[2]) > 0.0 and close < float(state[2]) * (
                         1.0 - parameters.trailing_stop_pct
                     )
-                    if exit_match or trailing_stop:
+                    # "N일 뒤 매도": the rule's own time exit, counted in sessions the
+                    # position was actually open. It is a real exit, so it stands in
+                    # for exit_conditions when the rule states no condition at all.
+                    holding_exit = holding_days is not None and float(state[3]) >= holding_days
+                    if exit_match or trailing_stop or holding_exit:
                         exits.append((index, ticker))
 
             for condition in rank_conditions:
@@ -884,7 +892,7 @@ class PreparedFeatureStore:
             if rotation_day:
                 for index in range(start, end):
                     ticker = self.tickers[index]
-                    if bool(states.setdefault(ticker, [False, 0.0, 0.0])[0]) and ticker not in target:
+                    if bool(states.setdefault(ticker, [False, 0.0, 0.0, 0.0])[0]) and ticker not in target:
                         exits.append((index, ticker))
 
             exited: set[str] = set()
@@ -892,7 +900,7 @@ class PreparedFeatureStore:
                 if ticker in exited or not bool(states[ticker][0]):
                     continue
                 actions[index] = -1
-                states[ticker] = [False, 0.0, 0.0]
+                states[ticker] = [False, 0.0, 0.0, 0.0]
                 exited.add(ticker)
             held = sum(1 for state in states.values() if bool(state[0]))
             entries = (
@@ -909,7 +917,7 @@ class PreparedFeatureStore:
                     continue
                 actions[index] = 1
                 scores[index] = score
-                states[ticker] = [True, close, close]
+                states[ticker] = [True, close, close, 0.0]
                 held += 1
         return RankedActions(actions=actions, scores=scores)
 

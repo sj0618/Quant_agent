@@ -67,6 +67,11 @@ _CURRENT: dict[str, str] = {
     "operating_margin": "operating_margin",
     "operating_income": "operating_income",
     "revenue": "revenue",
+    # Price/earnings, computed per bar by db.py from the bar's as-reported close and the
+    # annual EPS known on that date. Unset when EPS <= 0, so `per <= 10` never matches a
+    # loss-maker. PBR is deliberately absent: the warehouse has no shares-outstanding or
+    # book-value-per-share series to divide by.
+    "per": "per",
 }
 _HISTORY: dict[str, str] = {
     "open": "opens",
@@ -78,7 +83,7 @@ _HISTORY: dict[str, str] = {
 # Financials are forward-filled and may be missing on early dates; a condition on them
 # must treat "not yet filed" as not-matched rather than erroring.
 _FINANCIAL_METRICS = frozenset(
-    {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue"}
+    {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue", "per"}
 )
 
 # Names that mean an existing metric but are spelled differently by whoever wrote the
@@ -114,6 +119,10 @@ _ALIASES: dict[str, str] = {
     "operating_profit": "operating_income",
     "sales": "revenue",
     "turnover": "revenue",
+    "pe": "per",
+    "pe_ratio": "per",
+    "per_ratio": "per",
+    "price_earnings_ratio": "per",
 }
 
 # Metrics whose conventional unit is a percentage while the row carries a ratio, with
@@ -202,6 +211,31 @@ _REALIZED_VOL = re.compile(r"^realized_volatility_(\d+)d$")
 _RELATIVE_STRENGTH = re.compile(r"^relative_strength_(\d+)d$")
 _PERCENTILE = re.compile(r"^(?P<metric>.+)_percentile$")
 
+# A moving average of any window, derived from the closes both evaluators already hold.
+# The warehouse only publishes 20/50/200, so "20일선이 60일선을 상향 돌파" used to be
+# refused for want of `sma60` - a number every bar in the snapshot can produce. The
+# warehouse value still wins for the three published windows (see _series_value and
+# PreparedFeatureStore._metric_series); the rest are computed from the price path.
+_MOVING_AVERAGE = re.compile(r"^(sma|ema)_?(\d{1,3})$")
+MOVING_AVERAGE_MIN_WINDOW = 2
+MOVING_AVERAGE_MAX_WINDOW = 250
+MOVING_AVERAGE_VOCABULARY = (
+    f"sma{{N}} / ema{{N}} for any integer N from {MOVING_AVERAGE_MIN_WINDOW} to "
+    f"{MOVING_AVERAGE_MAX_WINDOW} (for example sma60), derived from closing prices"
+)
+
+
+def moving_average_spec(name: str) -> tuple[str, int] | None:
+    """("sma"|"ema", window) for a derivable moving average, or None."""
+
+    match = _MOVING_AVERAGE.match(canonical_metric(name))
+    if match is None:
+        return None
+    window = int(match.group(2))
+    if not MOVING_AVERAGE_MIN_WINDOW <= window <= MOVING_AVERAGE_MAX_WINDOW:
+        return None
+    return (match.group(1), window)
+
 
 def derived_series_spec(name: str) -> tuple[str, str, int] | None:
     """(kind, base metric, window) for a store-derived metric, or None.
@@ -277,6 +311,42 @@ _BOOLEAN_WINDOW_RULES: dict[str, tuple[str, str, str, int, float]] = {
     "breakout_high_20": ("high", "max", ">=", 20, 0.995),
     "close_below_lower_band_recent": ("close", "min", "<=", 5, 1.0),
 }
+
+
+def condition_metric_inputs(name: str) -> tuple[str, ...]:
+    """The row metrics a condition operand is actually evaluated from.
+
+    A flag like `close_cross_above_sma20` and an alias like `bollinger_lower` are not
+    row keys; they are rules over `close`/`sma20` and a spelling of `bb_lower`. Callers
+    that judge data availability - which ta_* families to load, which operands the
+    snapshot is missing - used to look the raw name up and find nothing, so the trend
+    family was never read and the condition was then reported as unverifiable. One
+    expansion, shared by every such caller, so they cannot disagree about what a
+    condition needs.
+    """
+
+    metric = canonical_metric(name)
+    comparison = _BOOLEAN_COMPARISONS.get(metric)
+    if comparison is not None:
+        return (canonical_metric(comparison[0]), canonical_metric(comparison[2]))
+    window_rule = _BOOLEAN_WINDOW_RULES.get(metric)
+    if window_rule is not None:
+        return ("close", canonical_metric(window_rule[0]))
+    requirements = _RUNTIME_DERIVED_REQUIREMENTS.get(metric)
+    if requirements is not None:
+        return tuple(dict.fromkeys(canonical_metric(item) for item in requirements))
+    ratio = _DERIVED_RATIOS.get(metric)
+    if ratio is not None:
+        return tuple(dict.fromkeys((canonical_metric(ratio[0]), canonical_metric(ratio[1]))))
+    spec = derived_series_spec(metric)
+    if spec is not None:
+        return (spec[1],)
+    if metric not in _CURRENT and moving_average_spec(metric) is not None:
+        # sma60/ema60 are computed from the price path, so a bar's closes are the only
+        # input; asking the warehouse for a `sma60` column would find nothing. The
+        # published windows (sma20/50/200) stay warehouse metrics and keep their family.
+        return ("close",)
+    return (metric,)
 
 
 def supported_metrics() -> list[str]:
@@ -427,9 +497,13 @@ def compile_conditions(conditions: Sequence[Condition]) -> CompiledConditions | 
     rank_filters: list[tuple[str, float, bool]] = []
     warmup_bars = 1
     for condition in conditions:
-        # `consecutive` needs that many evaluated bars; `window` needs a full window.
+        # `consecutive` needs that many evaluated bars; `window` needs a full window;
+        # a derived sma60/ema60 needs its own window of closes before it exists.
         warmup_bars = max(
-            warmup_bars, int(condition.window or 1), int(condition.consecutive or 1)
+            warmup_bars,
+            int(condition.window or 1),
+            int(condition.consecutive or 1),
+            _moving_average_warmup(condition),
         )
         rank = _rank_filter(condition)
         if rank is not None:
@@ -466,6 +540,19 @@ def untranslatable_conditions(
     return tuple(unsupported)
 
 
+def _moving_average_warmup(condition: Condition) -> int:
+    """Bars a condition's derived moving averages need before they mean anything."""
+
+    windows = [1]
+    for operand in (condition.left, condition.right):
+        if not isinstance(operand, str):
+            continue
+        spec = moving_average_spec(operand)
+        if spec is not None:
+            windows.append(spec[1])
+    return max(windows)
+
+
 def _rank_filter(condition: Condition) -> tuple[str, float, bool] | None:
     """A cross-sectional top/bottom-percentile cut, or None if this is not one.
 
@@ -486,6 +573,7 @@ def _rank_filter(condition: Condition) -> tuple[str, float, bool] | None:
         metric not in _CURRENT
         and metric not in _FINANCIAL_METRICS
         and derived_series_spec(metric) is None
+        and moving_average_spec(metric) is None
     ):
         return None
     # gt/gte -> want the top of the distribution; lt/lte -> the bottom.
@@ -599,6 +687,8 @@ def _compile_one(condition: Condition) -> str | None:
         if low > high:
             return None
         return f"({low!r} <= {left} <= {high!r})"
+    if condition.operator in {ConditionOperator.CROSS_ABOVE, ConditionOperator.CROSS_BELOW}:
+        return _compile_cross(condition)
     if condition.operator not in _OPERATOR:
         return None
 
@@ -620,6 +710,52 @@ def _compile_one(condition: Condition) -> str | None:
     if condition.scale is not None:
         right = f"({right} * {float(condition.scale)!r})"
     return f"({left} {_OPERATOR[condition.operator]} {right})"
+
+
+def _compile_cross(condition: Condition) -> str | None:
+    """`a cross_above b`: a is above b now and was not on the previous bar.
+
+    A golden cross is the whole rule for "MACD 골든크로스에 매수" and "20일선이 60일선을
+    상향 돌파", and cross_above/cross_below have been in the grammar all along - they
+    were simply absent from `_OPERATOR`, so every such candidate was refused as
+    "unsupported execution semantics" before it could run.
+
+    The executor is PreparedFeatureStore._base_condition_matches, which reads both
+    operands off the previous bar exactly. This generated form can only look back at
+    OHLCV history, so an indicator's previous value reads as NaN and the test is simply
+    false there - conservative rather than approximating a cross with "is above".
+    """
+
+    if not isinstance(condition.right, str):
+        return None
+    left = _series_value(condition.left, None, None)
+    right = _series_value(condition.right, condition.window, condition.aggregate)
+    if left is None or right is None:
+        return None
+    previous_left = _previous_series_value(condition.left)
+    previous_right = _previous_series_value(condition.right)
+    if condition.scale is not None:
+        scale = float(condition.scale)
+        right = f"({right} * {scale!r})"
+        previous_right = f"({previous_right} * {scale!r})"
+    if condition.operator == ConditionOperator.CROSS_ABOVE:
+        return f"({left} > {right} and {previous_left} <= {previous_right})"
+    return f"({left} < {right} and {previous_left} >= {previous_right})"
+
+
+def _previous_series_value(metric: str) -> str:
+    """The prior bar's value of a metric, as far as the generated template can see it."""
+
+    metric = canonical_metric(metric)
+    history = _HISTORY.get(metric)
+    if history is not None:
+        # The template appends the current bar only after evaluating, so [-1] is
+        # yesterday.
+        return f"{history}[-1]"
+    spec = moving_average_spec(metric)
+    if spec is not None and spec[0] == "sma":
+        return f"_avg(closes[-{spec[1]}:])"
+    return 'float("nan")'
 
 
 def _boolean_is_asserted(condition: Condition) -> bool | None:
@@ -665,5 +801,19 @@ def _series_value(metric: str, window: int | None, aggregate: str | None) -> str
         # (the AST validator rejects every candidate it emits) and must be revisited
         # before it is relied on again.
         return metric
-    return _CURRENT.get(metric)
+    current = _CURRENT.get(metric)
+    if current is not None:
+        # The warehouse value wins for the windows it publishes (20/50/200).
+        return current
+    spec = moving_average_spec(metric)
+    if spec is None:
+        return None
+    kind, window = spec
+    if kind == "sma":
+        # `closes` holds prior bars only, so the current close completes the window.
+        return f"_avg(closes[-{window - 1}:] + [close])" if window > 1 else "close"
+    # An EMA is recursive and cannot be written as one expression over `closes`; read
+    # whatever the bar carries, which is NaN when absent so the test simply fails.
+    # PreparedFeatureStore, the evaluator that actually runs, derives it from the path.
+    return f'_ind(row, "{metric}")'
 

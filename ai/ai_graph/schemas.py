@@ -494,10 +494,30 @@ class ResearchCandidateV3(BaseModel):
     hypothesis: str = Field(min_length=1, max_length=800)
     counter_hypothesis: str = Field(min_length=1, max_length=800)
     entry_conditions: list[Condition] = Field(min_length=1, max_length=6)
-    exit_conditions: list[Condition] = Field(min_length=1, max_length=6)
+    # May be empty only when `holding_days` states the exit. "5일 뒤 매도" is a time
+    # exit, and encoding it as an always-true condition (close >= 0) produced a rule
+    # that sold on every bar; the field exists so that never has to be faked.
+    exit_conditions: list[Condition] = Field(default_factory=list, max_length=6)
+    # Close a position N trading sessions after it was opened, in addition to any
+    # exit condition.
+    holding_days: int | None = Field(default=None, ge=1, le=250)
+    # Re-evaluate the entry rule only every N sessions from the start of the window;
+    # holdings that no longer satisfy it are exited on the same dates. 21 ~ one month.
+    rebalance_interval_days: int | None = Field(default=None, ge=5, le=63)
     required_metrics: list[str] = Field(min_length=1, max_length=20)
     assumptions: list[str] = Field(min_length=1, max_length=10)
     source_ids: list[str] = Field(min_length=1, max_length=8)
+
+    # A named WICS sector the PIT universe is restricted to before the rule is applied.
+    # It is part of the sealed contract rather than re-derived from the query text, so
+    # what the backtest traded is exactly what the research node resolved.
+    sector: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def rule_states_an_exit(self) -> "ResearchCandidateV3":
+        if not self.exit_conditions and self.holding_days is None:
+            raise ValueError("candidate needs exit_conditions or holding_days")
+        return self
 
 
 class ResearchCandidateExecutionSpecV3(BaseModel):
@@ -802,6 +822,10 @@ class StrategyIR(BaseModel):
     ranking_metric: str | None = None
     ranking_direction: Literal["desc", "asc"] = "desc"
     execution_mode: Literal["event_driven", "scheduled_rotation"] = "event_driven"
+    # Time exit stated by the rule itself: close a position this many sessions after
+    # it opened. `scheduled_rotation` + CandidateParameters.rebalance_interval_days
+    # remains the one place the rebalance cadence lives.
+    holding_days: int | None = Field(default=None, ge=1, le=250)
 
 
 class CandidateParameters(BaseModel):

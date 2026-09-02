@@ -196,6 +196,8 @@ class PerformanceMethodManifest(BaseModel):
     eod_basis: str = Field(min_length=1)
     initial_capital: float = Field(gt=0)
     rebalance_timing: str = Field(min_length=1)
+    # Optional so results produced before time exits existed still validate.
+    holding_period: str | None = None
     fill_timing: str = Field(min_length=1)
     corporate_action_method: str = Field(min_length=1)
     cost_tax_slippage_liquidity: str = Field(min_length=1)
