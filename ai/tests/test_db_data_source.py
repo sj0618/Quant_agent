@@ -1539,7 +1539,11 @@ def test_fixed_window_uses_kst_calendar_sessions_and_manifest_values() -> None:
     # The length is bound, never interpolated, and defaults to one year.
     assert "make_interval(years => %s)" in connection.query
     assert connection.params == [1]
-    assert "feature.kis_adjusted_ohlcv_daily" not in connection.query
+    # The window ends on the last completed session that actually has a bar: between
+    # KST midnight and the morning ingestion the calendar is one session ahead of the
+    # price table, and ending there made the release profile reject every run.
+    assert "LEAST(" in connection.query
+    assert "max(time)::date FROM feature.kis_adjusted_ohlcv_daily" in connection.query
 
 
 def test_window_ends_on_the_last_closed_session_not_todays() -> None:
