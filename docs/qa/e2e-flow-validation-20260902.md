@@ -198,3 +198,9 @@ UI로 "반도체 섹터에서 RSI 30 이하 종목 매수"를 다시 넣었을 �
 - 반도체 섹터 실행의 종목 판정 0건은 마지막 세션에 RSI ≤ 30인 섹터 종목과 보유 중인 포지션이 없다는 뜻이다(엔진 최종 상태 기준). FE는 이 경우 "규칙상 오늘 해당 종목 없음"으로 표시한다.
 - node3 AI 스위트(874f0aa 스냅샷): 968 passed, 11 skipped.
 
+### 8.9 "리포트 저장 실패 (Analysis run is already completed with different content)" 배너
+
+사용자가 본 배너의 원인은 두 겹이다. (1) 백엔드 `complete_analysis_run_from_db`는 이미 완료된 run에 대해 AI 잡 결과에서 스냅샷을 다시 유도해 저장본과 비교했는데, 배포 사이에 AI 결과 스키마가 필드를 얻으면(holding_days, out_sample_max_drawdown 등) 같은 잡의 스냅샷이 달라져 409 `completion_payload_conflict`가 났다. 실사이트에서 f4e412e 시점에 저장된 리포트를 다시 저장하면 409, 스키마 변경 뒤 저장된 리포트는 200 `created:false`로 재현됐다. (2) FE는 클라이언트 라우터가 없어 화면 이동마다 재마운트되고, 완료된 잡을 매번 다시 저장하며, 실패하면 다음 폴링마다 무한 재시도했다.
+
+수정: 백엔드는 같은 사용자·같은 aiJobId의 완료된 run이면 스냅샷 비교 없이 기존 핸들을 돌려준다(불변 `app.analysis_result`는 절대 다시 쓰지 않음; 다른 aiJobId는 여전히 409). FE는 409 `completion_payload_conflict`를 "이미 저장됨"으로 처리하고, 그 밖의 실패는 5 s·20 s 백오프로 최대 2회만 재시도한 뒤 멈추며, 배너는 닫기 버튼이 있고 성공하면 지워진다. 테스트: backend unit 413, FE 54.
+

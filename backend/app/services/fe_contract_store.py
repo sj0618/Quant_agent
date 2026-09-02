@@ -1930,6 +1930,73 @@ async def _load_owned_run_for_completion(
     )
 
 
+async def _completed_run_replay_handle(
+    connection: Any,
+    *,
+    user_id: str,
+    run_id: str,
+    report_id: str,
+    ai_report_id: str,
+    request_ai_job_id: str | None,
+    run_analysis_result_id: str | None,
+) -> dict[str, Any] | None:
+    """Stored handle for a completion that already landed for this exact (user, run, AI job).
+
+    Completion is idempotent per AI job. The workspace re-saves the same finished job on
+    every remount, and the snapshot it derives from the AI result drifts whenever that
+    result schema gains a field between deploys - so comparing a freshly derived snapshot
+    with the persisted one turns a harmless replay into a 409. Returning the stored handle
+    here leaves the immutable analysis_result / report rows untouched. A completion that
+    carries a *different* AI job still falls through to the conflict checks below.
+    """
+    if request_ai_job_id is None:
+        return None
+    existing = await _fetch_one_from_connection(
+        connection,
+        """
+        SELECT report_id, run_id, user_id, analysis_result_id, summary, report_jsonb
+        FROM app.ai_backtest_report
+        WHERE report_id = :report_id
+        LIMIT 1
+        """,
+        {"report_id": ai_report_id},
+    )
+    if existing is None:
+        return None
+    document = _json_object(existing.get("report_jsonb"))
+    if _non_empty_text(_first_non_empty(existing.get("run_id"), document.get("runId"))) != run_id:
+        return None
+    existing_user_id = _non_empty_text(_first_non_empty(existing.get("user_id"), document.get("userId")))
+    if existing_user_id is not None and existing_user_id != user_id:
+        return None
+    existing_ai_job_id = _non_empty_text(_first_non_empty(document.get("aiJobId"), document.get("ai_job_id")))
+    if existing_ai_job_id is None or existing_ai_job_id != request_ai_job_id:
+        return None
+    # Only short-circuit a run whose three analysis_result_id columns are already linked and
+    # agree. A partially linked row (a half-done migration backfill) still needs the full
+    # path below, whose idempotent UPDATEs heal it; a disagreeing one still needs its 409.
+    linked = {
+        run_analysis_result_id,
+        _non_empty_text(existing.get("analysis_result_id")),
+        await _owned_report_analysis_result_id(connection, report_id=report_id, user_id=user_id),
+    }
+    if len(linked) != 1:
+        return None
+    analysis_result_id = linked.pop()
+    if analysis_result_id is None:
+        return None
+    final_report = await existing_report_queries.get_report(connection, report_id, user_id=user_id)
+    if final_report is None:
+        return None
+    return {
+        "runId": run_id,
+        "reportId": _non_empty_text(final_report.get("id")) or report_id,
+        "analysisResultId": analysis_result_id,
+        "status": "completed",
+        "created": False,
+    }
+
+
 async def _validate_completion_replay(
     connection: Any,
     *,
@@ -2327,6 +2394,19 @@ async def complete_analysis_run_from_db(
                     details={"runId": run_id, "status": run_status},
                     message="Analysis run cannot be completed from a terminal failure state",
                 )
+
+            if run_status == "completed":
+                replay_handle = await _completed_run_replay_handle(
+                    connection,
+                    user_id=user_id_param,
+                    run_id=run_id,
+                    report_id=report_id,
+                    ai_report_id=ai_report_id,
+                    request_ai_job_id=request_ai_job_id,
+                    run_analysis_result_id=_non_empty_text(run.get("analysis_result_id")),
+                )
+                if replay_handle is not None:
+                    return replay_handle
 
             requested_completed_at = _non_empty_text(
                 _first_non_empty(completion_data.get("completedAt"), completion_data.get("completed_at"))

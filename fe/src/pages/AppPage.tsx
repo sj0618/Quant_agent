@@ -40,6 +40,10 @@ const ANALYSIS_JOB_POLL_INTERVAL_MS = 2000;
 // job will never resolve on its own and the user needs to be told rather than left
 // watching a progress bar that can no longer move.
 const MAX_POLL_FAILURES = 3;
+// A report save that keeps failing must not retry forever: every retry re-raises the
+// save-failed banner on a workspace the user is already reading, and a save that failed
+// twice with backoff is not going to succeed on the third poll either.
+const REPORT_SAVE_RETRY_DELAYS_MS = [5_000, 20_000];
 // Wall-clock safety net. Polling only gives up when the request itself keeps failing;
 // a job that stays RUNNING forever (e.g. the server died mid-run, or a failure never got
 // recorded) returns clean 200s with result:null and would otherwise spin the progress bar
@@ -277,6 +281,11 @@ export function AppPage() {
   const pollAttemptsRef = useRef<Record<string, number>>({});
   // Jobs already written to the service DB, so a re-render does not save them twice.
   const persistedJobIdsRef = useRef<Set<string>>(new Set());
+  // Failed save attempts per job, capped by REPORT_SAVE_RETRY_DELAYS_MS.
+  const saveAttemptsRef = useRef<Record<string, number>>({});
+  // Bumped by a scheduled retry so the persist effect reruns without waiting for a poll:
+  // once every job has a result the polling loop stops replacing `analysisJobs`.
+  const [reportSaveRetry, setReportSaveRetry] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -433,6 +442,9 @@ export function AppPage() {
       try {
         const run = await createAnalysisRun(persistable);
         await completeAnalysisRun(run.id, persistable);
+        // A retry that lands has to take the banner down with it, or a save that failed
+        // once and succeeded on the retry still reads as failed for the rest of the page.
+        setReportSaveError(null);
       } catch (error) {
         // A 410 public_create_retired means the save endpoint itself was retired server
         // side: retrying on every future poll would just repeat the same permanent
@@ -441,17 +453,34 @@ export function AppPage() {
         if (error instanceof BackendApiError && error.status === 410 && error.code === "public_create_retired") {
           return;
         }
-        // Retry on the next result rather than on a loop - a failed save must not block
-        // the workspace the user is already looking at.
-        persistedJobIdsRef.current.delete(persistable.job_id);
+        // A 409 completion_payload_conflict means this exact job is already completed in
+        // the service DB - the report the user is after is saved. Only the snapshot the
+        // server re-derives differs (the AI result schema moved on since the first save),
+        // so this is a successful save, not a failure to report.
+        if (error instanceof BackendApiError && error.status === 409 && error.code === "completion_payload_conflict") {
+          setReportSaveError(null);
+          return;
+        }
         setReportSaveError(
           error instanceof Error
             ? `분석 결과를 리포트로 저장하지 못했습니다. (${error.message})`
             : "분석 결과를 리포트로 저장하지 못했습니다.",
         );
+        const attempts = (saveAttemptsRef.current[persistable.job_id] ?? 0) + 1;
+        saveAttemptsRef.current[persistable.job_id] = attempts;
+        const retryDelay = REPORT_SAVE_RETRY_DELAYS_MS[attempts - 1];
+        if (retryDelay === undefined) {
+          // Out of retries: leave the job marked persisted so nothing retries it again
+          // this session. A failed save must not block the workspace being read.
+          return;
+        }
+        window.setTimeout(() => {
+          persistedJobIdsRef.current.delete(persistable.job_id);
+          setReportSaveRetry((tick) => tick + 1);
+        }, retryDelay);
       }
     })();
-  }, [analysisJobs]);
+  }, [analysisJobs, reportSaveRetry]);
 
   // Derived above the loading/error returns below: hooks must run on every render, and
   // useAnalysisActivity would otherwise be skipped while the workspace template loads.
@@ -640,6 +669,9 @@ export function AppPage() {
                 <div className="warning-box warning-box--error" role="status">
                   <strong>리포트 저장 실패</strong>
                   <span>{reportSaveError} 화면의 결과는 그대로 사용할 수 있습니다.</span>
+                  <button aria-label="리포트 저장 실패 알림 닫기" onClick={() => setReportSaveError(null)} type="button">
+                    닫기 ✕
+                  </button>
                 </div>
               ) : null}
               {explorationReport && latestJob ? (
