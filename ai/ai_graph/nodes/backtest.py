@@ -144,9 +144,10 @@ DEFAULT_WALL_BUDGET_SECONDS = 540.0
 MAX_SELF_IMPROVEMENT_ROUNDS = 2
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
 BACKTEST_ENGINE_VERSION = "candidate-engine.v3"
-# v5 prevents cached summaries created before the metric availability contract from
-# re-exposing an engine-defaulted public metric as a measured zero.
-BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v5"
+# v6 adds the source-notional capacity claim to persisted summaries. Cached v5
+# evaluations predate that claim and could otherwise be reused as if capacity had
+# been checked (or not checked) under the new contract.
+BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v6"
 BACKTEST_CACHE_DIR_ENV = "AI_BACKTEST_CACHE_DIR"
 BACKTEST_CACHE_TTL_ENV = "AI_BACKTEST_CACHE_TTL_SECONDS"
 BACKTEST_CACHE_MAX_BYTES_ENV = "AI_BACKTEST_CACHE_MAX_BYTES"
@@ -284,6 +285,28 @@ def _performance_method_manifest(
     parameters = candidate.parameters
     cost_model = engine_summary.get("cost_model")
     costs = cost_model if isinstance(cost_model, Mapping) else {}
+    capacity = engine_summary.get("execution_capacity")
+    capacity_enabled = bool(capacity.get("enabled")) if isinstance(capacity, Mapping) else False
+    capacity_reason = (
+        str(capacity.get("reason_code"))
+        if isinstance(capacity, Mapping) and capacity.get("reason_code")
+        else None
+    )
+    capacity_clause = (
+        "execution_capacity=source_raw_notional_validated"
+        if capacity_enabled
+        else "execution_capacity=not_evaluated"
+        + (
+            f"({capacity_reason})"
+            if capacity_reason
+            else "(source_raw_notional_not_recorded)"
+        )
+    )
+    cost_liquidity = "cost_model=" + json.dumps(
+        costs, sort_keys=True, separators=(",", ":")
+    )
+    if costs:
+        cost_liquidity += "; " + capacity_clause
     candidate_rule = (
         str(parameters.blueprint_id or parameters.profile)
         if parameters is not None
@@ -295,6 +318,7 @@ def _performance_method_manifest(
         "dates": dates,
         "trade_count": engine_summary.get("effective_trade_count"),
         "initial_capital": engine_summary.get("initial_capital"),
+        "execution_capacity": capacity,
     }
     return {
         "evaluated_rule": candidate_rule,
@@ -319,9 +343,7 @@ def _performance_method_manifest(
             engine_summary.get("execution_timing") or MISSING_EXECUTION_ASSUMPTION
         ),
         "corporate_action_method": "engine_corporate_action_event_policy",
-        "cost_tax_slippage_liquidity": (
-            "cost_model=" + json.dumps(costs, sort_keys=True, separators=(",", ":"))
-        ),
+        "cost_tax_slippage_liquidity": cost_liquidity,
         "observations": len(dates),
         "trades": max(0, int(_summary_float_default(engine_summary, "effective_trade_count", 0.0))),
         "benchmark_method": "official_kospi_kosdaq_total_return_or_explicitly_unavailable",
@@ -960,6 +982,7 @@ class _CandidateBacktestSession:
                 strategy,
                 preparation_candidate,
                 available_ticker_count=_available_ticker_count(self.price_rows),
+                execution_capacity_enabled=_execution_capacity_enabled(self.price_rows),
             )
             engine_config = EngineBacktestRunConfig(
                 initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL,
@@ -1646,6 +1669,10 @@ def _evaluate_candidate_task(
     )
     enriched_candidate = candidate.model_copy(update={"metrics": metrics})
     engine_summary = dict(engine_result.summary)
+    execution_capacity_enabled = _execution_capacity_enabled(rows)
+    engine_summary["execution_capacity"] = _execution_capacity_metadata(
+        execution_capacity_enabled
+    )
     engine_summary["buy_signal_count"] = _signal_action_count(engine_result, "BUY")
     engine_summary["sell_signal_count"] = _signal_action_count(engine_result, "SELL")
     execution_audit = _execution_audit(engine_result)
@@ -1936,7 +1963,10 @@ def _fold_engine(
     }
     ohlcv_rows, metric_rows = _engine_market_rows(engine_rows)
     spec = _engine_strategy_spec(
-        strategy, candidate, available_ticker_count=_available_ticker_count(engine_rows)
+        strategy,
+        candidate,
+        available_ticker_count=_available_ticker_count(engine_rows),
+        execution_capacity_enabled=_execution_capacity_enabled(engine_rows),
     )
     prepared = prepare_engine_market_data(
         spec, ohlcv_rows=ohlcv_rows, metric_rows=metric_rows,
@@ -2176,11 +2206,33 @@ def _run_walk_forward_candidate_backtest(
                 }
             ),
         }
+    execution_capacity_enabled = _execution_capacity_enabled(rows)
     engine_summary = {
         "walk_forward_sample": _walk_forward_metadata(_walk_forward_sample(rows), policy),
         "walk_forward_policy": "rolling_selection_policy",
+        "initial_capital": CANONICAL_ANALYSIS_INITIAL_CAPITAL,
+        "execution_timing": "next_open",
+        "cost_model": {
+            "commission_pct": float(
+                strategy.risk_constraints.get("commission_pct", DEFAULT_COMMISSION_PCT)
+            ),
+            "tax_pct": float(strategy.risk_constraints.get("tax_pct", DEFAULT_TAX_PCT)),
+            "slippage_pct": float(
+                strategy.risk_constraints.get("slippage_pct", DEFAULT_SLIPPAGE_PCT)
+            ),
+        },
+        "effective_trade_count": len(fills),
+        "execution_capacity": _execution_capacity_metadata(
+            execution_capacity_enabled
+        ),
         "_storage_execution_ledger": _merge_storage_execution_ledgers(evaluation_ledgers),
     }
+    engine_summary["performance_method_manifest"] = _performance_method_manifest(
+        strategy,
+        selected,
+        rows,
+        engine_summary,
+    )
     result = CandidateBacktestResult(
         strategy_a=strategy,
         candidates=candidates,
@@ -2444,6 +2496,7 @@ def _run_candidate_backtest(
         strategy,
         candidate,
         available_ticker_count=_available_ticker_count(price_rows),
+        execution_capacity_enabled=_execution_capacity_enabled(price_rows),
     )
     return run_engine_backtest(
         engine_spec,
@@ -2581,7 +2634,7 @@ def _engine_market_rows(
         row_date = date.fromisoformat(str(raw["date"]))
         ticker = str(raw.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
         if raw_execution_declared:
-            required_raw_fields = ("raw_open", "raw_high", "raw_low", "raw_close", "raw_volume", "raw_notional")
+            required_raw_fields = ("raw_open", "raw_high", "raw_low", "raw_close", "raw_volume")
             missing = [field for field in required_raw_fields if raw.get(field) in (None, "")]
             if missing:
                 raise ValueError(
@@ -2592,7 +2645,12 @@ def _engine_market_rows(
             low = _finite_float(raw["raw_low"], "raw_low")
             close = _finite_float(raw["raw_close"], "raw_close")
             volume = _finite_float(raw["raw_volume"], "raw_volume")
-            parsed_raw_notional = _finite_float(raw["raw_notional"], "raw_notional")
+            raw_notional = raw.get("raw_notional")
+            parsed_raw_notional = (
+                None
+                if raw_notional in (None, "")
+                else _finite_float(raw_notional, "raw_notional")
+            )
         else:
             # Synthetic callers that predate the raw loader retain one self-consistent
             # series. Warehouse rows declare raw fields and therefore never reach here.
@@ -2627,6 +2685,40 @@ def _engine_market_rows(
         metric_rows[(row_date, ticker)] = metric_row
 
     return ohlcv_rows, metric_rows
+
+
+def _execution_capacity_enabled(price_rows: Sequence[Mapping[str, Any]]) -> bool:
+    """Require source-provided traded value before claiming fill capacity.
+
+    Raw OHLCV supports a costed next-open backtest. Raw traded value supports the
+    additional participation-capacity constraint. When it is absent, leave it absent
+    and disable only that constraint rather than creating a false close × volume value.
+    """
+
+    return bool(price_rows) and all(
+        row.get("raw_notional") not in (None, "") for row in price_rows
+    )
+
+
+def _execution_capacity_metadata(enabled: bool) -> dict[str, bool | str | None]:
+    """Record whether liquidity capacity was checked without inventing traded value."""
+
+    if enabled:
+        return {
+            "enabled": True,
+            "status": "source_raw_notional_validated",
+            "reason_code": None,
+            "detail": "Participation-capacity checks used source-provided traded value.",
+        }
+    return {
+        "enabled": False,
+        "status": "not_evaluated",
+        "reason_code": "raw_notional_source_missing_or_uncovered",
+        "detail": (
+            "Price execution used raw OHLCV, but participation-capacity checks were "
+            "not evaluated because source traded value is unavailable."
+        ),
+    }
 
 
 def _merge_generated_signals(
@@ -2666,6 +2758,7 @@ def _engine_strategy_spec(
     candidate: CodeCandidate,
     *,
     available_ticker_count: int | None = None,
+    execution_capacity_enabled: bool = True,
 ):
     return EngineStrategySpec(
         strategy_id=f"{strategy.strategy_id}_{candidate.candidate_id.lower()}",
@@ -2703,7 +2796,11 @@ def _engine_strategy_spec(
                 "slippage_pct": float(
                     strategy.risk_constraints.get("slippage_pct", DEFAULT_SLIPPAGE_PCT)
                 ),
-            }
+            },
+            # Capacity is a separate claim from price execution. The engine can run
+            # next-open fills using verified raw OHLCV even when source-provided KRX
+            # traded value is unavailable. Never invent it from close × volume.
+            "execution_capacity": {"enabled": execution_capacity_enabled},
         },
     )
 

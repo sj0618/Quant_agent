@@ -303,6 +303,15 @@ def _walk_forward_price_rows() -> list[dict[str, object]]:
                         "low": close * 0.99,
                         "close": close,
                         "volume": 1_000_000.0 + day * 1_000,
+                        # Production returns raw OHLCV but currently has no source
+                        # traded-value column. This must remain executable without
+                        # fabricating close × volume or claiming capacity validation.
+                        "raw_open": close * 0.997,
+                        "raw_high": close * 1.01,
+                        "raw_low": close * 0.99,
+                        "raw_close": close,
+                        "raw_volume": 1_000_000.0 + day * 1_000,
+                        "raw_notional": None,
                         "rsi": 30.0 + (day % 40),
                     }
                 )
@@ -358,6 +367,15 @@ def test_rolling_walk_forward_artifact_binds_actual_oos_result(monkeypatch, tmp_
     assert all(item["after_costs"] is True for item in candidate_results.values())
     assert all("costs" in item for item in candidate_results.values())
     assert result.backtest_payload["benchmark"]["primary"]["available"] is True
+    assert result.engine_summary["execution_capacity"]["enabled"] is False
+    assert (
+        result.engine_summary["execution_capacity"]["reason_code"]
+        == "raw_notional_source_missing_or_uncovered"
+    )
+    assert (
+        "execution_capacity=not_evaluated(raw_notional_source_missing_or_uncovered)"
+        in result.engine_summary["performance_method_manifest"]["cost_tax_slippage_liquidity"]
+    )
 
 
 def test_unsafe_rolling_candidate_artifact_uses_its_actual_unavailable_reason(
