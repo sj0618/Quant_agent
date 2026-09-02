@@ -46,7 +46,15 @@ RULE_DRAFT_SCHEMA_VERSION = "research-rule-draft.v1"
 STRATEGY_EXECUTION_SPEC_VERSION = "strategy-execution-spec.v1"
 EXPLORATION_EXECUTION_SPEC_VERSION = "exploration-execution-spec.v2"
 RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION = RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3
-RULE_DRAFT_POLICY_HASH = hashlib.sha256(
+# This value binds a signed, browser-submitted execution contract to the version of
+# the contract rules that issued it. Raw natural-language requests bypass this token
+# path and are resolved by the research node inside their durable job. Keep the
+# earlier digest valid until its short token TTL has elapsed so an already-issued
+# browser token does not turn into a false 409 during a rolling deployment.
+RULE_DRAFT_CONTRACT_HASH = hashlib.sha256(
+    b"quantagent-research-contract-v1"
+).hexdigest()
+_LEGACY_RULE_DRAFT_CONTRACT_HASH = hashlib.sha256(
     b"quantagent-research-only-preflight-v1"
 ).hexdigest()
 RULE_DRAFT_HMAC_SECRET_ENV = "AI_RULE_DRAFT_HMAC_SECRET"
@@ -361,7 +369,7 @@ class RuleDraftSigner:
             "iat": int(issued_at.timestamp()),
             "key_version": self._key_version,
             "nonce": str(uuid4()),
-            "policy_hash": RULE_DRAFT_POLICY_HASH,
+            "policy_hash": RULE_DRAFT_CONTRACT_HASH,
             "rule_digest": canonical_rule_digest(rule),
             "schema_version": RULE_DRAFT_SCHEMA_VERSION,
             "user_id": user_id,
@@ -401,7 +409,10 @@ class RuleDraftSigner:
             raise DraftTokenValidationError("draft_invalid")
         if claims.get("schema_version") != RULE_DRAFT_SCHEMA_VERSION:
             raise DraftTokenValidationError("draft_invalid")
-        if claims.get("policy_hash") != RULE_DRAFT_POLICY_HASH:
+        if claims.get("policy_hash") not in {
+            RULE_DRAFT_CONTRACT_HASH,
+            _LEGACY_RULE_DRAFT_CONTRACT_HASH,
+        }:
             raise DraftTokenValidationError("draft_invalid")
         if claims.get("user_id") != user_id:
             raise DraftTokenValidationError("draft_user_mismatch")
@@ -595,7 +606,7 @@ def build_rule_draft(
         clarifications=clarifications,
         is_executable=executable,
         authoring_method=authoring_method,
-        policy_hash=RULE_DRAFT_POLICY_HASH,
+        policy_hash=RULE_DRAFT_CONTRACT_HASH,
         expires_at=signed.expires_at,
         draft_token=signed.token,
         strategy_execution_spec=rule if executable else None,
@@ -718,7 +729,7 @@ def _build_exploration_draft(
         clarification_required=False,
         is_executable=True,
         authoring_method="deterministic",
-        policy_hash=RULE_DRAFT_POLICY_HASH,
+        policy_hash=RULE_DRAFT_CONTRACT_HASH,
         expires_at=signed.expires_at,
         draft_token=signed.token,
         strategy_execution_spec=spec,
@@ -757,7 +768,7 @@ def _build_researched_draft(
         clarification_required=False,
         is_executable=True,
         authoring_method="llm",
-        policy_hash=RULE_DRAFT_POLICY_HASH,
+        policy_hash=RULE_DRAFT_CONTRACT_HASH,
         expires_at=signed.expires_at,
         draft_token=signed.token,
         strategy_execution_spec=spec,

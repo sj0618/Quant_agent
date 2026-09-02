@@ -232,7 +232,21 @@ def test_confirmed_execution_spec_is_compiled_without_reinterpretation(
     def fail_reinterpretation(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("confirmed execution conditions must not be reinterpreted")
 
+    class CompiledResearch:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "provider": "test",
+                "interpretation": "confirmed execution contract",
+                "supporting_rationale": ["test-only compile output"],
+                "counterpoints": ["test-only counterpoint"],
+                "limitations": ["test-only limitation"],
+            }
+
     monkeypatch.setattr(graph_module, "build_strategy_spec", fail_reinterpretation)
+    # This regression is about compiling the confirmed conditions exactly once.  It
+    # must not make an AOAI request; live-provider behavior belongs to the explicitly
+    # opt-in live smoke tests.
+    monkeypatch.setattr(graph_module, "compile_research", lambda **_kwargs: CompiledResearch())
     result = graph_module.research_node(
         {
             "user_query": "사용자가 확인한 전략",
