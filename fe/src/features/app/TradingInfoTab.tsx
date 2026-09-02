@@ -16,7 +16,7 @@ export function TradingInfoTab({ candidates }: TradingInfoTabProps) {
         <Card className="list-head">
           <div>
             <h1>매매종목 정보 <Badge variant="soft">총 0건</Badge></h1>
-            <p>현재 AI 응답에는 종목별 추천 데이터가 없습니다.</p>
+            <p>오늘은 규칙에 해당하는 종목이 없습니다 (신호 0건). 백테스트 결론과 성과는 위 카드에서 확인할 수 있습니다.</p>
           </div>
         </Card>
       </div>
