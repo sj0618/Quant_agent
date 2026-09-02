@@ -66,7 +66,7 @@ MAX_BACKTEST_LOOKBACK_YEARS = 3
 # The PIT window holds every common stock that was ever a member (1,717 over five
 # years).  Loading all of them is what made the read unaffordable, so it is capped by
 # liquidity measured *before* the window - see _fetch_backtest_universe.
-DEFAULT_BACKTEST_UNIVERSE_MAX_TICKERS = 200
+DEFAULT_BACKTEST_UNIVERSE_MAX_TICKERS = 100
 UNIVERSE_RANKING_SESSIONS = 60
 DEFAULT_L4_EVIDENCE_LIMIT = 5
 # A broad screen can match many names, but recommendations never define historical
@@ -498,9 +498,29 @@ class PostgresPipelineDataSource:
                     # for a screen that legitimately matched nothing today it doubled the
                     # cost of the request and pushed it into a statement timeout.
                     if not already_screened:
-                        screening_candidates, screening_relaxation = self._screen_with_relaxation(
-                            conn, query
-                        )
+                        # The current-day screen and the PIT market load are independent
+                        # reads; serialising them cost ~9 s per request. Screen on a
+                        # second connection while this one loads the backtest market.
+                        parallel_screening_backtest = True
+                        with ThreadPoolExecutor(max_workers=1) as executor:
+                            screening = executor.submit(
+                                self._screen_on_its_own_connection, query
+                            )
+                            pit_market = self._load_pit_market(
+                                conn,
+                                backtest_window,
+                                query,
+                                indicator_families,
+                                requires_financials,
+                                timings,
+                                compact_price_rows=compact_execution_rows,
+                            )
+                            (
+                                screening_candidates,
+                                screening_relaxation,
+                                screening_timings,
+                            ) = screening.result()
+                        timings.update(screening_timings)
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
                         if screening_candidates

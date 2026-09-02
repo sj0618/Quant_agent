@@ -150,7 +150,7 @@ SERVICE_DB_ARCHIVE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgr
 | 환경변수 | 기본값 | 뜻 |
 |---|---|---|
 | `AI_BACKTEST_LOOKBACK_YEARS` | `1` | 마지막 완료 KST 세션에서 거슬러 올라가는 백테스트 창의 길이(년). `1~3`으로 clamp 되며, 범위 밖 값은 배포를 죽이는 대신 잘린다. 창 길이는 정책 id(`krx_pit_common_stock_{N}y_kst_settled_session_v3`)에 그대로 실린다 |
-| `AI_BACKTEST_UNIVERSE_MAX_TICKERS` | `200` | 백테스트가 적재할 PIT 보통주 상한. 창 **시작 직전** 60세션의 평균 거래대금(`adj_close × adj_volume`)으로 순위를 매겨 상위 N종만 남긴다. 창 시작 이전 정보만 쓰므로 look-ahead가 아니고, 창 안에서 상장폐지된 종목은 그대로 남는다(생존편향 방지) |
+| `AI_BACKTEST_UNIVERSE_MAX_TICKERS` | `100` | 백테스트가 적재할 PIT 보통주 상한. 창 **시작 직전** 60세션의 평균 거래대금(`adj_close × adj_volume`)으로 순위를 매겨 상위 N종만 남긴다. 창 시작 이전 정보만 쓰므로 look-ahead가 아니고, 창 안에서 상장폐지된 종목은 그대로 남는다(생존편향 방지) |
 
 ### 요청 전역 deadline
 

@@ -203,7 +203,7 @@ PY
 | in-memory debug/job store | `AI_JOB_STORE=memory` |
 | persistent gate | `AI_JOB_STORE=persistent`는 `/api-status`에서 requested/active/fallback로 추적 |
 
-## PIT 유니버스: 1년 창 + 거래대금 상위 200종
+## PIT 유니버스: 1년 창 + 거래대금 상위 100종
 
 > 멤버십은 `core.symbol_listing_history`(상장 구간) + `core.symbol_security_type_history`(보통주 분류)의 **창과 겹치는 구간**으로 정한다. `mart.common_stock_universe_asof` 뷰는 security-type 이력이 2026-08-11부터만 있어 그 이전 날짜에는 멤버를 하나도 돌려주지 않았고, 그래서 "5년 PIT 유니버스"가 사실상 오늘 상장 종목이었다(생존자 편향).
 

@@ -92,18 +92,18 @@ def test_window_policy_id_carries_the_lookback_it_was_produced_under() -> None:
 
 def test_universe_ranks_by_pre_window_traded_value_and_caps_in_the_database() -> None:
     connection = RecordingConnection([
-        {"symbol": f"{i:06d}", "window_member_count": 1_717} for i in range(200)
+        {"symbol": f"{i:06d}", "window_member_count": 1_717} for i in range(100)
     ])
 
     universe, descriptor = _source()._fetch_backtest_universe(connection, WINDOW)
 
-    assert len(universe) == 200
+    assert len(universe) == 100
     # The database ranks and caps; returning all 1,717 members to sort them in Python
     # is the load this cap exists to avoid.
     assert "avg(p.adj_close * p.adj_volume)" in connection.query
     assert "ORDER BY traded_value DESC NULLS LAST" in connection.query
     assert "LIMIT %(cap)s" in connection.query
-    assert connection.params["cap"] == 200
+    assert connection.params["cap"] == 100
     assert connection.params["ranking_sessions"] == 60
     # Point in time: the ranking window ends at the window start, so the selection uses
     # nothing that happened during the period being tested.

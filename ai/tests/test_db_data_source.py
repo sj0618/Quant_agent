@@ -1128,7 +1128,7 @@ def test_backtest_universe_is_lifecycle_pit_bounded_to_fixed_window() -> None:
         "ranking_metric": "avg_traded_value_adj_close_x_adj_volume",
         "ranking_sessions": 60,
         "ranking_window_end": "2021-08-12",
-        "max_tickers": 200,
+        "max_tickers": 100,
         "source": "core.symbol_listing_history",
         "listing_provenance": "core.symbol_listing_history",
         "delisting_policy": "official-event-then-final-close-v1",
