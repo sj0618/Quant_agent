@@ -549,14 +549,17 @@ class PostgresPipelineDataSource:
                 # Current candidates are recommendation context only.  Filter them
                 # against the historical universe, but always trade the PIT member.
                 # This prevents a present-day screen from entering historical results.
-                candidates = _backtest_ticker_pool(
-                    screening_candidates, self.config.backtest_max_tickers
-                )
+                # Intersect with the historical universe BEFORE capping the pool: with
+                # a liquidity-capped universe, capping first left the pool full of
+                # names the backtest never traded and the recommendation list empty.
                 pit_set = set(tickers)
-                excluded_screening_candidate_count = sum(
-                    1 for item in candidates if item not in pit_set
-                )
-                recommended = [item for item in candidates if item in pit_set]
+                in_universe = [
+                    item
+                    for item in screening_candidates
+                    if str(item.get("ticker") or "").zfill(6) in pit_set
+                ]
+                excluded_screening_candidate_count = len(screening_candidates) - len(in_universe)
+                recommended = _backtest_ticker_pool(in_universe, self.config.backtest_max_tickers)
                 ticker = tickers[0]
                 universe_descriptor["excluded_screening_candidate_count"] = (
                     excluded_screening_candidate_count
