@@ -12,6 +12,7 @@ from ai_graph.validation_gates import (
     AI_VALIDATION_GATES_ENV,
     DEFAULT_MODE,
     ENFORCED,
+    RELEASE_DEFAULT_MODE,
     REPORT_ONLY,
     objective_floor_is_enforced,
     validation_gate_mode,
@@ -36,10 +37,25 @@ def _failing_result() -> SimpleNamespace:
     )
 
 
-def test_the_test_phase_default_is_report_only() -> None:
+def test_the_dev_default_is_report_only() -> None:
     assert DEFAULT_MODE == REPORT_ONLY
     assert validation_gate_mode({}) == REPORT_ONLY
     assert objective_floor_is_enforced({}) is False
+
+
+def test_a_release_profile_enforces_the_floor_by_default() -> None:
+    # D-1: production never silently ships the report-only floor. Either release
+    # signal defaults to enforced; an explicit AI_VALIDATION_GATES still wins.
+    assert RELEASE_DEFAULT_MODE == ENFORCED
+    assert validation_gate_mode({"APP_ENV": "production"}) == ENFORCED
+    assert validation_gate_mode({"AI_RELEASE_PROFILE": "release"}) == ENFORCED
+    assert objective_floor_is_enforced({"APP_ENV": "production"}) is True
+    assert (
+        validation_gate_mode(
+            {"APP_ENV": "production", AI_VALIDATION_GATES_ENV: REPORT_ONLY}
+        )
+        == REPORT_ONLY
+    )
 
 
 def test_one_variable_puts_the_floor_back_in_the_path() -> None:

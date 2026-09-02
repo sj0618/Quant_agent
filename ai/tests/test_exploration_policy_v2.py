@@ -9,7 +9,6 @@ from fastapi.testclient import TestClient
 
 from ai_graph.api import (
     ANALYSIS_JOB_RESEARCH_APPENDIX_PATH,
-    ANALYSIS_JOBS_PATH,
     SPEC_STRATEGY_PARSE_PATH,
     _dispatch_research_appendix_outbox,
     create_app,
@@ -18,8 +17,8 @@ from ai_graph.auth import DisabledSessionResolver
 from ai_graph.exploration_policy import (
     ActiveExplorationPolicyV2,
     ExplorationCostModelV2,
-    ExplorationPolicyV2,
     ExplorationPolicyUnavailableError,
+    ExplorationPolicyV2,
     ExplorationValidationV2,
     canonical_exploration_policy_hash,
     load_active_exploration_policy_from_env,
@@ -325,9 +324,18 @@ def test_fixture_source_does_not_publish_base_report_v2() -> None:
     )
 
 
-def test_production_base_report_admission_does_not_require_live_research_provider(
+def test_production_automatic_strategy_requires_live_research_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Contract determination (2026-09-02): ``ce6f1a3`` ("seal AOAI researched
+    # strategy specs before backtest") deliberately removed the earlier
+    # provider-free exploration fallback. In production an unfamiliar
+    # ("automatic") strategy request must be confirmed through live AI research
+    # first; with no research provider configured the parse endpoint now fails
+    # closed with 503 ``strategy_research_unavailable`` instead of admitting a
+    # base report from a published exploration policy. This replaces the former
+    # ``..._does_not_require_live_research_provider`` expectation, which encoded
+    # the reversed (pre-seal) contract and had no coverage after the guard landed.
     monkeypatch.setenv("APP_ENV", "production")
     for key in ("AI_LLM_PROVIDER", "AI_AOAI_RESPONSES_URL", "AI_AOAI_API_KEY"):
         monkeypatch.delenv(key, raising=False)
@@ -363,16 +371,7 @@ def test_production_base_report_admission_does_not_require_live_research_provide
         SPEC_STRATEGY_PARSE_PATH,
         json={"natural_language": "돈 벌 수 있는 전략 만들어줘"},
     )
-    assert parsed.status_code == 200
-    draft = parsed.json()
-    admitted = client.post(
-        ANALYSIS_JOBS_PATH,
-        json={
-            "parse_token": draft["parse_token"],
-            "client_idempotency_key": "provider-free-exploration",
-            "spec_version": draft["spec_version"],
-            "spec_hash": draft["spec_hash"],
-            "strategy_execution_spec": draft["strategy_execution_spec"],
-        },
-    )
-    assert admitted.status_code == 201
+    assert parsed.status_code == 503
+    detail = parsed.json()["detail"]
+    assert detail["code"] == "strategy_research_unavailable"
+    assert "live_provider_configuration" in detail["checks"]

@@ -84,7 +84,7 @@ def test_build_daily_digest_composes_all_sections_for_three_strategies() -> None
     assert len(report.strategy_cards) == 3
     assert report.comparison_rows[0].status == "주목"
     assert report.comparison_rows[1].status == "유지"
-    assert report.comparison_rows[2].status == "관망"
+    assert report.comparison_rows[2].status == "매도"
     assert "BUY" in report.overall_summary[0]
     assert report.ai_overall_comment
     assert report.footer

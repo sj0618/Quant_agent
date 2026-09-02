@@ -20,7 +20,7 @@ MAX_DIGEST_STRATEGIES = 3
 _STATUS_BY_SIGNAL: dict[str, str] = {
     "BUY": "주목",
     "HOLD": "유지",
-    "DROP": "관망",
+    "SELL": "매도",
     "NO_RECOMMENDATION": "근거 부족",
 }
 
@@ -87,7 +87,7 @@ def build_overall_summary(
     total = len(strategies)
     buy_count = sum(1 for row in comparison_rows if row.today_signal == "BUY")
     hold_count = sum(1 for row in comparison_rows if row.today_signal == "HOLD")
-    drop_count = sum(1 for row in comparison_rows if row.today_signal == "DROP")
+    sell_count = sum(1 for row in comparison_rows if row.today_signal == "SELL")
     unavailable_count = sum(
         1 for row in comparison_rows if row.today_signal == "NO_RECOMMENDATION"
     )
@@ -97,8 +97,8 @@ def build_overall_summary(
     summary = [f"총 {total}개 전략 중 {buy_count}개 전략에서 BUY 신호가 발생했습니다."]
     if hold_count:
         summary.append(f"{hold_count}개 전략은 HOLD 상태입니다.")
-    if drop_count:
-        summary.append(f"{drop_count}개 전략은 DROP(비중 축소) 상태입니다.")
+    if sell_count:
+        summary.append(f"{sell_count}개 전략은 SELL(매도) 상태입니다.")
     if unavailable_count:
         summary.append(f"{unavailable_count}개 전략은 L4 근거 부족으로 추천을 생성하지 않았습니다.")
     summary.append(f"최근 백테스트 기준 평균 수익률은 {avg_return * 100:.1f}%, 평균 MDD는 {avg_mdd * 100:.1f}%입니다.")

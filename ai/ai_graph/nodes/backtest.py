@@ -30,7 +30,9 @@ from ai_graph.nodes.position_sizing import (
     required_max_position_pct,
 )
 from ai_graph.progress import (
+    AnalysisCancelled,
     deadline_remaining_seconds,
+    raise_if_cancelled,
     raise_if_past_deadline,
     report_activity,
 )
@@ -46,6 +48,7 @@ from ai_graph.schemas import (
 )
 from ai_graph.schemas import StrategySpec as AIStrategySpec
 from ai_graph.security.ast_validator import validate_backtest_code
+from ai_graph.source_manifest import is_release_profile
 from ai_graph.validation_gates import objective_floor_is_enforced, validation_gate_mode
 
 _logger = logging.getLogger(__name__)
@@ -149,6 +152,10 @@ BACKTEST_CACHE_TTL_ENV = "AI_BACKTEST_CACHE_TTL_SECONDS"
 BACKTEST_CACHE_MAX_BYTES_ENV = "AI_BACKTEST_CACHE_MAX_BYTES"
 DEFAULT_CACHE_TTL_SECONDS = 86_400
 DEFAULT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+# How many stores between disk sweeps. Cleanup no longer runs on construction, so a
+# fresh session never scans the whole cache dir; the sweep is amortized across writes.
+# ponytail: write-count amortization, switch to a byte counter if TTL eviction must be prompt.
+CACHE_CLEANUP_WRITE_INTERVAL = 64
 PRICE_FIELD_NAMES = frozenset(
     {
         "date",
@@ -763,16 +770,29 @@ def _evaluate_candidate_worker(
     )
 
 
+class BacktestCacheConfigurationError(RuntimeError):
+    """Raised when the disk cache directory is not configured under a release profile."""
+
+
 class _DiskEvaluationCache:
     def __init__(self) -> None:
         configured = os.getenv(BACKTEST_CACHE_DIR_ENV)
+        if not configured and is_release_profile():
+            # A shared /tmp fallback under a release profile silently mixes cache
+            # entries across deployments and is wiped by the host at will. Fail
+            # closed and make the operator point at a persistent directory.
+            raise BacktestCacheConfigurationError(
+                f"{BACKTEST_CACHE_DIR_ENV} must point at a persistent directory under a "
+                "release profile; refusing to fall back to a shared temp directory."
+            )
         self.root = (
             Path(configured) if configured else Path(gettempdir()) / "quantagent-backtest-v2"
         )
         self.root.mkdir(parents=True, exist_ok=True)
         self.ttl_seconds = _positive_int_env(BACKTEST_CACHE_TTL_ENV, DEFAULT_CACHE_TTL_SECONDS)
         self.max_bytes = _positive_int_env(BACKTEST_CACHE_MAX_BYTES_ENV, DEFAULT_CACHE_MAX_BYTES)
-        self._cleanup()
+        # No sweep on construction: cleanup is amortized across writes in store().
+        self._writes_since_cleanup = 0
 
     def load(
         self,
@@ -851,9 +871,14 @@ class _DiskEvaluationCache:
         try:
             temporary.write_text(encoded, encoding="utf-8")
             os.replace(temporary, path)
-            return path.stat().st_size
+            size = path.stat().st_size
         finally:
             temporary.unlink(missing_ok=True)
+        self._writes_since_cleanup += 1
+        if self._writes_since_cleanup >= CACHE_CLEANUP_WRITE_INTERVAL:
+            self._writes_since_cleanup = 0
+            self._cleanup()
+        return size
 
     def _cleanup(self) -> None:
         now = time.time()
@@ -1178,6 +1203,15 @@ class _CandidateBacktestSession:
         }
         pending: set[Future[_CandidateTaskResult]] = set(futures)
         while pending:
+            # Stop before the next wave when the run was cancelled, so a cancel does
+            # not have to wait for every already-queued candidate to finish.
+            try:
+                raise_if_cancelled()
+            except AnalysisCancelled:
+                self._terminate_executor()
+                for unresolved in pending:
+                    unresolved.cancel()
+                raise
             remaining_seconds = deadline - time.perf_counter()
             if remaining_seconds <= 0:
                 break

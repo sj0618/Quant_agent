@@ -40,6 +40,10 @@ class QuantAgentState(TypedDict, total=False):
     backtest_code: dict[str, Any]
     backtest: dict[str, Any]
     signal: dict[str, Any]
+    # Judge-derived per-stock action produced by the signal node and read by the
+    # risk manager and report nodes. Declared as its own channel so the primary
+    # LangGraph path can accept the node update instead of raising on an unknown key.
+    investment_signal: dict[str, Any]
     risk: dict[str, Any]
     risk_context: dict[str, Any]
     report: dict[str, Any]
