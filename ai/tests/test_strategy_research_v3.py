@@ -313,6 +313,47 @@ def test_graph_compiles_the_sealed_research_conditions_without_a_template_substi
     assert strategy.risk_constraints["research_snapshot_hash"] == spec.research_snapshot_hash
 
 
+def test_sealed_research_skips_non_authoritative_current_screening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Current screening cards must not delay the V3 PIT backtest path.
+
+    A present-day screen is display enrichment only. The historical execution still
+    receives the full PIT universe through the data loader; this checks that the graph
+    asks that loader not to issue the unrelated current-screen query as well.
+    """
+
+    from ai_graph.graph import data_node
+
+    spec = research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=_ResearchClient(_donchian_response()),
+    )
+    captured: dict[str, object] = {}
+
+    def stop_after_capture(
+        query: str, trace_id: str, *, screen_current: bool = True
+    ) -> object:
+        captured.update(
+            {"query": query, "trace_id": trace_id, "screen_current": screen_current}
+        )
+        raise RuntimeError("data loader captured")
+
+    monkeypatch.setattr("ai_graph.graph.load_pipeline_data_from_env", stop_after_capture)
+
+    with pytest.raises(RuntimeError, match="data loader captured"):
+        data_node(
+            {
+                "user_query": "돈치안 채널 돌파 전략으로 검증해줘",
+                "trace_id": "sealed-v3-screening",
+                "execution_spec": spec.model_dump(mode="json"),
+            }
+        )
+
+    assert captured["screen_current"] is False
+
+
 def test_data_plan_reads_the_sealed_ast_not_only_the_researcher_metric_summary() -> None:
     from ai_graph.graph import _data_requirements_from_sealed_spec
 
