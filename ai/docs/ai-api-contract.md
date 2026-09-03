@@ -209,10 +209,12 @@ signal/rationale to `trade_signals`. This AI task does not create or mutate
 those DB tables.
 
 When `user_payload.performance.reliability.status` is `insufficient`, the public
-performance projection is explicitly unavailable: `is_available` is `false`,
-`metrics` and `equity_curve` are empty/unset, and every published metric detail has
-`is_available=false`. Positive values from an older stored result are removed at the
-API response boundary as well.
+performance projection is still published with every number it produced: `metrics`,
+`equity_curve`, and metric details stay as computed. The verdict travels with it -
+`limitations[0]` is the fixed "표본이 부족해 아래 수치는 참고용입니다." line, followed by
+`reliability.reasons` naming each sample check that fell short (trading days, ticker
+count, fixture source). Only a stale source or a missing engine method manifest makes
+the projection `unavailable`.
 
 ## StrategySpec
 

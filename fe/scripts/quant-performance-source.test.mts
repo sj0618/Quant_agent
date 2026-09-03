@@ -61,15 +61,21 @@ test("benchmark series requires an available real curve and never a zero placeho
   assert.doesNotMatch(`${adapter}\n${overview}\n${performance}`, /\?\? "KOSPI200"/);
 });
 
-test("insufficient reliability hides numbers and explains sample limits", async () => {
-  const [adapter, performance] = await Promise.all([
+test("insufficient reliability keeps numbers visible and explains sample limits", async () => {
+  const [adapter, overview, performance] = await Promise.all([
     source("../src/api/quantAgentClient.ts"),
+    source("../src/features/app/OverviewTab.tsx"),
     source("../src/features/app/PerformanceTab.tsx"),
   ]);
 
-  assert.match(adapter, /reliability\?\.status === "insufficient"/);
-  assert.match(adapter, /isInsufficient\s*\?\s*\[\]/);
-  assert.match(performance, /표본이 너무 작아 수익률·샤프·낙폭 같은 숫자를 숨겼습니다/);
+  // A small sample is a caveat on the result, not a reason to blank it: nothing may swap
+  // the metrics, curve, comparison rows, or overview tiles for an empty value on it.
+  assert.doesNotMatch(adapter, /isInsufficient/);
+  assert.doesNotMatch(adapter, /공개하지 않습니다/);
+  assert.doesNotMatch(overview, /"표본 부족"/);
+  assert.doesNotMatch(performance, /숨겼습니다/);
+  assert.match(overview, /표본 부족 · 참고용/);
+  assert.match(performance, /참고용/);
   assert.match(performance, /row_count/);
   assert.match(performance, /ticker_count/);
   assert.match(performance, /trading_days/);
@@ -103,18 +109,20 @@ test("generated strategies stay visible as pre-backtest blueprints with derivati
   assert.match(performance, /indicator\.customization/);
 });
 
-test("a recommendation score never shows a numeric grade for a run the gate rejected", async () => {
-  const adapter = await source("../src/api/quantAgentClient.ts");
+test("a recommendation score stays numeric when the gate fails, with the gate reason beside it", async () => {
+  const [adapter, appPage, overview] = await Promise.all([
+    source("../src/api/quantAgentClient.ts"),
+    source("../src/pages/AppPage.tsx"),
+    source("../src/features/app/OverviewTab.tsx"),
+  ]);
 
-  // One shared label, used at both places that turn a confidence into a recommendation
-  // score, so "10.0 / 10" can never be printed for a strategy the gate marked unvalidated -
-  // and the fallback is a conclusion ("보류"), never a blank string or "산출 안 함".
-  assert.match(adapter, /const RECOMMENDATION_SCORE_HOLD_LABEL = "보류";/);
+  // A failed gate is reported, not hidden: the score is never swapped for a label or a
+  // blank, and the gate's own reason - which metric fell short - renders next to it.
+  assert.doesNotMatch(adapter, /RECOMMENDATION_SCORE_HOLD_LABEL/);
   assert.doesNotMatch(adapter, /산출 안 함/);
-  const holdLabelUses = adapter.match(/RECOMMENDATION_SCORE_HOLD_LABEL/g) ?? [];
-  assert.ok(holdLabelUses.length >= 3, "expected the shared label declared once and used at both score builders");
-  assert.match(adapter, /gateValidated\s*=\s*result\?\.user_payload\.recommendation_gate\?\.validated\s*\?\?\s*true/);
-  assert.match(adapter, /gateValidated\s*=\s*result\.user_payload\.recommendation_gate\?\.validated\s*\?\?\s*true/);
+  assert.doesNotMatch(adapter, /gateValidated/);
+  assert.match(appPage, /recommendationGate\.reason/);
+  assert.match(overview, /백테스트 목표 기준 미달 · 참고용/);
 });
 
 test("overview total return and Sharpe tiles read the same out-of-sample figures as the chart", async () => {

@@ -4,6 +4,7 @@ from ai_graph import graph, quant_performance
 from ai_graph.nodes.backtest import _performance_method_manifest
 from ai_graph.quant_explanations import metric_explanation, metric_registry_provenance
 from ai_graph.quant_performance import (
+    INSUFFICIENT_SAMPLE_LIMITATION,
     build_public_backtest_performance,
     project_public_performance,
 )
@@ -449,7 +450,9 @@ def test_public_performance_reliability_boundary_cases() -> None:
     assert no_rows is not None
     assert no_rows.reliability is not None
     assert no_rows.reliability.status == "insufficient"
-    assert all(item.is_available is False for item in no_rows.metric_details)
+    # The numbers stay published; only the verdict says the sample was too small.
+    assert no_rows.is_available is True
+    assert any(item.is_available for item in no_rows.metric_details)
     for detail in no_rows.metric_details:
         registry = metric_registry_provenance(detail.key)
         assert detail.registry_version == registry["registry_version"]
@@ -597,33 +600,46 @@ def test_graph_public_performance_alias_points_to_quant_module() -> None:
     )
 
 
-def test_public_projection_removes_every_metric_and_chart_for_insufficient_data() -> None:
+def test_public_projection_keeps_every_metric_and_chart_for_insufficient_data() -> None:
+    """A too-small sample is reported as a limitation, not by blanking the result."""
+
     projection = project_public_performance(
         _build_payload(
             BacktestMetrics(
                 sharpe_ratio=0.2, max_drawdown=-0.1, win_rate=0.5,
                 total_return=0.08, in_sample_sharpe=0.1,
                 out_sample_sharpe=None, degradation=0.0,
-            )
+            ),
+            engine_summary={
+                "effective_trade_count": 8,
+                "performance_method_manifest": {
+                    "evaluated_rule": "rsi", "rule_version": "v1", "substituted": False,
+                    "market": "KRX", "universe": "test", "start_date": "2024-01-01",
+                    "end_date": "2024-01-05", "eod_basis": "ohlcv_eod", "initial_capital": 1000000,
+                    "rebalance_timing": "weekly", "fill_timing": "next_open",
+                    "corporate_action_method": "engine", "cost_tax_slippage_liquidity": "configured",
+                    "observations": 5, "trades": 8, "data_version": "test", "result_version": "test",
+                    "execution_version": "test", "historical_simulation_warning": "not predictive",
+                },
+            },
         ),
         price_rows=_rows(datetime(2024, 1, 1, tzinfo=UTC), trading_days=5),
         pipeline_data_source={"source": "fixture"},
     )
 
-    assert isinstance(projection, PerformanceUnavailable)
-    public = projection.model_dump(mode="json")
-    forbidden = {"metrics", "equity_curve", "benchmark", "total_return", "sharpe_ratio", "max_drawdown"}
-
-    def walk(value):
-        if isinstance(value, dict):
-            assert not forbidden.intersection(value)
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(public)
+    assert isinstance(projection, PerformanceAvailable)
+    public = projection.performance
+    assert public["reliability"]["status"] == "insufficient"
+    assert public["is_available"] is True
+    assert public["metrics"]["total_return"] == 0.08
+    assert public["metrics"]["sharpe_ratio"] == 0.2
+    details = {item["key"]: item for item in public["metric_details"]}
+    assert details["total_return"]["is_available"] is True
+    assert details["max_drawdown"]["value"] == -0.1
+    # The limitation list leads with the verdict, then names each check that fell short.
+    assert projection.limitations[0] == INSUFFICIENT_SAMPLE_LIMITATION
+    assert any("fixture" in item for item in projection.limitations)
+    assert any("거래일" in item for item in projection.limitations)
 
 
 def test_public_projection_requires_engine_manifest_before_exposing_complete_values() -> None:

@@ -48,7 +48,9 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
     || "벤치마크";
   const hasBenchmarkSeries = overview.performance.benchmark?.is_available === true
     && chartPoints.some((point) => Number.isFinite(point.benchmark));
-  const insufficient = overview.performance.reliability?.status === "insufficient";
+  // An insufficient sample no longer hides the tiles - it prefixes them, and the
+  // reliability card above lists which sample check fell short.
+  const sampleNote = overview.performance.reliability?.status === "insufficient" ? "표본 부족 · 참고용 · " : "";
   const candidateCounts = countScoredSignals(overview.candidates);
   // The acceptance-floor's own conclusion sentence, when the backend sends one, is more
   // specific than the gate's short reason code - prefer it, falling back to the reason.
@@ -102,25 +104,19 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
             // it too - preferring the whole-period metric card here is what produced the
             // "-11.97% vs -1.95%" disagreement between this tile and the chart.
             label: "검증 구간(OOS) 누적 수익률",
-            value: insufficient
-              ? "표본 부족"
-              : strategyReturn !== undefined
-                ? formatPercentValue(strategyReturn)
-                : totalReturnMetric?.value ?? "—",
+            value: strategyReturn !== undefined
+              ? formatPercentValue(strategyReturn)
+              : totalReturnMetric?.value ?? "—",
             delta: totalReturnMetric?.delta,
-            caption: insufficient
-              ? "신뢰도 기준 미달로 숫자를 표시하지 않습니다."
-              : strategyReturn !== undefined
-                ? "아래 차트와 동일한 검증 구간(OOS) 값입니다."
-                : totalReturnMetric?.caption ?? (benchmarkReturn === undefined ? "실제 수익률 곡선 기준" : `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`),
+            caption: sampleNote + (strategyReturn !== undefined
+              ? "아래 차트와 동일한 검증 구간(OOS) 값입니다."
+              : totalReturnMetric?.caption ?? (benchmarkReturn === undefined ? "실제 수익률 곡선 기준" : `${benchmarkLabel} ${formatPercentValue(benchmarkReturn)} 대비`)),
           },
           {
             label: "Sharpe (Walk-forward OOS)",
-            value: insufficient ? "표본 부족" : oosSharpeMetric?.value ?? sharpeMetric?.value ?? "—",
+            value: oosSharpeMetric?.value ?? sharpeMetric?.value ?? "—",
             delta: sharpeMetric?.delta,
-            caption: insufficient
-              ? "신뢰도 기준 미달로 숫자를 표시하지 않습니다."
-              : oosSharpeMetric?.caption ?? sharpeMetric?.caption ?? "AI 전략 검증 결과",
+            caption: sampleNote + (oosSharpeMetric?.caption ?? sharpeMetric?.caption ?? "AI 전략 검증 결과"),
           },
         ].map((item) => (
           <Card className="summary-card" key={item.label}>
@@ -221,7 +217,7 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
       </Card> : (
         <Card className="performance-empty">
           <strong>누적 수익률을 표시할 수 없습니다</strong>
-          <p>{insufficient ? "표본이 부족해 숫자와 곡선을 숨겼습니다." : "실제 백테스트 시계열이 없습니다."}</p>
+          <p>실제 백테스트 시계열이 없습니다.</p>
         </Card>
       )}
     </div>
