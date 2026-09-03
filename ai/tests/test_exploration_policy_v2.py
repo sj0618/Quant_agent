@@ -47,7 +47,7 @@ from ai_graph.strategy_blueprint_catalog import (
 
 def _active_policy() -> ActiveExplorationPolicyV2:
     policy = ExplorationPolicyV2(
-        policy_version="exploration-policy-v2.krx.2026-09-01",
+        policy_version="exploration-policy-v2.krx.2026-09-03",
         history_years=5,
         candidate_count=3,
         risk_style="balanced",
@@ -75,7 +75,7 @@ def _active_policy() -> ActiveExplorationPolicyV2:
     return ActiveExplorationPolicyV2(
         policy=policy,
         policy_hash=canonical_exploration_policy_hash(policy),
-        effective_at=datetime(2026, 9, 1, tzinfo=UTC),
+        effective_at=datetime(2026, 9, 3, tzinfo=UTC),
     )
 
 
@@ -100,7 +100,7 @@ def test_vague_request_seals_policy_and_all_candidate_results() -> None:
     assert len({candidate.catalog_id for candidate in spec.candidates}) == 3
     assert draft.exploration.opposing_hypothesis
     assert _active_policy().policy_hash == (
-        "054762617514ca4164fdf11fecdd66404e06ec84f0f04e23805ec47eac1d920f"
+        "86971de4ac92b1c6177ef64c3446a2f75881a587e6d07c38fc67329972b1bf1f"
     )
 
     strategy = StrategySpec(
