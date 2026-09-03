@@ -107,9 +107,7 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
       ) : (
         <Card className="performance-empty">
           <strong>표시할 성과 수치가 없습니다</strong>
-          <p>{reliability?.status === "insufficient"
-            ? "짧거나 좁은 표본의 숫자를 실제 성과처럼 보이지 않도록 숨겼습니다. 위 부족 사유를 확인해 주세요."
-            : "백테스트 응답에 검증 가능한 지표가 포함되지 않았습니다."}</p>
+          <p>백테스트 응답에 검증 가능한 지표가 포함되지 않았습니다.</p>
         </Card>
       )}
 
@@ -276,7 +274,7 @@ function reliabilityMessage(status: "sufficient" | "limited" | "insufficient") {
   return {
     sufficient: "기간·종목·거래 수가 공개 성과 기준을 충족했습니다.",
     limited: "수치는 계산됐지만 표본 한계가 있어 참고용으로 해석해야 합니다.",
-    insufficient: "표본이 너무 작아 수익률·샤프·낙폭 같은 숫자를 숨겼습니다.",
+    insufficient: "표본이 너무 작아 수익률·샤프·낙폭 같은 숫자는 참고용입니다. 아래 사유가 부족한 항목입니다.",
   }[status];
 }
 

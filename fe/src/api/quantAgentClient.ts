@@ -49,11 +49,6 @@ const DECIMAL_DISPLAY_DIGITS = 2;
 const AI_REQUEST_TIMEOUT_MS = 1_200_000;
 const STORAGE_KEY_LATEST_ANALYSIS_JOB = "quantagent.latest-analysis-job.v1";
 const AI_REPORT_ID_PREFIX = "ai-job:";
-// A numeric grade on a run the gate rejected reads as an endorsement the system never gave.
-// "보류" is itself the conclusion - never blank, never a raw score - and both places that
-// format a recommendation score (the overview tile and every report summary) share it so
-// the rule cannot drift between components.
-const RECOMMENDATION_SCORE_HOLD_LABEL = "보류";
 const TIMEFRAME_LABELS: Record<string, string> = {
   daily: "매일 분석",
   weekly: "매주 분석",
@@ -359,16 +354,14 @@ export function mergeAnalysisJobIntoOverview(base: AppOverview, job: AnalysisJob
   const recommendationConfidence = result?.strategy_spec
     ? selectRecommendationConfidence(finalSignal?.confidence, result.strategy_spec.confidence)
     : null;
-  const gateValidated = result?.user_payload.recommendation_gate?.validated ?? true;
-
   return {
     ...base,
     strategy,
+    // The score stays numeric even when the recommendation gate failed. The gate's own
+    // reason (which metric fell short) is rendered next to it, not in place of it.
     recommendationScore: recommendationConfidence === null
       ? base.recommendationScore
-      : gateValidated
-        ? formatScore(recommendationConfidence)
-        : RECOMMENDATION_SCORE_HOLD_LABEL,
+      : formatScore(recommendationConfidence),
     recommendationDelta: result ? formatStatusDelta(result.status) : base.recommendationDelta,
     passCount: result ? signals.BUY + signals.HOLD + signals.DROP : base.passCount,
     buyCount: result ? signals.BUY : base.buyCount,
@@ -595,7 +588,6 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
   const confidence = result.strategy_spec
     ? selectRecommendationConfidence(signal?.confidence, result.strategy_spec.confidence)
     : signal?.confidence;
-  const gateValidated = result.user_payload.recommendation_gate?.validated ?? true;
   const date = new Date(job.updated_at);
   return {
     id: latestAnalysisReportId(job.job_id),
@@ -609,9 +601,7 @@ function buildReportSummaryFromAnalysisJob(job: AnalysisJob): ReportSummary | nu
     strategyName: result.strategy_spec?.name ?? result.user_payload.headline,
     recommendationScore: confidence === null || confidence === undefined
       ? formatEnvelopeStatus(result.status)
-      : gateValidated
-        ? formatScoreValue(confidence)
-        : RECOMMENDATION_SCORE_HOLD_LABEL,
+      : formatScoreValue(confidence),
     signals: signalCounts(signal?.action ?? null),
     marketSnapshot: [
       { label: "AI 상태", value: formatEnvelopeStatus(result.status), tone: toneForStatus(result.status) },
@@ -792,26 +782,20 @@ function buildPerformanceSummaryFromAnalysisJob(job: AnalysisJob, fallback: Perf
   const reliability = parseAIBacktestReliability(aiPerformance.reliability);
   const metricDetails = parseAIBacktestMetricDetails(aiPerformance.metric_details);
   const benchmark = parseAIBacktestBenchmark(aiPerformance.benchmark);
-  const isInsufficient = reliability?.status === "insufficient";
+  // An insufficient sample no longer blanks the numbers: they render as-is, and the
+  // reliability panel lists which sample check fell short.
   const benchmarkCurve = benchmark?.is_available ? benchmark.cumulative_curve : [];
-  const equityCurve = isInsufficient
-    ? []
-    : buildAIEquityCurve(aiPerformance.equity_curve, benchmarkCurve);
-  const metrics = isInsufficient
-    ? []
-    : metricDetails.length
-      ? buildAIMetricCardsFromDetails(metricDetails)
-      : buildAIMetricCards(selectedMetrics, aiPerformance.engine_summary);
-  const comparison = isInsufficient
-    ? []
-    : buildAIComparisonRows(selectedMetrics, aiPerformance.engine_summary);
+  const equityCurve = buildAIEquityCurve(aiPerformance.equity_curve, benchmarkCurve);
+  const metrics = metricDetails.length
+    ? buildAIMetricCardsFromDetails(metricDetails)
+    : buildAIMetricCards(selectedMetrics, aiPerformance.engine_summary);
+  const comparison = buildAIComparisonRows(selectedMetrics, aiPerformance.engine_summary);
   // The overview screen must not show two disagreeing max-drawdown numbers (the walk-forward
   // out-of-sample curve on the chart vs. the selected candidate's whole-period card below).
   // `out_sample_max_drawdown` is the OOS sibling of the whole-period `max_drawdown` already
   // used by the metric cards - carry it separately so the chart card can read the OOS figure
   // the gate itself judged against.
-  const outOfSampleMaxDrawdown = !isInsufficient
-    && typeof selectedMetrics.out_sample_max_drawdown === "number"
+  const outOfSampleMaxDrawdown = typeof selectedMetrics.out_sample_max_drawdown === "number"
     && Number.isFinite(selectedMetrics.out_sample_max_drawdown)
     ? ratioToPercent(selectedMetrics.out_sample_max_drawdown)
     : null;
@@ -1080,12 +1064,11 @@ function buildPerformanceDisclaimer(
   reliability: AIBacktestReliability | null,
   benchmark: AIBacktestBenchmark | null,
 ) {
-  if (reliability?.status === "insufficient") {
-    return `후보 ${candidateId}: 표본이 부족해 수익률과 지표를 공개하지 않습니다.`;
-  }
-  const reliabilityNote = reliability?.status === "limited"
-    ? "제한된 표본이므로 결과를 참고용으로만 해석하세요."
-    : "충분 조건을 충족한 표본입니다.";
+  const reliabilityNote = reliability?.status === "insufficient"
+    ? "표본이 부족해 수치는 참고용으로만 해석하세요."
+    : reliability?.status === "limited"
+      ? "제한된 표본이므로 결과를 참고용으로만 해석하세요."
+      : "충분 조건을 충족한 표본입니다.";
   const benchmarkNote = benchmark?.is_available
     ? `벤치마크는 ${benchmark.method} 방식입니다.`
     : "사용 가능한 벤치마크 곡선이 없어 비교선을 표시하지 않습니다.";

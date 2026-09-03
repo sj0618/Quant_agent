@@ -15,7 +15,7 @@ from ai_graph.nodes.risk_manager import (
     _average_pairwise_correlation,
     apply_risk_rules,
 )
-from ai_graph.quant_performance import MINIMUM_DATA_RULE
+from ai_graph.quant_performance import INSUFFICIENT_SAMPLE_LIMITATION, MINIMUM_DATA_RULE
 from ai_graph.research_eligibility import PerformanceUnavailable
 from ai_graph.schemas import (
     BacktestMetrics,
@@ -47,6 +47,19 @@ def make_strategy() -> StrategySpec:
         indicators=["RSI"],
         confidence=0.8,
     )
+
+
+# A complete engine manifest, so a payload can reach the public performance contract and
+# the test is exercising the sample-size verdict rather than the manifest gate.
+_METHOD_MANIFEST = {
+    "evaluated_rule": "rsi", "rule_version": "v1", "substituted": False,
+    "market": "KRX", "universe": "test", "start_date": "2026-01-02",
+    "end_date": "2026-01-05", "eod_basis": "ohlcv_eod", "initial_capital": 1000000,
+    "rebalance_timing": "daily", "fill_timing": "next_open",
+    "corporate_action_method": "engine", "cost_tax_slippage_liquidity": "configured",
+    "observations": 4, "trades": 1, "data_version": "test", "result_version": "test",
+    "execution_version": "test", "historical_simulation_warning": "not predictive",
+}
 
 
 def _performance_payload(metrics: BacktestMetrics, engine_summary: dict | None = None) -> dict:
@@ -264,15 +277,18 @@ def test_public_performance_reliability_marks_fixture_4row_single_ticker_as_insu
     assert performance.reliability.ticker_count == 1
     assert performance.reliability.trading_days == 4
     assert any("fixture" in reason for reason in performance.reliability.reasons)
-    assert performance.is_available is False
-    assert performance.metrics is None
-    assert performance.equity_curve == []
+    # The verdict is published next to the numbers, not instead of them.
+    assert performance.is_available is True
+    assert performance.metrics is not None
+    assert performance.metrics.total_return == 0.0898
+    # No official benchmark inputs in this payload - that, not the sample size, is why
+    # the benchmark stays unavailable.
     assert performance.benchmark is not None
     assert performance.benchmark.is_available is False
-    assert performance.benchmark.total_return is None
-    assert performance.benchmark.cumulative_curve == []
-    assert all(item.is_available is False for item in performance.metric_details)
-    assert all(item.unavailable_reason is not None for item in performance.metric_details)
+    details = {item.key: item for item in performance.metric_details}
+    assert details["total_return"].is_available is True
+    assert details["total_return"].value == 0.0898
+    assert details["max_drawdown"].value == -0.0776
 
 
 def test_public_performance_reliability_marks_multi_ticker_postgres_as_sufficient_for_long_history() -> (
@@ -578,8 +594,13 @@ def test_recommendation_gate_withholds_when_inputs_miss_the_minimum_data_rule() 
     assert _recommendation_gate(_passing_gate_state()).validated is True
 
 
-def test_ready_envelope_withholds_ticker_actions_when_inputs_miss_minimum_data_rule() -> None:
-    """A non-actionable performance result cannot carry an actionable ticker card."""
+def test_ready_envelope_keeps_numbers_and_ticker_actions_when_sample_is_insufficient() -> None:
+    """A small sample is a caveat on the result, not a reason to blank it.
+
+    Four sessions of one ticker is still the result the user asked for. It is published
+    with every number, the reliability verdict says which sample check fell short, and
+    the per-stock actions stay - the gate no longer treats sample size as a data gap.
+    """
 
     state = {
         "status": "ready",
@@ -597,7 +618,11 @@ def test_ready_envelope_withholds_ticker_actions_when_inputs_miss_minimum_data_r
                     in_sample_sharpe=0.6,
                     out_sample_sharpe=0.5,
                     degradation=0.1,
-                )
+                ),
+                engine_summary={
+                    "effective_trade_count": 110,
+                    "performance_method_manifest": _METHOD_MANIFEST,
+                },
             ),
             "ticker_actions": [
                 {
@@ -615,23 +640,25 @@ def test_ready_envelope_withholds_ticker_actions_when_inputs_miss_minimum_data_r
     envelope = envelope_node(state)["envelope"]
     payload = envelope["user_payload"]
 
-    assert payload["performance"]["availability"] == "unavailable"
-    assert payload["performance"]["reason_code"] == "insufficient_reliability"
-    assert payload["recommendation_gate"]["validated"] is False
-    assert payload["recommendation_gate"]["unmet_data_requirements"]
-    assert payload["ticker_actions"] == []
+    performance = payload["performance"]
+    assert performance["availability"] == "available"
+    assert performance["performance"]["reliability"]["status"] == "insufficient"
+    assert performance["performance"]["metrics"]["total_return"] == 0.5
+    assert performance["limitations"][0] == INSUFFICIENT_SAMPLE_LIMITATION
+    assert any("거래일" in item for item in performance["limitations"])
+    assert any("종목 수" in item for item in performance["limitations"])
+    assert payload["recommendation_gate"]["unmet_data_requirements"] == []
+    assert [action["action"] for action in payload["ticker_actions"]] == ["BUY"]
 
 
-def test_report_withholds_every_trade_instruction_when_inputs_miss_minimum_data_rule(
+def test_report_keeps_trade_signal_and_numbers_when_sample_is_insufficient(
     monkeypatch,
 ) -> None:
-    """The report must not publish the pre-gate BUY signal on insufficient input."""
-
-    def _report_writer_must_not_run(**_kwargs: object) -> object:
-        raise AssertionError("provider boundary reached")
+    """The report carries the signal and the numbers; the sample verdict rides along."""
 
     monkeypatch.setattr(
-        "ai_graph.nodes.report.generate_report_writeup", _report_writer_must_not_run
+        "ai_graph.nodes.report.generate_report_writeup",
+        lambda **kwargs: kwargs["fallback"],
     )
     state = {
         "strategy_spec": make_strategy().model_dump(),
@@ -650,7 +677,11 @@ def test_report_withholds_every_trade_instruction_when_inputs_miss_minimum_data_
                 in_sample_sharpe=0.6,
                 out_sample_sharpe=0.5,
                 degradation=0.1,
-            )
+            ),
+            engine_summary={
+                "effective_trade_count": 110,
+                "performance_method_manifest": _METHOD_MANIFEST,
+            },
         ),
     }
 
@@ -658,17 +689,15 @@ def test_report_withholds_every_trade_instruction_when_inputs_miss_minimum_data_
     web_sections = {section["id"]: section["items"] for section in report["web_projection"]["sections"]}
     rendered = json.dumps(report, ensure_ascii=False)
 
-    assert report["web_projection"]["summary"].startswith("NO_RECOMMENDATION")
-    assert "NO_RECOMMENDATION" in report["email_projection"]["summary"]
-    assert web_sections["signal"]["action"] == "NO_RECOMMENDATION"
-    assert web_sections["signal"]["confidence"] == 0.0
-    assert web_sections["performance"]["reason_code"] == "insufficient_reliability"
-    assert web_sections["risk"] == []
-    assert report["risk_adjustments"] == []
-    assert report["web_projection"]["sections"][-1]["items"]["writeup"]["recommendation"] == "NO_RECOMMENDATION"
-    assert "BUY" not in rendered
-    assert "SELL" not in rendered
-    assert "HOLD" not in rendered
+    assert web_sections["signal"]["action"] == "BUY"
+    assert web_sections["signal"]["confidence"] == 0.95
+    performance = web_sections["performance"]
+    assert performance["availability"] == "available"
+    assert performance["performance"]["reliability"]["status"] == "insufficient"
+    assert performance["performance"]["metrics"]["total_return"] == 0.5
+    assert performance["limitations"][0] == INSUFFICIENT_SAMPLE_LIMITATION
+    assert report["web_projection"]["sections"][-1]["items"]["writeup"]["recommendation"] == "BUY"
+    assert "NO_RECOMMENDATION" not in rendered
 
 
 def _automatic_strategy() -> StrategySpec:

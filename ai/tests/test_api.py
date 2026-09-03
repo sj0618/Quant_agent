@@ -381,12 +381,13 @@ def test_analysis_job_api_runs_real_graph_and_can_be_polled() -> None:
     assert [stage["stage"] for stage in polled_job["stages"]] == MOCK_PROVIDER_STAGES
     assert all(stage["status"] == "succeeded" for stage in polled_job["stages"])
     performance = polled_job["result"]["user_payload"]["performance"]
-    assert performance["availability"] == "unavailable"
-    assert performance["reason_code"] == "insufficient_reliability"
-    assert "performance" not in performance
-    assert "metrics" not in performance
-    assert "equity_curve" not in performance
-    assert polled_job["result"]["user_payload"]["ticker_actions"] == []
+    # The fixture sample is too small to be reliable, and the result is still published
+    # with its numbers; the verdict travels as a limitation instead of blanking it.
+    assert performance["availability"] == "available"
+    assert performance["performance"]["reliability"]["status"] == "insufficient"
+    assert performance["performance"]["metrics"] is not None
+    assert performance["limitations"]
+    assert isinstance(polled_job["result"]["user_payload"]["ticker_actions"], list)
 
 
 def test_production_rejects_unready_core_execution_before_side_effects(
@@ -767,7 +768,7 @@ def test_core_execution_keeps_restart_reconciliation_for_prior_process_jobs(
     assert settled.error_message is not None
 
 
-def test_backtest_api_redacts_legacy_insufficient_performance_before_serialization() -> None:
+def test_backtest_api_keeps_legacy_insufficient_performance_numbers_visible() -> None:
     legacy_available = PerformanceAvailable.model_construct(
         availability="available",
         performance={
@@ -806,19 +807,12 @@ def test_backtest_api_redacts_legacy_insufficient_performance_before_serializati
 
     assert response.status_code == 200
     public_performance = response.json()["result"]["user_payload"]["performance"]
-    assert public_performance["availability"] == "unavailable"
-    assert public_performance["reason_code"] == "insufficient_reliability"
-    assert public_performance["safe_facts"] == {
-        "source": "fixture",
-        "row_count": 4,
-        "ticker_count": 1,
-        "trading_days": 4,
-        "trade_count": 7,
-        "history_start": None,
-        "history_end": None,
-    }
-    assert "metrics" not in public_performance
-    assert "equity_curve" not in public_performance
+    assert public_performance["availability"] == "available"
+    assert public_performance["performance"]["metrics"] == {"total_return": 0.12, "sharpe_ratio": 0.3}
+    assert public_performance["performance"]["equity_curve"] == [
+        {"date": "2026-01-01", "cumulative_return": 0.12}
+    ]
+    assert public_performance["performance"]["reliability"]["status"] == "insufficient"
 
 
 def test_job_api_redacts_legacy_available_performance_when_source_is_stale() -> None:
@@ -975,9 +969,8 @@ def test_analysis_job_api_turns_vague_request_into_automatic_tournament() -> Non
     )
     assert result["rule_provenance"]["substituted"] is False
     projection = result["user_payload"]["performance"]
-    assert projection["availability"] == "unavailable"
-    assert projection["reason_code"] == "insufficient_reliability"
-    assert "performance" not in projection
+    assert projection["availability"] == "available"
+    assert projection["performance"]["reliability"]["status"] == "insufficient"
 
 
 def test_analysis_job_api_lists_only_authenticated_users_jobs_newest_first() -> None:
@@ -1081,11 +1074,9 @@ def test_documented_fixture_mvp_profile_reports_and_executes_expected_spine(monk
     assert report["web_projection"]
     assert report["email_projection"]
     performance = created_result["user_payload"]["performance"]
-    assert performance["availability"] == "unavailable"
-    assert performance["reason_code"] == "insufficient_reliability"
-    assert "performance" not in performance
-    assert "metrics" not in performance
-    assert "equity_curve" not in performance
+    assert performance["availability"] == "available"
+    assert performance["performance"]["reliability"]["status"] == "insufficient"
+    assert performance["performance"]["metrics"] is not None
 
     poll_response = client.get(f"{ANALYSIS_JOBS_PATH}/{created_job['job_id']}")
     assert poll_response.status_code == 200
