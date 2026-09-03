@@ -705,11 +705,14 @@ function buildWorkspaceReportDetailFromAnalysisJob(job: AnalysisJob): WorkspaceR
   const overview = mergeAnalysisJobIntoOverview(clone(EMPTY_WORKSPACE), job);
   return {
     id: report.id,
+    jobId: job.job_id,
     query: job.query,
     createdAt: job.created_at,
     updatedAt: job.updated_at,
     report,
     overview,
+    baseReport: result.user_payload.report?.base_report_v2 ?? null,
+    recommendationGate: result.user_payload.recommendation_gate ?? null,
     recommendationValidated: result.user_payload.recommendation_gate?.validated ?? true,
   };
 }

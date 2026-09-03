@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { AsyncState } from "../components/common/AsyncState";
-import { Tabs, type TabItem } from "../components/common/Tabs";
 import { AppLayout } from "../components/layout/AppLayout";
 import {
   clearLatestAnalysisJob,
@@ -17,21 +16,11 @@ import {
 } from "../api/quantAgentClient";
 import { useAnalysisActivity, type ActivityState } from "../api/analysisActivity";
 import { DebateActivityPanel } from "../features/app/DebateActivityPanel";
-import { OverviewTab } from "../features/app/OverviewTab";
-import { PerformanceTab } from "../features/app/PerformanceTab";
 import { StrategyInputPanel } from "../features/app/StrategyInputPanel";
-import { TradingInfoTab } from "../features/app/TradingInfoTab";
-import { ExplorationBaseReport } from "../features/reports/ExplorationBaseReport";
+import { WorkspaceResultPanel, type WorkspaceResultTab } from "../features/app/WorkspaceResultPanel";
 import { useAsyncData } from "../hooks/useAsyncData";
 import type { AIJobStage, AIJobStageStatus, AnalysisJob, AppOverview, ChatConversationPreview, WorkspaceAnalysisStatus } from "../types/quantagent";
 
-type WorkspaceTab = "overview" | "trading" | "performance";
-
-const TAB_ITEMS: Array<TabItem<WorkspaceTab>> = [
-  { id: "overview", label: "전체" },
-  { id: "trading", label: "매매종목 정보", count: 10 },
-  { id: "performance", label: "수익률" },
-];
 const CONVERSATION_HISTORY_STORAGE_KEY = "quantagent.chat-conversations.v1";
 const CONVERSATION_HISTORY_LIMIT = 8;
 const ANALYSIS_JOB_POLL_INTERVAL_MS = 2000;
@@ -96,7 +85,7 @@ interface JobFailure {
   debugRef?: string;
 }
 
-function getInitialTab(): WorkspaceTab {
+function getInitialTab(): WorkspaceResultTab {
   const tab = new URLSearchParams(window.location.search).get("tab");
   return tab === "trading" || tab === "performance" ? tab : "overview";
 }
@@ -253,7 +242,7 @@ function WorkspaceEmptyState({
 
 export function AppPage() {
   const { data, loading, error } = useAsyncData(getWorkspaceTemplate, []);
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>(getInitialTab);
+  const [activeTab, setActiveTab] = useState<WorkspaceResultTab>(getInitialTab);
   const [analysisJobs, setAnalysisJobs] = useState<AnalysisJob[]>([]);
   const [conversationHistory, setConversationHistory] = useState<WorkspaceConversation[]>(readConversationHistory);
   const [pendingAnalysis, setPendingAnalysis] = useState<PendingAnalysis | null>(null);
@@ -452,7 +441,7 @@ export function AppPage() {
     .find((job) => !job.result && !inertJobIds.includes(job.job_id));
   const analysisActivity = useAnalysisActivity(runningJob?.job_id ?? null);
 
-  const handleTabChange = (tab: WorkspaceTab) => {
+  const handleTabChange = (tab: WorkspaceResultTab) => {
     const url = new URL(window.location.href);
     if (tab === "overview") {
       url.searchParams.delete("tab");
@@ -487,9 +476,7 @@ export function AppPage() {
   // banner so they read as reference, not a buy list.
   const latestPayload = latestJob?.result?.user_payload;
   const explorationReport = latestPayload?.report?.base_report_v2 ?? null;
-  const recommendationGate =
-    latestPayload && "recommendation_gate" in latestPayload ? latestPayload.recommendation_gate ?? null : null;
-  const showGateWarning = canRenderWorkspace && recommendationGate !== null && !recommendationGate.validated;
+  const recommendationGate = latestPayload?.recommendation_gate ?? null;
   const panelStrategy = canRenderWorkspace
     ? overview.strategy
     : { ...data.strategy, natural_language_strategy: latestJob?.query ?? data.strategy.natural_language_strategy };
@@ -622,38 +609,20 @@ export function AppPage() {
         <main className={`workspace-main${mobilePane === "result" ? "" : " workspace-pane-hidden"}`}>
           {canRenderWorkspace ? (
             <>
-              {showGateWarning && recommendationGate ? (
-                <div className="warning-box" role="alert">
-                  <strong>검증 미통과</strong>
-                  <span>{recommendationGate.reason} 아래 종목은 추천이 아닌 참고용입니다.</span>
-                </div>
-              ) : null}
               {reportSaveError ? (
                 <div className="warning-box warning-box--error" role="status">
                   <strong>리포트 저장 실패</strong>
                   <span>{reportSaveError} 화면의 결과는 그대로 사용할 수 있습니다.</span>
                 </div>
               ) : null}
-              {explorationReport && latestJob ? (
-                <ExplorationBaseReport jobId={latestJob.job_id} report={explorationReport} />
-              ) : (
-                <>
-                  <Tabs
-                    activeId={activeTab}
-                    items={TAB_ITEMS.map((item) => item.id === "trading" ? { ...item, count: overview.candidates.length } : item)}
-                    onChange={handleTabChange}
-                    rightSlot={
-                      <>
-                        <span className="live-dot" /> <span>{overview.latestRunLabel}</span> <span className="divider" /> <span>다음 발송</span>{" "}
-                        <strong>{overview.nextRunLabel}</strong>
-                      </>
-                    }
-                  />
-                  {activeTab === "overview" ? <OverviewTab overview={overview} validated={!showGateWarning} /> : null}
-                  {activeTab === "trading" ? <TradingInfoTab candidates={overview.candidates} /> : null}
-                  {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
-                </>
-              )}
+              <WorkspaceResultPanel
+                activeTab={activeTab}
+                baseReport={explorationReport}
+                jobId={latestJob?.job_id}
+                onTabChange={handleTabChange}
+                overview={overview}
+                recommendationGate={recommendationGate}
+              />
             </>
           ) : (
             <WorkspaceEmptyState activity={analysisActivity} hasConversation={hasCurrentConversation} progress={workspaceProgress} />

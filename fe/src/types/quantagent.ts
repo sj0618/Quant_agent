@@ -645,11 +645,14 @@ export interface ReportDetail extends ReportSummary {
  */
 export interface WorkspaceReportDetail {
   id: string;
+  jobId: string;
   query: string;
   createdAt: string;
   updatedAt: string;
   report: ReportSummary;
   overview: AppOverview;
+  baseReport: AIBaseReportV2 | null;
+  recommendationGate: AIRecommendationGate | null;
   recommendationValidated: boolean;
 }
 
