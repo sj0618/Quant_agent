@@ -112,6 +112,38 @@ export async function validateCurrentSession(): Promise<AuthSession | null> {
   return validatedSession;
 }
 
+/**
+ * Adopt a server-established session when the browser has a valid HttpOnly cookie but
+ * localStorage does not yet contain a cached QuantAgent session.
+ *
+ * This is the browser state after a successful backend callback that set the cookie
+ * without first hydrating localStorage in the SPA.
+ */
+export async function bootstrapSessionFromCookie(): Promise<AuthSession | null> {
+  const backendSession = await fetchAuthenticatedSession();
+  if (!backendSession) {
+    return null;
+  }
+
+  const session: AuthSession = { user: backendSession.user, validatedAt: Date.now() };
+  saveCurrentSession(session);
+  return session;
+}
+
+/**
+ * Reconcile the login page against the live backend session before trusting any cached
+ * browser identity.
+ *
+ * - If localStorage has a session, validate it against `/auth/me`.
+ * - If localStorage is empty, bootstrap from the HttpOnly session cookie.
+ * - 401/403 clears stale QuantAgent auth state via the validation path.
+ * - Transient failures are surfaced to the caller instead of silently trusting cache.
+ */
+export async function reconcileLoginSession(): Promise<AuthSession | null> {
+  const currentSession = getCurrentSession();
+  return currentSession ? validateCurrentSession() : bootstrapSessionFromCookie();
+}
+
 export async function startGoogleSignIn(returnTo: string) {
   const baseUrl = requireAuthApiBaseUrl();
   const url = new URL(`${baseUrl}${AUTH_ENDPOINTS.googleStart}`, window.location.origin);
