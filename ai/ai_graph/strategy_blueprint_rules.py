@@ -38,6 +38,21 @@ SOURCE_REGISTRY: dict[str, str] = {
     ),
     "lean_engine": "https://github.com/QuantConnect/Lean",
     "backtrader_strategies": "https://www.backtrader.com/docu/strategy-reference/",
+    # Fundamental-factor sources for the value/quality/growth/multi-factor rows added in
+    # v2.  These strategies use the point-in-time DART financials (per/roe/operating_margin
+    # /debt_to_equity/operating_income/revenue and their up-streaks) the loader already
+    # forward-fills onto every bar, so they extend the catalog beyond price-only technicals.
+    "greenblatt_magic_formula": "https://www.magicformulainvesting.com/",
+    "novy_marx_profitability": "https://rnm.simon.rochester.edu/research/OSoV.pdf",
+    "asness_frazzini_pedersen_qmj": (
+        "https://www.aqr.com/Insights/Research/Journal-Article/Quality-Minus-Junk"
+    ),
+    "frazzini_pedersen_bab": (
+        "https://www.aqr.com/Insights/Research/Journal-Article/Betting-Against-Beta"
+    ),
+    "aqr_value_momentum": (
+        "https://www.aqr.com/Insights/Research/Journal-Article/Value-and-Momentum-Everywhere"
+    ),
 }
 
 
@@ -468,6 +483,55 @@ INDICATORS: dict[str, IndicatorDefinition] = {
             "기간 최고 종가 대비 현재 하락률과 최근 20일 반등률의 비율을 결합합니다.",
             "단순 저가매수보다 실제로 반등 힘이 생긴 낙폭 종목만 고르기 위해 씁니다.",
             ("quantconnect_indicators",),
+        ),
+        # Point-in-time DART fundamentals.  The warehouse loader forward-fills each of
+        # these onto every trading-day bar (only filings dated strictly before the bar),
+        # so a rule referencing them is backtested on the same next-open engine as the
+        # price-only rows - not a screen-only concept.
+        IndicatorDefinition(
+            "per",
+            "PER (주가수익비율)",
+            "주가가 한 해 벌어들인 순이익의 몇 배인지 나타내는 저평가·고평가 척도입니다.",
+            "PER=종가/주당순이익(EPS)",
+            "그 날 시점에 공시된 연간 EPS로 당일 종가를 나눕니다. EPS가 0 이하인 적자 기업은 값을 두지 않아 저평가 화면에 적자기업이 섞이지 않습니다.",
+            "이익 대비 얼마나 싸게 거래되는지를 종목 간 같은 기준으로 비교하기 위해 씁니다.",
+            ("greenblatt_magic_formula", "aqr_value_momentum"),
+        ),
+        IndicatorDefinition(
+            "roe",
+            "ROE (자기자본이익률)",
+            "회사가 자기자본으로 얼마나 효율적으로 이익을 냈는지를 비율로 봅니다.",
+            "ROE=당기순이익/자기자본",
+            "그 시점에 공시된 순이익을 자기자본으로 나눕니다. 지속적으로 높은 ROE는 자본을 잘 굴리는 우량기업의 대표 신호입니다.",
+            "가격 신호와 무관하게 사업 자체의 수익성·질을 걸러내기 위해 씁니다.",
+            ("novy_marx_profitability", "asness_frazzini_pedersen_qmj"),
+        ),
+        IndicatorDefinition(
+            "operating_margin",
+            "영업이익률",
+            "매출 100원당 본업에서 남긴 영업이익이 몇 원인지 보여줍니다.",
+            "OPM=영업이익/매출액",
+            "그 시점 공시된 영업이익을 매출액으로 나눕니다. 자산 대비 총이익을 쓰는 Novy-Marx의 원지표와 달라 자산집약 업종은 낮게 나올 수 있습니다.",
+            "본업의 마진 경쟁력과 수익성 지속성을 보기 위해 씁니다.",
+            ("novy_marx_profitability",),
+        ),
+        IndicatorDefinition(
+            "debt_to_equity",
+            "부채비율 (D/E)",
+            "자기자본 대비 빚이 얼마나 많은지를 비율로 나타내는 안전성 지표입니다.",
+            "D/E=총부채/자기자본",
+            "그 시점 공시된 총부채를 자기자본으로 나눕니다. 값이 낮을수록 재무 레버리지가 작아 하락장에서 더 견디는 경향이 있습니다.",
+            "수익성만 높고 빚으로 떠받친 기업을 걸러 방어형·우량 조건을 만들기 위해 씁니다.",
+            ("asness_frazzini_pedersen_qmj", "frazzini_pedersen_bab"),
+        ),
+        IndicatorDefinition(
+            "fundamental_growth_streak",
+            "펀더멘털 연속증가 분기수",
+            "매출·영업이익 등이 직전 분기보다 늘어난 흐름이 몇 분기 연속됐는지 셉니다.",
+            "Streak_t=Streak_{t-1}+1 if X_t>X_{t-1} else 0",
+            "각 공시에서 지표가 직전 공시보다 크면 카운트를 1 늘리고 아니면 0으로 초기화한 값을 바에 실어둡니다. YoY가 아닌 직전분기 대비라 계절적 비수기 하락에 끊길 수 있습니다.",
+            "한 번의 호실적이 아니라 여러 분기 지속된 개선을 성장의 대리 신호로 쓰기 위해 씁니다.",
+            ("greenblatt_magic_formula", "novy_marx_profitability"),
         ),
     )
 }
@@ -1147,6 +1211,107 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         (_c("drawdown_recovery_63", GT, .5),), (_c("drawdown_63", LT, -.15),),
         "drawdown_recovery_63", ("drawdown", "return"), ("낙폭회복", "drawdown recovery", "회복추세"),
         ("quantconnect_indicators",), lookback=63, risk="defensive", priority=74,
+    ),
+
+    # ---- Fundamental factor & multi-factor rows (beyond price-only technicals) ----
+    # These use the point-in-time DART fundamentals the loader forward-fills onto every
+    # bar (per/roe/operating_margin/debt_to_equity and the {metric}_up_streak columns),
+    # combined with cross-sectional rank cuts and a price-trend exit.  Priorities are kept
+    # below the top technical momentum rows so they do not displace the existing default
+    # selection for generic requests; they surface when a request names value/quality/etc.
+    _r(
+        "earnings-value-quality-rotation", "value_quality", "저평가+수익성 로테이션",
+        "PER이 시장에서 싼 하위 40%이면서 ROE가 양수인 흑자 우량주만 골라, 그중 ROE가 높은 순으로 순환 보유합니다.",
+        "rank_bottom40(PER) and ROE>0; rank=ROE desc",
+        "적자기업은 PER이 비어 자동 제외되고, 남은 흑자기업 중 PER 하위 40% 저평가 종목을 ROE 높은 순으로 보유해 싼값과 수익성을 함께 요구합니다.",
+        "가격지표만으로는 볼 수 없는 이익 대비 저평가와 자본수익성을 결합해 밸류트랩을 피하려고 씁니다(그린블랫 매직포뮬러 적응형).",
+        (_c("per", LTE, 0.0, universe_rank_pct=.40), _c("roe", GT, 0.0)),
+        (_c("close", LT, "sma_200"),), "roe", ("per", "roe"),
+        ("밸류", "저평가", "per", "저per", "수익성", "매직포뮬러", "value", "quality"),
+        ("greenblatt_magic_formula",),
+        lookback=200, direction="desc", mode="scheduled_rotation", risk="balanced", horizon="long", priority=62,
+        caveat="지주사·재벌계열은 지분법이익·일회성 이익으로 PER이 왜곡될 수 있어 ROE 품질 필터를 함께 씁니다.",
+    ),
+    _r(
+        "profitability-quality-leaders", "quality", "수익성 우량주 리더",
+        "영업이익률이 시장 상위 30%이면서 ROE가 양수인 고수익성 기업을 영업이익률 높은 순으로 순환 보유합니다.",
+        "rank_top30(operating_margin) and ROE>0; rank=operating_margin desc",
+        "본업 마진이 상위 30%인 기업에 흑자 조건을 더해, 마진이 높은 순으로 보유합니다.",
+        "가격 추세가 아니라 사업 자체의 마진 경쟁력으로 종목을 고르기 위해 씁니다(Novy-Marx 수익성 프리미엄 적응형).",
+        (_c("operating_margin", GTE, 0.0, universe_rank_pct=.30), _c("roe", GT, 0.0)),
+        (_c("close", LT, "sma_200"),), "operating_margin", ("operating_margin", "roe"),
+        ("수익성", "우량주", "영업이익률", "마진", "quality", "profitability"),
+        ("novy_marx_profitability",),
+        lookback=200, direction="desc", mode="scheduled_rotation", risk="defensive", horizon="long", priority=60,
+        caveat="영업이익률은 Novy-Marx의 총이익/자산과 달라 자산집약 업종을 낮게 평가할 수 있습니다.",
+    ),
+    _r(
+        "quality-minus-junk-composite", "quality", "퀄리티-정크 복합",
+        "ROE가 상위 40%로 높으면서 부채비율은 하위 50%로 낮은 고품질·저위험 기업을 ROE 높은 순으로 보유합니다.",
+        "rank_top40(ROE) and rank_bottom50(D/E); rank=ROE desc",
+        "수익성(ROE 상위)과 안전성(부채비율 하위)을 동시에 요구해 이익은 나지만 빚으로 떠받친 기업을 걸러냅니다.",
+        "고수익성과 저레버리지를 결합한 '우량(quality)' 정의로 정크를 배제하기 위해 씁니다(Asness-Frazzini-Pedersen QMJ 적응형).",
+        (_c("roe", GTE, 0.0, universe_rank_pct=.40), _c("debt_to_equity", LTE, 0.0, universe_rank_pct=.50)),
+        (_c("close", LT, "sma_200"),), "roe", ("roe", "debt_to_equity"),
+        ("퀄리티", "우량", "저부채", "안전성", "qmj", "quality", "quality minus junk"),
+        ("asness_frazzini_pedersen_qmj",),
+        lookback=200, direction="desc", mode="scheduled_rotation", risk="balanced", horizon="medium", priority=58,
+        caveat="분기 재무는 공시 지연이 있어 최신 자본구조 변화가 며칠 늦게 반영될 수 있습니다.",
+    ),
+    _r(
+        "low-vol-quality-defensive", "defensive_quality", "저변동 우량주",
+        "실현변동성이 시장 하위 40%로 안정적이면서 ROE가 양수인 흑자 기업을 변동성이 낮은 순으로 방어적으로 보유합니다.",
+        "rank_bottom40(sigma_63) and ROE>0; rank=sigma_63 asc",
+        "63일 실현변동성 하위 40% 필터에 흑자 조건을 더해, 가장 덜 흔들리는 순으로 보유합니다.",
+        "낮은 위험과 사업 수익성을 결합해 하락장 방어력이 큰 우량주를 고르기 위해 씁니다(저베타·퀄리티 결합).",
+        (_c("realized_volatility_63d", LTE, 0.0, universe_rank_pct=.40), _c("roe", GT, 0.0)),
+        (_c("close", LT, "sma_200"),), "realized_volatility_63d", ("volatility", "roe"),
+        # Tags deliberately avoid the bare "저변동"/"low volatility" terms so this
+        # fundamental row does not displace the existing purely-technical low-volatility
+        # menu; it surfaces on quality/defensive intent instead.
+        ("우량방어", "우량주", "안정성", "저변동우량", "defensive quality", "quality defensive"),
+        ("frazzini_pedersen_bab", "asness_frazzini_pedersen_qmj"),
+        lookback=200, direction="asc", mode="scheduled_rotation", risk="defensive", horizon="long", priority=61,
+        caveat="유동성 하위 종목은 희박거래로 변동성이 실제보다 낮게 보이는 착시가 있을 수 있습니다.",
+    ),
+    _r(
+        "quality-momentum-overlay", "quality_momentum", "퀄리티-모멘텀 오버레이",
+        "ROE가 상위 40%인 우량주 중 200일 추세 위에 있고 6개월 수익이 양수인 종목을 모멘텀 강한 순으로 보유합니다.",
+        "rank_top40(ROE) and P>SMA200 and R_126>0; rank=R_126 desc",
+        "펀더멘털 우량 필터(ROE 상위)에 가격 추세 확인(200일선 위, 6개월 수익 양수)을 더해 개선되는 우량주의 상승 참여를 노립니다.",
+        "우량성만으로 놓치는 타이밍을 가격 모멘텀으로 보완해 결합하기 위해 씁니다(수익성+모멘텀 결합).",
+        (_c("roe", GTE, 0.0, universe_rank_pct=.40), _c("close", GT, "sma_200"), _c("return_126d", GT, 0.0)),
+        (_c("close", LT, "sma_50"),), "return_126d", ("roe", "return", "sma"),
+        ("퀄리티모멘텀", "우량성장", "추세", "quality momentum"),
+        ("novy_marx_profitability", "jegadeesh_titman"),
+        lookback=200, direction="desc", mode="scheduled_rotation", risk="balanced", horizon="medium", priority=59,
+        caveat="청산이 추세선(SMA50) 위주라 회전 성격이 추세추종처럼 보일 수 있습니다.",
+    ),
+    _r(
+        "streak-garp-composite", "garp", "스트릭 기반 GARP",
+        "영업이익이 2분기 이상 연속 증가하고 PER은 하위 50%로 비싸지 않으며 ROE가 양수인 흑자 성장주를 ROE 높은 순으로 보유합니다.",
+        "operating_income_up_streak>=2 and rank_bottom50(PER) and ROE>0; rank=ROE desc",
+        "성장 지속성(영업이익 연속 증가)과 합리적 가격(PER 하위 50%), 흑자 조건을 결합해 비싸게 사지 않는 성장주를 고릅니다.",
+        "성장을 좇되 밸류에이션 규율을 함께 걸어 고평가 성장주 위험을 줄이기 위해 씁니다(GARP 적응형, YoY 대신 연속증가 스트릭 사용).",
+        (_c("operating_income_up_streak", GTE, 2.0), _c("per", LTE, 0.0, universe_rank_pct=.50), _c("roe", GT, 0.0)),
+        (_c("close", LT, "sma_200"),), "roe", ("fundamental_growth_streak", "per", "roe"),
+        ("garp", "성장", "저평가성장", "스트릭", "growth", "이익성장", "합리적성장"),
+        ("greenblatt_magic_formula",),
+        lookback=200, direction="desc", mode="scheduled_rotation", risk="balanced", horizon="medium", priority=57,
+        caveat="스트릭은 report_code 없는 직전분기 대비 순차비교라 정상적인 계절 비수기에도 끊길 수 있습니다.",
+    ),
+    _r(
+        "value-quality-momentum-tri", "multi_factor", "밸류-퀄리티-모멘텀 3팩터",
+        "PER 하위 50% 저평가·ROE 상위 50% 우량·200일 추세 위 세 조건을 모두 통과한 종목을 상대강도 강한 순으로 보유합니다.",
+        "rank_bottom50(PER) and rank_top50(ROE) and P>SMA200; rank=relative_strength_126d desc",
+        "밸류(저PER)·퀄리티(고ROE)·모멘텀(추세 위+상대강도)을 순차 스크린으로 결합해 세 팩터가 동시에 우호적인 교집합만 보유합니다.",
+        "한 팩터에 의존하지 않고 서로 보완적인 세 팩터를 묶어 안정적인 초과수익을 노리기 위해 씁니다(AQR Value·Momentum + 퀄리티 결합).",
+        (_c("per", LTE, 0.0, universe_rank_pct=.50), _c("roe", GTE, 0.0, universe_rank_pct=.50), _c("close", GT, "sma_200")),
+        (_c("close", LT, "sma_50"),), "relative_strength_126d", ("per", "roe", "relative_strength", "sma"),
+        ("멀티팩터", "밸류퀄리티모멘텀", "3팩터", "복합", "multi factor", "multifactor"),
+        ("aqr_value_momentum", "asness_frazzini_pedersen_qmj"),
+        lookback=200, direction="desc", mode="scheduled_rotation", risk="balanced", horizon="medium", priority=63,
+        caveat="세 팩터를 순차 스크린으로 결합하므로 교집합 종목수가 작아 보유수를 못 채울 수 있습니다.",
     ),
 )
 

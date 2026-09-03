@@ -34,6 +34,10 @@ FIXED_MIGRATIONS = (
     "023_archive_undecodable_analysis_jobs.sql",
     "024_parse_bound_analysis_job_admission.sql",
     "025_exploration_policy_v2.sql",
+    # Additive INSERT-only re-seal (new published policy version + active-pointer repoint)
+    # after the blueprint catalog gained fundamental-factor rows.  Creates no schema
+    # objects, so the catalog-union fingerprint is unchanged.
+    "026_reseal_exploration_policy_v2.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 ROLLBACK_RESTORE_MIGRATION = "022_immutable_analysis_results.sql"

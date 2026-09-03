@@ -58,6 +58,25 @@ def _rich_ohlcv_rows(*, days: int = 520, tickers: int = 16) -> list[dict[str, ob
             )
             if day_index % 47 == ticker_index % 9:
                 volume *= 3.2
+            # Point-in-time DART fundamentals the real loader forward-fills onto every
+            # bar. Deterministic in (ticker, day) only - no rng draw (so the OHLCV series
+            # above is byte-identical to before and the price-only rows are unaffected)
+            # and no look-ahead. per/roe use different ticker permutations so "cheap" and
+            # "high quality" are roughly independent, which keeps the value+quality
+            # intersection (multi-factor rows) non-empty; slow per-metric oscillations
+            # shift the cross-sectional ranks over time so rows both enter and exit.
+            t = ticker_index
+            quarter = day_index // 63
+            osc_r = 0.18 * float(np.sin(2.0 * np.pi * (day_index / 170.0 + t / 16.0)))
+            osc_p = 0.18 * float(np.sin(2.0 * np.pi * (day_index / 190.0 + t / 16.0 + 0.30)))
+            osc_m = 0.15 * float(np.sin(2.0 * np.pi * (day_index / 210.0 + t / 16.0 + 0.60)))
+            osc_d = 0.15 * float(np.sin(2.0 * np.pi * (day_index / 150.0 + t / 16.0 + 0.15)))
+            roe = (-0.02 + 0.026 * ((t * 3 + 1) % 7)) * (1.0 + osc_r)
+            operating_margin = max(0.0, (0.02 + 0.013 * ((t * 2) % 8)) * (1.0 + 0.5 * osc_m))
+            debt_to_equity = max(0.05, (0.25 + 0.10 * ((t * 4 + 1) % 6)) * (1.0 - 0.3 * osc_d))
+            revenue = (8.0e10 + 1.2e10 * t) * (1.0 + 0.2 * osc_m)
+            operating_income = revenue * operating_margin
+            per_value = (6.0 + 2.0 * ((t * 5 + 2) % 9)) * (1.0 + osc_p)
             rows.append(
                 {
                     "date": (start + timedelta(days=day_index)).isoformat(),
@@ -67,6 +86,17 @@ def _rich_ohlcv_rows(*, days: int = 520, tickers: int = 16) -> list[dict[str, ob
                     "low": low,
                     "close": close,
                     "volume": volume,
+                    "roe": float(roe),
+                    "operating_margin": float(operating_margin),
+                    "debt_to_equity": float(debt_to_equity),
+                    "revenue": float(revenue),
+                    "operating_income": float(operating_income),
+                    # per is unset for a loss-maker (EPS<=0), mirroring db.py.
+                    "per": (float(per_value) if roe > 0.0 else None),
+                    "operating_income_up_streak": float((quarter + t) % 5),
+                    "revenue_up_streak": float((quarter + t * 2 + 1) % 5),
+                    "roe_up_streak": float((quarter + t + 2) % 4),
+                    "operating_margin_up_streak": float((quarter + t * 3 + 2) % 5),
                 }
             )
     return sorted(rows, key=lambda row: (str(row["date"]), str(row["ticker"])))
