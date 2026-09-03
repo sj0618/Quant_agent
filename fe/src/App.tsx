@@ -11,7 +11,13 @@ import { WorkspaceReportDetailPage } from "./pages/WorkspaceReportDetailPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { SearchPage } from "./pages/SearchPage";
 import { UnsubscribePage } from "./pages/UnsubscribePage";
-import { getCurrentSession, isSessionRecentlyValidated, validateCurrentSession } from "./api/authClient";
+import { AsyncState } from "./components/common/AsyncState";
+import {
+  bootstrapSessionFromCookie,
+  getCurrentSession,
+  isSessionRecentlyValidated,
+  validateCurrentSession,
+} from "./api/authClient";
 import {
   ROUTES,
   getCurrentPathWithSearch,
@@ -50,6 +56,41 @@ function AppRoutes() {
   // click. The cached session renders immediately and revalidation happens behind it; only
   // an actual 401 (validateCurrentSession returning null) takes the user to the login page.
   const [session, setSession] = useState<AuthSession | null>(getCurrentSession);
+  // A cookie-authenticated user with no cached SPA session — the normal state after the
+  // backend's server-side OAuth callback in the combined production topology — must be
+  // admitted, not walled. Until the cookie bootstrap resolves we cannot tell "signed out"
+  // apart from "session lives only in the cookie", so hold the protected-route gate closed
+  // meanwhile instead of flashing the login wall.
+  const [bootstrappingCookieSession, setBootstrappingCookieSession] = useState(
+    () => protectedRoute && session === null,
+  );
+
+  useEffect(() => {
+    if (!protectedRoute || session !== null) {
+      return;
+    }
+    let cancelled = false;
+    bootstrapSessionFromCookie()
+      .then((cookieSession) => {
+        if (!cancelled) {
+          setSession(cookieSession);
+        }
+      })
+      .catch((error: unknown) => {
+        // No valid cookie session (or the check failed): fall through to the login wall.
+        console.warn("쿠키 세션 부트스트랩에 실패해 로그인 화면으로 이동합니다.", error);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setBootstrappingCookieSession(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // session is null here and the bootstrap either sets it or leaves it null; re-running
+    // on a null->null no-op would not loop, but keep the dependency explicit.
+  }, [protectedRoute, session]);
 
   useEffect(() => {
     if (!protectedRoute || !session || isSessionRecentlyValidated(session)) {
@@ -102,6 +143,9 @@ function AppRoutes() {
   }
 
   if (protectedRoute && !session) {
+    if (bootstrappingCookieSession) {
+      return <AsyncState title="세션을 확인하는 중" description="로그인 상태를 확인하고 있습니다." tone="loading" />;
+    }
     return <AuthRequiredPage returnTo={getCurrentPathWithSearch()} />;
   }
 

@@ -112,6 +112,29 @@ export async function validateCurrentSession(): Promise<AuthSession | null> {
   return validatedSession;
 }
 
+/**
+ * Adopt a server-established session when the browser holds a valid session cookie but
+ * localStorage has no cached session.
+ *
+ * This is the normal state after a successful login in the combined-backend production
+ * topology: Google redirects to the backend's server-side `GET /auth/google/callback`,
+ * which sets the session cookie and 303s to the app, so the SPA callback page that would
+ * have populated localStorage never runs. `validateCurrentSession` deliberately no-ops
+ * without a cached session, so without this the cookie is never consulted and a
+ * cookie-authenticated user is walled at the login screen. Returns null (without clearing
+ * anything) when no valid cookie session exists.
+ */
+export async function bootstrapSessionFromCookie(): Promise<AuthSession | null> {
+  const backendSession = await fetchAuthenticatedSession();
+  if (!backendSession) {
+    return null;
+  }
+
+  const session: AuthSession = { user: backendSession.user, validatedAt: Date.now() };
+  saveCurrentSession(session);
+  return session;
+}
+
 export async function startGoogleSignIn(returnTo: string) {
   const baseUrl = requireAuthApiBaseUrl();
   const url = new URL(`${baseUrl}${AUTH_ENDPOINTS.googleStart}`, window.location.origin);
