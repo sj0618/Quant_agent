@@ -22,6 +22,8 @@ import logging
 import re
 from typing import Any
 
+from .identity import canonical_ticker, display_name
+
 _logger = logging.getLogger(__name__)
 
 # Schemas are discovered rather than listed. A hand-maintained table list is the same
@@ -433,7 +435,7 @@ def enrich_with_symbol_master(conn: Any, rows: list[dict[str, Any]]) -> list[dic
 
     if not rows:
         return rows
-    tickers = sorted({str(row.get("ticker") or "") for row in rows if row.get("ticker")})
+    tickers = sorted({canonical_ticker(row.get("ticker")) for row in rows if row.get("ticker")})
     if not tickers:
         return rows
     found = conn.execute(
@@ -444,17 +446,28 @@ def enrich_with_symbol_master(conn: Any, rows: list[dict[str, Any]]) -> list[dic
         """,
         [tickers],
     ).fetchall()
-    by_ticker = {str(row["symbol"]).zfill(6): row for row in found}
+    by_ticker: dict[str, dict[str, Any]] = {}
+    for master in found:
+        ticker = canonical_ticker(master.get("symbol"))
+        if not ticker:
+            continue
+        previous = by_ticker.get(ticker)
+        if previous is None or (
+            not display_name(previous.get("name")) and display_name(master.get("name"))
+        ):
+            by_ticker[ticker] = master
     enriched: list[dict[str, Any]] = []
     for row in rows:
-        ticker = str(row.get("ticker") or "").zfill(6)
+        ticker = canonical_ticker(row.get("ticker"))
         master = by_ticker.get(ticker) or {}
+        master_name = display_name(master.get("name"))
         enriched.append(
             {
                 **row,
                 # A ticker with no master row still trades; showing its code is better
                 # than dropping it.
-                "name": row.get("name") or master.get("name") or ticker,
+                "ticker": ticker,
+                "name": master_name or display_name(row.get("name")) or ticker,
                 "market": row.get("market")
                 or master.get("market_segment")
                 or master.get("market")

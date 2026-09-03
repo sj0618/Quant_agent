@@ -7,36 +7,38 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ai_graph.immutable_snapshot import validate_snapshot_bundle
+from ai_graph.data_sources import db as db_variant
+from ai_graph.data_sources import db_split
 from ai_graph.data_sources.db import (
+    ADJUSTED_OHLCV_TABLE,
     AI_DATABASE_DSN_ENV,
     DATABASE_URL_ENV,
     DEFAULT_BACKTEST_LOOKBACK_DAYS,
-    ADJUSTED_OHLCV_TABLE,
-    DataSourceConfig,
     FEATURE_FRAME_MARKER,
-    PostgresPipelineDataSource,
     QUANT_DB_DSN_ENV,
     RSI_OVERSOLD_THRESHOLD,
+    DataSourceConfig,
+    PostgresPipelineDataSource,
     ScreeningThresholds,
     _attach_pointintime_financials,
     _compact_price_row_from_tuple,
-    _raw_price_capabilities,
-    _price_row_from_feature_frame_record,
-    _relaxed_thresholds,
     _mart_frame_sql,
     _path_features_sql,
     _prev_rsi_sql,
+    _price_row_from_feature_frame_record,
+    _raw_price_capabilities,
     _relative_strength,
+    _relaxed_thresholds,
     _screening_matcher,
+    classify_research_runtime_failure,
     indicator_families_for_metrics,
     load_pipeline_data_from_env,
-    classify_research_runtime_failure,
     research_runtime_facts_from_bundle,
     resolve_database_dsn_from_env,
     screening_profile,
 )
 from ai_graph.data_sources.sectors import clear_sector_cache
+from ai_graph.immutable_snapshot import validate_snapshot_bundle
 
 
 def setup_function() -> None:
@@ -314,6 +316,70 @@ def test_feature_frame_record_maps_prices_and_rsi_metric() -> None:
     assert price_row["ticker"] == "005930"
     assert price_row["close"] == 103.0
     assert price_row["rsi"] == 28.5
+
+
+@pytest.mark.parametrize("module", [db_variant, db_split], ids=["db", "db_split"])
+def test_symbol_master_identity_normalizes_ticker_and_keeps_the_company_name(module) -> None:
+    class Connection:
+        def __init__(self) -> None:
+            self.params: object = None
+
+        def execute(self, query: str, params: object = None) -> FakeResult:
+            assert "FROM core.symbol_master" in query
+            self.params = params
+            return FakeResult(rows=[
+                {
+                    "symbol": " 25980 ",
+                    "name": "아난티",
+                    "market": "KOSDAQ",
+                    "market_segment": "KOSDAQ",
+                    "listing_status": "listed",
+                }
+            ])
+
+    source = module.PostgresPipelineDataSource(
+        module.DataSourceConfig(database_dsn="postgresql://example")
+    )
+    connection = Connection()
+    symbol_info = source._fetch_symbol_info_map(connection, [25980, " 025980 "])
+    feature_row = module._feature_frame_row_from_sources(
+        {
+            "as_of_date": AS_OF,
+            "ticker": " 25980 ",
+            "open": Decimal("100"),
+            "high": Decimal("105"),
+            "low": Decimal("99"),
+            "close": Decimal("103"),
+            "volume": Decimal("1000"),
+        },
+        {},
+        symbol_info["025980"],
+    )
+
+    price_row = module._price_row_from_feature_frame_record(feature_row)
+
+    assert connection.params == [["025980"]]
+    assert price_row["ticker"] == "025980"
+    assert price_row["name"] == "아난티"
+
+
+@pytest.mark.parametrize("module", [db_variant, db_split], ids=["db", "db_split"])
+def test_symbol_master_identity_uses_ticker_only_when_no_master_name_exists(module) -> None:
+    feature_row = module._feature_frame_row_from_sources(
+        {
+            "as_of_date": AS_OF,
+            "ticker": 25980,
+            "open": Decimal("100"),
+            "high": Decimal("105"),
+            "low": Decimal("99"),
+            "close": Decimal("103"),
+            "volume": Decimal("1000"),
+        },
+        {},
+        {"name": "   "},
+    )
+
+    assert module._price_row_from_feature_frame_record(feature_row)["name"] == "025980"
 
 
 def test_compact_price_stream_is_date_major_for_cross_sectional_features() -> None:

@@ -23,6 +23,7 @@ from ai_graph.source_manifest import (
     compute_pipeline_extract_hash,
 )
 
+from .identity import canonical_ticker, display_name
 from .sectors import extract_sector_from_query, get_known_sectors
 
 _logger = logging.getLogger(__name__)
@@ -1358,7 +1359,7 @@ class PostgresPipelineDataSource:
     ) -> tuple[list[dict[str, Any]], int]:
         del query
         timings = {} if timings is None else timings
-        ticker_list = list(tickers)
+        ticker_list = [canonical_ticker(ticker) for ticker in tickers]
         if compact_price_rows and hasattr(conn, "cursor"):
             # psycopg's dict-row factory would first materialise several million
             # dictionaries and then the adapter would build a second list of compact
@@ -1457,10 +1458,10 @@ class PostgresPipelineDataSource:
                     _feature_frame_row_from_sources(
                         row,
                         {
-                            family: by_ticker.get(str(row.get("ticker") or "").zfill(6), {})
+                            family: by_ticker.get(canonical_ticker(row.get("ticker")), {})
                             for family, by_ticker in indicators_by_family.items()
                         },
-                        symbol_info_by_ticker.get(str(row.get("ticker") or "").zfill(6), {}),
+                        symbol_info_by_ticker.get(canonical_ticker(row.get("ticker")), {}),
                     )
                 )
                 for row in rows
@@ -1828,6 +1829,7 @@ class PostgresPipelineDataSource:
         # its listing_status filter is bulk-broken upstream. Query symbol_master directly and
         # treat "included" as "known KRX symbol", not "currently listed" (listing_status is
         # still surfaced below for visibility, but not trusted as a filter).
+        ticker = canonical_ticker(ticker)
         row = conn.execute(
             """
             SELECT symbol, name, market, market_segment, listing_status
@@ -1842,7 +1844,7 @@ class PostgresPipelineDataSource:
         return {
             "ticker": ticker,
             "included": True,
-            "name": row.get("name"),
+            "name": display_name(row.get("name")),
             "market": row.get("market"),
             "market_segment": row.get("market_segment"),
             "listing_status": row.get("listing_status"),
@@ -1851,30 +1853,40 @@ class PostgresPipelineDataSource:
     def _fetch_symbol_info_map(
         self, conn: Any, tickers: Sequence[str]
     ) -> dict[str, dict[str, Any]]:
+        canonical_tickers = list(dict.fromkeys(
+            ticker for ticker in (canonical_ticker(value) for value in tickers) if ticker
+        ))
+        if not canonical_tickers:
+            return {}
         rows = conn.execute(
             """
             SELECT symbol, name, market, market_segment, listing_status
             FROM core.symbol_master
             WHERE symbol = ANY(%s)
             """,
-            [list(tickers)],
+            [canonical_tickers],
         ).fetchall()
-        found = {
-            str(row.get("symbol") or "").zfill(6): {
-                "ticker": str(row.get("symbol") or "").zfill(6),
+        found: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            ticker = canonical_ticker(row.get("symbol"))
+            if not ticker:
+                continue
+            symbol_info = {
+                "ticker": ticker,
                 "included": True,
-                "name": row.get("name"),
+                "name": display_name(row.get("name")),
                 "market": row.get("market"),
                 "market_segment": row.get("market_segment"),
                 "listing_status": row.get("listing_status"),
             }
-            for row in rows
-        }
+            previous = found.get(ticker)
+            if previous is None or (not display_name(previous.get("name")) and symbol_info["name"]):
+                found[ticker] = symbol_info
         # symbol_master is a display-only join (see _screening_sql), so a ticker missing
         # from it still trades - it just has no name/market to show.
         return {
             ticker: found.get(ticker, {"ticker": ticker, "included": False})
-            for ticker in tickers
+            for ticker in canonical_tickers
         }
 
     def _fetch_macro_snapshot(
@@ -3492,10 +3504,11 @@ def _raw_price_capabilities(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]
 
 def _price_row_from_feature_frame_record(row: Mapping[str, Any]) -> dict[str, Any]:
     trade_date = _date_value(row["as_of_date"]).isoformat()
+    ticker = canonical_ticker(row.get("ticker"))
     price_row = {
         "date": trade_date,
-        "ticker": str(row["ticker"]).zfill(6),
-        "name": row.get("name") or "",
+        "ticker": ticker,
+        "name": display_name(row.get("name")) or ticker,
         "market": row.get("market_segment") or "KRX",
         "open": _float_value(row["open"]),
         "high": _float_value(row["high"]),
@@ -3594,8 +3607,9 @@ def _feature_frame_row_from_sources(
     trade_date = _date_value(row["as_of_date"])
     return {
         **dict(row),
+        "ticker": canonical_ticker(row.get("ticker")),
         "as_of_date": trade_date,
-        "name": symbol_info.get("name") or "",
+        "name": display_name(symbol_info.get("name")),
         "market_segment": symbol_info.get("market_segment") or "KRX",
         **{
             f"{family}_values": indicators_by_family.get(family, {}).get(trade_date, {})

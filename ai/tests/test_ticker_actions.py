@@ -58,6 +58,28 @@ def test_unheld_name_with_an_entry_signal_is_a_buy():
     assert action_for(_ticker_actions(result, ROWS, "A1"), "000300") == "BUY"
 
 
+@pytest.mark.parametrize(
+    ("signal", "held", "expected_action"),
+    [("BUY", set(), "BUY"), ("SELL", {"025980"}, "SELL"), ("BUY", {"025980"}, "HOLD")],
+)
+def test_actions_preserve_a_canonical_company_name(signal, held, expected_action):
+    rows = [{"date": "2026-08-04", "ticker": "025980", "name": "아난티", "close": 5_000.0}]
+    result = FakeResult([FakeSignal("2026-08-04", "025980", signal)], held=held)
+
+    action = _ticker_actions(result, rows, "A-ananti")[0]
+
+    assert action["action"] == expected_action
+    assert action["ticker"] == "025980"
+    assert action["name"] == "아난티"
+
+
+def test_actions_fall_back_to_the_ticker_only_for_a_blank_company_name():
+    rows = [{"date": "2026-08-04", "ticker": "025980", "name": "   ", "close": 5_000.0}]
+    result = FakeResult([FakeSignal("2026-08-04", "025980", "BUY")], held=set())
+
+    assert _ticker_actions(result, rows, "A-ananti")[0]["name"] == "025980"
+
+
 def test_a_buy_signal_on_a_name_already_held_never_returns_buy():
     """The engine skips buys it has no slot for, so signal alone must not mean 'enter'."""
     result = FakeResult([FakeSignal("2026-08-04", "000100", "BUY")], held={"000100"})

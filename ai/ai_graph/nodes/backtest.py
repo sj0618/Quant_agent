@@ -3313,7 +3313,11 @@ def _ticker_actions(
         for row in rows
         if str(row.get("date") or "") == as_of
     }
-    names = {str(row.get("ticker")): row.get("name") for row in rows if row.get("name")}
+    names: dict[str, str] = {}
+    for row in rows:
+        name = str(row.get("name") or "").strip()
+        if name:
+            names[str(row.get("ticker"))] = name
 
     actions: list[dict[str, Any]] = []
     for ticker in sorted(held | set(last_signal)):
