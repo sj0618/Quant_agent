@@ -74,20 +74,26 @@ test("/search stays report-centric and forwards the submitted q to report search
 });
 
 test("workspace and email report details have distinct routes and views", async () => {
-  const [workspaceDetail, emailDetail, timeline, routesSource] = await Promise.all([
+  const [appPage, workspaceDetail, workspaceResult, emailDetail, timeline, routesSource] = await Promise.all([
+    read("../src/pages/AppPage.tsx"),
     read("../src/pages/WorkspaceReportDetailPage.tsx"),
+    read("../src/features/app/WorkspaceResultPanel.tsx"),
     read("../src/pages/EmailReportDetailPage.tsx"),
     read("../src/features/reports/EmailHistoryTimeline.tsx"),
     read("../src/config/routes.ts"),
   ]);
 
   assert.match(workspaceDetail, /getWorkspaceReportById/);
-  assert.match(workspaceDetail, /OverviewTab/);
-  assert.match(workspaceDetail, /TradingInfoTab/);
-  assert.match(workspaceDetail, /PerformanceTab/);
+  assert.match(workspaceDetail, /WorkspaceResultPanel/);
+  assert.match(appPage, /WorkspaceResultPanel/);
+  assert.match(workspaceResult, /OverviewTab/);
+  assert.match(workspaceResult, /TradingInfoTab/);
+  assert.match(workspaceResult, /PerformanceTab/);
+  assert.match(workspaceResult, /ExplorationBaseReport/);
   assert.match(emailDetail, /getEmailReportById/);
   assert.match(emailDetail, /ReportDetail/);
   assert.match(timeline, /ROUTES\.emailReportDetail/);
   assert.match(routesSource, /emailReportDetail/);
+  assert.doesNotMatch(workspaceDetail, /features\/reports\/ReportDetail/);
   assert.doesNotMatch(workspaceDetail, /이메일 재발송/);
 });

@@ -1,26 +1,14 @@
 import { useState } from "react";
 import { AsyncState } from "../components/common/AsyncState";
-import { Card } from "../components/common/Card";
-import { Tabs, type TabItem } from "../components/common/Tabs";
 import { AppLayout } from "../components/layout/AppLayout";
 import { getWorkspaceReportById } from "../api/quantAgentClient";
 import { ROUTES } from "../config/routes";
-import { OverviewTab } from "../features/app/OverviewTab";
-import { PerformanceTab } from "../features/app/PerformanceTab";
-import { TradingInfoTab } from "../features/app/TradingInfoTab";
+import { WorkspaceResultPanel, type WorkspaceResultTab } from "../features/app/WorkspaceResultPanel";
 import { useAsyncData } from "../hooks/useAsyncData";
 
 interface WorkspaceReportDetailPageProps {
   id: string;
 }
-
-type WorkspaceReportTab = "overview" | "trading" | "performance";
-
-const TABS: Array<TabItem<WorkspaceReportTab>> = [
-  { id: "overview", label: "전략 요약" },
-  { id: "trading", label: "조건 일치 종목" },
-  { id: "performance", label: "백테스트" },
-];
 
 /**
  * Read-only view of a report made in the strategy workspace.
@@ -30,7 +18,7 @@ const TABS: Array<TabItem<WorkspaceReportTab>> = [
  */
 export function WorkspaceReportDetailPage({ id }: WorkspaceReportDetailPageProps) {
   const { data, loading, error } = useAsyncData(() => getWorkspaceReportById(id), [id]);
-  const [activeTab, setActiveTab] = useState<WorkspaceReportTab>("overview");
+  const [activeTab, setActiveTab] = useState<WorkspaceResultTab>("overview");
 
   if (loading || error || !data) {
     return (
@@ -50,30 +38,21 @@ export function WorkspaceReportDetailPage({ id }: WorkspaceReportDetailPageProps
     );
   }
 
-  const { overview, report } = data;
   return (
     <AppLayout active="reports">
       <div className="report-subbar">
         <a href={ROUTES.reports}>← 전략 분석 리포트</a>
-        <span>/</span>
-        <strong>{report.date}</strong>
+        <span>/ 워크스페이스 결과</span>
       </div>
-      <main className="reports-page">
-        <Card className="list-head">
-          <div>
-            <p className="eyebrow-row"><span>WORKSPACE REPORT</span></p>
-            <h1>{report.title}</h1>
-            <p>{data.query}</p>
-          </div>
-          <dl className="workspace-report-meta">
-            <div><dt>생성 시각</dt><dd>{report.sentAt}</dd></div>
-            <div><dt>전략</dt><dd>{report.strategyName}</dd></div>
-          </dl>
-        </Card>
-        <Tabs activeId={activeTab} items={TABS} onChange={setActiveTab} />
-        {activeTab === "overview" ? <OverviewTab overview={overview} validated={data.recommendationValidated} /> : null}
-        {activeTab === "trading" ? <TradingInfoTab candidates={overview.candidates} /> : null}
-        {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
+      <main className="workspace-main">
+        <WorkspaceResultPanel
+          activeTab={activeTab}
+          baseReport={data.baseReport}
+          jobId={data.jobId}
+          onTabChange={setActiveTab}
+          overview={data.overview}
+          recommendationGate={data.recommendationGate}
+        />
       </main>
     </AppLayout>
   );

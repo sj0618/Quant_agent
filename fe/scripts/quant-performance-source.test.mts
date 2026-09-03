@@ -110,9 +110,10 @@ test("generated strategies stay visible as pre-backtest blueprints with derivati
 });
 
 test("a recommendation score stays numeric when the gate fails, with the gate reason beside it", async () => {
-  const [adapter, appPage, overview] = await Promise.all([
+  const [adapter, appPage, resultPanel, overview] = await Promise.all([
     source("../src/api/quantAgentClient.ts"),
     source("../src/pages/AppPage.tsx"),
+    source("../src/features/app/WorkspaceResultPanel.tsx"),
     source("../src/features/app/OverviewTab.tsx"),
   ]);
 
@@ -121,7 +122,10 @@ test("a recommendation score stays numeric when the gate fails, with the gate re
   assert.doesNotMatch(adapter, /RECOMMENDATION_SCORE_HOLD_LABEL/);
   assert.doesNotMatch(adapter, /산출 안 함/);
   assert.doesNotMatch(adapter, /gateValidated/);
-  assert.match(appPage, /recommendationGate\.reason/);
+  // The workspace page and saved-report page now share this panel, so the gate reason
+  // must remain in their common render path instead of being duplicated in AppPage.
+  assert.match(appPage, /WorkspaceResultPanel/);
+  assert.match(resultPanel, /recommendationGate\.reason/);
   assert.match(overview, /백테스트 목표 기준 미달 · 참고용/);
 });
 
