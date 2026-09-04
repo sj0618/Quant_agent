@@ -95,8 +95,9 @@ test("workspace and email report details have distinct routes and views", async 
   assert.match(workspaceResult, /ExplorationBaseReport/);
   assert.match(overview, /PerformanceReliabilityPanel/);
   assert.match(performance, /PerformanceReliabilityPanel/);
-  assert.match(reliabilityPanel, /성과 수치 신뢰도/);
-  assert.match(reliabilityPanel, /reliability-panel__samples/);
+  assert.match(reliabilityPanel, /성과 신뢰도:/);
+  assert.match(reliabilityPanel, /reliability-strip__summary/);
+  assert.doesNotMatch(reliabilityPanel, /reliability-panel__samples/);
   assert.doesNotMatch(overview, /overview-reliability/);
   assert.match(emailDetail, /getEmailReportById/);
   assert.match(emailDetail, /ReportDetail/);
