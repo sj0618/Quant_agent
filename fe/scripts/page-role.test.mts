@@ -74,10 +74,13 @@ test("/search stays report-centric and forwards the submitted q to report search
 });
 
 test("workspace and email report details have distinct routes and views", async () => {
-  const [appPage, workspaceDetail, workspaceResult, emailDetail, timeline, routesSource] = await Promise.all([
+  const [appPage, workspaceDetail, workspaceResult, overview, performance, reliabilityPanel, emailDetail, timeline, routesSource] = await Promise.all([
     read("../src/pages/AppPage.tsx"),
     read("../src/pages/WorkspaceReportDetailPage.tsx"),
     read("../src/features/app/WorkspaceResultPanel.tsx"),
+    read("../src/features/app/OverviewTab.tsx"),
+    read("../src/features/app/PerformanceTab.tsx"),
+    read("../src/features/app/PerformanceReliabilityPanel.tsx"),
     read("../src/pages/EmailReportDetailPage.tsx"),
     read("../src/features/reports/EmailHistoryTimeline.tsx"),
     read("../src/config/routes.ts"),
@@ -90,6 +93,11 @@ test("workspace and email report details have distinct routes and views", async 
   assert.match(workspaceResult, /TradingInfoTab/);
   assert.match(workspaceResult, /PerformanceTab/);
   assert.match(workspaceResult, /ExplorationBaseReport/);
+  assert.match(overview, /PerformanceReliabilityPanel/);
+  assert.match(performance, /PerformanceReliabilityPanel/);
+  assert.match(reliabilityPanel, /성과 수치 신뢰도/);
+  assert.match(reliabilityPanel, /reliability-panel__samples/);
+  assert.doesNotMatch(overview, /overview-reliability/);
   assert.match(emailDetail, /getEmailReportById/);
   assert.match(emailDetail, /ReportDetail/);
   assert.match(timeline, /ROUTES\.emailReportDetail/);

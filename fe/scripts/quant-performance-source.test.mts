@@ -62,10 +62,11 @@ test("benchmark series requires an available real curve and never a zero placeho
 });
 
 test("insufficient reliability keeps numbers visible and explains sample limits", async () => {
-  const [adapter, overview, performance] = await Promise.all([
+  const [adapter, overview, performance, reliabilityPanel] = await Promise.all([
     source("../src/api/quantAgentClient.ts"),
     source("../src/features/app/OverviewTab.tsx"),
     source("../src/features/app/PerformanceTab.tsx"),
+    source("../src/features/app/PerformanceReliabilityPanel.tsx"),
   ]);
 
   // A small sample is a caveat on the result, not a reason to blank it: nothing may swap
@@ -75,12 +76,12 @@ test("insufficient reliability keeps numbers visible and explains sample limits"
   assert.doesNotMatch(overview, /"표본 부족"/);
   assert.doesNotMatch(performance, /숨겼습니다/);
   assert.match(overview, /표본 부족 · 참고용/);
-  assert.match(performance, /참고용/);
-  assert.match(performance, /row_count/);
-  assert.match(performance, /ticker_count/);
-  assert.match(performance, /trading_days/);
-  assert.match(performance, /trade_count/);
-  assert.match(performance, /reliability\.reasons/);
+  assert.match(reliabilityPanel, /참고용/);
+  assert.match(reliabilityPanel, /row_count/);
+  assert.match(reliabilityPanel, /ticker_count/);
+  assert.match(reliabilityPanel, /trading_days/);
+  assert.match(reliabilityPanel, /trade_count/);
+  assert.match(reliabilityPanel, /reliability\.reasons/);
 });
 
 test("metric and strategy explanations expose cautions and source links", async () => {
