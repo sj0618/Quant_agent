@@ -527,6 +527,49 @@ def test_recommendation_gate_accepts_valid_objective() -> None:
     assert "objective gate를 모두 통과" in gate.reason
 
 
+@pytest.mark.parametrize(
+    ("mode", "strategy_validated"),
+    (("report_only", True), ("enforced", False)),
+)
+def test_recommendation_gate_uses_the_backtest_policy_verdict(
+    mode: str, strategy_validated: bool
+) -> None:
+    """The UI must not re-enforce a floor that the backtest marked report-only."""
+
+    metrics = BacktestMetrics(
+        sharpe_ratio=-0.2,
+        max_drawdown=-0.2,
+        win_rate=0.4,
+        total_return=-0.1,
+        in_sample_sharpe=-0.1,
+        out_sample_sharpe=-0.2,
+        degradation=0.0,
+    )
+    floor_reason = "미사용 구간 Sharpe -0.20 가 기준 0 에 미달합니다"
+    state = {"backtest": _performance_payload(metrics, {"effective_trade_count": 3})}
+    state.update(
+        {
+            "strategy_validated": strategy_validated,
+            "objective_floor": {
+                "mode": mode,
+                "cleared": False,
+                "reasons": [floor_reason],
+            },
+        }
+    )
+
+    gate = _recommendation_gate(state)
+
+    assert gate is not None
+    assert gate.validated is strategy_validated
+    assert gate.unmet_objective_criteria == [floor_reason]
+    if mode == "report_only":
+        assert "report_only 정책" in gate.reason
+        assert "차단하지 않습니다" in gate.reason
+    else:
+        assert "objective 조건 미충족" in gate.reason
+
+
 def _passing_gate_state() -> dict:
     """A backtest whose metrics clear the objective floor on their own."""
 

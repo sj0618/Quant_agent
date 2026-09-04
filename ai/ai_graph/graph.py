@@ -3820,24 +3820,53 @@ def _recommendation_gate(
             reason="검증 대상 백테스트 지표가 없어 추천 규칙 통과 여부를 판단할 수 없습니다.",
         )
 
-    reasons = _objective_gate_reasons(
-        # The same numbers the acceptance floor judged: under walk-forward the selected
-        # candidate carries its last fold's split, which selection was run on. Reading
-        # that here let the gate publish 검증됨 for a run the floor had failed.
-        _floor_metrics(backtest),
-        backtest.engine_summary,
-        selection_mode=backtest.strategy_a.selection_mode,
-        benchmark_return=backtest.backtest_payload.get("benchmark_return"),
+    # `backtest_node` is the single owner of the objective-floor policy.  In
+    # particular, report-only mode records the same reasons but intentionally leaves
+    # `strategy_validated` true.  Recomputing the reasons here used to re-enforce that
+    # report-only floor in the UI, turning a visible warning into a false failure.
+    floor = state.get("objective_floor")
+    canonical_policy_verdict = isinstance(floor, Mapping) and isinstance(
+        state.get("strategy_validated"), bool
     )
-    validated = not reasons
+    if canonical_policy_verdict:
+        raw_reasons = floor.get("reasons", ())
+        reasons = (
+            [str(reason) for reason in raw_reasons if str(reason).strip()]
+            if isinstance(raw_reasons, Sequence) and not isinstance(raw_reasons, str)
+            else []
+        )
+        validated = bool(state["strategy_validated"])
+    else:
+        # Historical result payloads predate `objective_floor`; retain their existing
+        # derivation rather than claiming a policy verdict that was never recorded.
+        reasons = _objective_gate_reasons(
+            # Preserve the remote main's walk-forward metric selection for legacy
+            # payloads, where no canonical policy verdict was recorded.
+            _floor_metrics(backtest),
+            backtest.engine_summary,
+            selection_mode=backtest.strategy_a.selection_mode,
+            benchmark_return=backtest.backtest_payload.get("benchmark_return"),
+        )
+        validated = not reasons
     shortfalls = [item for item in reasons if not _is_data_gap_reason(item)]
     gaps = [
         *_benchmark_input_gaps(backtest),
         *(item for item in reasons if _is_data_gap_reason(item)),
     ]
+    report_only_shortfall = (
+        canonical_policy_verdict
+        and str(floor.get("mode", "")).strip().lower() == "report_only"
+        and not bool(floor.get("cleared"))
+    )
+    reason = (
+        "백테스트 목표 기준은 아직 충족하지 못했지만 report_only 정책에 따라 추천을 "
+        "차단하지 않습니다: " + "; ".join(reasons)
+        if report_only_shortfall
+        else _gate_reason(validated, shortfalls, gaps)
+    )
     return RecommendationGate(
         validated=validated,
-        reason=_gate_reason(validated, shortfalls, gaps),
+        reason=reason,
         verification_complete=not gaps,
         unmet_objective_criteria=shortfalls,
         unmet_data_requirements=gaps,
