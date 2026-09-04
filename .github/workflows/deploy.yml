@@ -87,9 +87,9 @@ on:
         default: false
         type: boolean
       deploy_target:
-        description: Target server (same host/user/key, different SSH port)
+        description: Target server (same host/user/key, different SSH port). node2-candidate is the default for both push-to-main and manual runs; pick node1 to opt out.
         required: false
-        default: node1
+        default: node2-candidate
         type: choice
         options:
           - node1
@@ -196,9 +196,9 @@ jobs:
     needs: release-trust
     if: ${{ inputs.rollback_drill != true }}
     runs-on: ubuntu-latest
-    environment: ${{ inputs.deploy_target == 'node2-candidate' && 'node2-candidate' || '' }}
+    environment: ${{ inputs.deploy_target == 'node1' && '' || 'node2-candidate' }}
     env:
-      SSH_PORT: ${{ inputs.deploy_target == 'node2-candidate' && '30232' || '30233' }}
+      SSH_PORT: ${{ inputs.deploy_target == 'node1' && '30233' || '30232' }}
 
     steps:
       - name: Checkout
