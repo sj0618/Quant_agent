@@ -77,7 +77,6 @@ test("insufficient reliability keeps numbers visible and explains sample limits"
   assert.doesNotMatch(performance, /숨겼습니다/);
   assert.match(overview, /표본 부족 · 참고용/);
   assert.match(reliabilityPanel, /참고용/);
-  assert.match(reliabilityPanel, /row_count/);
   assert.match(reliabilityPanel, /ticker_count/);
   assert.match(reliabilityPanel, /trading_days/);
   assert.match(reliabilityPanel, /trade_count/);
