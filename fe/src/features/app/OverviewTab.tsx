@@ -4,6 +4,7 @@ import { ROUTES } from "../../config/routes";
 import type { AppOverview } from "../../types/quantagent";
 import { countScoredSignals } from "../../utils/signalCounts";
 import { PerformanceChart } from "./PerformanceChart";
+import { PerformanceReliabilityPanel } from "./PerformanceReliabilityPanel";
 import { SignalCard } from "./SignalCard";
 
 interface OverviewTabProps {
@@ -79,13 +80,7 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
       </Card>
 
       {overview.performance.reliability ? (
-        <Card className={`overview-reliability overview-reliability--${overview.performance.reliability.status}`}>
-          <div>
-            <strong>성과 신뢰도: {overview.performance.reliability.status === "sufficient" ? "충분" : overview.performance.reliability.status === "limited" ? "제한적" : "부족"}</strong>
-            <span>{overview.performance.reliability.trading_days}거래일 · {overview.performance.reliability.ticker_count}종목 · 거래 {overview.performance.reliability.trade_count}회</span>
-          </div>
-          {overview.performance.reliability.reasons.length ? <p>{overview.performance.reliability.reasons.join(" · ")}</p> : null}
-        </Card>
+        <PerformanceReliabilityPanel reliability={overview.performance.reliability} />
       ) : null}
 
       <section className="summary-grid">
