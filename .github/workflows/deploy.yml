@@ -86,6 +86,14 @@ on:
         required: false
         default: false
         type: boolean
+      deploy_target:
+        description: Target server (same host/user/key, different SSH port)
+        required: false
+        default: node1
+        type: choice
+        options:
+          - node1
+          - node2-candidate
 
 concurrency:
   group: quant-agent-deploy
@@ -188,6 +196,9 @@ jobs:
     needs: release-trust
     if: ${{ inputs.rollback_drill != true }}
     runs-on: ubuntu-latest
+    environment: ${{ inputs.deploy_target == 'node2-candidate' && 'node2-candidate' || '' }}
+    env:
+      SSH_PORT: ${{ inputs.deploy_target == 'node2-candidate' && '30232' || '30233' }}
 
     steps:
       - name: Checkout
@@ -213,11 +224,11 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -p 30233 quant-agent.kro.kr >> ~/.ssh/known_hosts
+          ssh-keyscan -p "$SSH_PORT" quant-agent.kro.kr >> ~/.ssh/known_hosts
 
       - name: Create deploy directory on server
         run: |
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+          ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
             "mkdir -p ~/mvp_sp1/quant-proj"
 
       - name: Verify pre-deploy readiness
@@ -228,7 +239,7 @@ jobs:
             local label="$1"
             local url="$2"
             local profile="$3"
-            ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
               "curl -q --fail --silent --show-error --connect-timeout 5 --max-time 15 '$url'" \
               | node scripts/readiness-semantic-gate.mjs --label "$label" --profile "$profile"
           }
@@ -238,7 +249,7 @@ jobs:
 
       - name: Create deploy snapshot archive
         run: |
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+          ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
             bash -s -- "$GITHUB_SHA" <<'REMOTE'
           set -Eeuo pipefail
 
@@ -301,9 +312,9 @@ jobs:
           set -Eeuo pipefail
           test -s scripts/readiness-semantic-gate.mjs
 
-          scp -q -i ~/.ssh/id_rsa -P 30233 scripts/readiness-semantic-gate.mjs "etluser@quant-agent.kro.kr:~/mvp_sp1/.releases/$GITHUB_SHA/readiness-semantic-gate.mjs.upload"
+          scp -q -i ~/.ssh/id_rsa -P "$SSH_PORT" scripts/readiness-semantic-gate.mjs "etluser@quant-agent.kro.kr:~/mvp_sp1/.releases/$GITHUB_SHA/readiness-semantic-gate.mjs.upload"
 
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr bash -s -- "$GITHUB_SHA" <<'REMOTE'
+          ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr bash -s -- "$GITHUB_SHA" <<'REMOTE'
           set -Eeuo pipefail
 
           DEPLOYMENT_REVISION="$1"
@@ -344,7 +355,7 @@ jobs:
             --exclude='**/*.pyc' \
             --exclude='**/logs/' \
             --exclude='**/.pytest_cache/' \
-            -e "ssh -v -i ~/.ssh/id_rsa -p 30233" \
+            -e "ssh -v -i ~/.ssh/id_rsa -p $SSH_PORT" \
             ./ \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
 
@@ -374,9 +385,9 @@ jobs:
             printf '%s\n' 'AUTH_COOKIE_SAMESITE=lax'
           } > "$auth_env_file"
 
-          scp -q -i ~/.ssh/id_rsa -P 30233 "$auth_env_file" \
+          scp -q -i ~/.ssh/id_rsa -P "$SSH_PORT" "$auth_env_file" \
             etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/.env.auth.upload
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr <<'REMOTE'
+          ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr <<'REMOTE'
             set -euo pipefail
             APP_DIR="$HOME/mvp_sp1/quant-proj"
             env_file="$APP_DIR/.env"
@@ -402,7 +413,7 @@ jobs:
           # Keep the SSH transport alive so a healthy but slow restart is not mistaken
           # for a failed deployment and rolled back solely by an idle connection drop.
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
-            -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
             bash -s -- "$GITHUB_SHA" <<'REMOTE'
             set -euo pipefail
 
@@ -784,7 +795,7 @@ jobs:
         if: failure() && env.DEPLOY_MUTATION_STARTED == 'true'
         run: |
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
-            -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+            -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
             bash -s -- "$GITHUB_SHA" <<'REMOTE'
           set -Eeuo pipefail
 
