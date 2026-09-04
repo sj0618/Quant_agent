@@ -789,10 +789,13 @@ async def get_reader_report(engine: AsyncEngine, report_id: str, *, user_id: str
             report.created_at,
             report.updated_at,
             report.content_html,
+            analysis_result.public_snapshot_jsonb,
             COALESCE(report.sent_at, report.created_at) AS sort_at
         FROM app.strategy_email_report AS report
         INNER JOIN app.backtest_run AS run
           ON run.run_id = report.backtest_run_id
+        LEFT JOIN app.analysis_result AS analysis_result
+          ON analysis_result.analysis_result_id = report.analysis_result_id
         WHERE {' AND '.join(filters)}
         LIMIT 1
         """,
@@ -803,6 +806,8 @@ async def get_reader_report(engine: AsyncEngine, report_id: str, *, user_id: str
     item = _reader_report_summary_item(row)
     item.pop("_sortAt", None)
     item["contentSections"] = _reader_evidence_sections(row.get("content_html"))
+    if (public_snapshot := _json_object(row.get("public_snapshot_jsonb"))) is not None:
+        item["publicReportSnapshot"] = public_snapshot
     return item
 
 
@@ -958,6 +963,7 @@ async def get_report(engine: AsyncEngine, report_id: str, *, user_id: str | None
             report.performance_jsonb,
             report.cost_notes,
             report.content_html,
+            analysis_result.public_snapshot_jsonb,
             run.run_id AS run_id,
             run.strategy_id AS run_strategy_id,
             run.config_jsonb AS run_config_jsonb,
@@ -990,6 +996,8 @@ async def get_report(engine: AsyncEngine, report_id: str, *, user_id: str | None
           ON summary.run_id = report.backtest_run_id
         LEFT JOIN app.backtest_metric_detail AS detail
           ON detail.run_id = report.backtest_run_id
+        LEFT JOIN app.analysis_result AS analysis_result
+          ON analysis_result.analysis_result_id = report.analysis_result_id
         WHERE {' AND '.join(filters)}
         LIMIT 1
         """,
@@ -1078,6 +1086,7 @@ async def get_report(engine: AsyncEngine, report_id: str, *, user_id: str | None
         "warningNote": _optional_text(row.get("warning_note")),
         "performance": _report_performance_payload(row),
         "contentSections": _reader_evidence_sections(row.get("content_html")),
+        "publicReportSnapshot": _json_object(row.get("public_snapshot_jsonb")) or None,
         "costNotes": [str(value) for value in _json_array(row.get("cost_notes")) if _optional_text(value)],
         "createdAt": _as_iso(row.get("created_at")),
         "updatedAt": _as_iso(row.get("updated_at")),

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.report_snapshot import PublicReportSnapshotV1
+
 
 class ArchivedReportEvidenceEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -44,6 +46,7 @@ class ArchivedReportSummary(BaseModel):
 
 class ArchivedReportDetail(ArchivedReportSummary):
     contentSections: list[ArchivedReportEvidenceSection] = Field(default_factory=list)
+    publicReportSnapshot: PublicReportSnapshotV1 | None = None
 
 
 class ArchivedReportListMeta(BaseModel):

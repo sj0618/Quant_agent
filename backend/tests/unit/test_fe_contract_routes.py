@@ -261,6 +261,11 @@ def test_email_report_detail_uses_owner_scoped_full_report_contract(monkeypatch)
             "weekday": "월요일",
             "sentAt": "오전 08:00",
             "status": "sent",
+            "publicReportSnapshot": {
+                "schemaVersion": "1",
+                "analysisResultId": "analysis-result-1",
+                "result": {"title": "Public report snapshot"},
+            },
             "title": "RSI 전략 리포트",
             "summary": "전송된 전략 분석 리포트",
             "signals": {"BUY": 1, "HOLD": 0, "DROP": 0},
@@ -280,6 +285,11 @@ def test_email_report_detail_uses_owner_scoped_full_report_contract(monkeypatch)
 
     assert owner.status_code == 200
     assert owner.json()["title"] == "RSI 전략 리포트"
+    assert owner.json()["publicReportSnapshot"] == {
+        "schemaVersion": "1",
+        "analysisResultId": "analysis-result-1",
+        "result": {"title": "Public report snapshot"},
+    }
     assert owner.json()["signals"] == {"BUY": 1, "HOLD": 0, "DROP": 0}
     assert observed["engine"] is app.state.trading_data_db_engine
     assert observed["report_id"] == "report-1"
@@ -361,6 +371,11 @@ def test_track_c_run_and_report_routes_enforce_owner_scope(monkeypatch):
                 "weekday": "월요일",
                 "sentAt": "오전 10:10 발송",
                 "status": "sent",
+                "publicReportSnapshot": {
+                    "schemaVersion": "1",
+                    "analysisResultId": "analysis-result-1",
+                    "result": {"title": "Public report snapshot"},
+                },
                 "contentSections": [],
             }
         return None
@@ -387,7 +402,7 @@ def test_track_c_run_and_report_routes_enforce_owner_scope(monkeypatch):
     assert intruder_reports.json()["items"] == []
     assert owner_report.status_code == 200
     assert owner_report.json()["id"] == "report-1"
-    assert set(owner_report.json()) == {"id", "runId", "date", "weekday", "sentAt", "status", "contentSections"}
+    assert set(owner_report.json()) == {"id", "runId", "date", "weekday", "sentAt", "status", "contentSections", "publicReportSnapshot"}
     forbidden_reader_fields = {
         "title",
         "summary",

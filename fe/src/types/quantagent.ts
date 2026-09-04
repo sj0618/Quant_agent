@@ -574,6 +574,12 @@ export interface ReportSummary {
   marketSnapshot: Array<{ label: string; value: string; tone?: Tone }>;
 }
 
+export interface PublicReportSnapshot {
+  schemaVersion: "1";
+  analysisResultId: string;
+  result: Record<string, unknown>;
+}
+
 export interface PersistedReportSection {
   id?: string;
   title?: string;
@@ -647,6 +653,7 @@ export interface ReportDetail extends ReportSummary {
   marketBrief: string;
   marketContext?: string | null;
   contentSections?: PersistedReportSection[];
+  publicReportSnapshot?: PublicReportSnapshot | null;
   news: Array<{ rank: number; title: string; source: string; tone: Tone }>;
   candidates: TradingCandidate[];
   signalAxes: Array<{ label: string; weight: string; title: string; description: string }>;

@@ -170,6 +170,11 @@ async def test_reader_archive_detail_uses_allowlisted_evidence_without_legacy_qu
             "recommendation_score": 9.9,
             "buy_count": 4,
             "market_snapshot": [{"label": "KOSPI", "value": "secret"}],
+            "public_snapshot_jsonb": {
+                "schemaVersion": "1",
+                "analysisResultId": "analysis-result-1",
+                "result": {"title": "Public report snapshot"},
+            },
         }
 
     async def fake_fetch_all(*_args, **_kwargs):
@@ -185,6 +190,7 @@ async def test_reader_archive_detail_uses_allowlisted_evidence_without_legacy_qu
     for forbidden in ("report.title", "report.summary", "recommendation_score", "buy_count", "market_snapshot", "candidate", "news", "performance"):
         assert forbidden not in sql
     assert recorded["params"] == {"report_id": "report-1", "user_id": "42"}
+    assert "analysis_result.public_snapshot_jsonb" in sql
     assert set(result) == {
         "id",
         "runId",
@@ -196,6 +202,7 @@ async def test_reader_archive_detail_uses_allowlisted_evidence_without_legacy_qu
         "updatedAt",
         "publishedAt",
         "contentSections",
+        "publicReportSnapshot",
     }
     assert result["contentSections"] == [
         {
@@ -208,6 +215,11 @@ async def test_reader_archive_detail_uses_allowlisted_evidence_without_legacy_qu
             ],
         }
     ]
+    assert result["publicReportSnapshot"] == {
+        "schemaVersion": "1",
+        "analysisResultId": "analysis-result-1",
+        "result": {"title": "Public report snapshot"},
+    }
 
 
 @pytest.mark.asyncio
@@ -403,6 +415,11 @@ async def test_track_c_get_report_parses_persisted_projection_and_scopes_to_owne
             "summary_win_rate": 0.67,
             "summary_trade_count": 12,
             "summary_metrics_version": "v1",
+            "public_snapshot_jsonb": {
+                "schemaVersion": "1",
+                "analysisResultId": "analysis-result-1",
+                "result": {"title": "Public report snapshot"},
+            },
         }
 
     async def fake_fetch_all(engine, sql, params=None):
@@ -447,6 +464,7 @@ async def test_track_c_get_report_parses_persisted_projection_and_scopes_to_owne
 
     assert recorded["params"]["user_id"] == "42"
     assert "FROM app.strategy_email_report AS report" in str(recorded["sql"])
+    assert "analysis_result.public_snapshot_jsonb" in str(recorded["sql"])
     assert "app.ai_backtest_report" not in str(recorded["sql"])
     assert "content" not in result
     assert result["id"] == "report-1"
@@ -489,6 +507,11 @@ async def test_track_c_get_report_parses_persisted_projection_and_scopes_to_owne
             "note": "수식 레지스트리 버전: quant-metric-registry.v2",
         },
     ]
+    assert result["publicReportSnapshot"] == {
+        "schemaVersion": "1",
+        "analysisResultId": "analysis-result-1",
+        "result": {"title": "Public report snapshot"},
+    }
 
 
 @pytest.mark.asyncio

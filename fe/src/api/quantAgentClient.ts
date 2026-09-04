@@ -203,6 +203,7 @@ function normalizeEmailReportDetail(report: ReportDetail | null): ReportDetail |
     weekday: report.weekday ?? "",
     sentAt: report.sentAt ?? "",
     status: report.status ?? "unknown",
+    publicReportSnapshot: report.publicReportSnapshot ?? null,
     title: report.title ?? "이메일 리포트",
     summary: report.summary ?? "",
     strategyName: report.strategyName ?? "전략 미상",

@@ -508,13 +508,14 @@ async def test_track_c_server_run_report_qt_db() -> None:
             assert owner_detail.json()["id"] == report_id
             assert owner_detail.json()["runId"] == run_id
             # ArchivedReportDetail is an allowlist: no marketBrief/performance/content leaks,
-            # only the two vetted evidence sections carried by the stored web projection.
+            # and it also carries the public report snapshot alongside the two vetted evidence sections.
             assert "content" not in owner_detail.json()
             assert "marketBrief" not in owner_detail.json()
             assert "performance" not in owner_detail.json()
             assert [section["id"] for section in owner_detail.json()["contentSections"]] == [
                 "reproduction_contract"
             ]
+            assert owner_detail.json()["publicReportSnapshot"]["schemaVersion"] == "1"
             assert intruder_detail.status_code == 404
 
             await _execute(

@@ -19,7 +19,10 @@ test("strategy parse failures retain a safe diagnosis without echoing strategy i
 });
 
 test("workspace reports use completed analysis jobs and keep email snapshots separate", async () => {
-  const source = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
+  const [source, typesSource] = await Promise.all([
+    readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/types/quantagent.ts", import.meta.url), "utf8"),
+  ]);
 
   assert.match(source, /backendRequest/);
   assert.match(source, /export async function getReports\(q\?: string\)/);
@@ -28,6 +31,10 @@ test("workspace reports use completed analysis jobs and keep email snapshots sep
   assert.match(source, /export async function getWorkspaceReportById/);
   assert.match(source, /export async function getEmailReportById/);
   assert.match(source, /`\/me\/email-reports\/\$\{encodeURIComponent\(id\)\}`/);
+  assert.match(source, /normalizeEmailReportDetail/);
+  assert.match(source, /publicReportSnapshot: report\.publicReportSnapshot \?\? null/);
+  assert.match(typesSource, /export interface PublicReportSnapshot/);
+  assert.match(typesSource, /publicReportSnapshot\?: PublicReportSnapshot \| null;/);
   assert.doesNotMatch(source, /export async function searchInstruments/);
   assert.match(source, /AI_REPORT_ID_PREFIX/);
   assert.doesNotMatch(source, /reportClient|reportAdapter/);
