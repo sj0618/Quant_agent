@@ -18,6 +18,20 @@ def test_deploy_uses_the_backtest_dependency_graph_and_verifies_imports():
     assert "import backtest_module, quantstats" in workflow
 
 
+def test_long_running_deploy_and_rollback_sessions_keep_ssh_alive():
+    """A quiet restart must not be rolled back just because the SSH transport idles out."""
+
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    deploy_restart = workflow.split("- name: Install and restart development servers", maxsplit=1)[1].split(
+        "- name: Restore deploy snapshot on failure", maxsplit=1
+    )[0]
+    rollback = workflow.split("- name: Restore deploy snapshot on failure", maxsplit=1)[1]
+
+    for section in (deploy_restart, rollback):
+        assert "ServerAliveInterval=30" in section
+        assert "ServerAliveCountMax=20" in section
+
+
 def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
 

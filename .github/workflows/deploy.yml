@@ -398,7 +398,11 @@ jobs:
 
       - name: Install and restart development servers
         run: |
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+          # The application boot/readiness checks can be quiet for several minutes.
+          # Keep the SSH transport alive so a healthy but slow restart is not mistaken
+          # for a failed deployment and rolled back solely by an idle connection drop.
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+            -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
             bash -s -- "$GITHUB_SHA" <<'REMOTE'
             set -euo pipefail
 
@@ -779,7 +783,8 @@ jobs:
       - name: Restore deploy snapshot on failure
         if: failure() && env.DEPLOY_MUTATION_STARTED == 'true'
         run: |
-          ssh -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+            -i ~/.ssh/id_rsa -p 30233 etluser@quant-agent.kro.kr \
             bash -s -- "$GITHUB_SHA" <<'REMOTE'
           set -Eeuo pipefail
 
