@@ -156,6 +156,8 @@ class AOAICodeGenerator:
         if not request.parsed_strategy_jsonb:
             raise ValueError("code generation requires a sealed strategy with a backtest period")
         strategy = StrategySpec.model_validate(request.parsed_strategy_jsonb)
+        if strategy.backtest_years is None:
+            raise ValueError("code generation requires a sealed strategy with a backtest period")
         prompt_request = build_backtest_code_json_request(strategy, "A")
         llm_client = create_llm_client(role="BACKTEST_CODE")
         RecordingAuditSink, bind_audit_context, create_audit_correlation = _load_audit_modules()

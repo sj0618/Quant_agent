@@ -841,8 +841,9 @@ def resolve_strategy_intent(
         payload = client.generate_json(repair_request)
         resolved = _LiveStrategyIntent.model_validate(payload)
     except (LLMClientError, ValueError, TypeError):
-        if is_live_llm_provider():
-            raise
+        # A provider/configuration failure cannot be replaced by a locally chosen
+        # period.  Returning no intent makes the graph stop at its pre-loader
+        # period gate, which is both retryable for the caller and safe for mock mode.
         return None
     if resolved.scope == "supported" and not resolved.resolved_query.strip():
         # An empty resolution would silently hand the raw vague query back to the

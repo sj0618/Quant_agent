@@ -84,6 +84,25 @@ def test_sealing_rejects_a_parsed_strategy_without_a_period() -> None:
     assert caught.value.code == "backtest_period_required"
 
 
+def test_generator_rejects_an_unsealed_strategy_before_calling_the_model() -> None:
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="RSI 전략",
+        parsed_strategy_jsonb={
+            "strategy_id": "incomplete",
+            "name": "Incomplete",
+            "market": "KRX",
+            "timeframe": "daily",
+            "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}],
+            "confidence": 0.5,
+        },
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    with pytest.raises(ValueError, match="sealed strategy"):
+        asyncio.run(AOAICodeGenerator().generate(request, trace_id=uuid4()))
+
+
 def test_sealing_resolves_one_period_and_persists_it(monkeypatch) -> None:
     from ai_graph.schemas import StrategySpec
 
@@ -162,6 +181,7 @@ def test_sandboxed_backtest_executor_enforces_timeout(monkeypatch):
             "name": "Loop Strategy",
             "market": "KRX",
             "timeframe": "daily",
+            "backtest_years": 2,
             "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}],
             "exit_conditions": [],
             "indicators": ["RSI"],
@@ -296,6 +316,7 @@ def test_aoai_code_generator_captures_full_model_call(monkeypatch):
             "name": "RSI 반등",
             "market": "KRX",
             "timeframe": "daily",
+            "backtest_years": 2,
             "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}],
             "exit_conditions": [{"left": "rsi", "operator": "gte", "right": 70}],
             "indicators": ["RSI"],
@@ -364,6 +385,9 @@ def test_aoai_code_generator_marks_provider_failure_and_keeps_prompt_for_fallbac
             raise LLMClientError("provider detail", retry_count=2)
 
     monkeypatch.setattr("ai_graph.llm.factory.create_llm_client", lambda role=None: FailingClient())
+    monkeypatch.setattr(
+        "ai_graph.nodes.backtest_code.is_live_llm_provider", lambda: False
+    )
     generator = AOAICodeGenerator()
     request = AICodeBacktestFlowRequest(
         natural_language_prompt="모델 실패 뒤 fallback 코드를 만들어줘",
@@ -372,6 +396,7 @@ def test_aoai_code_generator_marks_provider_failure_and_keeps_prompt_for_fallbac
             "name": "Provider Failure",
             "market": "KRX",
             "timeframe": "daily",
+            "backtest_years": 2,
             "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}],
             "exit_conditions": [],
             "indicators": ["RSI"],
@@ -486,7 +511,13 @@ def test_aoai_code_generator_keeps_model_call_when_fallback_also_fails(
             type(
                 "StrategySpec",
                 (),
-                {"model_validate": staticmethod(lambda payload: SimpleNamespace(strategy_id=payload["strategy_id"]))},
+                {
+                    "model_validate": staticmethod(
+                        lambda payload: SimpleNamespace(
+                            strategy_id=payload["strategy_id"], backtest_years=2
+                        )
+                    )
+                },
             ),
             DummyAOAIClient,
             DummyMockClient,
@@ -542,6 +573,9 @@ def test_aoai_code_generator_marks_response_schema_fallback_as_failed(monkeypatc
             return {"unexpected": True}
 
     monkeypatch.setattr("ai_graph.llm.factory.create_llm_client", lambda role=None: WrongSchemaClient())
+    monkeypatch.setattr(
+        "ai_graph.nodes.backtest_code.is_live_llm_provider", lambda: False
+    )
     generator = AOAICodeGenerator()
     request = AICodeBacktestFlowRequest(
         natural_language_prompt="잘못된 응답 스키마를 fallback 처리해줘",
@@ -550,6 +584,7 @@ def test_aoai_code_generator_marks_response_schema_fallback_as_failed(monkeypatc
             "name": "Wrong Schema",
             "market": "KRX",
             "timeframe": "daily",
+            "backtest_years": 2,
             "entry_conditions": [{"left": "rsi", "operator": "lte", "right": 30}],
             "exit_conditions": [],
             "indicators": ["RSI"],
@@ -605,7 +640,13 @@ def test_aoai_code_generator_marks_deterministic_fallback_model_call_as_failed(m
             type(
                 "StrategySpec",
                 (),
-                {"model_validate": staticmethod(lambda payload: SimpleNamespace(strategy_id=payload["strategy_id"]))},
+                {
+                    "model_validate": staticmethod(
+                        lambda payload: SimpleNamespace(
+                            strategy_id=payload["strategy_id"], backtest_years=2
+                        )
+                    )
+                },
             ),
             DummyAOAIClient,
             DummyMockClient,

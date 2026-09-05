@@ -621,8 +621,8 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
     report_activity("step", label="요청 해석", detail="입력을 실행 가능한 전략으로 구체화하는 중")
     intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
     if intent is None:
-        # Mock mode and provider failures: no model to decide with, so fall back to the
-        # judgments that do not need one - small talk, and asset class.
+        # Without a model decision this can still be classified as a stock request,
+        # but it cannot reach the loader: data_node requires a sealed period first.
         return _ambiguity_state(classify_query(query), query, intent=None)
     if intent["scope"] == "not_a_request":
         return _ambiguity_state(AmbiguityCode.NO_STRATEGY_INTENT, query, intent=intent)

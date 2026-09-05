@@ -23,6 +23,41 @@ pytest_plugins = ("offline_test_environment",)
 pytestmark = pytest.mark.usefixtures("offline_test_environment")
 
 
+@pytest.fixture(autouse=True)
+def _explicit_period_selected_by_test_ai(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep offline happy paths explicit without restoring a mock-period default.
+
+    Production and ordinary mock calls must stop before data access when the AI has not
+    selected a period.  E2E tests that exercise later nodes instead inject one complete
+    AI decision, so the loader only sees an already locked value.
+    """
+
+    def resolve(query: str, **_kwargs: object) -> dict[str, object]:
+        if "옵션" in query:
+            return {
+                "scope": "unsupported",
+                "scope_reason": "옵션은 KRX 현물 데이터로 검증할 수 없습니다.",
+                "resolved_query": "",
+                "interpretation": "옵션 전략 요청입니다.",
+                "assumptions": [],
+                "citations": [],
+                "backtest_years": 2,
+                "backtest_period_basis": "테스트 AI가 데이터 조회 전에 범위를 확정했습니다.",
+            }
+        return {
+            "scope": "supported",
+            "scope_reason": "",
+            "resolved_query": query,
+            "interpretation": "테스트 AI가 요청을 실행 조건으로 확정했습니다.",
+            "assumptions": ["테스트 AI가 데이터 조회 전에 2년을 선택했습니다."],
+            "citations": [],
+            "backtest_years": 2,
+            "backtest_period_basis": "테스트 AI가 데이터 조회 전에 범위를 확정했습니다.",
+        }
+
+    monkeypatch.setattr("ai_graph.graph.resolve_strategy_intent", resolve)
+
+
 def test_offline_environment_rebinds_imported_consumers_and_tripwires_boundaries(
     offline_test_environment: "OfflineTestEnvironment",
 ) -> None:

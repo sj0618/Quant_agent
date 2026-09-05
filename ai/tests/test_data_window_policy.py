@@ -68,7 +68,7 @@ def test_window_binds_the_configured_lookback_years() -> None:
 
 @pytest.mark.parametrize(
     ("configured", "expected"),
-    [("0", 1), ("-3", 1), ("1", 1), ("3", 3), ("9", 3), ("", 1)],
+    [("0", 1), ("-3", 1), ("1", 1), ("3", 3), ("9", 5), ("", 1)],
 )
 def test_lookback_years_clamp_instead_of_failing_the_deployment(configured, expected) -> None:
     """An out-of-range env value must narrow the read, not take the service down."""
@@ -201,6 +201,11 @@ def test_data_node_reads_the_sealed_v1_rule_before_loading(monkeypatch) -> None:
                 "user_query": "RSI 30 이하 매수 70 이상 매도 전략을 검증해줘",
                 "trace_id": "sealed-v1-plan",
                 "execution_spec": spec,
+                "backtest_period": {
+                    "backtest_years": 2,
+                    "basis": "테스트가 데이터 조회 전 확정한 기간입니다.",
+                    "period_locked": True,
+                },
             }
         )
 
@@ -210,6 +215,8 @@ def test_data_node_reads_the_sealed_v1_rule_before_loading(monkeypatch) -> None:
     assert captured["compact_price_rows"] is False
     # The current-day screen is still presentation context for a V1 run.
     assert captured["screen_current"] is True
+    assert captured["backtest_lookback_years"] == 2
+    assert captured["period_locked"] is True
     assert indicator_families_for_metrics(("rsi",), include_default=False) == ("momentum",)
 
 
@@ -242,8 +249,15 @@ def test_data_node_asks_for_dart_only_when_the_sealed_v1_rule_names_a_fundamenta
                 "user_query": "ROE 10% 이상이면 매수하는 전략을 검증해줘",
                 "trace_id": "sealed-v1-fundamental",
                 "execution_spec": spec,
+                "backtest_period": {
+                    "backtest_years": 2,
+                    "basis": "테스트가 데이터 조회 전 확정한 기간입니다.",
+                    "period_locked": True,
+                },
             }
         )
 
     assert captured["required_metrics"] == ("roe",)
     assert captured["requires_financials"] is True
+    assert captured["backtest_lookback_years"] == 2
+    assert captured["period_locked"] is True

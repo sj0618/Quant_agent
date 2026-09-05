@@ -497,6 +497,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
         compact_price_rows: bool = False,
         sector: str | None = None,
         backtest_lookback_years: int | None = None,
+        period_locked: bool = False,
     ) -> object:
         captured.update(
             {
@@ -507,6 +508,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
                 "requires_financials": requires_financials,
                 "compact_price_rows": compact_price_rows,
                 "backtest_lookback_years": backtest_lookback_years,
+                "period_locked": period_locked,
             }
         )
         raise RuntimeError("data loader captured")
@@ -529,6 +531,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
     # OHLCV-only projection reserved for relative-strength price paths.
     assert captured["compact_price_rows"] is False
     assert captured["backtest_lookback_years"] == 3
+    assert captured["period_locked"] is True
 
 
 def test_data_plan_reads_the_sealed_ast_not_only_the_researcher_metric_summary() -> None:

@@ -163,11 +163,19 @@ def test_resolved_strategy_is_what_gets_screened(
     """The unit test owns its data adapter; it must not start a live PostgreSQL read."""
 
     live_intent(_intent_payload())
+    captured: dict[str, Any] = {}
+
+    def load_unit_data(*_args: Any, **kwargs: Any) -> PipelineDataBundle:
+        captured.update(kwargs)
+        return PipelineDataBundle(data_availability={}, metadata={"source": "unit-test"})
+
     monkeypatch.setattr(
         "ai_graph.graph.load_pipeline_data_from_env",
-        lambda *_args, **_kwargs: PipelineDataBundle(
-            data_availability={}, metadata={"source": "unit-test"}
-        ),
+        load_unit_data,
+    )
+    monkeypatch.setattr(
+        "ai_graph.graph.generate_analyst_strategy_candidates",
+        lambda **_kwargs: [],
     )
 
     state: dict[str, Any] = {"user_query": "화학 관련주 사줘", "trace_id": "t"}
@@ -178,6 +186,8 @@ def test_resolved_strategy_is_what_gets_screened(
     # come from the strategy the interpreter chose - not from a query that named none.
     assert "rsi" in data["semantic_slots"]["indicator"]
     assert "sma_200" in data["semantic_slots"]["indicator"]
+    assert captured["backtest_lookback_years"] == 3
+    assert captured["period_locked"] is True
 
 
 def test_the_decisions_made_for_the_user_are_disclosed_on_the_result(live_intent) -> None:
@@ -263,13 +273,20 @@ def test_a_citation_without_a_title_still_resolves(live_intent) -> None:
     assert resolved["citations"] == [{"title": "", "url": "https://example.com/krx"}]
 
 
-def test_provider_failure_still_runs_the_analysis() -> None:
-    """Mock mode and provider outages must not turn into questions either; without a
-    model to interpret with, the fallback answers the one question that needs no
-    model - is this a KRX equity request at all."""
+def test_missing_ai_period_stops_before_the_data_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mock/provider-free paths must not silently choose a local default period."""
+
+    monkeypatch.setattr("ai_graph.llm.role_calls.is_live_llm_provider", lambda: False)
+    monkeypatch.setattr(
+        "ai_graph.graph.load_pipeline_data_from_env",
+        lambda *_args, **_kwargs: pytest.fail("the loader must not receive an unsealed period"),
+    )
 
     state = ambiguity_classifier_node({"user_query": "돈 버는 전략 만들어서 검증해줘", "trace_id": "t"})
+    data = data_node({"user_query": "돈 버는 전략 만들어서 검증해줘", "trace_id": "t", **state})
 
     assert state["status"] == EnvelopeStatus.READY.value
     assert "intent" not in state
+    assert data["status"] == EnvelopeStatus.NEED_CLARIFICATION.value
+    assert "백테스트 기간" in data["ambiguity"]["reason"]
     assert classify_query("돈 버는 전략 만들어서 검증해줘") == AmbiguityCode.READY
