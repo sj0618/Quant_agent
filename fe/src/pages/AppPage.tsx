@@ -416,7 +416,7 @@ export function AppPage() {
   // A terminal failure is no longer "running", but it still needs the exact
   // server diagnosis rendered in the workspace instead of falling through to
   // the generic candidate-selection empty state.
-  const terminalFailureJob = latestJob?.result?.status === "failed" ? latestJob : undefined;
+  const terminalFailureJob = latestJob?.result?.failure_cause ? latestJob : undefined;
   const progressJob = runningJob ?? terminalFailureJob;
   const analysisActivity = useAnalysisActivity(runningJob?.job_id ?? null);
 
