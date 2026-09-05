@@ -436,6 +436,12 @@ export function AppPage() {
   const runningJob = [...analysisJobs]
     .reverse()
     .find((job) => !job.result && !inertJobIds.includes(job.job_id));
+  const latestJob = analysisJobs.at(-1);
+  // A terminal failure is no longer "running", but it still needs the exact
+  // server diagnosis rendered in the workspace instead of falling through to
+  // the generic candidate-selection empty state.
+  const terminalFailureJob = latestJob?.result?.status === "failed" ? latestJob : undefined;
+  const progressJob = runningJob ?? terminalFailureJob;
   const analysisActivity = useAnalysisActivity(runningJob?.job_id ?? null);
 
   const handleTabChange = (tab: WorkspaceResultTab) => {
@@ -465,7 +471,6 @@ export function AppPage() {
     (currentOverview, job) => mergeAnalysisJobIntoOverview(currentOverview, job),
     data,
   );
-  const latestJob = analysisJobs.at(-1);
   const hasCurrentConversation = analysisJobs.length > 0;
   const canRenderWorkspace = hasWorkspaceResult(latestJob);
   // Today's picks are only a recommendation if the strategy behind them cleared its
@@ -480,9 +485,9 @@ export function AppPage() {
   const historyPreviews = conversationHistory.map((conversation) => conversationPreview(conversation, data));
   const cancelRequested = Boolean(runningJob && cancelledJobIds.includes(runningJob.job_id));
   const workspaceProgress = buildWorkspaceProgress({
-    job: runningJob,
+    job: progressJob,
     pendingAnalysis,
-    error: runningJob ? jobErrors[runningJob.job_id] : undefined,
+    error: progressJob ? jobErrors[progressJob.job_id] : undefined,
     cancelRequested,
   });
 

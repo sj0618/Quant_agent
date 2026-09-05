@@ -51,6 +51,15 @@ test("workspace progress follows server stages instead of elapsed client time", 
   );
 });
 
+test("terminal analysis failures retain the server diagnosis in the workspace", async () => {
+  const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /const terminalFailureJob = latestJob\?\.result\?\.status === "failed" \? latestJob : undefined;/);
+  assert.match(source, /const progressJob = runningJob \?\? terminalFailureJob;/);
+  assert.match(source, /job: progressJob,/);
+  assert.match(source, /error: progressJob \? jobErrors\[progressJob\.job_id\] : undefined,/);
+});
+
 test("workspace directly queues a natural-language strategy job", async () => {
   const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
   const createJob = clientSource.slice(
