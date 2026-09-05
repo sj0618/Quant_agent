@@ -53,6 +53,11 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
   // reliability card above lists which sample check fell short.
   const sampleNote = overview.performance.reliability?.status === "insufficient" ? "표본 부족 · 참고용 · " : "";
   const candidateCounts = countScoredSignals(overview.candidates);
+  // Candidate rows already use the per-ticker action returned by the backtest.  The
+  // summary must count that same source; `passCount` is a strategy-level fallback and
+  // can be zero even while the displayed rows carry HOLD/BUY/DROP verdicts.
+  const tickerSignalCounts = candidateCounts ?? { BUY: 0, HOLD: 0, DROP: 0 };
+  const activeSignalCount = tickerSignalCounts.BUY + tickerSignalCounts.HOLD + tickerSignalCounts.DROP;
   // The acceptance-floor's own conclusion sentence, when the backend sends one, is more
   // specific than the gate's short reason code - prefer it, falling back to the reason.
   const gateNote = overview.objectiveFloorConclusion ?? overview.recommendationGateReason;
@@ -93,7 +98,7 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
                 delta: undefined,
                 caption: gateNote ? `백테스트 목표 기준 미달 · 참고용 · ${gateNote}` : "백테스트 목표 기준 미달 · 참고용",
               },
-          { label: "활성 신호", value: `${overview.passCount}건`, delta: undefined, caption: `BUY ${overview.buyCount} · HOLD ${overview.holdCount} · DROP ${overview.dropCount}` },
+          { label: "활성 신호", value: `${activeSignalCount}건`, delta: undefined, caption: `BUY ${tickerSignalCounts.BUY} · HOLD ${tickerSignalCounts.HOLD} · DROP ${tickerSignalCounts.DROP}` },
           {
             // The chart card below plots this exact out-of-sample curve, so the tile reads
             // it too - preferring the whole-period metric card here is what produced the
@@ -137,9 +142,9 @@ export function OverviewTab({ overview, validated = true }: OverviewTabProps) {
                 <Badge variant="dark">ALL {overview.candidates.length}</Badge>
                 {candidateCounts ? (
                   <>
-                    <Badge signal="BUY">BUY {candidateCounts.BUY}</Badge>
-                    <Badge signal="HOLD">HOLD {candidateCounts.HOLD}</Badge>
-                    <Badge signal="DROP">DROP {candidateCounts.DROP}</Badge>
+                    <Badge signal="BUY">BUY {tickerSignalCounts.BUY}</Badge>
+                    <Badge signal="HOLD">HOLD {tickerSignalCounts.HOLD}</Badge>
+                    <Badge signal="DROP">DROP {tickerSignalCounts.DROP}</Badge>
                   </>
                 ) : null}
               </div>
