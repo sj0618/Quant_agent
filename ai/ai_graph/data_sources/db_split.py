@@ -37,6 +37,8 @@ AI_DB_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_STATEMENT_TIMEOUT_MS"
 AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS"
 AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 AI_DATA_SOURCE_LOAD_MODE_ENV = "AI_DATA_SOURCE_LOAD_MODE"
+AI_ALLOW_SCREENING_RELAXATION_ENV = "AI_ALLOW_SCREENING_RELAXATION"
+AI_ENABLE_LLM_SCREENING_ENV = "AI_ENABLE_LLM_SCREENING"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
@@ -152,6 +154,8 @@ class DataSourceConfig(BaseModel):
     load_mode: Literal["backtest", "screening_only"] = Field(
         default=DEFAULT_DATA_SOURCE_LOAD_MODE
     )
+    allow_screening_relaxation: bool = False
+    enable_llm_screening: bool = False
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "DataSourceConfig":
@@ -185,6 +189,10 @@ class DataSourceConfig(BaseModel):
                 AI_DATA_SOURCE_LOAD_MODE_ENV, DEFAULT_DATA_SOURCE_LOAD_MODE
             ).strip().lower()
             or DEFAULT_DATA_SOURCE_LOAD_MODE,
+            allow_screening_relaxation=_bool_env(
+                env, AI_ALLOW_SCREENING_RELAXATION_ENV, False
+            ),
+            enable_llm_screening=_bool_env(env, AI_ENABLE_LLM_SCREENING_ENV, False),
         )
 
 
@@ -198,10 +206,14 @@ class PipelineDataBundle(BaseModel):
 
     price_rows: list[dict[str, Any]] = Field(default_factory=list)
     screening_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    current_screen_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    relaxed_screening_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    historical_backtest_universe: list[str] = Field(default_factory=list)
     l4_evidence: list[dict[str, Any]] = Field(default_factory=list)
     # Carries the measured values plus the label saying what the equity leg was
     # measured against, so a report can never call a universe proxy "the KOSPI".
     macro_snapshot: dict[str, Any] | None = None
+    official_benchmark: dict[str, Any] | None = None
     data_availability: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -324,22 +336,46 @@ class PostgresPipelineDataSource:
         required_metrics: Sequence[str] | None = None,
         requires_financials: bool | None = None,
         compact_price_rows: bool = False,
+        sector: str | None = None,
     ) -> PipelineDataBundle:
         # Keep the alternative source API compatible with the sealed V3 data plan.
         # Its own projection planner is intentionally unchanged; this prevents a
         # configured variant from failing merely because the primary source gained a
         # plan-aware optional argument.
-        del required_metrics, requires_financials, compact_price_rows
+        required_indicator_families = (
+            indicator_families_for_metrics(required_metrics)
+            if required_metrics is not None
+            else None
+        )
+        del requires_financials, compact_price_rows
         if self.config.load_mode == "screening_only":
-            if not screen_current:
+            if not screen_current or required_indicator_families is not None:
                 raise PipelineDataUnavailableError(
                     "backtest_data_required",
-                    "sealed exploration requires the server backtest data load mode",
+                    "sealed execution requires the server backtest data load mode",
                 )
-            return self.load_screening_only(query, trace_id)
-        return self.load_with_backtest(query, trace_id, screen_current=screen_current)
+            return self.load_screening_only(
+                query,
+                trace_id,
+                sector=sector,
+                required_indicator_families=required_indicator_families,
+            )
+        return self.load_with_backtest(
+            query,
+            trace_id,
+            screen_current=screen_current,
+            sector=sector,
+            required_indicator_families=required_indicator_families,
+        )
 
-    def load_screening_only(self, query: str, trace_id: str) -> PipelineDataBundle:
+    def load_screening_only(
+        self,
+        query: str,
+        trace_id: str,
+        *,
+        sector: str | None = None,
+        required_indicator_families: Sequence[str] | None = None,
+    ) -> PipelineDataBundle:
         self.unavailable_indicator_families = ()
         with self._connect() as conn:
             self._set_statement_timeout(conn)
@@ -360,7 +396,11 @@ class PostgresPipelineDataSource:
                     },
                 )
 
-            indicator_families = indicator_families_for_query(query)
+            indicator_families = (
+                tuple(required_indicator_families)
+                if required_indicator_families is not None
+                else indicator_families_for_query(query)
+            )
             screening_candidates: list[dict[str, Any]] = []
             screening_relaxation: dict[str, Any] = {}
             recommended: list[str] = []
@@ -387,6 +427,13 @@ class PostgresPipelineDataSource:
                 else:
                     ticker_resolution = "explicit_or_name_match"
 
+            relaxed_screening_candidates = (
+                screening_candidates if screening_relaxation.get("relaxed") else []
+            )
+            current_screen_candidates = (
+                [] if relaxed_screening_candidates else screening_candidates
+            )
+            screening_candidates = current_screen_candidates
             if not screening_candidates and not single_ticker:
                 raise PipelineDataUnavailableError(
                     "no_screening_matches",
@@ -404,12 +451,17 @@ class PostgresPipelineDataSource:
                     screening_candidates[0].get("ticker") or ""
                 ).zfill(6)
             if ticker is None:
-                ticker = self.config.default_ticker
+                raise PipelineDataUnavailableError(
+                    "no_screening_matches",
+                    "no screening candidate or resolvable ticker found; refusing to use a default ticker",
+                )
 
             tickers = recommended[:] if recommended else [ticker]
             return PipelineDataBundle(
                 price_rows=[],
                 screening_candidates=screening_candidates,
+                current_screen_candidates=current_screen_candidates,
+                relaxed_screening_candidates=relaxed_screening_candidates,
                 l4_evidence=[],
                 macro_snapshot=None,
                 data_availability=_data_availability_for_query(
@@ -435,7 +487,13 @@ class PostgresPipelineDataSource:
             )
 
     def load_with_backtest(
-        self, query: str, trace_id: str, *, screen_current: bool = True
+        self,
+        query: str,
+        trace_id: str,
+        *,
+        screen_current: bool = True,
+        sector: str | None = None,
+        required_indicator_families: Sequence[str] | None = None,
     ) -> PipelineDataBundle:
         self.unavailable_indicator_families = ()
         with self._connect() as conn:
@@ -463,7 +521,11 @@ class PostgresPipelineDataSource:
                         "capability_probe": capability_availability,
                     },
                 )
-            indicator_families = indicator_families_for_query(query)
+            indicator_families = (
+                tuple(required_indicator_families)
+                if required_indicator_families is not None
+                else indicator_families_for_query(query)
+            )
             screening_candidates = []
             screening_relaxation: dict[str, Any] = {}
             recommended: list[str] = []
@@ -498,6 +560,15 @@ class PostgresPipelineDataSource:
                     )
                 else:
                     ticker_resolution = "explicit_or_name_match"
+            relaxed_screening_candidates = (
+                screening_candidates if screening_relaxation.get("relaxed") else []
+            )
+            current_screen_candidates = (
+                [] if relaxed_screening_candidates else screening_candidates
+            )
+            # Relaxed matches are presentation-only and cannot influence the
+            # historical universe selected below.
+            screening_candidates = current_screen_candidates
             if screening_mode:
                 # The matched names are the recommendation ("buy these today"). The
                 # backtest, though, runs over a liquidity-selected universe so build_signals
@@ -512,12 +583,19 @@ class PostgresPipelineDataSource:
                 # ~2,900 tickers and the price history ~3.6M rows, far past the statement
                 # budget. This is the single cause of the reported
                 # "데이터 조회 시간이 초과되었습니다".
-                recommended = _backtest_ticker_pool(
+                screening_recommended = _backtest_ticker_pool(
                     screening_candidates, self.config.backtest_max_tickers
                 )
-                tickers = self._fetch_backtest_universe(conn, recommended)
+                tickers = self._fetch_backtest_universe(conn, screening_recommended, sector)
                 if not tickers:
-                    raise ValueError("historical backtest universe is empty")
+                    scope = f" for sector {sector}" if sector else ""
+                    raise PipelineDataUnavailableError(
+                        "historical_backtest_universe_empty",
+                        f"historical backtest universe is empty{scope}",
+                    )
+                recommended = [
+                    candidate for candidate in screening_recommended if candidate in tickers
+                ]
                 ticker = recommended[0] if recommended else tickers[0]
                 symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
@@ -550,6 +628,15 @@ class PostgresPipelineDataSource:
                 raise PipelineDataUnavailableError(
                     "no_price_rows",
                     f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}",
+                )
+            if required_indicator_families is not None:
+                self.unavailable_indicator_families = tuple(
+                    sorted(
+                        set(self.unavailable_indicator_families)
+                        | _missing_indicator_families_from_rows(
+                            price_rows, indicator_families
+                        )
+                    )
                 )
             # This is intentionally queried after the extract has been read from the
             # same connection.  The manifest can call the extract current only when
@@ -603,6 +690,9 @@ class PostgresPipelineDataSource:
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
+            current_screen_candidates=current_screen_candidates,
+            relaxed_screening_candidates=relaxed_screening_candidates,
+            historical_backtest_universe=list(tickers),
             l4_evidence=l4_evidence,
             macro_snapshot=macro_snapshot,
             data_availability=data_availability,
@@ -644,7 +734,12 @@ class PostgresPipelineDataSource:
             },
         )
 
-    def _fetch_backtest_universe(self, conn: Any, recommended: Sequence[str]) -> list[str]:
+    def _fetch_backtest_universe(
+        self,
+        conn: Any,
+        recommended: Sequence[str],
+        sector: str | None = None,
+    ) -> list[str]:
         """The universe the backtest actually trades over: KOSPI 200.
 
         The screen answers "which names meet the condition today"; using that as the
@@ -656,8 +751,8 @@ class PostgresPipelineDataSource:
 
         KOSPI 200 is that market. There is no index-membership table, so it is
         approximated the standard way - the 200 largest KOSPI common stocks by market
-        cap (MKTCAP on symbol_master). The strategy's recommended names are unioned in so
-        they remain tradable even if one sits just outside the top 200.
+        cap (MKTCAP on symbol_master). Current recommendations are intentionally not
+        unioned into this historical universe.
         """
 
         rows = conn.execute(
@@ -667,15 +762,15 @@ class PostgresPipelineDataSource:
             WHERE market = 'KOSPI'
               AND security_type = '보통주'
               AND metadata_jsonb->>'MKTCAP' ~ '^[0-9]+$'
+              AND (%(sector)s::text IS NULL OR sector = %(sector)s)
             ORDER BY (metadata_jsonb->>'MKTCAP')::numeric DESC
             LIMIT 200
-            """
+            """,
+            {"sector": sector},
         ).fetchall()
         universe = [str(row["symbol"]).zfill(6) for row in rows]
-        seen = set(universe)
-        # Recommended names first, then KOSPI 200, so a recommendation is never dropped.
-        extra = [t for t in (str(x).zfill(6) for x in recommended) if t not in seen]
-        return [*extra, *universe]
+        del recommended
+        return universe
 
     def _fetch_screening_candidates(self, conn: Any, query: str) -> list[dict[str, Any]]:
         return self._screen_with_relaxation(conn, query)[0]
@@ -745,7 +840,7 @@ class PostgresPipelineDataSource:
         # generation. In production those calls each exhausted three response-start
         # attempts before falling back here, adding 87 seconds without changing the
         # result. Keep LLM-authored SQL for strategies outside the supported profiles.
-        if profile == "technical_proxy":
+        if profile == "technical_proxy" and self.config.enable_llm_screening:
             llm_result = self._screen_via_llm(conn, query)
             if llm_result is not None:
                 return llm_result
@@ -765,7 +860,12 @@ class PostgresPipelineDataSource:
 
         thresholds = ScreeningThresholds()
         rounds: list[dict[str, Any]] = []
-        for round_index in range(MAX_SCREENING_RELAXATION_ROUNDS + 1):
+        max_rounds = (
+            MAX_SCREENING_RELAXATION_ROUNDS
+            if self.config.allow_screening_relaxation
+            else 0
+        )
+        for round_index in range(max_rounds + 1):
             matches = _screening_matcher(profile, thresholds)
             matched = [row for row in rows if matches(row)]
             rounds.append(
@@ -781,9 +881,13 @@ class PostgresPipelineDataSource:
                     _screening_candidate_from_row(row, profile, sector=sector) for row in matched
                 ]
                 return candidates, _relaxation_trace(
-                    profile, rounds, len(rows), frame=frame_trace
+                    profile,
+                    rounds,
+                    len(rows),
+                    frame=frame_trace,
+                    relaxation_allowed=self.config.allow_screening_relaxation,
                 )
-            if round_index == MAX_SCREENING_RELAXATION_ROUNDS:
+            if round_index == max_rounds:
                 break
             thresholds = _propose_relaxed_thresholds(
                 query=query,
@@ -791,8 +895,15 @@ class PostgresPipelineDataSource:
                 thresholds=thresholds,
                 round_index=round_index,
                 universe_rows=len(rows),
+                allow_llm=self.config.enable_llm_screening,
             )
-        return [], _relaxation_trace(profile, rounds, len(rows), frame=frame_trace)
+        return [], _relaxation_trace(
+            profile,
+            rounds,
+            len(rows),
+            frame=frame_trace,
+            relaxation_allowed=self.config.allow_screening_relaxation,
+        )
 
     def _load_screening_frame(
         self, conn: Any, *, sector: str | None, profile: str
@@ -1462,6 +1573,7 @@ def load_pipeline_data_from_env(
     required_metrics: Sequence[str] | None = None,
     requires_financials: bool | None = None,
     compact_price_rows: bool = False,
+    sector: str | None = None,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -1476,6 +1588,7 @@ def load_pipeline_data_from_env(
         required_metrics=required_metrics,
         requires_financials=requires_financials,
         compact_price_rows=compact_price_rows,
+        sector=sector,
     )
 
 
@@ -1791,6 +1904,7 @@ def _relaxation_trace(
     universe_rows: int,
     *,
     frame: Mapping[str, Any] | None = None,
+    relaxation_allowed: bool = True,
 ) -> dict[str, Any]:
     final = rounds[-1] if rounds else {}
     return {
@@ -1799,6 +1913,8 @@ def _relaxation_trace(
         "rounds": rounds,
         "relaxation_rounds": max(len(rounds) - 1, 0),
         "relaxed": bool(final.get("relaxed")) and bool(final.get("matched_count")),
+        "relaxation_allowed": relaxation_allowed,
+        "relaxation_blocked": not relaxation_allowed,
         "matched_count": int(final.get("matched_count") or 0),
         # Which date was screened, where the indicators came from, and what the
         # relative-strength benchmark was measured against - all three used to be
@@ -1814,10 +1930,13 @@ def _propose_relaxed_thresholds(
     thresholds: ScreeningThresholds,
     round_index: int,
     universe_rows: int,
+    allow_llm: bool = False,
 ) -> ScreeningThresholds:
     """Ask the LLM to loosen the screen, falling back to the deterministic ladder."""
 
     deterministic = _relaxed_thresholds(thresholds, round_index, profile=profile)
+    if not allow_llm:
+        return deterministic
     try:
         # Imported lazily: ai_graph.llm pulls in the provider stack, which must stay
         # optional for fixture-only runs of this module.
@@ -2096,6 +2215,30 @@ INDICATOR_TABLES: dict[str, str] = {
     "volatility": TA_VOLATILITY_TICKER_TABLE,
     "volume": TA_VOLUME_TICKER_TABLE,
 }
+
+_INDICATOR_ROW_FIELDS: dict[str, tuple[str, ...]] = {
+    "trend": tuple(_TREND_KEYS),
+    "momentum": tuple(_MOMENTUM_KEYS),
+    "volatility": (*tuple(_VOLATILITY_KEYS), "bb_width"),
+    "volume": tuple(_VOLUME_KEYS),
+}
+
+
+def _missing_indicator_families_from_rows(
+    price_rows: Sequence[Mapping[str, Any]], families: Sequence[str]
+) -> set[str]:
+    """Find required families that returned no usable value in the loaded rows."""
+
+    missing: set[str] = set()
+    for family in families:
+        fields = _INDICATOR_ROW_FIELDS.get(family, ())
+        if fields and not any(
+            _optional_float_value(row.get(field)) is not None
+            for row in price_rows
+            for field in fields
+        ):
+            missing.add(family)
+    return missing
 
 # Which family each condition metric lives in, so the backtest reads only the tables its
 # strategy actually references. Reading all four over a 200-name universe cost ~37s;
@@ -2863,3 +3006,15 @@ def _int_env(env: Mapping[str, str], key: str, default: int) -> int:
     if value is None or not value.strip():
         return default
     return int(value)
+
+
+def _bool_env(env: Mapping[str, str], key: str, default: bool) -> bool:
+    value = env.get(key)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{key} must be a boolean value")

@@ -21,6 +21,7 @@ from ai_graph.audit import (
 )
 from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_sink
 from ai_graph.data_sources import (
+    ACTIVE_DATA_SOURCE_VARIANT,
     PipelineDataUnavailableError,
     load_pipeline_data_from_env,
     screening_data_families,
@@ -108,10 +109,8 @@ from ai_graph.schemas import (
     canonical_execution_spec_digest,
     validate_execution_spec,
 )
-from ai_graph.source_manifest import (
-    is_release_profile,
-    validate_release_metadata,
-)
+from ai_graph.source_manifest import validate_release_metadata
+from ai_graph.data_sources.db import is_release_profile
 from ai_graph.state import QuantAgentState
 from ai_graph.strategy_blueprint_catalog import strategy_blueprint_catalog
 
@@ -744,6 +743,11 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
         else None
     )
+    if is_release_profile() and ACTIVE_DATA_SOURCE_VARIANT != "db":
+        raise PipelineDataUnavailableError(
+            "production_data_source_variant_forbidden",
+            "운영 환경에서는 검증된 PostgreSQL data source variant(db)만 사용할 수 있습니다.",
+        )
     if required_metrics is not None:
         requires_financials = bool(required_metrics & _FUNDAMENTAL_CONDITION_METRICS)
         # Only a sealed V3 price-path plan may take the OHLCV-only projection.  V1
@@ -770,9 +774,37 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         )
     else:
         pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
+    if is_release_profile() and pipeline_data.metadata.get("source") != "postgres":
+        raise PipelineDataUnavailableError(
+            "production_postgres_required",
+            "운영 환경에서는 PostgreSQL 데이터가 확인된 경우에만 분석을 진행할 수 있습니다.",
+        )
+    missing_required_families = _missing_required_indicator_families(
+        required_metrics,
+        pipeline_data.metadata,
+    )
+    if missing_required_families:
+        raise PipelineDataUnavailableError(
+            "required_indicator_data_unavailable",
+            "필수 기술지표 데이터가 없어 분석을 진행할 수 없습니다: "
+            + ", ".join(missing_required_families),
+        )
+    pipeline_metadata = dict(pipeline_data.metadata)
+    pipeline_metadata.setdefault("data_source_variant", ACTIVE_DATA_SOURCE_VARIANT)
+    pipeline_metadata.setdefault("data_node_contract", "data-node-v2")
+    timings = pipeline_metadata.get("timings")
+    if isinstance(timings, Mapping):
+        report_activity(
+            "step",
+            label="데이터 조회 완료",
+            detail=(
+                f"{pipeline_metadata.get('price_rows', len(pipeline_data.price_rows))}개 가격 행을 "
+                f"{float(timings.get('total_seconds', 0.0)):.2f}초에 확인했습니다."
+            ),
+        )
     if is_release_profile():
         manifest_errors = validate_release_metadata(
-            pipeline_data.metadata,
+            pipeline_metadata,
             loaded_extract_hash=(
                 str(pipeline_data.metadata["loaded_extract_hash"])
                 if pipeline_data.metadata.get("loaded_extract_hash") is not None
@@ -788,16 +820,16 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         query,
         data_requirements,
         trace_id=state["trace_id"],
-        pipeline_metadata=pipeline_data.metadata,
+        pipeline_metadata=pipeline_metadata,
     )
     evidence_refs = build_evidence_refs(source_usage, trace_id=state["trace_id"])
     cards = strategy_candidate_cards(
         query,
-        screening_candidates=pipeline_data.screening_candidates,
+        screening_candidates=pipeline_data.current_screen_candidates,
         sector=semantic_slots.sector,
     )
     freshness_evidence = annotate_l4_coverage(
-        build_freshness_evidence(pipeline_data.metadata),
+        build_freshness_evidence(pipeline_metadata),
         l4_evidence=pipeline_data.l4_evidence,
         tickers=pipeline_data.metadata.get("l4_evidence_tickers") or (),
     )
@@ -811,15 +843,17 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         "proxy_disclosure": _proxy_disclosure(data_requirements),
         "data": {
             "candidate_cards": [card.model_dump() for card in cards],
-            "pipeline_data_source": pipeline_data.metadata,
-            "screening_candidates": pipeline_data.screening_candidates,
+            "pipeline_data_source": pipeline_metadata,
+            "screening_candidates": pipeline_data.current_screen_candidates,
+            "relaxed_screening_candidates": pipeline_data.relaxed_screening_candidates,
+            "historical_backtest_universe": pipeline_data.historical_backtest_universe,
             "data_availability": pipeline_data.data_availability,
             "data_source_inventory": data_source_inventory(),
         },
     }
     if pipeline_data.price_rows:
         output["price_rows"] = pipeline_data.price_rows
-    if pipeline_data.metadata.get("source") == "postgres" or pipeline_data.l4_evidence:
+    if pipeline_metadata.get("source") == "postgres" or pipeline_data.l4_evidence:
         output["l4_evidence"] = pipeline_data.l4_evidence
     if pipeline_data.macro_snapshot:
         output["macro_snapshot"] = pipeline_data.macro_snapshot
@@ -835,6 +869,25 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         output["status"] = EnvelopeStatus.NEED_CLARIFICATION.value
         output["ambiguity"] = _unverifiable_ambiguity(unsupported)
     return output
+
+
+def _missing_required_indicator_families(
+    required_metrics: Sequence[str] | None,
+    pipeline_metadata: Mapping[str, Any],
+) -> list[str]:
+    """Return required indicator families that the loader could not provide."""
+
+    if required_metrics is None:
+        return []
+    required_families = set(
+        indicator_families_for_metrics(
+            tuple(sorted(required_metrics)), include_default=False
+        )
+    )
+    unavailable_families = {
+        str(item) for item in pipeline_metadata.get("unavailable_indicator_families", ())
+    }
+    return sorted(required_families & unavailable_families)
 
 
 _FUNDAMENTAL_CONDITION_METRICS = frozenset(

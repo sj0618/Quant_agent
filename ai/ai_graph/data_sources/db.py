@@ -21,6 +21,7 @@ from ai_graph.source_manifest import (
     build_pipeline_extract_snapshot,
     build_source_manifest,
     compute_pipeline_extract_hash,
+    is_operational_release_profile as is_release_profile,
 )
 
 from .identity import canonical_ticker, display_name
@@ -46,6 +47,8 @@ AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS_ENV = "AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS"
 AI_BACKTEST_MAX_TICKERS_ENV = "AI_BACKTEST_MAX_TICKERS"
 AI_BACKTEST_LOOKBACK_YEARS_ENV = "AI_BACKTEST_LOOKBACK_YEARS"
 AI_BACKTEST_UNIVERSE_MAX_TICKERS_ENV = "AI_BACKTEST_UNIVERSE_MAX_TICKERS"
+AI_ALLOW_SCREENING_RELAXATION_ENV = "AI_ALLOW_SCREENING_RELAXATION"
+AI_ENABLE_LLM_SCREENING_ENV = "AI_ENABLE_LLM_SCREENING"
 
 DEFAULT_BACKTEST_TICKER = "005930"
 TRADING_DAYS_PER_YEAR = 252
@@ -196,6 +199,8 @@ class DataSourceConfig(BaseModel):
     backtest_universe_max_tickers: int = Field(
         default=DEFAULT_BACKTEST_UNIVERSE_MAX_TICKERS, gt=0
     )
+    allow_screening_relaxation: bool = False
+    enable_llm_screening: bool = False
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> DataSourceConfig:
@@ -239,22 +244,11 @@ class DataSourceConfig(BaseModel):
                 AI_BACKTEST_UNIVERSE_MAX_TICKERS_ENV,
                 DEFAULT_BACKTEST_UNIVERSE_MAX_TICKERS,
             ),
+            allow_screening_relaxation=_bool_env(
+                env, AI_ALLOW_SCREENING_RELAXATION_ENV, False
+            ),
+            enable_llm_screening=_bool_env(env, AI_ENABLE_LLM_SCREENING_ENV, False),
         )
-
-
-RELEASE_PROFILE_ENV = "APP_ENV"
-RELEASE_PROFILE_VALUES = frozenset({"production", "prod"})
-
-
-def is_release_profile() -> bool:
-    """Whether this process is running as a release deployment.
-
-    One definition, because "is this production?" is asked from both the API layer and
-    the data layer and the two must never disagree. A second copy of this literal set
-    is how a fixture guard ends up silently disabled on the host it exists to protect.
-    """
-
-    return (os.environ.get(RELEASE_PROFILE_ENV) or "").strip().lower() in RELEASE_PROFILE_VALUES
 
 
 def backtest_window_policy_id(lookback_years: int) -> str:
@@ -315,6 +309,9 @@ class PipelineDataBundle(BaseModel):
 
     price_rows: list[dict[str, Any]] = Field(default_factory=list)
     screening_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    current_screen_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    relaxed_screening_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    historical_backtest_universe: list[str] = Field(default_factory=list)
     l4_evidence: list[dict[str, Any]] = Field(default_factory=list)
     # Carries the measured values plus the label saying what the equity leg was
     # measured against, so a report can never call a universe proxy "the KOSPI".
@@ -539,8 +536,17 @@ class PostgresPipelineDataSource:
                         if screening_candidates
                         else "ambiguous_backtest_without_current_recommendations"
                     )
-                else:
-                    ticker_resolution = "explicit_or_name_match"
+            else:
+                ticker_resolution = "explicit_or_name_match"
+            relaxed_screening_candidates = (
+                screening_candidates if screening_relaxation.get("relaxed") else []
+            )
+            current_screen_candidates = (
+                [] if relaxed_screening_candidates else screening_candidates
+            )
+            # Relaxed matches are presentation-only. They must not select the
+            # historical backtest universe or appear as verified current candidates.
+            screening_candidates = current_screen_candidates
             if screening_mode:
                 if pit_market is None:
                     pit_market = self._load_pit_market(
@@ -613,6 +619,15 @@ class PostgresPipelineDataSource:
                 raise PipelineDataUnavailableError(
                     "no_price_rows",
                     f"{KIS_ADJUSTED_OHLCV_TABLE} returned no price rows for {ticker}",
+                )
+            if required_metrics is not None:
+                self.unavailable_indicator_families = tuple(
+                    sorted(
+                        set(self.unavailable_indicator_families)
+                        | _missing_indicator_families_from_rows(
+                            price_rows, indicator_families
+                        )
+                    )
                 )
             raw_price_capabilities = _raw_price_capabilities(price_rows)
             pit_members_without_price_rows = sorted(
@@ -722,6 +737,9 @@ class PostgresPipelineDataSource:
         return PipelineDataBundle(
             price_rows=price_rows,
             screening_candidates=screening_candidates,
+            current_screen_candidates=current_screen_candidates,
+            relaxed_screening_candidates=relaxed_screening_candidates,
+            historical_backtest_universe=list(tickers),
             l4_evidence=l4_evidence,
             macro_snapshot=macro_snapshot,
             official_benchmark=official_benchmark,
@@ -766,6 +784,8 @@ class PostgresPipelineDataSource:
                 "pit_members_without_price_rows": pit_members_without_price_rows,
                 "pit_members_without_price_row_count": len(pit_members_without_price_rows),
                 "screening_candidates": len(screening_candidates),
+                "current_screen_candidates": len(current_screen_candidates),
+                "relaxed_screening_candidates": len(relaxed_screening_candidates),
                 "screening_relaxation": screening_relaxation,
                 "backtest_lookback_days": effective_lookback_days,
                 "backtest_window_policy_id": window_policy_id,
@@ -1087,7 +1107,7 @@ class PostgresPipelineDataSource:
         # generation. In production those calls each exhausted three response-start
         # attempts before falling back here, adding 87 seconds without changing the
         # result. Keep LLM-authored SQL for strategies outside the supported profiles.
-        if profile == "technical_proxy":
+        if profile == "technical_proxy" and self.config.enable_llm_screening:
             llm_result = self._screen_via_llm(conn, query)
             if llm_result is not None:
                 return llm_result
@@ -1107,7 +1127,12 @@ class PostgresPipelineDataSource:
 
         thresholds = ScreeningThresholds()
         rounds: list[dict[str, Any]] = []
-        for round_index in range(MAX_SCREENING_RELAXATION_ROUNDS + 1):
+        max_rounds = (
+            MAX_SCREENING_RELAXATION_ROUNDS
+            if self.config.allow_screening_relaxation
+            else 0
+        )
+        for round_index in range(max_rounds + 1):
             matches = _screening_matcher(profile, thresholds)
             matched = [row for row in rows if matches(row)]
             rounds.append(
@@ -1123,9 +1148,13 @@ class PostgresPipelineDataSource:
                     _screening_candidate_from_row(row, profile, sector=sector) for row in matched
                 ]
                 return candidates, _relaxation_trace(
-                    profile, rounds, len(rows), frame=frame_trace
+                    profile,
+                    rounds,
+                    len(rows),
+                    frame=frame_trace,
+                    relaxation_allowed=self.config.allow_screening_relaxation,
                 )
-            if round_index == MAX_SCREENING_RELAXATION_ROUNDS:
+            if round_index == max_rounds:
                 break
             thresholds = _propose_relaxed_thresholds(
                 query=query,
@@ -1134,7 +1163,13 @@ class PostgresPipelineDataSource:
                 round_index=round_index,
                 universe_rows=len(rows),
             )
-        return [], _relaxation_trace(profile, rounds, len(rows), frame=frame_trace)
+        return [], _relaxation_trace(
+            profile,
+            rounds,
+            len(rows),
+            frame=frame_trace,
+            relaxation_allowed=self.config.allow_screening_relaxation,
+        )
 
     def _load_screening_frame(
         self, conn: Any, *, sector: str | None, profile: str
@@ -2406,6 +2441,7 @@ def _relaxation_trace(
     universe_rows: int,
     *,
     frame: Mapping[str, Any] | None = None,
+    relaxation_allowed: bool = True,
 ) -> dict[str, Any]:
     final = rounds[-1] if rounds else {}
     return {
@@ -2414,6 +2450,8 @@ def _relaxation_trace(
         "rounds": rounds,
         "relaxation_rounds": max(len(rounds) - 1, 0),
         "relaxed": bool(final.get("relaxed")) and bool(final.get("matched_count")),
+        "relaxation_allowed": relaxation_allowed,
+        "relaxation_blocked": not relaxation_allowed,
         "matched_count": int(final.get("matched_count") or 0),
         # Which date was screened, where the indicators came from, and what the
         # relative-strength benchmark was measured against - all three used to be
@@ -2697,6 +2735,30 @@ INDICATOR_TABLES: dict[str, str] = {
     "volatility": TA_VOLATILITY_TICKER_TABLE,
     "volume": TA_VOLUME_TICKER_TABLE,
 }
+
+_INDICATOR_ROW_FIELDS: dict[str, tuple[str, ...]] = {
+    "trend": tuple(_TREND_KEYS),
+    "momentum": tuple(_MOMENTUM_KEYS),
+    "volatility": (*tuple(_VOLATILITY_KEYS), "bb_width"),
+    "volume": tuple(_VOLUME_KEYS),
+}
+
+
+def _missing_indicator_families_from_rows(
+    price_rows: Sequence[Mapping[str, Any]], families: Sequence[str]
+) -> set[str]:
+    """Find required families that returned no usable value in the loaded rows."""
+
+    missing: set[str] = set()
+    for family in families:
+        fields = _INDICATOR_ROW_FIELDS.get(family, ())
+        if fields and not any(
+            _optional_float_value(row.get(field)) is not None
+            for row in price_rows
+            for field in fields
+        ):
+            missing.add(family)
+    return missing
 
 # Which family each condition metric lives in, so the backtest reads only the tables its
 # strategy actually references. Reading all four over a 200-name universe cost ~37s;
@@ -3783,3 +3845,15 @@ def _int_env(env: Mapping[str, str], key: str, default: int) -> int:
     if value is None or not value.strip():
         return default
     return int(value)
+
+
+def _bool_env(env: Mapping[str, str], key: str, default: bool) -> bool:
+    value = env.get(key)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{key} must be a boolean value")

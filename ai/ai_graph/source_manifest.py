@@ -416,3 +416,17 @@ def is_release_profile(environ: Mapping[str, str] | None = None) -> bool:
         values.get(environment_name, "").strip().lower() in RELEASE_PROFILES
         for environment_name in (RELEASE_PROFILE_ENV, DEPLOYMENT_PROFILE_ENV)
     )
+
+
+def is_operational_release_profile(environ: Mapping[str, str] | None = None) -> bool:
+    """Include the API's legacy ``APP_ENV=prod`` deployment value.
+
+    ``is_release_profile`` is retained for provenance validation compatibility. The
+    data node needs the broader operational gate so the legacy deployment label cannot
+    re-enable fixture data.
+    """
+
+    values = environ if environ is not None else os.environ
+    return is_release_profile(values) or (
+        values.get(DEPLOYMENT_PROFILE_ENV, "").strip().lower() == "prod"
+    )
