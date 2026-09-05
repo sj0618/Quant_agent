@@ -90,6 +90,10 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert "xfwd: true" in (REPOSITORY_ROOT / "fe" / "vite.config.ts").read_text(encoding="utf-8")
     assert "node scripts/production-gateway.mjs" in workflow
     assert 'HOST="0.0.0.0" PORT="18010"' in workflow
+    assert 'SSH_PORT: "30233"' in workflow
+    assert 'APP_DIR="$HOME/mvp_sp2/quant-proj"' in workflow
+    assert 'RELEASES_DIR="$HOME/mvp_sp2/.releases"' in workflow
+    assert 'production_env="$HOME/mvp_sp1/quant-proj/.env"' in workflow
     assert "retired-internal-route" in workflow
     assert "npm run preview" not in workflow
     assert "AI_RULE_DRAFT_HMAC_SECRET" in workflow

@@ -86,14 +86,6 @@ on:
         required: false
         default: false
         type: boolean
-      deploy_target:
-        description: Target server (same host/user/key, different SSH port). node2-candidate is the default for both push-to-main and manual runs; pick node1 to opt out.
-        required: false
-        default: node2-candidate
-        type: choice
-        options:
-          - node1
-          - node2-candidate
 
 concurrency:
   group: quant-agent-deploy
@@ -196,9 +188,8 @@ jobs:
     needs: release-trust
     if: ${{ inputs.rollback_drill != true }}
     runs-on: ubuntu-latest
-    environment: ${{ inputs.deploy_target == 'node1' && '' || 'node2-candidate' }}
     env:
-      SSH_PORT: ${{ inputs.deploy_target == 'node1' && '30233' || '30232' }}
+      SSH_PORT: "30233"
 
     steps:
       - name: Checkout
@@ -229,14 +220,22 @@ jobs:
       - name: Create deploy directory on server
         run: |
           ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
-            "mkdir -p ~/mvp_sp1/quant-proj"
+            'set -Eeuo pipefail
+             app_dir="$HOME/mvp_sp2/quant-proj"
+             production_env="$HOME/mvp_sp1/quant-proj/.env"
+             mkdir -p "$app_dir"
+             if [ ! -e "$app_dir/.env" ]; then
+               test -s "$production_env"
+               cp "$production_env" "$app_dir/.env"
+               chmod 600 "$app_dir/.env"
+             fi'
 
       - name: Verify pre-deploy readiness
         run: |
           set -Eeuo pipefail
 
           release_state="$(ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
-            'if [ -f ~/mvp_sp1/quant-proj/combined_main.py ]; then printf existing; else printf initial; fi')"
+            'if [ -f ~/mvp_sp2/quant-proj/combined_main.py ]; then printf existing; else printf initial; fi')"
           if [ "$release_state" = "initial" ]; then
             echo "No previous application release found; allowing initial deployment."
             exit 0
@@ -265,8 +264,8 @@ jobs:
           set -Eeuo pipefail
 
           DEPLOYMENT_REVISION="$1"
-          APP_DIR="$HOME/mvp_sp1/quant-proj"
-          RELEASES_DIR="$HOME/mvp_sp1/.releases"
+          APP_DIR="$HOME/mvp_sp2/quant-proj"
+          RELEASES_DIR="$HOME/mvp_sp2/.releases"
           SNAPSHOT_DIR="$RELEASES_DIR/$DEPLOYMENT_REVISION"
           SNAPSHOT_STAGE="$(mktemp -d "$HOME/mvp_sp1/rollback-snapshot-stage.XXXXXX")"
           SNAPSHOT_ARCHIVE="$SNAPSHOT_DIR/current-release.tar.gz"
@@ -323,13 +322,13 @@ jobs:
           set -Eeuo pipefail
           test -s scripts/readiness-semantic-gate.mjs
 
-          scp -q -i ~/.ssh/id_rsa -P "$SSH_PORT" scripts/readiness-semantic-gate.mjs "etluser@quant-agent.kro.kr:~/mvp_sp1/.releases/$GITHUB_SHA/readiness-semantic-gate.mjs.upload"
+          scp -q -i ~/.ssh/id_rsa -P "$SSH_PORT" scripts/readiness-semantic-gate.mjs "etluser@quant-agent.kro.kr:~/mvp_sp2/.releases/$GITHUB_SHA/readiness-semantic-gate.mjs.upload"
 
           ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr bash -s -- "$GITHUB_SHA" <<'REMOTE'
           set -Eeuo pipefail
 
           DEPLOYMENT_REVISION="$1"
-          SNAPSHOT_DIR="$HOME/mvp_sp1/.releases/$DEPLOYMENT_REVISION"
+          SNAPSHOT_DIR="$HOME/mvp_sp2/.releases/$DEPLOYMENT_REVISION"
           incoming="$SNAPSHOT_DIR/readiness-semantic-gate.mjs.upload"
           target="$SNAPSHOT_DIR/readiness-semantic-gate.mjs"
 
@@ -368,7 +367,7 @@ jobs:
             --exclude='**/.pytest_cache/' \
             -e "ssh -v -i ~/.ssh/id_rsa -p $SSH_PORT" \
             ./ \
-            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/
+            etluser@quant-agent.kro.kr:~/mvp_sp2/quant-proj/
 
       - name: Configure production Google auth
         env:
@@ -397,10 +396,10 @@ jobs:
           } > "$auth_env_file"
 
           scp -q -i ~/.ssh/id_rsa -P "$SSH_PORT" "$auth_env_file" \
-            etluser@quant-agent.kro.kr:~/mvp_sp1/quant-proj/.env.auth.upload
+            etluser@quant-agent.kro.kr:~/mvp_sp2/quant-proj/.env.auth.upload
           ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr <<'REMOTE'
             set -euo pipefail
-            APP_DIR="$HOME/mvp_sp1/quant-proj"
+            APP_DIR="$HOME/mvp_sp2/quant-proj"
             env_file="$APP_DIR/.env"
             incoming="$APP_DIR/.env.auth.upload"
             next_file="$(mktemp "$APP_DIR/.env.next.XXXXXX")"
@@ -435,9 +434,9 @@ jobs:
               set -u
             fi
 
-            APP_DIR="$HOME/mvp_sp1/quant-proj"
+            APP_DIR="$HOME/mvp_sp2/quant-proj"
             RUN_DIR="$APP_DIR/.run"
-            RELEASES_DIR="$HOME/mvp_sp1/.releases"
+            RELEASES_DIR="$HOME/mvp_sp2/.releases"
             SNAPSHOT_DIR="$RELEASES_DIR/$DEPLOYMENT_REVISION"
             SNAPSHOT_ARCHIVE="$SNAPSHOT_DIR/current-release.tar.gz"
             SNAPSHOT_CHECKSUM="$SNAPSHOT_ARCHIVE.sha256"
@@ -706,7 +705,7 @@ jobs:
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
 
             cd "$APP_DIR"
-            # node2 candidate: the external tunnel maps 38011 to this backend port.
+            # node3 development: the external tunnel maps 38011 to this backend port.
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
               --host 0.0.0.0 \
               --port 18011 \
@@ -715,7 +714,7 @@ jobs:
             echo "$!" > "$RUN_DIR/combined.pid"
 
             cd "$APP_DIR/fe"
-            # node2 candidate: the external tunnel maps 38010 to this frontend port.
+            # node3 development: the external tunnel maps 38010 to this frontend port.
             nohup env \
               COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18011" \
               HOST="0.0.0.0" PORT="18010" node scripts/production-gateway.mjs \
@@ -813,9 +812,9 @@ jobs:
           set -Eeuo pipefail
 
           DEPLOYMENT_REVISION="$1"
-          APP_DIR="$HOME/mvp_sp1/quant-proj"
+          APP_DIR="$HOME/mvp_sp2/quant-proj"
           RUN_DIR="$APP_DIR/.run"
-          RELEASES_DIR="$HOME/mvp_sp1/.releases"
+          RELEASES_DIR="$HOME/mvp_sp2/.releases"
           SNAPSHOT_DIR="$RELEASES_DIR/$DEPLOYMENT_REVISION"
           SNAPSHOT_ARCHIVE="$SNAPSHOT_DIR/current-release.tar.gz"
           SNAPSHOT_CHECKSUM="$SNAPSHOT_ARCHIVE.sha256"
