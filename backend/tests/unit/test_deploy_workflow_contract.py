@@ -94,6 +94,8 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert 'APP_DIR="$HOME/mvp_sp2/quant-proj"' in workflow
     assert 'RELEASES_DIR="$HOME/mvp_sp2/.releases"' in workflow
     assert 'production_env="$HOME/mvp_sp1/quant-proj/.env"' in workflow
+    assert 'mvp_sp2/quant-proj/.run/release-ready' in workflow
+    assert 'touch "$RUN_DIR/release-ready"' in workflow
     assert "retired-internal-route" in workflow
     assert "npm run preview" not in workflow
     assert "AI_RULE_DRAFT_HMAC_SECRET" in workflow
@@ -195,13 +197,13 @@ def test_email_worker_start_is_gated_and_points_at_the_ai_venv():
     assert "print(str(load_settings().email_delivery_worker_enabled).lower())" in workflow
     assert 'if [ "$email_worker_enabled" = "true" ]; then' in workflow
     assert "WARNING: email worker check failed" in workflow
-    assert '"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start' in workflow
-    assert '"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" check' in workflow
-    assert '"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop' in workflow
+    assert 'bash "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start' in workflow
+    assert 'bash "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" check' in workflow
+    assert 'bash "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop' in workflow
     assert 'QUANTAGENT_BACKEND_PYTHON="$APP_DIR/ai/.venv/bin/python"' in workflow
     assert "email worker disabled (EMAIL_DELIVERY_WORKER_ENABLED != true)" in workflow
 
-    start_idx = workflow.index('"$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start')
+    start_idx = workflow.index('bash "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start')
     ai_ready_idx = workflow.index('"deployed-ai-api-readiness" ai')
     fe_wait_idx = workflow.index('wait_for_url "Frontend gateway"')
     assert ai_ready_idx < start_idx < fe_wait_idx

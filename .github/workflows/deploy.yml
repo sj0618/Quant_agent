@@ -235,7 +235,7 @@ jobs:
           set -Eeuo pipefail
 
           release_state="$(ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
-            'if [ -f ~/mvp_sp2/quant-proj/combined_main.py ]; then printf existing; else printf initial; fi')"
+            'if [ -f ~/mvp_sp2/quant-proj/combined_main.py ] && [ -f ~/mvp_sp2/quant-proj/.run/release-ready ]; then printf existing; else printf initial; fi')"
           if [ "$release_state" = "initial" ]; then
             echo "No previous application release found; allowing initial deployment."
             exit 0
@@ -535,7 +535,7 @@ jobs:
               local exit_status="$1"
               trap - ERR
             echo "Restore deploy snapshot on failure"
-            "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
+            bash "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
             stop_listeners_on_port 18011
             stop_listeners_on_port 18010
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
@@ -747,12 +747,12 @@ jobs:
             # The flag is read through Settings so it may live in .env or the shell env.
             email_worker_enabled="$(cd "$APP_DIR" && "$APP_DIR/ai/.venv/bin/python" -c 'from app.core.config import load_settings; print(str(load_settings().email_delivery_worker_enabled).lower())' 2>/dev/null || echo false)"
             if [ "$email_worker_enabled" = "true" ]; then
-              "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
+              bash "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
               QUANTAGENT_BACKEND_PYTHON="$APP_DIR/ai/.venv/bin/python" \
-                "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start
+                bash "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" start
               # Email readiness must not roll back a healthy web release; it is reported, not enforced.
               if ! QUANTAGENT_BACKEND_PYTHON="$APP_DIR/ai/.venv/bin/python" \
-                "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" check; then
+                bash "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" check; then
                 echo "WARNING: email worker check failed; see $RUN_DIR/email-worker.log and /health email_* fields"
               fi
             else
@@ -797,6 +797,7 @@ jobs:
           assert query["client_id"][0].endswith(".apps.googleusercontent.com")
           PY
             rm -f "$auth_headers" "$auth_body"
+            touch "$RUN_DIR/release-ready"
             }
 
             trap 'rollback_deploy_release $?' ERR
