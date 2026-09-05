@@ -80,6 +80,86 @@ def test_runner_reads_and_executes_only_after_valid_release(monkeypatch, tmp_pat
     assert exit_code == 0
     assert executed == [(request, "def build_signals(prices):\n    return []\n")]
     assert CodeExecutionResult.model_validate_json(result_path.read_text(encoding="utf-8")).status == "succeeded"
+
+
+def test_generated_backtest_uses_the_period_sealed_in_the_strategy(monkeypatch) -> None:
+    from ai_graph import data_sources
+    from ai_graph.nodes import backtest as ai_backtest
+    from ai_graph.schemas import StrategySpec
+
+    strategy = StrategySpec(
+        strategy_id="sealed_period",
+        name="sealed period",
+        market="KRX",
+        timeframe="daily",
+        backtest_years=2,
+        entry_conditions=[{"left": "rsi", "operator": "lte", "right": 30}],
+        confidence=0.5,
+    )
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="RSI 전략",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+        parsed_strategy_jsonb=strategy.model_dump(mode="json"),
+    )
+    observed: dict[str, object] = {}
+
+    def load_pipeline_data(_query: str, _trace_id: str, **kwargs: object):
+        observed.update(kwargs)
+        return SimpleNamespace(price_rows=[], metadata={"source": "fixture"})
+
+    empty_engine_result = SimpleNamespace(
+        summary={}, signals=[], trades=[], equity_curve=[], order_audit=[], output_paths={}
+    )
+    monkeypatch.setattr(data_sources, "load_pipeline_data_from_env", load_pipeline_data)
+    monkeypatch.setattr(ai_backtest, "_execute_candidate_code", lambda *_: [])
+    monkeypatch.setattr(ai_backtest, "_engine_market_rows", lambda *_: ([], []))
+    monkeypatch.setattr(ai_backtest, "_merge_generated_signals", lambda *_: [])
+    monkeypatch.setattr(ai_backtest, "_available_ticker_count", lambda *_: 0)
+    monkeypatch.setattr(ai_backtest, "_engine_strategy_spec", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(ai_backtest, "run_engine_backtest", lambda *_args, **_kwargs: empty_engine_result)
+    monkeypatch.setattr(ai_backtest, "_benchmark_return", lambda *_: None)
+
+    result = runner._execute_generated_backtest(
+        request,
+        runner.GeneratedCodeResult(
+            target_runtime="python-sandbox",
+            code_purpose="backtest",
+            generated_code="def build_signals(prices):\n    return []\n",
+        ),
+        trace_id=uuid4(),
+    )
+
+    assert observed == {"backtest_lookback_years": 2, "period_locked": True}
+    assert result.backtest_result is not None
+
+
+def test_generated_backtest_refuses_an_unsealed_strategy_before_loading_data(monkeypatch) -> None:
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="RSI 전략을 2년 백테스트",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+    called = False
+
+    def load_pipeline_data(*_args: object, **_kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("ai_graph.data_sources.load_pipeline_data_from_env", load_pipeline_data)
+
+    with pytest.raises(ValueError, match="sealed strategy"):
+        runner._execute_generated_backtest(
+            request,
+            runner.GeneratedCodeResult(
+                target_runtime="python-sandbox",
+                code_purpose="backtest",
+                generated_code="def build_signals(prices):\n    return []\n",
+            ),
+            trace_id=uuid4(),
+        )
+
+    assert called is False
 def test_realized_cost_totals_sum_trade_costs_and_fill_slippage():
     trade = SimpleNamespace(
         ticker="005930",

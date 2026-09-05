@@ -48,6 +48,7 @@ class LLMJsonRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_output_tokens: int | None = Field(default=None, ge=1)
     enable_web_search: bool = False
+    require_web_search: bool = False
     # The strategy-research lane intentionally pays for a broader evidence search;
     # routine terminology lookups keep the provider default instead.
     web_search_context_size: Literal["low", "medium", "high"] | None = None

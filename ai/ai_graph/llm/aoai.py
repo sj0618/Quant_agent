@@ -643,6 +643,8 @@ class AOAIResponsesClient:
             if request.web_search_context_size is not None:
                 tool["search_context_size"] = request.web_search_context_size
             body["tools"] = [tool]
+            if request.require_web_search:
+                body["tool_choice"] = "required"
         if request.response_schema is not None and self._structured_outputs_supported:
             body["text"] = {
                 "format": {

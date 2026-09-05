@@ -100,7 +100,7 @@ export function StrategyInputPanel({
   };
 
   const handleCandidateSelect = async (card: StrategyCandidateCard) => {
-    const query = `후보 확정: strategy_id=${card.strategy_id}; ${card.title}. ${card.summary} 조건: ${card.key_conditions.join(", ")}.`;
+    const query = card.backtest_query || `후보 확정: strategy_id=${card.strategy_id}; ${card.title}. ${card.summary} 조건: ${card.key_conditions.join(", ")}.`;
     setDraft(query);
     setSubmitError(null);
     await submitQuery(query);
@@ -248,7 +248,7 @@ export function StrategyInputPanel({
                     <span className="flex items-center justify-between gap-2">
                       <strong className="text-xs">{card.title}</strong>
                       <small className="text-[10px] font-bold text-subdued">
-                        {Math.round(card.confidence * 100)}%
+                        AI confidence {Math.round(card.confidence * 100)}%
                       </small>
                     </span>
                     <p className="mt-2 text-[11px] leading-relaxed text-[#dfe3ee]">{card.summary}</p>

@@ -80,16 +80,20 @@ def _execute_generated_backtest(
     trace_id: UUID,
 ) -> CodeExecutionResult:
     from ai_graph.data_sources import load_pipeline_data_from_env
-    from ai_graph.graph import build_strategy_spec
     from ai_graph.nodes import backtest as ai_backtest
     from ai_graph.schemas import CodeCandidate, StrategySpec
 
-    strategy = (
-        StrategySpec.model_validate(request.parsed_strategy_jsonb)
-        if request.parsed_strategy_jsonb
-        else build_strategy_spec(request.natural_language_prompt, variant="A")
+    if not request.parsed_strategy_jsonb:
+        raise ValueError("generated backtest requires a sealed strategy with a backtest period")
+    strategy = StrategySpec.model_validate(request.parsed_strategy_jsonb)
+    if strategy.backtest_years is None:
+        raise ValueError("generated backtest requires a sealed strategy with a backtest period")
+    pipeline = load_pipeline_data_from_env(
+        request.natural_language_prompt,
+        str(trace_id),
+        backtest_lookback_years=strategy.backtest_years,
+        period_locked=True,
     )
-    pipeline = load_pipeline_data_from_env(request.natural_language_prompt, str(trace_id))
     rows = pipeline.price_rows or list(ai_backtest.DEFAULT_BACKTEST_PRICE_ROWS)
     candidate = CodeCandidate(
         candidate_id="A1",

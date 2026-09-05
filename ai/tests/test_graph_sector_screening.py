@@ -1,9 +1,21 @@
 from ai_graph.data_sources.sectors import clear_sector_cache
 from ai_graph.graph import build_strategy_spec, parse_semantic_slots, strategy_candidate_cards
+from ai_graph.schemas import StrategyCandidateCard
 
 
 def setup_function() -> None:
     clear_sector_cache()
+
+
+def _research_card() -> StrategyCandidateCard:
+    return StrategyCandidateCard(
+        strategy_id="analyst_semiconductor_cycle",
+        title="반도체 재고 정상화 가설",
+        summary="독립 애널리스트 리포트의 재고 정상화 논리를 지원 지표로 검증합니다.",
+        key_conditions=["relative_strength_20d", "volume_ratio_20"],
+        confidence=0.78,
+        backtest_query="KRX 반도체 유니버스에서 상대강도와 거래량 조건을 백테스트한다.",
+    )
 
 
 def test_parse_semantic_slots_extracts_sector() -> None:
@@ -59,10 +71,10 @@ def test_build_strategy_spec_does_not_create_a_market_scope_field() -> None:
 
 
 def test_strategy_candidate_cards_without_screening_data_is_unchanged() -> None:
-    query = "저평가주 사줘"
+    research_cards = [_research_card()]
 
-    baseline = strategy_candidate_cards(query)
-    with_none = strategy_candidate_cards(query, screening_candidates=None, sector=None)
+    baseline = strategy_candidate_cards(research_cards)
+    with_none = strategy_candidate_cards(research_cards, screening_candidates=None, sector=None)
 
     assert [card.model_dump() for card in baseline] == [card.model_dump() for card in with_none]
 
@@ -86,7 +98,7 @@ def test_strategy_candidate_cards_attaches_sector_filtered_matches() -> None:
     ]
 
     cards = strategy_candidate_cards(
-        "반도체 섹터에서 RSI 과매도 종목 찾아줘",
+        [_research_card()],
         screening_candidates=screening_candidates,
         sector="반도체",
     )
@@ -109,7 +121,7 @@ def test_strategy_candidate_cards_keep_every_condition_match() -> None:
     ]
 
     cards = strategy_candidate_cards(
-        "반도체 조건 종목을 모두 찾아줘",
+        [_research_card()],
         screening_candidates=screening_candidates,
         sector="반도체",
     )

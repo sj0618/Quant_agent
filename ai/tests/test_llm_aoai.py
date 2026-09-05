@@ -148,6 +148,31 @@ def test_aoai_client_sends_requested_web_search_context_size() -> None:
     ) == {"message": "ok"}
 
 
+def test_aoai_client_requires_web_search_when_requested() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["tools"] == [{"type": "web_search_preview"}]
+        assert body["tool_choice"] == "required"
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_json(
+        make_request().model_copy(
+            update={
+                "enable_web_search": True,
+                "require_web_search": True,
+                "stream_response": False,
+            }
+        )
+    ) == {"message": "ok"}
+
+
 def test_aoai_client_parses_output_text_json_payload() -> None:
     client = make_client(
         {"output_text": json.dumps({"candidates": ["a", "b", "c"], "fallback_reasons": []})}

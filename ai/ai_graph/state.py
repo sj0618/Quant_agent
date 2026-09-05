@@ -10,6 +10,8 @@ class QuantAgentState(TypedDict, total=False):
     resolved_query: str
     execution_spec: dict[str, Any]
     exploration_policy: dict[str, Any]
+    # The sole backtest window selected before any historical-data loader runs.
+    backtest_period: dict[str, Any]
     base_report_started_at: float
     intent: dict[str, Any]
     trace_id: str

@@ -176,7 +176,9 @@ def test_pullback_term_uses_l1_l2_definition_without_blocking() -> None:
     envelope = run_analysis("눌림목 전략으로 해줘", trace_id="trace-c2")
 
     assert envelope.status == "ready"
-    assert envelope.user_payload.candidate_cards[0].strategy_id == "pullback_trend"
+    # Offline fixtures never substitute static indicator cards for live analyst
+    # research. The concrete strategy still proceeds through the normal pipeline.
+    assert envelope.user_payload.candidate_cards == []
 
 
 def test_pullback_rsi40_volume_prompt_generates_nonzero_backtest() -> None:

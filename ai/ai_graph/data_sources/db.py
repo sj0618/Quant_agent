@@ -60,13 +60,11 @@ TRADING_DAYS_PER_YEAR = 252
 # - see backtest_lookback_years.
 BACKTEST_EVALUATION_YEARS = 5
 DEFAULT_BACKTEST_LOOKBACK_DAYS = TRADING_DAYS_PER_YEAR * BACKTEST_EVALUATION_YEARS
-# A five-year full-universe read is 3.2M price rows plus four TA families, which cost
-# the production node 875s and ~21GB RSS for a single request.  One year is the default
-# because it is what the 60-second budget affords; three is the ceiling, past which the
-# node runs out of memory rather than time.
+# A five-year full-universe read is expensive.  A sealed research strategy may still
+# select it, but the chosen value is explicit in the execution contract and manifest.
 DEFAULT_BACKTEST_LOOKBACK_YEARS = 1
 MIN_BACKTEST_LOOKBACK_YEARS = 1
-MAX_BACKTEST_LOOKBACK_YEARS = 3
+MAX_BACKTEST_LOOKBACK_YEARS = 5
 # The PIT window holds every common stock that was ever a member (1,717 over five
 # years).  Loading all of them is what made the read unaffordable, so it is capped by
 # liquidity measured *before* the window - see _fetch_backtest_universe.
@@ -196,6 +194,7 @@ class DataSourceConfig(BaseModel):
         ge=MIN_BACKTEST_LOOKBACK_YEARS,
         le=MAX_BACKTEST_LOOKBACK_YEARS,
     )
+    period_locked: bool = False
     backtest_universe_max_tickers: int = Field(
         default=DEFAULT_BACKTEST_UNIVERSE_MAX_TICKERS, gt=0
     )
@@ -800,6 +799,8 @@ class PostgresPipelineDataSource:
                 "relaxed_screening_candidates": len(relaxed_screening_candidates),
                 "screening_relaxation": screening_relaxation,
                 "backtest_lookback_days": effective_lookback_days,
+                "backtest_lookback_years": self.config.backtest_lookback_years,
+                "backtest_period_locked": self.config.period_locked,
                 "backtest_window_policy_id": window_policy_id,
                 "backtest_start_session": backtest_window["start"].isoformat(),
                 "backtest_end_session": backtest_window["end"].isoformat(),
@@ -2151,8 +2152,11 @@ def load_pipeline_data_from_env(
     compact_price_rows: bool = False,
     sector: str | None = None,
     backtest_lookback_years: int | None = None,
+    period_locked: bool = False,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
+    if period_locked and backtest_lookback_years is None:
+        raise ValueError("a locked backtest period requires backtest_lookback_years")
     if backtest_lookback_years is not None:
         if (
             isinstance(backtest_lookback_years, bool)
@@ -2165,12 +2169,26 @@ def load_pipeline_data_from_env(
                 f"backtest_lookback_years must be {MIN_BACKTEST_LOOKBACK_YEARS}..{MAX_BACKTEST_LOOKBACK_YEARS}"
             )
         config = config.model_copy(
-            update={"backtest_lookback_years": backtest_lookback_years}
+            update={
+                "backtest_lookback_years": backtest_lookback_years,
+                "period_locked": period_locked,
+            }
         )
     if not config.database_dsn:
-        return _fixture_bundle(
-            f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.",
-            query=query,
+        bundle = _fixture_bundle(
+            f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.", query=query
+        )
+        return bundle.model_copy(
+            update={
+                "metadata": {
+                    **bundle.metadata,
+                    "backtest_lookback_years": config.backtest_lookback_years,
+                    "backtest_period_locked": config.period_locked,
+                    "backtest_window_policy_id": backtest_window_policy_id(
+                        config.backtest_lookback_years
+                    ),
+                }
+            }
         )
     return PostgresPipelineDataSource(config).load(
         query,

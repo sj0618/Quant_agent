@@ -37,6 +37,10 @@ from ai_graph.progress import (
     report_activity,
 )
 from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
+from ai_graph.research_campaign import (
+    DEFAULT_RESEARCH_CAMPAIGN_MAX_ROUNDS,
+    ResearchCampaign,
+)
 from ai_graph.research_eligibility import MISSING_EXECUTION_ASSUMPTION
 from ai_graph.schemas import (
     BacktestEquityPoint,
@@ -158,10 +162,10 @@ AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
 # self-improvement rounds fit and ready runs landed at 61-78s; at 22 the node stays at or
 # under ~25s and at most one round starts when its projected cost fits.
 DEFAULT_WALL_BUDGET_SECONDS = 22.0
-# Rounds of threshold-adjusted candidates tried when the acceptance floor is not cleared.
-# Each round proposes up to six distinct candidates and stops early once the floor clears
-# or the wall budget is spent, so this is a ceiling, not a cost every run pays.
-MAX_SELF_IMPROVEMENT_ROUNDS = 3
+# Compatibility spelling for integrations that import the old constant. The actual
+# bound is now owned by ``ResearchCampaign`` so candidate, duplicate and no-progress
+# limits are enforced together rather than by a round count alone.
+MAX_SELF_IMPROVEMENT_ROUNDS = DEFAULT_RESEARCH_CAMPAIGN_MAX_ROUNDS
 SELF_IMPROVEMENT_CANDIDATES_PER_ROUND = 6
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
 BACKTEST_ENGINE_VERSION = "candidate-engine.v3"
@@ -2651,7 +2655,9 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
             detail=_selected_candidate_detail(result),
         )
         all_candidates = candidates
-        seen_candidates = {_candidate_identity(candidate) for candidate in all_candidates}
+        campaign = ResearchCampaign.start(
+            {_candidate_identity(candidate) for candidate in all_candidates}
+        )
         fallback_reasons = list(state.get("backtest_code", {}).get("fallback_reasons", []))
         # Refinement operates only on the selection data: candidates are still chosen
         # per fold on train/validation, so re-running the walk-forward with a wider set
@@ -2659,7 +2665,7 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         # walk-forward was READY, which meant a run that missed the acceptance floor
         # stopped at the first pass and reported the miss instead of trying to clear it.
         # Each extra round widens the search, and `candidate_count` prices that in.
-        self_improvement_rounds = MAX_SELF_IMPROVEMENT_ROUNDS
+        self_improvement_rounds = campaign.budget.max_rounds
         rounds_run = 0
         # A round now only evaluates the candidates it adds - `session.run_fold_engines`
         # memoises every (candidate, fold) pair - and spreads them over the worker pool,
@@ -2673,9 +2679,10 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         )
         result = _apply_selection_correction(result, len(all_candidates))
         floor_reasons = objective_floor_reasons(result)
-        for iteration in range(1, self_improvement_rounds + 1):
-            if not floor_reasons:
-                break
+        if not floor_reasons:
+            campaign.stop("objective_target_reached")
+        while floor_reasons and campaign.allow_next_round():
+            iteration = campaign.rounds_started + 1
             # The request-wide ceiling is checked here too, not only at node boundaries:
             # a self-improvement round can run for minutes, and stopping between rounds
             # keeps the candidates already evaluated instead of losing the node's work.
@@ -2683,8 +2690,9 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
             remaining = _wall_budget_seconds() - (time.perf_counter() - node_started)
             projected = per_candidate_seconds * SELF_IMPROVEMENT_CANDIDATES_PER_ROUND
             if projected > remaining:
+                campaign.stop("wall_budget_insufficient")
                 fallback_reasons.append(
-                    f"self-improvement stopped: projected {projected:.1f}s round does not "
+                    f"research campaign stopped: projected {projected:.1f}s round does not "
                     f"fit the {remaining:.1f}s left of the {_wall_budget_seconds():g}s wall budget"
                 )
                 break
@@ -2695,18 +2703,20 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                 iteration=iteration,
                 max_positions=max_positions,
             )
-            improved = []
-            for candidate in proposed:
-                identity = _candidate_identity(candidate)
-                if identity in seen_candidates:
-                    continue
-                seen_candidates.add(identity)
-                improved.append(candidate)
-                if len(improved) >= SELF_IMPROVEMENT_CANDIDATES_PER_ROUND:
-                    break
+            admitted_identities = set(
+                campaign.admit_candidate_identities(
+                    [_candidate_identity(candidate) for candidate in proposed]
+                )
+            )
+            improved = [
+                candidate
+                for candidate in proposed
+                if _candidate_identity(candidate) in admitted_identities
+            ]
             if not improved:
+                campaign.stop(campaign.stop_reason or "no_distinct_candidates")
                 fallback_reasons.append(
-                    f"self-improvement iteration {iteration}: no distinct candidates"
+                    f"research campaign iteration {iteration}: no distinct candidates"
                 )
                 break
             all_candidates = [*all_candidates, *improved]
@@ -2737,9 +2747,16 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
             # selection data. Ranking rounds by their out-of-sample result would be a
             # second argmax over the evaluation period, which is the bias this node
             # spends the deflation term correcting.
-            if not next_reasons or _selected_objective_score(
-                next_result
-            ) > _selected_objective_score(result):
+            previous_score = _selected_objective_score(result)
+            next_score = _selected_objective_score(next_result)
+            campaign_improved = campaign.record_round(
+                proposed_count=len(proposed),
+                admitted_count=len(improved),
+                score_before=previous_score,
+                score_after=next_score,
+                progress=not next_reasons or next_score > previous_score,
+            )
+            if campaign_improved:
                 result = next_result
                 floor_reasons = next_reasons
                 report_activity(
@@ -2751,8 +2768,10 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                 report_activity(
                     "step",
                     label=f"자가개선 {iteration}차 · 개선 없음",
-                    detail="선택 구간에서 개선은 없었습니다. 다음 제한 탐색 구간을 확인합니다.",
+                    detail="선택 구간에서 개선은 없었습니다. 남은 리서치 예산을 확인합니다.",
                 )
+        if not floor_reasons:
+            campaign.stop("objective_target_reached", replace=True)
         # The winner was chosen by argmax over every candidate tried, so its in-sample
         # numbers carry the bias of that search. N is only known here - the per-candidate
         # evaluations are cached and must not depend on how many siblings they had.
@@ -2779,6 +2798,7 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
                     ),
                     "self_improvement_rounds_limit": self_improvement_rounds,
                     "self_improvement_rounds_run": rounds_run,
+                    "research_campaign": campaign.manifest(),
                 },
             }
         )

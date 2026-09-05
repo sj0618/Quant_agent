@@ -61,6 +61,8 @@ def _donchian_response(*, required_metrics: list[str] | None = None) -> dict:
                 ],
                 "required_metrics": required_metrics or ["close", "high", "sma20"],
                 "assumptions": ["KRX 일봉 종가 기준으로 다음 거래일 체결을 가정합니다."],
+                "backtest_years": 1,
+                "backtest_period_basis": "KRX PIT 자료 가용성과 전략의 단기 추세 가설을 조사해 1년을 선택했습니다.",
                 "source_ids": ["source-1"],
             }
         ],
@@ -300,6 +302,38 @@ def test_researcher_repairs_one_invalid_structured_candidate_then_seals_v3() -> 
     assert repair_context["previous_validation_failure"]["code"] == "research_metric_unsupported"
 
 
+@pytest.mark.parametrize("invalid_period", [None, 0, 6, "3"])
+def test_researcher_repairs_a_missing_or_invalid_period_once(invalid_period: object) -> None:
+    invalid = _donchian_response()
+    if invalid_period is None:
+        invalid["candidates"][0].pop("backtest_years")
+    else:
+        invalid["candidates"][0]["backtest_years"] = invalid_period
+    repaired = _donchian_response()
+
+    class SequencedResearchClient:
+        def __init__(self) -> None:
+            self.requests: list[LLMJsonRequest] = []
+            self._responses = [invalid, repaired]
+
+        def generate_json(self, request: LLMJsonRequest) -> dict:
+            self.requests.append(request)
+            return self._responses.pop(0)
+
+    client = SequencedResearchClient()
+    spec = research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=client,
+    )
+
+    assert spec.candidates[0].backtest_years == 1
+    assert [request.task_type for request in client.requests] == [
+        "strategy_research_resolution",
+        "strategy_research_resolution_repair",
+    ]
+
+
 def test_researcher_does_not_spend_a_semantic_repair_on_provider_timeout(monkeypatch) -> None:
     monkeypatch.setattr(strategy_research, "STRATEGY_RESEARCH_RETRY_BACKOFF_SECONDS", 0.0)
 
@@ -420,6 +454,7 @@ def test_graph_compiles_the_sealed_research_conditions_without_a_template_substi
 
     assert strategy.selection_mode == "user_defined"
     assert strategy.name == "20일 돈치안 상단 돌파"
+    assert strategy.backtest_years == 3
     assert strategy.entry_conditions == spec.candidates[0].entry_conditions
     assert strategy.exit_conditions == spec.candidates[0].exit_conditions
     assert strategy.risk_constraints["research_snapshot_hash"] == spec.research_snapshot_hash

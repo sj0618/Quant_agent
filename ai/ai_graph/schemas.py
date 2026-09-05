@@ -329,6 +329,45 @@ class ScreeningMatch(BaseModel):
     matched_rules: list[str] = Field(default_factory=list)
 
 
+class CandidateResearchSource(BaseModel):
+    """A dated analyst-research source behind a backtest hypothesis card."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    publisher: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    url: str = Field(min_length=1)
+    published_at: str = Field(min_length=1)
+    analyst: str | None = None
+    claim: str = Field(min_length=1)
+
+
+class CandidateConfidenceBreakdown(BaseModel):
+    """Explainable research-quality score, not a forecast of investment returns."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_integrity: int = Field(ge=0, le=30)
+    independent_corroboration: int = Field(ge=0, le=25)
+    rule_executability: int = Field(ge=0, le=20)
+    freshness: int = Field(ge=0, le=15)
+    adversarial_survival: int = Field(ge=0, le=10)
+    deduction_points: int = Field(default=0, ge=0, le=35)
+    deductions: list[str] = Field(default_factory=list)
+
+    @property
+    def score(self) -> int:
+        raw_score = (
+            self.source_integrity
+            + self.independent_corroboration
+            + self.rule_executability
+            + self.freshness
+            + self.adversarial_survival
+            - self.deduction_points
+        )
+        return max(0, min(100, raw_score))
+
+
 class StrategyCandidateCard(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -340,6 +379,11 @@ class StrategyCandidateCard(BaseModel):
     reason: str | None = None
     sector: str | None = None
     matches: list[ScreeningMatch] = Field(default_factory=list)
+    backtest_query: str | None = None
+    research_as_of: str | None = None
+    research_sources: list[CandidateResearchSource] = Field(default_factory=list)
+    confidence_breakdown: CandidateConfidenceBreakdown | None = None
+    counter_hypothesis: str | None = None
 
 
 class ClarificationOption(BaseModel):
@@ -365,6 +409,9 @@ class StrategySpec(BaseModel):
     market: str = Field(min_length=1)
     sector: str | None = None
     timeframe: str = Field(min_length=1)
+    # Drafts may remain period-free for display or editing, but an execution path must
+    # seal an AI-selected integer before it can load any price history.
+    backtest_years: int | None = Field(default=None, ge=1, le=5, strict=True)
     entry_conditions: list[Condition] = Field(min_length=1)
     exit_conditions: list[Condition] = Field(default_factory=list)
     indicators: list[str] = Field(default_factory=list)
@@ -518,10 +565,10 @@ class ResearchCandidateV3(BaseModel):
         default="백테스트에서 실제 회전율과 비용 민감도를 산출합니다.", max_length=400
     )
     regime_risks: list[str] = Field(default_factory=list, max_length=8)
-    backtest_years: int = Field(default=1, ge=1, le=3)
-    backtest_period_basis: str = Field(
-        default="서버의 기본 PIT 관측 창을 사용합니다.", max_length=600
-    )
+    # A live research response must choose this before data loading.  Defaults would
+    # turn an omitted model value into an invisible backtest-policy decision.
+    backtest_years: int = Field(ge=1, le=5, strict=True)
+    backtest_period_basis: str = Field(min_length=1, max_length=600)
     source_ids: list[str] = Field(min_length=1, max_length=12)
 
     # A named WICS sector the PIT universe is restricted to before the rule is applied.

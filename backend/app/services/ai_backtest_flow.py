@@ -38,7 +38,11 @@ from app.schemas.ai_backtest import (
     ModelCallLogBundle,
 )
 from app.services.raw_audit_admission import RawAuditAdmission
-from app.services.ai_backtest_runtime import ProcessIdentityRecorder, ReleaseAuthorizer
+from app.services.ai_backtest_runtime import (
+    ProcessIdentityRecorder,
+    ReleaseAuthorizer,
+    seal_backtest_strategy_request,
+)
 
 
 _AUDIT_FAILURE_COUNT = 0
@@ -258,6 +262,7 @@ class AICodeBacktestService:
         code_id = uuid4()
         validation_id = uuid4()
         execution_run_id = uuid4()
+        request = seal_backtest_strategy_request(request)
 
         # The request claim atomically created the trace before any external work.
         await self.repository.create_strategy_parse(
@@ -970,7 +975,7 @@ class AICodeBacktestService:
         )
 
 
-REQUEST_FINGERPRINT_VERSION = "ai-backtest-intent-v1"
+REQUEST_FINGERPRINT_VERSION = "ai-backtest-intent-v2"
 _IDEMPOTENCY_KEY_PATTERN = r"^[A-Za-z0-9._~-]{8,128}$"
 
 

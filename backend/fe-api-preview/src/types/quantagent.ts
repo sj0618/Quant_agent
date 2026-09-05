@@ -69,6 +69,26 @@ export interface StrategyCandidateCard {
   key_conditions: string[];
   confidence: number;
   reason?: string | null;
+  backtest_query?: string | null;
+  research_as_of?: string | null;
+  research_sources?: Array<{
+    publisher: string;
+    title: string;
+    url: string;
+    published_at: string;
+    analyst?: string | null;
+    claim: string;
+  }>;
+  confidence_breakdown?: {
+    source_integrity: number;
+    independent_corroboration: number;
+    rule_executability: number;
+    freshness: number;
+    adversarial_survival: number;
+    deduction_points: number;
+    deductions: string[];
+  } | null;
+  counter_hypothesis?: string | null;
 }
 
 export interface AIClarificationOption {

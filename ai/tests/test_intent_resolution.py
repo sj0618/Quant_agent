@@ -8,6 +8,7 @@ strategy, and every stage after it works on that strategy rather than the vague 
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from ai_graph.data_sources.db import PipelineDataBundle
 from ai_graph.graph import (
@@ -30,13 +31,13 @@ RESOLVED = (
 
 
 class StubIntentClient:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
+    def __init__(self, payload: dict[str, Any] | list[dict[str, Any]]) -> None:
+        self.payloads = payload if isinstance(payload, list) else [payload]
         self.requests: list[LLMJsonRequest] = []
 
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
         self.requests.append(request)
-        return self.payload
+        return self.payloads.pop(0)
 
 
 def _intent_payload(**overrides: Any) -> dict[str, Any]:
@@ -50,6 +51,8 @@ def _intent_payload(**overrides: Any) -> dict[str, Any]:
         "scope": "supported",
         "scope_reason": "",
         "citations": [{"title": "KRX 업종 분류", "url": "https://example.com/krx"}],
+        "backtest_years": 3,
+        "backtest_period_basis": "최근 변동성 국면과 KRX PIT 자료 가용성을 조사해 3년을 선택했습니다.",
     }
     payload.update(overrides)
     return payload
@@ -87,6 +90,33 @@ def test_intent_resolution_searches_the_web_before_committing(live_intent) -> No
     assert client.requests[0].prompt_version == "v3"
     assert "never make a\nuser-stated material rule appear tested" in client.requests[0].system_prompt
     assert resolved["resolved_query"] == RESOLVED
+    assert resolved["backtest_years"] == 3
+
+
+def test_live_intent_repairs_a_missing_period_once(live_intent) -> None:
+    invalid = _intent_payload()
+    invalid.pop("backtest_years")
+    client = live_intent([invalid, _intent_payload(backtest_years=2)])
+
+    resolved = resolve_strategy_intent(query="화학 관련주 사줘", capabilities=[])
+
+    assert resolved is not None
+    assert resolved["backtest_years"] == 2
+    assert [request.task_type for request in client.requests] == [
+        "strategy_intent",
+        "strategy_intent_repair",
+    ]
+    assert client.requests[1].enable_web_search is False
+
+
+@pytest.mark.parametrize("invalid_period", [0, 6, "3"])
+def test_live_intent_rejects_invalid_period_after_one_repair(live_intent, invalid_period: object) -> None:
+    invalid = _intent_payload(backtest_years=invalid_period)
+    client = live_intent([invalid, invalid])
+
+    with pytest.raises(ValidationError):
+        resolve_strategy_intent(query="화학 관련주 사줘", capabilities=[])
+    assert len(client.requests) == 2
 
 
 def test_missing_data_preserves_the_exact_rule_and_hides_candidate_cards() -> None:

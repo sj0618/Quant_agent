@@ -42,6 +42,16 @@ from app.services.raw_audit_admission import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _bypass_runtime_strategy_sealing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flow tests supply lightweight parse fixtures; sealing is unit-tested in runtime."""
+
+    monkeypatch.setattr(
+        "app.services.ai_backtest_flow.seal_backtest_strategy_request",
+        lambda request: request,
+    )
+
+
 @dataclass(slots=True)
 class FakeRepository:
     traces: list[AITraceCreate] = field(default_factory=list)
@@ -241,11 +251,17 @@ def make_flow_request(**values: object) -> AICodeBacktestFlowRequest:
         execution_context=context,
         idempotency_key=f"test-{uuid4().hex}",
         request_fingerprint="0" * 64,
-        fingerprint_version="ai-backtest-intent-v1",
+        fingerprint_version="ai-backtest-intent-v2",
         **values,
     )
     version, fingerprint = build_request_fingerprint(provisional)
     return provisional.model_copy(update={"fingerprint_version": version, "request_fingerprint": fingerprint})
+
+
+def test_request_fingerprint_uses_a_new_namespace_for_period_sealing() -> None:
+    request = make_flow_request(natural_language_prompt="RSI 전략을 2년 백테스트")
+
+    assert request.fingerprint_version == "ai-backtest-intent-v2"
 
 class FakeGenerator:
     def __init__(self):

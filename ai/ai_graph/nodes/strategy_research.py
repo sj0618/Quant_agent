@@ -44,8 +44,8 @@ from ai_graph.schemas import (
 )
 
 STRATEGY_RESEARCH_RETRY_BACKOFF_SECONDS = 1.0
-STRATEGY_RESEARCH_PROMPT_VERSION = "v6"
-STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v6"
+STRATEGY_RESEARCH_PROMPT_VERSION = "v7"
+STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v7"
 RELATIVE_STRENGTH_PROXY_DISCLOSURE = (
     "relative_strength_Nd는 같은 날짜의 PIT KRX 보통주 유니버스 평균 N일 수익률을 뺀 값이며, "
     "공식 KOSPI/KOSDAQ 지수 대비 수익률이 아님"
@@ -137,7 +137,7 @@ and ``revenue``. Use them for valuation and quality rules when they appear in
 
 Candidate conditions are a historical research rule. Also return economic_rationale,
 falsification_conditions, ai_assumptions, expected_turnover, regime_risks,
-backtest_years, and backtest_period_basis. Choose a 1--3 year backtest window using
+backtest_years, and backtest_period_basis. Choose an integer 1--5 year backtest window using
 research and the supported KRX data window. If the user omitted it, disclose the chosen
 period as an AI assumption with its evidence basis; never ask the user merely because a
 period, exit, or rebalance rule was omitted.
@@ -202,10 +202,8 @@ class _CandidateDraft(BaseModel):
         default="백테스트에서 실제 회전율과 비용 민감도를 산출합니다.", max_length=400
     )
     regime_risks: list[str] = Field(default_factory=list, max_length=8)
-    backtest_years: int = Field(default=1, ge=1, le=3)
-    backtest_period_basis: str = Field(
-        default="서버의 기본 PIT 관측 창을 사용합니다.", max_length=600
-    )
+    backtest_years: int = Field(ge=1, le=5, strict=True)
+    backtest_period_basis: str = Field(min_length=1, max_length=600)
     source_ids: list[str] = Field(min_length=1, max_length=12)
     sector: str | None = Field(default=None, min_length=1, max_length=64)
 

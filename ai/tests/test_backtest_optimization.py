@@ -617,6 +617,32 @@ def test_improvement_candidates_are_bounded_and_normalized() -> None:
     )
 
 
+def test_backtest_records_a_finite_campaign_when_refinement_budget_is_spent(
+    monkeypatch,
+) -> None:
+    strategy = _strategy()
+    generated = generate_loop3_candidates(
+        Loop3Request(strategy=strategy, variant="A", trace_id="campaign-budget")
+    )
+    # The baseline has exactly three candidates. A campaign may still run that
+    # baseline, but cannot admit a fourth candidate merely because the score misses.
+    monkeypatch.setenv("AI_RESEARCH_CAMPAIGN_MAX_CANDIDATES", "3")
+
+    outcome = backtest_node.backtest_node(
+        {
+            "strategy_spec": strategy.model_dump(),
+            "backtest_code": generated.model_dump(),
+            "price_rows": _rows(days=80),
+        }
+    )
+
+    campaign = outcome["backtest"]["execution_stats"]["research_campaign"]
+    assert campaign["policy"] == "finite_research_campaign.v1"
+    assert campaign["usage"]["baseline_candidates"] == 3
+    assert campaign["usage"]["refinement_candidates"] == 0
+    assert campaign["stop_reason"] == "candidate_budget_exhausted"
+
+
 def test_candidate_profiles_are_schema_profiles_only() -> None:
     plan = build_code_generation_plan(_strategy(), map_strategy_features(_strategy()))
     profiles = backtest_node.generate_self_improvement_candidates(

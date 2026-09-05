@@ -94,10 +94,57 @@ class CodeGenerationFailure(RuntimeError):
         self.model_call = model_call
 
 
+def seal_backtest_strategy_request(
+    request: AICodeBacktestFlowRequest,
+) -> AICodeBacktestFlowRequest:
+    """Resolve one strategy period before either generation or execution starts."""
+
+    try:
+        from ai_graph.graph import build_strategy_spec
+        from ai_graph.llm.role_calls import resolve_strategy_intent
+        from ai_graph.schemas import StrategySpec
+    except ModuleNotFoundError as exc:
+        raise _pythonpath_error(exc) from exc
+
+    if request.parsed_strategy_jsonb:
+        if "backtest_years" not in request.parsed_strategy_jsonb:
+            raise AppError(
+                status_code=422,
+                component="ai_backtest",
+                code="backtest_period_required",
+                message="Parsed strategy must include a preselected backtest period.",
+            )
+        strategy = StrategySpec.model_validate(request.parsed_strategy_jsonb)
+        if strategy.backtest_years is None:
+            raise AppError(
+                status_code=422,
+                component="ai_backtest",
+                code="backtest_period_required",
+                message="Parsed strategy must include a preselected backtest period.",
+            )
+    else:
+        intent = resolve_strategy_intent(query=request.natural_language_prompt, capabilities=[])
+        if intent is None or intent.get("scope") != "supported":
+            raise AppError(
+                status_code=422,
+                component="ai_backtest",
+                code="backtest_period_unresolved",
+                message="AI could not resolve a strategy and backtest period before execution.",
+            )
+        strategy = build_strategy_spec(
+            str(intent["resolved_query"]),
+            variant="A",
+            original_query=request.natural_language_prompt,
+            backtest_years=intent["backtest_years"],
+        )
+
+    return request.model_copy(update={"parsed_strategy_jsonb": strategy.model_dump(mode="json")})
+
+
 class AOAICodeGenerator:
     async def generate(self, request: AICodeBacktestFlowRequest, *, trace_id: UUID) -> GeneratedCodeResult:
         (
-            build_strategy_spec,
+            _build_strategy_spec,
             build_backtest_code_json_request,
             create_llm_client,
             generate_loop3_candidates,
@@ -106,11 +153,9 @@ class AOAICodeGenerator:
             AOAIResponsesClient,
             MockLLMClient,
         ) = _load_generation_modules()
-        strategy = (
-            StrategySpec.model_validate(request.parsed_strategy_jsonb)
-            if request.parsed_strategy_jsonb
-            else build_strategy_spec(request.natural_language_prompt, variant="A")
-        )
+        if not request.parsed_strategy_jsonb:
+            raise ValueError("code generation requires a sealed strategy with a backtest period")
+        strategy = StrategySpec.model_validate(request.parsed_strategy_jsonb)
         prompt_request = build_backtest_code_json_request(strategy, "A")
         llm_client = create_llm_client(role="BACKTEST_CODE")
         RecordingAuditSink, bind_audit_context, create_audit_correlation = _load_audit_modules()

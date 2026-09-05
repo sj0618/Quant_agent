@@ -42,9 +42,11 @@ from ai_graph.freshness import (
 )
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
+    generate_analyst_strategy_candidates,
     generate_strategy_conditions,
     resolve_strategy_intent,
 )
+from ai_graph.nodes.condition_compiler import supported_metrics
 from ai_graph.memory import AnalysisMemory
 from ai_graph.nodes.backtest import (
     MAX_OBJECTIVE_DRAWDOWN,
@@ -591,15 +593,30 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
     if _is_small_talk(query):
         return _ambiguity_state(AmbiguityCode.NO_STRATEGY_INTENT, query, intent=None)
     if state.get("execution_spec"):
+        sealed_execution_spec = validate_execution_spec(state["execution_spec"])
+        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3):
+            candidate = sealed_execution_spec.candidates[0]
+            return _ambiguity_state(
+                AmbiguityCode.READY,
+                query,
+                intent={
+                    "scope": "strategy",
+                    "resolved_query": query,
+                    "interpretation": "AI 리서치로 봉인한 실행 조건을 적용합니다.",
+                    "backtest_years": candidate.backtest_years,
+                    "backtest_period_basis": candidate.backtest_period_basis,
+                },
+            )
+        # A legacy confirmed rule seals entry/exit only.  It still needs the same
+        # one-time AI period selection before the data loader can run.
+        intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
+        if intent is not None:
+            intent = {**intent, "resolved_query": query}
         report_activity("step", label="요청 해석 완료", detail="사용자가 확인한 실행 조건을 적용합니다.")
         return _ambiguity_state(
             AmbiguityCode.READY,
             query,
-            intent={
-                "scope": "strategy",
-                "resolved_query": query,
-                "interpretation": "사용자가 확인한 구조화 실행 조건",
-            },
+            intent=intent,
         )
     report_activity("step", label="요청 해석", detail="입력을 실행 가능한 전략으로 구체화하는 중")
     intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
@@ -654,6 +671,13 @@ def _ambiguity_state(
         output["intent"] = dict(intent)
     if category == AmbiguityCode.READY and intent is not None:
         output["resolved_query"] = str(intent["resolved_query"])
+        try:
+            output["backtest_period"] = _backtest_period_from_intent(intent)
+        except ValueError:
+            # Keep the malformed payload for a typed data-node failure.  This makes
+            # the failure occur before the loader, rather than hiding it behind an
+            # arbitrary local/mock default.
+            pass
 
     if category == AmbiguityCode.READY:
         detail = str((intent or {}).get("interpretation") or "").strip()
@@ -695,8 +719,63 @@ def _strategy_query(state: Mapping[str, Any]) -> str:
     return str(state.get("resolved_query") or state.get("user_query") or "")
 
 
+def _backtest_period_from_intent(intent: Mapping[str, Any]) -> dict[str, Any]:
+    years = intent.get("backtest_years")
+    if isinstance(years, bool) or not isinstance(years, int) or not 1 <= years <= 5:
+        raise ValueError("AI가 백테스트 기간을 1~5년 정수로 확정하지 못했습니다.")
+    basis = str(intent.get("backtest_period_basis") or intent.get("basis") or "").strip()
+    if not basis:
+        raise ValueError("AI가 선택한 백테스트 기간의 근거를 제공하지 않았습니다.")
+    return {
+        "backtest_years": years,
+        "selection_source": "ai_research",
+        "period_locked": True,
+        "basis": basis,
+    }
+
+
+def _backtest_period_for_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the only history-window decision permitted before data access."""
+
+    existing = state.get("backtest_period")
+    if isinstance(existing, Mapping):
+        try:
+            period = _backtest_period_from_intent(existing)
+        except ValueError:
+            period = None
+        if period is not None and existing.get("period_locked") is True:
+            return period
+    execution_spec = state.get("execution_spec")
+    if execution_spec is not None:
+        sealed = validate_execution_spec(execution_spec)
+        if isinstance(sealed, ResearchCandidateExecutionSpecV3):
+            candidate = sealed.candidates[0]
+            return _backtest_period_from_intent(
+                {
+                    "backtest_years": candidate.backtest_years,
+                    "backtest_period_basis": candidate.backtest_period_basis,
+                }
+            )
+    intent = state.get("intent")
+    if isinstance(intent, Mapping):
+        return _backtest_period_from_intent(intent)
+    raise ValueError("AI가 백테스트 기간을 확정하지 못했습니다. 다시 시도해 주세요.")
+
+
 def data_node(state: QuantAgentState) -> dict[str, Any]:
     query = _strategy_query(state)
+    try:
+        backtest_period = _backtest_period_for_state(state)
+    except ValueError as exc:
+        message = str(exc)
+        return {
+            "status": EnvelopeStatus.NEED_CLARIFICATION.value,
+            "ambiguity": {
+                "category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+                "reason": message,
+                "ambiguity_reasons": [message],
+            },
+        }
     semantic_slots = parse_semantic_slots(query, trace_id=state["trace_id"])
     data_requirements = _data_requirements_from_sealed_spec(
         state.get("execution_spec"),
@@ -748,16 +827,8 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
             "production_data_source_variant_forbidden",
             "운영 환경에서는 검증된 PostgreSQL data source variant(db)만 사용할 수 있습니다.",
         )
-    selected_backtest_years = (
-        sealed_execution_spec.candidates[0].backtest_years
-        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
-        else None
-    )
-    selected_backtest_period_basis = (
-        sealed_execution_spec.candidates[0].backtest_period_basis
-        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
-        else None
-    )
+    selected_backtest_years = backtest_period["backtest_years"]
+    selected_backtest_period_basis = backtest_period["basis"]
     if required_metrics is not None:
         requires_financials = bool(required_metrics & _FUNDAMENTAL_CONDITION_METRICS)
         # Only a sealed V3 price-path plan may take the OHLCV-only projection.  V1
@@ -778,6 +849,7 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
             compact_price_rows=compact_price_rows,
             sector=sealed_sector,
             backtest_lookback_years=selected_backtest_years,
+            period_locked=True,
         )
     elif skip_current_screen:
         pipeline_data = load_pipeline_data_from_env(
@@ -786,12 +858,14 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
             screen_current=False,
             sector=sealed_sector,
             backtest_lookback_years=selected_backtest_years,
+            period_locked=True,
         )
     else:
         pipeline_data = load_pipeline_data_from_env(
             query,
             state["trace_id"],
             backtest_lookback_years=selected_backtest_years,
+            period_locked=True,
         )
     if selected_backtest_years is not None:
         pipeline_data = pipeline_data.model_copy(
@@ -800,8 +874,9 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
                     **pipeline_data.metadata,
                     "backtest_period": {
                         "years": selected_backtest_years,
-                        "selection_source": "ai_research",
+                        "selection_source": backtest_period["selection_source"],
                         "basis": selected_backtest_period_basis,
+                        "locked": True,
                     },
                 }
             }
@@ -863,8 +938,15 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         pipeline_metadata=pipeline_metadata,
     )
     evidence_refs = build_evidence_refs(source_usage, trace_id=state["trace_id"])
+    candidate_research_as_of = datetime.now(UTC).isoformat()
+    researched_cards = generate_analyst_strategy_candidates(
+        query=query,
+        research_as_of=candidate_research_as_of,
+        allowed_metrics=supported_metrics(),
+        loaded_analyst_evidence=pipeline_data.l4_evidence,
+    )
     cards = strategy_candidate_cards(
-        query,
+        researched_cards,
         screening_candidates=pipeline_data.current_screen_candidates,
         sector=semantic_slots.sector,
     )
@@ -883,6 +965,7 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         "proxy_disclosure": _proxy_disclosure(data_requirements),
         "data": {
             "candidate_cards": [card.model_dump() for card in cards],
+            "candidate_research_as_of": candidate_research_as_of,
             "pipeline_data_source": pipeline_metadata,
             "screening_candidates": pipeline_data.current_screen_candidates,
             "relaxed_screening_candidates": pipeline_data.relaxed_screening_candidates,
@@ -1112,6 +1195,8 @@ def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[st
 def _strategy_spec_from_execution_spec(
     raw_spec: Mapping[str, Any] | ExecutionSpecV1OrV2,
     raw_policy: Mapping[str, Any] | None = None,
+    *,
+    backtest_years: int | None = None,
 ) -> StrategySpec:
     """Compile the confirmed rule without asking another model to reinterpret it."""
 
@@ -1123,6 +1208,7 @@ def _strategy_spec_from_execution_spec(
             name=candidate.title,
             market=execution_spec.market,
             timeframe=execution_spec.timeframe,
+            backtest_years=candidate.backtest_years,
             entry_conditions=candidate.entry_conditions,
             exit_conditions=candidate.exit_conditions,
             indicators=list(dict.fromkeys(candidate.required_metrics)),
@@ -1167,6 +1253,7 @@ def _strategy_spec_from_execution_spec(
             name="사전등록 후보군 탐색 연구",
             market=execution_spec.market,
             timeframe=execution_spec.timeframe,
+            backtest_years=backtest_years,
             entry_conditions=first.entry_conditions,
             exit_conditions=first.exit_conditions,
             indicators=list(dict.fromkeys(
@@ -1224,6 +1311,7 @@ def _strategy_spec_from_execution_spec(
         name="사용자 확인 전략",
         market=execution_spec.market,
         timeframe=execution_spec.timeframe,
+        backtest_years=backtest_years,
         entry_conditions=entry_conditions,
         exit_conditions=exit_conditions,
         indicators=indicators,
@@ -1243,10 +1331,12 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
     """
 
     confirmed_spec = state.get("execution_spec")
+    backtest_years = _backtest_period_for_state(state)["backtest_years"]
     if confirmed_spec:
         strategy_a = _strategy_spec_from_execution_spec(
             confirmed_spec,
             state.get("exploration_policy"),
+            backtest_years=backtest_years,
         )
     else:
         strategy_a = build_strategy_spec(
@@ -1254,6 +1344,7 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
             variant="A",
             semantic_slots=state.get("semantic_slots"),
             original_query=state.get("user_query"),
+            backtest_years=backtest_years,
         )
 
     # If the screen already expressed the rule as structured conditions, adopt them as
@@ -1924,12 +2015,17 @@ def _unique(values: list[str]) -> list[str]:
 
 
 def strategy_candidate_cards(
-    query: str,
+    research_cards: list[StrategyCandidateCard] | None = None,
     *,
     screening_candidates: list[dict[str, Any]] | None = None,
     sector: str | None = None,
 ) -> list[StrategyCandidateCard]:
-    cards = _static_strategy_candidate_cards(query)
+    """Attach server screening matches to live analyst-research cards only.
+
+    Empty discovery results stay empty: no static textbook-card fallback is allowed.
+    """
+
+    cards = list(research_cards) if isinstance(research_cards, list) else []
     if screening_candidates:
         cards = _attach_screening_matches(cards, screening_candidates, sector=sector)
     return cards
@@ -2288,21 +2384,13 @@ def build_clarification_prompt(category: AmbiguityCode, query: str) -> dict[str,
             confidence=0.9,
             confidence_reason="현재 API/백테스트는 KRX 현물 주식 중심으로 검증됩니다.",
         )
-    cards = strategy_candidate_cards(query)
-    options = [
-        ClarificationOption(
-            label=card.title,
-            reason=card.reason or card.summary,
-        )
-        for card in cards[:3]
-    ]
     return _clarification(
-        question="먼저 어떤 후보 전략으로 구체화할까요?",
-        question_reason="입력 조건 일부가 재무·컨센서스·공시 데이터에 걸쳐 있어 실행 가능한 후보로 나눕니다.",
-        options=options,
-        recommended=0,
-        confidence=0.7,
-        confidence_reason="첫 후보가 입력의 핵심 조건과 현재 검증 가능한 데이터 범위의 교집합이 가장 큽니다.",
+        question="최신 애널리스트 리포트를 조사해 백테스트 후보를 도출하겠습니다.",
+        question_reason="정적 지표 후보는 제시하지 않으며, 조사 근거를 통과한 후보만 표시합니다.",
+        options=[],
+        recommended=None,
+        confidence=0.0,
+        confidence_reason="AI confidence는 리포트 근거·독립성·규칙 실행 가능성 검토 후에만 계산됩니다.",
     )
 
 
@@ -2311,7 +2399,7 @@ def _clarification(
     question: str,
     question_reason: str,
     options: list[ClarificationOption],
-    recommended: int,
+    recommended: int | None,
     confidence: float,
     confidence_reason: str,
 ) -> dict[str, Any]:
@@ -2393,6 +2481,7 @@ def build_strategy_spec(
     variant: str,
     semantic_slots: Mapping[str, Any] | None = None,
     original_query: str | None = None,
+    backtest_years: int | None = None,
 ) -> StrategySpec:
     # The interpreter may turn "알아서 좋은 거" into a concrete RSI sentence.  That
     # resolution is useful for data lookup but it must not erase the user's original
@@ -2484,6 +2573,7 @@ def build_strategy_spec(
         market="KRX",
         sector=sector,
         timeframe="daily",
+        backtest_years=backtest_years,
         entry_conditions=conditions.entry_conditions,
         exit_conditions=conditions.exit_conditions,
         indicators=conditions.indicators or profile["indicators"],

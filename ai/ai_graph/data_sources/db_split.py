@@ -78,6 +78,10 @@ RSI_OVERSOLD_THRESHOLD = 30.0
 SCREENING_BASELINE_PROFILE = "__baseline__"
 MAX_SCREENING_RELAXATION_ROUNDS = 3
 
+
+def _backtest_window_policy_id(backtest_years: int) -> str:
+    return f"split_pipeline_{backtest_years}y_calendar_lookback_v1"
+
 KIS_FEATURE_FRAME_VIEW = "mart.kis_adjusted_feature_frame_asof"
 KIS_ADJUSTED_OHLCV_TABLE = "feature.kis_adjusted_ohlcv_daily"
 TA_MOMENTUM_TICKER_TABLE = "feature.ta_momentum_ticker_daily"
@@ -144,6 +148,8 @@ class DataSourceConfig(BaseModel):
     database_dsn_env: str = AI_DATABASE_DSN_ENV
     default_ticker: str = Field(default=DEFAULT_BACKTEST_TICKER, min_length=6, max_length=6)
     backtest_lookback_days: int = Field(default=DEFAULT_BACKTEST_LOOKBACK_DAYS, gt=0)
+    backtest_years: int | None = Field(default=None, ge=1, le=5)
+    period_locked: bool = False
     l4_evidence_limit: int = Field(default=DEFAULT_L4_EVIDENCE_LIMIT, gt=0)
     connect_timeout_seconds: int = Field(default=DEFAULT_DB_CONNECT_TIMEOUT_SECONDS, gt=0)
     statement_timeout_ms: int = Field(default=DEFAULT_DB_STATEMENT_TIMEOUT_MS, gt=0)
@@ -725,6 +731,12 @@ class PostgresPipelineDataSource:
                 "screening_relaxation": screening_relaxation,
                 "current_screening": "enabled" if screen_current else "skipped_for_sealed_exploration",
                 "backtest_lookback_days": effective_lookback_days,
+                "backtest_lookback_years": self.config.backtest_years
+                or DEFAULT_BACKTEST_LOOKBACK_YEARS,
+                "backtest_period_locked": self.config.period_locked,
+                "backtest_window_policy_id": _backtest_window_policy_id(
+                    self.config.backtest_years or DEFAULT_BACKTEST_LOOKBACK_YEARS
+                ),
                 "l4_evidence_source": ANALYST_REPORT_TABLE,
                 "l4_evidence_rows": len(l4_evidence),
                 "universe_source": SYMBOL_MASTER_TABLE,
@@ -1110,6 +1122,7 @@ class PostgresPipelineDataSource:
         )
         if (
             _query_requires_rsi_oversold(query)
+            and not self.config.period_locked
             and lookback_days < DEFAULT_BACKTEST_LOOKBACK_DAYS
             and not _has_rsi_oversold_entry(price_rows)
         ):
@@ -1575,22 +1588,39 @@ def load_pipeline_data_from_env(
     compact_price_rows: bool = False,
     sector: str | None = None,
     backtest_lookback_years: int | None = None,
+    period_locked: bool = False,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
+    if period_locked and backtest_lookback_years is None:
+        raise ValueError("a locked backtest period requires backtest_lookback_years")
     if backtest_lookback_years is not None:
         if (
             isinstance(backtest_lookback_years, bool)
             or not isinstance(backtest_lookback_years, int)
-            or not 1 <= backtest_lookback_years <= 3
+            or not 1 <= backtest_lookback_years <= 5
         ):
-            raise ValueError("backtest_lookback_years must be 1..3")
+            raise ValueError("backtest_lookback_years must be 1..5")
         config = config.model_copy(
-            update={"backtest_lookback_days": backtest_lookback_years * TRADING_DAYS_PER_YEAR}
+            update={
+                "backtest_lookback_days": backtest_lookback_years * TRADING_DAYS_PER_YEAR,
+                "backtest_years": backtest_lookback_years,
+                "period_locked": period_locked,
+            }
         )
     if not config.database_dsn:
-        return _fixture_bundle(
-            f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.",
-            query=query,
+        bundle = _fixture_bundle(
+            f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.", query=query
+        )
+        years = config.backtest_years or DEFAULT_BACKTEST_LOOKBACK_YEARS
+        return bundle.model_copy(
+            update={
+                "metadata": {
+                    **bundle.metadata,
+                    "backtest_lookback_years": years,
+                    "backtest_period_locked": config.period_locked,
+                    "backtest_window_policy_id": _backtest_window_policy_id(years),
+                }
+            }
         )
     return PostgresPipelineDataSource(config).load(
         query,

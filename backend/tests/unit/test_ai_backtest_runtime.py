@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from ai_graph.llm.prompts import BACKTEST_CODE_SCHEMA_NAME, BACKTEST_CODE_SYSTEM_PROMPT
+from app.core.errors import AppError
 from app.schemas.ai_backtest import (
     AI_BACKTEST_MAX_MEMORY_LIMIT_MB,
     AI_BACKTEST_MAX_PROMPT_CHARS,
@@ -22,6 +23,7 @@ from app.services.ai_backtest_runtime import (
     ASTCodeValidator,
     CodeGenerationFailure,
     SandboxedBacktestExecutor,
+    seal_backtest_strategy_request,
 )
 
 
@@ -66,6 +68,61 @@ def test_backtest_request_resource_limits_reject_oversized_values(
         request_type(**payload)
 
     assert exc_info.value.errors()[0]["type"] == error_type
+
+
+def test_sealing_rejects_a_parsed_strategy_without_a_period() -> None:
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="RSI 전략",
+        parsed_strategy_jsonb={"strategy_id": "incomplete"},
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    with pytest.raises(AppError) as caught:
+        seal_backtest_strategy_request(request)
+
+    assert caught.value.code == "backtest_period_required"
+
+
+def test_sealing_resolves_one_period_and_persists_it(monkeypatch) -> None:
+    from ai_graph.schemas import StrategySpec
+
+    strategy = StrategySpec(
+        strategy_id="sealed_period",
+        name="sealed period",
+        market="KRX",
+        timeframe="daily",
+        backtest_years=2,
+        entry_conditions=[{"left": "rsi", "operator": "lte", "right": 30}],
+        confidence=0.5,
+    )
+    monkeypatch.setattr(
+        "ai_graph.llm.role_calls.resolve_strategy_intent",
+        lambda **_kwargs: {
+            "scope": "supported",
+            "resolved_query": "RSI 30 이하 매수",
+            "backtest_years": 2,
+        },
+    )
+    observed: dict[str, object] = {}
+
+    def build_strategy_spec(query: str, **kwargs: object) -> StrategySpec:
+        observed["query"] = query
+        observed.update(kwargs)
+        return strategy
+
+    monkeypatch.setattr("ai_graph.graph.build_strategy_spec", build_strategy_spec)
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="좋은 RSI 전략을 찾아줘",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    sealed = seal_backtest_strategy_request(request)
+
+    assert observed["backtest_years"] == 2
+    assert sealed.parsed_strategy_jsonb is not None
+    assert sealed.parsed_strategy_jsonb["backtest_years"] == 2
 
 def test_ast_code_validator_blocks_non_runtime_imports_and_file_io_calls():
     validator = ASTCodeValidator()
