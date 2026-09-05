@@ -83,6 +83,9 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     ).read_text(encoding="utf-8")
     assert "AUTH_TRUSTED_PROXY_HEADERS=true" in workflow
     assert "AUTH_TRUSTED_PROXY_HOSTS=127.0.0.1,::1" in workflow
+    assert "GOOGLE_REDIRECT_URI=https://qt-agent.kro.kr:38010/auth/google/callback" in workflow
+    assert "AUTH_PUBLIC_BACKEND_ORIGIN=https://qt-agent.kro.kr:38010" in workflow
+    assert "AUTH_ALLOWED_ORIGINS=https://qt-agent.kro.kr:38010" in workflow
     auth_unset_block = workflow.split("for auth_var in", maxsplit=1)[1].split("do", maxsplit=1)[0]
     assert "AUTH_TRUSTED_PROXY_HEADERS" in auth_unset_block
     assert "AUTH_TRUSTED_PROXY_HOSTS" in auth_unset_block

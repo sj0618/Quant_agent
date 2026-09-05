@@ -385,9 +385,9 @@ jobs:
             printf '%s\n' 'AUTH_ENABLED=true'
             printf 'GOOGLE_CLIENT_ID=%s\n' "$GOOGLE_CLIENT_ID"
             printf 'GOOGLE_CLIENT_SECRET=%s\n' "$GOOGLE_CLIENT_SECRET"
-            printf '%s\n' 'GOOGLE_REDIRECT_URI=https://qt-agent.kro.kr/auth/google/callback'
-            printf '%s\n' 'AUTH_PUBLIC_BACKEND_ORIGIN=https://qt-agent.kro.kr'
-            printf '%s\n' 'AUTH_ALLOWED_ORIGINS=https://qt-agent.kro.kr'
+            printf '%s\n' 'GOOGLE_REDIRECT_URI=https://qt-agent.kro.kr:38010/auth/google/callback'
+            printf '%s\n' 'AUTH_PUBLIC_BACKEND_ORIGIN=https://qt-agent.kro.kr:38010'
+            printf '%s\n' 'AUTH_ALLOWED_ORIGINS=https://qt-agent.kro.kr:38010'
             printf '%s\n' 'AUTH_ALLOWED_HOSTS=qt-agent.kro.kr,localhost,127.0.0.1'
             printf '%s\n' 'AUTH_TRUSTED_PROXY_HEADERS=true'
             printf '%s\n' 'AUTH_TRUSTED_PROXY_HOSTS=127.0.0.1,::1'
@@ -558,7 +558,7 @@ jobs:
             (
               cd "$APP_DIR"
               "$APP_DIR/ai/.venv/bin/python" -c \
-                'from app.core.config import load_settings; settings = load_settings(); assert settings.is_production, "APP_ENV must be production"; assert settings.auth_enabled, "AUTH_ENABLED must be true"; assert settings.auth_cookie_secure, "AUTH_COOKIE_SECURE must be true"; assert settings.google_redirect_uri == "https://qt-agent.kro.kr/auth/google/callback", "GOOGLE_REDIRECT_URI mismatch"; assert "https://qt-agent.kro.kr" in settings.allowed_origins, "AUTH_ALLOWED_ORIGINS mismatch"; assert settings.auth_trusted_proxy_headers, "AUTH_TRUSTED_PROXY_HEADERS must be true"; assert set(settings.trusted_proxy_hosts) == {"127.0.0.1", "::1"}, "AUTH_TRUSTED_PROXY_HOSTS mismatch"'
+                'from app.core.config import load_settings; settings = load_settings(); assert settings.is_production, "APP_ENV must be production"; assert settings.auth_enabled, "AUTH_ENABLED must be true"; assert settings.auth_cookie_secure, "AUTH_COOKIE_SECURE must be true"; assert settings.google_redirect_uri == "https://qt-agent.kro.kr:38010/auth/google/callback", "GOOGLE_REDIRECT_URI mismatch"; assert "https://qt-agent.kro.kr:38010" in settings.allowed_origins, "AUTH_ALLOWED_ORIGINS mismatch"; assert settings.auth_trusted_proxy_headers, "AUTH_TRUSTED_PROXY_HEADERS must be true"; assert set(settings.trusted_proxy_hosts) == {"127.0.0.1", "::1"}, "AUTH_TRUSTED_PROXY_HOSTS mismatch"'
             )
 
             # Schema/ETL ownership belongs to the DB release lane.  Application
@@ -782,7 +782,7 @@ jobs:
             auth_headers="$(mktemp "$RUN_DIR/google-auth-smoke.headers.XXXXXX")"
             auth_body="$(mktemp "$RUN_DIR/google-auth-smoke.body.XXXXXX")"
             curl -fsS -D "$auth_headers" -o "$auth_body" \
-              'http://127.0.0.1:18010/api/v1/auth/google/start?redirect_uri=https%3A%2F%2Fqt-agent.kro.kr%2Fauth%2Fgoogle%2Fcallback&return_to=%2Fapp'
+              'http://127.0.0.1:18010/api/v1/auth/google/start?redirect_uri=https%3A%2F%2Fqt-agent.kro.kr%3A38010%2Fauth%2Fgoogle%2Fcallback&return_to=%2Fapp'
             grep -Eqi '^set-cookie: qa_oauth_state=.*Path=/api/v1/auth/google' "$auth_headers"
             cd "$APP_DIR"
             "$APP_DIR/ai/.venv/bin/python" - "$auth_body" <<'PY'
@@ -793,7 +793,7 @@ jobs:
 
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           query = parse_qs(urlsplit(payload["authorizationUrl"]).query)
-          assert query["redirect_uri"] == ["https://qt-agent.kro.kr/auth/google/callback"]
+          assert query["redirect_uri"] == ["https://qt-agent.kro.kr:38010/auth/google/callback"]
           assert query["client_id"][0].endswith(".apps.googleusercontent.com")
           PY
             rm -f "$auth_headers" "$auth_body"
