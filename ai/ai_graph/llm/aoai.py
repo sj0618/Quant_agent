@@ -16,6 +16,7 @@ from ai_graph.llm.base import (
     LLMJsonRequest,
     LLMResponseParseError,
     LLMTimeoutError,
+    ProviderFailureHint,
 )
 from ai_graph.llm.concurrency_gate import AOAIConcurrencyGate, get_shared_gate
 from ai_graph.progress import report_activity
@@ -30,7 +31,10 @@ DEFAULT_SERVICE_TIER = "priority"
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 5.0
 MAX_RETRY_AFTER_SECONDS = 60.0
 DEFAULT_WEB_SEARCH_TOOL_TYPE = "web_search"
-MAX_COMPATIBILITY_ADJUSTMENTS = 3
+# Every recognized capability can be removed at most once. Keep the physical-post
+# budget high enough to attempt the resulting compatible request, but do not retry
+# any capability blindly or more than once.
+MAX_COMPATIBILITY_ADJUSTMENTS = 6
 UNSUPPORTED_STRICT_SCHEMA_KEYWORDS = frozenset(
     {
         "$id",
@@ -77,6 +81,9 @@ def _compatibility_snapshot(cache_key: str | None) -> dict[str, bool]:
         "temperature": True,
         "service_tier": True,
         "structured_outputs": True,
+        "reasoning_effort": True,
+        "max_tool_calls": True,
+        "web_search_context_size": True,
     }
     if cache_key is None:
         return defaults
@@ -139,6 +146,9 @@ class AOAIResponsesClient:
         )
         self._service_tier_supported = compatibility["service_tier"]
         self._structured_outputs_supported = compatibility["structured_outputs"]
+        self._reasoning_effort_supported = compatibility["reasoning_effort"]
+        self._max_tool_calls_supported = compatibility["max_tool_calls"]
+        self._web_search_context_size_supported = compatibility["web_search_context_size"]
         self.logical_call_count = 0
         self.physical_http_post_count = 0
         self.last_call_timings: dict[str, Any] = {}
@@ -338,6 +348,30 @@ class AOAIResponsesClient:
                                 )
                                 body.pop("text", None)
                                 continue
+                            if _unsupported_reasoning_effort(response):
+                                compatibility_adjustments.append("reasoning_effort")
+                                self._reasoning_effort_supported = False
+                                _remember_unsupported(
+                                    self._compatibility_cache_key, "reasoning_effort"
+                                )
+                                body.pop("reasoning", None)
+                                continue
+                            if _unsupported_capability_parameter(response, "max_tool_calls"):
+                                compatibility_adjustments.append("max_tool_calls")
+                                self._max_tool_calls_supported = False
+                                _remember_unsupported(
+                                    self._compatibility_cache_key, "max_tool_calls"
+                                )
+                                body.pop("max_tool_calls", None)
+                                continue
+                            if _unsupported_web_search_context_size(response):
+                                compatibility_adjustments.append("web_search_context_size")
+                                self._web_search_context_size_supported = False
+                                _remember_unsupported(
+                                    self._compatibility_cache_key, "web_search_context_size"
+                                )
+                                _remove_web_search_context_size(body)
+                                continue
                             if (
                                 response.status_code in RETRYABLE_STATUS_CODES
                                 and retry_count < self.max_retries
@@ -464,6 +498,26 @@ class AOAIResponsesClient:
                         self._structured_outputs_supported = False
                         _remember_unsupported(self._compatibility_cache_key, "structured_outputs")
                         body.pop("text", None)
+                        continue
+                    if _unsupported_reasoning_effort(response):
+                        compatibility_adjustments.append("reasoning_effort")
+                        self._reasoning_effort_supported = False
+                        _remember_unsupported(self._compatibility_cache_key, "reasoning_effort")
+                        body.pop("reasoning", None)
+                        continue
+                    if _unsupported_capability_parameter(response, "max_tool_calls"):
+                        compatibility_adjustments.append("max_tool_calls")
+                        self._max_tool_calls_supported = False
+                        _remember_unsupported(self._compatibility_cache_key, "max_tool_calls")
+                        body.pop("max_tool_calls", None)
+                        continue
+                    if _unsupported_web_search_context_size(response):
+                        compatibility_adjustments.append("web_search_context_size")
+                        self._web_search_context_size_supported = False
+                        _remember_unsupported(
+                            self._compatibility_cache_key, "web_search_context_size"
+                        )
+                        _remove_web_search_context_size(body)
                         continue
                     if (
                         response.status_code in RETRYABLE_STATUS_CODES
@@ -634,13 +688,13 @@ class AOAIResponsesClient:
             body["service_tier"] = self.service_tier
         if request.max_output_tokens is not None:
             body["max_output_tokens"] = request.max_output_tokens
-        if request.reasoning_effort is not None:
+        if request.reasoning_effort is not None and self._reasoning_effort_supported:
             body["reasoning"] = {"effort": request.reasoning_effort}
-        if request.max_tool_calls is not None:
+        if request.max_tool_calls is not None and self._max_tool_calls_supported:
             body["max_tool_calls"] = request.max_tool_calls
         if request.enable_web_search:
             tool: dict[str, Any] = {"type": self.web_search_tool_type}
-            if request.web_search_context_size is not None:
+            if request.web_search_context_size is not None and self._web_search_context_size_supported:
                 tool["search_context_size"] = request.web_search_context_size
             body["tools"] = [tool]
             if request.require_web_search:
@@ -752,6 +806,20 @@ def _unsupported_parameter(response: httpx.Response, parameter: str) -> bool:
     return _provider_error_field(response, "param") == parameter
 
 
+def _unsupported_capability_parameter(response: httpx.Response, parameter: str) -> bool:
+    """Return true only when the provider explicitly rejects a capability.
+
+    A parameter name on an ``invalid_request_error`` can mean that the caller sent
+    an invalid value. Treating that as a missing feature would hide a configuration
+    error and poison the process-local compatibility cache.
+    """
+
+    return (
+        _provider_error_field(response, "code") == "unsupported_parameter"
+        and _unsupported_parameter(response, parameter)
+    )
+
+
 def _unsupported_structured_outputs(response: httpx.Response) -> bool:
     """Allow one schema fallback only for Azure's explicit unsupported-parameter code.
 
@@ -768,6 +836,27 @@ def _unsupported_structured_outputs(response: httpx.Response) -> bool:
         and isinstance(parameter, str)
         and (parameter == "text" or parameter.startswith("text."))
     )
+
+
+def _unsupported_reasoning_effort(response: httpx.Response) -> bool:
+    return _unsupported_capability_parameter(
+        response, "reasoning.effort"
+    ) or _unsupported_capability_parameter(
+        response, "reasoning"
+    )
+
+
+def _unsupported_web_search_context_size(response: httpx.Response) -> bool:
+    return any(
+        _unsupported_capability_parameter(response, parameter)
+        for parameter in ("tools.0.search_context_size", "tools[0].search_context_size")
+    )
+
+
+def _remove_web_search_context_size(body: dict[str, Any]) -> None:
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools and isinstance(tools[0], dict):
+        tools[0].pop("search_context_size", None)
 
 
 def _schema_format_name(schema_name: str) -> str:
@@ -940,10 +1029,30 @@ def _typed_provider_failure(error: Exception | None, *, retry_count: int) -> LLM
     if isinstance(error, httpx.TimeoutException):
         return LLMTimeoutError("AOAI Responses request failed: timeout", retry_count=retry_count)
     if isinstance(error, httpx.HTTPStatusError):
-        return LLMHTTPStatusError(error.response.status_code, retry_count=retry_count)
+        return LLMHTTPStatusError(
+            error.response.status_code,
+            retry_count=retry_count,
+            provider_failure_hint=_safe_provider_failure_hint(error.response),
+        )
     if isinstance(error, httpx.TransportError):
         return LLMConnectionError("AOAI Responses request failed: transport", retry_count=retry_count)
     return LLMClientError("AOAI Responses request failed", retry_count=retry_count)
+
+
+def _safe_provider_failure_hint(response: httpx.Response) -> ProviderFailureHint | None:
+    """Project only allow-listed configuration causes from a provider 400."""
+
+    if response.status_code != 400:
+        return None
+    error_code = _provider_error_field(response, "code")
+    if error_code not in {"invalid_request_error", "unsupported_parameter", "unsupported_value"}:
+        return None
+    parameter = _provider_error_field(response, "param")
+    if parameter in {"tools", "tools.0.type", "tools[0].type", "tool_choice"}:
+        return "web_search_unsupported"
+    if parameter == "model":
+        return "model_unsupported"
+    return None
 
 
 def _sleep_before_retry(

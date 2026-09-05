@@ -12,6 +12,7 @@ from ai_graph.llm import aoai as aoai_module
 from ai_graph.llm.aoai import AOAIResponsesClient
 from ai_graph.llm.base import (
     LLMClientError,
+    LLMHTTPStatusError,
     LLMJsonRequest,
     LLMProviderConfigError,
     LLMResponseParseError,
@@ -517,6 +518,196 @@ def test_gpt5_research_transport_budget_stays_bounded_after_compatibility_retrie
     assert "service_tier" not in request_bodies[1]
     assert "text" not in request_bodies[2]
     assert client.last_call_timings["physical_http_posts"] == 4
+
+
+def test_aoai_client_drops_unsupported_optional_research_budgets() -> None:
+    request_bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        request_bodies.append(body)
+        if len(request_bodies) == 1:
+            return httpx.Response(
+                400,
+                json={"error": {"code": "unsupported_parameter", "param": "reasoning.effort"}},
+            )
+        if len(request_bodies) == 2:
+            return httpx.Response(
+                400,
+                json={"error": {"code": "unsupported_parameter", "param": "max_tool_calls"}},
+            )
+        if len(request_bodies) == 3:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "unsupported_parameter",
+                        "param": "tools.0.search_context_size",
+                    }
+                },
+            )
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="gpt-5.6-luna",
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = make_request().model_copy(
+        update={
+            "stream_response": False,
+            "reasoning_effort": "medium",
+            "max_tool_calls": 12,
+            "enable_web_search": True,
+            "web_search_context_size": "high",
+        }
+    )
+
+    assert client.generate_json(request) == {"message": "ok"}
+    assert len(request_bodies) == 4
+    assert "reasoning" not in request_bodies[1]
+    assert "max_tool_calls" not in request_bodies[2]
+    assert request_bodies[3]["tools"] == [{"type": "web_search"}]
+
+
+def test_aoai_client_can_apply_every_compatibility_adjustment() -> None:
+    request_bodies: list[dict] = []
+    rejected_parameters = (
+        "temperature",
+        "service_tier",
+        "text.format.schema",
+        "reasoning.effort",
+        "max_tool_calls",
+        "tools.0.search_context_size",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content.decode("utf-8")))
+        index = len(request_bodies) - 1
+        if index < len(rejected_parameters):
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "unsupported_parameter",
+                        "param": rejected_parameters[index],
+                    }
+                },
+            )
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="test-model",
+        max_retries=0,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = make_request().model_copy(
+        update={
+            "stream_response": False,
+            "response_schema": {
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+                "additionalProperties": False,
+            },
+            "reasoning_effort": "medium",
+            "max_tool_calls": 12,
+            "enable_web_search": True,
+            "web_search_context_size": "high",
+        }
+    )
+
+    assert client.generate_json(request) == {"message": "ok"}
+    assert len(request_bodies) == 7
+    assert request_bodies[-1]["tools"] == [{"type": "web_search"}]
+    assert "temperature" not in request_bodies[-1]
+    assert "service_tier" not in request_bodies[-1]
+    assert "text" not in request_bodies[-1]
+    assert "reasoning" not in request_bodies[-1]
+    assert "max_tool_calls" not in request_bodies[-1]
+
+
+@pytest.mark.parametrize(
+    ("parameter", "request_update", "expected_path"),
+    (
+        ("reasoning.effort", {"reasoning_effort": "medium"}, ("reasoning",)),
+        ("max_tool_calls", {"max_tool_calls": 12}, ("max_tool_calls",)),
+        (
+            "tools.0.search_context_size",
+            {"enable_web_search": True, "web_search_context_size": "high"},
+            ("tools", 0, "search_context_size"),
+        ),
+    ),
+)
+def test_aoai_client_does_not_treat_invalid_optional_values_as_unsupported_capabilities(
+    parameter: str, request_update: dict[str, object], expected_path: tuple[object, ...]
+) -> None:
+    cache_key = f"invalid-optional-{parameter}"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": {"code": "invalid_request_error", "param": parameter}},
+        )
+
+    request = make_request().model_copy(
+        update={"stream_response": False, **request_update}
+    )
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="gpt-5.6-luna",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        compatibility_cache_key=cache_key,
+    )
+
+    with pytest.raises(LLMHTTPStatusError):
+        client.generate_json(request)
+
+    fresh_client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="gpt-5.6-luna",
+        compatibility_cache_key=cache_key,
+    )
+    body: object = fresh_client._request_body(request)
+    for part in expected_path:
+        body = body[part]  # type: ignore[index]
+    assert body is not None
+
+
+def test_aoai_client_projects_only_a_safe_web_search_hint_from_a_provider_400() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "unsupported_parameter",
+                    "param": "tools",
+                    "message": "private provider detail",
+                }
+            },
+        )
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="gpt-5.6-luna",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(LLMHTTPStatusError) as raised:
+        client.generate_json(make_request().model_copy(update={"stream_response": False, "enable_web_search": True}))
+
+    assert raised.value.provider_failure_hint == "web_search_unsupported"
+    assert "private provider detail" not in str(raised.value)
 
 
 def test_aoai_client_does_not_downgrade_structured_output_for_schema_validation_error() -> None:

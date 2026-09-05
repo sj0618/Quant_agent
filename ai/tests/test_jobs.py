@@ -67,9 +67,14 @@ def test_strategy_research_failure_keeps_its_typed_subcause() -> None:
         (LLMTimeoutError("provider-secret-timeout"), "aoai_response_timeout", True),
         (LLMConnectionError("provider-secret-connect"), "aoai_connection_error", True),
         (LLMHTTPStatusError(400), "aoai_http_4xx", False),
+        (
+            LLMHTTPStatusError(400, provider_failure_hint="web_search_unsupported"),
+            "aoai_web_search_unsupported",
+            False,
+        ),
         (LLMHTTPStatusError(503), "aoai_http_5xx", True),
     ],
-    ids=("timeout", "connection", "http_400", "http_503"),
+    ids=("timeout", "connection", "http_400", "web_search", "http_503"),
 )
 def test_strategy_research_provider_failure_preserves_safe_wrapped_aoai_cause(
     provider_error, expected_subcause: str, retryable: bool

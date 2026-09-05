@@ -522,6 +522,7 @@ export interface ChatMessage {
     question: string;
     options: AIClarificationOption[];
     recommended?: number | null;
+    retryQuery?: string;
   };
 }
 

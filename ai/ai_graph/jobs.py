@@ -1576,6 +1576,8 @@ def _aoai_failure_diagnostic(
         "aoai_http_4xx",
         "aoai_http_5xx",
         "aoai_http_error",
+        "aoai_web_search_unsupported",
+        "aoai_model_unsupported",
     ],
     stage: Stage,
     retryable: bool,
@@ -1622,6 +1624,23 @@ def _research_provider_diagnostic(
             safe_message="AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
         )
     if isinstance(typed_failure, LLMHTTPStatusError):
+        if typed_failure.provider_failure_hint == "web_search_unsupported":
+            return _aoai_failure_diagnostic(
+                subcause="aoai_web_search_unsupported",
+                stage=stage,
+                retryable=False,
+                safe_message=(
+                    "현재 Azure AI 배포가 리서치에 필요한 웹 검색 도구를 지원하지 않습니다. "
+                    "웹 검색을 지원하는 모델 배포를 선택한 뒤 다시 시도해 주세요."
+                ),
+            )
+        if typed_failure.provider_failure_hint == "model_unsupported":
+            return _aoai_failure_diagnostic(
+                subcause="aoai_model_unsupported",
+                stage=stage,
+                retryable=False,
+                safe_message="현재 Azure AI 배포에서 선택한 모델을 사용할 수 없습니다. 모델 배포 이름을 확인해 주세요.",
+            )
         status_code = typed_failure.status_code
         subcause = (
             "aoai_http_5xx"

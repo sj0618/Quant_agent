@@ -224,7 +224,15 @@ export function StrategyInputPanel({
                       )}
                       disabled={inputDisabled}
                       key={`${message.id}:option:${option.label}`}
-                      onClick={() => setDraft(option.label)}
+                      onClick={() => {
+                        const retryQuery = message.clarification?.retryQuery;
+                        if (option.label === "다시 시도" && retryQuery) {
+                          setSubmitError(null);
+                          void submitQuery(retryQuery);
+                          return;
+                        }
+                        setDraft(option.label);
+                      }}
                       type="button"
                     >
                       <span className="block text-xs font-bold">{option.label}</span>

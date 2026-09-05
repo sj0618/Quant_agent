@@ -21,14 +21,25 @@ class LLMConnectionError(LLMClientError):
     """The client could not establish or maintain a provider transport connection."""
 
 
+ProviderFailureHint = Literal["web_search_unsupported", "model_unsupported"]
+
+
 class LLMHTTPStatusError(LLMClientError):
     """The provider returned a non-success HTTP status without exposing its body."""
 
-    def __init__(self, status_code: int, *, retry_count: int = 0) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        retry_count: int = 0,
+        provider_failure_hint: ProviderFailureHint | None = None,
+    ) -> None:
         if status_code < 100 or status_code > 599:
             raise ValueError("status_code must be an HTTP status code")
         super().__init__("AOAI Responses request failed with an HTTP error", retry_count=retry_count)
         self.status_code = status_code
+        # This is a closed, allow-listed projection; never retain a provider body.
+        self.provider_failure_hint = provider_failure_hint
 
 
 class LLMProviderConfigError(LLMClientError):

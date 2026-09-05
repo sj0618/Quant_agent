@@ -531,6 +531,10 @@ function buildAnalysisChatMessages(job: AnalysisJob): ChatMessage[] {
           question: payload.question,
           options: payload.options,
           recommended: payload.recommended,
+          retryQuery:
+            job.result?.retryable && payload.options.some((option) => option.label === "다시 시도")
+              ? job.query
+              : undefined,
         }
       : undefined;
 

@@ -60,6 +60,18 @@ test("analysis results with a failure cause retain the server diagnosis in the w
   assert.match(source, /error: progressJob \? jobErrors\[progressJob\.job_id\] \?\? terminalJobFailure\(progressJob\) : undefined,/);
 });
 
+test("provider retry actions resubmit the original strategy instead of their button label", async () => {
+  const [clientSource, panelSource] = await Promise.all([
+    readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/features/app/StrategyInputPanel.tsx", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(clientSource, /retryQuery:\s*job\.result\?\.retryable/);
+  assert.match(clientSource, /\? job\.query/);
+  assert.match(panelSource, /void submitQuery\(retryQuery\)/);
+  assert.doesNotMatch(panelSource, /onClick=\{\(\) => setDraft\(option\.label\)\}/);
+});
+
 test("workspace directly queues a natural-language strategy job", async () => {
   const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
   const createJob = clientSource.slice(
