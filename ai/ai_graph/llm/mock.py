@@ -7,7 +7,8 @@ from typing import Any
 from ai_graph.audit import begin_model_call, finish_model_call
 from ai_graph.llm.base import LLMJsonRequest
 from ai_graph.llm.prompts import BACKTEST_CODE_SCHEMA_NAME
-from ai_graph.schemas import StrategySpec
+from ai_graph.nodes.ambiguity import classify_query
+from ai_graph.schemas import AmbiguityCode, StrategySpec
 
 SAFE_RSI_CODE = '''def build_signals(prices):
     signals = []
@@ -658,6 +659,42 @@ PULLBACK_RSI40_VOLUME_CANDIDATES = [
 ]
 
 
+MOCK_BACKTEST_YEARS = 2
+MOCK_BACKTEST_PERIOD_BASIS = (
+    "mock 모드의 결정론 기간입니다: fixture 구간 기준 2년. 실제 리서치로 고른 값이 아닙니다."
+)
+
+
+def _mock_strategy_intent_payload(request: LLMJsonRequest) -> dict[str, Any]:
+    """Answer the strategy-intent role the way the graph requires of any model.
+
+    The data loader refuses to run without a period the model selected and justified.
+    The mock model therefore selects one too - visibly, as a recorded model decision
+    with a basis that says it is a fixture value - instead of the graph quietly falling
+    back to a local default. Scope reuses the same small-talk / asset-class judgement
+    the live path applies before calling a model, so both refuse the same inputs.
+    """
+
+    query = str(request.variables_jsonb.get("query") or "")
+    category = classify_query(query)
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        scope = "not_a_request"
+    elif category == AmbiguityCode.INFEASIBLE:
+        scope = "unsupported"
+    else:
+        scope = "supported"
+    return {
+        "interpretation": "mock 모드: 입력한 조건을 그대로 실행 조건으로 사용합니다.",
+        "resolved_query": query,
+        "assumptions": [f"mock 모드에서는 백테스트 기간을 {MOCK_BACKTEST_YEARS}년으로 고정합니다."],
+        "scope": scope,
+        "scope_reason": "",
+        "citations": [],
+        "backtest_years": MOCK_BACKTEST_YEARS,
+        "backtest_period_basis": MOCK_BACKTEST_PERIOD_BASIS,
+    }
+
+
 class MockLLMClient:
     def generate_json(self, request: LLMJsonRequest) -> dict[str, Any]:
         call_id = begin_model_call(
@@ -691,6 +728,8 @@ class MockLLMClient:
                     "metrics": [],
                     "citations": [],
                 }
+            elif request.schema_name.startswith("quantagent.strategy_intent"):
+                result = _mock_strategy_intent_payload(request)
             elif request.schema_name.startswith("quantagent.strategy_revision"):
                 # Nothing to revise deterministically; report no change.
                 result = {

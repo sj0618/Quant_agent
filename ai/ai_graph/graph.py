@@ -26,7 +26,11 @@ from ai_graph.data_sources import (
     load_pipeline_data_from_env,
     screening_data_families,
 )
-from ai_graph.data_sources.db import BACKTEST_EVALUATION_YEARS, indicator_families_for_metrics
+from ai_graph.data_sources.db import (
+    BACKTEST_EVALUATION_YEARS,
+    indicator_families_for_metrics,
+    is_release_profile,
+)
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from ai_graph.envelope import InMemoryDebugStore, build_envelope
 from ai_graph.exploration_policy import (
@@ -46,8 +50,8 @@ from ai_graph.llm.role_calls import (
     generate_strategy_conditions,
     resolve_strategy_intent,
 )
-from ai_graph.nodes.condition_compiler import supported_metrics
 from ai_graph.memory import AnalysisMemory
+from ai_graph.nodes.ambiguity import classify_query, is_small_talk
 from ai_graph.nodes.backtest import (
     MAX_OBJECTIVE_DRAWDOWN,
     MIN_OBJECTIVE_SHARPE,
@@ -64,7 +68,11 @@ from ai_graph.nodes.backtest import (
 )
 from ai_graph.nodes.backtest_code import backtest_code_node
 from ai_graph.nodes.backtest_features import unavailable_condition_metrics
-from ai_graph.nodes.condition_compiler import canonical_metric, untranslatable_conditions
+from ai_graph.nodes.condition_compiler import (
+    canonical_metric,
+    supported_metrics,
+    untranslatable_conditions,
+)
 from ai_graph.nodes.report import report_node
 from ai_graph.nodes.research_compile import compile_research
 from ai_graph.nodes.risk_manager import risk_manager_node
@@ -112,7 +120,6 @@ from ai_graph.schemas import (
     validate_execution_spec,
 )
 from ai_graph.source_manifest import validate_release_metadata
-from ai_graph.data_sources.db import is_release_profile
 from ai_graph.state import QuantAgentState
 from ai_graph.strategy_blueprint_catalog import strategy_blueprint_catalog
 
@@ -590,7 +597,7 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
     """
 
     query = state["user_query"]
-    if _is_small_talk(query):
+    if is_small_talk(query):
         return _ambiguity_state(AmbiguityCode.NO_STRATEGY_INTENT, query, intent=None)
     if state.get("execution_spec"):
         sealed_execution_spec = validate_execution_spec(state["execution_spec"])
@@ -1655,96 +1662,6 @@ def _universe_split_disclosure(state: QuantAgentState) -> list[str]:
             "백테스트 거래 대상에서 제외됐습니다."
         )
     return lines
-
-
-def classify_query(query: str) -> AmbiguityCode:
-    """The fallback used only when no model is available to interpret the request.
-
-    It deliberately answers two questions and not the others: is this small talk, and
-    is this an asset class the warehouse can price. Everything it used to decide by
-    keyword - whether a term was "known", whether enough conditions were named,
-    whether two goals conflicted - is a judgment call that belongs to
-    resolve_strategy_intent, which can search and then commit. Matching phrases here
-    only ever produced questions for inputs a person would have had no trouble acting
-    on.
-    """
-
-    if _is_small_talk(query):
-        return AmbiguityCode.NO_STRATEGY_INTENT
-    return AmbiguityCode.INFEASIBLE if _is_unsupported_asset_class(query) else AmbiguityCode.READY
-
-
-def _is_unsupported_asset_class(query: str) -> bool:
-    lowered = query.lower()
-    return any(
-        term in lowered for term in ("옵션", "양매도", "선물", "crypto", "가상화폐", "비트코인")
-    )
-
-
-# Greetings, thanks and idle questions - a backtest is not an answer to any of them.
-_SMALL_TALK_TERMS = (
-    "안녕",
-    "ㅎㅇ",
-    "하이",
-    "반가",
-    "고마",
-    "감사",
-    "ㄳ",
-    "수고",
-    "잘 지내",
-    "날씨",
-    "몇 시",
-    "누구야",
-    "누구세요",
-    "뭐 해",
-    "뭐해",
-    "심심",
-)
-# Anything the warehouse can act on. Present only to keep the check above from firing
-# on a real request that happens to be polite.
-_MARKET_TERMS = (
-    "주",
-    "종목",
-    "매수",
-    "매도",
-    "전략",
-    "투자",
-    "수익",
-    "차트",
-    "코스피",
-    "코스닥",
-    "백테스트",
-    "포트폴리오",
-    "배당",
-    "실적",
-    "지수",
-    "stock",
-    "buy",
-    "sell",
-    "strategy",
-)
-_SMALL_TALK_LENGTH_LIMIT = 20
-
-
-def _is_small_talk(query: str) -> bool:
-    """Whether this message is not asking for a strategy at all.
-
-    Deliberately shaped as positive evidence of chit-chat rather than as an allowlist
-    of strategy words. An allowlist decides by what it fails to recognise, so
-    "화학 관련주 사줘" - a perfectly clear request naming no listed keyword - came back
-    as a greeting. Every uncertain input must fall through to the analysis; the cost of
-    running one is a wasted job, the cost of refusing one is the user's answer.
-
-    Only consulted for the obvious cases, and before the model is called so a greeting
-    does not pay for a web search. Live runs let resolve_strategy_intent decide.
-    """
-
-    normalized = " ".join(query.split()).lower()
-    if not normalized or len(normalized) > _SMALL_TALK_LENGTH_LIMIT:
-        return False
-    if any(term in normalized for term in _MARKET_TERMS):
-        return False
-    return any(term in normalized for term in _SMALL_TALK_TERMS)
 
 
 def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:

@@ -795,12 +795,9 @@ def resolve_strategy_intent(
     This is the step that decides whether the user gets an answer or a question. Every
     stage after it reads `resolved_query` instead of the raw input, so the vagueness is
     resolved once, by a model that can search, rather than re-detected by keyword at
-    each stage. Returns None with no live provider so mock mode keeps its
-    deterministic path.
+    each stage. In mock mode the deterministic mock client answers this role, period
+    included, so the local profile runs end to end without a hidden default.
     """
-
-    if not is_live_llm_provider():
-        return None
 
     expected_json_schema = _LiveStrategyIntent.model_json_schema()
     context = {"query": query, "capabilities": capabilities or []}
@@ -842,8 +839,10 @@ def resolve_strategy_intent(
         resolved = _LiveStrategyIntent.model_validate(payload)
     except (LLMClientError, ValueError, TypeError):
         # A provider/configuration failure cannot be replaced by a locally chosen
-        # period.  Returning no intent makes the graph stop at its pre-loader
-        # period gate, which is both retryable for the caller and safe for mock mode.
+        # period.  Live: the job fails and says so.  Otherwise the graph stops at its
+        # pre-loader period gate, which is retryable for the caller.
+        if is_live_llm_provider():
+            raise
         return None
     if resolved.scope == "supported" and not resolved.resolved_query.strip():
         # An empty resolution would silently hand the raw vague query back to the

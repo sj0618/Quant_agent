@@ -253,6 +253,8 @@ def test_relative_strength_research_is_admitted_from_server_ohlcv_capability() -
                     )
                 ],
                 "source_ids": ["source-1"],
+                "backtest_years": 2,
+                "backtest_period_basis": "테스트 AI가 데이터 조회 전에 2년을 선택했습니다.",
             }
         ],
     }
