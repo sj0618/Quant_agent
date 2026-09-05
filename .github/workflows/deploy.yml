@@ -244,8 +244,8 @@ jobs:
               | node scripts/readiness-semantic-gate.mjs --label "$label" --profile "$profile"
           }
 
-          check_readiness "current-backend-readiness" "http://127.0.0.1:18001/readiness" backend
-          check_readiness "current-ai-api-readiness" "http://127.0.0.1:18001/ai-api/readiness" ai
+          check_readiness "current-backend-readiness" "http://127.0.0.1:18011/readiness" backend
+          check_readiness "current-ai-api-readiness" "http://127.0.0.1:18011/ai-api/readiness" ai
 
       - name: Create deploy snapshot archive
         run: |
@@ -526,8 +526,8 @@ jobs:
               trap - ERR
             echo "Restore deploy snapshot on failure"
             "$APP_DIR/backend/scripts/manage_email_delivery_worker.sh" stop || true
-            stop_listeners_on_port 18001
-            stop_listeners_on_port 18000
+            stop_listeners_on_port 18011
+            stop_listeners_on_port 18010
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
             restore_deploy_snapshot
             deploy_release
@@ -690,22 +690,22 @@ jobs:
             sleep 2
             pkill -KILL -f "$APP_DIR/ai/.venv/bin/python -m uvicorn combined_main:app" 2>/dev/null || true
 
-            stop_listeners_on_port 18001
-            stop_listeners_on_port 18000
+            stop_listeners_on_port 18011
+            stop_listeners_on_port 18010
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
 
             cd "$APP_DIR"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
               --host 0.0.0.0 \
-              --port 18001 \
+              --port 18011 \
               --workers 1 \
               > "$RUN_DIR/combined.log" 2>&1 &
             echo "$!" > "$RUN_DIR/combined.pid"
 
             cd "$APP_DIR/fe"
             nohup env \
-              COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18001" \
-              HOST="127.0.0.1" PORT="18000" node scripts/production-gateway.mjs \
+              COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18011" \
+              HOST="0.0.0.0" PORT="18010" node scripts/production-gateway.mjs \
               > "$RUN_DIR/fe.log" 2>&1 &
             echo "$!" > "$RUN_DIR/fe.pid"
 
@@ -725,12 +725,12 @@ jobs:
               return 1
             }
 
-            wait_for_url "Combined backend" "http://127.0.0.1:18001/combined-health" "$RUN_DIR/combined.log"
-            wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18001/readiness" "deployed-backend-readiness"
-            curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
+            wait_for_url "Combined backend" "http://127.0.0.1:18011/combined-health" "$RUN_DIR/combined.log"
+            wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18011/readiness" "deployed-backend-readiness"
+            curl -fsS 'http://127.0.0.1:18011/ai-api/api-status' \
               | "$APP_DIR/ai/.venv/bin/python" -c \
                 'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
-            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "deployed-ai-api-readiness" ai
+            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18011/ai-api/readiness" "deployed-ai-api-readiness" ai
 
             # The flag is read through Settings so it may live in .env or the shell env.
             email_worker_enabled="$(cd "$APP_DIR" && "$APP_DIR/ai/.venv/bin/python" -c 'from app.core.config import load_settings; print(str(load_settings().email_delivery_worker_enabled).lower())' 2>/dev/null || echo false)"
@@ -747,9 +747,9 @@ jobs:
               echo "email worker disabled (EMAIL_DELIVERY_WORKER_ENABLED != true)"
             fi
 
-            wait_for_url "Frontend gateway" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
+            wait_for_url "Frontend gateway" "http://127.0.0.1:18010/" "$RUN_DIR/fe.log"
             frontend_html="$(mktemp "$RUN_DIR/frontend-smoke.XXXXXX")"
-            if ! curl -fsS -o "$frontend_html" "http://127.0.0.1:18000/"; then
+            if ! curl -fsS -o "$frontend_html" "http://127.0.0.1:18010/"; then
               rm -f "$frontend_html"
               exit 1
             fi
@@ -761,16 +761,16 @@ jobs:
             rm -f "$frontend_html"
 
             unknown_route_html="$(mktemp "$RUN_DIR/frontend-404.XXXXXX")"
-            unknown_route_status="$(curl -sS -o "$unknown_route_html" -w '%{http_code}' "http://127.0.0.1:18000/retired-internal-route")"
+            unknown_route_status="$(curl -sS -o "$unknown_route_html" -w '%{http_code}' "http://127.0.0.1:18010/retired-internal-route")"
             test "$unknown_route_status" = "404"
             test -s "$unknown_route_html"
             rm -f "$unknown_route_html"
-            curl -fsS "http://127.0.0.1:18000/terms" >/dev/null
+            curl -fsS "http://127.0.0.1:18010/terms" >/dev/null
 
             auth_headers="$(mktemp "$RUN_DIR/google-auth-smoke.headers.XXXXXX")"
             auth_body="$(mktemp "$RUN_DIR/google-auth-smoke.body.XXXXXX")"
             curl -fsS -D "$auth_headers" -o "$auth_body" \
-              'http://127.0.0.1:18000/api/v1/auth/google/start?redirect_uri=https%3A%2F%2Fqt-agent.kro.kr%2Fauth%2Fgoogle%2Fcallback&return_to=%2Fapp'
+              'http://127.0.0.1:18010/api/v1/auth/google/start?redirect_uri=https%3A%2F%2Fqt-agent.kro.kr%2Fauth%2Fgoogle%2Fcallback&return_to=%2Fapp'
             grep -Eqi '^set-cookie: qa_oauth_state=.*Path=/api/v1/auth/google' "$auth_headers"
             cd "$APP_DIR"
             "$APP_DIR/ai/.venv/bin/python" - "$auth_body" <<'PY'
@@ -952,8 +952,8 @@ jobs:
           }
 
           restart_restored_release() {
-            stop_listeners_on_port 18001
-            stop_listeners_on_port 18000
+            stop_listeners_on_port 18011
+            stop_listeners_on_port 18010
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
 
             SECRET_DIR="$HOME/.config/quantagent"
@@ -1046,25 +1046,25 @@ jobs:
             cd "$APP_DIR"
             nohup "$APP_DIR/ai/.venv/bin/python" -m uvicorn combined_main:app \
               --host 0.0.0.0 \
-              --port 18001 \
+              --port 18011 \
               --workers 1 \
               > "$RUN_DIR/combined.log" 2>&1 &
             echo "$!" > "$RUN_DIR/combined.pid"
 
             cd "$APP_DIR/fe"
             nohup env \
-              COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18001" \
-              HOST="127.0.0.1" PORT="18000" node scripts/production-gateway.mjs \
+              COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18011" \
+              HOST="0.0.0.0" PORT="18010" node scripts/production-gateway.mjs \
               > "$RUN_DIR/fe.log" 2>&1 &
             echo "$!" > "$RUN_DIR/fe.pid"
 
-            wait_for_url "Combined backend" "http://127.0.0.1:18001/combined-health" "$RUN_DIR/combined.log"
-            wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18001/readiness" "rollback-backend-readiness"
-            curl -fsS 'http://127.0.0.1:18001/ai-api/api-status' \
+            wait_for_url "Combined backend" "http://127.0.0.1:18011/combined-health" "$RUN_DIR/combined.log"
+            wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18011/readiness" "rollback-backend-readiness"
+            curl -fsS 'http://127.0.0.1:18011/ai-api/api-status' \
               | "$APP_DIR/ai/.venv/bin/python" -c \
                 'import json,sys; assert json.load(sys.stdin)["job_store"]["active_mode"] == "persistent"'
-            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "rollback-ai-api-readiness" ai
-            wait_for_url "Frontend gateway" "http://127.0.0.1:18000/" "$RUN_DIR/fe.log"
+            wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18011/ai-api/readiness" "rollback-ai-api-readiness" ai
+            wait_for_url "Frontend gateway" "http://127.0.0.1:18010/" "$RUN_DIR/fe.log"
             touch "$ROLLBACK_MARKER"
           }
 
