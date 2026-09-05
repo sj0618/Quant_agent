@@ -57,7 +57,7 @@ test("terminal analysis failures retain the server diagnosis in the workspace", 
   assert.match(source, /const terminalFailureJob = latestJob\?\.result\?\.status === "failed" \? latestJob : undefined;/);
   assert.match(source, /const progressJob = runningJob \?\? terminalFailureJob;/);
   assert.match(source, /job: progressJob,/);
-  assert.match(source, /error: progressJob \? jobErrors\[progressJob\.job_id\] : undefined,/);
+  assert.match(source, /error: progressJob \? jobErrors\[progressJob\.job_id\] \?\? terminalJobFailure\(progressJob\) : undefined,/);
 });
 
 test("workspace directly queues a natural-language strategy job", async () => {

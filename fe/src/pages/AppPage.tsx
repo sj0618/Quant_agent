@@ -17,6 +17,7 @@ import {
 } from "../api/quantAgentClient";
 import { useAnalysisActivity, type ActivityState } from "../api/analysisActivity";
 import { DebateActivityPanel } from "../features/app/DebateActivityPanel";
+import { terminalJobFailure, type JobFailure } from "../features/app/jobFailure";
 import { StrategyInputPanel } from "../features/app/StrategyInputPanel";
 import { WorkspaceResultPanel, type WorkspaceResultTab } from "../features/app/WorkspaceResultPanel";
 import { useAsyncData } from "../hooks/useAsyncData";
@@ -60,23 +61,6 @@ interface WorkspaceProgress {
   steps: Array<{ label: string; status: AIJobStageStatus }>;
   error?: JobFailure;
   cancelRequested?: boolean;
-}
-
-// A failed analysis carries a diagnosis the envelope already built - what broke, who
-// owns it, whether retrying can help, and the debug_ref support needs. None of it used
-// to reach the screen: a job whose result came back `failed` matched neither the
-// "has a result" branch nor the polling-error branch, so the workspace simply sat on a
-// progress bar until the wall-clock cap turned it into "시간이 초과되었습니다" - a
-// message that was wrong about the cause in every case where the run had already
-// stopped on purpose.
-interface JobFailure {
-  message: string;
-  category?: string;
-  subcause?: string;
-  stage?: string;
-  owner?: string;
-  retryable?: boolean;
-  debugRef?: string;
 }
 
 function getInitialTab(): WorkspaceResultTab {
@@ -340,17 +324,9 @@ export function AppPage() {
         // A finished-but-failed job carries its own diagnosis. Surface that instead of
         // waiting for the wall-clock cap, which would blame a timeout for a run that had
         // already stopped for a known reason.
-        const cause = job.result?.failure_cause;
-        if (job.result?.status === "failed" && !failures[job.job_id]) {
-          failures[job.job_id] = {
-            message: cause?.safe_message ?? "분석을 완료하지 못했습니다.",
-            category: cause?.category,
-            subcause: cause?.subcause,
-            stage: cause?.failure_stage,
-            owner: cause?.owner,
-            retryable: cause?.retryable,
-            debugRef: job.result?.debug_ref ?? undefined,
-          };
+        const terminalFailure = terminalJobFailure(job);
+        if (terminalFailure && !failures[job.job_id]) {
+          failures[job.job_id] = terminalFailure;
         }
       }
       if (Object.keys(failures).length) {
@@ -487,7 +463,7 @@ export function AppPage() {
   const workspaceProgress = buildWorkspaceProgress({
     job: progressJob,
     pendingAnalysis,
-    error: progressJob ? jobErrors[progressJob.job_id] : undefined,
+    error: progressJob ? jobErrors[progressJob.job_id] ?? terminalJobFailure(progressJob) : undefined,
     cancelRequested,
   });
 
