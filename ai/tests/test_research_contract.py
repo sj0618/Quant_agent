@@ -277,6 +277,28 @@ def test_a_research_provider_outage_asks_for_a_retry_not_a_rewrite(monkeypatch) 
     assert [choice.label for choice in draft.clarifications] == ["다시 시도"]
 
 
+def test_raw_query_jobs_propagate_provider_outages_to_their_typed_failure_handler(monkeypatch) -> None:
+    from ai_graph import research_contract
+    from ai_graph.nodes.strategy_research import StrategyResearchError
+
+    def _raise_provider_failure(**_kwargs: object) -> None:
+        raise StrategyResearchError(
+            "strategy research provider is temporarily unavailable",
+            cause_code="research_provider_failure",
+        )
+
+    monkeypatch.setattr(research_contract, "_build_researched_draft", _raise_provider_failure)
+
+    with pytest.raises(StrategyResearchError, match="temporarily unavailable"):
+        build_rule_draft(
+            query="유명한 퀀트전략으로 검증해줘",
+            user_id="user-1",
+            signer=_signer(),
+            use_llm=True,
+            propagate_provider_failure=True,
+        )
+
+
 def test_a_provider_outage_envelope_offers_one_retry_option(monkeypatch) -> None:
     from ai_graph.api import _clarification_envelope
     from ai_graph.research_contract import RESEARCH_PROVIDER_RETRY_MESSAGE

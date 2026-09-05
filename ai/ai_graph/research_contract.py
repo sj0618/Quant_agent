@@ -492,6 +492,7 @@ def build_rule_draft(
     llm_client: object | None = None,
     use_llm: bool | None = None,
     exploration_policy: ActiveExplorationPolicyV2 | None = None,
+    propagate_provider_failure: bool = False,
 ) -> RuleDraftV1:
     """Make a bounded natural-language rule review without retaining raw input."""
 
@@ -552,6 +553,11 @@ def build_rule_draft(
                 now=now,
             )
         except StrategyResearchError as exc:
+            if (
+                propagate_provider_failure
+                and exc.cause_code == RESEARCH_PROVIDER_FAILURE_CAUSE
+            ):
+                raise
             # The public contract must fail closed as a review response, never leak a
             # provider/schema exception that callers turn into a 500 or an admission.
             research_error = exc
@@ -621,6 +627,11 @@ def build_rule_draft(
                 now=now,
             )
         except StrategyResearchError as exc:
+            if (
+                propagate_provider_failure
+                and exc.cause_code == RESEARCH_PROVIDER_FAILURE_CAUSE
+            ):
+                raise
             research_error = exc
             parsed = _no_run_parse(exc)
     if not research_requested and exploration_policy is not None and (

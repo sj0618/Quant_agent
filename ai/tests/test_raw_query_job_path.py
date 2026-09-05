@@ -20,6 +20,8 @@ from ai_graph.api import (
 )
 from ai_graph.graph import run_analysis
 from ai_graph.jobs import AnalysisJobStatus, InMemoryAnalysisJobStore, run_job_sync
+from ai_graph.llm import LLMHTTPStatusError
+from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.research_contract import RuleDraftSigner, RuleDraftV1, build_rule_draft
 from ai_graph.schemas import EnvelopeStatus, Stage
 
@@ -89,6 +91,27 @@ def test_non_executable_outcome_asks_instead_of_failing() -> None:
     assert payload.candidate_cards == []
     assert payload.report is None
     assert payload.performance is None
+
+
+def test_provider_outage_fails_the_job_with_its_typed_safe_diagnostic() -> None:
+    store = InMemoryAnalysisJobStore()
+    job = store.create_job("유명한 퀀트전략으로 검증해줘", user_id="u1")
+    provider_failure = StrategyResearchError(
+        "strategy research provider is temporarily unavailable",
+        cause_code="research_provider_failure",
+    )
+    provider_failure.__cause__ = LLMHTTPStatusError(400)
+
+    def resolve_provider_failure(_query: str, _trace_id: str) -> RuleDraftV1:
+        raise provider_failure
+
+    finished = run_job_sync(store, job.job_id, _runner(resolve_provider_failure))
+
+    assert finished.status is AnalysisJobStatus.FAILED
+    assert finished.result is not None
+    assert finished.result.status is EnvelopeStatus.FAILED
+    assert finished.result.failure_cause is not None
+    assert finished.result.failure_cause.subcause == "aoai_http_4xx"
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "\n\t "])

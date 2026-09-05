@@ -1070,6 +1070,7 @@ def _build_rule_draft_with_audit(
     available_metrics: list[str] | tuple[str, ...] | None,
     use_llm: bool,
     exploration_policy: ActiveExplorationPolicyV2 | None,
+    propagate_provider_failure: bool = False,
 ) -> RuleDraftV1:
     """Build a V3 draft inside a durable audit context.
 
@@ -1112,6 +1113,7 @@ def _build_rule_draft_with_audit(
                 available_metrics=available_metrics,
                 use_llm=use_llm,
                 exploration_policy=exploration_policy,
+                propagate_provider_failure=propagate_provider_failure,
             )
     except Exception as exc:
         latency_ms = (perf_counter() - started) * 1_000
@@ -1614,6 +1616,7 @@ def create_app(
                             available_metrics=available_metrics,
                             use_llm=True,
                             exploration_policy=exploration_policy,
+                            propagate_provider_failure=True,
                         )
 
                     deferred_rule_draft_resolver = resolve_raw_job_rule_draft
