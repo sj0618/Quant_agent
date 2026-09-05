@@ -15,10 +15,10 @@ export interface JobFailure {
  * from the server or conversation history that never pass through the polling loop.
  */
 export function terminalJobFailure(job: AnalysisJob | undefined): JobFailure | undefined {
-  if (job?.result?.status !== "failed") {
+  const cause = job?.result?.failure_cause;
+  if (!job?.result || !cause) {
     return undefined;
   }
-  const cause = job.result.failure_cause;
   return {
     message: cause?.safe_message ?? "분석을 완료하지 못했습니다.",
     category: cause?.category,

@@ -51,7 +51,7 @@ test("workspace progress follows server stages instead of elapsed client time", 
   );
 });
 
-test("terminal analysis failures retain the server diagnosis in the workspace", async () => {
+test("analysis results with a failure cause retain the server diagnosis in the workspace", async () => {
   const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
 
   assert.match(source, /const terminalFailureJob = latestJob\?\.result\?\.status === "failed" \? latestJob : undefined;/);

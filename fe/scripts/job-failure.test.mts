@@ -3,11 +3,11 @@ import test from "node:test";
 import { terminalJobFailure } from "../src/features/app/jobFailure.ts";
 import type { AnalysisJob } from "../src/types/quantagent.ts";
 
-test("restored terminal failures retain only the server-safe diagnosis", () => {
+test("restored provider failures retain only the server-safe diagnosis", () => {
   const restoredJob = {
     job_id: "job-restored-failure",
     result: {
-      status: "failed",
+      status: "need_clarification",
       debug_ref: "job-error:job-restored-failure",
       failure_cause: {
         category: "infrastructure_failure",
@@ -29,5 +29,5 @@ test("restored terminal failures retain only the server-safe diagnosis", () => {
     retryable: false,
     debugRef: "job-error:job-restored-failure",
   });
-  assert.equal(terminalJobFailure({ result: { status: "ready" } } as AnalysisJob), undefined);
+  assert.equal(terminalJobFailure({ result: { status: "need_clarification" } } as AnalysisJob), undefined);
 });
