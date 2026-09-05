@@ -1,6 +1,6 @@
 import json
-from hashlib import sha256
 import time
+from hashlib import sha256
 from uuid import uuid4
 
 import httpx
@@ -120,6 +120,30 @@ def test_aoai_client_sends_bounded_reasoning_and_tool_budgets() -> None:
     assert client.generate_json(
         make_request().model_copy(
             update={"reasoning_effort": "low", "max_tool_calls": 1, "stream_response": False}
+        )
+    ) == {"message": "ok"}
+
+
+def test_aoai_client_sends_requested_web_search_context_size() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["tools"] == [{"type": "web_search_preview", "search_context_size": "high"}]
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_json(
+        make_request().model_copy(
+            update={
+                "enable_web_search": True,
+                "web_search_context_size": "high",
+                "stream_response": False,
+            }
         )
     ) == {"message": "ok"}
 
@@ -919,8 +943,10 @@ def test_response_start_deadline_measures_silence_not_thinking_time(monkeypatch)
         b'data: {"type":"response.web_search_call.searching","item_id":"ws_1"}',
         b'data: {"type":"response.output_text.delta","delta":"{\\"message\\":"}',
         b'data: {"type":"response.output_text.delta","delta":"\\"ok\\"}"}',
-        b'data: {"type":"response.completed","response":{"output":[{"type":"message",'
-        b'"content":[{"type":"output_text","text":"{\\"message\\":\\"ok\\"}"}]}]}}',
+        (
+            b'data: {"type":"response.completed","response":{"output":[{"type":"message",'
+            b'"content":[{"type":"output_text","text":"{\\"message\\":\\"ok\\"}"}]}]}}'
+        ),
     ]
 
     class ThinkingStream(httpx.SyncByteStream):

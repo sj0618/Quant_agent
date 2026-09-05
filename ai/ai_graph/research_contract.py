@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -528,7 +529,19 @@ def build_rule_draft(
     # strategy path slower and created a second failure point without adding evidence.
     # Concrete conditions still get the fast deterministic parser below; incomplete
     # concrete input falls through to this same V3 path with its full context.
-    if request_mode != "user_defined" and research_requested:
+    # A fully stated entry/exit rule used to bypass V3 even when it did not state the
+    # *backtest* period.  That silently handed the critical time window to an
+    # environment default.  In a live AOAI admission, an omitted period is a material
+    # strategy choice, so resolve it through the same pre-backtest web-research
+    # contract as other ambiguity. Explicit test clients remain deterministic fixtures.
+    needs_researched_period = (
+        request_mode == "user_defined"
+        and research_requested
+        and llm_client is None
+        and _live_parser_enabled()
+        and not _query_declares_backtest_window(query)
+    )
+    if (request_mode != "user_defined" or needs_researched_period) and research_requested:
         try:
             return _build_researched_draft(
                 query=query,
@@ -949,6 +962,21 @@ def _research_resolution_enabled(use_llm: bool | None) -> bool:
     """Whether this admission has a live AOAI researcher, not a fixture substitute."""
 
     return _live_parser_enabled() if use_llm is None else use_llm
+
+
+_BACKTEST_WINDOW_PATTERNS = (
+    # "최근 2년 백테스트", "3년 검증". Requiring a validation word means a
+    # holding-period phrase such as "20일 보유" cannot masquerade as the sample window.
+    r"(?:최근\s*)?\d+\s*(?:년|개월|달|months?|years?)\s*(?:간\s*)?(?:백테스트|검증|테스트|시뮬레이션)",
+    r"(?:백테스트|검증|테스트|시뮬레이션)\s*(?:기간\s*)?(?:은|을|:)?\s*(?:최근\s*)?\d+\s*(?:년|개월|달|months?|years?)",
+    # A concrete calendar range is an explicit window even when the user omitted the
+    # word "backtest" (for example "2023년부터 2025년까지").
+    r"20\d{2}\s*년?\s*(?:부터|~|–|-)\s*20\d{2}\s*년?",
+)
+
+
+def _query_declares_backtest_window(query: str) -> bool:
+    return any(re.search(pattern, query, flags=re.IGNORECASE) for pattern in _BACKTEST_WINDOW_PATTERNS)
 
 
 def _canonical_rule_from_parse(parsed: StrategyParseResultV1) -> CanonicalRuleV1 | None:

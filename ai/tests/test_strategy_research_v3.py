@@ -67,6 +67,35 @@ def _donchian_response(*, required_metrics: list[str] | None = None) -> dict:
     }
 
 
+def _deep_donchian_response() -> dict:
+    response = _donchian_response()
+    response["sources"] = [
+        {
+            "source_id": f"source-{index}",
+            "title": f"Independent source {index}",
+            "url": f"https://example.com/source-{index}",
+            "claim": f"Evidence angle {index} for trend following in Korean equities.",
+            "limitation": f"Source {index} is not a post-cost KRX strategy proof.",
+        }
+        for index in range(1, 6)
+    ]
+    response["candidates"][0].update(
+        {
+            "source_ids": ["source-1", "source-2", "source-3", "source-4", "source-5"],
+            "ai_assumptions": ["사용자가 청산 규칙을 생략해 사전 리서치 기준으로 20일 보유를 정했습니다."],
+            "economic_rationale": "추세 확산 국면에서 신규 고가 돌파가 투자자 반응 지연을 포착할 수 있다는 가설입니다.",
+            "falsification_conditions": [
+                {"condition": "비용 후 OOS 성과가 기준 대비 열위", "interpretation": "가설을 지지하지 않음"}
+            ],
+            "expected_turnover": "20일 돌파 신호 기준의 중간 회전율을 예상하며, 실제 회전율·비용은 백테스트로 산출합니다.",
+            "regime_risks": ["횡보·급반전 국면에서는 거짓 돌파와 비용이 늘 수 있습니다."],
+            "backtest_years": 2,
+            "backtest_period_basis": "최근 KRX 변동성 국면과 서버 PIT 자료 가용성을 조사해 2년을 선택했습니다.",
+        }
+    )
+    return response
+
+
 def test_unknown_strategy_uses_web_research_then_seals_the_researched_conditions() -> None:
     client = _ResearchClient(_donchian_response())
 
@@ -90,11 +119,50 @@ def test_unknown_strategy_uses_web_research_then_seals_the_researched_conditions
     assert len(client.requests) == 1
     request = client.requests[0]
     assert request.enable_web_search is True
+    assert request.web_search_context_size == "high"
     assert request.stream_response is False
-    assert request.reasoning_effort == "low"
-    assert request.max_tool_calls == 1
+    assert request.reasoning_effort == "medium"
+    assert request.max_output_tokens == 5000
+    assert request.max_tool_calls == 12
     assert request.task_type == "strategy_research_resolution"
     assert "Do not create Python, SQL" in request.system_prompt
+    assert "Aim for 8--12" in request.system_prompt
+    assert spec.candidates[0].backtest_years == 1
+
+
+def test_live_research_repairs_a_shallow_brief_before_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ResearchClient(_donchian_response())
+    monkeypatch.setattr(strategy_research, "create_llm_client", lambda *, role: client)
+
+    with pytest.raises(StrategyResearchError, match="remained unexecutable"):
+        research_strategy_execution_spec(
+            query="돈치안 채널 돌파 전략으로 검증해줘",
+            available_metrics=["sma20"],
+        )
+
+    assert [request.task_type for request in client.requests] == [
+        "strategy_research_resolution",
+        "strategy_research_resolution_repair",
+    ]
+
+
+def test_live_research_signs_a_deep_brief_with_research_selected_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ResearchClient(_deep_donchian_response())
+    monkeypatch.setattr(strategy_research, "create_llm_client", lambda *, role: client)
+
+    spec = research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+    )
+
+    assert len(spec.sources) == 5
+    assert spec.candidates[0].backtest_years == 2
+    assert spec.candidates[0].ai_assumptions
+    assert spec.candidates[0].falsification_conditions
 
 
 def test_researcher_cannot_replace_an_unsupported_strategy_with_a_catalogue_rule() -> None:
@@ -334,10 +402,18 @@ def test_rule_draft_binds_the_researched_contract_before_job_admission() -> None
 def test_graph_compiles_the_sealed_research_conditions_without_a_template_substitution() -> None:
     from ai_graph.graph import _strategy_spec_from_execution_spec
 
+    response = _donchian_response()
+    response["candidates"][0].update(
+        {
+            "backtest_years": 3,
+            "backtest_period_basis": "중기 추세와 KRX PIT 자료 가용성을 조사해 3년을 선택했습니다.",
+            "ai_assumptions": ["사용자가 기간을 지정하지 않아 AI 리서치가 3년을 선택했습니다."],
+        }
+    )
     spec = research_strategy_execution_spec(
         query="돈치안 채널 돌파 전략으로 검증해줘",
         available_metrics=["sma20"],
-        llm_client=_ResearchClient(_donchian_response()),
+        llm_client=_ResearchClient(response),
     )
 
     strategy = _strategy_spec_from_execution_spec(spec)
@@ -361,10 +437,18 @@ def test_sealed_research_skips_non_authoritative_current_screening(
 
     from ai_graph.graph import data_node
 
+    response = _donchian_response()
+    response["candidates"][0].update(
+        {
+            "backtest_years": 3,
+            "backtest_period_basis": "중기 추세와 KRX PIT 자료 가용성을 조사해 3년을 선택했습니다.",
+            "ai_assumptions": ["사용자가 기간을 지정하지 않아 AI 리서치가 3년을 선택했습니다."],
+        }
+    )
     spec = research_strategy_execution_spec(
         query="돈치안 채널 돌파 전략으로 검증해줘",
         available_metrics=["sma20"],
-        llm_client=_ResearchClient(_donchian_response()),
+        llm_client=_ResearchClient(response),
     )
     captured: dict[str, object] = {}
 
@@ -377,6 +461,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
         requires_financials: object | None = None,
         compact_price_rows: bool = False,
         sector: str | None = None,
+        backtest_lookback_years: int | None = None,
     ) -> object:
         captured.update(
             {
@@ -386,6 +471,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
                 "required_metrics": required_metrics,
                 "requires_financials": requires_financials,
                 "compact_price_rows": compact_price_rows,
+                "backtest_lookback_years": backtest_lookback_years,
             }
         )
         raise RuntimeError("data loader captured")
@@ -407,6 +493,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
     # A moving-average condition has a warehouse TA family, so it must not take the
     # OHLCV-only projection reserved for relative-strength price paths.
     assert captured["compact_price_rows"] is False
+    assert captured["backtest_lookback_years"] == 3
 
 
 def test_data_plan_reads_the_sealed_ast_not_only_the_researcher_metric_summary() -> None:

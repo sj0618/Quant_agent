@@ -2083,8 +2083,23 @@ def load_pipeline_data_from_env(
     requires_financials: bool | None = None,
     compact_price_rows: bool = False,
     sector: str | None = None,
+    backtest_lookback_years: int | None = None,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
+    if backtest_lookback_years is not None:
+        if (
+            isinstance(backtest_lookback_years, bool)
+            or not isinstance(backtest_lookback_years, int)
+            or not MIN_BACKTEST_LOOKBACK_YEARS
+            <= backtest_lookback_years
+            <= MAX_BACKTEST_LOOKBACK_YEARS
+        ):
+            raise ValueError(
+                f"backtest_lookback_years must be {MIN_BACKTEST_LOOKBACK_YEARS}..{MAX_BACKTEST_LOOKBACK_YEARS}"
+            )
+        config = config.model_copy(
+            update={"backtest_lookback_years": backtest_lookback_years}
+        )
     if not config.database_dsn:
         return _fixture_bundle(
             f"database DSN is not set in any of {', '.join(DATABASE_DSN_ENV_CANDIDATES)}.",

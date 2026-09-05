@@ -44,8 +44,8 @@ from ai_graph.schemas import (
 )
 
 STRATEGY_RESEARCH_RETRY_BACKOFF_SECONDS = 1.0
-STRATEGY_RESEARCH_PROMPT_VERSION = "v5"
-STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v5"
+STRATEGY_RESEARCH_PROMPT_VERSION = "v6"
+STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v6"
 RELATIVE_STRENGTH_PROXY_DISCLOSURE = (
     "relative_strength_Nd는 같은 날짜의 PIT KRX 보통주 유니버스 평균 N일 수익률을 뺀 값이며, "
     "공식 KOSPI/KOSDAQ 지수 대비 수익률이 아님"
@@ -62,7 +62,18 @@ candidate only when it can be expressed with the supplied condition grammar and 
 vocabulary; put a meaningful competing view in ``counter_hypothesis``. Do not substitute
 RSI, a generic momentum template, or a similar strategy for a term you cannot represent.
 Do not create Python, SQL, data-source instructions, personal portfolio advice,
-BUY/HOLD/SELL actions, or performance figures.
+BUY/HOLD/SELL actions, or performance figures. The candidate is fixed before any
+backtest data is read: never optimise thresholds, holding period, universe, or the
+backtest window using observed returns.
+
+Perform a deep evidence review before sealing the one candidate. Aim for 8--12
+independent sources (never pad weak sources merely to hit a count), covering: (1) the
+economic mechanism; (2) KRX applicability and point-in-time data limitations; (3) the
+strongest counter-evidence or alternative explanation; (4) turnover, liquidity,
+capacity, tax and execution-cost sensitivity; and (5) current Korean/global market or
+sector context. At least five distinct credible sources are required when evidence is
+available. Each source claim must state its limitation. One candidate is retained to
+prevent post-hoc strategy search, but it may cite every relevant source.
 
 Resolve strategy language compositionally, rather than by matching it to a fixed
 strategy catalogue. In particular, when the request calls for leaders, strongest names,
@@ -95,10 +106,10 @@ sessions per month (한 주 = 5, 분기 = 63). Never encode a time exit as an al
 condition such as ``close gte 0``; that sells on every bar and is rejected. A candidate
 whose only exit is time may return an empty ``exit_conditions`` array, as long as
 ``holding_days`` is set. A request that states an entry rule but no exit rule at all
-(for example "RSI 30 이하 종목 매수") is still executable: set ``holding_days`` to 20
-(about one month), leave ``exit_conditions`` empty, and record the assumption
-"청산 조건이 없어 20거래일 보유 후 청산으로 가정" in ``assumptions``. A missing exit is
-never a reason to return no candidate.
+(for example "RSI 30 이하 종목 매수") is still executable: use the pre-backtest research
+to choose a concrete holding period, leave ``exit_conditions`` empty, and record the
+choice and reason in ``ai_assumptions``. A missing exit is never a reason to return no
+candidate.
 
 For every candidate, cite one or more sources you actually used. Candidate conditions
 are a historical research rule: entry must be non-empty, and exit must be non-empty
@@ -109,12 +120,13 @@ window plus aggregate; use universe_rank_pct only for cross-sectional entry sele
 If the strategy needs unsupported data or semantics, return no candidates and explain
 the missing capability in resolution_summary rather than changing the strategy.
 
-Return every required JSON field. Each source must include source_id, title, url, and
-claim. Each candidate must include candidate_id, title, hypothesis,
+Return every required JSON field. Each source must include source_id, title, url, claim,
+and limitation. Each candidate must include candidate_id, title, hypothesis,
 counter_hypothesis, non-empty entry_conditions, exit_conditions (empty only with
-holding_days), required_metrics, assumptions, and source_ids. Add holding_days or
-rebalance_interval_days only when the request states a holding period or a
-rebalance cadence. Add ``sector`` only when the request names an industry.
+holding_days), required_metrics, assumptions, ai_assumptions, economic_rationale,
+falsification_conditions, expected_turnover, regime_risks, backtest_years,
+backtest_period_basis, and source_ids. Add ``sector`` only when the request names an
+industry.
 Titles are display labels only; never omit them.
 
 Fundamentals available as metrics are point-in-time DART figures: ``per`` (the bar's
@@ -123,11 +135,17 @@ with EPS <= 0), ``roe``, ``debt_to_equity``, ``operating_margin``, ``operating_i
 and ``revenue``. Use them for valuation and quality rules when they appear in
 ``allowed_metrics``. There is no book-value or PBR metric in this deployment.
 
-Interactive latency budget: use exactly one web source and exactly one candidate. Keep
-resolution_summary to two short sentences, and each claim, hypothesis,
-counter_hypothesis, and assumption to one short sentence. Return no explanatory prose
-outside the JSON object. Use the exact identifiers ``source-1`` and
-``research-candidate-1``; the candidate's source_ids must be ["source-1"].
+Candidate conditions are a historical research rule. Also return economic_rationale,
+falsification_conditions, ai_assumptions, expected_turnover, regime_risks,
+backtest_years, and backtest_period_basis. Choose a 1--3 year backtest window using
+research and the supported KRX data window. If the user omitted it, disclose the chosen
+period as an AI assumption with its evidence basis; never ask the user merely because a
+period, exit, or rebalance rule was omitted.
+
+Keep resolution_summary concise, but do not trade away adversarial evidence coverage.
+Return no explanatory prose outside the JSON object. Use source identifiers from
+``source-1`` through ``source-12`` and the exact candidate identifier
+``research-candidate-1``.
 """
 
 
@@ -151,10 +169,13 @@ class _RepairableStrategyResearchError(StrategyResearchError):
 class _SourceDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    source_id: str = Field(pattern=r"^source-[1-8]$")
+    source_id: str = Field(pattern=r"^source-(?:[1-9]|1[0-2])$")
     title: str = Field(min_length=1, max_length=240)
     url: str = Field(pattern=r"^https://")
     claim: str = Field(min_length=1, max_length=600)
+    limitation: str = Field(
+        default="근거의 적용 범위와 한계를 추가 확인해야 합니다.", max_length=400
+    )
 
 
 class _CandidateDraft(BaseModel):
@@ -172,7 +193,20 @@ class _CandidateDraft(BaseModel):
     rebalance_interval_days: int | None = Field(default=None, ge=5, le=63)
     required_metrics: list[str] = Field(min_length=1, max_length=20)
     assumptions: list[str] = Field(min_length=1, max_length=10)
-    source_ids: list[str] = Field(min_length=1, max_length=8)
+    ai_assumptions: list[str] = Field(default_factory=list, max_length=10)
+    economic_rationale: str = Field(
+        default="경험적 가설로서 비용 후 검증이 필요합니다.", max_length=800
+    )
+    falsification_conditions: list[dict[str, str]] = Field(default_factory=list, max_length=8)
+    expected_turnover: str = Field(
+        default="백테스트에서 실제 회전율과 비용 민감도를 산출합니다.", max_length=400
+    )
+    regime_risks: list[str] = Field(default_factory=list, max_length=8)
+    backtest_years: int = Field(default=1, ge=1, le=3)
+    backtest_period_basis: str = Field(
+        default="서버의 기본 PIT 관측 창을 사용합니다.", max_length=600
+    )
+    source_ids: list[str] = Field(min_length=1, max_length=12)
     sector: str | None = Field(default=None, min_length=1, max_length=64)
 
 
@@ -180,7 +214,7 @@ class _ResearchResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     resolution_summary: str = Field(min_length=1, max_length=800)
-    sources: list[_SourceDraft] = Field(min_length=1, max_length=8)
+    sources: list[_SourceDraft] = Field(min_length=1, max_length=12)
     candidates: list[_CandidateDraft] = Field(default_factory=list, max_length=1)
 
 
@@ -220,12 +254,20 @@ def research_strategy_execution_spec(
     client = llm_client or create_llm_client(role="STRATEGY_RESEARCH")
     request = _request(query=query, allowed_metrics=allowed, allowed_sectors=sectors)
     try:
-        return _seal_research_response(
+        sealed = _seal_research_response(
             _generate_with_one_transport_retry(client, request),
             query=query,
             allowed_metrics=allowed,
             allowed_sectors=sectors,
         )
+        # Unit callers deliberately inject a tiny, deterministic fixture.  The live
+        # AOAI path, however, must not silently downgrade a deep-research request to
+        # one citation simply because that response happened to satisfy the execution
+        # grammar.  Treat evidence completeness as repairable before the spec is
+        # signed; the repair is still pre-backtest and cannot select on returns.
+        if llm_client is None:
+            _validate_live_research_evidence(sealed)
+        return sealed
     except _RepairableStrategyResearchError as first_error:
         # Structured-output validation errors are different from provider failures:
         # AOAI responded successfully, but omitted a compiler requirement or selected
@@ -239,12 +281,15 @@ def research_strategy_execution_spec(
             failure=first_error,
         )
         try:
-            return _seal_research_response(
+            sealed = _seal_research_response(
                 client.generate_json(repair_request),
                 query=query,
                 allowed_metrics=allowed,
                 allowed_sectors=sectors,
             )
+            if llm_client is None:
+                _validate_live_research_evidence(sealed)
+            return sealed
         except _RepairableStrategyResearchError as repair_error:
             raise StrategyResearchError(
                 f"strategy research remained unexecutable after one bounded repair: {repair_error}",
@@ -594,7 +639,7 @@ def _request(
     }
     output_contract = {
         "resolution_summary": "string",
-        "sources": ["source_id", "title", "url", "claim"],
+        "sources": ["source_id", "title", "url", "claim", "limitation"],
         "candidates": [
             "candidate_id",
             "title",
@@ -606,6 +651,13 @@ def _request(
             "rebalance_interval_days",
             "required_metrics",
             "assumptions",
+            "ai_assumptions",
+            "economic_rationale",
+            "falsification_conditions",
+            "expected_turnover",
+            "regime_risks",
+            "backtest_years",
+            "backtest_period_basis",
             "source_ids",
         ],
     }
@@ -633,16 +685,14 @@ def _request(
             sort_keys=True,
         ),
         temperature=0.0,
-        # ``max_output_tokens`` includes reasoning as well as visible JSON.  The
-        # real web-research call needs enough room to emit the compiler contract after
-        # one concise investigation; 800 was exhausted by reasoning before a message
-        # existed. The compact contract and one-source/one-candidate response keep
-        # 1800 sufficient in the interactive lane without weakening V3 semantics.
-        max_output_tokens=1800,
+        # This lane investigates several independent evidence angles before it seals
+        # one rule. The wider budget is for research evidence, not a parameter search.
+        max_output_tokens=5000,
         enable_web_search=True,
+        web_search_context_size="high",
         stream_response=False,
-        reasoning_effort="low",
-        max_tool_calls=1,
+        reasoning_effort="medium",
+        max_tool_calls=12,
         task_type="strategy_research_resolution",
         prompt_template_name="strategy_research_resolution",
         prompt_version=STRATEGY_RESEARCH_PROMPT_VERSION,
@@ -693,11 +743,12 @@ def _repair_request(
             sort_keys=True,
         ),
         temperature=0.0,
-        max_output_tokens=1100,
+        max_output_tokens=5000,
         enable_web_search=True,
+        web_search_context_size="high",
         stream_response=False,
-        reasoning_effort="low",
-        max_tool_calls=1,
+        reasoning_effort="medium",
+        max_tool_calls=12,
         task_type="strategy_research_resolution_repair",
         prompt_template_name="strategy_research_resolution_repair",
         prompt_version=STRATEGY_RESEARCH_PROMPT_VERSION,
@@ -792,6 +843,46 @@ def _validate_candidate(
         raise _RepairableStrategyResearchError(
             f"{candidate.candidate_id}: rule states no exit; give exit_conditions or holding_days",
             cause_code="research_exit_missing",
+        )
+
+
+def _validate_live_research_evidence(spec: ResearchCandidateExecutionSpecV3) -> None:
+    """Require a usable research brief before a live request reaches a backtest.
+
+    Structural validity alone proves that the compiler can run; it does not prove that
+    AOAI actually investigated the economic claim it is about to test.  This is kept
+    outside the draft schema so historical saved specs and narrow test fixtures remain
+    readable.  Live output gets one bounded repair opportunity through the caller.
+    """
+
+    candidate = spec.candidates[0]
+    missing: list[str] = []
+    if len(spec.sources) < 5:
+        missing.append("at least five independent sources")
+    if len(candidate.source_ids) < 3:
+        missing.append("at least three candidate-linked sources")
+    if not candidate.ai_assumptions:
+        missing.append("AI assumptions for omitted or ambiguous rules")
+    if not candidate.economic_rationale or candidate.economic_rationale == (
+        "경험적 가설로서 비용 후 검증이 필요합니다."
+    ):
+        missing.append("economic rationale")
+    if not candidate.falsification_conditions:
+        missing.append("pre-backtest falsification conditions")
+    if not candidate.regime_risks:
+        missing.append("regime risks")
+    if not candidate.expected_turnover or candidate.expected_turnover == (
+        "백테스트에서 실제 회전율과 비용 민감도를 산출합니다."
+    ):
+        missing.append("expected turnover")
+    if not candidate.backtest_period_basis or candidate.backtest_period_basis == (
+        "서버의 기본 PIT 관측 창을 사용합니다."
+    ):
+        missing.append("research basis for the selected backtest period")
+    if missing:
+        raise _RepairableStrategyResearchError(
+            "deep evidence brief is incomplete: " + ", ".join(missing),
+            cause_code="research_evidence_incomplete",
         )
 
 

@@ -72,7 +72,7 @@ def build_report_bundle(
         sections.append(
             {
                 "id": "ai_research",
-                "title": "AI 전략 해석",
+                "title": "가설과 리서치 근거",
                 "items": research_compile,
             }
         )

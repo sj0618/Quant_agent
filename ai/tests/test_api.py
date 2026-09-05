@@ -98,6 +98,42 @@ def _ready_envelope(trace_id: str) -> APIEnvelope:
         retryable=False,
     )
 
+
+def _deep_research_payload(payload: dict) -> dict:
+    """Upgrade a test-only V3 fixture to the production deep-evidence contract."""
+
+    first_source = dict(payload["sources"][0])
+    first_source["limitation"] = "단일 정의 자료만으로 비용 후 KRX 성과를 증명하지는 않습니다."
+    payload["sources"] = [
+        first_source,
+        *[
+            {
+                "source_id": f"source-{index}",
+                "title": f"Independent evidence {index}",
+                "url": f"https://example.test/evidence-{index}",
+                "claim": f"전략 가설의 서로 다른 증거 관점 {index}입니다.",
+                "limitation": f"자료 {index}은 KRX 비용 후 성과 자체를 증명하지는 않습니다.",
+            }
+            for index in range(2, 6)
+        ],
+    ]
+    candidate = payload["candidates"][0]
+    candidate.update(
+        {
+            "source_ids": [f"source-{index}" for index in range(1, 6)],
+            "ai_assumptions": ["사용자가 기간을 정하지 않아 사전 리서치로 2년을 선택했습니다."],
+            "economic_rationale": "추세 확산기에 신규 고가 돌파가 투자자 반응 지연을 포착할 수 있다는 가설입니다.",
+            "falsification_conditions": [
+                {"condition": "비용 후 OOS 성과가 기준 대비 열위", "interpretation": "가설을 지지하지 않음"}
+            ],
+            "expected_turnover": "돌파 빈도에 따른 중간 회전율을 예상하며 실제 비용 민감도는 백테스트로 산출합니다.",
+            "regime_risks": ["횡보·급반전 장에서는 거짓 돌파와 비용이 커질 수 있습니다."],
+            "backtest_years": 2,
+            "backtest_period_basis": "최근 변동성 국면과 서버 PIT 자료 가용성을 조사해 2년을 선택했습니다.",
+        }
+    )
+    return payload
+
 def test_swagger_openapi_lists_current_api_surface() -> None:
     client = TestClient(create_app(InMemoryAnalysisJobStore()))
 
@@ -515,7 +551,7 @@ def test_live_v3_parse_uses_the_server_metric_catalog_before_sealing(
     class _ResearchClient:
         def generate_json(self, request):
             captured.append(request)
-            return {
+            return _deep_research_payload({
                 "resolution_summary": "돈치안 채널을 20일 최고가 돌파 규칙으로 해석했습니다.",
                 "sources": [
                     {
@@ -549,7 +585,7 @@ def test_live_v3_parse_uses_the_server_metric_catalog_before_sealing(
                         "source_ids": ["source-1"],
                     }
                 ],
-            }
+            })
 
     monkeypatch.setattr(
         "ai_graph.nodes.strategy_research.create_llm_client",
@@ -675,7 +711,7 @@ def test_ready_release_accepts_raw_natural_language_and_seals_it_server_side(
     class _ResearchClient:
         def generate_json(self, request):
             research_requests.append(request)
-            return {
+            return _deep_research_payload({
                 "resolution_summary": "돈치안 돌파를 일봉 검증 규칙으로 정규화했습니다.",
                 "sources": [
                     {
@@ -698,7 +734,7 @@ def test_ready_release_accepts_raw_natural_language_and_seals_it_server_side(
                         "source_ids": ["source-1"],
                     }
                 ],
-            }
+            })
 
     monkeypatch.setattr(
         "ai_graph.nodes.strategy_research.create_llm_client",
@@ -1144,7 +1180,7 @@ def test_v3_strategy_parse_records_prompt_response_and_sealed_spec_audit(monkeyp
                 response_schema_name=request.schema_name,
                 web_search_used=request.enable_web_search,
             )
-            payload = {
+            payload = _deep_research_payload({
                 "resolution_summary": "돈치안 상단 돌파를 KRX 일봉 추세 규칙으로 정규화했습니다.",
                 "sources": [
                     {
@@ -1178,7 +1214,7 @@ def test_v3_strategy_parse_records_prompt_response_and_sealed_spec_audit(monkeyp
                         "source_ids": ["source-1"],
                     }
                 ],
-            }
+            })
             finish_model_call(
                 call_id,
                 status="succeeded",

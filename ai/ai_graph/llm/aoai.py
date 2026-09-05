@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from threading import Lock
 import time
+from threading import Lock
 from typing import Any
 
 import httpx
@@ -19,7 +19,6 @@ from ai_graph.llm.base import (
 )
 from ai_graph.llm.concurrency_gate import AOAIConcurrencyGate, get_shared_gate
 from ai_graph.progress import report_activity
-
 
 RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504})
 DEFAULT_TIMEOUT_SECONDS = 45.0
@@ -640,7 +639,10 @@ class AOAIResponsesClient:
         if request.max_tool_calls is not None:
             body["max_tool_calls"] = request.max_tool_calls
         if request.enable_web_search:
-            body["tools"] = [{"type": self.web_search_tool_type}]
+            tool: dict[str, Any] = {"type": self.web_search_tool_type}
+            if request.web_search_context_size is not None:
+                tool["search_context_size"] = request.web_search_context_size
+            body["tools"] = [tool]
         if request.response_schema is not None and self._structured_outputs_supported:
             body["text"] = {
                 "format": {

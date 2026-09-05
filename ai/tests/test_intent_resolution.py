@@ -79,6 +79,9 @@ def test_intent_resolution_searches_the_web_before_committing(live_intent) -> No
 
     assert resolved is not None
     assert client.requests[0].enable_web_search is True
+    assert client.requests[0].web_search_context_size == "high"
+    assert client.requests[0].reasoning_effort == "medium"
+    assert client.requests[0].max_tool_calls == 8
     assert resolved["resolved_query"] == RESOLVED
 
 

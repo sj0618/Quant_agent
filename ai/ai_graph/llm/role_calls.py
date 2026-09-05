@@ -47,9 +47,9 @@ STRATEGY_REVISION_PROMPT_VERSION = "v1"
 STRATEGY_REVIEW_SCHEMA_NAME = "quantagent.strategy_review.v1"
 STRATEGY_REVIEW_PROMPT_TEMPLATE_NAME = "strategy_review"
 STRATEGY_REVIEW_PROMPT_VERSION = "v1"
-STRATEGY_INTENT_SCHEMA_NAME = "quantagent.strategy_intent.v1"
+STRATEGY_INTENT_SCHEMA_NAME = "quantagent.strategy_intent.v2"
 STRATEGY_INTENT_PROMPT_TEMPLATE_NAME = "strategy_intent"
-STRATEGY_INTENT_PROMPT_VERSION = "v1"
+STRATEGY_INTENT_PROMPT_VERSION = "v2"
 
 
 class RoleDebatePayload(BaseModel):
@@ -684,10 +684,15 @@ them yourself, and say in `assumptions` what you chose and why. A request with n
 specified is the easy case, not the blocked one - answer it with the strategy you would
 actually run.
 
-Use the web search tool before deciding. Look up what is currently working or in focus in
-the Korean market, how the sector or theme the user named is usually screened, and the
-conventional parameters for the rule you pick. Ground the choice in what you find rather
-than defaulting to the same textbook rule every time; cite the sources you used.
+Use the web search tool before deciding. Conduct a bounded multi-source research brief:
+the possible economic mechanism, current Korean/global market and sector regime,
+counter-evidence, and implementability (turnover, liquidity, tax and trading costs).
+Use several independent credible sources rather than one news item or a textbook
+template. Resolve every omitted material choice -- universe, rule threshold, exit,
+rebalance, and a 1--3 year backtest window -- from that research. State each AI choice
+and its research basis in `assumptions`; never return a question merely because one is
+omitted. Ground the choice in the evidence, not in a fixed default such as "three
+years"; cite the sources actually used.
 
 Constraints on what you may choose:
 - KRX-listed cash equities only (KOSPI/KOSDAQ). No options, futures, FX or crypto.
@@ -714,7 +719,8 @@ Return JSON only:
   resolved_query - the self-contained Korean strategy instruction described above, or
                    "" when scope is not "supported"
   assumptions    - Korean sentences, one per decision you made for the user, each
-                   giving the reason ("기간 미지정 → 최근 3년으로 백테스트합니다")
+                   giving the research reason ("기간 미지정 → 최근 변동성 국면과 PIT
+                   가용성을 조사해 2년으로 백테스트합니다")
   scope          - "supported", "unsupported" or "not_a_request"
   scope_reason   - Korean; why nothing was analysed, or "" when supported
   citations      - sources you actually consulted, title and url
@@ -760,10 +766,15 @@ def resolve_strategy_intent(
             f"{json.dumps(context['capabilities'], ensure_ascii=False, sort_keys=True, default=str)}\n"
             f"USER_QUERY={query}"
         ),
-        # Not 0.0: the point of this call is to pick a strategy worth running, and a
-        # frozen decoder returns the same textbook rule for every vague request.
-        temperature=0.4,
+        # This is a pre-backtest research choice, never a score-driven parameter
+        # search. A moderate evidence budget lets it resolve omitted strategy fields
+        # from current sources rather than inventing a fixed "three year" default.
+        temperature=0.0,
+        max_output_tokens=3500,
         enable_web_search=True,
+        web_search_context_size="high",
+        reasoning_effort="medium",
+        max_tool_calls=8,
         task_type="strategy_intent",
         prompt_template_name=STRATEGY_INTENT_PROMPT_TEMPLATE_NAME,
         prompt_version=STRATEGY_INTENT_PROMPT_VERSION,

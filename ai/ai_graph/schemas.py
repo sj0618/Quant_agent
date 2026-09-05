@@ -477,10 +477,13 @@ class ResearchSourceRefV3(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    source_id: str = Field(pattern=r"^source-[1-8]$")
+    source_id: str = Field(pattern=r"^source-(?:[1-9]|1[0-2])$")
     title: str = Field(min_length=1, max_length=240)
     url: str = Field(pattern=r"^https://")
     claim: str = Field(min_length=1, max_length=600)
+    limitation: str = Field(
+        default="근거의 적용 범위와 한계를 추가 확인해야 합니다.", max_length=400
+    )
     excerpt_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -506,7 +509,20 @@ class ResearchCandidateV3(BaseModel):
     rebalance_interval_days: int | None = Field(default=None, ge=5, le=63)
     required_metrics: list[str] = Field(min_length=1, max_length=20)
     assumptions: list[str] = Field(min_length=1, max_length=10)
-    source_ids: list[str] = Field(min_length=1, max_length=8)
+    ai_assumptions: list[str] = Field(default_factory=list, max_length=10)
+    economic_rationale: str = Field(
+        default="경험적 가설로서 비용 후 검증이 필요합니다.", max_length=800
+    )
+    falsification_conditions: list[dict[str, str]] = Field(default_factory=list, max_length=8)
+    expected_turnover: str = Field(
+        default="백테스트에서 실제 회전율과 비용 민감도를 산출합니다.", max_length=400
+    )
+    regime_risks: list[str] = Field(default_factory=list, max_length=8)
+    backtest_years: int = Field(default=1, ge=1, le=3)
+    backtest_period_basis: str = Field(
+        default="서버의 기본 PIT 관측 창을 사용합니다.", max_length=600
+    )
+    source_ids: list[str] = Field(min_length=1, max_length=12)
 
     # A named WICS sector the PIT universe is restricted to before the rule is applied.
     # It is part of the sealed contract rather than re-derived from the query text, so
@@ -540,7 +556,7 @@ class ResearchCandidateExecutionSpecV3(BaseModel):
     resolution_summary: str = Field(min_length=1, max_length=800)
     research_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     capability_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    sources: list[ResearchSourceRefV3] = Field(min_length=1, max_length=8)
+    sources: list[ResearchSourceRefV3] = Field(min_length=1, max_length=12)
     # V3.0 executes one faithful researched rule. A later multi-candidate engine must
     # not silently drop sealed rules before it can execute and report every one.
     candidates: list[ResearchCandidateV3] = Field(min_length=1, max_length=1)

@@ -58,6 +58,55 @@ def test_incomplete_rule_has_at_most_three_explained_choices_and_stays_non_execu
     assert query not in draft.model_dump_json()
 
 
+def test_live_explicit_rule_without_a_test_window_enters_research_before_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user-set entry/exit rule still needs a researched sample window if omitted."""
+
+    from ai_graph import research_contract
+
+    calls: list[dict[str, object]] = []
+
+    def stop_after_capture(**kwargs: object) -> None:
+        calls.append(kwargs)
+        raise RuntimeError("researched period selected")
+
+    monkeypatch.setattr(research_contract, "_live_parser_enabled", lambda: True)
+    monkeypatch.setattr(research_contract, "_build_researched_draft", stop_after_capture)
+
+    with pytest.raises(RuntimeError, match="researched period selected"):
+        build_rule_draft(
+            query="RSI 30 이하일 때 매수하고 RSI 70 이상일 때 매도",
+            user_id="user-1",
+            signer=_signer(),
+            use_llm=True,
+        )
+
+    assert calls and calls[0]["query"] == "RSI 30 이하일 때 매수하고 RSI 70 이상일 때 매도"
+
+
+def test_explicit_backtest_window_keeps_an_explicit_rule_out_of_extra_research(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ai_graph import research_contract
+
+    monkeypatch.setattr(research_contract, "_live_parser_enabled", lambda: True)
+    monkeypatch.setattr(
+        research_contract,
+        "_build_researched_draft",
+        lambda **_kwargs: pytest.fail("explicit sample window must not be replaced"),
+    )
+
+    draft = build_rule_draft(
+        query="RSI 30 이하일 때 매수하고 RSI 70 이상일 때 매도, 최근 2년 백테스트",
+        user_id="user-1",
+        signer=_signer(),
+        use_llm=True,
+    )
+
+    assert draft.is_executable
+
+
 def test_signed_draft_rejects_tampering_wrong_user_and_expiry() -> None:
     signer = _signer()
     issued_at = datetime(2026, 8, 20, tzinfo=UTC)

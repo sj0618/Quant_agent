@@ -748,6 +748,16 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
             "production_data_source_variant_forbidden",
             "운영 환경에서는 검증된 PostgreSQL data source variant(db)만 사용할 수 있습니다.",
         )
+    selected_backtest_years = (
+        sealed_execution_spec.candidates[0].backtest_years
+        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
+        else None
+    )
+    selected_backtest_period_basis = (
+        sealed_execution_spec.candidates[0].backtest_period_basis
+        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
+        else None
+    )
     if required_metrics is not None:
         requires_financials = bool(required_metrics & _FUNDAMENTAL_CONDITION_METRICS)
         # Only a sealed V3 price-path plan may take the OHLCV-only projection.  V1
@@ -767,13 +777,35 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
             requires_financials=requires_financials,
             compact_price_rows=compact_price_rows,
             sector=sealed_sector,
+            backtest_lookback_years=selected_backtest_years,
         )
     elif skip_current_screen:
         pipeline_data = load_pipeline_data_from_env(
-            query, state["trace_id"], screen_current=False, sector=sealed_sector
+            query,
+            state["trace_id"],
+            screen_current=False,
+            sector=sealed_sector,
+            backtest_lookback_years=selected_backtest_years,
         )
     else:
-        pipeline_data = load_pipeline_data_from_env(query, state["trace_id"])
+        pipeline_data = load_pipeline_data_from_env(
+            query,
+            state["trace_id"],
+            backtest_lookback_years=selected_backtest_years,
+        )
+    if selected_backtest_years is not None:
+        pipeline_data = pipeline_data.model_copy(
+            update={
+                "metadata": {
+                    **pipeline_data.metadata,
+                    "backtest_period": {
+                        "years": selected_backtest_years,
+                        "selection_source": "ai_research",
+                        "basis": selected_backtest_period_basis,
+                    },
+                }
+            }
+        )
     if is_release_profile() and pipeline_data.metadata.get("source") != "postgres":
         raise PipelineDataUnavailableError(
             "production_postgres_required",
@@ -1282,15 +1314,36 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
         research_compile: dict[str, Any] = {
             "provider": "aoai",
             "interpretation": sealed_spec.resolution_summary,
+            "economic_rationale": candidate.economic_rationale,
             "supporting_rationale": [source.claim for source in sealed_spec.sources],
             "counterpoints": [candidate.counter_hypothesis],
+            "pre_falsification_conditions": candidate.falsification_conditions,
+            "ai_assumptions": candidate.ai_assumptions,
+            "expected_holding_period": (
+                f"{candidate.holding_days} 거래일"
+                if candidate.holding_days is not None
+                else "조건 기반 청산"
+            ),
+            "expected_turnover": candidate.expected_turnover,
+            "regime_risks": candidate.regime_risks,
+            "backtest_period": {
+                "years": candidate.backtest_years,
+                "basis": candidate.backtest_period_basis,
+                "selection_source": "ai_research",
+            },
             "limitations": [
                 "웹 리서치는 전략 용어와 가설의 근거이며 성과 수치는 PostgreSQL 백테스트만 사용합니다.",
                 "봉인 뒤에는 연구 결과가 진입·종료 조건을 바꾸지 않습니다.",
+                *[source.limitation for source in sealed_spec.sources],
             ],
         }
         research_sources = [
-            {"title": source.title, "url": source.url}
+            {
+                "title": source.title,
+                "url": source.url,
+                "claim": source.claim,
+                "limitation": source.limitation,
+            }
             for source in sealed_spec.sources
         ]
     else:
