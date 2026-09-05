@@ -7,6 +7,7 @@ HEALTH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "server-health.yml
 SMOKE_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "production-backtest-smoke.yml"
 READINESS_GATE = REPOSITORY_ROOT / "scripts" / "readiness-semantic-gate.mjs"
 AI_API_SOURCE = REPOSITORY_ROOT / "ai" / "ai_graph" / "api.py"
+EMAIL_WORKER_MANAGER = REPOSITORY_ROOT / "backend" / "scripts" / "manage_email_delivery_worker.sh"
 
 
 def test_deploy_uses_the_backtest_dependency_graph_and_verifies_imports():
@@ -207,6 +208,13 @@ def test_email_worker_start_is_gated_and_points_at_the_ai_venv():
     ai_ready_idx = workflow.index('"deployed-ai-api-readiness" ai')
     fe_wait_idx = workflow.index('wait_for_url "Frontend gateway"')
     assert ai_ready_idx < start_idx < fe_wait_idx
+
+
+def test_email_worker_manager_loads_the_app_root_env_file():
+    script = EMAIL_WORKER_MANAGER.read_text(encoding="utf-8")
+
+    assert 'readiness() {\n  cd "$APP_DIR"' in script
+    assert 'cd "$APP_DIR"\n    nohup "$PYTHON" "$LAUNCHER" --loop' in script
 
 
 def test_public_ai_readiness_smoke_uses_the_ai_dependency_set():

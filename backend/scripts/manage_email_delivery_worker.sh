@@ -105,7 +105,7 @@ assert_worker_absent() {
 }
 
 readiness() {
-  cd "$BACKEND_DIR"
+  cd "$APP_DIR"
   "$PYTHON" "$LAUNCHER" --check --require-send-ready
 }
 
@@ -136,7 +136,7 @@ case "$ACTION" in
     rm -f "$PID_FILE"
     assert_worker_absent >/dev/null
     readiness >/dev/null
-    cd "$BACKEND_DIR"
+    cd "$APP_DIR"
     nohup "$PYTHON" "$LAUNCHER" --loop >>"$LOG_FILE" 2>&1 &
     pid="$!"
     printf '%s\n' "$pid" >"$PID_FILE"
