@@ -235,6 +235,17 @@ jobs:
         run: |
           set -Eeuo pipefail
 
+          release_state="$(ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
+            'if [ -f ~/mvp_sp1/quant-proj/combined_main.py ]; then printf existing; else printf initial; fi')"
+          if [ "$release_state" = "initial" ]; then
+            echo "No previous application release found; allowing initial deployment."
+            exit 0
+          fi
+          if [ "$release_state" != "existing" ]; then
+            echo "Unexpected pre-deploy release state: $release_state" >&2
+            exit 1
+          fi
+
           check_readiness() {
             local label="$1"
             local url="$2"
