@@ -127,7 +127,7 @@ def test_aoai_client_sends_bounded_reasoning_and_tool_budgets() -> None:
 def test_aoai_client_sends_requested_web_search_context_size() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
-        assert body["tools"] == [{"type": "web_search_preview", "search_context_size": "high"}]
+        assert body["tools"] == [{"type": "web_search", "search_context_size": "high"}]
         return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
 
     client = AOAIResponsesClient(
@@ -151,7 +151,7 @@ def test_aoai_client_sends_requested_web_search_context_size() -> None:
 def test_aoai_client_requires_web_search_when_requested() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
-        assert body["tools"] == [{"type": "web_search_preview"}]
+        assert body["tools"] == [{"type": "web_search"}]
         assert body["tool_choice"] == "required"
         return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
 
@@ -424,7 +424,13 @@ def test_aoai_compatibility_adjustments_do_not_consume_transport_retry() -> None
         if call_number == 3:
             return httpx.Response(
                 400,
-                json={"error": {"param": "text.format.schema", "message": "invalid schema"}},
+                json={
+                    "error": {
+                        "code": "unsupported_parameter",
+                        "param": "text.format.schema",
+                        "message": "unsupported",
+                    }
+                },
             )
         if call_number == 4:
             return httpx.Response(429, text="retry")
@@ -455,6 +461,157 @@ def test_aoai_compatibility_adjustments_do_not_consume_transport_retry() -> None
     assert "service_tier" not in request_bodies[2]
     assert "text" not in request_bodies[3]
     assert client.last_call_timings["physical_http_posts"] == 5
+
+
+def test_gpt5_research_transport_budget_stays_bounded_after_compatibility_retries() -> None:
+    """One logical gpt-5 research call uses only the client's bounded retry budget."""
+
+    request_bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        request_bodies.append(body)
+        call_number = len(request_bodies)
+        if call_number == 1:
+            return httpx.Response(
+                400,
+                json={"error": {"param": "service_tier", "message": "unsupported"}},
+            )
+        if call_number == 2:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "unsupported_parameter",
+                        "param": "text.format.schema",
+                        "message": "unsupported",
+                    }
+                },
+            )
+        if call_number == 3:
+            return httpx.Response(503, text="retry")
+        return httpx.Response(200, json={"output_text": '{"message":"ok"}'})
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="gpt-5.6-luna",
+        max_retries=1,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = make_request().model_copy(
+        update={
+            "response_schema": {
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+                "additionalProperties": False,
+            }
+        }
+    )
+
+    assert client.generate_json(request) == {"message": "ok"}
+    assert len(request_bodies) == 4
+    assert all("temperature" not in body for body in request_bodies)
+    assert "service_tier" not in request_bodies[1]
+    assert "text" not in request_bodies[2]
+    assert client.last_call_timings["physical_http_posts"] == 4
+
+
+def test_aoai_client_does_not_downgrade_structured_output_for_schema_validation_error() -> None:
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "invalid_request_error",
+                    "param": "text.format.schema",
+                    "message": "invalid schema",
+                }
+            },
+        )
+
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/responses",
+        api_key="test-api-key",
+        model="test-model",
+        max_retries=1,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = make_request().model_copy(
+        update={
+            "stream_response": False,
+            "response_schema": {
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+                "additionalProperties": False,
+            },
+        }
+    )
+
+    with pytest.raises(LLMClientError) as raised:
+        client.generate_json(request)
+
+    assert getattr(raised.value, "status_code", None) == 400
+    assert len(requests) == 1
+    assert "text" in requests[0]
+    assert client._structured_outputs_supported is True
+
+
+def test_llm_factory_uses_endpoint_compatible_web_search_default_and_explicit_override() -> None:
+    v1_env = {
+        "AI_LLM_PROVIDER": "aoai",
+        "AI_AOAI_RESPONSES_URL": "https://example.test/openai/v1/responses",
+        "AI_AOAI_API_KEY": "test-api-key",
+        "AI_AOAI_MODEL": "test-model",
+    }
+    legacy_env = {
+        **v1_env,
+        "AI_AOAI_RESPONSES_URL": "https://example.test/openai/responses?api-version=2025-04-01-preview",
+    }
+
+    assert create_llm_client(v1_env).web_search_tool_type == "web_search"
+    assert create_llm_client(legacy_env).web_search_tool_type == "web_search_preview"
+    assert (
+        create_llm_client(
+            {**v1_env, "AI_AOAI_WEB_SEARCH_TOOL_TYPE": "web_search_preview"}
+        ).web_search_tool_type
+        == "web_search_preview"
+    )
+
+
+def test_llm_factory_resolves_strategy_research_timeout_by_role_then_global_then_default() -> None:
+    base_env = {
+        "AI_LLM_PROVIDER": "aoai",
+        "AI_AOAI_RESPONSES_URL": "https://example.test/openai/v1/responses",
+        "AI_AOAI_API_KEY": "test-api-key",
+        "AI_AOAI_MODEL": "test-model",
+    }
+
+    assert create_llm_client(base_env, role="STRATEGY_RESEARCH").timeout_seconds == 180.0
+    assert create_llm_client(base_env, role="REPORT_JUDGE").timeout_seconds == 45.0
+    assert (
+        create_llm_client(
+            {**base_env, "AI_AOAI_TIMEOUT_SECONDS": "75"}, role="STRATEGY_RESEARCH"
+        ).timeout_seconds
+        == 75.0
+    )
+    assert (
+        create_llm_client(
+            {
+                **base_env,
+                "AI_AOAI_TIMEOUT_SECONDS": "75",
+                "AI_LLM_STRATEGY_RESEARCH_TIMEOUT_SECONDS": "120",
+            },
+            role="STRATEGY_RESEARCH",
+        ).timeout_seconds
+        == 120.0
+    )
 
 
 def test_aoai_client_rejects_broken_output_text_json() -> None:

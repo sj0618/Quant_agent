@@ -29,7 +29,7 @@ DEFAULT_SERVICE_TIER = "priority"
 # Used when a 429 arrives without a Retry-After header, and as the cap when it has one.
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 5.0
 MAX_RETRY_AFTER_SECONDS = 60.0
-DEFAULT_WEB_SEARCH_TOOL_TYPE = "web_search_preview"
+DEFAULT_WEB_SEARCH_TOOL_TYPE = "web_search"
 MAX_COMPATIBILITY_ADJUSTMENTS = 3
 UNSUPPORTED_STRICT_SCHEMA_KEYWORDS = frozenset(
     {
@@ -324,7 +324,7 @@ class AOAIResponsesClient:
                                 )
                                 body.pop("service_tier", None)
                                 continue
-                            if "text" in body:
+                            if _unsupported_structured_outputs(response):
                                 # Azure deployments differ in their structured-output
                                 # support. Keep the JSON contract in the prompt and let
                                 # Pydantic validate it when this deployment rejects the
@@ -459,7 +459,7 @@ class AOAIResponsesClient:
                         _remember_unsupported(self._compatibility_cache_key, "service_tier")
                         body.pop("service_tier", None)
                         continue
-                    if "text" in body:
+                    if _unsupported_structured_outputs(response):
                         compatibility_adjustments.append("structured_outputs")
                         self._structured_outputs_supported = False
                         _remember_unsupported(self._compatibility_cache_key, "structured_outputs")
@@ -734,15 +734,40 @@ def _publish_stream_activity(event_type: Any, event: dict[str, Any]) -> None:
             report_activity("search_queries", queries=queries)
 
 
-def _unsupported_parameter(response: httpx.Response, parameter: str) -> bool:
-    if response.status_code != 400:
-        return False
+def _provider_error_field(response: httpx.Response, field: str) -> str | None:
+    """Return one closed provider-error field without exposing the response body."""
+
     try:
         payload = response.json()
     except json.JSONDecodeError:
-        return False
+        return None
     error = payload.get("error") if isinstance(payload, dict) else None
-    return isinstance(error, dict) and error.get("param") == parameter
+    value = error.get(field) if isinstance(error, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def _unsupported_parameter(response: httpx.Response, parameter: str) -> bool:
+    if response.status_code != 400:
+        return False
+    return _provider_error_field(response, "param") == parameter
+
+
+def _unsupported_structured_outputs(response: httpx.Response) -> bool:
+    """Allow one schema fallback only for Azure's explicit unsupported-parameter code.
+
+    A generic 400 or a schema-validation 400 is actionable configuration feedback,
+    not evidence that this deployment lacks structured-output capability.  Never
+    mutate the compatibility cache for those errors.
+    """
+
+    if response.status_code != 400:
+        return False
+    parameter = _provider_error_field(response, "param")
+    return (
+        _provider_error_field(response, "code") == "unsupported_parameter"
+        and isinstance(parameter, str)
+        and (parameter == "text" or parameter.startswith("text."))
+    )
 
 
 def _schema_format_name(schema_name: str) -> str:

@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 from urllib.parse import urlsplit
@@ -23,9 +22,7 @@ from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_s
 from ai_graph.llm import (
     LLMClient,
     LLMClientError,
-    LLMConnectionError,
     LLMJsonRequest,
-    LLMTimeoutError,
     create_llm_client,
 )
 from ai_graph.nodes.condition_compiler import (
@@ -43,7 +40,6 @@ from ai_graph.schemas import (
     ResearchSourceRefV3,
 )
 
-STRATEGY_RESEARCH_RETRY_BACKOFF_SECONDS = 1.0
 STRATEGY_RESEARCH_PROMPT_VERSION = "v7"
 STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v7"
 RELATIVE_STRENGTH_PROXY_DISCLOSURE = (
@@ -216,23 +212,6 @@ class _ResearchResponse(BaseModel):
     candidates: list[_CandidateDraft] = Field(default_factory=list, max_length=1)
 
 
-def _generate_with_one_transport_retry(client: LLMClient, request: LLMJsonRequest) -> object:
-    """Two attempts, then give up.
-
-    A dropped connection or a timeout is not an answer about the strategy, and roughly
-    one live research request in ten failed that way - costing the user the whole run.
-    Bounded on purpose: one extra attempt after a short fixed pause, and no retry at all
-    for a provider that answered (a bad status, an unparseable body), which retrying
-    would only pay for twice.
-    """
-
-    try:
-        return client.generate_json(request)
-    except (LLMConnectionError, LLMTimeoutError):
-        time.sleep(STRATEGY_RESEARCH_RETRY_BACKOFF_SECONDS)
-        return client.generate_json(request)
-
-
 def research_strategy_execution_spec(
     *,
     query: str,
@@ -253,7 +232,7 @@ def research_strategy_execution_spec(
     request = _request(query=query, allowed_metrics=allowed, allowed_sectors=sectors)
     try:
         sealed = _seal_research_response(
-            _generate_with_one_transport_retry(client, request),
+            client.generate_json(request),
             query=query,
             allowed_metrics=allowed,
             allowed_sectors=sectors,

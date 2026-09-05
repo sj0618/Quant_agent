@@ -28,6 +28,8 @@ AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV = "AI_AOAI_WEB_SEARCH_TOOL_TYPE"
 
 LLM_PROVIDER_MOCK = "mock"
 LLM_PROVIDER_AOAI = "aoai"
+STRATEGY_RESEARCH_ROLE = "STRATEGY_RESEARCH"
+STRATEGY_RESEARCH_DEFAULT_TIMEOUT_SECONDS = 180.0
 _AOAI_ROLE_OVERRIDE_SUFFIXES = (
     "RESPONSES_URL",
     "API_KEY",
@@ -121,11 +123,7 @@ def _live_provider_configuration_ready_for_role(
 
         _role_or_global_env(env, role, "API_KEY", AI_AOAI_API_KEY_ENV)
         _role_or_global_env(env, role, "MODEL", AI_AOAI_MODEL_ENV)
-        _float_env(
-            env,
-            _role_env_name(role, "TIMEOUT_SECONDS"),
-            _float_env(env, AI_AOAI_TIMEOUT_SECONDS_ENV, DEFAULT_TIMEOUT_SECONDS),
-        )
+        _timeout_seconds_for_role(env, role)
         _int_env(
             env,
             _role_env_name(role, "MAX_RETRIES"),
@@ -136,11 +134,7 @@ def _live_provider_configuration_ready_for_role(
             _role_env_name(role, "RETRY_BACKOFF_SECONDS"),
             _float_env(env, AI_AOAI_RETRY_BACKOFF_SECONDS_ENV, 0.25),
         )
-        _str_env(
-            env,
-            _role_env_name(role, "WEB_SEARCH_TOOL_TYPE"),
-            _str_env(env, AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV, DEFAULT_WEB_SEARCH_TOOL_TYPE),
-        )
+        _web_search_tool_type_for_role(env, role, responses_url)
     except (LLMProviderConfigError, TypeError, ValueError):
         return False
     return True
@@ -173,11 +167,7 @@ def _create_aoai_client(
         responses_url=responses_url,
         api_key=api_key,
         model=model,
-        timeout_seconds=_float_env(
-            env,
-            _role_env_name(role, "TIMEOUT_SECONDS"),
-            _float_env(env, AI_AOAI_TIMEOUT_SECONDS_ENV, DEFAULT_TIMEOUT_SECONDS),
-        ),
+        timeout_seconds=_timeout_seconds_for_role(env, role),
         max_retries=_int_env(
             env,
             _role_env_name(role, "MAX_RETRIES"),
@@ -188,11 +178,7 @@ def _create_aoai_client(
             _role_env_name(role, "RETRY_BACKOFF_SECONDS"),
             _float_env(env, AI_AOAI_RETRY_BACKOFF_SECONDS_ENV, 0.25),
         ),
-        web_search_tool_type=_str_env(
-            env,
-            _role_env_name(role, "WEB_SEARCH_TOOL_TYPE"),
-            _str_env(env, AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV, DEFAULT_WEB_SEARCH_TOOL_TYPE),
-        ),
+        web_search_tool_type=_web_search_tool_type_for_role(env, role, responses_url),
         http_client=_get_shared_http_client(),
         compatibility_cache_key=f"{responses_url}\0{model}",
     )
@@ -213,10 +199,44 @@ def _role_or_global_env(
 
 
 def _role_env_name(role: str | None, suffix: str) -> str:
+    normalized = _normalized_role(role)
+    if not normalized:
+        return ""
+    return f"AI_LLM_{normalized}_{suffix}"
+
+
+def _normalized_role(role: str | None) -> str:
     if role is None or not role.strip():
         return ""
-    normalized = role.strip().upper().replace("-", "_").replace(" ", "_")
-    return f"AI_LLM_{normalized}_{suffix}"
+    return role.strip().upper().replace("-", "_").replace(" ", "_")
+
+
+def _timeout_seconds_for_role(env: Mapping[str, str], role: str | None) -> float:
+    """Resolve the same timeout policy used by readiness and client construction."""
+
+    default = (
+        STRATEGY_RESEARCH_DEFAULT_TIMEOUT_SECONDS
+        if _normalized_role(role) == STRATEGY_RESEARCH_ROLE
+        else DEFAULT_TIMEOUT_SECONDS
+    )
+    global_timeout = _float_env(env, AI_AOAI_TIMEOUT_SECONDS_ENV, default)
+    return _float_env(env, _role_env_name(role, "TIMEOUT_SECONDS"), global_timeout)
+
+
+def _web_search_tool_type_for_role(
+    env: Mapping[str, str], role: str | None, responses_url: str
+) -> str:
+    """Prefer explicit overrides, otherwise preserve legacy endpoint behaviour."""
+
+    role_value = env.get(_role_env_name(role, "WEB_SEARCH_TOOL_TYPE"))
+    if role_value is not None and role_value.strip():
+        return role_value.strip()
+    global_value = env.get(AI_AOAI_WEB_SEARCH_TOOL_TYPE_ENV)
+    if global_value is not None and global_value.strip():
+        return global_value.strip()
+    if urlsplit(responses_url).path.rstrip("/").endswith("/openai/v1/responses"):
+        return DEFAULT_WEB_SEARCH_TOOL_TYPE
+    return "web_search_preview"
 
 
 def _required_env(env: Mapping[str, str], key: str) -> str:

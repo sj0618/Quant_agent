@@ -334,9 +334,7 @@ def test_researcher_repairs_a_missing_or_invalid_period_once(invalid_period: obj
     ]
 
 
-def test_researcher_does_not_spend_a_semantic_repair_on_provider_timeout(monkeypatch) -> None:
-    monkeypatch.setattr(strategy_research, "STRATEGY_RESEARCH_RETRY_BACKOFF_SECONDS", 0.0)
-
+def test_researcher_does_not_spend_a_semantic_repair_on_provider_timeout() -> None:
     class TimeoutResearchClient:
         def __init__(self) -> None:
             self.requests: list[LLMJsonRequest] = []
@@ -354,18 +352,12 @@ def test_researcher_does_not_spend_a_semantic_repair_on_provider_timeout(monkeyp
         )
 
     assert raised.value.cause_code == "research_provider_failure"
-    # Two transport attempts, and not one semantic repair turn: a timeout is not a
-    # response to correct.
-    assert [request.task_type for request in client.requests] == [
-        "strategy_research_resolution",
-        "strategy_research_resolution",
-    ]
+    # The AOAI client owns bounded transport retry. A timeout is neither retried by
+    # the node nor treated as a semantic response that needs repair.
+    assert [request.task_type for request in client.requests] == ["strategy_research_resolution"]
 
 
-def test_researcher_survives_one_transport_failure(monkeypatch) -> None:
-    """One live research request in ten failed on transport, costing the whole run."""
-
-    monkeypatch.setattr(strategy_research, "STRATEGY_RESEARCH_RETRY_BACKOFF_SECONDS", 0.0)
+def test_researcher_does_not_repeat_transport_failures_owned_by_the_client() -> None:
 
     class FlakyResearchClient:
         def __init__(self) -> None:
@@ -378,14 +370,15 @@ def test_researcher_survives_one_transport_failure(monkeypatch) -> None:
             return _donchian_response()
 
     client = FlakyResearchClient()
-    spec = research_strategy_execution_spec(
-        query="돈치안 채널 돌파 전략으로 검증해줘",
-        available_metrics=["sma20"],
-        llm_client=client,
-    )
+    with pytest.raises(StrategyResearchError) as raised:
+        research_strategy_execution_spec(
+            query="돈치안 채널 돌파 전략으로 검증해줘",
+            available_metrics=["sma20"],
+            llm_client=client,
+        )
 
-    assert client.calls == 2
-    assert spec.candidates[0].candidate_id == "research-donchian-breakout-20"
+    assert raised.value.cause_code == "research_provider_failure"
+    assert client.calls == 1
 
 
 def test_researcher_can_seal_a_range_rule_when_the_compiler_supports_it() -> None:

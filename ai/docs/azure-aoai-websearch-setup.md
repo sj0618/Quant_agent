@@ -6,8 +6,8 @@
 ## 1. 전제 확인 (Azure Portal / AOAI 리소스)
 
 - [ ] 사용 중인 AOAI 리소스가 **Responses API**를 지원하는 리전/배포인지 확인 (Chat Completions API가 아니라 Responses API 엔드포인트를 쓴다 — 코드가 이미 `.../responses` 형태의 URL을 호출함).
-- [ ] 해당 배포 모델이 **web search(내장 tool) 프리뷰**를 지원하는지 확인. 지원 모델/리전은 Azure 쪽에서 계속 업데이트되므로 Azure OpenAI 공식 문서의 "Built-in tools" 또는 "Web search" 섹션에서 최신 지원 리스트를 확인할 것 — **이 문서 작성 시점 기준으로 정확한 tool type 문자열이 확정되어 있지 않으므로 반드시 재확인 필요**.
-- [ ] 프리뷰 기능이면 별도 신청/등록(allowlist) 절차가 있는지 확인.
+- [ ] 해당 배포 모델이 **web search(내장 tool)** 를 지원하는지 확인. 지원 모델/리전은 Azure OpenAI 공식 문서의 "Web search" 섹션에서 최신 지원 리스트를 확인한다. v1 Responses API의 기본 tool type은 `web_search`다.
+- [ ] 조직 또는 구독 수준에서 web search가 차단되어 있지 않은지 확인. 기존 preview API를 쓰는 배포만 `web_search_preview`가 필요할 수 있다.
 - [ ] 리소스의 아웃바운드 네트워크 정책이 web search 기능(Bing 기반일 가능성이 높음)의 외부 호출을 막지 않는지 확인 — VNet/방화벽으로 제한된 환경이면 별도 예외 처리가 필요할 수 있음.
 
 ## 2. 코드가 기대하는 동작
@@ -20,7 +20,7 @@
 }
 ```
 
-- `<web_search_tool_type>`은 하드코딩되어 있지 않고 **환경변수로 주입**된다. Azure 쪽에서 실제 tool type 문자열이 확정되면(예: `web_search_preview` 등 프리뷰명이 바뀔 수 있음) 코드 변경 없이 환경변수 값만 바꾸면 된다.
+- `<web_search_tool_type>`은 URL과 환경변수로 결정된다. `/openai/v1/responses` URL은 기본값 `web_search`를 쓰고, 기존 preview URL은 호환성을 위해 `web_search_preview`를 쓴다. 전역 또는 role별 환경변수로 언제든 명시적으로 덮어쓸 수 있다.
 - 응답 파싱(`_extract_nested_output_text`)은 `output` 배열에서 텍스트가 있는 항목만 뽑아내므로, 응답에 `web_search_call` 같은 도구 호출 항목이 섞여 있어도 무시하고 최종 텍스트만 사용한다 — 별도 파싱 로직 추가가 필요 없다.
 - 웹서치 호출이 실패/타임아웃/미설정이면 `generate_market_brief`가 자동으로 빈 `items` + `fallback_reasons=["websearch_unavailable", ...]`로 안전하게 대체하므로, 이메일의 다른 섹션(전략 비교표, AI 코멘트 등)은 정상 발송된다.
 
@@ -34,10 +34,10 @@
 | `AI_AOAI_RESPONSES_URL` | AOAI Responses API 엔드포인트 URL |
 | `AI_AOAI_API_KEY` | AOAI API 키 |
 | `AI_AOAI_MODEL` | 배포된 모델/deployment 이름 |
-| `AI_AOAI_TIMEOUT_SECONDS` | (선택) 기본 30초 |
-| `AI_AOAI_MAX_RETRIES` | (선택) 기본 2회 |
+| `AI_AOAI_TIMEOUT_SECONDS` | (선택) 일반 역할 기본 45초. 전략 리서치 역할은 기본 180초 |
+| `AI_AOAI_MAX_RETRIES` | (선택) 기본 1회 |
 | `AI_AOAI_RETRY_BACKOFF_SECONDS` | (선택) 기본 0.25초 |
-| `AI_AOAI_WEB_SEARCH_TOOL_TYPE` | (신규) Responses API에 넘길 web search tool의 `type` 문자열. 기본값 `web_search_preview` — Azure 쪽 확정 문자열로 교체 |
+| `AI_AOAI_WEB_SEARCH_TOOL_TYPE` | (선택) Responses API에 넘길 web search tool의 `type` 문자열. 미설정이면 v1은 `web_search`, legacy preview URL은 `web_search_preview` |
 
 역할(role)별 오버라이드도 가능 (`_role_env_name` 규칙: `AI_LLM_<ROLE>_<SUFFIX>`). 시황 브리핑 호출은 역할명 `DIGEST_MARKET_BRIEF`로 실행되므로, 이 역할에만 다른 배포/모델을 쓰고 싶다면:
 

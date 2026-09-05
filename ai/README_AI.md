@@ -105,7 +105,7 @@ AOAI Responses API는 opt-in이다. 기본값은 로컬 테스트용 mock LLM이
 `httpx` 기반 AOAI client를 사용한다. `AI_LLM_PROVIDER=aoai`에서는 provider 오류, schema 오류, 안전한 코드 후보 부재를 결정론 fallback으로 숨기지 않고 analysis job 실패로 남긴다.
 ```bash
 AI_LLM_PROVIDER=aoai \
-AI_AOAI_RESPONSES_URL='https://<resource>.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview' \
+AI_AOAI_RESPONSES_URL='https://<resource>.openai.azure.com/openai/v1/responses' \
 AI_AOAI_API_KEY='<secret>' \
 AI_AOAI_MODEL='<deployment-or-model-name>' \
 AI_LLM_RESEARCH_BULL_MODEL='<mini-deployment>' \
@@ -123,14 +123,16 @@ AI_LLM_REPORT_JUDGE_MODEL='<judge-deployment>' \
 ```
 
 AOAI 설정은 위 명시적 환경변수만 사용한다. role별 model env가 비어 있으면
-`AI_AOAI_MODEL`을 fallback으로 사용한다.
+`AI_AOAI_MODEL`을 fallback으로 사용한다. v1 Responses URL은 기본적으로
+`web_search` tool을 사용한다. 기존 preview URL은 `web_search_preview`를 유지하며,
+필요하면 `AI_AOAI_WEB_SEARCH_TOOL_TYPE` 또는 역할별 동일 suffix로 명시적으로 덮어쓸 수 있다.
 
 공개 배포에서는 `AUTH_ENABLED=1`과 `REDIS_URL`을 설정해 backend가 기록한 `qa_session`을 검증한다. `AUTH_ENABLED=0`은 loopback 로컬 개발 전용이며 실제 AOAI/DB API를 공개하는 설정으로 사용하지 않는다.
 
 실제 AOAI 네트워크 smoke test는 기본 pytest에서 제외된다.
 ```bash
 AI_LLM_PROVIDER=aoai \
-AI_AOAI_RESPONSES_URL='https://<resource>.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview' \
+AI_AOAI_RESPONSES_URL='https://<resource>.openai.azure.com/openai/v1/responses' \
 AI_AOAI_API_KEY='<secret>' \
 AI_AOAI_MODEL='<deployment-or-model-name>' \
 "$MVP_VENV/bin/python" -m pytest tests/test_llm_aoai_live.py

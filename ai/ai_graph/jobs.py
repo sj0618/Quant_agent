@@ -1259,6 +1259,12 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
     )
     if isinstance(research_failure, StrategyResearchError):
         if research_failure.cause_code == "research_provider_failure":
+            typed_diagnostic = _research_provider_diagnostic(
+                exception_chain,
+                stage=failure_stage,
+            )
+            if typed_diagnostic is not None:
+                return typed_diagnostic
             subcause = "strategy_research_provider_failure"
             message = "AI 리서치 제공자가 일시적으로 응답하지 않았습니다. 잠시 후 다시 시도해 주세요."
             retryable = True
@@ -1584,6 +1590,53 @@ def _aoai_failure_diagnostic(
         safe_message=safe_message,
         evidence_refs=[f"failure:{subcause}"],
     )
+
+
+def _research_provider_diagnostic(
+    exception_chain: tuple[BaseException, ...],
+    *,
+    stage: Stage,
+) -> FailureDiagnostic | None:
+    """Expose only stable AOAI metadata wrapped by a provider research failure."""
+
+    typed_failure = next(
+        (
+            error
+            for error in exception_chain
+            if isinstance(error, (LLMTimeoutError, LLMConnectionError, LLMHTTPStatusError))
+        ),
+        None,
+    )
+    if isinstance(typed_failure, LLMTimeoutError):
+        return _aoai_failure_diagnostic(
+            subcause="aoai_response_timeout",
+            stage=stage,
+            retryable=True,
+            safe_message="AI 응답이 제한 시간 안에 도착하지 않았습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    if isinstance(typed_failure, LLMConnectionError):
+        return _aoai_failure_diagnostic(
+            subcause="aoai_connection_error",
+            stage=stage,
+            retryable=True,
+            safe_message="AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    if isinstance(typed_failure, LLMHTTPStatusError):
+        status_code = typed_failure.status_code
+        subcause = (
+            "aoai_http_5xx"
+            if status_code >= 500
+            else "aoai_http_4xx"
+            if status_code >= 400
+            else "aoai_http_error"
+        )
+        return _aoai_failure_diagnostic(
+            subcause=subcause,
+            stage=stage,
+            retryable=status_code >= 500 or status_code in {408, 409, 429},
+            safe_message="AI 제공자 응답을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    return None
 
 
 def _failure_envelope(

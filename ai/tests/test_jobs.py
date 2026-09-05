@@ -17,6 +17,7 @@ from ai_graph.jobs import (
     classify_failure,
     create_analysis_job_store_from_env,
 )
+from ai_graph.llm.base import LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
 from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.research_eligibility import PerformanceAvailable, PerformanceMethodManifest
 from ai_graph.schemas import (
@@ -58,6 +59,32 @@ def test_strategy_research_failure_keeps_its_typed_subcause() -> None:
     assert diagnostic.category == "infrastructure_failure"
     assert diagnostic.subcause == "strategy_research_provider_failure"
     assert diagnostic.failure_stage == "interpreting"
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected_subcause", "retryable"),
+    [
+        (LLMTimeoutError("provider-secret-timeout"), "aoai_response_timeout", True),
+        (LLMConnectionError("provider-secret-connect"), "aoai_connection_error", True),
+        (LLMHTTPStatusError(400), "aoai_http_4xx", False),
+        (LLMHTTPStatusError(503), "aoai_http_5xx", True),
+    ],
+    ids=("timeout", "connection", "http_400", "http_503"),
+)
+def test_strategy_research_provider_failure_preserves_safe_wrapped_aoai_cause(
+    provider_error, expected_subcause: str, retryable: bool
+) -> None:
+    failure = StrategyResearchError(
+        "strategy research provider failed",
+        cause_code="research_provider_failure",
+    )
+    failure.__cause__ = provider_error
+
+    diagnostic = classify_failure(failure, stage="interpreting")
+
+    assert diagnostic.subcause == expected_subcause
+    assert diagnostic.retryable is retryable
+    assert "provider-secret" not in diagnostic.model_dump_json()
 
 
 def _completed_backtest_envelope(trace_id: str) -> APIEnvelope:
