@@ -65,15 +65,15 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert "Mark deploy mutation started" in workflow
     assert 'DEPLOY_MUTATION_STARTED=true' in workflow
     assert "failure() && env.DEPLOY_MUTATION_STARTED == 'true'" in workflow
-    assert "http://127.0.0.1:18001/ai-api/readiness" in workflow
+    assert "http://127.0.0.1:18011/ai-api/readiness" in workflow
     assert 'node scripts/readiness-semantic-gate.mjs --label "$label"' in workflow
     assert "current-backend-readiness" in workflow
     assert "current-ai-api-readiness" in workflow
     assert "No deploy snapshot available to restore" in workflow
     assert "rollback-applied.marker" in workflow
     assert "restart_restored_release" in workflow
-    assert 'wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18001/readiness" "rollback-backend-readiness"' in workflow
-    assert 'wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18001/ai-api/readiness" "rollback-ai-api-readiness"' in workflow
+    assert 'wait_for_semantic_readiness "Backend readiness" "http://127.0.0.1:18011/readiness" "rollback-backend-readiness"' in workflow
+    assert 'wait_for_semantic_readiness "AI API readiness" "http://127.0.0.1:18011/ai-api/readiness" "rollback-ai-api-readiness"' in workflow
     assert "Database migrations are verified by readiness" in workflow
     assert "no DDL runs in application deploy" in workflow
     assert "conn.execute(" not in workflow
@@ -89,7 +89,7 @@ def test_deploy_requires_offline_release_trust_and_fail_closed_readiness():
     assert 'set(settings.trusted_proxy_hosts) == {"127.0.0.1", "::1"}' in workflow
     assert "xfwd: true" in (REPOSITORY_ROOT / "fe" / "vite.config.ts").read_text(encoding="utf-8")
     assert "node scripts/production-gateway.mjs" in workflow
-    assert 'HOST="127.0.0.1" PORT="18000"' in workflow
+    assert 'HOST="0.0.0.0" PORT="18010"' in workflow
     assert "retired-internal-route" in workflow
     assert "npm run preview" not in workflow
     assert "AI_RULE_DRAFT_HMAC_SECRET" in workflow
@@ -170,10 +170,10 @@ def test_every_readiness_gate_invocation_selects_a_profile():
             assert "--profile" in line, f"{workflow_path.name} gates readiness without a profile: {line.strip()}"
 
     deploy = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
-    assert 'check_readiness "current-ai-api-readiness" "http://127.0.0.1:18001/ai-api/readiness" ai' in deploy
-    assert 'check_readiness "current-backend-readiness" "http://127.0.0.1:18001/readiness" backend' in deploy
+    assert 'check_readiness "current-ai-api-readiness" "http://127.0.0.1:18011/ai-api/readiness" ai' in deploy
+    assert 'check_readiness "current-backend-readiness" "http://127.0.0.1:18011/readiness" backend' in deploy
     for label in ("deployed-ai-api-readiness", "rollback-ai-api-readiness"):
-        assert f'"http://127.0.0.1:18001/ai-api/readiness" "{label}" ai' in deploy
+        assert f'"http://127.0.0.1:18011/ai-api/readiness" "{label}" ai' in deploy
 
     health = HEALTH_WORKFLOW.read_text(encoding="utf-8")
     assert 'check_readiness "AI API readiness" "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness" ai' in health
