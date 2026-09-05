@@ -356,6 +356,7 @@ def load_pipeline_data_from_env(
     required_metrics: Sequence[str] | None = None,
     requires_financials: bool | None = None,
     compact_price_rows: bool = False,
+    sector: str | None = None,
 ) -> PipelineDataBundle:
     config = DataSourceConfig.from_env()
     if not config.database_dsn:
@@ -370,4 +371,5 @@ def load_pipeline_data_from_env(
         required_metrics=required_metrics,
         requires_financials=requires_financials,
         compact_price_rows=compact_price_rows,
+        sector=sector,
     )

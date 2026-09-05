@@ -196,5 +196,8 @@ def test_release_profile_fails_before_fixture_analysis_can_return_a_result(
     monkeypatch.setenv("AI_RELEASE_PROFILE", "release")
     monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
 
-    with pytest.raises(PipelineDataUnavailableError, match="release source manifest is invalid"):
+    with pytest.raises(
+        PipelineDataUnavailableError,
+        match="운영 환경에서는 로컬 fixture 데이터로 분석할 수 없습니다",
+    ):
         run_analysis("RSI가 30 이하인 KOSPI200 종목", trace_id="trace-release-manifest")
