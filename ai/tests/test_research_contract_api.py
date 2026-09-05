@@ -251,6 +251,13 @@ def test_confirmed_execution_spec_is_compiled_without_reinterpretation(
         {
             "user_query": "사용자가 확인한 전략",
             "execution_spec": spec.model_dump(mode="json"),
+            # A confirmed V1 rule seals entry/exit only; the period arrives sealed from
+            # the ambiguity node's one-time model decision, which this test bypasses.
+            "backtest_period": {
+                "backtest_years": 2,
+                "basis": "테스트가 데이터 조회 전 확정한 기간입니다.",
+                "period_locked": True,
+            },
         }
     )
 

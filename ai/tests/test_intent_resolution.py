@@ -274,19 +274,35 @@ def test_a_citation_without_a_title_still_resolves(live_intent) -> None:
 
 
 def test_missing_ai_period_stops_before_the_data_loader(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mock/provider-free paths must not silently choose a local default period."""
+    """A READY state that carries no model-selected period must stop before any data read."""
 
-    monkeypatch.setattr("ai_graph.llm.role_calls.is_live_llm_provider", lambda: False)
     monkeypatch.setattr(
         "ai_graph.graph.load_pipeline_data_from_env",
         lambda *_args, **_kwargs: pytest.fail("the loader must not receive an unsealed period"),
     )
 
-    state = ambiguity_classifier_node({"user_query": "돈 버는 전략 만들어서 검증해줘", "trace_id": "t"})
-    data = data_node({"user_query": "돈 버는 전략 만들어서 검증해줘", "trace_id": "t", **state})
+    data = data_node(
+        {
+            "user_query": "돈 버는 전략 만들어서 검증해줘",
+            "trace_id": "t",
+            "status": EnvelopeStatus.READY.value,
+        }
+    )
 
-    assert state["status"] == EnvelopeStatus.READY.value
-    assert "intent" not in state
     assert data["status"] == EnvelopeStatus.NEED_CLARIFICATION.value
     assert "백테스트 기간" in data["ambiguity"]["reason"]
+
+
+def test_mock_mode_period_is_a_recorded_model_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a live provider the mock model still selects the period explicitly, so the
+    documented deterministic profile runs end to end without a hidden local default."""
+
+    monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
+
+    state = ambiguity_classifier_node({"user_query": "돈 버는 전략 만들어서 검증해줘", "trace_id": "t"})
+
+    assert state["status"] == EnvelopeStatus.READY.value
+    assert state["backtest_period"]["period_locked"] is True
+    assert state["backtest_period"]["backtest_years"] == 2
+    assert "mock" in state["backtest_period"]["basis"]
     assert classify_query("돈 버는 전략 만들어서 검증해줘") == AmbiguityCode.READY
