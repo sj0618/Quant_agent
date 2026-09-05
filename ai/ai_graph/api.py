@@ -62,7 +62,6 @@ from ai_graph.graph import (
     build_clarification_prompt,
     classify_query,
     run_analysis,
-    strategy_candidate_cards,
 )
 from ai_graph.job_events import JobEventBuffer
 from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
@@ -642,8 +641,10 @@ def _clarification_envelope(outcome: RuleDraftV1, *, query: str, trace_id: str) 
         user_payload=UserPayload(
             headline="추가 확인이 필요합니다.",
             message=outcome.explanation,
-            next_actions=next_actions or ["후보 카드 중 하나 선택", "시장/기간/조건 보강"],
-            candidate_cards=strategy_candidate_cards(query)[:3],
+            next_actions=next_actions or ["시장/기간/조건 보강", "원래 규칙 유지"],
+            # A clarification before analyst research has no evidence-backed cards to
+            # display. Do not turn the user's text into a generic technical template.
+            candidate_cards=[],
             question=prompt["question"],
             options=options[:3],
             recommended=prompt["recommended"],

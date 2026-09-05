@@ -86,7 +86,7 @@ def test_non_executable_outcome_asks_instead_of_failing() -> None:
     # is a question about nothing the user said.
     assert payload.question == "어떤 투자 전략이나 매매 조건을 분석할까요?"
     assert payload.options == []
-    assert len(payload.candidate_cards) == 3
+    assert payload.candidate_cards == []
     assert payload.report is None
     assert payload.performance is None
 

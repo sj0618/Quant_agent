@@ -33,16 +33,6 @@ const MAX_POLL_FAILURES = 3;
 // save-failed banner on a workspace the user is already reading, and a save that failed
 // twice with backoff is not going to succeed on the third poll either.
 const REPORT_SAVE_RETRY_DELAYS_MS = [5_000, 20_000];
-// Wall-clock safety net. Polling only gives up when the request itself keeps failing;
-// a job that stays RUNNING forever (e.g. the server died mid-run, or a failure never got
-// recorded) returns clean 200s with result:null and would otherwise spin the progress bar
-// indefinitely. Past this age we surface a timeout instead of leaving the user watching
-// forever. Generous on purpose - a 200-name universe backtest legitimately takes minutes.
-const MAX_ANALYSIS_DURATION_MS = 10 * 60_000;
-const PROGRESS_TICK_INTERVAL_MS = 250;
-const CLIENT_PROGRESS_DURATION_MS = 90_000;
-const CLIENT_PROGRESS_START_PERCENT = 6;
-const CLIENT_PROGRESS_MAX_PERCENT = 92;
 const WORKSPACE_PROGRESS_STEPS: Array<{ stage: AIJobStage; label: string }> = [
   { stage: "interpreting", label: "전략 해석 중" },
   { stage: "code_generation", label: "코드 생성 중" },
@@ -61,7 +51,6 @@ interface WorkspaceConversation {
 
 interface PendingAnalysis {
   query: string;
-  startedAt: number;
 }
 
 interface WorkspaceProgress {
@@ -251,7 +240,6 @@ export function AppPage() {
   const [analysisJobs, setAnalysisJobs] = useState<AnalysisJob[]>([]);
   const [conversationHistory, setConversationHistory] = useState<WorkspaceConversation[]>(readConversationHistory);
   const [pendingAnalysis, setPendingAnalysis] = useState<PendingAnalysis | null>(null);
-  const [progressNow, setProgressNow] = useState(Date.now());
   const [jobErrors, setJobErrors] = useState<Record<string, JobFailure>>({});
   // Jobs restored from a past conversation that never recorded a result. The server's
   // in-memory store is long gone, so polling them can only ever end in the wall-clock
@@ -295,19 +283,6 @@ export function AppPage() {
   useEffect(() => {
     writeConversationHistory(conversationHistory);
   }, [conversationHistory]);
-
-  useEffect(() => {
-    const hasRunningJob = analysisJobs.some((job) => !job.result && !inertJobIds.includes(job.job_id));
-    if (!pendingAnalysis && !hasRunningJob) {
-      return undefined;
-    }
-
-    const intervalId = window.setInterval(() => {
-      setProgressNow(Date.now());
-    }, PROGRESS_TICK_INTERVAL_MS);
-
-    return () => window.clearInterval(intervalId);
-  }, [analysisJobs, inertJobIds, pendingAnalysis]);
 
   useEffect(() => {
     const pollingJobs = analysisJobs.filter(
@@ -376,21 +351,6 @@ export function AppPage() {
             retryable: cause?.retryable,
             debugRef: job.result?.debug_ref ?? undefined,
           };
-        }
-        // A job the server keeps reporting as still-running past the wall-clock cap is
-        // treated as stuck: successful polls alone would never end the loading state.
-        if (!job.result && !failures[job.job_id]) {
-          const startedAt = Date.parse(job.created_at);
-          if (Number.isFinite(startedAt) && Date.now() - startedAt > MAX_ANALYSIS_DURATION_MS) {
-            failures[job.job_id] = {
-              message: "분석이 시간 내에 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.",
-              category: "client_timeout",
-              // polling_stage is excluded from the public job model, so name the stage
-              // from the progress the client can actually see.
-              stage: job.stages.find((step) => step.status === "running")?.stage,
-              retryable: true,
-            };
-          }
         }
       }
       if (Object.keys(failures).length) {
@@ -522,7 +482,6 @@ export function AppPage() {
   const workspaceProgress = buildWorkspaceProgress({
     job: runningJob,
     pendingAnalysis,
-    now: progressNow,
     error: runningJob ? jobErrors[runningJob.job_id] : undefined,
     cancelRequested,
   });
@@ -623,9 +582,8 @@ export function AppPage() {
             if (!awaitingUserInput) {
               archiveCurrentConversation();
             }
-            const pending = { query, startedAt: Date.now() };
+            const pending = { query };
             setPendingAnalysis(pending);
-            setProgressNow(pending.startedAt);
             // The progress card and the live activity log live in the result pane; on a
             // phone the user would otherwise stare at a chat that looks like it did nothing.
             setMobilePane("result");
@@ -676,13 +634,11 @@ export function AppPage() {
 function buildWorkspaceProgress({
   job,
   pendingAnalysis,
-  now,
   error,
   cancelRequested = false,
 }: {
   job?: AnalysisJob;
   pendingAnalysis: PendingAnalysis | null;
-  now: number;
   error?: JobFailure;
   cancelRequested?: boolean;
 }): WorkspaceProgress | null {
@@ -691,7 +647,7 @@ function buildWorkspaceProgress({
       label,
       status: job.stages.find((step) => step.stage === stage)?.status ?? "queued",
     }));
-    const percent = Math.max(progressPercentFromSteps(steps), progressPercentFromElapsed(new Date(job.created_at).getTime(), now));
+    const percent = progressPercentFromSteps(steps);
 
     return {
       query: job.query,
@@ -707,41 +663,25 @@ function buildWorkspaceProgress({
     return null;
   }
 
-  const percent = progressPercentFromElapsed(pendingAnalysis.startedAt, now);
-  const steps = WORKSPACE_PROGRESS_STEPS.map(({ label }, index) => ({
+  // The request has been accepted locally but the server has not published its first
+  // stage yet. Show only that first pending stage; never infer later progress from time.
+  const steps: WorkspaceProgress["steps"] = WORKSPACE_PROGRESS_STEPS.map(({ label }, index) => ({
     label,
-    status: clientStageStatus(index, percent),
+    status: index === 0 ? "running" : "queued",
   }));
 
   return {
     query: pendingAnalysis.query,
-    percent,
+    percent: progressPercentFromSteps(steps),
     activeLabel: activeProgressLabel(steps),
     steps,
   };
 }
 
-function progressPercentFromElapsed(startedAt: number, now: number) {
-  const elapsedRatio = Math.max(0, Math.min(1, (now - startedAt) / CLIENT_PROGRESS_DURATION_MS));
-  const easedRatio = 1 - (1 - elapsedRatio) ** 2;
-  return Math.round(CLIENT_PROGRESS_START_PERCENT + easedRatio * (CLIENT_PROGRESS_MAX_PERCENT - CLIENT_PROGRESS_START_PERCENT));
-}
-
 function progressPercentFromSteps(steps: WorkspaceProgress["steps"]) {
   const completed = steps.filter((step) => step.status === "succeeded").length;
   const hasRunning = steps.some((step) => step.status === "running");
-  return Math.min(CLIENT_PROGRESS_MAX_PERCENT, completed * 20 + (hasRunning ? 10 : 0));
-}
-
-function clientStageStatus(index: number, percent: number): AIJobStageStatus {
-  const activeIndex = Math.min(WORKSPACE_PROGRESS_STEPS.length - 1, Math.floor(percent / 20));
-  if (index < activeIndex) {
-    return "succeeded";
-  }
-  if (index === activeIndex) {
-    return "running";
-  }
-  return "queued";
+  return Math.min(100, completed * 20 + (hasRunning ? 10 : 0));
 }
 
 function activeProgressLabel(steps: WorkspaceProgress["steps"]) {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import ai_graph.graph as graph
 from ai_graph.graph import strategy_candidate_cards
 from ai_graph.llm import role_calls
 
@@ -97,3 +98,4 @@ def test_analyst_candidate_research_rejects_unsupported_metric_and_stale_source(
 def test_candidate_card_wrapper_never_restores_static_fallback() -> None:
     assert strategy_candidate_cards() == []
     assert strategy_candidate_cards("RSI 평균회귀") == []
+    assert not hasattr(graph, "_static_strategy_candidate_cards")

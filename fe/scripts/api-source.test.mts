@@ -40,6 +40,17 @@ test("workspace restores the latest server analysis on a fresh browser", async (
   assert.match(source, /setAnalysisJobs\(\(jobs\) => \(jobs\.length \? jobs : \[latestJob\]\)\)/);
 });
 
+test("workspace progress follows server stages instead of elapsed client time", async () => {
+  const source = await readFile(new URL("../src/pages/AppPage.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /const percent = progressPercentFromSteps\(steps\);/);
+  assert.match(source, /status: index === 0 \? "running" : "queued"/);
+  assert.doesNotMatch(
+    source,
+    /MAX_ANALYSIS_DURATION_MS|PROGRESS_TICK_INTERVAL_MS|progressPercentFromElapsed|clientStageStatus|client_timeout/,
+  );
+});
+
 test("workspace directly queues a natural-language strategy job", async () => {
   const clientSource = await readFile(new URL("../src/api/quantAgentClient.ts", import.meta.url), "utf8");
   const createJob = clientSource.slice(
