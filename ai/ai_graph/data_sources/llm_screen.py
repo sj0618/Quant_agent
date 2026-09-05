@@ -87,13 +87,17 @@ Known pitfalls in this warehouse - getting these wrong yields silently wrong res
 """
 
 REQUIRED_OUTPUT_CONTRACT = f"""
-Return one SQL SELECT (a leading WITH is fine) that yields at most {MAX_SCREEN_ROWS}
-rows, one per matching stock, with:
+Return one SQL SELECT (a leading WITH is fine) only when every material strategy
+condition is expressible. It must yield at most {MAX_SCREEN_ROWS} rows, one per matching
+stock, with:
   - a column named "ticker" holding the bare 6-digit code
   - one column per metric your conditions used, so the result explains itself
 Screen against the most recent trading date present in
 feature.kis_adjusted_ohlcv_daily. Do not use INSERT/UPDATE/DELETE/DDL, transactions,
 multiple statements, or semicolons.
+If any material condition cannot be expressed, return an empty sql string and empty
+metrics/condition lists, and name every missing input in unmet_requirements. Do not
+execute or propose a partial-rule substitute.
 """
 
 _FORBIDDEN = re.compile(
@@ -323,12 +327,34 @@ def screen_with_llm(conn: Any, query: str) -> dict[str, Any] | None:
         if plan is None:
             return None
 
+        unmet_requirements = list(plan.get("unmet_requirements") or [])
         record: dict[str, Any] = {
             "attempt": attempt_index + 1,
             "reasoning": plan.get("reasoning"),
             "sql": plan.get("sql"),
-            "unmet_requirements": plan.get("unmet_requirements") or [],
+            "unmet_requirements": unmet_requirements,
         }
+        if unmet_requirements:
+            # A partial SQL result would be indistinguishable from a validation of the
+            # user's rule. Preserve the exact rule and hand the missing inputs to the
+            # data-availability layer instead of executing a weakened substitute.
+            record["outcome"] = "blocked: required data unavailable for exact rule"
+            attempts.append(record)
+            report_activity(
+                "step",
+                label="원래 규칙 보류",
+                detail=(", ".join(str(item) for item in unmet_requirements))[:160],
+            )
+            return {
+                "rows": [],
+                "research": research,
+                "attempts": attempts,
+                "metrics": [],
+                "unmet_requirements": unmet_requirements,
+                "entry_conditions": [],
+                "exit_conditions": [],
+                "exact_rule_blocked": True,
+            }
         try:
             rows = run_screen_sql(conn, str(plan.get("sql") or ""))
             accepted, notes = validate_screen_rows(rows, known_tickers=known_tickers)

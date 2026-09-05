@@ -37,7 +37,7 @@ SCREENING_RESEARCH_PROMPT_TEMPLATE_NAME = "screening_research"
 SCREENING_RESEARCH_PROMPT_VERSION = "v1"
 SCREENING_SQL_SCHEMA_NAME = "quantagent.screening_sql.v1"
 SCREENING_SQL_PROMPT_TEMPLATE_NAME = "screening_sql"
-SCREENING_SQL_PROMPT_VERSION = "v1"
+SCREENING_SQL_PROMPT_VERSION = "v2"
 REPORT_WRITEUP_SCHEMA_NAME = "quantagent.report_writeup.v1"
 REPORT_WRITEUP_PROMPT_TEMPLATE_NAME = "report_writeup"
 REPORT_WRITEUP_PROMPT_VERSION = "v1"
@@ -49,7 +49,7 @@ STRATEGY_REVIEW_PROMPT_TEMPLATE_NAME = "strategy_review"
 STRATEGY_REVIEW_PROMPT_VERSION = "v1"
 STRATEGY_INTENT_SCHEMA_NAME = "quantagent.strategy_intent.v2"
 STRATEGY_INTENT_PROMPT_TEMPLATE_NAME = "strategy_intent"
-STRATEGY_INTENT_PROMPT_VERSION = "v2"
+STRATEGY_INTENT_PROMPT_VERSION = "v3"
 
 
 class RoleDebatePayload(BaseModel):
@@ -694,12 +694,20 @@ and its research basis in `assumptions`; never return a question merely because 
 omitted. Ground the choice in the evidence, not in a fixed default such as "three
 years"; cite the sources actually used.
 
+For a broad request such as "돈 되는 전략 만들어서 검증해줘", commit to one complete,
+conservative KRX hypothesis whenever CAPABILITIES can evaluate it. Do not return a menu
+or stop simply because the user left the rules open. Conversely, never make a
+user-stated material rule appear tested by dropping it or replacing it with a different
+metric: preserve that condition as unresolved when CAPABILITIES cannot evaluate it, so
+the execution layer can explain the exact-rule data blocker.
+
 Constraints on what you may choose:
 - KRX-listed cash equities only (KOSPI/KOSDAQ). No options, futures, FX or crypto.
 - Only conditions computable from daily OHLCV, technical indicators derived from it,
   and the fundamentals/consensus/flow fields listed in CAPABILITIES. If a natural
-  reading of the request needs something outside that, pick the closest rule that IS
-  computable and record the substitution in `assumptions`.
+  reading of the request needs something outside that, preserve the material condition
+  as unresolved. Do not pick a closest computable rule and present it as the user's
+  requested strategy.
 - `resolved_query` must stand alone: a downstream engine sees only that string, never
   the user's original words. Write it in Korean as a single screening instruction
   naming the universe/sector, the entry conditions with concrete numbers and windows,
@@ -803,9 +811,12 @@ You are given the real schema, how full each table is, and the warehouse's known
 pitfalls - follow them exactly.
 
 Reason before writing: name each quantity the strategy needs, map it onto columns, then
-compose the query. If a quantity cannot be derived from this schema, leave it out of the
-conditions and report it under unmet_requirements naming the missing input. Never
-substitute an unrelated column for a condition you cannot express.
+compose the query. Every quantity required by the strategy is material. If any one of
+them cannot be derived from this schema, report it under unmet_requirements naming the
+missing input and do NOT omit, weaken, replace, or screen an incomplete version of the
+rule. In that case return empty sql, metrics, entry_conditions, and exit_conditions.
+An executable answer has an empty unmet_requirements list. Never substitute an unrelated
+column for a condition you cannot express.
 
 If earlier attempts are supplied, fix precisely what they got wrong. When a previous
 attempt matched nothing, the conditions were too tight for this particular date -
@@ -830,7 +841,8 @@ structured conditions MUST describe the same rule.
 
 Return JSON only:
   reasoning          - how each condition maps onto columns
-  sql                - the SELECT (single statement, no semicolon, no DDL/DML)
+  sql                - the SELECT (single statement, no semicolon, no DDL/DML), or ""
+                       only when unmet_requirements is non-empty
   metrics            - metric column names the SELECT returns
   entry_conditions   - structured entry conditions (as above)
   exit_conditions    - structured exit conditions, if the strategy implies any

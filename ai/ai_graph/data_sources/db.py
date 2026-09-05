@@ -491,6 +491,12 @@ class PostgresPipelineDataSource:
                         screening_timings,
                     ) = screening.result()
                 timings.update(screening_timings)
+            if screening_relaxation.get("exact_rule_blocked"):
+                return self._exact_rule_blocked_bundle(
+                    query,
+                    capability_availability=capability_availability,
+                    screening_relaxation=screening_relaxation,
+                )
             single_ticker: str | None = None
             if not screening_candidates and screen_current:
                 single_ticker = self._resolve_ticker(conn, query)
@@ -531,6 +537,12 @@ class PostgresPipelineDataSource:
                                 screening_timings,
                             ) = screening.result()
                         timings.update(screening_timings)
+                    if screening_relaxation.get("exact_rule_blocked"):
+                        return self._exact_rule_blocked_bundle(
+                            query,
+                            capability_availability=capability_availability,
+                            screening_relaxation=screening_relaxation,
+                        )
                     ticker_resolution = (
                         "ambiguous_fallback_to_screening"
                         if screening_candidates
@@ -1059,6 +1071,21 @@ class PostgresPipelineDataSource:
         except Exception:
             _logger.exception("LLM screening failed; falling back to profile screening")
             result = None
+        if result and result.get("exact_rule_blocked"):
+            self._set_statement_timeout(conn)
+            return [], {
+                "mode": "llm_authored_sql",
+                "attempts": result.get("attempts") or [],
+                "metrics": [],
+                "unmet_requirements": result.get("unmet_requirements") or [],
+                "research": result.get("research"),
+                "matched_count": 0,
+                "relaxed": False,
+                "relaxation_rounds": 0,
+                "entry_conditions": [],
+                "exit_conditions": [],
+                "exact_rule_blocked": True,
+            }
         if not result or not result.get("rows"):
             # A PostgreSQL statement failure aborts the whole transaction. The LLM
             # screen normally rolls back failed attempts itself, but this boundary
@@ -1089,6 +1116,46 @@ class PostgresPipelineDataSource:
             "exit_conditions": result.get("exit_conditions") or [],
         }
         return candidates, trace
+
+    def _exact_rule_blocked_bundle(
+        self,
+        query: str,
+        *,
+        capability_availability: Mapping[str, bool],
+        screening_relaxation: Mapping[str, Any],
+    ) -> PipelineDataBundle:
+        """Return a source-backed explanation without backtesting a changed rule."""
+
+        unmet_requirements = [
+            str(item).strip()
+            for item in screening_relaxation.get("unmet_requirements") or []
+            if str(item).strip()
+        ]
+        unsupported = [
+            {
+                "capability": "exact_rule",
+                "label": requirement,
+                "reason": "이 조건을 계산할 데이터가 현재 서버에 연결되어 있지 않습니다.",
+            }
+            for requirement in unmet_requirements
+        ]
+        data_availability = _data_availability_for_query(
+            query, source="postgres", available=capability_availability
+        )
+        data_availability["unsupported_capabilities"] = unsupported
+        return PipelineDataBundle(
+            data_availability=data_availability,
+            metadata={
+                "source": "postgres",
+                "dsn_env": self.config.database_dsn_env,
+                "stopped_before_backtest": True,
+                "exact_rule_blocked": True,
+                "screening_relaxation": dict(screening_relaxation),
+                "unsupported_capabilities": unsupported,
+                "capability_probe": dict(capability_availability),
+                "research_measurement_complete": False,
+            },
+        )
 
     def _screen_with_relaxation(
         self, conn: Any, query: str

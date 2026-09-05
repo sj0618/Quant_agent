@@ -834,7 +834,15 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
                 f"{float(timings.get('total_seconds', 0.0)):.2f}초에 확인했습니다."
             ),
         )
-    if is_release_profile():
+    # A source-backed exact-rule block is deliberately returned without price rows or
+    # a source manifest: validating it as a completed extract would hide the real
+    # reason the backtest did not run. The pre-screen capability blocker follows the
+    # same contract.
+    stopped_before_execution = bool(
+        pipeline_metadata.get("stopped_before_screening")
+        or pipeline_metadata.get("stopped_before_backtest")
+    )
+    if is_release_profile() and not stopped_before_execution:
         manifest_errors = validate_release_metadata(
             pipeline_metadata,
             loaded_extract_hash=(
@@ -1067,33 +1075,37 @@ def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[st
         "category": AmbiguityCode.INPUT_AMBIGUOUS.value,
         "ambiguity_category": AmbiguityCode.INPUT_AMBIGUOUS.value,
         "safety_priority": False,
-        "reason": f"현재 데이터로 검증할 수 없는 조건이 있습니다: {joined}",
+        "reason": (
+            f"현재 서버에는 {joined} 데이터를 계산할 수 있는 자료가 연결되지 않아, "
+            "이 조건을 포함한 원래 규칙 그대로는 백테스트할 수 없습니다."
+        ),
         "ambiguity_reasons": reasons,
         "ambiguity_dimensions": ["data_availability"],
         "source_resolvable": False,
         "needs_clarification_after_source_check": True,
         "clarification_blocker_type": "missing_data_source",
         "clarification_question": (
-            f"{joined} 조건은 현재 적재된 데이터로 검증할 수 없습니다. 해당 조건을 빼고 검증할까요?"
+            f"{joined} 조건에 필요한 데이터가 현재 서버에 없습니다. 조건을 임의로 빼거나 "
+            "다른 지표로 바꾸지 않고, 원래 규칙은 그대로 보류했습니다."
         ),
-        "question_reason": "검증 불가한 조건을 가격 지표로 대체하면 확인되지 않은 결과가 사실처럼 보입니다.",
+        "question_reason": "원래 규칙을 바꾸면 그 결과는 사용자가 요청한 전략의 검증이 아닙니다.",
         # ClarificationOption takes label and reason only, and forbids extras - the
         # envelope validates these, so an option shaped any other way turns an honest
         # refusal into a failed analysis.
         "options": [
             {
-                "label": f"{joined} 조건을 빼고 나머지만 검증",
-                "reason": "검증 가능한 조건만으로 다시 요청하면 결과의 신뢰도를 유지할 수 있습니다.",
+                "label": "원래 규칙 유지",
+                "reason": "필요한 데이터가 연결되면 같은 규칙으로 백테스트할 수 있습니다.",
             },
             {
-                "label": "데이터가 연결될 때까지 보류",
-                "reason": "해당 데이터 소스가 적재되면 원래 조건 그대로 검증할 수 있습니다.",
+                "label": "별도 탐색 가설 만들기",
+                "reason": "원래 규칙과 분리해, 지금 데이터로 검증 가능한 새 가설을 만들 수 있습니다.",
             },
         ],
         # An index into options, not a label - UserPayload.recommended is int|None.
         "recommended_option": 0,
-        "recommendation_confidence": 0.7,
-        "recommendation_confidence_reason": "검증 가능한 조건만 남기면 결과의 신뢰도를 유지할 수 있습니다.",
+        "recommendation_confidence": 1.0,
+        "recommendation_confidence_reason": "원래 규칙을 유지해야 검증 대상이 바뀌지 않습니다.",
     }
 
 
@@ -1368,6 +1380,9 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         StrategyCandidateCard.model_validate(card)
         for card in state.get("data", {}).get("candidate_cards", [])
     ]
+    exact_rule_blocked = (
+        state.get("ambiguity", {}).get("clarification_blocker_type") == "missing_data_source"
+    )
     if status == EnvelopeStatus.READY:
         exploration = bool(state.get("exploration_policy"))
         performance = project_public_performance(
@@ -1428,8 +1443,12 @@ def envelope_node(state: QuantAgentState) -> dict[str, Any]:
         payload = {
             "headline": "추가 확인이 필요합니다.",
             "message": state["ambiguity"]["reason"],
-            "next_actions": ["후보 카드 중 하나 선택", "시장/기간/조건 보강"],
-            "candidate_cards": cards,
+            "next_actions": (
+                ["원래 조건 유지", "검증 가능한 별도 탐색 가설 만들기"]
+                if exact_rule_blocked
+                else ["후보 카드 중 하나 선택", "시장/기간/조건 보강"]
+            ),
+            "candidate_cards": [] if exact_rule_blocked else cards,
             **clarification,
         }
     internal = build_internal_payload(state)

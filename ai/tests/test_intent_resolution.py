@@ -11,11 +11,13 @@ import pytest
 
 from ai_graph.data_sources.db import PipelineDataBundle
 from ai_graph.graph import (
+    _unverifiable_ambiguity,
     _strategy_query,
     ambiguity_classifier_node,
     classify_query,
     data_node,
     envelope_node,
+    strategy_candidate_cards,
 )
 from ai_graph.llm.base import LLMJsonRequest
 from ai_graph.llm.role_calls import resolve_strategy_intent
@@ -82,7 +84,33 @@ def test_intent_resolution_searches_the_web_before_committing(live_intent) -> No
     assert client.requests[0].web_search_context_size == "high"
     assert client.requests[0].reasoning_effort == "medium"
     assert client.requests[0].max_tool_calls == 8
+    assert client.requests[0].prompt_version == "v3"
+    assert "never make a\nuser-stated material rule appear tested" in client.requests[0].system_prompt
     assert resolved["resolved_query"] == RESOLVED
+
+
+def test_missing_data_preserves_the_exact_rule_and_hides_candidate_cards() -> None:
+    ambiguity = _unverifiable_ambiguity(
+        [{"label": "공매도 잔고", "reason": "필요한 데이터가 적재되어 있지 않습니다."}]
+    )
+    cards = [card.model_dump() for card in strategy_candidate_cards("RSI 평균회귀 전략")]
+    state: dict[str, Any] = {
+        "status": EnvelopeStatus.NEED_CLARIFICATION.value,
+        "trace_id": "missing-data-rule",
+        "debug_ref": "missing-data-rule",
+        "ambiguity": ambiguity,
+        "data": {"candidate_cards": cards},
+    }
+
+    payload = envelope_node(state)["envelope"]["user_payload"]
+
+    assert "원래 규칙 그대로는 백테스트할 수 없습니다" in payload["message"]
+    assert "임의로 빼거나 다른 지표로 바꾸지 않고" in payload["question"]
+    assert payload["candidate_cards"] == []
+    assert [option["label"] for option in payload["options"]] == [
+        "원래 규칙 유지",
+        "별도 탐색 가설 만들기",
+    ]
 
 
 def test_vague_request_becomes_a_concrete_strategy_the_rest_of_the_graph_runs(
