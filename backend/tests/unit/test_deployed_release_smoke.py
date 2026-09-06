@@ -84,3 +84,23 @@ def test_smoke_script_mints_and_revokes_its_own_session_instead_of_logging_in():
     assert "revoke_session(" in source
     assert "auth/google" not in source
     assert 'user_id = f"qa-smoke:' in source
+
+
+def test_a_transient_poll_failure_is_retried_until_the_grace_period_ends():
+    """While the single-process service computes a backtest the gateway answers 502 for a
+    while; one such poll is not a verdict on the release."""
+
+    smoke = _smoke_module()
+
+    assert smoke.poll_outcome(200, {"job_id": "j"}, failing_since=None, now=100.0) == ("ok", None)
+    assert smoke.poll_outcome(502, "unavailable", failing_since=None, now=100.0) == ("retry", 100.0)
+    assert smoke.poll_outcome(504, None, failing_since=100.0, now=100.0 + smoke.POLL_FAILURE_GRACE_SECONDS) == (
+        "retry",
+        100.0,
+    )
+    assert smoke.poll_outcome(502, None, failing_since=100.0, now=100.0 + smoke.POLL_FAILURE_GRACE_SECONDS + 1) == (
+        "fail",
+        100.0,
+    )
+    # A good poll resets the failure window.
+    assert smoke.poll_outcome(200, {"job_id": "j"}, failing_since=100.0, now=500.0) == ("ok", None)

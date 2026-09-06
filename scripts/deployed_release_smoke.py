@@ -28,6 +28,9 @@ from typing import Any
 # on a warehouse without them it is refused with need_clarification naming that gap.
 DEFAULT_QUERY = "RSI(14)가 30 이하로 떨어진 코스피 종목을 사고, 70 이상이면 파는 전략"
 DEFAULT_EXPECTED_STATUSES = ("ready",)
+# The combined service runs as one process; while a backtest is computing, the gateway
+# can answer a poll with 502/504 for a while. That is a poll to retry, not a verdict.
+POLL_FAILURE_GRACE_SECONDS = 300.0
 
 
 def is_terminal(job: Any) -> bool:
@@ -70,6 +73,20 @@ def clarification_details(job: Any) -> str:
     if ambiguity.get("reason"):
         lines.append(f"ambiguity={ambiguity.get('category')!r} reason={ambiguity['reason']!r}")
     return "\n".join(f"[smoke]   {line}" for line in lines)
+
+
+def poll_outcome(status: int, job: Any, *, failing_since: float | None, now: float) -> tuple[str, float | None]:
+    """Classify one poll: ("ok", None), ("retry", first_failure_time) or ("fail", first_failure_time).
+
+    A non-200 answer is tolerated until it has persisted for POLL_FAILURE_GRACE_SECONDS.
+    """
+
+    if status == 200 and isinstance(job, dict):
+        return "ok", None
+    started = now if failing_since is None else failing_since
+    if now - started > POLL_FAILURE_GRACE_SECONDS:
+        return "fail", started
+    return "retry", started
 
 
 def stage_summary(job: Any) -> str:
@@ -175,11 +192,22 @@ def run(args: argparse.Namespace) -> int:
 
         deadline = time.monotonic() + args.timeout_seconds
         last_stages = ""
+        failing_since: float | None = None
         while True:
             status, job = http_json("GET", f"{jobs_url}/{job_id}", cookie=(cookie_name, session_id))
-            if status != 200 or not isinstance(job, dict):
-                print(f"[smoke] polling failed: HTTP {status} {json.dumps(job, ensure_ascii=False)[:400]}")
+            outcome, failing_since = poll_outcome(
+                status, job, failing_since=failing_since, now=time.monotonic()
+            )
+            if outcome == "fail":
+                print(f"[smoke] polling kept failing for {POLL_FAILURE_GRACE_SECONDS:.0f}s: HTTP {status} {json.dumps(job, ensure_ascii=False)[:400]}")
                 return 4
+            if outcome == "retry":
+                print(f"[smoke] {time.strftime('%H:%M:%S')} poll returned HTTP {status}; retrying (service busy)")
+                if time.monotonic() > deadline:
+                    print(f"[smoke] job {job_id} did not finish within {args.timeout_seconds}s")
+                    return 5
+                time.sleep(args.poll_seconds)
+                continue
             stages = stage_summary(job)
             if stages != last_stages:
                 print(f"[smoke] {time.strftime('%H:%M:%S')} {stages}")
