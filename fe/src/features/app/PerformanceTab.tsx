@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Badge } from "../../components/common/Badge";
 import { Card } from "../../components/common/Card";
 import { downloadPerformanceCsv } from "../../api/reportActionsClient";
+import { sendDemoReport } from "../../api/quantAgentClient";
 import type { EquityPoint, PerformanceSummary } from "../../types/quantagent";
 import { MetricCard } from "./MetricCard";
 import { PerformanceChart } from "./PerformanceChart";
@@ -9,6 +10,7 @@ import { PerformanceReliabilityPanel } from "./PerformanceReliabilityPanel";
 
 interface PerformanceTabProps {
   performance: PerformanceSummary;
+  jobId?: string | null;
 }
 
 const RANGE_YEARS: Record<"1Y" | "5Y" | "10Y", number> = { "1Y": 1, "5Y": 5, "10Y": 10 };
@@ -36,9 +38,31 @@ function sliceByYears(points: EquityPoint[], range: "1Y" | "5Y" | "10Y"): Equity
   return windowed.length >= 2 ? windowed : points;
 }
 
-export function PerformanceTab({ performance }: PerformanceTabProps) {
+export function PerformanceTab({ performance, jobId = null }: PerformanceTabProps) {
   const [mode, setMode] = useState<"selected" | "baseline" | "combined">("selected");
   const [range, setRange] = useState<"1Y" | "5Y" | "10Y">("10Y");
+  const [recipient, setRecipient] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sendStatus, setSendStatus] = useState<{ tone: "ok" | "error"; message: string } | null>(null);
+
+  const handleSendEmail = async () => {
+    if (!jobId || sending) {
+      return;
+    }
+    setSending(true);
+    setSendStatus(null);
+    try {
+      const result = await sendDemoReport(jobId, recipient);
+      setSendStatus({ tone: "ok", message: `전송 완료 → ${result.recipient}` });
+    } catch (error) {
+      setSendStatus({
+        tone: "error",
+        message: error instanceof Error ? error.message : "이메일 전송에 실패했습니다.",
+      });
+    } finally {
+      setSending(false);
+    }
+  };
   const points = performance.source === "ai" ? performance.equityCurve : sliceByYears(performance.equityCurve, range);
   const benchmarkLabel = performance.benchmark?.label || performance.benchmarkLabel || "벤치마크";
   const hasMacroEvents = performance.macroEvents.length > 0;
@@ -64,8 +88,49 @@ export function PerformanceTab({ performance }: PerformanceTabProps) {
           <p>{performance.period}</p>
         </div>
 
-        <button className="export-button" onClick={() => downloadPerformanceCsv(performance)} type="button">CSV</button>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <button className="export-button" onClick={() => downloadPerformanceCsv(performance)} type="button">CSV</button>
+          {jobId ? (
+            <>
+              <input
+                aria-label="리포트 받는 사람 이메일"
+                type="email"
+                placeholder="받는 사람 이메일"
+                value={recipient}
+                onChange={(event) => setRecipient(event.target.value)}
+                disabled={sending}
+                style={{
+                  padding: "7px 10px",
+                  border: "1px solid var(--line, #e5e7eb)",
+                  borderRadius: 8,
+                  fontSize: 13,
+                  minWidth: 190,
+                }}
+              />
+              <button
+                className="export-button"
+                onClick={handleSendEmail}
+                disabled={sending}
+                type="button"
+                style={{ background: "#2563eb", color: "#fff", borderColor: "#2563eb" }}
+              >
+                {sending ? "전송 중…" : "이메일로 전송"}
+              </button>
+            </>
+          ) : null}
+        </div>
       </Card>
+
+      {sendStatus ? (
+        <div
+          className={sendStatus.tone === "error" ? "warning-box warning-box--error" : "warning-box"}
+          role="status"
+          style={sendStatus.tone === "ok" ? { borderColor: "#16a34a", color: "#166534" } : undefined}
+        >
+          <strong>{sendStatus.tone === "ok" ? "이메일 전송 완료" : "이메일 전송 실패"}</strong>
+          <span>{sendStatus.message}</span>
+        </div>
+      ) : null}
 
       {reliability ? (
         <PerformanceReliabilityPanel reliability={reliability} />

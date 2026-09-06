@@ -64,7 +64,7 @@ export function WorkspaceResultPanel({
           />
           {activeTab === "overview" ? <OverviewTab overview={overview} validated={!showGateWarning} /> : null}
           {activeTab === "trading" ? <TradingInfoTab candidates={overview.candidates} /> : null}
-          {activeTab === "performance" ? <PerformanceTab performance={overview.performance} /> : null}
+          {activeTab === "performance" ? <PerformanceTab performance={overview.performance} jobId={jobId} /> : null}
         </>
       )}
     </>

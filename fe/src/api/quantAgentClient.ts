@@ -276,6 +276,38 @@ export async function createAnalysisJob(query: string): Promise<AnalysisJob> {
   return job;
 }
 
+export interface DemoSendReportResult {
+  status: string;
+  recipient: string;
+  message_id?: string;
+  has_pdf?: boolean;
+}
+
+/** 시연용: 완료된 리포트를 서버가 SMTP로 실제 이메일 발송한다.
+ *  실패 시 서버가 준 사유 메시지(예: SMTP 환경변수 미설정 안내)를 그대로 던진다. */
+export async function sendDemoReport(jobId: string, recipient?: string): Promise<DemoSendReportResult> {
+  const response = await fetchAI(AI_ENDPOINTS.demoSendReport, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job_id: jobId, recipient: recipient?.trim() || undefined }),
+  });
+  const body = (await response.json().catch(() => null)) as
+    | (DemoSendReportResult & { detail?: unknown })
+    | { detail?: unknown }
+    | null;
+  if (!response.ok) {
+    const detail = body?.detail;
+    const message =
+      detail && typeof detail === "object" && "message" in detail
+        ? String((detail as { message: unknown }).message)
+        : typeof detail === "string"
+          ? detail
+          : "이메일 전송에 실패했습니다.";
+    throw new Error(message);
+  }
+  return body as DemoSendReportResult;
+}
+
 export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
   const response = await fetchAI(AI_ENDPOINTS.analysisJobCancel(jobId), { method: "POST" });
   await assertOk(response);
