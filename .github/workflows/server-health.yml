@@ -151,7 +151,9 @@ jobs:
           # The gate ships with the repo, so it is run here on the checked-out release
           # rather than out of $APP_DIR. A server still on an older revision does not
           # have the script yet, and gating on it there fails with MODULE_NOT_FOUND
-          # before a single dependency has been checked.
+          # before a single dependency has been checked. The checked-out gate can also
+          # be newer than the deployed release, so a check it does not publish yet is
+          # reported (--allow-missing) rather than treated as an outage.
           check_readiness() {
             local label="$1"
             local url="$2"
@@ -163,7 +165,7 @@ jobs:
               -p "$SERVER_PORT" \
               "$SERVER_USER@$SERVER_HOST" \
               "curl -q --fail --silent --show-error --connect-timeout 5 --max-time 15 '$url'" \
-              | node scripts/readiness-semantic-gate.mjs --label "$label" --profile "$profile"
+              | node scripts/readiness-semantic-gate.mjs --label "$label" --profile "$profile" --allow-missing
           }
 
           check_readiness "General backend readiness" "http://127.0.0.1:$COMBINED_PORT/readiness" backend

@@ -245,13 +245,18 @@ jobs:
             exit 1
           fi
 
+          # This gates the release that is *currently running* with the gate from the
+          # revision about to be deployed. A check this revision introduces is not yet
+          # published by the running release, so "missing" is reported rather than
+          # fatal here; unready or unexpected checks still block the deploy. The new
+          # release is gated strictly after it starts (deployed-ai-api-readiness).
           check_readiness() {
             local label="$1"
             local url="$2"
             local profile="$3"
             ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
               "curl -q --fail --silent --show-error --connect-timeout 5 --max-time 15 '$url'" \
-              | node scripts/readiness-semantic-gate.mjs --label "$label" --profile "$profile"
+              | node scripts/readiness-semantic-gate.mjs --label "$label" --profile "$profile" --allow-missing
           }
 
           check_readiness "current-backend-readiness" "http://127.0.0.1:18011/readiness" backend

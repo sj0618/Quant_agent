@@ -84,7 +84,14 @@ export function parseReadinessPayload(rawText) {
   }
 }
 
-export function validateReadinessPayload(payload, { requiredChecks = REQUIRED_READINESS_CHECKS } = {}) {
+// `allowMissing` is for gating a release that is *already running* with a gate that may
+// be newer than it (pre-deploy, scheduled health): a check the running release predates
+// is reported, not fatal. Unready or unexpected checks always fail. The release a deploy
+// just started is gated strictly, with the gate it shipped.
+export function validateReadinessPayload(
+  payload,
+  { requiredChecks = REQUIRED_READINESS_CHECKS, allowMissing = false } = {},
+) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("readiness payload must be an object");
   }
@@ -119,7 +126,7 @@ export function validateReadinessPayload(payload, { requiredChecks = REQUIRED_RE
   }
 
   const missing = required.filter((name) => !seen.has(name));
-  if (missing.length > 0) {
+  if (missing.length > 0 && !allowMissing) {
     throw new Error(`readiness payload is missing required checks: ${missing.join(", ")}`);
   }
 
@@ -135,6 +142,7 @@ export function validateReadinessPayload(payload, { requiredChecks = REQUIRED_RE
       ready: true,
       reason: null,
     })),
+    ...(missing.length > 0 ? { missing } : {}),
   };
 }
 
@@ -158,7 +166,17 @@ export async function runReadinessSemanticGateCli(
 ) {
   const options = parseCliArguments(argv);
   const payload = parseReadinessPayload(await readInput());
-  const result = validateReadinessPayload(payload, { requiredChecks: options.requiredChecks });
+  const allowMissing = options.allowMissing === true;
+  const result = validateReadinessPayload(payload, {
+    requiredChecks: options.requiredChecks,
+    allowMissing,
+  });
+  const missing = result.missing ?? [];
+  if (missing.length > 0) {
+    stderr.write(
+      `${options.label}: running release does not publish ${missing.join(", ")} yet (allowed by --allow-missing)\n`,
+    );
+  }
 
   writeOutput(
     `${JSON.stringify(
@@ -166,6 +184,7 @@ export async function runReadinessSemanticGateCli(
         label: options.label,
         status: result.status,
         checks: result.checks.map((check) => check.name),
+        ...(missing.length > 0 ? { missing } : {}),
       },
       null,
       2,

@@ -197,6 +197,26 @@ def test_every_readiness_gate_invocation_selects_a_profile():
     assert "$APP_DIR/scripts/readiness-semantic-gate.mjs" not in health
 
 
+def test_only_the_running_release_is_gated_with_allow_missing():
+    """A newly required readiness check is published only by the release that
+    introduces it. The pre-deploy gate (running release) and the scheduled health check
+    tolerate a missing check; the release a deploy just started, the rollback target,
+    and the post-deploy smoke are gated strictly with the gate they shipped."""
+
+    deploy = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    pre_deploy = deploy.split("Verify pre-deploy readiness", maxsplit=1)[1].split("Create deploy snapshot archive", maxsplit=1)[0]
+    assert "--profile \"$profile\" --allow-missing" in pre_deploy
+    for line in deploy.splitlines():
+        if '"$READINESS_CHECKER"' in line:
+            assert "--allow-missing" not in line, line.strip()
+
+    health = HEALTH_WORKFLOW.read_text(encoding="utf-8")
+    assert "--profile \"$profile\" --allow-missing" in health
+
+    smoke = (REPOSITORY_ROOT / ".github" / "workflows" / "deployed-release-smoke.yml").read_text(encoding="utf-8")
+    assert "--allow-missing" not in smoke
+
+
 def test_email_worker_start_is_gated_and_points_at_the_ai_venv():
     workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
 
