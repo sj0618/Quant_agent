@@ -42,6 +42,11 @@ from ai_graph.schemas import (
 
 STRATEGY_RESEARCH_PROMPT_VERSION = "v7"
 STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v7"
+# The live provider reached the former 5,000-token cap while emitting the required
+# evidence-rich JSON, leaving an otherwise successful response truncated mid-object.
+# This lane needs room for its web-grounded sources and structured contract; the
+# role-specific 180-second timeout still bounds the end-to-end request.
+STRATEGY_RESEARCH_MAX_OUTPUT_TOKENS = 8_000
 RELATIVE_STRENGTH_PROXY_DISCLOSURE = (
     "relative_strength_Nd는 같은 날짜의 PIT KRX 보통주 유니버스 평균 N일 수익률을 뺀 값이며, "
     "공식 KOSPI/KOSDAQ 지수 대비 수익률이 아님"
@@ -682,7 +687,7 @@ def _request(
         temperature=0.0,
         # This lane investigates several independent evidence angles before it seals
         # one rule. The wider budget is for research evidence, not a parameter search.
-        max_output_tokens=5000,
+        max_output_tokens=STRATEGY_RESEARCH_MAX_OUTPUT_TOKENS,
         enable_web_search=True,
         web_search_context_size="high",
         stream_response=False,
@@ -738,7 +743,7 @@ def _repair_request(
             sort_keys=True,
         ),
         temperature=0.0,
-        max_output_tokens=5000,
+        max_output_tokens=STRATEGY_RESEARCH_MAX_OUTPUT_TOKENS,
         enable_web_search=True,
         web_search_context_size="high",
         stream_response=False,

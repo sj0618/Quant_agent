@@ -17,7 +17,12 @@ from ai_graph.jobs import (
     classify_failure,
     create_analysis_job_store_from_env,
 )
-from ai_graph.llm.base import LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
+from ai_graph.llm.base import (
+    LLMConnectionError,
+    LLMHTTPStatusError,
+    LLMResponseParseError,
+    LLMTimeoutError,
+)
 from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.research_eligibility import PerformanceAvailable, PerformanceMethodManifest
 from ai_graph.schemas import (
@@ -66,6 +71,7 @@ def test_strategy_research_failure_keeps_its_typed_subcause() -> None:
     [
         (LLMTimeoutError("provider-secret-timeout"), "aoai_response_timeout", True),
         (LLMConnectionError("provider-secret-connect"), "aoai_connection_error", True),
+        (LLMResponseParseError("provider-secret-json"), "aoai_response_invalid_json", True),
         (LLMHTTPStatusError(400), "aoai_http_4xx", False),
         (
             LLMHTTPStatusError(400, provider_failure_hint="web_search_unsupported"),
@@ -74,7 +80,7 @@ def test_strategy_research_failure_keeps_its_typed_subcause() -> None:
         ),
         (LLMHTTPStatusError(503), "aoai_http_5xx", True),
     ],
-    ids=("timeout", "connection", "http_400", "web_search", "http_503"),
+    ids=("timeout", "connection", "invalid_json", "http_400", "web_search", "http_503"),
 )
 def test_strategy_research_provider_failure_preserves_safe_wrapped_aoai_cause(
     provider_error, expected_subcause: str, retryable: bool

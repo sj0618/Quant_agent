@@ -9,6 +9,7 @@ from ai_graph.llm.base import LLMConnectionError, LLMJsonRequest, LLMTimeoutErro
 from ai_graph.nodes import strategy_research
 from ai_graph.nodes.strategy_research import (
     RELATIVE_STRENGTH_PROXY_DISCLOSURE,
+    STRATEGY_RESEARCH_MAX_OUTPUT_TOKENS,
     StrategyResearchError,
     research_strategy_execution_spec,
 )
@@ -125,7 +126,7 @@ def test_unknown_strategy_uses_web_research_then_seals_the_researched_conditions
     assert request.web_search_context_size == "high"
     assert request.stream_response is False
     assert request.reasoning_effort == "medium"
-    assert request.max_output_tokens == 5000
+    assert request.max_output_tokens == STRATEGY_RESEARCH_MAX_OUTPUT_TOKENS
     assert request.max_tool_calls == 12
     assert request.task_type == "strategy_research_resolution"
     assert "Do not create Python, SQL" in request.system_prompt
@@ -149,6 +150,10 @@ def test_live_research_repairs_a_shallow_brief_before_signing(
         "strategy_research_resolution",
         "strategy_research_resolution_repair",
     ]
+    assert all(
+        request.max_output_tokens == STRATEGY_RESEARCH_MAX_OUTPUT_TOKENS
+        for request in client.requests
+    )
 
 
 def test_live_research_signs_a_deep_brief_with_research_selected_period(

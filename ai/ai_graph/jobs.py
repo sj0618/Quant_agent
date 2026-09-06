@@ -26,7 +26,13 @@ from ai_graph.analysis_capacity import (
 from ai_graph.data_sources.db import PipelineDataUnavailableError, resolve_database_dsn_from_env
 from ai_graph.exploration_policy import ExplorationPolicyUnavailableError
 from ai_graph.job_events import JobEventBuffer
-from ai_graph.llm import LLMClientError, LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
+from ai_graph.llm import (
+    LLMClientError,
+    LLMConnectionError,
+    LLMHTTPStatusError,
+    LLMResponseParseError,
+    LLMTimeoutError,
+)
 from ai_graph.llm.concurrency_gate import AOAIGateBusyError
 from ai_graph.nodes.strategy_research import StrategyResearchError
 from ai_graph.progress import (
@@ -1308,7 +1314,10 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
         (
             error
             for error in exception_chain
-            if isinstance(error, (LLMTimeoutError, LLMConnectionError, LLMHTTPStatusError))
+            if isinstance(
+                error,
+                (LLMTimeoutError, LLMConnectionError, LLMResponseParseError, LLMHTTPStatusError),
+            )
         ),
         None,
     )
@@ -1325,6 +1334,13 @@ def classify_failure(exc: Exception, *, stage: str) -> FailureDiagnostic:
             stage=failure_stage,
             retryable=True,
             safe_message="AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    if isinstance(typed_provider_failure, LLMResponseParseError):
+        return _aoai_failure_diagnostic(
+            subcause="aoai_response_invalid_json",
+            stage=failure_stage,
+            retryable=True,
+            safe_message="AI 응답이 완성된 결과 형식으로 도착하지 않았습니다. 잠시 후 다시 시도해 주세요.",
         )
     if isinstance(typed_provider_failure, LLMHTTPStatusError):
         subcause = (
@@ -1573,6 +1589,7 @@ def _aoai_failure_diagnostic(
     subcause: Literal[
         "aoai_response_timeout",
         "aoai_connection_error",
+        "aoai_response_invalid_json",
         "aoai_http_4xx",
         "aoai_http_5xx",
         "aoai_http_error",
@@ -1605,7 +1622,10 @@ def _research_provider_diagnostic(
         (
             error
             for error in exception_chain
-            if isinstance(error, (LLMTimeoutError, LLMConnectionError, LLMHTTPStatusError))
+            if isinstance(
+                error,
+                (LLMTimeoutError, LLMConnectionError, LLMResponseParseError, LLMHTTPStatusError),
+            )
         ),
         None,
     )
@@ -1622,6 +1642,13 @@ def _research_provider_diagnostic(
             stage=stage,
             retryable=True,
             safe_message="AI 제공자 연결에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+        )
+    if isinstance(typed_failure, LLMResponseParseError):
+        return _aoai_failure_diagnostic(
+            subcause="aoai_response_invalid_json",
+            stage=stage,
+            retryable=True,
+            safe_message="AI 응답이 완성된 결과 형식으로 도착하지 않았습니다. 잠시 후 다시 시도해 주세요.",
         )
     if isinstance(typed_failure, LLMHTTPStatusError):
         if typed_failure.provider_failure_hint == "web_search_unsupported":

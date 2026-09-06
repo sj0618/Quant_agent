@@ -78,6 +78,7 @@ FailureSubcause = Literal[
     # operator can distinguish an AOAI incident from a database incident without
     # exposing provider response bodies to API consumers.
     "aoai_connection_error",
+    "aoai_response_invalid_json",
     "aoai_http_4xx",
     "aoai_http_5xx",
     "aoai_http_error",

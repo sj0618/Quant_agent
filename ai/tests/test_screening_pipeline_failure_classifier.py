@@ -4,7 +4,12 @@ import pytest
 
 from ai_graph.data_sources import PipelineDataUnavailableError
 from ai_graph.jobs import AnalysisRunner, InMemoryAnalysisJobStore, classify_failure
-from ai_graph.llm import LLMConnectionError, LLMHTTPStatusError, LLMTimeoutError
+from ai_graph.llm import (
+    LLMConnectionError,
+    LLMHTTPStatusError,
+    LLMResponseParseError,
+    LLMTimeoutError,
+)
 from ai_graph.progress import report_node_stage
 from ai_graph.schemas import APIEnvelope, Stage
 
@@ -28,6 +33,7 @@ def test_untyped_connection_message_does_not_claim_a_database_timeout() -> None:
     [
         (LLMTimeoutError("private provider detail"), "aoai_response_timeout", True),
         (LLMConnectionError("private provider detail"), "aoai_connection_error", True),
+        (LLMResponseParseError("private provider detail"), "aoai_response_invalid_json", True),
         (LLMHTTPStatusError(429), "aoai_http_4xx", True),
         (LLMHTTPStatusError(400), "aoai_http_4xx", False),
         (LLMHTTPStatusError(503), "aoai_http_5xx", True),
@@ -50,6 +56,7 @@ def test_typed_provider_failures_preserve_safe_subcause(
     [
         (LLMTimeoutError("private provider detail"), "aoai_response_timeout", True),
         (LLMConnectionError("private provider detail"), "aoai_connection_error", True),
+        (LLMResponseParseError("private provider detail"), "aoai_response_invalid_json", True),
         (LLMHTTPStatusError(400), "aoai_http_4xx", False),
         (LLMHTTPStatusError(503), "aoai_http_5xx", True),
     ],
