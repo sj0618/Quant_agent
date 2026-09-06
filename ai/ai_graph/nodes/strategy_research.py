@@ -383,13 +383,14 @@ def _normalize_research_response_aliases(payload: object, *, query: str) -> obje
 
     if not isinstance(payload, dict):
         return payload
-    normalized = dict(payload)
+    normalized = _clamp_prose_fields(dict(payload), _ResearchResponse)
     raw_sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
     sources: list[object] = []
     source_id_map: dict[str, str] = {}
     for index, item in enumerate(raw_sources, start=1):
         source = _normalize_source_display_label(item)
         if isinstance(source, dict):
+            source = _clamp_prose_fields(source, _SourceDraft)
             original_id = source.get("source_id")
             normalized_id = f"source-{index}"
             if isinstance(original_id, str) and original_id:
@@ -404,6 +405,15 @@ def _normalize_research_response_aliases(payload: object, *, query: str) -> obje
     for index, item in enumerate(raw_candidates, start=1):
         candidate = _normalize_candidate_display_label(item, query=query)
         if isinstance(candidate, dict):
+            candidate = _clamp_prose_fields(candidate, _CandidateDraft)
+            falsifications = candidate.get("falsification_conditions")
+            if isinstance(falsifications, list):
+                candidate["falsification_conditions"] = [
+                    _clamp_prose_fields(entry, _FalsificationConditionDraft)
+                    if isinstance(entry, dict)
+                    else entry
+                    for entry in falsifications
+                ]
             candidate = _normalize_rank_percent_units(candidate)
             candidate = _normalize_market_relative_thresholds(candidate)
             candidate = _disclose_relative_strength_proxy(candidate)
@@ -419,6 +429,35 @@ def _normalize_research_response_aliases(payload: object, *, query: str) -> obje
     normalized["sources"] = sources
     normalized["candidates"] = candidates
     return normalized
+
+
+def _clamp_prose_fields(item: dict[str, object], model: type[BaseModel]) -> dict[str, object]:
+    """Trim free-text fields to the schema's max_length instead of rejecting the result.
+
+    A researched RSI rule that compiled cleanly was refused in production only because
+    ``expected_turnover`` ran to 401+ characters; the repair turn that followed rewrote
+    the rule itself into something the compiler could not run.  Prose limits bound the
+    report, they are not evidence about the strategy, so an over-long paragraph is cut
+    and the strategy-bearing fields (conditions, metrics, sources, periods) are left
+    for the strict schema and the compiler exactly as before.
+    """
+
+    clamped = dict(item)
+    for name, field in model.model_fields.items():
+        value = clamped.get(name)
+        if not isinstance(value, str):
+            continue
+        limit = next(
+            (
+                meta.max_length
+                for meta in field.metadata
+                if getattr(meta, "max_length", None) is not None
+            ),
+            None,
+        )
+        if limit is not None and len(value) > limit:
+            clamped[name] = value[: limit - 1].rstrip() + "…"
+    return clamped
 
 
 def _disclose_relative_strength_proxy(candidate: dict[str, object]) -> dict[str, object]:
