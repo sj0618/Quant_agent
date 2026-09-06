@@ -646,7 +646,9 @@ def research_screening_terms(*, query: str) -> dict[str, Any] | None:
 
     Formulas are researched rather than recalled: the previous design hardcoded how each
     metric is computed and blocked PER on a wrong assumption about needing a share
-    count. Returns None with no live provider so mock mode keeps its deterministic path.
+    count. Returns None with no live provider: nothing downstream requires this role's
+    answer, so the mock client does not answer it (resolve_strategy_intent is the one
+    role it does answer, because the period gate needs a model decision).
     """
 
     if not is_live_llm_provider():
@@ -795,8 +797,11 @@ def resolve_strategy_intent(
     This is the step that decides whether the user gets an answer or a question. Every
     stage after it reads `resolved_query` instead of the raw input, so the vagueness is
     resolved once, by a model that can search, rather than re-detected by keyword at
-    each stage. In mock mode the deterministic mock client answers this role, period
-    included, so the local profile runs end to end without a hidden default.
+    each stage. Unlike the sibling roles, which return None without a live provider,
+    the deterministic mock client answers this role too (period included): the data
+    loader refuses to run without a model-selected period, so the local profile could
+    not run end to end otherwise. Provider and configuration failures - an unsupported
+    AI_LLM_PROVIDER value included - raise in live mode and return None otherwise.
     """
 
     expected_json_schema = _LiveStrategyIntent.model_json_schema()
@@ -827,8 +832,8 @@ def resolve_strategy_intent(
         response_schema=expected_json_schema,
         variables_jsonb={**context, "expected_json_schema": expected_json_schema},
     )
-    client = create_llm_client(role="STRATEGY_INTENT")
     try:
+        client = create_llm_client(role="STRATEGY_INTENT")
         payload = client.generate_json(request)
         resolved = _LiveStrategyIntent.model_validate(payload)
     except ValidationError as first_error:
@@ -838,9 +843,10 @@ def resolve_strategy_intent(
         payload = client.generate_json(repair_request)
         resolved = _LiveStrategyIntent.model_validate(payload)
     except (LLMClientError, ValueError, TypeError):
-        # A provider/configuration failure cannot be replaced by a locally chosen
-        # period.  Live: the job fails and says so.  Otherwise the graph stops at its
-        # pre-loader period gate, which is retryable for the caller.
+        # A provider/configuration failure - an unsupported AI_LLM_PROVIDER value
+        # included, which is why create_llm_client sits inside this try - cannot be
+        # replaced by a locally chosen period.  Live: the job fails and says so.
+        # Otherwise the graph stops at its pre-loader period gate, which is retryable.
         if is_live_llm_provider():
             raise
         return None

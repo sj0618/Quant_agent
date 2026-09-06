@@ -101,6 +101,8 @@ def _candidate(**overrides: object) -> dict[str, object]:
         "required_metrics": ["volume_ratio_20"],
         "assumptions": ["KRX 일봉 종가 기준 다음 거래일 시가 체결을 가정합니다."],
         "source_ids": ["source-1"],
+        "backtest_years": 2,
+        "backtest_period_basis": "테스트 AI가 데이터 조회 전에 2년을 선택했습니다.",
     }
     payload.update(overrides)
     return payload

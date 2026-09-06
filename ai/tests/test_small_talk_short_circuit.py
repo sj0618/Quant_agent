@@ -15,7 +15,7 @@ from ai_graph.research_contract import RuleDraftSigner, build_rule_draft
 from ai_graph.schemas import EnvelopeStatus
 
 NO_STRATEGY_INTENT_QUESTION = "어떤 투자 전략이나 매매 조건을 분석할까요?"
-INPUT_AMBIGUOUS_QUESTION = "먼저 어떤 후보 전략으로 구체화할까요?"
+RESEARCH_FIRST_QUESTION = "최신 애널리스트 리포트를 조사해 백테스트 후보를 도출하겠습니다."
 
 
 class _RefusingClient:
@@ -67,12 +67,16 @@ def test_small_talk_clarification_asks_what_to_analyse_not_which_candidate() -> 
     assert envelope.user_payload.recommended is None
 
 
-def test_a_real_strategy_request_keeps_the_candidate_clarification_question() -> None:
+def test_a_real_strategy_request_gets_the_research_first_answer_not_the_greeting() -> None:
+    """A real request that cannot be sealed from keywords is answered with the
+    research-first message (no static candidate menu), never with the greeting."""
+
     query = "RSI가 30 이하인 KRX 종목을 검토해 주세요."
     draft = build_rule_draft(query=query, user_id="user-1", signer=_signer(), use_llm=False)
 
     envelope = _clarification_envelope(draft, query=query, trace_id="trace-2")
 
     assert draft.is_executable is False
-    assert envelope.user_payload.question == INPUT_AMBIGUOUS_QUESTION
+    assert envelope.user_payload.question == RESEARCH_FIRST_QUESTION
+    assert envelope.user_payload.question != NO_STRATEGY_INTENT_QUESTION
     assert envelope.user_payload.options

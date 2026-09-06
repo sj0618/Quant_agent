@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from hashlib import sha256
 from typing import Any, Literal
 
@@ -29,7 +30,6 @@ DEFAULT_ASSUMPTIONS: dict[str, str] = {
 
 MIN_CONFIRMED_CONFIDENCE = 0.72
 MISSING_FIELD_PENALTY = 0.16
-REJECTION_TERMS = ("가상화폐", "crypto", "선물", "옵션", "fx", "외환")
 
 
 class AmbiguityResult(BaseModel):
@@ -69,7 +69,7 @@ def classify_ambiguity(
         for field_name, keywords in REQUIRED_FIELD_KEYWORDS.items()
         if not any(keyword in lowered for keyword in keywords)
     ]
-    rejected = any(term in lowered for term in REJECTION_TERMS)
+    rejected = is_unsupported_asset_class(normalized_query)
     confidence = max(0.0, 0.95 - (len(missing_fields) * MISSING_FIELD_PENALTY))
     status: AmbiguityStatus
     if rejected:
@@ -116,7 +116,7 @@ def _trace_id(value: str) -> str:
 
 
 def classify_query(query: str) -> AmbiguityCode:
-    """The fallback used only when no model is available to interpret the request.
+    """The two refusals decided by keyword before - or instead of - a model.
 
     It deliberately answers two questions and not the others: is this small talk, and
     is this an asset class the warehouse can price. Everything it used to decide by
@@ -125,6 +125,10 @@ def classify_query(query: str) -> AmbiguityCode:
     resolve_strategy_intent, which can search and then commit. Matching phrases here
     only ever produced questions for inputs a person would have had no trouble acting
     on.
+
+    Callers: the graph when no model decision is available, the rule-draft and
+    clarification paths (api.py, research_contract.py), and - asset-class half only -
+    the deterministic mock model.
     """
 
     if is_small_talk(query):
@@ -132,18 +136,42 @@ def classify_query(query: str) -> AmbiguityCode:
     return AmbiguityCode.INFEASIBLE if is_unsupported_asset_class(query) else AmbiguityCode.READY
 
 
-def is_unsupported_asset_class(query: str) -> bool:
-    lowered = query.lower()
-    return any(
-        term in lowered for term in ("옵션", "양매도", "선물", "crypto", "가상화폐", "비트코인")
+# Derivatives, FX and crypto, phrased as the trading terms rather than the bare nouns:
+# 선물 is also "gift" and 옵션 is also "setting" ("부모님께 선물할 배당주", "리밸런싱
+# 옵션을 월간으로"), so a bare substring refused ordinary cash-equity requests.
+_UNSUPPORTED_ASSET_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"가상\s*(?:화폐|자산)",
+        r"암호\s*화폐",
+        r"crypto",
+        r"크립토",
+        r"비트코인",
+        r"이더리움",
+        r"코인\s*(?:선물|거래|투자|마진)",
+        r"(?:지수|코스피\s*\d*|코스닥\s*\d*|주가|달러|미니|야간|통화|금리|원유)\s*선물",
+        r"선물\s*(?:거래|매도|매수|옵션|시장|포지션|롱|숏|전략|투자|스프레드|만기|헤지)",
+        r"선옵",
+        r"(?:콜|풋)\s*옵션",
+        r"옵션\s*(?:매도|매수|거래|전략|양매도|프리미엄|만기|투자|시장|헤지)",
+        r"양매[도수]",
+        r"\bfx\b",
+        r"fx\s*마진",
+        r"외환\s*(?:거래|투자|마진|전략|선물)",
     )
+)
+
+
+def is_unsupported_asset_class(query: str) -> bool:
+    lowered = " ".join(query.split()).lower()
+    return any(pattern.search(lowered) for pattern in _UNSUPPORTED_ASSET_PATTERNS)
 
 
 # Greetings, thanks and idle questions - a backtest is not an answer to any of them.
+# Matched as substrings, so only stems that do not begin an ordinary noun belong here.
 _SMALL_TALK_TERMS = (
     "안녕",
     "ㅎㅇ",
-    "하이",
     "반가",
     "고마",
     "감사",
@@ -157,12 +185,32 @@ _SMALL_TALK_TERMS = (
     "뭐 해",
     "뭐해",
     "심심",
+    "주말",
+    "좋은 하루",
+    "굿모닝",
 )
-# Anything the warehouse can act on. Present only to keep the check above from firing
-# on a real request that happens to be polite.
+# Greetings that are also the first syllables of a listed name (하이닉스, 하이브):
+# whole words only.
+_SMALL_TALK_WORDS = frozenset({"하이", "하이하이", "하이요", "헬로", "안뇽"})
+# Anything the warehouse can act on, plus the verbs that make a message a request.
+# Present only to keep the check above from firing on a real request that happens to
+# be polite or to contain a greeting stem ("감사보고서", "수고비").
 _MARKET_TERMS = (
-    "주",
+    "주식",
+    "주가",
+    "관련주",
+    "배당주",
+    "성장주",
+    "가치주",
+    "저평가주",
+    "우량주",
+    "테마주",
+    "대형주",
+    "소형주",
+    "급등주",
     "종목",
+    "기업",
+    "회사",
     "매수",
     "매도",
     "전략",
@@ -176,6 +224,20 @@ _MARKET_TERMS = (
     "배당",
     "실적",
     "지수",
+    "단타",
+    "스윙",
+    "사줘",
+    "사고",
+    "팔아",
+    "골라",
+    "찾아",
+    "추천",
+    "분석",
+    "검토",
+    "검증",
+    "만들어",
+    "설정",
+    "알아서",
     "stock",
     "buy",
     "sell",
@@ -191,11 +253,13 @@ def is_small_talk(query: str) -> bool:
     of strategy words. An allowlist decides by what it fails to recognise, so
     "화학 관련주 사줘" - a perfectly clear request naming no listed keyword - came back
     as a greeting. Every uncertain input must fall through to the analysis; the cost of
-    running one is a wasted job, the cost of refusing one is the user's answer.
+    running one is a wasted job, the cost of refusing one is the user's answer. That is
+    also why the length cap stays: a long message with a greeting inside is far more
+    often a request than a greeting.
 
     Only consulted for the obvious cases, and before the model is called so a greeting
     does not pay for a web search. Live runs let resolve_strategy_intent decide; the
-    mock model reuses classify_query so both providers refuse the same inputs.
+    mock model does not repeat this check because the graph has already applied it.
     """
 
     normalized = " ".join(query.split()).lower()
@@ -203,4 +267,6 @@ def is_small_talk(query: str) -> bool:
         return False
     if any(term in normalized for term in _MARKET_TERMS):
         return False
-    return any(term in normalized for term in _SMALL_TALK_TERMS)
+    if any(term in normalized for term in _SMALL_TALK_TERMS):
+        return True
+    return any(token.strip("!?.,~^") in _SMALL_TALK_WORDS for token in normalized.split())

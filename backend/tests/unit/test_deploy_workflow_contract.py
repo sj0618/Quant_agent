@@ -5,6 +5,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEPLOY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "deploy.yml"
 HEALTH_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "server-health.yml"
 SMOKE_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "production-backtest-smoke.yml"
+RECOVER_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "recover-backend-fe.yml"
 READINESS_GATE = REPOSITORY_ROOT / "scripts" / "readiness-semantic-gate.mjs"
 AI_API_SOURCE = REPOSITORY_ROOT / "ai" / "ai_graph" / "api.py"
 EMAIL_WORKER_MANAGER = REPOSITORY_ROOT / "backend" / "scripts" / "manage_email_delivery_worker.sh"
@@ -160,6 +161,7 @@ def test_the_readiness_gate_ai_profile_tracks_the_ai_api_dependency_set():
         "live_provider_configuration",
         "ai_contract_version",
         "rule_draft_signer",
+        "backtest_evaluation_cache",
     ]
     assert _gate_ai_profile_names() == ai_checks
 
@@ -224,7 +226,7 @@ def test_public_ai_readiness_smoke_uses_the_ai_dependency_set():
     smoke = SMOKE_WORKFLOW.read_text(encoding="utf-8")
 
     assert "public-ai-readiness" in smoke
-    assert "ai_required_checks='durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer'" in smoke
+    assert "ai_required_checks='durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer,backtest_evaluation_cache'" in smoke
     assert '--label public-ai-readiness --checks "$ai_required_checks"' in smoke
 
 
@@ -261,6 +263,27 @@ def test_failure_rollback_restores_ai_readiness_runtime():
     assert "npm ci" not in rollback
     assert "npm run build" not in rollback
     assert "stop_listeners_on_port() {" not in rollback
+
+
+def _release_runtime_exports(workflow_text: str) -> set[str]:
+    block = workflow_text.split("export APP_ENV=production", maxsplit=1)[1].split("nohup ", maxsplit=1)[0]
+    return set(re.findall(r"^\s*export ([A-Z0-9_]+)", block, re.MULTILINE)) | {"APP_ENV"}
+
+
+def test_recovery_exports_the_same_release_runtime_env_as_deploy_before_starting_the_ai_service():
+    """The recovery script is a hand copy of deploy's runtime env block. A variable that
+    deploy exports and recovery forgets fails every job after a recovery restart, which
+    is how AI_BACKTEST_CACHE_DIR took production down at the Backtest node."""
+
+    deploy = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    recovery = RECOVER_WORKFLOW.read_text(encoding="utf-8")
+
+    assert _release_runtime_exports(recovery) >= _release_runtime_exports(deploy)
+    assert 'export AI_BACKTEST_CACHE_DIR="$RUN_DIR/backtest-cache"' in recovery
+    assert recovery.index('export AI_BACKTEST_CACHE_DIR="$RUN_DIR/backtest-cache"') < recovery.index(
+        'nohup "$PYTHON" -m uvicorn combined_main:app'
+    )
+    assert recovery.index("umask 077") < recovery.index('mkdir -p "$RUN_DIR/backtest-cache"')
 
 
 def test_deploy_exports_a_persistent_backtest_cache_dir_before_starting_the_ai_service():

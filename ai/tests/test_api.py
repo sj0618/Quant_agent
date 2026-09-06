@@ -251,6 +251,37 @@ def test_release_readiness_requires_a_rule_draft_signer() -> None:
     }
 
 
+def test_release_readiness_requires_a_persistent_backtest_cache_dir(monkeypatch, tmp_path) -> None:
+    """Every launcher could forget AI_BACKTEST_CACHE_DIR and still pass readiness; the
+    first backtest then failed. Readiness now mirrors the cache's own release gate."""
+
+    _configure_live_provider(monkeypatch)
+    monkeypatch.setenv("AI_RELEASE_PROFILE", "release")
+    monkeypatch.delenv("AI_BACKTEST_CACHE_DIR", raising=False)
+    client = TestClient(
+        create_app(
+            job_store_runtime=_persistent_job_store_runtime(),
+            readiness_migration_probe=lambda: True,
+            rule_draft_signer=RuleDraftSigner("test-rule-draft-secret"),
+        )
+    )
+
+    missing = client.get(READINESS_PATH)
+    assert missing.status_code == 503
+    checks = {check["name"]: check for check in missing.json()["checks"]}
+    assert checks["backtest_evaluation_cache"] == {
+        "name": "backtest_evaluation_cache",
+        "ready": False,
+        "reason": "backtest_cache_dir_required",
+    }
+
+    monkeypatch.setenv("AI_BACKTEST_CACHE_DIR", str(tmp_path / "backtest-cache"))
+    ready = client.get(READINESS_PATH)
+    assert ready.status_code == 200
+    checks = {check["name"]: check for check in ready.json()["checks"]}
+    assert checks["backtest_evaluation_cache"]["ready"] is True
+
+
 def test_release_readiness_requires_live_aoai_configuration(monkeypatch) -> None:
     monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
     client = TestClient(

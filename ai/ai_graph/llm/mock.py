@@ -7,8 +7,8 @@ from typing import Any
 from ai_graph.audit import begin_model_call, finish_model_call
 from ai_graph.llm.base import LLMJsonRequest
 from ai_graph.llm.prompts import BACKTEST_CODE_SCHEMA_NAME
-from ai_graph.nodes.ambiguity import classify_query
-from ai_graph.schemas import AmbiguityCode, StrategySpec
+from ai_graph.nodes.ambiguity import is_unsupported_asset_class
+from ai_graph.schemas import StrategySpec
 
 SAFE_RSI_CODE = '''def build_signals(prices):
     signals = []
@@ -661,8 +661,10 @@ PULLBACK_RSI40_VOLUME_CANDIDATES = [
 
 MOCK_BACKTEST_YEARS = 2
 MOCK_BACKTEST_PERIOD_BASIS = (
-    "mock 모드의 결정론 기간입니다: fixture 구간 기준 2년. 실제 리서치로 고른 값이 아닙니다."
+    f"오프라인 결정론 프로필의 고정 기간({MOCK_BACKTEST_YEARS}년)입니다. "
+    "리서치로 선택한 값이 아닙니다."
 )
+MOCK_UNSUPPORTED_SCOPE_REASON = "옵션·선물·가상자산은 KRX 현물 데이터로 검증할 수 없습니다."
 
 
 def _mock_strategy_intent_payload(request: LLMJsonRequest) -> dict[str, Any]:
@@ -670,24 +672,33 @@ def _mock_strategy_intent_payload(request: LLMJsonRequest) -> dict[str, Any]:
 
     The data loader refuses to run without a period the model selected and justified.
     The mock model therefore selects one too - visibly, as a recorded model decision
-    with a basis that says it is a fixture value - instead of the graph quietly falling
-    back to a local default. Scope reuses the same small-talk / asset-class judgement
-    the live path applies before calling a model, so both refuse the same inputs.
+    whose basis says it is a fixture value and whose period is sealed with
+    selection_source="mock_fixture" by the graph - instead of the graph quietly
+    falling back to a local default. The strings here reach the user (progress
+    stream, envelope), so they describe the decision, not the provider mode.
+
+    Only the asset-class half of the keyword judgement is repeated here: the graph
+    has already refused small talk before it calls a model. The refusal shape mirrors
+    the live contract - resolved_query empty and a Korean scope_reason.
     """
 
     query = str(request.variables_jsonb.get("query") or "")
-    category = classify_query(query)
-    if category == AmbiguityCode.NO_STRATEGY_INTENT:
-        scope = "not_a_request"
-    elif category == AmbiguityCode.INFEASIBLE:
-        scope = "unsupported"
-    else:
-        scope = "supported"
+    if is_unsupported_asset_class(query):
+        return {
+            "interpretation": "KRX 현물 주식이 아닌 자산군에 대한 요청입니다.",
+            "resolved_query": "",
+            "assumptions": [],
+            "scope": "unsupported",
+            "scope_reason": MOCK_UNSUPPORTED_SCOPE_REASON,
+            "citations": [],
+            "backtest_years": MOCK_BACKTEST_YEARS,
+            "backtest_period_basis": MOCK_BACKTEST_PERIOD_BASIS,
+        }
     return {
-        "interpretation": "mock 모드: 입력한 조건을 그대로 실행 조건으로 사용합니다.",
+        "interpretation": "입력한 조건을 그대로 실행 조건으로 사용합니다.",
         "resolved_query": query,
-        "assumptions": [f"mock 모드에서는 백테스트 기간을 {MOCK_BACKTEST_YEARS}년으로 고정합니다."],
-        "scope": scope,
+        "assumptions": [f"백테스트 기간은 {MOCK_BACKTEST_YEARS}년으로 고정합니다."],
+        "scope": "supported",
         "scope_reason": "",
         "citations": [],
         "backtest_years": MOCK_BACKTEST_YEARS,
@@ -722,25 +733,12 @@ class MockLLMClient:
                 result = _mock_role_debate_payload(
                     "리포트 작성(mock): 백테스트 결과와 데이터 가용성을 함께 제시합니다."
                 )
-            elif request.schema_name.startswith("quantagent.screening_research"):
-                result = {
-                    "strategy_reading": "mock 모드에서는 용어 리서치를 수행하지 않습니다.",
-                    "metrics": [],
-                    "citations": [],
-                }
             elif request.schema_name.startswith("quantagent.strategy_intent"):
                 result = _mock_strategy_intent_payload(request)
-            elif request.schema_name.startswith("quantagent.strategy_revision"):
-                # Nothing to revise deterministically; report no change.
-                result = {
-                    "changed": False,
-                    "rationale": "mock 모드에서는 조건을 수정하지 않습니다.",
-                    "entry_conditions": [],
-                    "exit_conditions": [],
-                    "indicators": [],
-                    "confidence": 0.5,
-                }
             else:
+                # Every other role returns None before creating a client when no live
+                # provider is configured (role_calls.py), so reaching this branch means
+                # a role started calling the mock without a deterministic payload here.
                 result = {"fallback_reasons": [f"unsupported mock schema: {request.schema_name}"]}
         except Exception as exc:
             finish_model_call(

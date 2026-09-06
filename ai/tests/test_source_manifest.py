@@ -195,9 +195,41 @@ def test_release_profile_fails_before_fixture_analysis_can_return_a_result(
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("AI_RELEASE_PROFILE", "release")
     monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
+    # A researched period gets past the period-source gate so the data-source gate
+    # itself is what refuses here (the mock's fixture period is refused earlier; see
+    # the next test).
+    monkeypatch.setattr(
+        "ai_graph.graph.resolve_strategy_intent",
+        lambda **_kwargs: {
+            "scope": "supported",
+            "scope_reason": "",
+            "resolved_query": "RSI가 30 이하인 KOSPI200 종목",
+            "interpretation": "테스트 AI가 요청을 실행 조건으로 확정했습니다.",
+            "assumptions": [],
+            "citations": [],
+            "backtest_years": 2,
+            "backtest_period_basis": "테스트 AI가 데이터 조회 전에 범위를 확정했습니다.",
+            "selection_source": "ai_research",
+        },
+    )
 
     with pytest.raises(
         PipelineDataUnavailableError,
         match="운영 환경에서는 로컬 fixture 데이터로 분석할 수 없습니다",
     ):
         run_analysis("RSI가 30 이하인 KOSPI200 종목", trace_id="trace-release-manifest")
+
+
+def test_release_profile_refuses_a_mock_period_before_reading_any_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for env_name in ("AI_DATABASE_DSN", "QUANT_DB_DSN", "DATABASE_URL"):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("AI_RELEASE_PROFILE", "release")
+    monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
+
+    with pytest.raises(
+        PipelineDataUnavailableError,
+        match="운영 환경에서는 AI가 리서치로 선택한 백테스트 기간만 사용할 수 있습니다",
+    ):
+        run_analysis("RSI가 30 이하인 KOSPI200 종목", trace_id="trace-release-mock-period")

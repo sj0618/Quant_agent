@@ -44,6 +44,7 @@ from ai_graph.freshness import (
     build_freshness_evidence,
     freshness_status_from_metadata,
 )
+from ai_graph.llm import is_live_llm_provider
 from ai_graph.llm.role_calls import (
     StrategyConditionsPayload,
     generate_analyst_strategy_candidates,
@@ -612,11 +613,17 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
                     "interpretation": "AI 리서치로 봉인한 실행 조건을 적용합니다.",
                     "backtest_years": candidate.backtest_years,
                     "backtest_period_basis": candidate.backtest_period_basis,
+                    "selection_source": "sealed_spec",
                 },
             )
         # A legacy confirmed rule seals entry/exit only.  It still needs the same
         # one-time AI period selection before the data loader can run.
         intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
+        if intent is not None and intent["scope"] == "unsupported":
+            # A confirmed rule does not override the asset-class gate: the model's
+            # refusal used to be discarded here and the run went on to backtest an
+            # asset the warehouse cannot price.
+            return _ambiguity_state(AmbiguityCode.INFEASIBLE, query, intent=intent)
         if intent is not None:
             intent = {**intent, "resolved_query": query}
         report_activity("step", label="요청 해석 완료", detail="사용자가 확인한 실행 조건을 적용합니다.")
@@ -679,7 +686,9 @@ def _ambiguity_state(
     if category == AmbiguityCode.READY and intent is not None:
         output["resolved_query"] = str(intent["resolved_query"])
         try:
-            output["backtest_period"] = _backtest_period_from_intent(intent)
+            output["backtest_period"] = _backtest_period_from_intent(
+                intent, selection_source=_intent_period_source(intent)
+            )
         except ValueError:
             # Keep the malformed payload for a typed data-node failure.  This makes
             # the failure occur before the loader, rather than hiding it behind an
@@ -726,7 +735,22 @@ def _strategy_query(state: Mapping[str, Any]) -> str:
     return str(state.get("resolved_query") or state.get("user_query") or "")
 
 
-def _backtest_period_from_intent(intent: Mapping[str, Any]) -> dict[str, Any]:
+# Who chose the history window. Only the first two are model decisions; data_node
+# refuses anything else under a release profile so a fixture period can never be
+# recorded as research.
+_MODEL_SELECTED_PERIOD_SOURCES = frozenset({"ai_research", "sealed_spec"})
+
+
+def _intent_period_source(intent: Mapping[str, Any]) -> str:
+    explicit = str(intent.get("selection_source") or "").strip()
+    if explicit:
+        return explicit
+    return "ai_research" if is_live_llm_provider() else "mock_fixture"
+
+
+def _backtest_period_from_intent(
+    intent: Mapping[str, Any], *, selection_source: str = "ai_research"
+) -> dict[str, Any]:
     years = intent.get("backtest_years")
     if isinstance(years, bool) or not isinstance(years, int) or not 1 <= years <= 5:
         raise ValueError("AI가 백테스트 기간을 1~5년 정수로 확정하지 못했습니다.")
@@ -735,7 +759,7 @@ def _backtest_period_from_intent(intent: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("AI가 선택한 백테스트 기간의 근거를 제공하지 않았습니다.")
     return {
         "backtest_years": years,
-        "selection_source": "ai_research",
+        "selection_source": selection_source,
         "period_locked": True,
         "basis": basis,
     }
@@ -747,7 +771,10 @@ def _backtest_period_for_state(state: Mapping[str, Any]) -> dict[str, Any]:
     existing = state.get("backtest_period")
     if isinstance(existing, Mapping):
         try:
-            period = _backtest_period_from_intent(existing)
+            period = _backtest_period_from_intent(
+                existing,
+                selection_source=str(existing.get("selection_source") or "ai_research"),
+            )
         except ValueError:
             period = None
         if period is not None and existing.get("period_locked") is True:
@@ -761,11 +788,14 @@ def _backtest_period_for_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 {
                     "backtest_years": candidate.backtest_years,
                     "backtest_period_basis": candidate.backtest_period_basis,
-                }
+                },
+                selection_source="sealed_spec",
             )
     intent = state.get("intent")
     if isinstance(intent, Mapping):
-        return _backtest_period_from_intent(intent)
+        return _backtest_period_from_intent(
+            intent, selection_source=_intent_period_source(intent)
+        )
     raise ValueError("AI가 백테스트 기간을 확정하지 못했습니다. 다시 시도해 주세요.")
 
 
@@ -829,6 +859,15 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
         else None
     )
+    if is_release_profile() and backtest_period["selection_source"] not in _MODEL_SELECTED_PERIOD_SOURCES:
+        # A mock/fixture period is sealed and labelled in non-release profiles so the
+        # deterministic pipeline runs end to end; a release profile must never read
+        # history for a window no model researched.
+        raise PipelineDataUnavailableError(
+            "production_period_source_forbidden",
+            "운영 환경에서는 AI가 리서치로 선택한 백테스트 기간만 사용할 수 있습니다. "
+            "실제 LLM 제공자 설정을 확인해 주세요.",
+        )
     if is_release_profile() and ACTIVE_DATA_SOURCE_VARIANT != "db":
         raise PipelineDataUnavailableError(
             "production_data_source_variant_forbidden",

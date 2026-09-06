@@ -962,6 +962,28 @@ class BacktestCacheConfigurationError(RuntimeError):
     """Raised when the disk cache directory is not configured under a release profile."""
 
 
+def backtest_cache_ready() -> tuple[bool, str | None]:
+    """Readiness probe mirroring _DiskEvaluationCache's precondition.
+
+    The cache used to be checked only when the first backtest ran, so a launcher that
+    forgot AI_BACKTEST_CACHE_DIR passed /readiness and failed on the first user job.
+    """
+
+    configured = os.getenv(BACKTEST_CACHE_DIR_ENV)
+    if not configured:
+        if is_release_profile():
+            return False, "backtest_cache_dir_required"
+        return True, None
+    root = Path(configured)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False, "backtest_cache_dir_unwritable"
+    if not os.access(root, os.W_OK):
+        return False, "backtest_cache_dir_unwritable"
+    return True, None
+
+
 class _DiskEvaluationCache:
     def __init__(self) -> None:
         configured = os.getenv(BACKTEST_CACHE_DIR_ENV)
