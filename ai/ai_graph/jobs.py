@@ -1070,7 +1070,10 @@ def _manifest_from_completion(manifest: ExecutionManifest, result_envelope: APIE
     events = _events_from_storage_ledger(ledger, completed_at)
     source_count = int(ledger.get("source_event_count", -1))
     source_hash = str(ledger.get("source_event_hash", ""))
-    if source_count != _event_count(events) or source_hash != _stable_hash(_ledger_source(ledger)):
+    # Per-bar signals are counted and hashed into the ledger digest but never copied
+    # into the manifest: see _events_from_storage_ledger.
+    persisted_count = _event_count(events) + len(_ledger_records(ledger, "signals"))
+    if source_count != persisted_count or source_hash != _stable_hash(_ledger_source(ledger)):
         raise JobStoreConfigurationError("storage execution ledger count/hash reconciliation failed.")
     return manifest.model_copy(update={"events": events, "ledger_event_count": source_count, "ledger_event_hash": source_hash, "policy_hashes": _policy_hashes(result_envelope, {}, ledger.get("order_audit", []), strategy_id=manifest.run_identity.strategy_id)})
 
@@ -1086,15 +1089,26 @@ def _storage_ledger(result_envelope: APIEnvelope) -> Mapping[str, Any] | None:
     return ledger if isinstance(ledger, Mapping) else None
 
 
+def _ledger_records(ledger: Mapping[str, Any], name: str) -> list[Mapping[str, Any]]:
+    value = ledger.get(name, [])
+    return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
 def _events_from_storage_ledger(ledger: Mapping[str, Any], occurred_at: datetime) -> ExecutionEvents:
-    def records(name: str) -> list[Mapping[str, Any]]:
-        value = ledger.get(name, [])
-        return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+    """Map the ledger's order/fill/position/trade/equity records into manifest events.
+
+    `signals` is deliberately left empty. It is one record per ticker per bar, so a
+    multi-year screening run carries ~1e5 entries (20 MB of JSONB) - the job row became
+    21 MB, the completion upsert hit the statement timeout, and the job sat in
+    finalizing forever. The list stays in DEBUG_STORE (its source); the manifest keeps
+    the ledger digest (`ledger_event_count` / `ledger_event_hash`), which already covers
+    every signal, and the executions that reconstruct cost and quantity.
+    """
 
     def mapped(name: str, prefix: str) -> list[ExecutionEvent]:
-        return [_audit_execution_event(event, f"{prefix}:{index}", _event_timestamp(event.get("exit_date", event.get("date")), occurred_at)) for index, event in enumerate(records(name))]
+        return [_audit_execution_event(event, f"{prefix}:{index}", _event_timestamp(event.get("exit_date", event.get("date")), occurred_at)) for index, event in enumerate(_ledger_records(ledger, name))]
 
-    return ExecutionEvents(signals=mapped("signals", "signal"), orders=mapped("order_audit", "order"), fills=mapped("fills", "fill"), positions=mapped("positions", "position"), trades=mapped("trades", "trade"), equity=mapped("equity", "equity"))
+    return ExecutionEvents(orders=mapped("order_audit", "order"), fills=mapped("fills", "fill"), positions=mapped("positions", "position"), trades=mapped("trades", "trade"), equity=mapped("equity", "equity"))
 
 
 def _event_count(events: ExecutionEvents) -> int:

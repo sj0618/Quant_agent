@@ -813,6 +813,11 @@ class PostgresAnalysisJobRepository:
 
     def _save(self, job: AnalysisJob) -> None:
         with self._connect() as connection:
+            # This write is the job's terminal state. A statement timeout inherited by the
+            # session (none is configured for the role, database, or DSN, yet production
+            # saw `QueryCanceled` here) would leave the row RUNNING/finalizing forever, so
+            # the upsert runs without one. Transaction-local: gone at commit.
+            connection.execute("SET LOCAL statement_timeout = 0")
             connection.execute(
                 """
                 INSERT INTO app.ai_analysis_job (
