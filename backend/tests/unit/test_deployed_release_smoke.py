@@ -68,7 +68,8 @@ def test_smoke_workflow_follows_the_deploy_and_targets_the_release_it_starts():
     assert "readiness-semantic-gate.mjs" in workflow
     assert "auth/google" not in workflow
     assert "qt-agent.kro.kr:38010" not in workflow
-    assert re.search(r"--expect ready", workflow)
+    assert "SMOKE_EXPECT: ${{ inputs.expect || 'ready' }}" in workflow
+    assert re.search(r'--expect "\$EXPECT"', workflow)
     # ssh does not re-quote its arguments for the remote login shell: the query (which
     # legitimately contains parentheses, spaces and Korean) must never be passed raw.
     assert '"$SMOKE_QUERY" <<' not in workflow

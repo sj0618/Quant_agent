@@ -23,7 +23,9 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-DEFAULT_QUERY = "RSI(14)가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 파는 전략"
+# Names a market (코스피), not an index: "KOSPI200 종목" is a point-in-time membership
+# filter the research grammar cannot seal, so it is refused with need_clarification.
+DEFAULT_QUERY = "RSI(14)가 30 이하로 떨어진 코스피 종목을 사고, 70 이상이면 파는 전략"
 DEFAULT_EXPECTED_STATUSES = ("ready",)
 
 
@@ -48,6 +50,25 @@ def evaluate_job(job: Any, expected_statuses: tuple[str, ...]) -> tuple[bool, st
     failure = result.get("failure_cause") or {}
     detail = failure.get("failure_stage") or failure.get("category") or ""
     return False, f"status={status} headline={headline!r} message={message!r} failure={detail!r}"
+
+
+def clarification_details(job: Any) -> str:
+    """What the release asked back or refused: the diagnosis for a non-ready result."""
+
+    result = (job.get("result") or {}) if isinstance(job, dict) else {}
+    payload = result.get("user_payload") or {}
+    ambiguity = result.get("ambiguity") or {}
+    lines = []
+    if payload.get("question"):
+        lines.append(f"question={payload['question']!r}")
+    for action in payload.get("next_actions") or []:
+        lines.append(f"next_action={action!r}")
+    labels = [o.get("label") for o in (payload.get("options") or []) if isinstance(o, dict)]
+    if labels:
+        lines.append(f"options={labels!r}")
+    if ambiguity.get("reason"):
+        lines.append(f"ambiguity={ambiguity.get('category')!r} reason={ambiguity['reason']!r}")
+    return "\n".join(f"[smoke]   {line}" for line in lines)
 
 
 def stage_summary(job: Any) -> str:
@@ -100,21 +121,32 @@ async def _session_store():
     return AuthSessionStore(client, settings), client, settings.auth_session_cookie_name
 
 
-async def mint_session(user_id: str) -> tuple[str, str, Any, Any]:
+async def _close(client: Any) -> None:
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if close is not None:
+        result = close()
+        if asyncio.iscoroutine(result):
+            await result
+
+
+# Each asyncio.run() is its own event loop and a redis-py connection is bound to the
+# loop that opened it, so mint and revoke each open and close their own client; the
+# session itself lives in Redis, not in the client.
+async def mint_session(user_id: str) -> tuple[str, str]:
     store, client, cookie_name = await _session_store()
-    session_id, _csrf = await store.create_session(user_id=user_id)
-    return cookie_name, session_id, store, client
+    try:
+        session_id, _csrf = await store.create_session(user_id=user_id)
+    finally:
+        await _close(client)
+    return cookie_name, session_id
 
 
-async def revoke_session(store: Any, client: Any, session_id: str) -> None:
+async def revoke_session(session_id: str) -> None:
+    store, client, _cookie_name = await _session_store()
     try:
         await store.revoke_session(session_id)
     finally:
-        close = getattr(client, "aclose", None) or getattr(client, "close", None)
-        if close is not None:
-            result = close()
-            if asyncio.iscoroutine(result):
-                await result
+        await _close(client)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -123,7 +155,7 @@ def run(args: argparse.Namespace) -> int:
     user_id = f"qa-smoke:{args.run_label}"
     expected = tuple(s.strip() for s in args.expect.split(",") if s.strip())
 
-    cookie_name, session_id, store, client = asyncio.run(mint_session(user_id))
+    cookie_name, session_id = asyncio.run(mint_session(user_id))
     print(f"[smoke] minted session for {user_id} (cookie {cookie_name})")
     job_id: str | None = None
     try:
@@ -160,11 +192,18 @@ def run(args: argparse.Namespace) -> int:
 
         passed, reason = evaluate_job(job, expected)
         print(f"[smoke] {'PASS' if passed else 'FAIL'} job={job_id} {reason}")
+        if not passed:
+            details = clarification_details(job)
+            if details:
+                print(details)
         print(json.dumps({"job_id": job_id, "passed": passed, "reason": reason, "stages": stage_summary(job)}, ensure_ascii=False))
         return 0 if passed else 6
     finally:
-        asyncio.run(revoke_session(store, client, session_id))
-        print("[smoke] session revoked")
+        try:
+            asyncio.run(revoke_session(session_id))
+            print("[smoke] session revoked")
+        except Exception as exc:  # noqa: BLE001 - the verdict above must not be masked
+            print(f"[smoke] session revoke failed ({type(exc).__name__}: {exc}); it expires by TTL")
 
 
 def main(argv: list[str] | None = None) -> int:
