@@ -4,10 +4,9 @@ import { Card } from "../../components/common/Card";
 import { copyReportShareLink, printCurrentView } from "../../api/reportActionsClient";
 import { ROUTES } from "../../config/routes";
 import type { ReportSummary, SignalType } from "../../types/quantagent";
-import { DEFAULT_REPORT_FILTERS, getReportStrategyNames, type ReportFilters, type ReportRange } from "./reportFilters";
+import { DEFAULT_REPORT_FILTERS, type ReportFilters, type ReportRange } from "./reportFilters";
 
 interface ReportListProps {
-  allReports: ReportSummary[];
   filters: ReportFilters;
   onApplyFilters: (filters: ReportFilters) => void;
   onResetFilters: () => void;
@@ -18,7 +17,7 @@ const SIGNALS: SignalType[] = ["BUY", "HOLD", "DROP"];
 const RANGE_OPTIONS: Array<[string, ReportRange]> = [["오늘", "1"], ["최근 7일", "7"], ["최근 30일", "30"], ["최근 3개월", "90"], ["전체", "all"]];
 const PAST_REPORT_PAGE_SIZE = 5;
 
-export function ReportList({ allReports, filters, onApplyFilters, onResetFilters, reports }: ReportListProps) {
+export function ReportList({ filters, onApplyFilters, onResetFilters, reports }: ReportListProps) {
   const [draftFilters, setDraftFilters] = useState(filters);
   const [status, setStatus] = useState<string | null>(null);
   const [page, setPage] = useState(1);
@@ -26,7 +25,6 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
   const pastReports = reports.slice(1);
   const totalPages = Math.max(Math.ceil(pastReports.length / PAST_REPORT_PAGE_SIZE), 1);
   const visiblePastReports = pastReports.slice((page - 1) * PAST_REPORT_PAGE_SIZE, page * PAST_REPORT_PAGE_SIZE);
-  const strategyNames = getReportStrategyNames(allReports);
 
   const updateSignal = (signal: SignalType, checked: boolean) => {
     setDraftFilters((current) => ({ ...current, signals: { ...current.signals, [signal]: checked } }));
@@ -64,30 +62,6 @@ export function ReportList({ allReports, filters, onApplyFilters, onResetFilters
             >
               <span className="filter-check" />
               <span>{label}</span>
-            </button>
-          ))}
-        </Card>
-        <Card className="filter-group">
-          <strong>전략</strong>
-          <button
-            className={draftFilters.strategyName === "all" ? "is-active" : ""}
-            onClick={() => setDraftFilters((current) => ({ ...current, strategyName: "all" }))}
-            type="button"
-          >
-            <span className="filter-check" />
-            <span>전체 전략</span>
-            <Badge variant="soft">{allReports.length}</Badge>
-          </button>
-          {strategyNames.map((strategyName) => (
-            <button
-              className={draftFilters.strategyName === strategyName ? "is-active" : ""}
-              key={strategyName}
-              onClick={() => setDraftFilters((current) => ({ ...current, strategyName }))}
-              type="button"
-            >
-              <span className="filter-check" />
-              <span>{strategyName}</span>
-              <Badge variant="soft">{allReports.filter((report) => report.strategyName.trim() === strategyName).length}</Badge>
             </button>
           ))}
         </Card>

@@ -73,7 +73,6 @@ export function ReportsPage() {
         </div>
         {actionStatus ? <div className="action-feedback">{actionStatus}</div> : null}
         <ReportList
-          allReports={reports}
           filters={filters}
           onApplyFilters={handleApplyFilters}
           onResetFilters={handleResetFilters}
