@@ -50,7 +50,7 @@ jobs:
             set -u
           fi
 
-          APP_DIR="$HOME/mvp_sp1/quant-proj"
+          APP_DIR="$HOME/mvp_sp2/quant-proj"
           RUN_DIR="$APP_DIR/.run"
           SECRET_DIR="$HOME/.config/quantagent"
           PYTHON="$APP_DIR/ai/.venv/bin/python"
