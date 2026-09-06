@@ -40,7 +40,7 @@ def make_client(response_payload: dict) -> AOAIResponsesClient:
         assert request.headers["api-key"] == "test-api-key"
         assert body["model"] == "test-model"
         assert body["temperature"] == 0.0
-        assert body["service_tier"] == "priority"
+        assert "service_tier" not in body
         assert body["stream"] is True
         assert body["input"][0]["role"] == "system"
         assert body["input"][1]["role"] == "user"
@@ -345,6 +345,7 @@ def test_aoai_client_retries_without_unsupported_priority_service_tier() -> None
         responses_url="https://example.test/openai/responses",
         api_key="test-api-key",
         model="test-model",
+        service_tier="priority",
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 
@@ -441,6 +442,7 @@ def test_aoai_compatibility_adjustments_do_not_consume_transport_retry() -> None
         responses_url="https://example.test/openai/responses",
         api_key="test-api-key",
         model="test-model",
+        service_tier="priority",
         max_retries=1,
         retry_backoff_seconds=0,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -497,6 +499,7 @@ def test_gpt5_research_transport_budget_stays_bounded_after_compatibility_retrie
         responses_url="https://example.test/openai/v1/responses",
         api_key="test-api-key",
         model="gpt-5.6-luna",
+        service_tier="priority",
         max_retries=1,
         retry_backoff_seconds=0,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -529,20 +532,36 @@ def test_aoai_client_drops_unsupported_optional_research_budgets() -> None:
         if len(request_bodies) == 1:
             return httpx.Response(
                 400,
-                json={"error": {"code": "unsupported_parameter", "param": "reasoning.effort"}},
+                json={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": None,
+                        "param": "reasoning.effort",
+                        "message": "Unsupported parameter: 'reasoning.effort'.",
+                    }
+                },
             )
         if len(request_bodies) == 2:
             return httpx.Response(
                 400,
-                json={"error": {"code": "unsupported_parameter", "param": "max_tool_calls"}},
+                json={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": None,
+                        "param": "max_tool_calls",
+                        "message": "Unsupported parameter: 'max_tool_calls'.",
+                    }
+                },
             )
         if len(request_bodies) == 3:
             return httpx.Response(
                 400,
                 json={
                     "error": {
-                        "code": "unsupported_parameter",
+                        "type": "invalid_request_error",
+                        "code": None,
                         "param": "tools.0.search_context_size",
+                        "message": "Unsupported parameter: 'search_context_size'.",
                     }
                 },
             )
@@ -602,6 +621,7 @@ def test_aoai_client_can_apply_every_compatibility_adjustment() -> None:
         responses_url="https://example.test/openai/v1/responses",
         api_key="test-api-key",
         model="test-model",
+        service_tier="priority",
         max_retries=0,
         retry_backoff_seconds=0,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -680,6 +700,101 @@ def test_aoai_client_does_not_treat_invalid_optional_values_as_unsupported_capab
     for part in expected_path:
         body = body[part]  # type: ignore[index]
     assert body is not None
+
+
+@pytest.mark.parametrize(
+    ("parameter", "request_update", "expected_wire_field"),
+    (
+        ("reasoning.effort", {"reasoning_effort": "medium"}, "reasoning"),
+        ("max_tool_calls", {"max_tool_calls": 12}, "max_tool_calls"),
+        (
+            "tools.0.search_context_size",
+            {"enable_web_search": True, "web_search_context_size": "high"},
+            "search_context_size",
+        ),
+    ),
+)
+def test_aoai_client_does_not_cache_ambiguous_azure_invalid_request_errors(
+    parameter: str, request_update: dict[str, object], expected_wire_field: str
+) -> None:
+    cache_key = f"ambiguous-azure-invalid-{parameter}"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": None,
+                    "param": parameter,
+                    "message": "The submitted value is invalid.",
+                }
+            },
+        )
+
+    request = make_request().model_copy(
+        update={"stream_response": False, **request_update}
+    )
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="gpt-5.6-luna",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        compatibility_cache_key=cache_key,
+    )
+
+    with pytest.raises(LLMHTTPStatusError):
+        client.generate_json(request)
+
+    fresh_client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="gpt-5.6-luna",
+        compatibility_cache_key=cache_key,
+    )
+    body = fresh_client._request_body(request)
+    assert expected_wire_field in json.dumps(body)
+
+
+def test_aoai_client_does_not_cache_coded_azure_validation_errors() -> None:
+    cache_key = "coded-azure-invalid-reasoning"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "validation_error",
+                    "param": "reasoning.effort",
+                    "message": "Unsupported parameter: 'reasoning.effort'.",
+                }
+            },
+        )
+
+    request = make_request().model_copy(
+        update={"stream_response": False, "reasoning_effort": "medium"}
+    )
+    client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="gpt-5.6-luna",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        compatibility_cache_key=cache_key,
+    )
+
+    with pytest.raises(LLMHTTPStatusError):
+        client.generate_json(request)
+
+    fresh_client = AOAIResponsesClient(
+        responses_url="https://example.test/openai/v1/responses",
+        api_key="test-api-key",
+        model="gpt-5.6-luna",
+        compatibility_cache_key=cache_key,
+    )
+    assert fresh_client._request_body(request)["reasoning"] == {"effort": "medium"}
 
 
 def test_aoai_client_projects_only_a_safe_web_search_hint_from_a_provider_400() -> None:

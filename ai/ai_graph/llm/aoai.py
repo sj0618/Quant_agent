@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from threading import Lock
 from typing import Any
@@ -26,7 +27,10 @@ DEFAULT_TIMEOUT_SECONDS = 45.0
 DEFAULT_RESPONSE_START_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_RETRIES = 1
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.25
-DEFAULT_SERVICE_TIER = "priority"
+# Azure priority processing is an opt-in deployment capability.  Sending this
+# field to a Global Standard deployment can reject the entire request with 400,
+# while omitting it lets Azure select its deployment-default ``auto`` behavior.
+DEFAULT_SERVICE_TIER: str | None = None
 # Used when a 429 arrives without a Retry-After header, and as the cap when it has one.
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 5.0
 MAX_RETRY_AFTER_SECONDS = 60.0
@@ -116,7 +120,7 @@ class AOAIResponsesClient:
         response_start_timeout_seconds: float = DEFAULT_RESPONSE_START_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
-        service_tier: str = DEFAULT_SERVICE_TIER,
+        service_tier: str | None = DEFAULT_SERVICE_TIER,
         web_search_tool_type: str = DEFAULT_WEB_SEARCH_TOOL_TYPE,
         http_client: httpx.Client | None = None,
         compatibility_cache_key: str | None = None,
@@ -684,7 +688,7 @@ class AOAIResponsesClient:
         }
         if self._temperature_supported:
             body["temperature"] = request.temperature
-        if self._service_tier_supported:
+        if self.service_tier is not None and self._service_tier_supported:
             body["service_tier"] = self.service_tier
         if request.max_output_tokens is not None:
             body["max_output_tokens"] = request.max_output_tokens
@@ -811,13 +815,37 @@ def _unsupported_capability_parameter(response: httpx.Response, parameter: str) 
 
     A parameter name on an ``invalid_request_error`` can mean that the caller sent
     an invalid value. Treating that as a missing feature would hide a configuration
-    error and poison the process-local compatibility cache.
+    error and poison the process-local compatibility cache. Azure's current
+    Responses endpoint commonly represents an explicit unsupported parameter as
+    ``type=invalid_request_error`` with a null ``code``, so recognize that form
+    only when its transient message uses the provider's fixed unsupported wording.
+    The message is never stored, logged, or returned to callers.
     """
 
+    if not _unsupported_parameter(response, parameter):
+        return False
+    error_code = _provider_error_field(response, "code")
+    if error_code == "unsupported_parameter":
+        return True
+    # Azure's alternate representation is specifically the null-code form. A
+    # non-null code carries more specific validation semantics, even when its
+    # human-readable message contains the word "unsupported"; do not turn that
+    # into a process-wide capability decision.
+    if error_code is not None:
+        return False
     return (
-        _provider_error_field(response, "code") == "unsupported_parameter"
-        and _unsupported_parameter(response, parameter)
+        _provider_error_field(response, "type") == "invalid_request_error"
+        and _provider_error_message_signals_unsupported_capability(response)
     )
+
+
+def _provider_error_message_signals_unsupported_capability(response: httpx.Response) -> bool:
+    """Recognize fixed provider wording without retaining arbitrary error text."""
+
+    message = _provider_error_field(response, "message")
+    if message is None:
+        return False
+    return bool(re.search(r"\b(unsupported parameter|not supported)\b", message, re.IGNORECASE))
 
 
 def _unsupported_structured_outputs(response: httpx.Response) -> bool:
