@@ -6,8 +6,10 @@ from hashlib import sha256
 
 import pytest
 
+import psycopg
+
 from ai_graph.graph import DEBUG_STORE
-from ai_graph.job_repository_postgres import _job_document
+from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository, _job_document
 from ai_graph.job_store_persistent import PersistentAnalysisJobStore
 from ai_graph.jobs import (
     AnalysisJob,
@@ -98,7 +100,7 @@ def test_strategy_research_provider_failure_preserves_safe_wrapped_aoai_cause(
     assert "provider-secret" not in diagnostic.model_dump_json()
 
 
-def _completed_backtest_envelope(trace_id: str) -> APIEnvelope:
+def _completed_backtest_envelope(trace_id: str, *, signal_count: int = 1) -> APIEnvelope:
     envelope = _ready_envelope(trace_id)
     internal_performance = BacktestPerformance.model_construct(
         selected_candidate_id="candidate-1",
@@ -127,8 +129,13 @@ def _completed_backtest_envelope(trace_id: str) -> APIEnvelope:
         benchmark=None,
     )
     audit = internal_performance.engine_summary["execution_audit"]["recent_events"]
+    # One signal per ticker per bar, shaped like the engine's `signal.as_dict()` rows.
+    signals = [
+        {**audit[0], "date": f"2026-{1 + index // 28 % 12:02d}-{1 + index % 28:02d}", "ticker": f"{index % 200:06d}", "bar": index}
+        for index in range(signal_count)
+    ]
     ledger = {
-        "signals": [audit[0]], "order_audit": audit, "fills": [audit[1]],
+        "signals": signals, "order_audit": audit, "fills": [audit[1]],
         "positions": [{"date": "2026-01-03", "ticker": "005930", "quantity": 8, "fill_quantity": 8, "side": "buy", "reason": "next_open_fill"}],
         "trades": [{"exit_date": "2026-01-03", "ticker": "005930", "quantity": 8, "reason": "closed"}],
         "equity": [{"date": "2026-01-03", "cash": 440000.0, "positions_value": 560000.0, "total_equity": 1000000.0, "daily_return": 0.01}],
@@ -203,7 +210,9 @@ def test_memory_completion_populates_reconstructable_execution_manifest() -> Non
     completed = store.complete_job(created.job_id, _completed_backtest_envelope(created.trace_id))
 
     manifest = completed.execution_manifest
-    assert manifest.events.signals
+    # Per-bar signals stay in DEBUG_STORE; the manifest keeps only their digest.
+    assert manifest.events.signals == []
+    assert manifest.ledger_event_count == 7  # 1 signal + 2 orders + 1 fill + 1 position + 1 trade + 1 equity
     assert manifest.events.orders
     assert manifest.events.fills
     assert manifest.events.positions
@@ -256,6 +265,80 @@ def test_persistent_job_document_round_trips_storage_only_fields() -> None:
     assert restored.owner_incarnation is not None
     assert _job_document(restored) == _job_document(completed)
     assert "execution_manifest" not in completed.model_dump(mode="json")
+
+
+def test_persisted_ready_job_document_stays_bounded_without_per_bar_signals() -> None:
+    """Production wrote a 21 MB row: 94,038 per-bar signals inside execution_manifest.
+    The completion upsert then hit the statement timeout and the job never left
+    finalizing. The row must stay small however long the backtest ran."""
+
+    store = InMemoryAnalysisJobStore()
+    created = store.create_job("RSI strategy", user_id="42")
+    envelope = _completed_backtest_envelope(created.trace_id, signal_count=100_000)
+
+    completed = store.complete_job(created.job_id, envelope)
+
+    document = _job_document(completed)
+    encoded = json.dumps(document, ensure_ascii=False, default=str).encode("utf-8")
+    assert len(encoded) < 1_000_000, f"persisted job document is {len(encoded)} bytes"
+    manifest = completed.execution_manifest
+    assert manifest.events.signals == []
+    assert manifest.events.orders and manifest.events.fills and manifest.events.equity
+    # The digest still covers every signal, so the ledger can be reconciled later.
+    assert manifest.ledger_event_count == 100_000 + 6
+    ledger = DEBUG_STORE.get(envelope.debug_ref).backtest_artifacts["engine_summary"]["_storage_execution_ledger"]
+    assert manifest.ledger_event_hash == ledger["source_event_hash"]
+    assert len(ledger["signals"]) == 100_000
+    assert AnalysisJob.model_validate(document).execution_manifest == manifest
+
+
+def test_complete_job_upsert_survives_an_inherited_statement_timeout() -> None:
+    """The session the upsert ran on carried a statement timeout nobody configured
+    for the role, database, or DSN. The terminal write must not depend on it."""
+
+    upsert_cost_ms = 3_200  # what writing the 21 MB row took in production
+    statements: list[str] = []
+    saved: dict[str, object] = {}
+
+    class _Rows:
+        def __init__(self, rows): self._rows = rows
+        def fetchone(self): return self._rows[0] if self._rows else None
+        def fetchall(self): return self._rows
+
+    class _SessionWithInheritedTimeout:
+        def __init__(self, row):
+            self._row = row
+            self.statement_timeout_ms = 2_000
+
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+
+        def execute(self, query, params=None):
+            text = " ".join(str(query).split())
+            statements.append(text)
+            if text == "SET LOCAL statement_timeout = 0":
+                self.statement_timeout_ms = 0
+            elif text.startswith("INSERT INTO app.ai_analysis_job"):
+                if self.statement_timeout_ms and upsert_cost_ms > self.statement_timeout_ms:
+                    raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+                saved["params"] = params
+            return _Rows([{"job_jsonb": self._row}])
+
+    seed = InMemoryAnalysisJobStore()
+    created = seed.create_job("RSI strategy", user_id="42")
+    row = _job_document(created)
+    repo = PostgresAnalysisJobRepository(
+        "postgresql://example",
+        connector=lambda *_a, **_k: _SessionWithInheritedTimeout(row),
+    )
+
+    completed = repo.complete_job(created.job_id, _completed_backtest_envelope(created.trace_id, signal_count=5_000))
+
+    assert completed.status == AnalysisJobStatus.COMPLETED
+    upsert_index = next(i for i, text in enumerate(statements) if text.startswith("INSERT INTO app.ai_analysis_job"))
+    assert statements[upsert_index - 1] == "SET LOCAL statement_timeout = 0"
+    assert saved["params"][2].obj["status"] == "completed"
+    assert saved["params"][2].obj["execution_manifest"]["events"]["signals"] == []
 
 
 def test_job_store_factory_defaults_to_memory_without_env() -> None:
