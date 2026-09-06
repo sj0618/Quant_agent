@@ -679,7 +679,11 @@ jobs:
                       client.responses_url,
                       headers={"Content-Type": "application/json", "api-key": client.api_key},
                       json=body,
-                      timeout=45.0,
+                      # Exercise the role's live timeout policy rather than the
+                      # generic 45-second client default. Strategy research uses
+                      # web search and is deliberately allowed a longer response
+                      # window by the deployed factory.
+                      timeout=client.timeout_seconds,
                   )
               except httpx.HTTPError as exc:
                   return {"case": name, "result": "transport_error", "exception": type(exc).__name__, **fields(body)}
