@@ -18,6 +18,12 @@ on:
           - pipeline-load-timing
           - trace-diagnostic
           - dev-aoai-request-diagnostic
+          - dev-job-diagnostic
+      job_id:
+        description: Development analysis job ID for safe diagnostics
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -714,6 +720,146 @@ jobs:
           print(json.dumps({"provider": "aoai", "results": results}, ensure_ascii=False, sort_keys=True))
           if any(item["result"] != "success" for item in results):
               raise SystemExit(1)
+          PY
+          REMOTE
+
+      - name: Diagnose one node3 development analysis job safely
+        if: ${{ inputs.mode == 'dev-job-diagnostic' }}
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$JOB_ID" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="$HOME/mvp_sp2/quant-proj"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          JOB_ID="$1"
+          [[ "$JOB_ID" =~ ^job_[A-Za-z0-9]+$ ]]
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          test -s "$PID_FILE"
+          AI_PID="$(cat "$PID_FILE")"
+          [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]]
+          test -r "/proc/$AI_PID/environ"
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) export "$entry" ;;
+            esac
+          done < "/proc/$AI_PID/environ"
+
+          cd "$APP_DIR"
+          PYTHONPATH="$APP_DIR/ai:$APP_DIR/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u - "$JOB_ID" <<'PY'
+          import json
+          import re
+          import sys
+
+          import psycopg
+
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+
+          job_id = sys.argv[1]
+          if not re.fullmatch(r"job_[A-Za-z0-9]+", job_id):
+              raise RuntimeError("invalid job identifier")
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is not configured")
+
+          markers = (
+              "LLMTimeoutError",
+              "LLMConnectionError",
+              "LLMHTTPStatusError",
+              "LLMResponseParseError",
+              "StrategyResearchError",
+          )
+          with psycopg.connect(dsn) as conn:
+              job = conn.execute(
+                  """
+                  SELECT job_jsonb ->> 'status', job_jsonb ->> 'polling_stage',
+                         job_jsonb ->> 'trace_id',
+                         job_jsonb #>> '{result,status}',
+                         job_jsonb #>> '{result,failure_cause,category}',
+                         job_jsonb #>> '{result,failure_cause,subcause}',
+                         job_jsonb #>> '{result,failure_cause,failure_stage}',
+                         job_jsonb #>> '{result,failure_cause,owner}',
+                         job_jsonb #>> '{result,failure_cause,retryable}',
+                         created_at, updated_at
+                  FROM app.ai_analysis_job
+                  WHERE job_id = %s
+                  """,
+                  (job_id,),
+              ).fetchone()
+              if job is None:
+                  raise RuntimeError("analysis job not found")
+              public_trace_id = job[2]
+              trace = conn.execute(
+                  """
+                  SELECT trace_id
+                  FROM app.ai_trace
+                  WHERE metadata_jsonb ->> 'public_trace_id' = %s
+                  ORDER BY started_at DESC
+                  LIMIT 1
+                  """,
+                  (public_trace_id,),
+              ).fetchone()
+              audit_trace_id = trace[0] if trace else None
+              model_rows = []
+              error_rows = []
+              if audit_trace_id is not None:
+                  model_rows = conn.execute(
+                      """
+                      SELECT task_type, provider, status, web_search_used, retry_count,
+                             error_message, count(*)
+                      FROM app.ai_model_call_log
+                      WHERE trace_id = %s
+                      GROUP BY 1, 2, 3, 4, 5, 6
+                      ORDER BY 1, 2, 3, 4, 5, 6
+                      """,
+                      (audit_trace_id,),
+                  ).fetchall()
+                  error_rows = conn.execute(
+                      """
+                      SELECT error_type, COALESCE(stack_trace, '')
+                      FROM app.ai_error_log
+                      WHERE trace_id = %s
+                      ORDER BY created_at
+                      """,
+                      (audit_trace_id,),
+                  ).fetchall()
+
+          stack_text = "\n".join(row[1] for row in error_rows)
+          print(json.dumps({
+              "job": {
+                  "job_id": job_id,
+                  "status": job[0],
+                  "polling_stage": job[1],
+                  "result_status": job[3],
+                  "failure": {
+                      "category": job[4], "subcause": job[5],
+                      "stage": job[6], "owner": job[7], "retryable": job[8],
+                  },
+                  "created_at": job[9].isoformat(),
+                  "updated_at": job[10].isoformat(),
+              },
+              "audit": {
+                  "trace_found": audit_trace_id is not None,
+                  "model_calls": [
+                      {"task_type": row[0], "provider": row[1], "status": row[2],
+                       "web_search_used": row[3], "retry_count": row[4],
+                       # AOAI stores only a fixed, secret-free failure category here.
+                       "failure_summary": row[5], "count": row[6]}
+                      for row in model_rows
+                  ],
+                  "error_types": [row[0] for row in error_rows],
+                  "exception_markers": [marker for marker in markers if marker in stack_text],
+              },
+          }, ensure_ascii=False, sort_keys=True))
           PY
           REMOTE
 
