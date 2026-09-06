@@ -18,6 +18,11 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ai_graph.data_sources.index_universes import (
+    extract_index_universe_from_query,
+    get_known_index_universes,
+    index_universe_unavailable_message,
+)
 from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
 from ai_graph.llm import (
     LLMClient,
@@ -40,8 +45,8 @@ from ai_graph.schemas import (
     ResearchSourceRefV3,
 )
 
-STRATEGY_RESEARCH_PROMPT_VERSION = "v7"
-STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v7"
+STRATEGY_RESEARCH_PROMPT_VERSION = "v8"
+STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v8"
 # The live provider reached the former 5,000-token cap while emitting the required
 # evidence-rich JSON, leaving an otherwise successful response truncated mid-object.
 # This lane needs room for its web-grounded sources and structured contract; the
@@ -90,6 +95,14 @@ members of that sector during the tested window before any condition is applied.
 express the sector as a condition - it is a universe constraint, not a metric. If the
 requested industry has no covering label in ``allowed_sectors``, return no candidate
 rather than dropping the sector constraint or approximating it with another label.
+A named KRX index universe ("KOSPI200 종목", "코스닥150 구성종목") is likewise a
+point-in-time constituent filter, not a metric and not a market: set the candidate's
+``index_universe`` field to the exact code from ``allowed_index_universes`` and the
+backtest universe is restricted to names that were constituents of that index during the
+tested window. If the requested index is not in ``allowed_index_universes``, this
+deployment has no point-in-time membership for it: return no candidate and say so in
+``resolution_summary``; never approximate it with the whole KOSPI/KOSDAQ market, a
+market-cap cutoff, or a sector.
 ``universe_rank_pct`` uses a decimal fraction from 0 to 1: top 20% is 0.20.
 ``relative_strength_Nd`` is the stock's N-day return minus the same-date PIT priced
 KRX common-stock universe's mean N-day return. It is a disclosed broad-market proxy,
@@ -127,8 +140,9 @@ counter_hypothesis, non-empty entry_conditions, exit_conditions (empty only with
 holding_days), required_metrics, assumptions, ai_assumptions, economic_rationale,
 falsification_conditions, expected_turnover, regime_risks, backtest_years,
 backtest_period_basis, and source_ids. Add ``sector`` only when the request names an
-industry. Each falsification condition must be an object with exactly ``condition``
-and ``interpretation`` string fields.
+industry, and ``index_universe`` only when it names a KRX index. Each falsification
+condition must be an object with exactly ``condition`` and ``interpretation`` string
+fields.
 Titles are display labels only; never omit them.
 
 Fundamentals available as metrics are point-in-time DART figures: ``per`` (the bar's
@@ -225,6 +239,7 @@ class _CandidateDraft(BaseModel):
     backtest_period_basis: str = Field(min_length=1, max_length=600)
     source_ids: list[str] = Field(min_length=1, max_length=12)
     sector: str | None = Field(default=None, min_length=1, max_length=64)
+    index_universe: str | None = Field(default=None, min_length=1, max_length=32)
 
 
 class _ResearchResponse(BaseModel):
@@ -251,14 +266,25 @@ def research_strategy_execution_spec(
 
     allowed = _allowed_metrics(available_metrics)
     sectors = tuple(get_known_sectors())
+    index_universes = tuple(get_known_index_universes())
+    # Decided before any model call: no research turn can create membership rows the
+    # warehouse does not have, and the one bounded repair would only spend a second
+    # web-grounded call to reach the same answer with a vaguer reason.
+    _refuse_unavailable_index_universe(query, index_universes)
     client = llm_client or create_llm_client(role="STRATEGY_RESEARCH")
-    request = _request(query=query, allowed_metrics=allowed, allowed_sectors=sectors)
+    request = _request(
+        query=query,
+        allowed_metrics=allowed,
+        allowed_sectors=sectors,
+        allowed_index_universes=index_universes,
+    )
     try:
         sealed = _seal_research_response(
             client.generate_json(request),
             query=query,
             allowed_metrics=allowed,
             allowed_sectors=sectors,
+            allowed_index_universes=index_universes,
         )
         # Unit callers deliberately inject a tiny, deterministic fixture.  The live
         # AOAI path, however, must not silently downgrade a deep-research request to
@@ -278,6 +304,7 @@ def research_strategy_execution_spec(
             query=query,
             allowed_metrics=allowed,
             allowed_sectors=sectors,
+            allowed_index_universes=index_universes,
             failure=first_error,
         )
         try:
@@ -286,6 +313,7 @@ def research_strategy_execution_spec(
                 query=query,
                 allowed_metrics=allowed,
                 allowed_sectors=sectors,
+                allowed_index_universes=index_universes,
             )
             if llm_client is None:
                 _validate_live_research_evidence(sealed)
@@ -316,6 +344,7 @@ def _seal_research_response(
     query: str,
     allowed_metrics: Sequence[str],
     allowed_sectors: Sequence[str] = (),
+    allowed_index_universes: Sequence[str] = (),
 ) -> ResearchCandidateExecutionSpecV3:
     try:
         response = _ResearchResponse.model_validate(
@@ -340,6 +369,7 @@ def _seal_research_response(
             allowed_metrics=allowed_metrics,
             source_ids=source_ids,
             allowed_sectors=allowed_sectors,
+            allowed_index_universes=allowed_index_universes,
             query=query,
         )
         candidates.append(ResearchCandidateV3.model_validate(candidate.model_dump()))
@@ -644,13 +674,18 @@ def _normalize_market_relative_thresholds(candidate: dict[str, object]) -> dict[
 
 
 def _request(
-    *, query: str, allowed_metrics: Sequence[str], allowed_sectors: Sequence[str]
+    *,
+    query: str,
+    allowed_metrics: Sequence[str],
+    allowed_sectors: Sequence[str],
+    allowed_index_universes: Sequence[str] = (),
 ) -> LLMJsonRequest:
     schema = _ResearchResponse.model_json_schema()
     context = {
         "natural_language_request": query,
         "allowed_metrics": list(allowed_metrics),
         "allowed_sectors": list(allowed_sectors),
+        "allowed_index_universes": list(allowed_index_universes),
         "condition_grammar": {
             "operators": [
                 "lt",
@@ -704,6 +739,7 @@ def _request(
         "natural_language_request": query,
         "allowed_metrics": list(allowed_metrics),
         "allowed_sectors": list(allowed_sectors),
+        "allowed_index_universes": list(allowed_index_universes),
         "condition_grammar": context["condition_grammar"],
     }
     return LLMJsonRequest(
@@ -746,6 +782,7 @@ def _repair_request(
     allowed_metrics: Sequence[str],
     allowed_sectors: Sequence[str],
     failure: StrategyResearchError,
+    allowed_index_universes: Sequence[str] = (),
 ) -> LLMJsonRequest:
     """Ask for one compiler-grounded correction without replaying model prose.
 
@@ -759,6 +796,7 @@ def _repair_request(
         "natural_language_request": query,
         "allowed_metrics": list(allowed_metrics),
         "allowed_sectors": list(allowed_sectors),
+        "allowed_index_universes": list(allowed_index_universes),
         "previous_validation_failure": {
             "code": failure.cause_code,
             "message": str(failure)[:500],
@@ -827,6 +865,7 @@ def _validate_candidate(
     allowed_metrics: Iterable[str],
     source_ids: set[str],
     allowed_sectors: Iterable[str] = (),
+    allowed_index_universes: Iterable[str] = (),
     query: str = "",
 ) -> None:
     allowed = set(allowed_metrics)
@@ -836,6 +875,9 @@ def _validate_candidate(
             cause_code="research_source_reference_invalid",
         )
     _validate_candidate_sector(candidate, allowed_sectors=allowed_sectors, query=query)
+    _validate_candidate_index_universe(
+        candidate, allowed_index_universes=allowed_index_universes, query=query
+    )
     required = {canonical_metric(metric) for metric in candidate.required_metrics}
     referenced = {
         canonical_metric(condition.left)
@@ -976,6 +1018,51 @@ def _validate_candidate_sector(
             f"{candidate.candidate_id}: request names the '{requested}' sector; "
             "the candidate must carry it as its sector universe constraint",
             cause_code="research_sector_dropped",
+        )
+
+
+def _refuse_unavailable_index_universe(query: str, allowed_index_universes: Sequence[str]) -> None:
+    """Stop before research when the request names an index the loader cannot filter by.
+
+    Without this the model was told the truth (no index in the vocabulary), returned no
+    candidate, was given a repair turn that could not change the data, and the user read
+    a paraphrase of the model's prose. The gap is a warehouse fact; state it directly.
+    """
+
+    requested = extract_index_universe_from_query(query)
+    if requested is not None and requested not in allowed_index_universes:
+        raise StrategyResearchError(
+            index_universe_unavailable_message(requested),
+            cause_code="research_index_universe_unavailable",
+        )
+
+
+def _validate_candidate_index_universe(
+    candidate: _CandidateDraft,
+    *,
+    allowed_index_universes: Iterable[str],
+    query: str,
+) -> None:
+    """Mirror of the sector rule: a sealed index must be servable, and never dropped.
+
+    The unavailable case is terminal rather than repairable - a second research turn
+    cannot add membership rows - and reads the same as the pre-research gate so the
+    reason does not depend on which check happened to see the request first.
+    """
+
+    universes = tuple(allowed_index_universes)
+    requested = extract_index_universe_from_query(query) if query else None
+    for index_code in (candidate.index_universe, requested):
+        if index_code is not None and index_code not in universes:
+            raise StrategyResearchError(
+                index_universe_unavailable_message(index_code),
+                cause_code="research_index_universe_unavailable",
+            )
+    if requested is not None and candidate.index_universe != requested:
+        raise _RepairableStrategyResearchError(
+            f"{candidate.candidate_id}: request names the {requested} index universe; "
+            "the candidate must carry it as its index_universe constraint",
+            cause_code="research_index_universe_dropped",
         )
 
 

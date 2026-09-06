@@ -470,9 +470,14 @@ def _no_run_parse(error: StrategyResearchError) -> StrategyParseResultV1:
     # Do not replace a strategy that the researcher/compiler cannot express with a
     # catalogue or RSI proxy.  Name the capability gap while keeping the raw request
     # out of the public contract.
+    explanation = "전략 의미는 조사했지만 현재 서버가 같은 규칙으로 백테스트할 수 없습니다."
+    if getattr(error, "cause_code", "") == "research_index_universe_unavailable":
+        # Decided before any research ran: the warehouse has no point-in-time
+        # constituents for the index the request named.
+        explanation = "요청한 지수 유니버스의 날짜별 구성종목 데이터가 이 서버에 없어 백테스트할 수 없습니다."
     return StrategyParseResultV1(
         clarification_required=True,
-        explanation="전략 의미는 조사했지만 현재 서버가 같은 규칙으로 백테스트할 수 없습니다.",
+        explanation=explanation,
         unsupported_conditions=[
             UnsupportedStrategyConditionV1(
                 condition="AI 연구 전략",

@@ -343,11 +343,19 @@ class PostgresPipelineDataSource:
         requires_financials: bool | None = None,
         compact_price_rows: bool = False,
         sector: str | None = None,
+        index_universe: str | None = None,
     ) -> PipelineDataBundle:
         # Keep the alternative source API compatible with the sealed V3 data plan.
         # Its own projection planner is intentionally unchanged; this prevents a
         # configured variant from failing merely because the primary source gained a
         # plan-aware optional argument.
+        if index_universe:
+            # This variant approximates KOSPI 200 by current market cap; it cannot honour
+            # a sealed point-in-time constituent constraint and must not pretend to.
+            raise PipelineDataUnavailableError(
+                "pit_index_universe_unavailable",
+                f"the db_split data source has no point-in-time {index_universe} membership",
+            )
         required_indicator_families = (
             indicator_families_for_metrics(required_metrics)
             if required_metrics is not None

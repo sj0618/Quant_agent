@@ -25,6 +25,7 @@ from ai_graph.source_manifest import (
 )
 
 from .identity import canonical_ticker, display_name
+from .index_universes import INDEX_MEMBERSHIP_HISTORY_TABLE
 from .sectors import extract_sector_from_query, get_known_sectors
 
 _logger = logging.getLogger(__name__)
@@ -398,6 +399,7 @@ class PostgresPipelineDataSource:
         requires_financials: bool | None = None,
         compact_price_rows: bool = False,
         sector: str | None = None,
+        index_universe: str | None = None,
     ) -> PipelineDataBundle:
         load_started = perf_counter()
         timings: dict[str, float] = {}
@@ -483,6 +485,7 @@ class PostgresPipelineDataSource:
                         timings,
                         compact_price_rows=compact_execution_rows,
                         sector=sector,
+                        index_universe=index_universe,
                     )
                     (
                         screening_candidates,
@@ -529,6 +532,7 @@ class PostgresPipelineDataSource:
                                 timings,
                                 compact_price_rows=compact_execution_rows,
                                 sector=sector,
+                                index_universe=index_universe,
                             )
                             (
                                 screening_candidates,
@@ -569,6 +573,7 @@ class PostgresPipelineDataSource:
                         timings,
                         compact_price_rows=compact_execution_rows,
                         sector=sector,
+                        index_universe=index_universe,
                     )
                 (
                     tickers,
@@ -713,6 +718,7 @@ class PostgresPipelineDataSource:
                 KIS_ADJUSTED_OHLCV_TABLE,
                 PIT_UNIVERSE_VIEW,
                 SYMBOL_LISTING_HISTORY_TABLE,
+                *([INDEX_MEMBERSHIP_HISTORY_TABLE] if index_universe else []),
                 *[INDICATOR_TABLES[family] for family in indicator_families],
                 *(
                     [OFFICIAL_BENCHMARK_TR_VIEW, OFFICIAL_BENCHMARK_WEIGHT_VIEW]
@@ -882,6 +888,7 @@ class PostgresPipelineDataSource:
         *,
         compact_price_rows: bool = False,
         sector: str | None = None,
+        index_universe: str | None = None,
     ) -> tuple[
         list[str],
         dict[str, Any],
@@ -892,9 +899,20 @@ class PostgresPipelineDataSource:
         """Load the fixed historical universe and price rows independently of screening."""
 
         started = perf_counter()
-        tickers, universe_descriptor = self._fetch_backtest_universe(conn, window, sector)
+        # Keyword, and only when set: subclasses and test doubles override this fetch
+        # with the older (conn, window, sector) signature.
+        tickers, universe_descriptor = self._fetch_backtest_universe(
+            conn, window, sector, **({"index_universe": index_universe} if index_universe else {})
+        )
         timings["universe_seconds"] = perf_counter() - started
         if not tickers:
+            if index_universe:
+                raise PipelineDataUnavailableError(
+                    "pit_index_universe_empty",
+                    f"no PIT KOSPI/KOSDAQ common stock was a {index_universe} constituent"
+                    + (f" in the '{sector}' WICS sector" if sector else "")
+                    + " during the fixed window",
+                )
             raise PipelineDataUnavailableError(
                 "pit_sector_universe_empty" if sector else "pit_universe_empty",
                 (
@@ -936,7 +954,11 @@ class PostgresPipelineDataSource:
         )
 
     def _fetch_backtest_universe(
-        self, conn: Any, window: Mapping[str, Any], sector: str | None = None
+        self,
+        conn: Any,
+        window: Mapping[str, Any],
+        sector: str | None = None,
+        index_universe: str | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         """The lifecycle PIT common-stock universe for the window, capped by liquidity.
 
@@ -961,8 +983,32 @@ class PostgresPipelineDataSource:
         sector a name sits in today. A name that left the sector mid-window is still a
         member for the part of the window it was in it, which is the same
         survivorship-safe choice the listing overlap makes.
+
+        `index_universe` restricts membership to point-in-time constituents of a named
+        KRX index (KOSPI200) with the same overlap test, read from
+        `INDEX_MEMBERSHIP_HISTORY_TABLE`. That table is optional in a deployment, and
+        PostgreSQL rejects a statement that names a missing table even behind a NULL
+        parameter, so - unlike the sector filter - the predicate is spliced in only when
+        an index is requested; the index code itself is still bound.
+
+        ponytail: window-overlap membership, like the sector filter - a name that joined
+        the index late in the window is traded for the whole window. Per-bar constituent
+        gating needs the engine to consume the intervals, not the loader.
         """
 
+        index_predicate = (
+            f"""
+                  AND EXISTS (
+                      SELECT 1
+                      FROM {INDEX_MEMBERSHIP_HISTORY_TABLE} im
+                      WHERE im.symbol_id = h.symbol_id
+                        AND im.index_code = %(index_universe)s
+                        AND im.valid_from <= %(window_end)s::date
+                        AND (im.valid_to IS NULL OR im.valid_to >= %(window_start)s::date)
+                  )"""
+            if index_universe
+            else ""
+        )
         rows = conn.execute(
             f"""
             WITH window_members AS (
@@ -995,7 +1041,7 @@ class PostgresPipelineDataSource:
                             AND w.valid_from <= %(window_end)s::date
                             AND (w.valid_to IS NULL OR w.valid_to >= %(window_start)s::date)
                       )
-                  )
+                  ){index_predicate}
             ), ranking_sessions AS (
                 SELECT trade_date
                 FROM core.trading_calendar
@@ -1028,6 +1074,7 @@ class PostgresPipelineDataSource:
                 "ranking_sessions": UNIVERSE_RANKING_SESSIONS,
                 "cap": self.config.backtest_universe_max_tickers,
                 "sector": sector,
+                "index_universe": index_universe,
             },
         ).fetchall()
         universe = sorted(str(row["symbol"]).zfill(6) for row in rows)
@@ -1037,13 +1084,16 @@ class PostgresPipelineDataSource:
         )
         return universe, {
             "selection": (
-                "lifecycle_pit_common_stock_window_top_traded_sector_restricted"
-                if sector
-                else "lifecycle_pit_common_stock_window_top_traded"
+                "lifecycle_pit_common_stock_window_top_traded"
+                + ("_sector_restricted" if sector else "")
+                + ("_index_restricted" if index_universe else "")
             ),
             "sector": sector,
             "sector_source": WICS_SECTOR_HISTORY_TABLE if sector else None,
             "sector_membership": "wics_interval_overlapping_window" if sector else None,
+            "index_universe": index_universe,
+            "index_membership_source": INDEX_MEMBERSHIP_HISTORY_TABLE if index_universe else None,
+            "index_membership": "interval_overlapping_window" if index_universe else None,
             "as_of_start": window["start"].isoformat(),
             "as_of_end": window["end"].isoformat(),
             "session_count": window["session_count"],
@@ -2151,6 +2201,7 @@ def load_pipeline_data_from_env(
     requires_financials: bool | None = None,
     compact_price_rows: bool = False,
     sector: str | None = None,
+    index_universe: str | None = None,
     backtest_lookback_years: int | None = None,
     period_locked: bool = False,
 ) -> PipelineDataBundle:
@@ -2198,6 +2249,7 @@ def load_pipeline_data_from_env(
         requires_financials=requires_financials,
         compact_price_rows=compact_price_rows,
         sector=sector,
+        index_universe=index_universe,
     )
 
 
