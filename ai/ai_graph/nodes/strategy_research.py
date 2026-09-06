@@ -122,7 +122,8 @@ counter_hypothesis, non-empty entry_conditions, exit_conditions (empty only with
 holding_days), required_metrics, assumptions, ai_assumptions, economic_rationale,
 falsification_conditions, expected_turnover, regime_risks, backtest_years,
 backtest_period_basis, and source_ids. Add ``sector`` only when the request names an
-industry.
+industry. Each falsification condition must be an object with exactly ``condition``
+and ``interpretation`` string fields.
 Titles are display labels only; never omit them.
 
 Fundamentals available as metrics are point-in-time DART figures: ``per`` (the bar's
@@ -174,6 +175,21 @@ class _SourceDraft(BaseModel):
     )
 
 
+class _FalsificationConditionDraft(BaseModel):
+    """One falsifiable outcome stated before a backtest is run.
+
+    A free-form ``dict[str, str]`` becomes an object with arbitrary properties in
+    Pydantic's JSON schema. Azure strict structured outputs reject that form: every
+    object must declare a closed property set. These two fields are also the stable
+    shape already used by the research prompt and the sealed public contract.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    condition: str = Field(min_length=1, max_length=400)
+    interpretation: str = Field(min_length=1, max_length=400)
+
+
 class _CandidateDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -193,7 +209,9 @@ class _CandidateDraft(BaseModel):
     economic_rationale: str = Field(
         default="경험적 가설로서 비용 후 검증이 필요합니다.", max_length=800
     )
-    falsification_conditions: list[dict[str, str]] = Field(default_factory=list, max_length=8)
+    falsification_conditions: list[_FalsificationConditionDraft] = Field(
+        default_factory=list, max_length=8
+    )
     expected_turnover: str = Field(
         default="백테스트에서 실제 회전율과 비용 민감도를 산출합니다.", max_length=400
     )

@@ -4,6 +4,7 @@ from datetime import date, timedelta
 
 import pytest
 
+from ai_graph.llm.aoai import _strict_response_schema
 from ai_graph.llm.base import LLMConnectionError, LLMJsonRequest, LLMTimeoutError
 from ai_graph.nodes import strategy_research
 from ai_graph.nodes.strategy_research import (
@@ -164,7 +165,33 @@ def test_live_research_signs_a_deep_brief_with_research_selected_period(
     assert len(spec.sources) == 5
     assert spec.candidates[0].backtest_years == 2
     assert spec.candidates[0].ai_assumptions
-    assert spec.candidates[0].falsification_conditions
+    assert spec.candidates[0].falsification_conditions == [
+        {
+            "condition": "비용 후 OOS 성과가 기준 대비 열위",
+            "interpretation": "가설을 지지하지 않음",
+        }
+    ]
+
+
+def test_research_request_schema_closes_falsification_condition_objects() -> None:
+    request = strategy_research._request(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        allowed_metrics=["close", "high", "sma20"],
+        allowed_sectors=[],
+    )
+
+    strict_schema = _strict_response_schema(request.response_schema)
+    candidate_schema = strict_schema["$defs"]["_CandidateDraft"]
+    item_schema = candidate_schema["properties"]["falsification_conditions"]["items"]
+    reference = item_schema["$ref"].rsplit("/", maxsplit=1)[-1]
+    falsification_schema = strict_schema["$defs"][reference]
+
+    assert falsification_schema["additionalProperties"] is False
+    assert falsification_schema["required"] == ["condition", "interpretation"]
+    assert falsification_schema["properties"] == {
+        "condition": {"type": "string"},
+        "interpretation": {"type": "string"},
+    }
 
 
 def test_researcher_cannot_replace_an_unsupported_strategy_with_a_catalogue_rule() -> None:
