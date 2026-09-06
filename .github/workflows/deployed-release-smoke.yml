@@ -1,0 +1,165 @@
+name: Deployed release smoke
+
+# Runs automatically after every successful "Deploy to SSH Server" run and verifies the
+# release it just started, without a browser and without Google login: readiness
+# contracts on loopback, then one real analysis job admitted with a session the
+# backend's own session store minted for a synthetic QA user (see
+# scripts/deployed_release_smoke.py). The external tunnel's TLS certificate is never
+# touched, so a broken certificate cannot mask - or be masked by - an application fault.
+
+on:
+  workflow_run:
+    workflows:
+      - Deploy to SSH Server
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What to verify
+        required: true
+        default: full-analysis
+        type: choice
+        options:
+          - readiness-only
+          - full-analysis
+      query:
+        description: Natural-language strategy to run (full-analysis only)
+        required: false
+        default: RSI(14)가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 파는 전략
+        type: string
+      timeout_minutes:
+        description: Wall budget for the analysis job
+        required: false
+        default: "20"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deployed-release-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Verify the deployed release without Google login
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT || '30233' }}
+      SERVER_USER: ${{ secrets.SERVER_USER || 'etluser' }}
+      # The release deploy.yml starts: node3 development tree on 18011/18010.
+      SERVER_APP_DIR: ${{ secrets.NODE3_APP_DIR || '/home/etluser/mvp_sp2/quant-proj' }}
+      COMBINED_PORT: "18011"
+      GATEWAY_PORT: "18010"
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SMOKE_MODE: ${{ inputs.mode || 'full-analysis' }}
+      SMOKE_QUERY: ${{ inputs.query || 'RSI(14)가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 파는 전략' }}
+      SMOKE_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes || '20' }}
+      SMOKE_SCRIPT: /tmp/quant-agent-smoke-${{ github.run_id }}.py
+
+    steps:
+      - name: Check out the release under test
+        uses: actions/checkout@v4
+
+      - name: Validate required secret
+        run: test -n "$SSH_PRIVATE_KEY"
+
+      - name: Configure SSH
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          for attempt in 1 2 3; do
+            ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts" \
+              && break
+            test "$attempt" = 3 && exit 1
+            sleep 2
+          done
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Verify readiness contracts on the deployed release
+        run: |
+          set -Eeuo pipefail
+          check_readiness() {
+            local label="$1"
+            local url="$2"
+            local profile="$3"
+            ssh -o BatchMode=yes \
+              -o ConnectTimeout=10 \
+              -o StrictHostKeyChecking=yes \
+              -i "$HOME/.ssh/id_ed25519" \
+              -p "$SERVER_PORT" \
+              "$SERVER_USER@$SERVER_HOST" \
+              "curl -q --fail --silent --show-error --connect-timeout 5 --max-time 15 '$url'" \
+              | node scripts/readiness-semantic-gate.mjs --label "$label" --profile "$profile"
+          }
+          check_readiness "Backend readiness" "http://127.0.0.1:$COMBINED_PORT/readiness" backend
+          check_readiness "AI API readiness" "http://127.0.0.1:$COMBINED_PORT/ai-api/readiness" ai
+          # Through the frontend gateway too: this is the path a browser request takes.
+          check_readiness "AI API readiness via gateway" "http://127.0.0.1:$GATEWAY_PORT/ai-api/readiness" ai
+
+      - name: Ship the smoke script
+        if: ${{ env.SMOKE_MODE == 'full-analysis' }}
+        run: |
+          scp -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -P "$SERVER_PORT" \
+            scripts/deployed_release_smoke.py \
+            "$SERVER_USER@$SERVER_HOST:$SMOKE_SCRIPT"
+
+      - name: Run one login-free analysis job on the deployed release
+        if: ${{ env.SMOKE_MODE == 'full-analysis' }}
+        run: |
+          timeout_seconds=$(( SMOKE_TIMEOUT_MINUTES * 60 ))
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=60 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" "$SMOKE_SCRIPT" "$GATEWAY_PORT" "$timeout_seconds" "${{ github.run_id }}" "$SMOKE_QUERY" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="$1"
+          SCRIPT="$2"
+          GATEWAY_PORT="$3"
+          TIMEOUT_SECONDS="$4"
+          RUN_LABEL="$5"
+          QUERY="$6"
+          case "$SCRIPT" in
+            /tmp/quant-agent-smoke-[0-9]*.py) ;;
+            *) printf 'Unsafe smoke script path: %s\n' "$SCRIPT" >&2; exit 2 ;;
+          esac
+          trap 'rm -f -- "$SCRIPT"' EXIT
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          test -f "$APP_DIR/.env"
+          # cwd = release dir so the backend loads the same .env the running service uses.
+          cd "$APP_DIR"
+          PYTHONPATH="$APP_DIR/backend:$APP_DIR/ai:$APP_DIR/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u "$SCRIPT" \
+              --base-url "http://127.0.0.1:$GATEWAY_PORT" \
+              --query "$QUERY" \
+              --expect ready \
+              --timeout-seconds "$TIMEOUT_SECONDS" \
+              --run-label "$RUN_LABEL" \
+            | tee "$APP_DIR/.run/deployed-release-smoke.log"
+          REMOTE
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Deployed release smoke"
+            echo "- mode: $SMOKE_MODE"
+            echo "- release dir: $SERVER_APP_DIR (combined :$COMBINED_PORT, gateway :$GATEWAY_PORT)"
+            echo "- trigger: ${{ github.event_name }} (${{ github.event.workflow_run.head_sha || github.sha }})"
+          } >> "$GITHUB_STEP_SUMMARY"

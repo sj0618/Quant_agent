@@ -151,7 +151,7 @@ SERVICE_DB_ARCHIVE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgr
 |---|---|---|
 | `AI_BACKTEST_LOOKBACK_YEARS` | `1` | 마지막 완료 KST 세션에서 거슬러 올라가는 백테스트 창의 길이(년). `1~3`으로 clamp 되며, 범위 밖 값은 배포를 죽이는 대신 잘린다. 창 길이는 정책 id(`krx_pit_common_stock_{N}y_kst_settled_session_v3`)에 그대로 실린다 |
 | `AI_BACKTEST_UNIVERSE_MAX_TICKERS` | `100` | 백테스트가 적재할 PIT 보통주 상한. 창 **시작 직전** 60세션의 평균 거래대금(`adj_close × adj_volume`)으로 순위를 매겨 상위 N종만 남긴다. 창 시작 이전 정보만 쓰므로 look-ahead가 아니고, 창 안에서 상장폐지된 종목은 그대로 남는다(생존편향 방지) |
-| `AI_BACKTEST_CACHE_DIR` | (배포가 `.run/backtest-cache`로 설정) | 백테스트 평가 캐시 디렉터리. `APP_ENV=production`에서는 미설정 시 백테스트를 거부하므로 `deploy.yml`이 항상 export한다 |
+| `AI_BACKTEST_CACHE_DIR` | (배포가 `.run/backtest-cache`로 설정) | 백테스트 평가 캐시 디렉터리. `APP_ENV=production`에서는 미설정 시 `/ai-api/readiness`의 `backtest_evaluation_cache` 검사가 실패하고 백테스트도 거부하므로 `deploy.yml`·`recover-backend-fe.yml`이 항상 export한다 |
 
 ### 요청 전역 deadline
 
@@ -201,6 +201,20 @@ release 프로필(`AI_RELEASE_PROFILE` 또는 `APP_ENV` 가 `release`/`productio
 **이 스위치가 덮지 않는 것:** freshness 게이트(가격이 낡아서 추천 보류)와 L4 증거
 게이트(증거가 없어서 추천 보류)는 데이터 품질 게이트라 그대로 둔다. 둘 다 전략이
 좋은지에 대한 판단이 아니므로 이 스위치 뒤에 있을 이유가 없다.
+
+## 배포 릴리스 자동 검증 (구글 로그인 우회)
+
+`Deploy to SSH Server`가 성공하면 `deployed-release-smoke.yml`이 자동으로 이어서 실행된다
+(수동 실행은 `workflow_dispatch`, `mode=readiness-only|full-analysis`). 배포가 띄운 릴리스 트리
+(`~/mvp_sp2/quant-proj`, combined :18011 / gateway :18010)를 대상으로:
+
+1. `/readiness`·`/ai-api/readiness`를 loopback과 gateway 경유로 받아 `readiness-semantic-gate.mjs`로 검사한다.
+2. `scripts/deployed_release_smoke.py`를 서버에서 릴리스 venv로 실행한다. 백엔드의 `AuthSessionStore`로
+   합성 QA 사용자(`qa-smoke:<run_id>`)의 `qa_session`을 공유 Redis에 직접 발급해 쿠키로 AI API를 호출하고,
+   분석 job 1건을 접수→종결까지 폴링해 `status=ready`를 확인한 뒤 세션을 폐기한다.
+
+브라우저·구글 OAuth·외부 터널의 TLS 인증서는 관여하지 않으므로, 터널 인증서 문제로 구글 로그인이
+막혀 있어도 애플리케이션 경로는 매 배포마다 검증된다. 인증서 자체는 터널/nginx 설정에서 별도로 고쳐야 한다.
 
 ## 운영 계약: 단일 프로세스
 
