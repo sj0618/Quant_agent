@@ -382,6 +382,15 @@ jobs:
           test -n "$GOOGLE_CLIENT_ID"
           test -n "$GOOGLE_CLIENT_SECRET"
 
+          # A truncated/mangled client id still ends in .apps.googleusercontent.com, so the
+          # readiness smoke below cannot tell it apart from a real one. Pin the full shape
+          # here, before the deploy mutates the server .env.
+          if ! printf '%s' "$GOOGLE_CLIENT_ID" \
+            | grep -Eq '^[0-9]{11,13}-[a-z0-9]{32}\.apps\.googleusercontent\.com$'; then
+            echo "::error::GOOGLE_CLIENT_ID secret is malformed. Expected <project-number>-<32 chars>.apps.googleusercontent.com; re-copy it from the Google Cloud console with the copy button." >&2
+            exit 1
+          fi
+
           auth_env_file="$RUNNER_TEMP/google-auth.env"
           trap 'rm -f "$auth_env_file"' EXIT
           umask 077
@@ -792,6 +801,7 @@ jobs:
             cd "$APP_DIR"
             "$APP_DIR/ai/.venv/bin/python" - "$auth_body" <<'PY'
           import json
+          import re
           import sys
           from pathlib import Path
           from urllib.parse import parse_qs, urlsplit
@@ -799,7 +809,10 @@ jobs:
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           query = parse_qs(urlsplit(payload["authorizationUrl"]).query)
           assert query["redirect_uri"] == ["https://qt-agent.kro.kr:38010/auth/google/callback"]
-          assert query["client_id"][0].endswith(".apps.googleusercontent.com")
+          client_id = query["client_id"][0]
+          assert re.fullmatch(
+              r"[0-9]{11,13}-[a-z0-9]{32}\.apps\.googleusercontent\.com", client_id
+          ), f"served client_id has the wrong shape: {client_id!r}"
           PY
             rm -f "$auth_headers" "$auth_body"
             touch "$RUN_DIR/release-ready"
