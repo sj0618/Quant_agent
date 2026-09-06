@@ -629,12 +629,11 @@ jobs:
           [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]]
           test -r "/proc/$AI_PID/environ"
 
-          # Use the running development service's exact live-provider configuration,
-          # but never print any configuration value.  Only AOAI role settings are
-          # needed to construct and execute the diagnostic request matrix.
+          # Use the running development service's exact provider and data-source
+          # environment, but never print any configuration value.
           while IFS= read -r -d '' entry; do
             case "$entry" in
-              AI_AOAI_*=*|AI_LLM_*=*) export "$entry" ;;
+              AI_AOAI_*=*|AI_LLM_*=*|AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) export "$entry" ;;
             esac
           done < "/proc/$AI_PID/environ"
           export AI_LLM_PROVIDER=aoai
@@ -647,40 +646,18 @@ jobs:
           import httpx
 
           from ai_graph.llm.aoai import AOAIResponsesClient
-          from ai_graph.llm.base import LLMJsonRequest
           from ai_graph.llm.factory import create_llm_client
-          from ai_graph.llm.role_calls import (
-              STRATEGY_INTENT_PROMPT_TEMPLATE_NAME,
-              STRATEGY_INTENT_PROMPT_VERSION,
-              STRATEGY_INTENT_SCHEMA_NAME,
-              STRATEGY_INTENT_SYSTEM_PROMPT,
-              _LiveStrategyIntent,
-          )
+          from ai_graph.data_sources.sectors import get_known_sectors
+          from ai_graph.nodes.condition_compiler import supported_metrics
+          from ai_graph.nodes.strategy_research import _request
 
           query = "삼성전자 RSI 전략을 최근 1년으로 검증해줘"
-          schema = _LiveStrategyIntent.model_json_schema()
-          request = LLMJsonRequest(
-              schema_name=STRATEGY_INTENT_SCHEMA_NAME,
-              system_prompt=STRATEGY_INTENT_SYSTEM_PROMPT,
-              user_prompt=(
-                  "Resolve this request into one runnable strategy.\n"
-                  f"EXPECTED_JSON_SCHEMA={json.dumps(schema, ensure_ascii=False, sort_keys=True)}\n"
-                  "CAPABILITIES=[]\n"
-                  f"USER_QUERY={query}"
-              ),
-              temperature=0.0,
-              max_output_tokens=3500,
-              enable_web_search=True,
-              web_search_context_size="high",
-              reasoning_effort="medium",
-              max_tool_calls=8,
-              task_type="strategy_intent_diagnostic",
-              prompt_template_name=STRATEGY_INTENT_PROMPT_TEMPLATE_NAME,
-              prompt_version=STRATEGY_INTENT_PROMPT_VERSION,
-              response_schema=schema,
-              variables_jsonb={"query": query, "capabilities": []},
+          request = _request(
+              query=query,
+              allowed_metrics=supported_metrics(),
+              allowed_sectors=get_known_sectors(),
           )
-          client = create_llm_client(role="STRATEGY_INTENT")
+          client = create_llm_client(role="STRATEGY_RESEARCH")
           if not isinstance(client, AOAIResponsesClient):
               raise RuntimeError("node3 development process is not configured for AOAI")
           full = client._request_body(request)
