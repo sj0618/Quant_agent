@@ -127,6 +127,54 @@ test("the ai profile accepts the AI readiness contract and still fails closed", 
   );
 });
 
+test("--allow-missing reports a check the running release predates but still fails closed", () => {
+  const older = {
+    status: "ready",
+    checks: REQUIRED_AI_READINESS_CHECKS.filter((name) => name !== "backtest_evaluation_cache").map(
+      (name) => ({ name, ready: true, reason: null }),
+    ),
+  };
+
+  assert.throws(
+    () => validateReadinessPayload(older, { requiredChecks: REQUIRED_AI_READINESS_CHECKS }),
+    /missing required checks: backtest_evaluation_cache/u,
+  );
+  assert.deepEqual(
+    validateReadinessPayload(older, { requiredChecks: REQUIRED_AI_READINESS_CHECKS, allowMissing: true }).missing,
+    ["backtest_evaluation_cache"],
+  );
+  assert.throws(
+    () =>
+      validateReadinessPayload(
+        { ...older, checks: [...older.checks, { name: "rule_draft_signer_v2", ready: true, reason: null }] },
+        { requiredChecks: REQUIRED_AI_READINESS_CHECKS, allowMissing: true },
+      ),
+    /unexpected checks: rule_draft_signer_v2/u,
+  );
+  assert.throws(
+    () =>
+      validateReadinessPayload(
+        { ...older, checks: older.checks.map((check) => (check.name === "redis" || check.name === "migration_revision" ? { ...check, ready: false, reason: "down" } : check)) },
+        { requiredChecks: REQUIRED_AI_READINESS_CHECKS, allowMissing: true },
+      ),
+    /is not ready: migration_revision/u,
+  );
+
+  const tolerated = spawnSync(process.execPath, ["scripts/readiness-semantic-gate.mjs", "--profile", "ai", "--allow-missing"], {
+    input: JSON.stringify(older),
+    encoding: "utf8",
+  });
+  assert.equal(tolerated.status, 0, tolerated.stderr);
+  assert.match(tolerated.stderr, /does not publish backtest_evaluation_cache yet/u);
+  assert.deepEqual(JSON.parse(tolerated.stdout).missing, ["backtest_evaluation_cache"]);
+
+  const strict = spawnSync(process.execPath, ["scripts/readiness-semantic-gate.mjs", "--profile", "ai"], {
+    input: JSON.stringify(older),
+    encoding: "utf8",
+  });
+  assert.equal(strict.status, 1);
+});
+
 test("the CLI selects a check list by profile and refuses an unknown one", () => {
   const accepted = spawnSync(
     process.execPath,
