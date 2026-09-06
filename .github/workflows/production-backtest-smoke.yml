@@ -652,6 +652,7 @@ jobs:
           import httpx
 
           from ai_graph.llm.aoai import AOAIResponsesClient
+          from ai_graph.llm.base import LLMClientError
           from ai_graph.llm.factory import create_llm_client
           from ai_graph.data_sources.sectors import get_known_sectors
           from ai_graph.nodes.condition_compiler import supported_metrics
@@ -717,6 +718,24 @@ jobs:
               ("full_strategy_intent", full),
           ]
           results = [report(name, body) for name, body in cases]
+          try:
+              # A successful HTTP response alone is insufficient: the production
+              # failure was valid HTTP containing JSON truncated at the output limit.
+              # Use the deployed client to prove it can parse the complete, strict
+              # strategy-research contract without exposing model output.
+              client.generate_json(request)
+              results.append({
+                  "case": "full_strategy_parse",
+                  "result": "success",
+                  **fields(full),
+              })
+          except LLMClientError as exc:
+              results.append({
+                  "case": "full_strategy_parse",
+                  "result": "client_error",
+                  "exception": type(exc).__name__,
+                  **fields(full),
+              })
           print(json.dumps({"provider": "aoai", "results": results}, ensure_ascii=False, sort_keys=True))
           if any(item["result"] != "success" for item in results):
               raise SystemExit(1)
