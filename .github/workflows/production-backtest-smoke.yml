@@ -774,8 +774,9 @@ jobs:
 
           cd "$APP_DIR"
           PYTHONPATH="$APP_DIR/ai:$APP_DIR/backtest_module" \
-            "$APP_DIR/ai/.venv/bin/python" -u - "$JOB_ID" <<'PY'
+            "$APP_DIR/ai/.venv/bin/python" -u - "$JOB_ID" "$AI_PID" <<'PY'
           import json
+          import os
           import re
           import sys
 
@@ -783,9 +784,11 @@ jobs:
 
           from ai_graph.data_sources.db import resolve_database_dsn_from_env
 
-          job_id = sys.argv[1]
+          job_id, ai_pid = sys.argv[1:]
           if not re.fullmatch(r"job_[A-Za-z0-9]+", job_id):
               raise RuntimeError("invalid job identifier")
+          if not re.fullmatch(r"[1-9][0-9]*", ai_pid):
+              raise RuntimeError("invalid service process identifier")
           dsn, _ = resolve_database_dsn_from_env()
           if not dsn:
               raise RuntimeError("database DSN is not configured")
@@ -830,7 +833,40 @@ jobs:
               audit_trace_id = trace[0] if trace else None
               model_rows = []
               error_rows = []
+              agent_rows = []
+              trace_row = None
+              outbox_rows = conn.execute(
+                  """
+                  SELECT status, created_at, claimed_at, delivered_at
+                  FROM app.ai_analysis_job_outbox
+                  WHERE job_id = %s
+                  ORDER BY created_at
+                  """,
+                  (job_id,),
+              ).fetchall()
               if audit_trace_id is not None:
+                  trace_row = conn.execute(
+                      """
+                      SELECT status, started_at, ended_at
+                      FROM app.ai_trace
+                      WHERE trace_id = %s
+                      """,
+                      (audit_trace_id,),
+                  ).fetchone()
+                  agent_rows = conn.execute(
+                      """
+                      SELECT agent_name, status, started_at, ended_at, latency_ms,
+                             CASE
+                               WHEN ended_at IS NULL AND started_at IS NOT NULL
+                               THEN floor(extract(epoch FROM now() - started_at))::integer
+                               ELSE NULL
+                             END AS running_seconds
+                      FROM app.ai_agent_execution_log
+                      WHERE trace_id = %s
+                      ORDER BY started_at, agent_name
+                      """,
+                      (audit_trace_id,),
+                  ).fetchall()
                   model_rows = conn.execute(
                       """
                       SELECT task_type, provider, status, web_search_used, retry_count,
@@ -852,6 +888,23 @@ jobs:
                       (audit_trace_id,),
                   ).fetchall()
 
+          memory_path = os.environ.get("AI_MEMORY_PATH")
+          memory_state = {
+              "enabled": bool(memory_path),
+              "path_exists": bool(memory_path and os.path.exists(memory_path)),
+              "size_bytes": (
+                  os.path.getsize(memory_path)
+                  if memory_path and os.path.isfile(memory_path)
+                  else None
+              ),
+          }
+          proc_state = None
+          proc_wchan = None
+          try:
+              proc_state = open(f"/proc/{ai_pid}/stat", encoding="utf-8").read().split(") ", 1)[1][0]
+              proc_wchan = open(f"/proc/{ai_pid}/wchan", encoding="utf-8").read().strip() or None
+          except OSError:
+              pass
           stack_text = "\n".join(row[1] for row in error_rows)
           print(json.dumps({
               "job": {
@@ -866,8 +919,43 @@ jobs:
                   "created_at": job[9].isoformat(),
                   "updated_at": job[10].isoformat(),
               },
+              "runtime": {
+                  "service_process_present": os.path.isdir(f"/proc/{ai_pid}"),
+                  "process_state": proc_state,
+                  "process_wait_channel": proc_wchan,
+                  "analysis_memory": memory_state,
+              },
+              "dispatch": {
+                  "outbox": [
+                      {
+                          "status": row[0],
+                          "created_at": row[1].isoformat(),
+                          "claimed_at": row[2].isoformat() if row[2] else None,
+                          "delivered_at": row[3].isoformat() if row[3] else None,
+                      }
+                      for row in outbox_rows
+                  ],
+              },
               "audit": {
                   "trace_found": audit_trace_id is not None,
+                  "trace": (
+                      {
+                          "status": trace_row[0],
+                          "started_at": trace_row[1].isoformat(),
+                          "ended_at": trace_row[2].isoformat() if trace_row[2] else None,
+                      }
+                      if trace_row is not None else None
+                  ),
+                  "agent_executions": [
+                      {
+                          "name": row[0], "status": row[1],
+                          "started_at": row[2].isoformat() if row[2] else None,
+                          "ended_at": row[3].isoformat() if row[3] else None,
+                          "latency_ms": float(row[4]) if row[4] is not None else None,
+                          "running_seconds": row[5],
+                      }
+                      for row in agent_rows
+                  ],
                   "model_calls": [
                       {"task_type": row[0], "provider": row[1], "status": row[2],
                        "web_search_used": row[3], "retry_count": row[4],
