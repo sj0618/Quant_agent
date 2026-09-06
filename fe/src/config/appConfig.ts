@@ -20,6 +20,7 @@ export const AI_ENDPOINTS = {
   analysisJobCancel: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/cancel`,
   analysisJobResearchAppendix: (id: string) => `/analysis-jobs/${encodeURIComponent(id)}/research-appendix`,
   strategyDescriptions: "/api/strategies/descriptions",
+  demoSendReport: "/demo/send-report",
 } as const;
 
 function trimTrailingSlash(value: string | undefined) {

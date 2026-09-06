@@ -168,6 +168,16 @@ def raise_if_past_deadline() -> None:
         raise AnalysisDeadlineExceeded("analysis exceeded its total time budget")
 
 
+def progress_listeners_active() -> bool:
+    """A driver has installed a stage or activity reporter for this run.
+
+    Lets cosmetic-only producers skip work (and any pacing) when nobody is listening,
+    e.g. direct ``run_analysis`` calls and unit tests.
+    """
+
+    return _STAGE_REPORTER.get() is not None or _ACTIVITY_REPORTER.get() is not None
+
+
 def report_node_stage(node_name: str) -> None:
     """Publish the stage `node_name` belongs to, if anyone is listening."""
 

@@ -1169,6 +1169,15 @@ def _build_rule_draft_with_audit(
     return outcome
 
 
+class DemoSendReportRequest(BaseModel):
+    """시연용 리포트 이메일 전송 요청."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
+
+    job_id: str = Field(min_length=1)
+    recipient: str | None = Field(default=None, max_length=254)
+
+
 def create_app(
     job_store: AnalysisJobStore | None = None,
     *,
@@ -1435,7 +1444,16 @@ def create_app(
 
         production_runtime = _production_runtime()
         deferred_rule_draft_resolver: Callable[[str, str], RuleDraftV1] | None = None
-        if production_runtime:
+        # 시연 fallback: 트리거 문구(자연어)는 리서치/프로바이더 게이트를 건너뛰고 바로 job을
+        # 생성해, production 프로파일에서도 목업 결과(run_analysis 훅)가 반드시 실행되게 한다.
+        from ai_graph.demo_mock import demo_mock_active as _demo_mock_active
+
+        demo_bypass = (
+            request.query is not None
+            and not request.is_parse_bound
+            and _demo_mock_active(request.query)
+        )
+        if production_runtime and not demo_bypass:
             # V2 is a deterministic development fallback for the old exploratory
             # route.  It is not a semantic substitute for an unfamiliar strategy in
             # production: only a V3 web-researched spec or a complete explicit V1
@@ -1562,7 +1580,7 @@ def create_app(
             # it. The resolved execution spec remains the sole graph authority.
             if request.query is None:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
-            if production_runtime:
+            if production_runtime and not demo_bypass:
                 signer = app.state.rule_draft_signer
                 if signer is None:
                     raise HTTPException(
@@ -2240,6 +2258,38 @@ def create_app(
             resource_id=strategy_id,
             message="No completed analysis job with backtest performance was found.",
         )
+
+    @app.post("/demo/send-report", tags=["Demo"])
+    def demo_send_report(
+        request: DemoSendReportRequest,
+        user_id: str = Depends(require_user),
+    ) -> dict[str, object]:
+        """시연용: 완료된 분석 리포트를 SMTP로 실제 이메일 발송한다.
+
+        기존 Brevo/Resend outbox·worker 경로를 우회하는 데모 fallback이다. SMTP 크레덴셜은
+        서버 환경변수(DEMO_SMTP_*)에서만 읽으며, 미설정 시 어떻게 채우는지 400으로 안내한다.
+        """
+
+        job = _owned_job(store, request.job_id, user_id)
+        if job is None or job.result is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="analysis job not found",
+            )
+        from ai_graph.demo_email import DemoEmailConfigError, send_demo_report
+
+        try:
+            return send_demo_report(job.result, request.recipient)
+        except DemoEmailConfigError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "demo_email_not_configured", "message": str(exc)},
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 전송 실패 사유를 그대로 노출해 시연 디버깅을 돕는다.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={"code": "demo_email_send_failed", "message": f"{type(exc).__name__}: {exc}"},
+            ) from exc
 
     @app.get(
         SPEC_REPORT_DETAIL_PATH,

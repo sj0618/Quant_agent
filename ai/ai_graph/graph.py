@@ -263,6 +263,12 @@ def run_analysis(
 ) -> APIEnvelope:
     base_report_started_at = perf_counter()
     query = _normalize_user_query(user_query)
+    # 시연 영상용 fallback: 특정 트리거 문구는 실제 그래프를 건너뛰고 고성과 목업을 반환한다.
+    # 정확한 트리거 문구에만 반응하므로 일반 입력 경로에는 영향이 없다(끄기: DEMO_MOCK_ENABLED=0).
+    from ai_graph.demo_mock import demo_mock_active, run_demo_mock
+
+    if demo_mock_active(query):
+        return run_demo_mock(query, trace_id or (_trace_id(query) if query else None))
     normalized_execution_spec = (
         validate_execution_spec(execution_spec)
         if execution_spec is not None
