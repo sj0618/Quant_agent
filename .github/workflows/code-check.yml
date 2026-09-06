@@ -60,6 +60,13 @@ jobs:
           ai/tests/test_graph_e2e.py
           ai/tests/test_api.py
           ai/tests/test_strategy_parser.py
+          ai/tests/test_strategy_intent.py
+          ai/tests/test_intent_resolution.py
+          ai/tests/test_holding_and_rebalance.py
+          ai/tests/test_sector_universe_and_per.py
+          ai/tests/test_condition_compiler_moving_averages.py
+          ai/tests/test_freshness_propagation.py
+          ai/tests/test_small_talk_short_circuit.py
           ai/tests/test_staging_pipeline_gate.py
           ai/tests/test_llm_concurrency_gate.py
           ai/tests/test_token_auth.py
@@ -74,6 +81,7 @@ jobs:
         run: >-
           python -m pytest -q
           backend/tests/unit/test_main_smoke.py
+          backend/tests/unit/test_deployed_release_smoke.py
           backend/tests/unit/test_auth_config.py
           backend/tests/unit/test_combined_main.py
           backend/tests/unit/test_auth_core.py

@@ -223,6 +223,8 @@ def _payload(*, sector=None, metric="per"):
         "required_metrics": [metric],
         "assumptions": ["PIT DART 연간 EPS 기준"],
         "source_ids": ["source-1"],
+        "backtest_years": 2,
+        "backtest_period_basis": "테스트 AI가 데이터 조회 전에 2년을 선택했습니다.",
     }
     if sector is not None:
         candidate["sector"] = sector

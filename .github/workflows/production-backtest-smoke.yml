@@ -973,7 +973,7 @@ jobs:
       - name: Verify public AI readiness
         if: ${{ inputs.mode == 'live-audit' }}
         run: |
-          ai_required_checks='durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer'
+          ai_required_checks='durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer,backtest_evaluation_cache'
           curl --fail --silent --show-error \
             --connect-timeout 10 --max-time 30 \
             https://qt-agent.kro.kr/ai-api/readiness \

@@ -88,6 +88,8 @@ def _research_response(entry: dict, exit_: dict, required: list[str]) -> dict:
                 "required_metrics": required,
                 "assumptions": ["KRX 일봉 종가 기준으로 다음 거래일 체결을 가정합니다."],
                 "source_ids": ["source-1"],
+                "backtest_years": 2,
+                "backtest_period_basis": "테스트 AI가 데이터 조회 전에 2년을 선택했습니다.",
             }
         ],
     }

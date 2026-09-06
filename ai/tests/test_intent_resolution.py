@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from ai_graph.data_sources.db import PipelineDataBundle
+from ai_graph.data_sources.db import PipelineDataBundle, PipelineDataUnavailableError
 from ai_graph.graph import (
     _unverifiable_ambiguity,
     _strategy_query,
@@ -293,16 +293,110 @@ def test_missing_ai_period_stops_before_the_data_loader(monkeypatch: pytest.Monk
     assert "백테스트 기간" in data["ambiguity"]["reason"]
 
 
+def test_a_classifier_without_a_model_decision_still_stops_at_the_period_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The node path rather than a hand-built state: with no model decision the
+    classifier is READY by keyword, seals no period, and the loader is never reached."""
+
+    monkeypatch.setattr("ai_graph.graph.resolve_strategy_intent", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        "ai_graph.graph.load_pipeline_data_from_env",
+        lambda *_args, **_kwargs: pytest.fail("the loader must not receive an unsealed period"),
+    )
+    query = "돈 버는 전략 만들어서 검증해줘"
+
+    state = ambiguity_classifier_node({"user_query": query, "trace_id": "t"})
+    data = data_node({"user_query": query, "trace_id": "t", **state})
+
+    assert classify_query(query) == AmbiguityCode.READY
+    assert state["status"] == EnvelopeStatus.READY.value
+    assert "intent" not in state
+    assert "backtest_period" not in state
+    assert data["status"] == EnvelopeStatus.NEED_CLARIFICATION.value
+    assert "백테스트 기간" in data["ambiguity"]["reason"]
+
+
+def test_an_unsupported_provider_value_returns_none_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo in AI_LLM_PROVIDER is a configuration failure, not an AOAI incident: the
+    classifier keeps its retryable period gate instead of crashing the first node."""
+
+    monkeypatch.setenv("AI_LLM_PROVIDER", "openai")
+
+    assert resolve_strategy_intent(query="RSI 30 이하 매수 전략", capabilities=[]) is None
+
+
 def test_mock_mode_period_is_a_recorded_model_decision(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without a live provider the mock model still selects the period explicitly, so the
-    documented deterministic profile runs end to end without a hidden local default."""
+    """Without a live provider the mock model still selects the period explicitly - as a
+    recorded model call whose sealed period says who chose it - so the deterministic
+    profile runs end to end without a hidden local default."""
 
     monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
+    recorded: list[str] = []
+
+    def begin_model_call(**kwargs: Any) -> None:
+        recorded.append(str(kwargs["task_type"]))
+        return None
+
+    monkeypatch.setattr("ai_graph.llm.mock.begin_model_call", begin_model_call)
 
     state = ambiguity_classifier_node({"user_query": "돈 버는 전략 만들어서 검증해줘", "trace_id": "t"})
 
+    assert recorded == ["strategy_intent"]
     assert state["status"] == EnvelopeStatus.READY.value
     assert state["backtest_period"]["period_locked"] is True
     assert state["backtest_period"]["backtest_years"] == 2
-    assert "mock" in state["backtest_period"]["basis"]
-    assert classify_query("돈 버는 전략 만들어서 검증해줘") == AmbiguityCode.READY
+    assert state["backtest_period"]["selection_source"] == "mock_fixture"
+    assert "리서치로 선택한 값이 아닙니다" in state["backtest_period"]["basis"]
+    # Product copy, not provider-mode vocabulary, reaches the progress stream/envelope.
+    assert "mock" not in state["ambiguity"]["interpretation"]
+    assert all("mock" not in item for item in state["ambiguity"]["assumptions"])
+
+
+def test_a_mock_period_is_refused_under_a_release_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fixture period must never be sealed as research on a production host."""
+
+    monkeypatch.setenv("AI_LLM_PROVIDER", "mock")
+    monkeypatch.setenv("AI_RELEASE_PROFILE", "release")
+    monkeypatch.setattr(
+        "ai_graph.graph.load_pipeline_data_from_env",
+        lambda *_args, **_kwargs: pytest.fail("the loader must not receive a mock period"),
+    )
+    query = "돈 버는 전략 만들어서 검증해줘"
+
+    state = ambiguity_classifier_node({"user_query": query, "trace_id": "t"})
+
+    assert state["backtest_period"]["selection_source"] == "mock_fixture"
+    with pytest.raises(PipelineDataUnavailableError, match="리서치로 선택한 백테스트 기간"):
+        data_node({"user_query": query, "trace_id": "t", **state})
+
+
+def test_a_confirmed_rule_does_not_override_the_asset_class_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy confirmed-spec branch used to harvest the period and discard the
+    model's scope, so a confirmed derivatives rule went on to a KRX backtest."""
+
+    monkeypatch.setattr("ai_graph.graph.validate_execution_spec", lambda _spec: object())
+    monkeypatch.setattr(
+        "ai_graph.graph.resolve_strategy_intent",
+        lambda **_kwargs: _intent_payload(
+            scope="unsupported",
+            resolved_query="",
+            scope_reason="선물은 KRX 현물 데이터로 검증할 수 없습니다.",
+        ),
+    )
+
+    state = ambiguity_classifier_node(
+        {
+            "user_query": "코스피 선물 RSI 30 이하 매수, RSI 70 이상 매도",
+            "trace_id": "t",
+            "execution_spec": {"kind": "confirmed-v1"},
+        }
+    )
+
+    assert state["status"] == EnvelopeStatus.REJECTED.value
+    assert state["ambiguity"]["reason"] == "선물은 KRX 현물 데이터로 검증할 수 없습니다."
+    assert "backtest_period" not in state

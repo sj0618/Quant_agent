@@ -75,6 +75,8 @@ jobs:
           # The backtest evaluation cache must be a persistent directory under the
           # release profile (a /tmp fallback is refused by the AI service). Without
           # this every analysis job fails at the Backtest node after a recovery restart.
+          # Same umask as deploy.yml so a directory first created here is not 0755.
+          umask 077
           mkdir -p "$RUN_DIR/backtest-cache"
           export AI_BACKTEST_CACHE_DIR="$RUN_DIR/backtest-cache"
           export AI_AUDIT_PRODUCTION_ENABLED=1

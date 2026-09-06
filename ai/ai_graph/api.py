@@ -88,6 +88,7 @@ from ai_graph.jobs import (
     run_job_sync,
 )
 from ai_graph.llm.role_calls import generate_strategy_description, research_screening_terms
+from ai_graph.nodes.backtest import backtest_cache_ready
 from ai_graph.quant_performance import sanitize_public_performance
 from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.research_contract import (
@@ -520,6 +521,7 @@ class ReadinessCheck(BaseModel):
         "live_provider_configuration",
         "ai_contract_version",
         "rule_draft_signer",
+        "backtest_evaluation_cache",
     ]
     ready: bool
     reason: str | None = None
@@ -2436,6 +2438,7 @@ def _release_readiness(
             migration_ready = False
     contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
     rule_draft_signer_ready = rule_draft_signer is not None
+    cache_ready, cache_reason = backtest_cache_ready()
     checks = [
         ReadinessCheck(
             name="durable_job_store",
@@ -2461,6 +2464,11 @@ def _release_readiness(
             name="rule_draft_signer",
             ready=rule_draft_signer_ready,
             reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
+        ),
+        ReadinessCheck(
+            name="backtest_evaluation_cache",
+            ready=cache_ready,
+            reason=cache_reason,
         ),
     ]
     return ReadinessResponse(
@@ -2499,6 +2507,7 @@ def _core_execution_readiness(
             migration_ready = False
     contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
     rule_draft_signer_ready = rule_draft_signer is not None
+    cache_ready, cache_reason = backtest_cache_ready()
     checks = [
         ReadinessCheck(
             name="durable_job_store",
@@ -2524,6 +2533,11 @@ def _core_execution_readiness(
             name="rule_draft_signer",
             ready=rule_draft_signer_ready,
             reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
+        ),
+        ReadinessCheck(
+            name="backtest_evaluation_cache",
+            ready=cache_ready,
+            reason=cache_reason,
         ),
     ]
     return ReadinessResponse(

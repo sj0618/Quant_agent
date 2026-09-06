@@ -246,7 +246,18 @@ def test_data_node_still_recommends_when_fresh_postgres_has_no_l4_evidence(
         "ai_graph.graph.load_pipeline_data_from_env", lambda *_args, **_kwargs: bundle
     )
 
-    data = data_node({"user_query": "RSI가 30 이하인 KOSPI200", "trace_id": "l4-absent"})
+    data = data_node(
+        {
+            "user_query": "RSI가 30 이하인 KOSPI200",
+            "trace_id": "l4-absent",
+            # The period arrives sealed from the ambiguity node, which this test bypasses.
+            "backtest_period": {
+                "backtest_years": 2,
+                "basis": "테스트가 데이터 조회 전 확정한 기간입니다.",
+                "period_locked": True,
+            },
+        }
+    )
 
     assert data["freshness_evidence"]["status"] == "fresh"
     assert data["freshness_evidence"]["no_recommendation"] is False

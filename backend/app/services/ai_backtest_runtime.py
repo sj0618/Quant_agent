@@ -101,6 +101,7 @@ def seal_backtest_strategy_request(
 
     try:
         from ai_graph.graph import build_strategy_spec
+        from ai_graph.llm import LLMClientError, is_live_llm_provider
         from ai_graph.llm.role_calls import resolve_strategy_intent
         from ai_graph.schemas import StrategySpec
     except ModuleNotFoundError as exc:
@@ -123,7 +124,30 @@ def seal_backtest_strategy_request(
                 message="Parsed strategy must include a preselected backtest period.",
             )
     else:
-        intent = resolve_strategy_intent(query=request.natural_language_prompt, capabilities=[])
+        if not is_live_llm_provider():
+            # The parsed strategy persists only backtest_years, not the model's basis,
+            # so a deterministic mock period on this path would be stored as if a
+            # model had researched it. Refuse instead of recording a fixture value.
+            raise AppError(
+                status_code=422,
+                component="ai_backtest",
+                code="backtest_period_unresolved",
+                message="A live AI provider is required to select the backtest period.",
+            )
+        try:
+            intent = resolve_strategy_intent(
+                query=request.natural_language_prompt, capabilities=[]
+            )
+        except LLMClientError as exc:
+            # resolve_strategy_intent raises on live provider failure. Keep the flow's
+            # typed, retryable failure instead of parking the request as
+            # execution_outcome_unknown for a provider blip.
+            raise AppError(
+                status_code=502,
+                component="ai_backtest",
+                code="backtest_period_unresolved",
+                message="AI provider failed while resolving the backtest period; retry later.",
+            ) from exc
         if intent is None or intent.get("scope") != "supported":
             raise AppError(
                 status_code=422,

@@ -115,6 +115,7 @@ def test_sealing_resolves_one_period_and_persists_it(monkeypatch) -> None:
         entry_conditions=[{"left": "rsi", "operator": "lte", "right": 30}],
         confidence=0.5,
     )
+    monkeypatch.setattr("ai_graph.llm.is_live_llm_provider", lambda: True)
     monkeypatch.setattr(
         "ai_graph.llm.role_calls.resolve_strategy_intent",
         lambda **_kwargs: {
@@ -142,6 +143,55 @@ def test_sealing_resolves_one_period_and_persists_it(monkeypatch) -> None:
     assert observed["backtest_years"] == 2
     assert sealed.parsed_strategy_jsonb is not None
     assert sealed.parsed_strategy_jsonb["backtest_years"] == 2
+
+
+def test_sealing_refuses_to_record_a_mock_period_as_a_model_decision(monkeypatch) -> None:
+    """The parsed strategy persists only backtest_years, so a deterministic mock period
+    would be stored as if a model had researched it. Without a live provider the flow
+    refuses, exactly as it did before the mock learned to answer the intent role."""
+
+    monkeypatch.setattr("ai_graph.llm.is_live_llm_provider", lambda: False)
+    monkeypatch.setattr(
+        "ai_graph.llm.role_calls.resolve_strategy_intent",
+        lambda **_kwargs: pytest.fail("no provider call is made without a live provider"),
+    )
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="좋은 RSI 전략을 찾아줘",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    with pytest.raises(AppError) as caught:
+        seal_backtest_strategy_request(request)
+
+    assert caught.value.status_code == 422
+    assert caught.value.code == "backtest_period_unresolved"
+
+
+def test_sealing_turns_a_live_provider_failure_into_a_retryable_typed_error(monkeypatch) -> None:
+    """resolve_strategy_intent raises on live provider failure. Left untyped, the flow
+    parked the request as execution_outcome_unknown for a provider blip that happens
+    before any code is generated; a 502 AppError keeps it a terminal, retryable failure."""
+
+    from ai_graph.llm import LLMClientError
+
+    monkeypatch.setattr("ai_graph.llm.is_live_llm_provider", lambda: True)
+
+    def failing(**_kwargs):
+        raise LLMClientError("provider unavailable")
+
+    monkeypatch.setattr("ai_graph.llm.role_calls.resolve_strategy_intent", failing)
+    request = AICodeBacktestFlowRequest(
+        natural_language_prompt="좋은 RSI 전략을 찾아줘",
+        target_runtime="python-sandbox",
+        code_purpose="backtest",
+    )
+
+    with pytest.raises(AppError) as caught:
+        seal_backtest_strategy_request(request)
+
+    assert caught.value.status_code == 502
+    assert caught.value.code == "backtest_period_unresolved"
 
 def test_ast_code_validator_blocks_non_runtime_imports_and_file_io_calls():
     validator = ASTCodeValidator()

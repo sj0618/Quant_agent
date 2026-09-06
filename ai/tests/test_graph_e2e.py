@@ -25,11 +25,12 @@ pytestmark = pytest.mark.usefixtures("offline_test_environment")
 
 @pytest.fixture(autouse=True)
 def _explicit_period_selected_by_test_ai(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep offline happy paths explicit without restoring a mock-period default.
+    """Keep offline happy paths on one explicit, test-owned AI decision.
 
-    Production and ordinary mock calls must stop before data access when the AI has not
-    selected a period.  E2E tests that exercise later nodes instead inject one complete
-    AI decision, so the loader only sees an already locked value.
+    The mock client answers the intent role with a fixed 2-year period that the graph
+    seals as selection_source="mock_fixture"; a release profile refuses anything but a
+    researched period.  E2E tests that exercise later nodes inject a complete decision
+    here so the loader sees the same locked value however the mock evolves.
     """
 
     def resolve(query: str, **_kwargs: object) -> dict[str, object]:

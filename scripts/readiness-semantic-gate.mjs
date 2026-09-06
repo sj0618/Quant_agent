@@ -20,6 +20,7 @@ export const REQUIRED_AI_READINESS_CHECKS = Object.freeze([
   "live_provider_configuration",
   "ai_contract_version",
   "rule_draft_signer",
+  "backtest_evaluation_cache",
 ]);
 
 const READINESS_PROFILES = Object.freeze({
