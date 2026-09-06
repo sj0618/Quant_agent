@@ -9,8 +9,10 @@ never emits Python, SQL, a data query, or performance figures.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Iterable, Sequence
 from typing import Any
@@ -39,6 +41,8 @@ from ai_graph.schemas import (
     ResearchCandidateV3,
     ResearchSourceRefV3,
 )
+
+_logger = logging.getLogger(__name__)
 
 STRATEGY_RESEARCH_PROMPT_VERSION = "v7"
 STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v7"
@@ -253,21 +257,21 @@ def research_strategy_execution_spec(
     sectors = tuple(get_known_sectors())
     client = llm_client or create_llm_client(role="STRATEGY_RESEARCH")
     request = _request(query=query, allowed_metrics=allowed, allowed_sectors=sectors)
+    # Unit callers deliberately inject a tiny, deterministic fixture.  The live AOAI
+    # path, however, must not silently downgrade a deep-research request to one
+    # citation simply because that response happened to satisfy the execution
+    # grammar.  Treat evidence completeness as repairable before the spec is signed;
+    # the repair is still pre-backtest and cannot select on returns.
+    live = llm_client is None
     try:
-        sealed = _seal_research_response(
-            client.generate_json(request),
+        first_payload = client.generate_json(request)
+        return _seal_checked(
+            first_payload,
             query=query,
             allowed_metrics=allowed,
             allowed_sectors=sectors,
+            live=live,
         )
-        # Unit callers deliberately inject a tiny, deterministic fixture.  The live
-        # AOAI path, however, must not silently downgrade a deep-research request to
-        # one citation simply because that response happened to satisfy the execution
-        # grammar.  Treat evidence completeness as repairable before the spec is
-        # signed; the repair is still pre-backtest and cannot select on returns.
-        if llm_client is None:
-            _validate_live_research_evidence(sealed)
-        return sealed
     except _RepairableStrategyResearchError as first_error:
         # Structured-output validation errors are different from provider failures:
         # AOAI responded successfully, but omitted a compiler requirement or selected
@@ -281,15 +285,14 @@ def research_strategy_execution_spec(
             failure=first_error,
         )
         try:
-            sealed = _seal_research_response(
+            return _seal_repaired_response(
+                first_payload,
                 client.generate_json(repair_request),
                 query=query,
                 allowed_metrics=allowed,
                 allowed_sectors=sectors,
+                live=live,
             )
-            if llm_client is None:
-                _validate_live_research_evidence(sealed)
-            return sealed
         except _RepairableStrategyResearchError as repair_error:
             raise StrategyResearchError(
                 f"strategy research remained unexecutable after one bounded repair: {repair_error}",
@@ -308,6 +311,134 @@ def research_strategy_execution_spec(
             "strategy research provider is temporarily unavailable",
             cause_code="research_provider_failure",
         ) from exc
+
+
+def _seal_checked(
+    payload: object,
+    *,
+    query: str,
+    allowed_metrics: Sequence[str],
+    allowed_sectors: Sequence[str],
+    live: bool,
+) -> ResearchCandidateExecutionSpecV3:
+    sealed = _seal_research_response(
+        payload, query=query, allowed_metrics=allowed_metrics, allowed_sectors=allowed_sectors
+    )
+    if live:
+        _validate_live_research_evidence(sealed)
+    return sealed
+
+
+# The fields that define which strategy is backtested.  Everything else a candidate
+# carries (titles, hypotheses, rationale, turnover, risks, source links) describes it.
+_STRATEGY_FIELDS = (
+    "entry_conditions",
+    "exit_conditions",
+    "holding_days",
+    "rebalance_interval_days",
+    "required_metrics",
+    "backtest_years",
+    "sector",
+)
+
+
+def _seal_repaired_response(
+    first_payload: object,
+    repair_payload: object,
+    *,
+    query: str,
+    allowed_metrics: Sequence[str],
+    allowed_sectors: Sequence[str],
+    live: bool,
+) -> ResearchCandidateExecutionSpecV3:
+    """Seal the repair turn, keeping the first turn's rule when the repair rewrote it.
+
+    Observed on the deployed release: the first candidate (``rsi lte 30`` /
+    ``rsi gte 70``) compiled, was refused for a fault outside the rule, and the repair
+    turn returned the same rule with ``window=14, aggregate="last"`` bolted on, which
+    no evaluator runs.  A repair is asked to fix the named fault, not to search for a
+    new strategy.  So when its strategy-bearing fields differ from the first turn's,
+    the first turn's rule is re-judged together with the repair's evidence and prose.
+    Only when that combination is itself unexecutable - the first rule was the fault -
+    does the repair stand on its own, exactly as before.
+    """
+
+    merged = _with_first_turn_rules(first_payload, repair_payload, query=query)
+    if merged is not None:
+        try:
+            sealed = _seal_checked(
+                merged,
+                query=query,
+                allowed_metrics=allowed_metrics,
+                allowed_sectors=allowed_sectors,
+                live=live,
+            )
+        except _RepairableStrategyResearchError:
+            pass
+        else:
+            _logger.warning(
+                "strategy research repair turn changed the researched rule; "
+                "kept the first turn's compiled rule and took only the repaired "
+                "evidence fields"
+            )
+            return sealed
+    return _seal_checked(
+        repair_payload,
+        query=query,
+        allowed_metrics=allowed_metrics,
+        allowed_sectors=allowed_sectors,
+        live=live,
+    )
+
+
+def _with_first_turn_rules(
+    first_payload: object, repair_payload: object, *, query: str
+) -> dict[str, object] | None:
+    """The repair payload carrying the first turn's strategy fields, or None.
+
+    None when either turn has no candidate to compare, or when the repair kept the
+    rule (condition ``description`` text is a label, not part of the rule).
+    """
+
+    first = _first_candidate(_normalize_research_response_aliases(first_payload, query=query))
+    repaired = _first_candidate(
+        _normalize_research_response_aliases(repair_payload, query=query)
+    )
+    if first is None or repaired is None or not isinstance(repair_payload, dict):
+        return None
+    if _rule_fingerprint(first) == _rule_fingerprint(repaired):
+        return None
+    merged = copy.deepcopy(repair_payload)
+    candidate = merged["candidates"][0]
+    for name in _STRATEGY_FIELDS:
+        if name in first:
+            candidate[name] = copy.deepcopy(first[name])
+        else:
+            candidate.pop(name, None)
+    return merged
+
+
+def _first_candidate(payload: object) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        return None
+    return candidates[0]
+
+
+def _rule_fingerprint(candidate: dict[str, object]) -> dict[str, object]:
+    rule: dict[str, object] = {name: candidate.get(name) for name in _STRATEGY_FIELDS}
+    for field in ("entry_conditions", "exit_conditions"):
+        conditions = rule[field]
+        if isinstance(conditions, list):
+            rule[field] = [
+                {key: value for key, value in condition.items() if key != "description"}
+                if isinstance(condition, dict)
+                else condition
+                for condition in conditions
+            ]
+    return rule
 
 
 def _seal_research_response(
@@ -768,9 +899,15 @@ def _repair_request(
         schema_name=STRATEGY_RESEARCH_SCHEMA_NAME,
         system_prompt=(
             f"{STRATEGY_RESEARCH_SYSTEM_PROMPT}\n\n"
-            "This is the one permitted repair attempt. Return a fresh, faithful "
-            "candidate using only the supplied grammar and metrics. Do not mention "
-            "the repair, invent unavailable inputs, or return prose outside the schema."
+            "This is the one permitted repair attempt. Correct only what "
+            "previous_validation_failure names and return the complete structured "
+            "result again. Unless that failure is about them, keep entry_conditions, "
+            "exit_conditions, holding_days, rebalance_interval_days, required_metrics, "
+            "backtest_years and sector exactly as first researched: do not add window, "
+            "aggregate, scale or other qualifiers to a condition that did not need "
+            "them, and do not substitute a different strategy. Use only the supplied "
+            "grammar and metrics. Do not mention the repair, invent unavailable "
+            "inputs, or return prose outside the schema."
         ),
         user_prompt=json.dumps(
             {
