@@ -17,6 +17,7 @@ on:
           - analysis-job-inventory
           - pipeline-load-timing
           - trace-diagnostic
+          - dev-aoai-request-diagnostic
 
 permissions:
   contents: read
@@ -603,6 +604,135 @@ jobs:
                   for row in jobs
               ],
           }, ensure_ascii=False, sort_keys=True))
+          PY
+          REMOTE
+
+      - name: Diagnose node3 development AOAI request shapes
+        if: ${{ inputs.mode == 'dev-aoai-request-diagnostic' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$HOME/mvp_sp2/quant-proj"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          test -s "$PID_FILE"
+          AI_PID="$(cat "$PID_FILE")"
+          [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]]
+          test -r "/proc/$AI_PID/environ"
+
+          # Use the running development service's exact live-provider configuration,
+          # but never print any configuration value.  Only AOAI role settings are
+          # needed to construct and execute the diagnostic request matrix.
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_AOAI_*=*|AI_LLM_*=*) export "$entry" ;;
+            esac
+          done < "/proc/$AI_PID/environ"
+          export AI_LLM_PROVIDER=aoai
+
+          cd "$APP_DIR"
+          PYTHONPATH="$APP_DIR/ai:$APP_DIR/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u - <<'PY'
+          import json
+
+          import httpx
+
+          from ai_graph.llm.aoai import AOAIResponsesClient
+          from ai_graph.llm.base import LLMJsonRequest
+          from ai_graph.llm.factory import create_llm_client
+          from ai_graph.llm.role_calls import (
+              STRATEGY_INTENT_PROMPT_TEMPLATE_NAME,
+              STRATEGY_INTENT_PROMPT_VERSION,
+              STRATEGY_INTENT_SCHEMA_NAME,
+              STRATEGY_INTENT_SYSTEM_PROMPT,
+              _LiveStrategyIntent,
+          )
+
+          query = "삼성전자 RSI 전략을 최근 1년으로 검증해줘"
+          schema = _LiveStrategyIntent.model_json_schema()
+          request = LLMJsonRequest(
+              schema_name=STRATEGY_INTENT_SCHEMA_NAME,
+              system_prompt=STRATEGY_INTENT_SYSTEM_PROMPT,
+              user_prompt=(
+                  "Resolve this request into one runnable strategy.\n"
+                  f"EXPECTED_JSON_SCHEMA={json.dumps(schema, ensure_ascii=False, sort_keys=True)}\n"
+                  "CAPABILITIES=[]\n"
+                  f"USER_QUERY={query}"
+              ),
+              temperature=0.0,
+              max_output_tokens=3500,
+              enable_web_search=True,
+              web_search_context_size="high",
+              reasoning_effort="medium",
+              max_tool_calls=8,
+              task_type="strategy_intent_diagnostic",
+              prompt_template_name=STRATEGY_INTENT_PROMPT_TEMPLATE_NAME,
+              prompt_version=STRATEGY_INTENT_PROMPT_VERSION,
+              response_schema=schema,
+              variables_jsonb={"query": query, "capabilities": []},
+          )
+          client = create_llm_client(role="STRATEGY_INTENT")
+          if not isinstance(client, AOAIResponsesClient):
+              raise RuntimeError("node3 development process is not configured for AOAI")
+          full = client._request_body(request)
+
+          def fields(body):
+              tool = body.get("tools", [{}])[0] if body.get("tools") else {}
+              return {
+                  "service_tier_sent": "service_tier" in body,
+                  "reasoning_sent": "reasoning" in body,
+                  "max_tool_calls_sent": "max_tool_calls" in body,
+                  "web_search_sent": tool.get("type") == "web_search",
+                  "search_context_size_sent": "search_context_size" in tool,
+                  "structured_output_sent": "text" in body,
+              }
+
+          def report(name, body):
+              try:
+                  response = httpx.post(
+                      client.responses_url,
+                      headers={"Content-Type": "application/json", "api-key": client.api_key},
+                      json=body,
+                      timeout=45.0,
+                  )
+              except httpx.HTTPError as exc:
+                  return {"case": name, "result": "transport_error", "exception": type(exc).__name__, **fields(body)}
+              try:
+                  error = response.json().get("error") if response.status_code >= 400 else None
+              except ValueError:
+                  error = None
+              safe_error = error if isinstance(error, dict) else {}
+              return {
+                  "case": name,
+                  "result": "success" if 200 <= response.status_code < 300 else "http_error",
+                  "status_code": response.status_code,
+                  "error_type": safe_error.get("type") if isinstance(safe_error.get("type"), str) else None,
+                  "error_code": safe_error.get("code") if isinstance(safe_error.get("code"), str) else None,
+                  "error_param": safe_error.get("param") if isinstance(safe_error.get("param"), str) else None,
+                  **fields(body),
+              }
+
+          base = {key: full[key] for key in ("model", "input")}
+          cases = [
+              ("base", base),
+              ("budgets", {**base, **{key: full[key] for key in ("max_output_tokens", "reasoning", "max_tool_calls") if key in full}}),
+              ("structured_output", {**base, "text": full["text"]}),
+              ("web_search", {**base, "tools": full["tools"]}),
+              ("full_strategy_intent", full),
+          ]
+          results = [report(name, body) for name, body in cases]
+          print(json.dumps({"provider": "aoai", "results": results}, ensure_ascii=False, sort_keys=True))
+          if any(item["result"] != "success" for item in results):
+              raise SystemExit(1)
           PY
           REMOTE
 
