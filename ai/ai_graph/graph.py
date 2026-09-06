@@ -859,6 +859,13 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
         if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
         else None
     )
+    # Same contract for a named index (KOSPI200): point-in-time constituents restrict
+    # the universe, and only a spec the research node sealed can ask for it.
+    sealed_index_universe = (
+        sealed_execution_spec.candidates[0].index_universe
+        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
+        else None
+    )
     if is_release_profile() and backtest_period["selection_source"] not in _MODEL_SELECTED_PERIOD_SOURCES:
         # A mock/fixture period is sealed and labelled in non-release profiles so the
         # deterministic pipeline runs end to end; a release profile must never read
@@ -894,6 +901,7 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
             requires_financials=requires_financials,
             compact_price_rows=compact_price_rows,
             sector=sealed_sector,
+            index_universe=sealed_index_universe,
             backtest_lookback_years=selected_backtest_years,
             period_locked=True,
         )
@@ -903,6 +911,7 @@ def data_node(state: QuantAgentState) -> dict[str, Any]:
             state["trace_id"],
             screen_current=False,
             sector=sealed_sector,
+            index_universe=sealed_index_universe,
             backtest_lookback_years=selected_backtest_years,
             period_locked=True,
         )

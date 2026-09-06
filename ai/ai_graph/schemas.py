@@ -578,6 +578,10 @@ class ResearchCandidateV3(BaseModel):
     # It is part of the sealed contract rather than re-derived from the query text, so
     # what the backtest traded is exactly what the research node resolved.
     sector: str | None = Field(default=None, min_length=1, max_length=64)
+    # A named KRX index (KOSPI200, KOSDAQ150) whose point-in-time constituents the PIT
+    # universe is restricted to. Sealed only when the warehouse holds membership
+    # intervals for it; otherwise research refuses rather than widening to the market.
+    index_universe: str | None = Field(default=None, min_length=1, max_length=32)
 
     @model_validator(mode="after")
     def rule_states_an_exit(self) -> "ResearchCandidateV3":

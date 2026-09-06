@@ -24,7 +24,8 @@ import urllib.request
 from typing import Any
 
 # Names a market (코스피), not an index: "KOSPI200 종목" is a point-in-time membership
-# filter the research grammar cannot seal, so it is refused with need_clarification.
+# filter that seals only when feature.krx_index_membership_history holds KOSPI200 rows;
+# on a warehouse without them it is refused with need_clarification naming that gap.
 DEFAULT_QUERY = "RSI(14)가 30 이하로 떨어진 코스피 종목을 사고, 70 이상이면 파는 전략"
 DEFAULT_EXPECTED_STATUSES = ("ready",)
 # The combined service runs as one process; while a backtest is computing, the gateway

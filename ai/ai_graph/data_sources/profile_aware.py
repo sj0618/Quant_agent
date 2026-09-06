@@ -36,6 +36,7 @@ def load_pipeline_data_from_env(
     requires_financials: bool | None = None,
     compact_price_rows: bool = False,
     sector: str | None = None,
+    index_universe: str | None = None,
     backtest_lookback_years: int | None = None,
     period_locked: bool = False,
 ) -> PipelineDataBundle:
@@ -76,4 +77,5 @@ def load_pipeline_data_from_env(
         requires_financials=requires_financials,
         compact_price_rows=compact_price_rows,
         sector=sector,
+        index_universe=index_universe,
     )

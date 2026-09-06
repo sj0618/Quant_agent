@@ -521,6 +521,7 @@ def test_sealed_research_skips_non_authoritative_current_screening(
         requires_financials: object | None = None,
         compact_price_rows: bool = False,
         sector: str | None = None,
+        index_universe: str | None = None,
         backtest_lookback_years: int | None = None,
         period_locked: bool = False,
     ) -> object:
@@ -532,6 +533,8 @@ def test_sealed_research_skips_non_authoritative_current_screening(
                 "required_metrics": required_metrics,
                 "requires_financials": requires_financials,
                 "compact_price_rows": compact_price_rows,
+                "sector": sector,
+                "index_universe": index_universe,
                 "backtest_lookback_years": backtest_lookback_years,
                 "period_locked": period_locked,
             }
