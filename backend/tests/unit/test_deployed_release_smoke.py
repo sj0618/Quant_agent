@@ -69,6 +69,10 @@ def test_smoke_workflow_follows_the_deploy_and_targets_the_release_it_starts():
     assert "auth/google" not in workflow
     assert "qt-agent.kro.kr:38010" not in workflow
     assert re.search(r"--expect ready", workflow)
+    # ssh does not re-quote its arguments for the remote login shell: the query (which
+    # legitimately contains parentheses, spaces and Korean) must never be passed raw.
+    assert '"$SMOKE_QUERY" <<' not in workflow
+    assert "base64 -w0" in workflow and "base64 -d" in workflow
 
 
 def test_smoke_script_mints_and_revokes_its_own_session_instead_of_logging_in():

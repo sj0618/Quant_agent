@@ -119,6 +119,10 @@ jobs:
         if: ${{ env.SMOKE_MODE == 'full-analysis' }}
         run: |
           timeout_seconds=$(( SMOKE_TIMEOUT_MINUTES * 60 ))
+          # ssh joins its arguments into one command line for the remote login shell
+          # without re-quoting, so a query such as "RSI(14)가 ..." is a syntax error
+          # there. Only shell-safe tokens travel as arguments; the query goes base64.
+          query_b64="$(printf '%s' "$SMOKE_QUERY" | base64 -w0)"
           ssh -o BatchMode=yes \
             -o ConnectTimeout=10 \
             -o ServerAliveInterval=30 \
@@ -127,14 +131,15 @@ jobs:
             -i "$HOME/.ssh/id_ed25519" \
             -p "$SERVER_PORT" \
             "$SERVER_USER@$SERVER_HOST" \
-            bash -s -- "$SERVER_APP_DIR" "$SMOKE_SCRIPT" "$GATEWAY_PORT" "$timeout_seconds" "${{ github.run_id }}" "$SMOKE_QUERY" <<'REMOTE'
+            bash -s -- "$SERVER_APP_DIR" "$SMOKE_SCRIPT" "$GATEWAY_PORT" "$timeout_seconds" "${{ github.run_id }}" "$query_b64" <<'REMOTE'
           set -Eeuo pipefail
           APP_DIR="$1"
           SCRIPT="$2"
           GATEWAY_PORT="$3"
           TIMEOUT_SECONDS="$4"
           RUN_LABEL="$5"
-          QUERY="$6"
+          QUERY="$(printf '%s' "$6" | base64 -d)"
+          test -n "$QUERY"
           case "$SCRIPT" in
             /tmp/quant-agent-smoke-[0-9]*.py) ;;
             *) printf 'Unsafe smoke script path: %s\n' "$SCRIPT" >&2; exit 2 ;;
