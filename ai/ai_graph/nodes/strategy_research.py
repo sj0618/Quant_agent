@@ -49,8 +49,8 @@ from ai_graph.schemas import (
 
 _logger = logging.getLogger(__name__)
 
-STRATEGY_RESEARCH_PROMPT_VERSION = "v8"
-STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v8"
+STRATEGY_RESEARCH_PROMPT_VERSION = "v9"
+STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v9"
 # The live provider reached the former 5,000-token cap while emitting the required
 # evidence-rich JSON, leaving an otherwise successful response truncated mid-object.
 # This lane needs room for its web-grounded sources and structured contract; the
@@ -106,7 +106,12 @@ backtest universe is restricted to names that were constituents of that index du
 tested window. If the requested index is not in ``allowed_index_universes``, this
 deployment has no point-in-time membership for it: return no candidate and say so in
 ``resolution_summary``; never approximate it with the whole KOSPI/KOSDAQ market, a
-market-cap cutoff, or a sector.
+market-cap cutoff, or a sector. Only a numbered index (KOSPI200, KOSDAQ150) is such a
+constraint. A bare market name - 코스피/KOSPI, 코스닥/KOSDAQ, 국내 주식, KRX, 한국 주식 -
+is NOT an index and needs no ``index_universe``: the default backtest universe is already
+the point-in-time KOSPI/KOSDAQ common-stock universe, so "코스피 종목" is fully served by
+it. An empty ``allowed_index_universes`` means only that no numbered-index filter is
+available; it is never a reason to refuse a market-wide or market-named request.
 ``universe_rank_pct`` uses a decimal fraction from 0 to 1: top 20% is 0.20.
 ``relative_strength_Nd`` is the stock's N-day return minus the same-date PIT priced
 KRX common-stock universe's mean N-day return. It is a disclosed broad-market proxy,

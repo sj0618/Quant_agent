@@ -273,6 +273,18 @@ def test_an_index_the_warehouse_does_not_know_is_refused_at_seal_time() -> None:
     assert not isinstance(failure.value, _RepairableStrategyResearchError)
 
 
+def test_the_prompt_tells_the_model_a_market_name_is_not_an_index() -> None:
+    """Observed on the deployed release: with an empty ``allowed_index_universes`` the
+    model refused "코스피 종목" as an unavailable KOSPI universe filter. The default PIT
+    universe already is the KOSPI/KOSDAQ market, and the prompt has to say so."""
+
+    prompt = strategy_research.STRATEGY_RESEARCH_SYSTEM_PROMPT
+    assert "A bare market name - 코스피/KOSPI, 코스닥/KOSDAQ" in prompt
+    assert "is NOT an index and needs no ``index_universe``" in prompt
+    assert "never a reason to refuse a market-wide or market-named request" in prompt
+    assert extract_index_universe_from_query("RSI 30 이하 코스피 종목") is None
+
+
 def test_a_request_without_an_index_is_untouched_by_the_gate() -> None:
     spec = _seal_research_response(
         _payload(),
