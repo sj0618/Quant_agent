@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -1253,6 +1254,148 @@ def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[st
     }
 
 
+# Which risk policy a researched rule falls back to when the research response did not
+# state one, keyed by the metric family its entry conditions read. Measured on five
+# years of PIT KRX data ("$SP/diag" prod_rules_grid, 48 combinations): loosening the
+# stop from 8% to 25% moved an RSI mean-reversion rule from -38.3% to +51.3%, while the
+# same change made a momentum rotation rule worse (-61.3% -> -80.6%). The sign of the
+# lever flips with the family, so one hardcoded number is wrong for half of them.
+# Matching is by substring against the entry metric names, first family wins.
+_RESEARCH_RISK_FAMILY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Mean-reversion, value, quality and low-volatility rules buy what has already
+    # fallen, or hold a slow fundamental thesis. A tight stop sells them inside exactly
+    # the drawdown they were bought for, so the stop here is a disaster stop only.
+    (
+        "defensive",
+        (
+            "rsi", "stoch", "williams", "cci", "zscore", "bollinger", "mfi",
+            "return_5d", "drawdown", "loss_streak", "ulcer",
+            "per", "pbr", "eps", "dividend", "earnings",
+            "roe", "operating_margin", "operating_income", "revenue",
+            "debt_to_equity", "up_streak", "growth_streak",
+            "volatility",
+        ),
+    ),
+    # Cross-sectional momentum and rotation: a stop is what limits the crash, and
+    # concentration is where the premium is.
+    (
+        "momentum",
+        (
+            "momentum", "relative_strength", "return_", "sharpe_", "sortino_",
+            "price_volume_score", "close_to_high", "r_squared",
+        ),
+    ),
+)
+# Trend crossovers (SMA/EMA/MACD/ADX) and anything unrecognised. Trend entries are
+# already late entries, so 8% catches ordinary pullbacks; 15% does not.
+_RESEARCH_RISK_DEFAULT_FAMILY = "trend"
+_RESEARCH_RISK_DEFAULTS: dict[str, tuple[float, float, int]] = {
+    # family: (stop_loss_pct, trailing_stop_pct, max_positions)
+    "defensive": (0.25, 0.30, 20),
+    "momentum": (0.15, 0.25, 10),
+    "trend": (0.15, 0.25, 15),
+}
+_RESEARCH_RISK_FAMILY_LABELS = {
+    "defensive": "평균회귀·가치·퀄리티·저변동",
+    "momentum": "모멘텀·로테이션",
+    "trend": "추세 교차",
+}
+# The engine's ceiling, i.e. no profit target. The old 0.45 default truncated the right
+# tail of every researched trend rule that never asked for a profit target.
+RESEARCH_TAKE_PROFIT_DISABLED = 10.0
+
+
+def _position_pct_for(max_positions: int) -> float:
+    """Encode "hold N names" as the ``max_position_pct`` the sizing helpers decode.
+
+    ``requested_max_positions`` reads it back as ``ceil(1 / pct)``, and plain
+    ``1.0 / n`` lands just *below* the true fraction for many n (1/7, 1/9, 1/12,
+    1/14 ...), so the round trip silently returned n + 1 names. Take the next float
+    up, which is never below the exact fraction.
+    """
+
+    return min(1.0, math.nextafter(1.0 / max_positions, math.inf))
+
+
+def _research_risk_family(candidate: Any) -> str:
+    """Which metric family a researched rule's entry conditions belong to."""
+
+    names: list[str] = []
+    for condition in candidate.entry_conditions:
+        names.append(str(getattr(condition, "left", "")).lower())
+        right = getattr(condition, "right", None)
+        if isinstance(right, str):
+            names.append(right.lower())
+    if not any(names):
+        names = [str(metric).lower() for metric in candidate.required_metrics]
+    for family, markers in _RESEARCH_RISK_FAMILY_MARKERS:
+        if any(marker in name for name in names for marker in markers):
+            return family
+    return _RESEARCH_RISK_DEFAULT_FAMILY
+
+
+def _research_risk_policy(candidate: Any) -> tuple[dict[str, float], list[str]]:
+    """The researched rule's risk controls, plus what had to be assumed for it.
+
+    The rule states its own stop/trailing/target/concentration when the research node
+    resolved them; every value it left unset takes the family default above and is
+    disclosed, so nothing is silently chosen for the user. All of it is fixed before a
+    single return is read.
+    """
+
+    family = _research_risk_family(candidate)
+    default_stop, default_trailing, default_positions = _RESEARCH_RISK_DEFAULTS[family]
+    stop = candidate.stop_loss_pct
+    trailing = candidate.trailing_stop_pct
+    take_profit = candidate.take_profit_pct
+    positions = candidate.max_positions
+    constraints = {
+        "max_position_pct": _position_pct_for(positions or default_positions),
+        "stop_loss_pct": float(stop if stop is not None else default_stop),
+        "trailing_stop_pct": float(
+            trailing if trailing is not None else default_trailing
+        ),
+        "take_profit_pct": float(
+            take_profit if take_profit is not None else RESEARCH_TAKE_PROFIT_DISABLED
+        ),
+    }
+    assumed = [
+        label
+        for value, label in (
+            (stop, f"손절 {constraints['stop_loss_pct']:.0%}"),
+            (trailing, f"고점 대비 추적손절 {constraints['trailing_stop_pct']:.0%}"),
+            (
+                take_profit,
+                "익절 미설정(사실상 해제)"
+                if take_profit is None
+                else f"익절 {constraints['take_profit_pct']:.0%}",
+            ),
+            (positions, f"최대 {positions or default_positions}종목"),
+        )
+        if value is None
+    ]
+    stated = [
+        label
+        for value, label in (
+            (stop, f"손절 {constraints['stop_loss_pct']:.0%}"),
+            (trailing, f"고점 대비 추적손절 {constraints['trailing_stop_pct']:.0%}"),
+            (take_profit, f"익절 {constraints['take_profit_pct']:.0%}"),
+            (positions, f"최대 {positions}종목"),
+        )
+        if value is not None
+    ]
+    notes: list[str] = []
+    if stated:
+        notes.append("리서치가 지정한 리스크 정책: " + ", ".join(stated))
+    if assumed:
+        notes.append(
+            f"리서치가 값을 제시하지 않아 진입 지표 계열"
+            f"({_RESEARCH_RISK_FAMILY_LABELS[family]})의 기본값을 적용: "
+            + ", ".join(assumed)
+        )
+    return constraints, notes
+
+
 def _strategy_spec_from_execution_spec(
     raw_spec: Mapping[str, Any] | ExecutionSpecV1OrV2,
     raw_policy: Mapping[str, Any] | None = None,
@@ -1264,6 +1407,7 @@ def _strategy_spec_from_execution_spec(
     execution_spec = validate_execution_spec(raw_spec)
     if isinstance(execution_spec, ResearchCandidateExecutionSpecV3):
         candidate = execution_spec.candidates[0]
+        risk_policy, risk_notes = _research_risk_policy(candidate)
         return StrategySpec(
             strategy_id=f"researched_{canonical_execution_spec_digest(execution_spec)[:12]}",
             name=candidate.title,
@@ -1274,8 +1418,7 @@ def _strategy_spec_from_execution_spec(
             exit_conditions=candidate.exit_conditions,
             indicators=list(dict.fromkeys(candidate.required_metrics)),
             risk_constraints={
-                "max_position_pct": 0.1,
-                "stop_loss_pct": 0.08,
+                **risk_policy,
                 "research_snapshot_hash": execution_spec.research_snapshot_hash,
                 "research_capability_hash": execution_spec.capability_hash,
                 "research_candidate_id": candidate.candidate_id,
@@ -1297,6 +1440,7 @@ def _strategy_spec_from_execution_spec(
                 *candidate.assumptions,
                 "AI 웹 리서치로 전략 의미를 정규화하고, 조건과 근거를 성과 조회 전에 봉인함",
                 f"반대 가설: {candidate.counter_hypothesis}",
+                *risk_notes,
             ],
             source_refs=[source.url for source in execution_spec.sources],
             selection_mode="user_defined",
@@ -1482,7 +1626,12 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
             "supporting_rationale": [source.claim for source in sealed_spec.sources],
             "counterpoints": [candidate.counter_hypothesis],
             "pre_falsification_conditions": candidate.falsification_conditions,
-            "ai_assumptions": candidate.ai_assumptions,
+            # The risk policy actually run travels with the other pre-backtest
+            # assumptions, whether research chose it or the family default did.
+            "ai_assumptions": [
+                *candidate.ai_assumptions,
+                *_research_risk_policy(candidate)[1],
+            ],
             "expected_holding_period": (
                 f"{candidate.holding_days} 거래일"
                 if candidate.holding_days is not None

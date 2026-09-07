@@ -1588,6 +1588,12 @@ def create_app(
                         detail="Strategy parse verification is temporarily unavailable.",
                     )
                 automatic = classify_strategy_request(request.query) == "automatic"
+                # A vague request is answered by the published catalogue tournament
+                # (three pre-registered candidates compared on identical data and
+                # costs), not by one rule an LLM invented for this query. This used
+                # to be hardcoded to None, which made the catalogue unreachable in
+                # production. An absent or stale policy is not a failure here: the
+                # draft builder falls back to V3 research, so this never 503s.
                 exploration_policy = None
                 if automatic and not app.state.strategy_parser_uses_llm:
                     raise HTTPException(
@@ -1598,6 +1604,11 @@ def create_app(
                             "checks": ["live_provider_configuration"],
                         },
                     )
+                if automatic:
+                    try:
+                        exploration_policy = app.state.exploration_policy_resolver()
+                    except Exception:  # noqa: BLE001 - research fallback, not an outage.
+                        exploration_policy = None
                 try:
                     # A live V3 research resolution is grounded in the actual server
                     # capability catalogue before AOAI can propose a rule. This is a

@@ -14,7 +14,7 @@ from ai_graph.nodes.strategy_research import (
     research_strategy_execution_spec,
 )
 from ai_graph.research_contract import RuleDraftSigner, build_rule_draft
-from ai_graph.schemas import ResearchCandidateExecutionSpecV3
+from ai_graph.schemas import Condition, ResearchCandidateExecutionSpecV3, ResearchCandidateV3
 
 
 class _ResearchClient:
@@ -698,3 +698,151 @@ def test_historical_missing_sealed_metric_stops_before_backtest_code_generation(
     assert output["status"] == "need_clarification"
     assert "roe" in output["ambiguity"]["reason"]
     assert "research_compile" not in output
+
+
+def _rsi_mean_reversion_response(**risk: object) -> dict:
+    response = _deep_donchian_response()
+    response["candidates"][0].update(
+        {
+            "candidate_id": "research-rsi-mean-reversion",
+            "title": "RSI 과매도 반등",
+            "entry_conditions": [{"left": "rsi_14", "operator": "lte", "right": 30.0}],
+            "exit_conditions": [{"left": "rsi_14", "operator": "gte", "right": 55.0}],
+            "required_metrics": ["rsi_14"],
+            **risk,
+        }
+    )
+    return response
+
+
+def _sealed(response: dict):
+    return research_strategy_execution_spec(
+        query="RSI 과매도 반등 전략으로 검증해줘",
+        available_metrics=["rsi_14"],
+        llm_client=_ResearchClient(response),
+    )
+
+
+def test_a_researched_rule_no_longer_inherits_the_one_hardcoded_risk_policy() -> None:
+    """Every researched strategy used to run at stop 8% / 10 names / take-profit 45%.
+
+    Measured on five years of PIT KRX data, that single setting is wrong for half the
+    families: loosening the stop moved an RSI mean-reversion rule from -38.3% to
+    +51.3%, while the same change made a momentum rotation rule worse. A mean-reversion
+    rule that states no stop now takes the family's disaster stop and holds 20 names,
+    and the applied default is disclosed rather than silently chosen.
+    """
+
+    from ai_graph.graph import _strategy_spec_from_execution_spec
+    from ai_graph.nodes.position_sizing import requested_max_positions
+
+    spec = _sealed(_rsi_mean_reversion_response())
+    candidate = spec.candidates[0]
+    assert candidate.stop_loss_pct is None
+    assert candidate.take_profit_pct is None
+
+    strategy = _strategy_spec_from_execution_spec(spec.model_dump(mode="json"))
+    constraints = strategy.risk_constraints
+
+    assert constraints["stop_loss_pct"] == 0.25
+    assert constraints["trailing_stop_pct"] == 0.30
+    # 10.0 is the engine ceiling: no profit target. The old 0.45 default truncated the
+    # right tail of every researched rule that never asked for one.
+    assert constraints["take_profit_pct"] == 10.0
+    assert requested_max_positions(constraints["max_position_pct"]) == 20
+    assert any("평균회귀" in note for note in strategy.assumptions)
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        # (stop_loss_pct, trailing_stop_pct, max_positions)
+        (Condition(left="rsi_14", operator="lte", right=30.0), (0.25, 0.30, 20)),
+        (Condition(left="roe", operator="gt", right=0.0), (0.25, 0.30, 20)),
+        (
+            Condition(left="realized_volatility_63d", operator="lte", right=0.5),
+            (0.25, 0.30, 20),
+        ),
+        (Condition(left="momentum_12_1", operator="gte", right=0.0), (0.15, 0.25, 10)),
+        (
+            Condition(left="close", operator="cross_above", right="sma_50"),
+            (0.15, 0.25, 15),
+        ),
+    ],
+)
+def test_default_risk_policy_follows_the_entry_metric_family(
+    entry: Condition, expected: tuple[float, float, int]
+) -> None:
+    """The lever's sign flips with the family, so the default has to as well."""
+
+    from ai_graph.graph import _research_risk_policy
+    from ai_graph.nodes.position_sizing import requested_max_positions
+
+    candidate = ResearchCandidateV3(
+        candidate_id="research-candidate-1",
+        title="후보",
+        hypothesis="가설",
+        counter_hypothesis="반대 가설",
+        entry_conditions=[entry],
+        exit_conditions=[Condition(left="close", operator="lte", right="sma_20")],
+        required_metrics=[entry.left],
+        assumptions=["가정"],
+        backtest_years=1,
+        backtest_period_basis="근거",
+        source_ids=["source-1"],
+    )
+    constraints, notes = _research_risk_policy(candidate)
+    stop, trailing, positions = expected
+
+    assert constraints["stop_loss_pct"] == stop
+    assert constraints["trailing_stop_pct"] == trailing
+    assert constraints["take_profit_pct"] == 10.0
+    assert requested_max_positions(constraints["max_position_pct"]) == positions
+    assert notes and all("기본값을 적용" in note for note in notes)
+
+
+def test_a_researched_rule_that_states_its_own_risk_policy_keeps_it() -> None:
+    """The sealed rule's own numbers win, and the engine runs exactly those."""
+
+    from ai_graph.graph import _strategy_spec_from_execution_spec
+    from ai_graph.nodes.backtest_code import backtest_code_node
+
+    spec = _sealed(
+        _rsi_mean_reversion_response(
+            stop_loss_pct=0.12,
+            trailing_stop_pct=0.4,
+            take_profit_pct=0.6,
+            max_positions=7,
+        )
+    )
+    strategy = _strategy_spec_from_execution_spec(spec.model_dump(mode="json"))
+
+    assert strategy.risk_constraints["stop_loss_pct"] == 0.12
+    assert strategy.risk_constraints["trailing_stop_pct"] == 0.4
+    assert strategy.risk_constraints["take_profit_pct"] == 0.6
+    assert any("리서치가 지정한" in note for note in strategy.assumptions)
+
+    generated = backtest_code_node(
+        {"strategy_spec": strategy.model_dump(), "trace_id": "trace-research-risk"}
+    )["backtest_code"]
+    parameters = generated["selected_candidate"]["parameters"]
+
+    assert parameters["stop_loss_pct"] == 0.12
+    assert parameters["trailing_stop_pct"] == 0.4
+    assert parameters["take_profit_pct"] == 0.6
+    assert parameters["max_positions"] == 7
+
+
+def test_the_research_prompt_asks_for_the_risk_policy() -> None:
+    client = _ResearchClient(_donchian_response())
+    research_strategy_execution_spec(
+        query="돈치안 채널 돌파 전략으로 검증해줘",
+        available_metrics=["sma20"],
+        llm_client=client,
+    )
+
+    request = client.requests[0]
+    assert "Risk controls are part of the strategy" in request.system_prompt
+    for field in ("stop_loss_pct", "trailing_stop_pct", "take_profit_pct", "max_positions"):
+        assert field in request.system_prompt
+        assert field in request.user_prompt
