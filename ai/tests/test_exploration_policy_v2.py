@@ -638,3 +638,47 @@ def test_catalogue_run_explains_itself_without_the_research_compile_model_call(
     assert any("AI 해석 호출을 하지 않았습니다" in item for item in compiled.limitations)
     sources = graph_module._exploration_research_sources(draft.strategy_execution_spec)
     assert sources and all(source["url"].startswith("http") for source in sources)
+
+
+def test_catalogue_run_does_not_ask_the_intent_model_for_a_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production job_50d2c2c0a625: a catalogue run died in the first node on an AOAI
+    read timeout from `resolve_strategy_intent`, although the sealed policy already
+    fixes the five-year window. A sealed exploration spec must reach the backtest
+    without that call.
+    """
+
+    active = _active_policy()
+    draft = build_rule_draft(
+        query="돈이 되는 전략 추천해줘",
+        user_id="local-dev-user",
+        signer=_exploration_signer(),
+        now=datetime.now(UTC),
+        use_llm=False,
+        exploration_policy=active,
+    )
+    assert isinstance(draft.strategy_execution_spec, ExplorationExecutionSpecV2)
+    monkeypatch.setattr(
+        graph_module, "load_exploration_policy_from_env", lambda _version: active
+    )
+
+    def _timing_out_intent(**_kwargs):
+        raise AssertionError("resolve_strategy_intent must not be called for a catalogue spec")
+
+    monkeypatch.setattr(graph_module, "resolve_strategy_intent", _timing_out_intent)
+
+    runner = _build_analysis_runner_with_audit(
+        run_analysis,
+        audit_sink=None,
+        trace_id="trace-exploration-no-intent",
+        entrypoint="api.analysis_jobs",
+        feature="analysis_job",
+        user_id="local-dev-user",
+        rule_draft_resolver=lambda _query, _trace_id: draft,
+    )
+    envelope = runner("돈이 되는 전략 추천해줘", "trace-exploration-no-intent")
+
+    assert envelope.status is EnvelopeStatus.READY, envelope.user_payload.message
+    assert envelope.strategy_spec is not None
+    assert envelope.strategy_spec.backtest_years == active.policy.history_years

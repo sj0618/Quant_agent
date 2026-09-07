@@ -31,7 +31,9 @@ from ai_graph.quant_strategy import (
 from ai_graph.schemas import CandidateParameters, Condition, ConditionOperator, StrategyIR
 
 
-FEATURE_DEFINITION_VERSION = "structured-features.v3"
+# v4: reset/stop-after session handling, mirrored fixed stop/target exits, and off-grid
+# slot backfill change which actions a rule emits, so v3 features must not be reused.
+FEATURE_DEFINITION_VERSION = "structured-features.v4"
 
 # A take-profit at or above this is the catalogue's way of saying "no target" (rows ship
 # 10.0 = +1000%). Mirroring those in the action generator would only add signals that can
