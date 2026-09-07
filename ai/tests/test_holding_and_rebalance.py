@@ -8,8 +8,8 @@ way to say "when":
   * "최근 3개월 수익률 상위 모멘텀 종목을 사고 한 달마다 교체" sealed no rebalance at all.
 
 ``holding_days`` and ``rebalance_interval_days`` on ResearchCandidateV3 say it
-directly, and PreparedFeatureStore._compiled_actions - the one evaluator every
-structured candidate runs through - is what enforces them.
+directly. Structured eligibility selects the targets; the engine enforces holding
+periods from actual fills and executes the next-open orders.
 """
 
 from __future__ import annotations
@@ -21,13 +21,15 @@ from pydantic import ValidationError
 
 from ai_graph.llm.base import LLMJsonRequest
 from ai_graph.nodes.backtest_code import _normalized_strategy_ir, _render_structured_reference_code
-from ai_graph.nodes.backtest_features import PreparedFeatureStore
+from ai_graph.nodes import backtest as backtest_node
 from ai_graph.nodes.strategy_research import (
     StrategyResearchError,
     research_strategy_execution_spec,
 )
 from ai_graph.schemas import (
     CandidateParameters,
+    CodeCandidate,
+    StrategySpec,
     Condition,
     ConditionOperator,
     ResearchCandidateV3,
@@ -79,12 +81,22 @@ def _parameters(**overrides: object) -> CandidateParameters:
     return CandidateParameters.model_validate(base)
 
 
-def _signal_dates(rows: list[dict[str, object]], actions: object) -> tuple[list[int], list[int]]:
-    buys = [index for index, value in enumerate(actions) if value == 1]
-    sells = [index for index, value in enumerate(actions) if value == -1]
-    assert len(rows) == len(actions)
+def _fill_dates(rows, strategy_ir, parameters) -> tuple[list[int], list[int]]:
+    strategy = StrategySpec(
+        strategy_id=strategy_ir.strategy_id, name="Synthetic holding check", market="KRX", timeframe="daily",
+        entry_conditions=strategy_ir.entry_conditions, exit_conditions=strategy_ir.exit_conditions,
+        risk_constraints={"max_position_pct": 1.0, "stop_loss_pct": parameters.stop_loss_pct}, confidence=1.0,
+    )
+    candidate = CodeCandidate(
+        candidate_id="holding-fill-unit", variant="A", validation_ok=True,
+        code="def build_signals(prices):\n    return []", representation="structured",
+        strategy_ir=strategy_ir, parameters=parameters,
+    )
+    result = backtest_node._fold_engine(strategy, candidate, rows, rows, {str(row["date"]) for row in rows})
+    indices = {str(row["date"]): index for index, row in enumerate(rows)}
+    buys = [indices[event.date] for event in result.order_audit if event.status == "executed" and event.side == "buy"]
+    sells = [indices[event.date] for event in result.order_audit if event.status == "executed" and event.side == "sell"]
     return buys, sells
-
 
 # --- schema -----------------------------------------------------------------
 
@@ -149,85 +161,41 @@ def test_boundary_values_are_accepted(holding_days: int, interval: int) -> None:
 
 def test_a_position_exits_exactly_five_sessions_after_it_opened() -> None:
     rows = _rows([110.0] * 20)
-    store = PreparedFeatureStore(rows)
-
-    actions = store.build_actions(_ir(holding_days=5), _parameters())
-
-    buys, sells = _signal_dates(rows, actions)
-    # Entry matches on every bar, so the book re-enters the session after each exit.
-    assert buys == [0, 6, 12, 18]
-    assert sells == [5, 11, 17]
+    buys, sells = _fill_dates(rows, _ir(holding_days=5), _parameters())
+    assert buys == [1, 7, 13, 19]
+    assert sells == [6, 12, 18]
     assert all(sell - buy == 5 for buy, sell in zip(buys, sells, strict=False))
 
-
 def test_without_holding_days_the_same_rule_never_sells() -> None:
-    rows = _rows([110.0] * 20)
-    store = PreparedFeatureStore(rows)
-
-    actions = store.build_actions(_ir(), _parameters())
-
-    buys, sells = _signal_dates(rows, actions)
-    assert buys == [0]
+    buys, sells = _fill_dates(_rows([110.0] * 20), _ir(), _parameters())
+    assert buys == [1]
     assert sells == []
-
 
 def test_an_empty_slot_is_filled_before_the_next_rebalance_date() -> None:
-    """Rotation replaces holdings on a schedule; it does not idle an empty slot.
-
-    Entries used to be blocked on every non-rebalance session, so a portfolio that had
-    nothing to hold - at the start of a walk-forward fold, or after a stop - sat in cash
-    until the grid came round. Measured on the five-year universe that was 23% of all
-    slot-sessions on a 21-day grid. Replacement is still schedule-only: the loop stops at
-    `max_positions`, so a name already held is never swapped off-schedule.
-    """
-
-    # Not eligible until session 3; the next rotation date is 5.
-    rows = _rows([90.0] * 3 + [110.0] * 17)
-    store = PreparedFeatureStore(rows)
-
-    actions = store.build_actions(
-        _ir(execution_mode="scheduled_rotation"),
+    # Eligible at session 3; the next-open entry at 4 precedes the rotation at 5.
+    buys, sells = _fill_dates(
+        _rows([90.0] * 3 + [110.0] * 17), _ir(execution_mode="scheduled_rotation"),
         _parameters(rebalance_interval_days=5),
     )
-
-    buys, sells = _signal_dates(rows, actions)
-    assert buys == [3]
+    assert buys == [4]
     assert sells == []
 
-
 def test_a_holding_that_stops_matching_is_exited_on_the_next_rebalance_date() -> None:
-    rows = _rows([110.0] * 7 + [90.0] * 13)
-    store = PreparedFeatureStore(rows)
-
-    actions = store.build_actions(
-        _ir(execution_mode="scheduled_rotation"),
-        # The fixed stop is mirrored into this book now, and a 110 -> 90 drop is 18%, so
-        # it would fire at session 7 and hide the rebalance-date exit this pins. Widen it
-        # to isolate the schedule.
+    buys, sells = _fill_dates(
+        _rows([110.0] * 7 + [90.0] * 13), _ir(execution_mode="scheduled_rotation"),
         _parameters(rebalance_interval_days=5, stop_loss_pct=0.5),
     )
-
-    buys, sells = _signal_dates(rows, actions)
-    assert buys == [0]
-    # It stops matching at session 7, but the rule only re-selects every five days.
-    assert sells == [10]
-
+    assert buys == [1]
+    # A failed entry at 7 is reselected at 10 and sold at the next open.
+    assert sells == [11]
 
 def test_holding_days_and_rebalancing_compose() -> None:
-    rows = _rows([110.0] * 20)
-    store = PreparedFeatureStore(rows)
-
-    actions = store.build_actions(
-        _ir(execution_mode="scheduled_rotation", holding_days=3),
+    buys, sells = _fill_dates(
+        _rows([110.0] * 20), _ir(execution_mode="scheduled_rotation", holding_days=3),
         _parameters(rebalance_interval_days=5),
     )
-
-    buys, sells = _signal_dates(rows, actions)
-    # Sold three sessions after each entry, re-bought on the next session that has an
-    # empty slot and something eligible to put in it - not held in cash until the grid.
-    assert buys == [0, 4, 8, 12, 16]
-    assert sells == [3, 7, 11, 15, 19]
-
+    assert buys == [1, 5, 9, 13, 17]
+    assert sells == [4, 8, 12, 16]
 
 def test_the_audit_descriptor_states_the_same_timing_the_evaluator_runs() -> None:
     """One rule, one description. The descriptor is what an auditor reads back."""

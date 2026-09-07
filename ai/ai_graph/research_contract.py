@@ -23,7 +23,7 @@ from threading import Lock
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, model_serializer
 
 from ai_graph.exploration_policy import (
     ActiveExplorationPolicyV2,
@@ -35,6 +35,7 @@ from ai_graph.quant_strategy import classify_strategy_request
 from ai_graph.schemas import (
     RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3,
     AmbiguityCode,
+    ExecutionControlsV1,
     ResearchCandidateExecutionSpecV3,
 )
 from ai_graph.strategy_parser import (
@@ -43,6 +44,7 @@ from ai_graph.strategy_parser import (
     StrategyParseResultV1,
     UnsupportedStrategyConditionV1,
     parse_natural_language_strategy,
+    parse_execution_controls,
 )
 
 RULE_DRAFT_SCHEMA_VERSION = "research-rule-draft.v1"
@@ -151,6 +153,15 @@ class ExplorationExecutionSpecV2(BaseModel):
     catalog_version: str = Field(min_length=1)
     catalog_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     candidates: list[ExplorationCandidateRefV2] = Field(min_length=2, max_length=10)
+
+    execution_controls: ExecutionControlsV1 | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_shape(self, handler):
+        result = handler(self)
+        if self.execution_controls is None:
+            result.pop("execution_controls", None)
+        return result
 
     @model_validator(mode="after")
     def candidate_ids_are_unique(self) -> ExplorationExecutionSpecV2:
@@ -526,6 +537,7 @@ def build_rule_draft(
             draft_token=signed.token,
         )
 
+    execution_controls = parse_execution_controls(query)
     research_requested = _research_resolution_enabled(use_llm)
     request_mode = classify_strategy_request(query)
     research_error: StrategyResearchError | None = None
@@ -566,7 +578,7 @@ def build_rule_draft(
         and _live_parser_enabled()
         and not _query_declares_backtest_window(query)
     )
-    if (request_mode != "user_defined" or needs_researched_period) and research_requested:
+    if (request_mode != "user_defined" or needs_researched_period or execution_controls is not None) and research_requested:
         try:
             return _build_researched_draft(
                 query=query,
@@ -661,6 +673,11 @@ def build_rule_draft(
         )
         if exploration_draft is not None:
             return exploration_draft
+    if execution_controls is not None and not research_requested:
+        parsed = _no_run_parse(StrategyResearchError(
+            "명시한 실행 설정을 보존하려면 전략 리서치 경로가 필요합니다.",
+            cause_code="execution_controls_require_research",
+        ))
     rule = _canonical_rule_from_parse(parsed)
     retry_only = (
         research_error is not None
@@ -774,7 +791,12 @@ def _build_exploration_draft(
 ) -> RuleDraftV1:
     policy = policy_record.policy
     templates = select_exploration_templates(query, policy_record)
+    controls = parse_execution_controls(query)
+    effective_controls = {**policy.model_dump(), **(controls.model_dump() if controls is not None else {})}
+    from ai_graph.graph import _execution_risk_summary
+    controls_summary = _execution_risk_summary(effective_controls)
     spec = ExplorationExecutionSpecV2(
+        execution_controls=controls,
         policy_version=policy.policy_version,
         policy_hash=policy_record.policy_hash,
         catalog_version=policy.catalog_version,
@@ -808,7 +830,7 @@ def _build_exploration_draft(
         available_metrics=available_metrics,
         defaults=[
             f"{policy.risk_style}/{policy.investment_horizon} 위험·기간 해석",
-            f"long-only, 최대 {policy.max_positions}종목, {policy.rebalance_interval_days}거래일 교체",
+            "long-only, " + controls_summary,
             (
                 f"수수료 {policy.cost_model.commission_pct:.3%}, 세금 {policy.cost_model.tax_pct:.3%}, "
                 f"슬리피지 {policy.cost_model.slippage_pct:.3%}"
@@ -844,7 +866,7 @@ def _build_exploration_draft(
         exploration=review,
         editable_summary=(
             f"{policy.market} {policy.timeframe}, 사전등록 후보 {len(templates)}개를 "
-            "같은 데이터·비용·검증 방식으로 비교합니다."
+            "같은 데이터·비용·검증 방식으로 비교합니다. " + controls_summary + ". 월간은 21거래일 근사입니다."
         ),
         clarification_required=False,
         is_executable=True,
@@ -875,15 +897,43 @@ def _build_researched_draft(
         available_metrics=available_metrics,
         llm_client=llm_client,  # type: ignore[arg-type]
     )
+    if spec.execution_controls is not None:
+        # V1 cannot carry portfolio controls. Reuse the V3 contract but retain any
+        # complete rule the existing deterministic parser already understood.
+        explicit_parse = parse_natural_language_strategy(query, available_metrics=available_metrics, use_llm=False)
+        explicit_rule = _canonical_rule_from_parse(explicit_parse)
+        if explicit_rule is not None and explicit_rule.is_executable:
+            from ai_graph.graph import _strategy_spec_from_execution_spec
+            from ai_graph.nodes.condition_compiler import canonical_metric
+            expected = _strategy_spec_from_execution_spec(explicit_rule)
+            candidate = spec.candidates[0]
+
+            def identities(conditions):
+                result = []
+                for condition in conditions:
+                    value = condition.model_dump(mode="json", exclude={"description"})
+                    value["left"] = canonical_metric(condition.left)
+                    if isinstance(condition.right, str):
+                        value["right"] = canonical_metric(condition.right)
+                    result.append(json.dumps(value, sort_keys=True))
+                return sorted(result)
+
+            if identities(candidate.entry_conditions) != identities(expected.entry_conditions) or identities(candidate.exit_conditions) != identities(expected.exit_conditions):
+                raise StrategyResearchError(
+                    "사용자가 명시한 진입·매도 조건과 리서치 결과가 달라 실행하지 않았습니다.",
+                    cause_code="explicit_rule_changed",
+                )
     signed = signer.issue(rule=spec, user_id=user_id, now=now)
     titles = ", ".join(candidate.title for candidate in spec.candidates)
+    from ai_graph.graph import _strategy_spec_from_execution_spec, _execution_risk_summary
+    controls_summary = _execution_risk_summary(_strategy_spec_from_execution_spec(spec).risk_constraints)
     return RuleDraftV1(
         explanation="AI가 전략 용어와 대안 가설을 조사한 뒤, 실행 가능한 후보 조건을 봉인했습니다.",
         canonical_rule=None,
         exploration=None,
         editable_summary=(
             f"KRX 일봉 · AI 연구 후보 {len(spec.candidates)}개: {titles}. "
-            "후보와 근거는 성과를 보기 전에 확정됩니다."
+            "후보와 근거는 성과를 보기 전에 확정됩니다. " + controls_summary + ". 월간은 21거래일 근사입니다."
         ),
         clarification_required=False,
         is_executable=True,

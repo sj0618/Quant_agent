@@ -537,11 +537,16 @@ def _build_public_metric_details(
     # the very comparison the verdict was made on. When the proxy was the judge, show
     # the proxy figures and say so on each card; the official-unavailable disclosure
     # stays on the benchmark block itself.
+    walk_forward_ready = (
+        result.walk_forward is not None and result.walk_forward.status == "ready"
+    )
     proxy_return = _acceptance_proxy_return(result, metrics)
     benchmark_is_proxy = not benchmark.is_available and proxy_return is not None
     values["benchmark_return"] = (
         benchmark.total_return if benchmark.is_available else proxy_return
     )
+    if benchmark.is_available and walk_forward_ready:
+        values["benchmark_return"] = _safe_metric(metrics.out_sample_benchmark_return)
     if _is_numeric_metric(values["total_return"]) and _is_numeric_metric(
         values["benchmark_return"]
     ):
@@ -555,11 +560,10 @@ def _build_public_metric_details(
         if isinstance(detail, Mapping) and isinstance(detail.get("unavailable_reason"), str):
             reasons[str(key)] = str(detail["unavailable_reason"])
     benchmark_reason = reasons.get("benchmark_comparison")
+    if benchmark.is_available and walk_forward_ready and values["benchmark_return"] is None:
+        benchmark_reason = benchmark_reason or "benchmark_evaluation_intervals_incomplete"
     # A ready walk-forward aggregate *is* the out-of-sample estimate; the
     # insufficient-sample default only applies when there is no such aggregate.
-    walk_forward_ready = (
-        result.walk_forward is not None and result.walk_forward.status == "ready"
-    )
     if "out_sample_sharpe" not in reasons and not walk_forward_ready:
         reasons["out_sample_sharpe"] = INSUFFICIENT_WALK_FORWARD_SAMPLE
     if "out_sample_excess_return" not in reasons and not walk_forward_ready:

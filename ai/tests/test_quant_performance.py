@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from ai_graph import graph, quant_performance
 from ai_graph.nodes.backtest import _performance_method_manifest
 from ai_graph.quant_explanations import metric_explanation, metric_registry_provenance
@@ -836,3 +838,41 @@ def test_proxy_judged_benchmark_figures_stay_on_the_cards_with_a_label() -> None
     assert "동일가중" in details["benchmark_return"].caution
     assert "동일가중" in details["excess_return"].caution
     assert "동일가중" not in details["sharpe_ratio"].caution
+
+
+@pytest.mark.parametrize("oos_benchmark", [0.3, 0.0, None])
+def test_official_benchmark_cards_use_the_same_oos_period_without_full_window_fallback(oos_benchmark):
+    """Synthetic report data; no market API or performance measurement."""
+    candidate_metrics = BacktestMetrics(
+        sharpe_ratio=0.2, max_drawdown=-0.1, win_rate=0.5, total_return=-0.5,
+        in_sample_sharpe=0.1, out_sample_sharpe=0.2, degradation=0.0,
+    )
+    aggregate = candidate_metrics.model_copy(update={
+        "total_return": 0.331, "out_sample_return": 0.331,
+        "out_sample_benchmark_return": oos_benchmark,
+        "out_sample_excess_return": None if oos_benchmark is None else 0.331 - oos_benchmark,
+    })
+    payload = _build_payload(candidate_metrics)
+    payload["walk_forward"] = {"status": "ready", "aggregate_metrics": aggregate.model_dump()}
+    payload["backtest_payload"] = {"benchmark": {
+        "primary": {
+            "available": True, "official_series_and_lagged_weights": True,
+            "return": 2.0, "unavailable_reason": None,
+        },
+        "auxiliary": {"return": 0.9, "used_for_acceptance": False},
+    }}
+    performance = build_public_backtest_performance(payload)
+    assert performance is not None
+    # The full-window source disclosure remains separate from the OOS metric cards.
+    assert performance.benchmark.total_return == 2.0
+    details = {item.key: item for item in performance.metric_details}
+    assert details["total_return"].value == 0.331
+    if oos_benchmark is None:
+        for key in ("benchmark_return", "excess_return", "out_sample_excess_return"):
+            assert details[key].value is None
+            assert details[key].is_available is False
+            assert details[key].unavailable_reason == "benchmark_evaluation_intervals_incomplete"
+    else:
+        assert details["benchmark_return"].value == oos_benchmark
+        assert details["excess_return"].value == pytest.approx(0.331 - oos_benchmark)
+        assert "동일가중" not in details["benchmark_return"].caution

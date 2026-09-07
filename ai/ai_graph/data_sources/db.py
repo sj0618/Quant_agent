@@ -27,6 +27,7 @@ from ai_graph.source_manifest import (
 from .identity import canonical_ticker, display_name
 from .index_universes import INDEX_MEMBERSHIP_HISTORY_TABLE
 from .sectors import extract_sector_from_query, get_known_sectors
+from .ticker_resolution import resolve_query_tickers
 
 _logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
@@ -476,7 +477,10 @@ class PostgresPipelineDataSource:
             }
             recommended: list[str] = []
             ticker_resolution = "screening"
-            already_screened = screen_current and _query_requests_screening(query)
+            requested_tickers = self._resolve_tickers(conn, query) if screen_current else ()
+            already_screened = (
+                screen_current and not requested_tickers and _query_requests_screening(query)
+            )
             screening_mode = not screen_current or already_screened
             pit_market: tuple[
                 list[str],
@@ -516,9 +520,8 @@ class PostgresPipelineDataSource:
                     capability_availability=capability_availability,
                     screening_relaxation=screening_relaxation,
                 )
-            single_ticker: str | None = None
+            single_ticker = requested_tickers[0] if requested_tickers else None
             if not screening_candidates and screen_current:
-                single_ticker = self._resolve_ticker(conn, query)
                 if single_ticker is None:
                     screening_mode = True
                     # Ambiguous query (no explicit ticker, no name match): screen as a
@@ -568,6 +571,8 @@ class PostgresPipelineDataSource:
                         if screening_candidates
                         else "ambiguous_backtest_without_current_recommendations"
                     )
+                else:
+                    ticker_resolution = "explicit_or_name_match"
             else:
                 ticker_resolution = "explicit_or_name_match"
             relaxed_screening_candidates = (
@@ -620,8 +625,12 @@ class PostgresPipelineDataSource:
                 symbol_info = symbol_info_by_ticker.get(ticker, {"ticker": ticker, "included": False})
             elif single_ticker:
                 ticker = single_ticker
-                tickers = [ticker]
-                symbol_info = self._fetch_symbol_info(conn, ticker)
+                tickers = list(requested_tickers)
+                universe_descriptor["selection"] = "explicit_tickers"
+                symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
+                symbol_info = symbol_info_by_ticker.get(
+                    ticker, {"ticker": ticker, "included": False}
+                )
                 price_rows_started = perf_counter()
                 fetch_kwargs: dict[str, Any] = {"timings": timings}
                 if requires_financials is not None:
@@ -631,7 +640,7 @@ class PostgresPipelineDataSource:
                 price_rows, effective_lookback_days = self._fetch_price_rows(
                     conn,
                     tickers,
-                    {ticker: symbol_info},
+                    symbol_info_by_ticker,
                     query,
                     backtest_window,
                     indicator_families,
@@ -806,9 +815,7 @@ class PostgresPipelineDataSource:
                     "required_metrics": sorted(required_metrics or ()),
                     "requires_financials": requires_financials,
                     "compact_price_rows": compact_execution_rows,
-                    "execution_price_basis": (
-                        "official_adjusted_ohlcv" if compact_execution_rows else "raw_ohlcv"
-                    ),
+                    "execution_price_basis": "raw_ohlcv",
                 },
                 "unavailable_indicator_families": list(
                     self.unavailable_indicator_families
@@ -830,20 +837,15 @@ class PostgresPipelineDataSource:
                 "backtest_session_count": backtest_window["session_count"],
                 "universe_provenance": SYMBOL_LISTING_HISTORY_TABLE,
                 "raw_price_provenance": {
-                    "raw_ohlcv_source": None if compact_execution_rows else "core.ohlcv_daily",
-                    "raw_notional_source": None,
-                    # Bars without a raw execution price are not loaded at all, so the
-                    # returned rows are exactly the ones the engine can execute on.
-                    "raw_execution_join": None if compact_execution_rows else "inner_required",
+                    "raw_ohlcv_source": "core.ohlcv_daily",
+                    "raw_notional_source": (
+                        f"{KIS_ADJUSTED_OHLCV_TABLE}.raw_payload_jsonb.acml_tr_pbmn"
+                    ),
+                    # Every executable row is aligned to the exact KRX ticker/date.
+                    "raw_execution_join": "inner_required",
                     "adjusted_signal_source": KIS_ADJUSTED_OHLCV_TABLE,
-                    "execution_price_source": (
-                        KIS_ADJUSTED_OHLCV_TABLE
-                        if compact_execution_rows
-                        else "core.ohlcv_daily"
-                    ),
-                    "execution_price_basis": (
-                        "official_adjusted_ohlcv" if compact_execution_rows else "raw_ohlcv"
-                    ),
+                    "execution_price_source": "core.ohlcv_daily",
+                    "execution_price_basis": "raw_ohlcv",
                 },
                 "raw_price_capabilities": raw_price_capabilities,
                 "dart_date_only_effective_policy": "next_krx_session_v1",
@@ -1502,24 +1504,8 @@ class PostgresPipelineDataSource:
             # connection instead of hiding the failure.
             _logger.debug("could not reset screening transaction", exc_info=True)
 
-    def _resolve_ticker(self, conn: Any, query: str) -> str | None:
-        """Resolve a single explicit ticker for `query`, or None if ambiguous.
-
-        Returning None (instead of silently defaulting to
-        `self.config.default_ticker`) lets `load()` retry ambiguous queries as
-        a broad condition screen rather than always trading the same
-        single hardcoded ticker.
-        """
-        explicit_ticker = TICKER_PATTERN.search(query)
-        if explicit_ticker:
-            return explicit_ticker.group(0)
-        if _has_market_scope_reference(query) or _has_broad_screening_reference(query):
-            return None
-
-        # core.symbol_master.listing_status is currently unreliable (bulk-marked
-        # 'delisted' by an ingestion issue on the DE side), so meta.view_common_stock_universe
-        # (which filters on it) returns 0 rows. Query symbol_master directly, scoped to the
-        # same market_segment/security_type the view otherwise applies, without listing_status.
+    def _resolve_tickers(self, conn: Any, query: str) -> tuple[str, ...]:
+        """Resolve every explicitly mentioned ticker in query order."""
         rows = conn.execute(
             """
             SELECT symbol, name
@@ -1527,16 +1513,12 @@ class PostgresPipelineDataSource:
             WHERE market_segment IN ('KOSPI', 'KOSDAQ') AND security_type = '보통주'
             """
         ).fetchall()
-        for row in rows:
-            symbol = str(row.get("symbol") or "")
-            name = str(row.get("name") or "")
-            if symbol and symbol in query:
-                return symbol.zfill(6)
-            if name and re.search(
-                _NAME_BOUNDARY_TEMPLATE.format(name=re.escape(name)), query
-            ):
-                return symbol.zfill(6)
-        return None
+        return resolve_query_tickers(query, rows)
+
+    def _resolve_ticker(self, conn: Any, query: str) -> str | None:
+        """Backward-compatible single-ticker view for direct callers."""
+        tickers = self._resolve_tickers(conn, query)
+        return tickers[0] if tickers else None
 
     def _fetch_price_rows(
         self,
@@ -1585,7 +1567,12 @@ class PostgresPipelineDataSource:
                 p.adj_volume AS adjusted_volume,
                 raw.open AS raw_open, raw.high AS raw_high, raw.low AS raw_low,
                 raw.close AS raw_close, raw.volume AS raw_volume,
-                NULL::numeric AS raw_notional
+                CASE
+                    WHEN BTRIM(COALESCE(p.raw_payload_jsonb ->> 'acml_tr_pbmn', ''))
+                         ~ '^[0-9]+([.][0-9]+)?$'
+                    THEN (p.raw_payload_jsonb ->> 'acml_tr_pbmn')::numeric
+                    ELSE NULL::numeric
+                END AS raw_notional
             FROM {KIS_ADJUSTED_OHLCV_TABLE} p
             JOIN core.symbol_master sm
               ON sm.symbol = p.ticker
@@ -1688,8 +1675,19 @@ class PostgresPipelineDataSource:
                 f"""
                 SELECT
                     p.time, p.ticker,
-                    p.adj_open, p.adj_high, p.adj_low, p.adj_close, p.adj_volume
+                    p.adj_open, p.adj_high, p.adj_low, p.adj_close, p.adj_volume,
+                    raw.open, raw.high, raw.low, raw.close, raw.volume,
+                    CASE
+                        WHEN BTRIM(COALESCE(p.raw_payload_jsonb ->> 'acml_tr_pbmn', ''))
+                             ~ '^[0-9]+([.][0-9]+)?$'
+                        THEN (p.raw_payload_jsonb ->> 'acml_tr_pbmn')::numeric
+                        ELSE NULL::numeric
+                    END AS raw_notional
                 FROM {KIS_ADJUSTED_OHLCV_TABLE} p
+                JOIN core.symbol_master sm ON sm.symbol = p.ticker
+                JOIN core.ohlcv_daily raw
+                  ON raw.symbol_id = sm.symbol_id AND raw.trade_date = p.time
+                 AND raw.trade_date BETWEEN %s::date AND %s::date
                 WHERE p.ticker = ANY(%s)
                   AND p.time BETWEEN %s::date AND %s::date
                 -- The feature engine's date ranges and rank filters require a
@@ -1697,7 +1695,10 @@ class PostgresPipelineDataSource:
                 -- PIT universe or the rows available to a condition.
                 ORDER BY p.time, p.ticker
                 """,
-                [list(tickers), window["start"], window["end"]],
+                [
+                    window["start"], window["end"], list(tickers),
+                    window["start"], window["end"],
+                ],
             )
             # A larger server-side batch amortises cursor round trips without keeping
             # the full PIT universe in the driver's result buffer.
@@ -3818,11 +3819,10 @@ def _compact_price_row_from_source(row: Mapping[str, Any]) -> dict[str, Any]:
 def _compact_price_row_from_tuple(row: Sequence[Any]) -> dict[str, Any]:
     """Convert one streamed PostgreSQL tuple without allocating an intermediate mapping.
 
-    This deliberately uses KIS's official adjusted OHLCV for both signals and fills.
-    It is not a raw-price substitute: the compact plan declares this execution basis
-    explicitly and disables capacity claims when source traded value is absent.  That
-    avoids a multi-million-row raw-table join for a price-only strategy while retaining
-    one internally consistent, source-provided series.
+    KIS official adjusted OHLCV remains the signal series. Fills use the exact
+    ticker/date KRX row, while capacity uses KIS's source-provided ``acml_tr_pbmn``.
+    Missing or malformed traded value remains ``None``; it is never synthesized from
+    close times volume.
     """
 
     (
@@ -3833,6 +3833,12 @@ def _compact_price_row_from_tuple(row: Sequence[Any]) -> dict[str, Any]:
         low_price,
         close_price,
         volume,
+        raw_open,
+        raw_high,
+        raw_low,
+        raw_close,
+        raw_volume,
+        raw_notional,
     ) = row
     return {
         "date": _date_value(as_of_date).isoformat(),
@@ -3842,7 +3848,13 @@ def _compact_price_row_from_tuple(row: Sequence[Any]) -> dict[str, Any]:
         "low": _float_value(low_price),
         "close": _float_value(close_price),
         "volume": _float_value(volume),
-        "execution_price_basis": "official_adjusted_ohlcv",
+        "raw_open": _optional_float_value(raw_open),
+        "raw_high": _optional_float_value(raw_high),
+        "raw_low": _optional_float_value(raw_low),
+        "raw_close": _optional_float_value(raw_close),
+        "raw_volume": _optional_float_value(raw_volume),
+        "raw_notional": _optional_float_value(raw_notional),
+        "execution_price_basis": "raw_ohlcv",
     }
 
 

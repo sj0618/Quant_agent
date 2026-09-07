@@ -15,6 +15,7 @@ from pydantic import (
     TypeAdapter,
     field_validator,
     model_validator,
+    model_serializer,
 )
 
 from ai_graph.research_eligibility import PublicPerformance
@@ -418,7 +419,7 @@ class StrategySpec(BaseModel):
     entry_conditions: list[Condition] = Field(min_length=1)
     exit_conditions: list[Condition] = Field(default_factory=list)
     indicators: list[str] = Field(default_factory=list)
-    risk_constraints: dict[str, float | int | str | bool] = Field(default_factory=dict)
+    risk_constraints: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
     assumptions: list[str] = Field(default_factory=list)
     source_refs: list[str] = Field(default_factory=list)
     selection_mode: Literal["standard", "automatic", "user_defined"] = "standard"
@@ -486,6 +487,30 @@ class StrategyExecutionSpecV1(BaseModel):
         return self
 
 
+class ExecutionControlsV1(BaseModel):
+    """Only explicitly supplied portfolio controls; absent fields retain existing defaults."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_positions: int | None = Field(default=None, strict=True, ge=1, le=1000)
+    stop_loss_pct: float | None = Field(default=None, ge=0.01, le=1.0, allow_inf_nan=False)
+    trailing_stop_pct: float | None = Field(default=None, ge=0.01, le=0.75, allow_inf_nan=False)
+    take_profit_pct: float | None = Field(default=None, ge=0.01, le=10.0, allow_inf_nan=False)
+    rebalance_interval_days: int | None = Field(default=None, strict=True, ge=5, le=63)
+
+    @model_serializer(mode="wrap")
+    def explicit_values(self, handler):
+        return {key: value for key, value in handler(self).items() if key in self.model_fields_set}
+
+    @model_validator(mode="after")
+    def explicit_values_are_supported(self) -> "ExecutionControlsV1":
+        if not self.model_fields_set or any(
+            getattr(self, key) is None for key in self.model_fields_set if key not in {"stop_loss_pct", "trailing_stop_pct", "take_profit_pct"}
+        ):
+            raise ValueError("execution controls require explicit supported values; only stop_loss_pct, trailing_stop_pct, and take_profit_pct may be null to disable an exit overlay")
+        return self
+
+
 class ExplorationCandidateRefV2(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -504,6 +529,15 @@ class ExplorationExecutionSpecV2(BaseModel):
     catalog_version: str = Field(min_length=1)
     catalog_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     candidates: list[ExplorationCandidateRefV2] = Field(min_length=2, max_length=10)
+
+    execution_controls: ExecutionControlsV1 | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_shape(self, handler):
+        result = handler(self)
+        if self.execution_controls is None:
+            result.pop("execution_controls", None)
+        return result
 
     @model_validator(mode="after")
     def candidate_ids_are_unique(self) -> "ExplorationExecutionSpecV2":
@@ -625,6 +659,15 @@ class ResearchCandidateExecutionSpecV3(BaseModel):
     # V3.0 executes one faithful researched rule. A later multi-candidate engine must
     # not silently drop sealed rules before it can execute and report every one.
     candidates: list[ResearchCandidateV3] = Field(min_length=1, max_length=1)
+
+    execution_controls: ExecutionControlsV1 | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_shape(self, handler):
+        result = handler(self)
+        if self.execution_controls is None:
+            result.pop("execution_controls", None)
+        return result
 
     @model_validator(mode="after")
     def source_and_candidate_references_are_complete(self) -> "ResearchCandidateExecutionSpecV3":
@@ -920,11 +963,11 @@ class CandidateParameters(BaseModel):
     blueprint_id: str | None = None
     lookback: int = Field(ge=3, le=252)
     threshold: float = Field(ge=-1.0, le=100.0)
-    stop_loss_pct: float = Field(gt=0.0, le=1.0)
-    take_profit_pct: float = Field(gt=0.0, le=10.0)
+    stop_loss_pct: float | None = Field(gt=0.0, le=1.0)
+    take_profit_pct: float | None = Field(gt=0.0, le=10.0)
     max_positions: int = Field(gt=0, le=1000)
     rebalance_interval_days: int = Field(default=21, ge=5, le=63)
-    trailing_stop_pct: float = Field(default=0.25, gt=0.0, le=0.75)
+    trailing_stop_pct: float | None = Field(default=0.25, gt=0.0, le=0.75)
     medium_momentum_weight: float = Field(default=0.60, ge=0.0, le=1.0)
 
 

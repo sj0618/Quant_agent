@@ -130,52 +130,48 @@ def _decisions(
 # --- fold alignment and seeding ---------------------------------------------
 
 
+def _executed_orders(rows, strategy_ir, parameters, *, start_index=0):
+    from ai_graph.schemas import StrategySpec, CodeCandidate
+
+    sessions = sorted({str(row["date"]) for row in rows})
+    strategy = StrategySpec(
+        strategy_id=strategy_ir.strategy_id, name="Synthetic fold execution", market="KRX", timeframe="daily",
+        entry_conditions=strategy_ir.entry_conditions, exit_conditions=strategy_ir.exit_conditions,
+        risk_constraints={"max_position_pct": 1.0 / parameters.max_positions, "stop_loss_pct": parameters.stop_loss_pct}, confidence=1.0,
+    )
+    candidate = CodeCandidate(
+        candidate_id="fold-execution-unit", variant="A", validation_ok=True,
+        code="def build_signals(prices):\n    return []", representation="structured",
+        strategy_ir=strategy_ir, parameters=parameters,
+    )
+    tradable = set(sessions[start_index:])
+    engine_rows = [row for row in rows if str(row["date"]) in tradable]
+    result = backtest_node._fold_engine(strategy, candidate, rows, engine_rows, tradable, store=PreparedFeatureStore(rows))
+    buys, sells = {}, {}
+    for event in result.order_audit:
+        if event.status == "executed":
+            target = buys if event.side == "buy" else sells
+            target.setdefault(sessions.index(event.date), []).append(event.ticker)
+    return buys, sells
+
+
 def test_the_rotation_grid_is_the_same_absolute_calendar_in_every_fold() -> None:
-    """Two folds, two start dates, one grid.
-
-    The replacement lands on session 14 whichever fold asked, because `date_number` now
-    counts the whole window. Anchored to the fold instead it would have been the fold's
-    own start + 7, i.e. 12 for one fold and 15 for the other - the drift that left the
-    deployed run flat for the first half of most evaluation months.
-    """
-
     sessions = _sessions(24)
     rows = _leadership_rows(sessions, swap_at=10)
-    store = PreparedFeatureStore(rows)
-    ir, parameters = _rotation_ir(), _parameters()
+    early_buys, early_sells = _executed_orders(rows, _rotation_ir(), _parameters(), start_index=5)
+    late_buys, late_sells = _executed_orders(rows, _rotation_ir(), _parameters(), start_index=8)
+    # Both folds replace the leader after the same global rotation close (14).
+    assert early_sells == late_sells == {15: ["000001"]}
+    assert early_buys == {6: ["000001"], 15: ["000002"]}
+    assert late_buys == {9: ["000001"], 15: ["000002"]}
 
-    early = store.build_actions(ir, parameters, reset_session=sessions[5])
-    late = store.build_actions(ir, parameters, reset_session=sessions[8])
-
-    early_buys, early_sells = _decisions(rows, early)
-    late_buys, late_sells = _decisions(rows, late)
-
-    # Replacement day: the held leader is sold and the new one bought, same session.
-    assert early_sells == {14: ["000001"]}
-    assert late_sells == {14: ["000001"]}
-    assert early_buys[14] == ["000002"]
-    assert late_buys[14] == ["000002"]
-
-
-def test_a_fold_buys_its_target_set_on_the_first_session_it_may_trade() -> None:
-    """The engine starts the fold in cash, so the generator must too - and buy there.
-
-    The generator used to carry positions in from the fold's train/validation
-    simulation, so it issued no BUY at the start of the evaluation month while the
-    engine sat in cash waiting for one.
-    """
-
+def test_a_fold_first_close_signal_fills_at_the_next_open() -> None:
     sessions = _sessions(24)
     rows = _leadership_rows(sessions, swap_at=10)
-    store = PreparedFeatureStore(rows)
-
-    actions = store.build_actions(_rotation_ir(), _parameters(), reset_session=sessions[5])
-
-    buys, sells = _decisions(rows, actions)
-    assert buys[5] == ["000001"]
-    # Restarting the book is not an exit: the engine holds nothing to sell there.
-    assert 5 not in sells
-
+    buys, sells = _executed_orders(rows, _rotation_ir(), _parameters(), start_index=5)
+    assert buys[6] == ["000001"]
+    assert 5 not in buys
+    assert 5 not in sells and 6 not in sells
 
 def test_rows_after_the_fold_are_never_read() -> None:
     sessions = _sessions(24)
@@ -221,34 +217,16 @@ def test_no_future_bar_can_change_a_decision_already_made() -> None:
 
 
 def test_a_stopped_out_name_releases_its_slot_and_the_next_session_refills_it() -> None:
-    """The engine's stop fill has to reach the generator's book.
-
-    It did not, so a stopped name stayed marked as held: its slot was locked for the
-    rest of the run and it could never re-enter. Measured on the deployed rule, buy
-    counts were byte-identical at stop 0.08 / 0.15 / 0.25 / 0.99 while total return
-    moved 101 points.
-    """
-
     sessions = _sessions(12)
-    rows: list[dict[str, object]] = []
+    rows = []
     for index, session in enumerate(sessions):
-        # 000001 leads, then loses 20% at session 5 - past an 8% stop, and out of the
-        # eligible set. 000002 is always eligible and always second.
         rows.append(_bar(session, "000001", 120.0 if index < 5 else 96.0))
         rows.append(_bar(session, "000002", 110.0))
-    store = PreparedFeatureStore(rows)
-
-    actions = store.build_actions(
-        _rotation_ir(), _parameters(stop_loss_pct=0.08), reset_session=sessions[0]
-    )
-
-    buys, sells = _decisions(rows, actions)
-    assert buys[0] == ["000001"]
-    assert sells[5] == ["000001"]
-    # The freed slot is refilled the same session - before this it stayed locked for the
-    # rest of the run, because the book still believed the stopped name was held.
-    assert buys[5] == ["000002"]
-
+    buys, sells = _executed_orders(rows, _rotation_ir(), _parameters(stop_loss_pct=0.08))
+    assert buys[1] == ["000001"]
+    assert sells[6] == ["000001"]
+    # The same next open sells first, then fills the waiting eligible replacement.
+    assert buys[6] == ["000002"]
 
 def test_a_take_profit_of_ten_means_no_target_at_all() -> None:
     """Catalogue rows ship `take_profit_pct=10.0` to say "no target"; +1000% is not one."""

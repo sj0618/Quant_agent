@@ -17,6 +17,7 @@ from ai_graph.source_manifest import build_pipeline_extract_snapshot, build_sour
 from .db import FixtureModeForbiddenError, PipelineDataUnavailableError, is_release_profile
 from .identity import canonical_ticker, display_name
 from .sectors import extract_sector_from_query, get_known_sectors
+from .ticker_resolution import resolve_query_tickers
 
 _logger = logging.getLogger(__name__)
 
@@ -419,15 +420,15 @@ class PostgresPipelineDataSource:
             screening_relaxation: dict[str, Any] = {}
             recommended: list[str] = []
             ticker_resolution = "screening"
-            already_screened = _query_requests_screening(query)
+            requested_tickers = self._resolve_tickers(conn, query)
+            already_screened = not requested_tickers and _query_requests_screening(query)
             if already_screened:
                 screening_candidates, screening_relaxation = self._screen_with_relaxation(
                     conn, query
                 )
 
-            single_ticker: str | None = None
+            single_ticker = requested_tickers[0] if requested_tickers else None
             if not screening_candidates:
-                single_ticker = self._resolve_ticker(conn, query)
                 if single_ticker is None:
                     if not already_screened:
                         screening_candidates, screening_relaxation = self._screen_with_relaxation(
@@ -470,7 +471,7 @@ class PostgresPipelineDataSource:
                     "no screening candidate or resolvable ticker found; refusing to use a default ticker",
                 )
 
-            tickers = recommended[:] if recommended else [ticker]
+            tickers = recommended[:] if recommended else list(requested_tickers)
             return PipelineDataBundle(
                 price_rows=[],
                 screening_candidates=screening_candidates,
@@ -544,13 +545,15 @@ class PostgresPipelineDataSource:
             screening_relaxation: dict[str, Any] = {}
             recommended: list[str] = []
             ticker_resolution = "screening"
-            already_screened = screen_current and _query_requests_screening(query)
+            requested_tickers = self._resolve_tickers(conn, query) if screen_current else ()
+            already_screened = (
+                screen_current and not requested_tickers and _query_requests_screening(query)
+            )
             screening_mode = not screen_current or already_screened
             if already_screened:
                 screening_candidates, screening_relaxation = self._screen_with_relaxation(conn, query)
-            single_ticker: str | None = None
+            single_ticker = requested_tickers[0] if requested_tickers else None
             if not screening_candidates and screen_current:
-                single_ticker = self._resolve_ticker(conn, query)
                 if single_ticker is None:
                     screening_mode = True
                     # Ambiguous query (no explicit ticker, no name match): screen as a
@@ -623,10 +626,13 @@ class PostgresPipelineDataSource:
                 self._set_statement_timeout(conn)
             elif single_ticker:
                 ticker = single_ticker
-                tickers = [ticker]
-                symbol_info = self._fetch_symbol_info(conn, ticker)
+                tickers = list(requested_tickers)
+                symbol_info_by_ticker = self._fetch_symbol_info_map(conn, tickers)
+                symbol_info = symbol_info_by_ticker.get(
+                    ticker, {"ticker": ticker, "included": False}
+                )
                 price_rows, effective_lookback_days = self._fetch_price_rows(
-                    conn, tickers, {ticker: symbol_info}, query, indicator_families
+                    conn, tickers, symbol_info_by_ticker, query, indicator_families
                 )
             else:
                 # No DB screening match and no explicit/name-resolved ticker: refuse to
@@ -1082,24 +1088,8 @@ class PostgresPipelineDataSource:
             # connection instead of hiding the failure.
             _logger.debug("could not reset screening transaction", exc_info=True)
 
-    def _resolve_ticker(self, conn: Any, query: str) -> str | None:
-        """Resolve a single explicit ticker for `query`, or None if ambiguous.
-
-        Returning None (instead of silently defaulting to
-        `self.config.default_ticker`) lets `load()` retry ambiguous queries as
-        a broad condition screen rather than always trading the same
-        single hardcoded ticker.
-        """
-        explicit_ticker = TICKER_PATTERN.search(query)
-        if explicit_ticker:
-            return explicit_ticker.group(0)
-        if _has_market_scope_reference(query) or _has_broad_screening_reference(query):
-            return None
-
-        # core.symbol_master.listing_status is currently unreliable (bulk-marked
-        # 'delisted' by an ingestion issue on the DE side), so meta.view_common_stock_universe
-        # (which filters on it) returns 0 rows. Query symbol_master directly, scoped to the
-        # same market_segment/security_type the view otherwise applies, without listing_status.
+    def _resolve_tickers(self, conn: Any, query: str) -> tuple[str, ...]:
+        """Resolve every explicitly mentioned ticker in query order."""
         rows = conn.execute(
             """
             SELECT symbol, name
@@ -1107,14 +1097,12 @@ class PostgresPipelineDataSource:
             WHERE market_segment IN ('KOSPI', 'KOSDAQ') AND security_type = '보통주'
             """
         ).fetchall()
-        for row in rows:
-            symbol = str(row.get("symbol") or "")
-            name = str(row.get("name") or "")
-            if symbol and symbol in query:
-                return symbol.zfill(6)
-            if name and name in query:
-                return symbol.zfill(6)
-        return None
+        return resolve_query_tickers(query, rows)
+
+    def _resolve_ticker(self, conn: Any, query: str) -> str | None:
+        """Backward-compatible single-ticker view for direct callers."""
+        tickers = self._resolve_tickers(conn, query)
+        return tickers[0] if tickers else None
 
     def _fetch_price_rows(
         self,

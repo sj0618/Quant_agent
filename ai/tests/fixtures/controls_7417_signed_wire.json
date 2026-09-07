@@ -1,0 +1,116 @@
+[
+  {
+    "spec": {
+      "classification": "exploratory_return_seeking",
+      "market": "KRX",
+      "timeframe": "daily",
+      "policy_version": "exploration-policy-v2.krx.2026-09-03",
+      "policy_hash": "86971de4ac92b1c6177ef64c3446a2f75881a587e6d07c38fc67329972b1bf1f",
+      "catalog_version": "quant-blueprints.v2",
+      "catalog_hash": "a36940228b4b6a4000ba3bae7bf2ffec274850e074896f308b35ccd06a084329",
+      "candidates": [
+        {
+          "catalog_id": "qb-v2-cross-sectional-12-1-momentum",
+          "execution_signature": "c0a4414538cf85741c3f27259df79f4e9e2789817ab1433e0e15a9a707115046"
+        },
+        {
+          "catalog_id": "qb-v2-dual-momentum",
+          "execution_signature": "915a216ea23a47f54c57908089529c67ed689ded9303302442df59a96f471c44"
+        },
+        {
+          "catalog_id": "qb-v2-fifty-two-week-high-momentum",
+          "execution_signature": "89b2970aeb621afa8d3a88171b8a7cc60e20404a6c62015a38e709b634ac33b1"
+        }
+      ]
+    },
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IlJNUC1SVUxFLURSQUZUIn0.eyJhdWQiOiJyZXNlYXJjaC1ydWxlLWRyYWZ0IiwiZXhwIjoxNzg4NzM5ODAwLCJpYXQiOjE3ODg3MzkyMDAsImtleV92ZXJzaW9uIjoidjEiLCJub25jZSI6ImFmOTBiZDY2LTIzM2UtNGE1Ni1iMzk2LTQ2ZjM4ZmI4NzFiZCIsInBvbGljeV9oYXNoIjoiZGZiN2UzMGZlZTU2OWY1OGU0MTU3MGNiNzJjMjA5YmNjYTkwMjVjZGE1OWQxNDExN2YzNGVjODA2NzY5NGNhNiIsInJ1bGVfZGlnZXN0IjoiZGM1MzBmNzBlZGFkNDZhNzNmOTgzNTk2YjBiYzM5Y2Y0NTQ2ZDVhYTIxYWI5MTUyMDY4ZDllNjA5ZDA2ODYwZSIsInNjaGVtYV92ZXJzaW9uIjoicmVzZWFyY2gtcnVsZS1kcmFmdC52MSIsInVzZXJfaWQiOiJ1bml0In0.bECEI6D-0wvuJ_bmCCUJSIf48NxSHpSWUYcX6bf1KnU",
+    "digest": "dc530f70edad46a73f983596b0bc39cf4546d5aa21ab9152068d9e609d06860e",
+    "now": "2026-09-07T00:00:00+00:00"
+  },
+  {
+    "spec": {
+      "classification": "research_required",
+      "market": "KRX",
+      "timeframe": "daily",
+      "research_schema_version": "strategy-research-draft.v3",
+      "research_prompt_version": "v10",
+      "query_digest": "d686d1c5fa9b0fa602cf7f3057adea4430cc390a23a6922b43ca7772f783b5c4",
+      "resolution_summary": "돈치안 돌파는 최근 고가 범위를 상향 이탈한 종목을 추세 후보로 보는 규칙으로 해석했습니다.",
+      "research_snapshot_hash": "067560fb12f24bb235d2b6d84052551dcf71d45f75a2401daa49543698789fc7",
+      "capability_hash": "653587edcb9933d9791a47e62d0a552c9f96b403cd2a06d35aadf4281345cec0",
+      "sources": [
+        {
+          "source_id": "source-1",
+          "title": "Donchian channel definition",
+          "url": "https://example.com/donchian",
+          "claim": "돈치안 채널은 일정 기간의 최고가와 최저가로 범위를 구성합니다.",
+          "limitation": "근거의 적용 범위와 한계를 추가 확인해야 합니다.",
+          "excerpt_digest": "ca6b0f93769f3c16b2c81084c0e2b57fdf65002fdfa67f0acecc99ea325f8c50"
+        }
+      ],
+      "candidates": [
+        {
+          "candidate_id": "research-donchian-breakout-20",
+          "title": "20일 돈치안 상단 돌파",
+          "hypothesis": "20일 최고가 부근 상향 돌파 뒤에 추세가 이어질 수 있습니다.",
+          "counter_hypothesis": "횡보장에서는 돌파가 잦은 손절로 이어질 수 있습니다.",
+          "entry_conditions": [
+            {
+              "left": "close",
+              "operator": "gte",
+              "right": "high",
+              "description": null,
+              "window": 20,
+              "aggregate": "max",
+              "scale": 0.995,
+              "consecutive": null,
+              "universe_rank_pct": null
+            }
+          ],
+          "exit_conditions": [
+            {
+              "left": "close",
+              "operator": "lte",
+              "right": "sma20",
+              "description": null,
+              "window": null,
+              "aggregate": null,
+              "scale": null,
+              "consecutive": null,
+              "universe_rank_pct": null
+            }
+          ],
+          "holding_days": null,
+          "rebalance_interval_days": null,
+          "stop_loss_pct": null,
+          "trailing_stop_pct": null,
+          "take_profit_pct": null,
+          "max_positions": null,
+          "required_metrics": [
+            "close",
+            "high",
+            "sma20"
+          ],
+          "assumptions": [
+            "KRX 일봉 종가 기준으로 다음 거래일 체결을 가정합니다."
+          ],
+          "ai_assumptions": [],
+          "economic_rationale": "경험적 가설로서 비용 후 검증이 필요합니다.",
+          "falsification_conditions": [],
+          "expected_turnover": "백테스트에서 실제 회전율과 비용 민감도를 산출합니다.",
+          "regime_risks": [],
+          "backtest_years": 1,
+          "backtest_period_basis": "KRX PIT 자료 가용성과 전략의 단기 추세 가설을 조사해 1년을 선택했습니다.",
+          "source_ids": [
+            "source-1"
+          ],
+          "sector": null,
+          "index_universe": null
+        }
+      ]
+    },
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IlJNUC1SVUxFLURSQUZUIn0.eyJhdWQiOiJyZXNlYXJjaC1ydWxlLWRyYWZ0IiwiZXhwIjoxNzg4NzM5ODAwLCJpYXQiOjE3ODg3MzkyMDAsImtleV92ZXJzaW9uIjoidjEiLCJub25jZSI6ImNjMDVjY2JjLWY1YTQtNGI4Zi1iMTc4LTk0MzdjNWY5NWIxMSIsInBvbGljeV9oYXNoIjoiZGZiN2UzMGZlZTU2OWY1OGU0MTU3MGNiNzJjMjA5YmNjYTkwMjVjZGE1OWQxNDExN2YzNGVjODA2NzY5NGNhNiIsInJ1bGVfZGlnZXN0IjoiY2NkYjhmZTFiOTg4ZDhmZmY4NjI4MjA0MDRlZWJjMGVmYmM3OGNiYjYzOTI0ZThjNjJjNmE0ODE3YWQxNmU0YyIsInNjaGVtYV92ZXJzaW9uIjoicmVzZWFyY2gtcnVsZS1kcmFmdC52MSIsInVzZXJfaWQiOiJ1bml0In0.h5mUYDYolksYoYRltjlbF2tYuspfc3miRyQ3DqtsbB0",
+    "digest": "ccdb8fe1b988d8fff862820404eebc0efbc78cbb63924e8c62c6a4817ad16e4c",
+    "now": "2026-09-07T00:00:00+00:00"
+  }
+]

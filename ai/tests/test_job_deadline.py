@@ -60,8 +60,11 @@ def test_the_scope_is_restored_so_one_run_cannot_bound_the_next() -> None:
     assert deadline_remaining_seconds() is None
 
 
-def test_a_job_that_outlives_its_budget_fails_with_a_retryable_message(monkeypatch) -> None:
-    """완료 판정: with a deadline set, the job does not run past it."""
+@pytest.mark.parametrize("runner_checks_deadline", (True, False))
+def test_a_job_that_outlives_its_budget_fails_with_a_retryable_message(
+    monkeypatch, runner_checks_deadline: bool
+) -> None:
+    """Late results fail even when a runner has no internal checkpoint."""
 
     monkeypatch.setenv(AI_JOB_DEADLINE_SECONDS_ENV, "0.05")
     store = InMemoryAnalysisJobStore()
@@ -70,7 +73,8 @@ def test_a_job_that_outlives_its_budget_fails_with_a_retryable_message(monkeypat
     def slow_runner(_query: str, trace_id: str) -> APIEnvelope:
         # Stands in for a node boundary reached after the budget is gone.
         time.sleep(0.2)
-        raise_if_past_deadline()
+        if runner_checks_deadline:
+            raise_if_past_deadline()
         return _envelope(trace_id)
 
     started = time.monotonic()
@@ -81,7 +85,7 @@ def test_a_job_that_outlives_its_budget_fails_with_a_retryable_message(monkeypat
     assert "다시 시도" in result.error_message
     assert result.result.retryable is True
     assert result.result.failure_cause.subcause == "job_deadline_exceeded"
-    # The point of the ceiling: the run does not keep going past it.
+    # This verifies terminal status; an uninterrupted runner may exceed its deadline.
     assert elapsed < 5.0
 
 

@@ -96,9 +96,9 @@ class GeneratedStrategyBlueprint(BaseModel):
     threshold: float = Field(default=0.0, ge=-1.0, le=100.0)
     max_positions: int = Field(gt=0, le=1000)
     rebalance_interval_days: int = Field(ge=5, le=63)
-    stop_loss_pct: float = Field(gt=0.0, le=1.0)
-    take_profit_pct: float = Field(default=10.0, gt=0.0, le=10.0)
-    trailing_stop_pct: float = Field(gt=0.0, le=0.75)
+    stop_loss_pct: float | None = Field(gt=0.0, le=1.0)
+    take_profit_pct: float | None = Field(default=10.0, gt=0.0, le=10.0)
+    trailing_stop_pct: float | None = Field(gt=0.0, le=0.75)
     matched_terms: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     required_data: list[str] = Field(default_factory=list)
@@ -117,14 +117,14 @@ class CodeGenerationPlan(BaseModel):
     proxy_feature: str
     lookbacks: list[int] = Field(min_length=1)
     thresholds: list[float] = Field(min_length=1)
-    stop_loss_pct: float = 0.08
-    take_profit_pct: float = 0.45
+    stop_loss_pct: float | None = 0.08
+    take_profit_pct: float | None = 0.45
     expected_trade_frequency: str
     candidate_profiles: list[StructuredProfile] = Field(default_factory=list)
     customization_style: Literal["aggressive", "balanced", "defensive"] = "balanced"
     investment_horizon: Literal["short", "medium", "long"] = "medium"
     rebalance_interval_days: int = Field(default=21, ge=5, le=63)
-    trailing_stop_pct: float = Field(default=0.25, gt=0.0, le=0.75)
+    trailing_stop_pct: float | None = Field(default=0.25, gt=0.0, le=0.75)
     medium_momentum_weight: float = Field(default=0.60, ge=0.0, le=1.0)
     benchmark_objective: bool = False
     customization_summary: str | None = None
@@ -311,20 +311,14 @@ def _normalized_parameter_sets(
             update={
                 "profile": profile,
                 "max_positions": max_positions,
-                "stop_loss_pct": float(
-                    strategy.risk_constraints.get("stop_loss_pct", item.stop_loss_pct)
-                ),
-                "take_profit_pct": float(
-                    strategy.risk_constraints.get("take_profit_pct", item.take_profit_pct)
-                ),
+                "stop_loss_pct": strategy.risk_constraints.get("stop_loss_pct", item.stop_loss_pct),
+                "take_profit_pct": strategy.risk_constraints.get("take_profit_pct", item.take_profit_pct),
                 "rebalance_interval_days": int(
                     strategy.risk_constraints.get(
                         "rebalance_interval_days", plan.rebalance_interval_days
                     )
                 ),
-                "trailing_stop_pct": float(
-                    strategy.risk_constraints.get("trailing_stop_pct", plan.trailing_stop_pct)
-                ),
+                "trailing_stop_pct": strategy.risk_constraints.get("trailing_stop_pct", plan.trailing_stop_pct),
                 "medium_momentum_weight": float(
                     strategy.risk_constraints.get(
                         "medium_momentum_weight", plan.medium_momentum_weight
@@ -363,10 +357,8 @@ def _default_parameter_sets(
                 profile="compiled_conditions",
                 lookback=max(3, min(252, int(plan.lookbacks[0]))),
                 threshold=float(plan.thresholds[0]),
-                stop_loss_pct=float(strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct)),
-                take_profit_pct=float(
-                    strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct)
-                ),
+                stop_loss_pct=strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct),
+                take_profit_pct=strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct),
                 max_positions=max_positions,
                 rebalance_interval_days=plan.rebalance_interval_days,
                 trailing_stop_pct=plan.trailing_stop_pct,
@@ -399,8 +391,8 @@ def _default_parameter_sets(
         selected_profiles = ["compiled_conditions", profiles[0], profiles[1]]
     else:
         selected_profiles = profiles[:MIN_GENERATED_CANDIDATES]
-    stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct))
-    take_profit = float(strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct))
+    stop_loss = strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct)
+    take_profit = strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct)
     return [
         CandidateParameters(
             profile=profile,  # type: ignore[arg-type]
@@ -508,7 +500,7 @@ def _render_structured_reference_code(
     rebalance_interval_days = {parameters.rebalance_interval_days}
     execution_mode = {strategy_ir.execution_mode!r}
     holding_days = {strategy_ir.holding_days!r}
-    trailing_stop_pct = {float(parameters.trailing_stop_pct)!r}
+    trailing_stop_pct = {parameters.trailing_stop_pct!r}
     medium_momentum_weight = {float(parameters.medium_momentum_weight)!r}
     strategy_id = {strategy_ir.strategy_id!r}
     for row in prices:
@@ -568,6 +560,7 @@ def backtest_code_node(state: dict) -> dict:
     max_positions = applied_max_positions(
         max_position_pct_from_risk_constraints(strategy_a.risk_constraints),
         available_ticker_count(price_rows) if price_rows else None,
+        explicit_max_positions=strategy_a.risk_constraints.get("max_positions"),
     )
     result_a = generate_loop3_candidates(
         Loop3Request(
@@ -788,10 +781,11 @@ def _automatic_strategy_blueprints(
     trailing_stop_pct: float,
 ) -> list[GeneratedStrategyBlueprint]:
     max_positions = requested_max_positions(
-        max_position_pct_from_risk_constraints(strategy.risk_constraints)
+        max_position_pct_from_risk_constraints(strategy.risk_constraints),
+        explicit_max_positions=strategy.risk_constraints.get("max_positions"),
     )
-    stop_loss_pct = float(strategy.risk_constraints.get("stop_loss_pct", 0.20))
-    take_profit_pct = float(strategy.risk_constraints.get("take_profit_pct", 10.0))
+    stop_loss_pct = strategy.risk_constraints.get("stop_loss_pct", 0.20)
+    take_profit_pct = strategy.risk_constraints.get("take_profit_pct", 10.0)
     style_label = {
         "aggressive": "공격형",
         "balanced": "균형형",
@@ -932,7 +926,7 @@ def build_code_generation_plan(
             for index, template in enumerate(selected_templates)
         ]
         rebalance_interval_days = int(strategy.risk_constraints.get("rebalance_interval_days", 21))
-        trailing_stop_pct = float(strategy.risk_constraints.get("trailing_stop_pct", 0.25))
+        trailing_stop_pct = strategy.risk_constraints.get("trailing_stop_pct", 0.25)
         medium_momentum_weight = float(
             strategy.risk_constraints.get("medium_momentum_weight", 0.60)
         )
@@ -956,7 +950,7 @@ def build_code_generation_plan(
             proxy_feature="past_only_price_factors",
             lookbacks=lookbacks,
             thresholds=thresholds,
-            stop_loss_pct=float(strategy.risk_constraints.get("stop_loss_pct", 0.20)),
+            stop_loss_pct=strategy.risk_constraints.get("stop_loss_pct", 0.20),
             take_profit_pct=10.0,
             expected_trade_frequency=f"every_{rebalance_interval_days}_trading_days",
             candidate_profiles=profiles,
@@ -1050,8 +1044,8 @@ def _render_condition_signal_code(
     position is not held forever; entry is the strategy itself.
     """
 
-    stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", 0.08))
-    take_profit = float(strategy.risk_constraints.get("take_profit_pct", 0.2))
+    stop_loss = strategy.risk_constraints.get("stop_loss_pct", 0.08)
+    take_profit = strategy.risk_constraints.get("take_profit_pct", 0.2)
     entry_expr = compiled.per_stock
     # How far past its thresholds a name sits, used to order same-day entries when more
     # of them qualify than there are slots. "0.0" leaves every entry tied, which the
@@ -1143,7 +1137,7 @@ def _render_condition_signal_code(
             if state["in_position"]:
                 entry_price = state["entry_price"]
                 gain = (close / entry_price - 1) if entry_price else 0.0
-                if gain <= -stop_loss or gain >= take_profit:
+                if (stop_loss is not None and gain <= -stop_loss) or (take_profit is not None and gain >= take_profit):
                     signals.append({{"date": current_date, "ticker": ticker, "action": "SELL", "price": close}})
                     state["in_position"] = False
                     state["entry_price"] = 0.0
@@ -1273,7 +1267,7 @@ def _render_adaptive_signal_code(
     lookback: int,
     threshold: float,
     stop_loss: float,
-    take_profit: float,
+    take_profit: float | None,
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> str:
     mode = plan.entry_feature
@@ -1286,9 +1280,9 @@ def _render_adaptive_signal_code(
     states = {{}}
     lookback = {int(lookback)}
     threshold = {float(threshold)!r}
-    stop_loss = {float(stop_loss)!r}
-    take_profit = {float(take_profit)!r}
-    trailing_stop_pct = {float(plan.trailing_stop_pct)!r}
+    stop_loss = {stop_loss!r}
+    take_profit = {take_profit!r}
+    trailing_stop_pct = {plan.trailing_stop_pct!r}
     mode = {mode!r}
     profile = {profile!r}
     strategy_id = {strategy_id!r}
@@ -1345,7 +1339,7 @@ def _render_adaptive_signal_code(
                 return_to_volatility = trend / volatility if volatility > 0 else 0
                 avg_volume = sum(volumes[-window:]) / window if volumes[-window:] else 0
                 volume_ratio = volume / avg_volume if avg_volume > 0 else 1
-                trailing_stop = state["peak"] > 0 and close < state["peak"] * (1 - trailing_stop_pct)
+                trailing_stop = trailing_stop_pct is not None and state["peak"] > 0 and close < state["peak"] * (1 - trailing_stop_pct)
                 score = rolling_sharpe + medium_return * 4 + long_return * 2 - volatility
                 if profile == "academic_momentum_trend" and len(closes) >= 252:
                     momentum_12_1 = closes[-21] / closes[-252] - 1
@@ -1434,7 +1428,7 @@ def _render_adaptive_signal_code(
                     sell = state["in_position"] and close < average
                 if state["in_position"] and state["entry_price"] > 0:
                     pnl = close / state["entry_price"] - 1
-                    sell = sell or pnl <= -stop_loss or pnl >= take_profit or trailing_stop
+                    sell = sell or (stop_loss is not None and pnl <= -stop_loss) or (take_profit is not None and pnl >= take_profit) or trailing_stop
             evaluations.append({{"ticker": ticker, "row": row, "close": close, "volume": volume, "buy": buy, "sell": sell, "score": score, "state": state, "history": history}})
         open_positions = sum(1 for state in states.values() if state["in_position"])
         open_slots = max(0, max_positions - open_positions)
@@ -1499,8 +1493,8 @@ def generate_self_improvement_candidates(
         _selective_threshold(float(value), plan.entry_feature, iteration)
         for value in plan.thresholds
     ]
-    stop_loss = float(strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct))
-    take_profit = float(strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct))
+    stop_loss = strategy.risk_constraints.get("stop_loss_pct", plan.stop_loss_pct)
+    take_profit = strategy.risk_constraints.get("take_profit_pct", plan.take_profit_pct)
     candidates: list[CodeCandidate] = []
     seen: set[str] = set()
     # A compact Cartesian traversal varies one axis at a time before combining

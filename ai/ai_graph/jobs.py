@@ -41,6 +41,7 @@ from ai_graph.progress import (
     activity_reporter,
     analysis_deadline,
     cancellation_check,
+    raise_if_past_deadline,
     stage_reporter,
 )
 from ai_graph.research_eligibility import PerformanceAvailable
@@ -64,9 +65,9 @@ _logger = logging.getLogger(__name__)
 PROCESS_INCARNATION = f"{getpid()}:{uuid4().hex[:12]}"
 
 AI_JOB_DEADLINE_SECONDS_ENV = "AI_JOB_DEADLINE_SECONDS"
-# Generous on purpose. The backtest node alone is budgeted at 540s and a healthy run has
-# been observed past 600s, so this is a ceiling for runs that are not coming back rather
-# than a target: its job is to release the analysis slot a stuck run is holding.
+# Request-wide ceiling, checked at graph boundaries and inside backtest workers.
+# The separate backtest wall budget only decides whether to start another research
+# round; it does not cap the first evaluation or the upstream data/provider calls.
 DEFAULT_JOB_DEADLINE_SECONDS = 1_800.0
 JOB_DEADLINE_MESSAGE = (
     "분석이 허용된 시간을 넘겨 중단되었습니다. 조건을 좁혀 다시 시도해 주세요."
@@ -904,6 +905,7 @@ def _run_analysis_job(
                 )
             scope.enter_context(analysis_deadline(job_deadline_seconds()))
             result = _require_analysis_envelope(runner(job.query, job.trace_id))
+            raise_if_past_deadline()
     except AnalysisDeadlineExceeded:
         _logger.warning(
             "analysis job exceeded its total time budget: job_id=%s budget=%ss",

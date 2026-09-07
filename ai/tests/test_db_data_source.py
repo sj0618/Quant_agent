@@ -396,10 +396,10 @@ def test_compact_price_stream_is_date_major_for_cross_sectional_features() -> No
             self.query = ""
             self._batches = [
                 [
-                    (date(2026, 5, 20), "000001", 10, 11, 9, 10, 100),
-                    (date(2026, 5, 20), "000002", 20, 21, 19, 20, 200),
+                    (date(2026, 5, 20), "000001", 10, 11, 9, 10, 100, 10, 11, 9, 10, 100, 1000),
+                    (date(2026, 5, 20), "000002", 20, 21, 19, 20, 200, 20, 21, 19, 20, 200, 4000),
                 ],
-                [(date(2026, 5, 21), "000001", 11, 12, 10, 11, 120)],
+                [(date(2026, 5, 21), "000001", 11, 12, 10, 11, 120, 11, 12, 10, 11, 120, 1320)],
             ]
 
         def __enter__(self):
@@ -435,6 +435,8 @@ def test_compact_price_stream_is_date_major_for_cross_sectional_features() -> No
 
     assert connection.created is not None
     assert "ORDER BY p.time, p.ticker" in connection.created.query
+    assert "JOIN core.ohlcv_daily raw" in connection.created.query
+    assert "acml_tr_pbmn" in connection.created.query
     assert [(row["date"], row["ticker"]) for row in rows] == [
         ("2026-05-20", "000001"),
         ("2026-05-20", "000002"),
@@ -1400,6 +1402,12 @@ class _L4Connection:
             })
         if "AS present" in query:
             return FakeResult(row={"present": True})
+        if "SELECT symbol, name" in query:
+            return FakeResult(rows=[
+                {"symbol": "005930", "name": "삼성전자"},
+                {"symbol": "000660", "name": "SK하이닉스"},
+                {"symbol": "001680", "name": "대상"},
+            ])
         return FakeResult(rows=[])
 
 
@@ -1503,6 +1511,47 @@ def test_single_ticker_load_keeps_l4_evidence_on_that_ticker() -> None:
     assert bundle.metadata["l4_evidence_ticker"] == "005930"
     assert bundle.metadata["l4_evidence_tickers"] == ["005930"]
 
+
+
+@pytest.mark.parametrize("module", [db_variant, db_split], ids=["db", "db_split"])
+def test_explicit_ticker_resolver_preserves_query_order_and_numeric_units(module) -> None:
+    class SymbolConnection:
+        def execute(self, query: str, params: object = None) -> FakeResult:
+            return FakeResult(rows=[
+                {"symbol": "001680", "name": "대상"},
+                {"symbol": "084690", "name": "대상홀딩스"},
+                {"symbol": "005930", "name": "삼성전자"},
+                {"symbol": "000660", "name": "SK하이닉스"},
+            ])
+
+    source = module.PostgresPipelineDataSource(
+        module.DataSourceConfig(database_dsn="postgresql://unit-test")
+    )
+    connection = SymbolConnection()
+    assert source._resolve_tickers(
+        connection, "삼성전자와 SK하이닉스를 대상으로"
+    ) == ("005930", "000660")
+    assert source._resolve_tickers(
+        connection, "대상을 대상으로 최근 5년 분석"
+    ) == ("001680",)
+    assert source._resolve_tickers(
+        connection, "코스피 종목을 대상으로 주가 100000원, 거래량 100000주 이상"
+    ) == ()
+
+
+def test_multiple_explicit_tickers_define_the_requested_backtest_universe() -> None:
+    captured: list[str] = []
+    source = _l4_source(universe=["000020"], candidates=[], captured=captured)
+
+    bundle = source.load(
+        "삼성전자와 SK하이닉스의 RSI를 비교해줘",
+        "trace-l4-multiple",
+    )
+
+    assert bundle.metadata["ticker"] == "005930"
+    assert bundle.metadata["tickers"] == ["005930", "000660"]
+    assert {row["ticker"] for row in bundle.price_rows} == {"005930", "000660"}
+    assert captured == ["005930"]
 
 def test_official_benchmark_absence_is_reported_without_failing_the_load() -> None:
     """The benchmark tables are optional; a warehouse without them still loads."""
@@ -1777,7 +1826,8 @@ def test_price_loader_projects_raw_notional_without_adjusted_fill() -> None:
                     "adjusted_low": Decimal("99"), "adjusted_close": Decimal("103"),
                     "adjusted_volume": Decimal("1000"),
                     "raw_open": Decimal("110"), "raw_high": Decimal("115"), "raw_low": Decimal("109"),
-                    "raw_close": Decimal("113"), "raw_volume": Decimal("900"), "raw_notional": None,
+                    "raw_close": Decimal("113"), "raw_volume": Decimal("900"),
+                    "raw_notional": Decimal("101700"),
                 }])
             return FakeResult(rows=[])
 
@@ -1800,8 +1850,9 @@ def test_price_loader_projects_raw_notional_without_adjusted_fill() -> None:
     )
 
     assert rows[0]["raw_close"] == 113.0
-    assert rows[0]["raw_notional"] is None
-    assert "NULL::numeric AS raw_notional" in connection.price_sql
+    assert rows[0]["raw_notional"] == 101700.0
+    assert "raw_payload_jsonb ->> 'acml_tr_pbmn'" in connection.price_sql
+    assert "ELSE NULL::numeric" in connection.price_sql
     assert "JOIN core.symbol_master sm" in connection.price_sql
     assert "JOIN mart.common_stock_universe_asof" not in connection.price_sql
     assert dart_reads == []
@@ -1839,6 +1890,12 @@ def test_compact_tuple_row_keeps_source_execution_fields_without_synthesis() -> 
             Decimal("99"),
             Decimal("103"),
             Decimal("1000"),
+            Decimal("110"),
+            Decimal("115"),
+            Decimal("109"),
+            Decimal("113"),
+            Decimal("900"),
+            Decimal("101700"),
         )
     )
 
@@ -1850,7 +1907,13 @@ def test_compact_tuple_row_keeps_source_execution_fields_without_synthesis() -> 
         "low": 99.0,
         "close": 103.0,
         "volume": 1000.0,
-        "execution_price_basis": "official_adjusted_ohlcv",
+        "raw_open": 110.0,
+        "raw_high": 115.0,
+        "raw_low": 109.0,
+        "raw_close": 113.0,
+        "raw_volume": 900.0,
+        "raw_notional": 101700.0,
+        "execution_price_basis": "raw_ohlcv",
     }
 
 

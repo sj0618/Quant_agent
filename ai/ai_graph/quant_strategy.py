@@ -1224,14 +1224,17 @@ def _indicator_explanation(
         _parameter_value(selected_parameters, "max_positions")
         or round(1.0 / float(constraints.get("max_position_pct", 0.1)))
     )
-    stop_loss_pct = float(
-        _parameter_value(selected_parameters, "stop_loss_pct")
-        or constraints.get("stop_loss_pct", 0.20)
-    )
-    trailing_stop_pct = float(
-        _parameter_value(selected_parameters, "trailing_stop_pct")
-        or constraints.get("trailing_stop_pct", 0.25)
-    )
+    def risk_value(name: str, default: float) -> float | None:
+        if isinstance(selected_parameters, Mapping) and name in selected_parameters:
+            value = selected_parameters[name]
+        elif selected_parameters is not None and hasattr(selected_parameters, name):
+            value = getattr(selected_parameters, name)
+        else:
+            value = constraints.get(name, default)
+        return None if value is None else float(value)
+
+    stop_loss_pct = risk_value("stop_loss_pct", 0.20)
+    trailing_stop_pct = risk_value("trailing_stop_pct", 0.25)
     medium_weight = float(
         _parameter_value(selected_parameters, "medium_momentum_weight")
         or constraints.get("medium_momentum_weight", 0.60)
@@ -1259,14 +1262,18 @@ def _indicator_explanation(
             f"입력 투자기간에 맞춰 교체 주기를 {rebalance_days}거래일로 고정했습니다."
         )
     elif key == "crash_risk_guard":
+        exits = []
+        if stop_loss_pct is not None:
+            exits.append(f"매수가 대비 {stop_loss_pct:.0%} 하락")
+        if trailing_stop_pct is not None:
+            exits.append(f"보유 중 최고가 대비 {trailing_stop_pct:.0%} 하락")
         item["plain_explanation"] = (
-            f"매수가보다 {stop_loss_pct:.0%} 이상 하락하거나 보유 중 최고가에서 "
-            f"{trailing_stop_pct:.0%} 이상 밀리면 다음 정기 교체일까지 기다리지 않고 나옵니다."
+            " 또는 ".join(exits) + " 시 정기 교체일을 기다리지 않고 청산합니다."
+            if exits else "별도 손절을 적용하지 않으며 전략의 매도·정기 교체 규칙을 따릅니다."
         )
-        item["customization"] = (
-            f"입력 위험성향을 {style}으로 해석해 손절 {stop_loss_pct:.0%}, "
-            f"추적손절 {trailing_stop_pct:.0%}를 적용했습니다."
-        )
+        fixed_label = "고정 손절 없음" if stop_loss_pct is None else f"고정 손절 {stop_loss_pct:.0%}"
+        trailing_label = "추적 손절 없음" if trailing_stop_pct is None else f"추적 손절 {trailing_stop_pct:.0%}"
+        item["customization"] = f"실행 설정: {fixed_label}, {trailing_label}."
     elif key == "portfolio_customization":
         item["plain_explanation"] = (
             f"최대 {max_positions}종목을 동일비중에 가깝게 보유하고 "

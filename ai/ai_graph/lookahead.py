@@ -30,7 +30,7 @@ HOLD = 0
 BUY = 1
 SELL = -1
 
-_ACTION_NAMES = {HOLD: "hold", BUY: "buy", SELL: "sell"}
+_ACTION_NAMES = {HOLD: "hold", BUY: "buy", SELL: "sell", 2: "entry_or_exit"}
 
 
 @dataclass(frozen=True)

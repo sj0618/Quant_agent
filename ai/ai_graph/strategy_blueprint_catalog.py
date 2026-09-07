@@ -37,9 +37,9 @@ class BlueprintParameters(BaseModel):
     threshold: float = Field(ge=-1.0, le=100.0)
     max_positions: int = Field(gt=0, le=1000)
     rebalance_interval_days: int = Field(ge=5, le=63)
-    stop_loss_pct: float = Field(gt=0.0, le=1.0)
-    take_profit_pct: float = Field(gt=0.0, le=10.0)
-    trailing_stop_pct: float = Field(gt=0.0, le=0.75)
+    stop_loss_pct: float | None = Field(gt=0.0, le=1.0)
+    take_profit_pct: float | None = Field(gt=0.0, le=10.0)
+    trailing_stop_pct: float | None = Field(gt=0.0, le=0.75)
 
 
 class BlueprintParameterRule(BaseModel):
@@ -359,7 +359,7 @@ def customize_blueprint_parameters(
     max_positions: int,
     rebalance_interval_days: int,
     stop_loss_pct: float,
-    take_profit_pct: float,
+    take_profit_pct: float | None,
     trailing_stop_pct: float,
     preferred_lookback: int | None = None,
 ) -> BlueprintParameters:
@@ -377,9 +377,9 @@ def customize_blueprint_parameters(
         threshold=template.default_parameters.threshold,
         max_positions=int(bounded("max_positions", max_positions)),
         rebalance_interval_days=int(bounded("rebalance_interval_days", rebalance_interval_days)),
-        stop_loss_pct=bounded("stop_loss_pct", stop_loss_pct),
-        take_profit_pct=bounded("take_profit_pct", take_profit_pct),
-        trailing_stop_pct=bounded("trailing_stop_pct", trailing_stop_pct),
+        stop_loss_pct=None if stop_loss_pct is None else bounded("stop_loss_pct", stop_loss_pct),
+        take_profit_pct=None if take_profit_pct is None else bounded("take_profit_pct", take_profit_pct),
+        trailing_stop_pct=None if trailing_stop_pct is None else bounded("trailing_stop_pct", trailing_stop_pct),
     )
 
 
