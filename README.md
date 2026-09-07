@@ -239,7 +239,7 @@ release 프로필(`AI_RELEASE_PROFILE` 또는 `APP_ENV` 가 `release`/`productio
 `EMAIL_DELIVERY_WORKER_ENABLED=true` 일 때만 이메일 워커를 시작/재시작하고, `false` 이거나
 미설정이면 아무것도 하지 않는다. 값은 backend `Settings`(`.env` 또는 셸 env)로 읽고, 워커 `check` 실패는
 배포를 롤백하지 않고 경고로만 남긴다(`/health`의 `email_*` 필드와 `.run/email-worker.log`로 확인). 두 값 모두 원격 서버의 배포 셸(SSH 로그인 셸)에서
-보여야 하므로 `~/.bashrc` export 나 `~/mvp_sp1/quant-proj/.env` 에 있어야 한다 — 워크플로 자체는
+보여야 하므로 `~/.bashrc` export 나 `~/mvp_sp2/quant-proj/.env` 에 있어야 한다 — 워크플로 자체는
 이 값을 주입하지 않는다.
 
 허용목록(allowlist) 테스트 발송에 필요한 최소 환경변수:

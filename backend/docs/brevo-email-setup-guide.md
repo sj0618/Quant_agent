@@ -70,13 +70,15 @@
 
 ### 넣는 위치 — 서버의 영속 `.env`
 
-값은 프로덕션 서버의 **`~/mvp_sp1/quant-proj/.env`** 파일에 넣습니다.
+값은 프로덕션 서버의 **`~/mvp_sp2/quant-proj/.env`** 파일에 넣습니다.
+(`~/mvp_sp1/quant-proj/.env` 는 `mvp_sp2` 에 `.env` 가 아직 없을 때만 쓰이는 최초 1회 시드입니다 —
+`deploy.yml` 의 `if [ ! -e "$app_dir/.env" ]` 분기. 이미 존재하므로 여기 넣은 값은 읽히지 않습니다.)
 배포 파이프라인은 이 `.env`를 **덮어쓰지 않고**(rsync 제외), Google 인증 키만 교체하며 **`EMAIL_*`·`BREVO_*` 키는 그대로 보존**합니다
 (`.github/workflows/deploy.yml`). 즉 **한 번 넣으면 배포해도 유지**됩니다.
 
 ```bash
 # 서버 접속 후
-cd ~/mvp_sp1/quant-proj
+cd ~/mvp_sp2/quant-proj
 # .env 편집기로 아래 블록을 append (기존 키는 두고 추가)
 ```
 
