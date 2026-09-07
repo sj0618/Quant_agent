@@ -195,3 +195,55 @@ def test_exclusion_marker_disables_the_trigger() -> None:
 
     result = _result_with_runner("거래량 기반 퀀트 전략 말고 RSI로 해줘", _exploding)
     assert result["status"] != "ready"
+
+
+def test_capacity_timeout_still_yields_the_demo_report() -> None:
+    """용량 대기 초과도 시연 화면은 고성과 리포트다.
+
+    이 실패는 _run_analysis_job 바깥(run_job_sync)에서 끝나므로 그 안의 교체를 지나치지
+    못한다. 앞선 잡이 물려 있을 때만 시연이 실패하는 구멍이 남지 않게 고정한다.
+    """
+
+    from ai_graph.analysis_capacity import AnalysisCapacityGate
+    from ai_graph.jobs import run_job_sync
+
+    store = InMemoryAnalysisJobStore()
+    job = store.create_job(TRIGGER)
+    gate = AnalysisCapacityGate(max_concurrency=1, queue_wait_seconds=0.01)
+
+    def _never_called(query: str, trace_id: str | None):  # pragma: no cover - 호출되면 실패
+        raise AssertionError("capacity gate should have rejected before the runner ran")
+
+    with gate.slot():  # 슬롯을 미리 점유해 대기 초과를 강제한다
+        result = run_job_sync(store, job.job_id, _never_called, capacity=gate)
+
+    envelope = result.result
+    assert envelope is not None
+    assert envelope.status.value == "ready"
+    metrics = envelope.user_payload.performance.performance["metrics"]
+    assert metrics["total_return"] == 1.63
+
+
+def test_refinement_words_do_not_disable_the_trigger() -> None:
+    """조건을 다듬는 말은 트리거를 물리지 않는다.
+
+    배제 판정을 처음 넣었을 때 "제외"·"대신"까지 마커로 잡아, 시연자가 그 전략을 원하는
+    문장 넷이 전부 꺼졌다. 배제 표현이 트리거 바로 뒤에 붙은 경우만 물린다.
+    """
+
+    from ai_graph.demo_mock import demo_mock_active
+
+    for query in (
+        "거래량 기반 퀀트 전략, KOSPI 대신 KOSDAQ으로 해줘",
+        "거래량 기반 퀀트 전략 짜줘. 우선주는 제외해줘",
+        "거래량 기반 퀀트 전략 만들어줘. 손절은 -5% 대신 -7%로",
+        "거래량 기반 퀀트 전략 만들어줘. 우선주 빼고",
+        "거래량 기반 퀀트 전략인데 단순 이평선이 아니라 거래량 급증 기준으로",
+    ):
+        assert demo_mock_active(query) is True, query
+
+    for query in (
+        "거래량 기반 퀀트 전략 말고 RSI로 해줘",
+        "거래량 기반 퀀트 전략은 빼고 배당주로",
+    ):
+        assert demo_mock_active(query) is False, query

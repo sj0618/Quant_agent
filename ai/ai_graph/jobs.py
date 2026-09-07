@@ -866,6 +866,22 @@ def run_job_sync(
             capacity.max_concurrency,
             capacity.waiting,
         )
+        # 용량 대기 초과는 _run_analysis_job 바깥에서 끝나므로 그 안의 시연 교체를 지나치지
+        # 못한다. 트리거 문구는 여기서도 같은 결말을 받아야 한다 - 아니면 앞선 잡이 물려
+        # 있을 때만 시연이 실패하는, 재현하기 어려운 구멍이 남는다.
+        from ai_graph.demo_mock import build_demo_mock_envelope, demo_mock_active
+
+        job = store.get_job(job_id)
+        if job is not None and demo_mock_active(job.query):
+            _logger.warning(
+                "demo report substituted for the real result: job_id=%s trace_id=%s outcome=%s",
+                job_id,
+                job.trace_id,
+                "capacity_timeout",
+            )
+            return store.complete_job(
+                job_id, build_demo_mock_envelope(job.query, job.trace_id)
+            )
         return store.fail_job(job_id, CAPACITY_TIMEOUT_MESSAGE)
 
 
