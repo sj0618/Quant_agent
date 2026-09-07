@@ -635,6 +635,21 @@ def _r(
 
 # 56 independent formulas.  Different windows of the same formula are not listed as
 # separate strategies; every row changes the economic signal or confirmation logic.
+# Rows measured in the bottom third of the catalogue in BOTH non-overlapping five-year
+# walk-forward windows on the production evaluator (2016-09-05..2021-09-03 and
+# 2021-09-06..2026-09-04, KOSPI/KOSDAQ top-100 traded universe, 45 folds each; see
+# 진행상황-수익률검증-수정-2026-09-07.md §8). They stay in the catalogue - a rule that
+# lost in two windows is still a legitimate, cited formula a user may ask for by name -
+# but they no longer outrank rows with two-window evidence when a vague request is
+# routed by risk style and horizon alone. Demotion is a priority change, never a
+# performance-fitted parameter change.
+TWO_WINDOW_BOTTOM_THIRD_CAVEAT = (
+    "두 개의 겹치지 않는 5년 구간(2016-09~2021-09, 2021-09~2026-09) walk-forward 실측에서 "
+    "모두 카탈로그 하위 1/3에 들어 기본 추천 우선순위를 낮췄습니다. 지정 요청에는 그대로 실행됩니다."
+)
+TWO_WINDOW_DEMOTION = 40
+
+
 STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
     _r(
         "cross-sectional-12-1-momentum", "momentum", "12-1 횡단면 모멘텀",
@@ -667,7 +682,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         (_c("return_252d", GT, 0.0), _c("relative_strength_126d", GTE, 0.0, universe_rank_pct=.20)),
         (_c("return_63d", LT, 0.0),), "relative_strength_126d", ("return", "relative_strength"),
         ("듀얼", "상대강도", "절대모멘텀", "dual momentum"), ("jegadeesh_titman", "time_series_momentum"),
-        lookback=252, mode="scheduled_rotation", priority=99,
+        lookback=252, mode="scheduled_rotation", priority=59,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
     _r(
         "risk-adjusted-momentum", "momentum", "위험조정 모멘텀",
@@ -755,7 +771,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         (_c("momentum_blend", GTE, 0.0, universe_rank_pct=.20), _c("return_252d", GT, 0.0)),
         (_c("return_21d", LT, 0.0),), "momentum_blend", ("momentum_blend", "return"),
         ("다중기간", "3개월", "6개월", "multi horizon"), ("jegadeesh_titman", "time_series_momentum"),
-        lookback=252, mode="scheduled_rotation", priority=93,
+        lookback=252, mode="scheduled_rotation", priority=53,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
 
     _r(
@@ -877,7 +894,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         "고전적 거래범위 돌파를 자기참조 없이 가장 단순하게 실행하기 위해 씁니다.",
         (_c("close", CROSS_ABOVE, "donchian_high_20"),), (_c("close", LT, "sma_20"),),
         "atr_expansion_20", ("donchian", "sma"), ("donchian", "돌파", "20일고점", "가격돌파"),
-        ("brock_technical_rules",), lookback=20, risk="aggressive", horizon="short", priority=90,
+        ("brock_technical_rules",), lookback=20, risk="aggressive", horizon="short", priority=50,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
     _r(
         "bollinger-volatility-breakout", "breakout", "볼린저 상단 돌파",
@@ -928,7 +946,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         "밴드 지표와 다른 순수 봉 범위 기반 압축 신호를 추가하기 위해 씁니다.",
         (_c("nr7_breakout", GT, .5),), (_c("close", LT, "sma_10"),),
         "atr_expansion_20", ("nr7", "candle_pattern"), ("nr7", "좁은봉", "압축돌파"),
-        ("lean_engine",), lookback=10, risk="aggressive", horizon="short", priority=66,
+        ("lean_engine",), lookback=10, risk="aggressive", horizon="short", priority=26,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
     _r(
         "inside-bar-breakout", "breakout", "Inside Bar 돌파",
@@ -938,7 +957,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         "짧은 가격 압축을 이동평균 없이 OHLC 구조만으로 포착하기 위해 씁니다.",
         (_c("inside_bar_breakout", GT, .5),), (_c("close", LT, "sma_10"),),
         "atr_expansion_20", ("candle_pattern",), ("inside bar", "인사이드바", "봉압축"),
-        ("lean_engine",), lookback=10, risk="aggressive", horizon="short", priority=64,
+        ("lean_engine",), lookback=10, risk="aggressive", horizon="short", priority=24,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
     _r(
         "outside-bar-continuation", "breakout", "Outside Bar 상승 지속",
@@ -948,7 +968,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         "압축 돌파와 반대인 강한 범위 확장형 지속 패턴도 독립 후보로 비교하기 위해 씁니다.",
         (_c("outside_bar_continuation", GT, .5),), (_c("close", LT, "ema_20"),),
         "atr_expansion_20", ("candle_pattern", "range_expansion"), ("outside bar", "아웃사이드바", "범위확장"),
-        ("lean_engine",), lookback=20, risk="aggressive", horizon="short", priority=61,
+        ("lean_engine",), lookback=20, risk="aggressive", horizon="short", priority=21,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
     _r(
         "gap-up-volume-breakout", "breakout", "갭상승·거래량 돌파",
@@ -968,7 +989,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         "크기만 큰 양방향 봉이 아니라 매수세가 끝까지 유지된 확장봉을 찾기 위해 씁니다.",
         (_c("range_expansion_breakout", GT, .5),), (_c("close", LT, "sma_20"),),
         "atr_expansion_20", ("range_expansion", "atr", "donchian"), ("wide range", "상단마감", "확장봉"),
-        ("talib_functions",), lookback=20, risk="aggressive", horizon="short", priority=76,
+        ("talib_functions",), lookback=20, risk="aggressive", horizon="short", priority=36,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
     _r(
         "high-tight-flag-breakout", "breakout", "High Tight Flag",
@@ -1138,7 +1160,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         "활발한 거래가 발생한 날의 가격 방향이 장기적으로 우호적인지 보기 위해 씁니다.",
         (_c("pvi", GT, "pvi_sma_100"),), (_c("pvi", LT, "pvi_sma_100"),),
         "pvi_trend_gap", ("pvi",), ("pvi", "positive volume index", "활발한거래"),
-        ("quantconnect_indicators",), lookback=100, horizon="long", priority=60,
+        ("quantconnect_indicators",), lookback=100, horizon="long", priority=20,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
     _r(
         "negative-volume-index-trend", "volume_flow", "NVI 조용한 참여 추세",
@@ -1158,7 +1181,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         "상승폭뿐 아니라 그 움직임을 만든 거래 힘의 크기를 반영하기 위해 씁니다.",
         (_c("force_index_13", GT, 0.0), _c("close", GT, "ema_20")),
         (_c("force_index_13", LT, 0.0),), "force_index_13", ("force_index", "ema"),
-        ("force index", "포스인덱스", "가격거래힘"), ("quantconnect_indicators",), lookback=20, priority=67,
+        ("force index", "포스인덱스", "가격거래힘"), ("quantconnect_indicators",), lookback=20, priority=27,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
     _r(
         "ease-of-movement-trend", "volume_flow", "Ease of Movement 추세",
@@ -1168,7 +1192,8 @@ STRATEGY_RULES: tuple[StrategyRuleDefinition, ...] = (
         "큰 거래량을 계속 요구하지 않고 가격이 얼마나 쉽게 움직였는지를 보기 위해 씁니다.",
         (_c("eom_14", GT, 0.0), _c("return_20d", GT, 0.0)), (_c("eom_14", LT, 0.0),),
         "eom_14", ("eom", "return"), ("ease of movement", "eom", "이동용이성"),
-        ("quantconnect_indicators",), lookback=20, priority=56,
+        ("quantconnect_indicators",), lookback=20, priority=16,
+        caveat=TWO_WINDOW_BOTTOM_THIRD_CAVEAT,
     ),
     _r(
         "percentage-volume-oscillator", "volume_flow", "PVO 거래 참여 가속",

@@ -38,6 +38,9 @@ FIXED_MIGRATIONS = (
     # after the blueprint catalog gained fundamental-factor rows.  Creates no schema
     # objects, so the catalog-union fingerprint is unchanged.
     "026_reseal_exploration_policy_v2.sql",
+    # Additive INSERT-only re-seal after ten catalogue rows were demoted (two-window
+    # walk-forward evidence, priority-only change).  Creates no schema objects.
+    "027_reseal_exploration_policy_v2_demotion.sql",
 )
 INTERNAL_TRANSACTION_MIGRATION = "014_create_report_email_tables.sql"
 ROLLBACK_RESTORE_MIGRATION = "022_immutable_analysis_results.sql"

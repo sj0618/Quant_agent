@@ -110,7 +110,7 @@ def test_vague_request_seals_policy_and_all_candidate_results() -> None:
     assert len({candidate.catalog_id for candidate in spec.candidates}) == 3
     assert draft.exploration.opposing_hypothesis
     assert _active_policy().policy_hash == (
-        "86971de4ac92b1c6177ef64c3446a2f75881a587e6d07c38fc67329972b1bf1f"
+        "38fa397ee1c971851bc7cd3b8310dc24f3e99058d18577689ddbfcf9d9aaba6f"
     )
 
     strategy = StrategySpec(

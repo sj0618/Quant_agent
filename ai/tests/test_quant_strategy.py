@@ -229,10 +229,13 @@ def test_automatic_request_builds_cited_three_family_tournament() -> None:
         )
         == ("compiled_conditions",) * 3
     )
+    # The balanced/medium menu after the two-window demotion: 12-1 momentum, 52-week
+    # high and risk-adjusted momentum (dual-momentum lost its slot; see
+    # TWO_WINDOW_BOTTOM_THIRD_CAVEAT in strategy_blueprint_rules).
     assert [candidate.parameters.lookback for candidate in candidates if candidate.parameters] == [
         252,
         252,
-        252,
+        126,
     ]
     assert [candidate.parameters.threshold for candidate in candidates if candidate.parameters] == [
         0.0,
@@ -284,11 +287,13 @@ def test_user_risk_and_horizon_customize_the_automatic_candidate_menu() -> None:
     assert aggressive_plan.rebalance_interval_days == 10
     assert aggressive_plan.trailing_stop_pct == 0.30
     assert aggressive_plan.medium_momentum_weight == 0.70
-    assert aggressive_plan.lookbacks == [20, 20, 20]
+    # Donchian was demoted on two-window evidence, so the aggressive/short menu is now
+    # ATR range expansion, Bollinger breakout and Keltner breakout.
+    assert aggressive_plan.lookbacks == [20, 20, 30]
     assert [item.blueprint_id for item in aggressive_plan.generated_strategies] == [
-        "qb-v2-donchian-price-breakout",
         "qb-v2-atr-range-expansion-breakout",
         "qb-v2-bollinger-volatility-breakout",
+        "qb-v2-keltner-atr-breakout",
     ]
     assert len(aggressive_plan.generated_strategies) == 3
     assert len({item.execution_signature for item in aggressive_plan.generated_strategies}) == 3
