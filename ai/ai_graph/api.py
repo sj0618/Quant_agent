@@ -1444,16 +1444,13 @@ def create_app(
 
         production_runtime = _production_runtime()
         deferred_rule_draft_resolver: Callable[[str, str], RuleDraftV1] | None = None
-        # 시연 fallback: 트리거 문구(자연어)는 리서치/프로바이더 게이트를 건너뛰고 바로 job을
-        # 생성해, production 프로파일에서도 목업 결과(run_analysis 훅)가 반드시 실행되게 한다.
-        from ai_graph.demo_mock import demo_mock_active as _demo_mock_active
-
-        demo_bypass = (
-            request.query is not None
-            and not request.is_parse_bound
-            and _demo_mock_active(request.query)
-        )
-        if production_runtime and not demo_bypass:
+        # 시연 트리거 문구도 여기서 예외를 받지 않는다. 예전에는 그래프 자체를 건너뛰었으므로
+        # 관문을 우회해도 무해했지만, 지금은 트리거 문구도 그래프를 실제로 실행한다. 우회하면
+        # V3 리서치 해석 없이 raw 질의만 그래프에 들어가 BacktestCode 단계가 무너진다(운영
+        # 스모크에서 "거래량 기반 퀀트 전략"은 code_generation=failed, 트리거에 걸리지 않는
+        # "거래량 급증 퀀트 전략"은 succeeded로 갈렸다). 리포트 교체는 run_analysis 끝에서만
+        # 일어나며, 여기까지 오는 경로는 일반 질의와 완전히 동일해야 한다.
+        if production_runtime:
             # V2 is a deterministic development fallback for the old exploratory
             # route.  It is not a semantic substitute for an unfamiliar strategy in
             # production: only a V3 web-researched spec or a complete explicit V1
@@ -1580,7 +1577,7 @@ def create_app(
             # it. The resolved execution spec remains the sole graph authority.
             if request.query is None:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
-            if production_runtime and not demo_bypass:
+            if production_runtime:
                 signer = app.state.rule_draft_signer
                 if signer is None:
                     raise HTTPException(
