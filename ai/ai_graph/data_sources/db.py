@@ -164,7 +164,24 @@ MARKET_SCOPE_TERMS = (
     "KOSDAQ 150",
     "코스닥150",
     "코스닥 150",
+    # A bare market name is a market-wide request, not a single name. Without these,
+    # "코스피 전체 종목을 대상으로 백테스트" fell through to the company-name matcher,
+    # which found ㈜대상 (001680) in "대상으로" and ㈜테스 (095610) in "백테스트" and
+    # ran a one-stock backtest that the report called "종목 수 1개".
+    "KOSPI",
+    "KOSDAQ",
+    "코스피",
+    "코스닥",
+    "KRX",
+    "한국거래소",
+    "전종목",
+    "전체 종목",
+    "유니버스",
 )
+# A listed company's name counts as a mention only when it stands as its own word:
+# neither preceded nor followed by Hangul or an alphanumeric character. "백테스트"
+# contains "테스" and "대상으로" contains "대상", and both are listed companies.
+_NAME_BOUNDARY_TEMPLATE = r"(?<![0-9A-Za-z가-힣]){name}(?![0-9A-Za-z가-힣])"
 BROAD_SCREENING_TERMS = (
     "종목을 찾아",
     "종목 찾아",
@@ -1515,7 +1532,9 @@ class PostgresPipelineDataSource:
             name = str(row.get("name") or "")
             if symbol and symbol in query:
                 return symbol.zfill(6)
-            if name and name in query:
+            if name and re.search(
+                _NAME_BOUNDARY_TEMPLATE.format(name=re.escape(name)), query
+            ):
                 return symbol.zfill(6)
         return None
 
