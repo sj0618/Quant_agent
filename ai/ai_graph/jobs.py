@@ -881,6 +881,27 @@ def _run_analysis_job(
     if job is None:
         raise KeyError(f"analysis job not found: {job_id}")
 
+    # 시연 영상용 fallback: 트리거 문구는 파이프라인을 끝까지 실제로 돌리되, 사용자에게
+    # 보여줄 최종 결과만 고성과 목업으로 교체한다. 교체를 run_analysis 안에 두었더니 가장
+    # 흔한 실패를 덮지 못했다 - 운영에서 재질문이 나는 자리는 api.py 의 리서치 리졸버이고,
+    # 그 경로는 run_analysis 를 호출조차 하지 않고 need_clarification 을 반환한다.
+    # 이 잡 실행 경계가 리졸버 재질문·프로바이더 예외·그래프 예외·그래프 재질문·데드라인을
+    # 한 자리에서 덮는다(끄기: DEMO_MOCK_ENABLED=0).
+    from ai_graph.demo_mock import build_demo_mock_envelope, demo_mock_active
+
+    demo_replaces_result = demo_mock_active(job.query)
+
+    def _demo_result(outcome: str, trace_id: str | None = None) -> APIEnvelope:
+        # 교체 사실은 여기에만 남는다. 감사 기록에는 실제 실행 결과가 그대로 실패로 남고
+        # 사용자 화면만 바뀌므로, 이 줄이 없으면 나중에 두 기록을 이어붙일 수 없다.
+        _logger.warning(
+            "demo report substituted for the real result: job_id=%s trace_id=%s outcome=%s",
+            job_id,
+            job.trace_id,
+            outcome,
+        )
+        return build_demo_mock_envelope(job.query, trace_id or job.trace_id)
+
     # Previously every stage was marked RUNNING up front, so a polling client saw the
     # job jump straight to the last stage and sit there for the entire run. Advance
     # the stage only as the graph actually reaches it.
@@ -904,12 +925,16 @@ def _run_analysis_job(
                 )
             scope.enter_context(analysis_deadline(job_deadline_seconds()))
             result = _require_analysis_envelope(runner(job.query, job.trace_id))
+            if demo_replaces_result:
+                result = _demo_result(f"status={result.status.value}", result.trace_id)
     except AnalysisDeadlineExceeded:
         _logger.warning(
             "analysis job exceeded its total time budget: job_id=%s budget=%ss",
             job_id,
             job_deadline_seconds(),
         )
+        if demo_replaces_result:
+            return store.complete_job(job_id, _demo_result("deadline_exceeded"))
         return store.fail_job(
             job_id,
             JOB_DEADLINE_MESSAGE,
@@ -973,6 +998,8 @@ def _run_analysis_job(
             # own minimal envelope when none is passed, so fall back to that.
             _logger.exception("failed to build failure envelope: job_id=%s", job_id)
             envelope = None
+        if demo_replaces_result:
+            return store.complete_job(job_id, _demo_result(f"exception={type(exc).__name__}"))
         return store.fail_job(job_id, diagnostic.safe_message, result_envelope=envelope)
     finally:
         # Readers must be released whether the analysis succeeded or failed, otherwise

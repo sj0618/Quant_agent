@@ -96,82 +96,102 @@ def test_real_pipeline_runs_and_only_the_final_report_is_swapped(
     assert swapped["user_payload"]["performance"]["performance"]["metrics"]["total_return"] == 1.63
 
 
-def test_non_ready_real_run_is_still_replaced(monkeypatch: pytest.MonkeyPatch) -> None:
-    """실제 실행이 재질문으로 끝나도 시연 화면은 고성과 리포트다.
+def _result_with_runner(query: str, runner) -> dict:
+    """주입한 러너로 잡을 끝까지 돌리고 결과를 돌려준다.
 
-    운영 스모크에서 같은 트리거 문구가 5회 중 3회 need_clarification 으로 끝났다.
-    ready 일 때만 교체하면 시연이 확률적으로 실패하므로, 실행 결과와 무관하게 교체한다.
+    잡 실행 경계(_run_analysis_job)를 실제로 통과시키는 것이 요점이다. run_analysis 를
+    monkeypatch 하는 방식은 운영에서 재질문이 실제로 나는 층을 건드리지 못한다 —
+    api.py 의 리서치 리졸버는 run_analysis 를 호출조차 하지 않고 반환하기 때문이다.
     """
 
-    from ai_graph import graph as graph_module
+    store = InMemoryAnalysisJobStore()
+    client = TestClient(create_app(store, analysis_runner=runner))
+    created = client.post(ANALYSIS_JOBS_PATH, json={"query": query})
+    assert created.status_code == 201, created.text
+    fetched = client.get(f"{ANALYSIS_JOBS_PATH}/{created.json()['job_id']}")
+    assert fetched.status_code == 200, fetched.text
+    return fetched.json()["result"]
+
+
+def _clarification_runner(query: str, trace_id: str | None):
+    """api.py 의 리서치 리졸버가 실행 불가 판정을 내렸을 때 내는 것과 같은 응답."""
+
     from ai_graph.schemas import APIEnvelope, EnvelopeStatus, UserPayload
 
-    clarification = APIEnvelope(
+    return APIEnvelope(
         status=EnvelopeStatus.NEED_CLARIFICATION,
-        trace_id="trace-real-run",
-        user_payload=UserPayload(headline="추가 정보가 필요합니다.", message="기간을 알려주세요."),
+        trace_id=trace_id or "trace-real-run",
+        user_payload=UserPayload(
+            headline="추가 확인이 필요합니다.",
+            message="전략 의미는 조사했지만 현재 서버가 같은 규칙으로 백테스트할 수 없습니다.",
+        ),
         debug_ref="real:clarification",
         retryable=False,
     )
 
-    class _StubGraph:
-        def invoke(self, state: dict) -> dict:
-            return {"envelope": clarification.model_dump(mode="json")}
 
-    monkeypatch.setattr(graph_module, "build_graph", lambda **kwargs: _StubGraph())
+def test_resolver_clarification_still_yields_the_demo_report() -> None:
+    """운영에서 실제로 나던 재질문도 시연 화면에서는 고성과 리포트다.
 
-    envelope = graph_module.run_analysis(TRIGGER)
+    운영 스모크 5회 중 3회가 이 표면에서 need_clarification 으로 끝났다. 교체를
+    run_analysis 안에 두었을 때는 이 경로가 덮이지 않았다.
+    """
 
-    assert envelope.status is EnvelopeStatus.READY
-    assert envelope.trace_id == "trace-real-run"
-    metrics = envelope.user_payload.performance.performance["metrics"]
+    result = _result_with_runner(TRIGGER, _clarification_runner)
+
+    assert result["status"] == "ready"
+    metrics = result["user_payload"]["performance"]["performance"]["metrics"]
     assert metrics["total_return"] == 1.63
 
 
-def test_graph_exception_still_yields_the_demo_report(monkeypatch: pytest.MonkeyPatch) -> None:
-    """그래프가 예외로 죽어도 시연 화면은 고성과 리포트다."""
+def test_runner_exception_still_yields_the_demo_report() -> None:
+    """러너가 예외로 죽어도 시연 화면은 고성과 리포트다."""
 
-    from ai_graph import graph as graph_module
-    from ai_graph.schemas import EnvelopeStatus
+    def _exploding(query: str, trace_id: str | None):
+        raise RuntimeError("backtest engine unavailable")
 
-    class _ExplodingGraph:
-        def invoke(self, state: dict) -> dict:
-            raise RuntimeError("backtest engine unavailable")
+    result = _result_with_runner(TRIGGER, _exploding)
 
-    monkeypatch.setattr(graph_module, "build_graph", lambda **kwargs: _ExplodingGraph())
-
-    envelope = graph_module.run_analysis(TRIGGER)
-
-    assert envelope.status is EnvelopeStatus.READY
-    assert envelope.user_payload.performance.performance["metrics"]["total_return"] == 1.63
+    assert result["status"] == "ready"
+    assert result["user_payload"]["performance"]["performance"]["metrics"]["total_return"] == 1.63
 
 
-def test_cancellation_is_not_masked_by_the_demo_report(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cancellation_is_not_masked_by_the_demo_report() -> None:
     """취소는 사용자 의도이므로 목업으로 덮지 않는다."""
 
-    from ai_graph import graph as graph_module
     from ai_graph.progress import AnalysisCancelled
 
-    class _CancelledGraph:
-        def invoke(self, state: dict) -> dict:
-            raise AnalysisCancelled("cancelled by user")
+    def _cancelled(query: str, trace_id: str | None):
+        raise AnalysisCancelled("cancelled by user")
 
-    monkeypatch.setattr(graph_module, "build_graph", lambda **kwargs: _CancelledGraph())
+    result = _result_with_runner(TRIGGER, _cancelled)
 
-    with pytest.raises(AnalysisCancelled):
-        graph_module.run_analysis(TRIGGER)
+    assert result["status"] != "ready"
+    assert result["user_payload"].get("performance") in (None, {})
 
 
-def test_untriggered_failure_is_not_replaced(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_untriggered_failure_is_not_replaced() -> None:
     """트리거 문구가 아니면 실패는 그대로 실패다 — 교체는 트리거 전용이다."""
 
-    from ai_graph import graph as graph_module
+    def _exploding(query: str, trace_id: str | None):
+        raise RuntimeError("backtest engine unavailable")
 
-    class _ExplodingGraph:
-        def invoke(self, state: dict) -> dict:
-            raise RuntimeError("backtest engine unavailable")
+    result = _result_with_runner("RSI 30 이하 매수 전략", _exploding)
 
-    monkeypatch.setattr(graph_module, "build_graph", lambda **kwargs: _ExplodingGraph())
+    assert result["status"] != "ready"
 
-    with pytest.raises(RuntimeError):
-        graph_module.run_analysis("RSI 30 이하 매수 전략")
+
+def test_exclusion_marker_disables_the_trigger() -> None:
+    """트리거 문구 뒤에 배제 표현이 오면 다른 요청이므로 목업을 띄우지 않는다."""
+
+    from ai_graph.demo_mock import demo_mock_active
+
+    assert demo_mock_active("거래량 기반 퀀트 전략 만들어줘") is True
+    assert demo_mock_active("거래량 기반 퀀트 전략 말고 RSI로 해줘") is False
+    assert demo_mock_active("거래량 기반 퀀트 전략은 빼고 배당주로") is False
+
+    def _exploding(query: str, trace_id: str | None):
+        raise RuntimeError("backtest engine unavailable")
+
+    result = _result_with_runner("거래량 기반 퀀트 전략 말고 RSI로 해줘", _exploding)
+    assert result["status"] != "ready"

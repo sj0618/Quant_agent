@@ -80,7 +80,6 @@ from ai_graph.nodes.research_compile import ResearchCompileV2, compile_research
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
 from ai_graph.progress import (
-    AnalysisCancelled,
     raise_if_cancelled,
     raise_if_past_deadline,
     report_activity,
@@ -328,12 +327,6 @@ def run_analysis(
         )
         raise ValueError("user_query must not be empty")
     _record_step(session, "analysis_started", message="analysis execution started")
-    # 시연 영상용 fallback: 트리거 문구는 그래프를 끝까지 실제로 실행하되, 사용자에게 보여줄
-    # 최종 결과만 고성과 목업으로 교체한다. 진행 단계·소요 시간·감사 기록·LLM 호출은 모두
-    # 실제 실행의 것이고, 아래 감사 기록도 교체 전 실제 결과를 남긴다(끄기: DEMO_MOCK_ENABLED=0).
-    from ai_graph.demo_mock import build_demo_mock_envelope, demo_mock_active
-
-    demo_replaces_result = demo_mock_active(query)
     node_error_token = _NODE_ERROR_RECORDED.set(False)
     try:
         state = build_graph(audit_session=session).invoke(
@@ -363,12 +356,6 @@ def run_analysis(
                 message=f"{type(exc).__name__} raised during analysis execution",
             )
         _record_finalization(session, "failed", message="analysis execution failed")
-        # 시연은 실제 실행의 성패와 무관하게 항상 리포트가 떠야 한다. 운영 스모크에서 같은
-        # 트리거 문구가 5회 중 3회 need_clarification 으로 끝났고(V3 리서치가 컴파일러가
-        # 모르는 표현으로 착지), 그때마다 시연 화면에 재질문이 떴다. 감사 기록은 위에서
-        # 실패로 남기고, 화면만 교체한다. 취소는 사용자 의도이므로 그대로 올린다.
-        if demo_replaces_result and not isinstance(exc, AnalysisCancelled):
-            return build_demo_mock_envelope(query, resolved_trace_id)
         raise
     finally:
         _NODE_ERROR_RECORDED.reset(node_error_token)
@@ -380,8 +367,6 @@ def run_analysis(
         message=f"analysis completed with status={status_label}",
         metadata_jsonb={"debug_ref": envelope.debug_ref, "public_trace_id": envelope.trace_id},
     )
-    if demo_replaces_result:
-        envelope = build_demo_mock_envelope(query, envelope.trace_id)
     return envelope
 
 
