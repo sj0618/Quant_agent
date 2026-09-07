@@ -33,6 +33,11 @@ from ai_graph.schemas import CandidateParameters, Condition, ConditionOperator, 
 
 FEATURE_DEFINITION_VERSION = "structured-features.v3"
 
+# A take-profit at or above this is the catalogue's way of saying "no target" (rows ship
+# 10.0 = +1000%). Mirroring those in the action generator would only add signals that can
+# never fire, so the book-keeping exit below ignores them.
+DISABLED_TAKE_PROFIT_PCT = 10.0
+
 
 def unavailable_condition_metrics(
     rows: Sequence[Mapping[str, Any]],
@@ -72,6 +77,46 @@ def unavailable_condition_metrics(
                     f"{canonical_metric(rolling_metric)}:{condition.aggregate}{condition.window}"
                 )
     return sorted(unavailable)
+
+
+def rule_metric_coverage(
+    store: PreparedFeatureStore, strategy_ir: StrategyIR | None
+) -> dict[str, float]:
+    """Share of loaded bars on which each metric this rule compares actually has a value.
+
+    A comparison against a missing operand is a non-match, so a metric the warehouse only
+    carries for part of the window silently switches the rule off for the rest of it -
+    and the user sees a flat, bad backtest with nothing saying why. This measures it so
+    the result can say so. `unavailable_condition_metrics` above only catches a metric
+    that is missing *everywhere*; this is the partial case.
+    """
+
+    if strategy_ir is None or not store.rows:
+        return {}
+    names: list[str] = []
+    for condition in (*strategy_ir.entry_conditions, *strategy_ir.exit_conditions):
+        # Both the operand the rule names and what it is computed from. A derived
+        # operand like `momentum_12_1` expands to inputs the bars always carry, and
+        # reporting only those would say 100% for a metric that needs 252 sessions of
+        # history and is therefore empty for most of a one-year window.
+        names.append(condition.left)
+        if isinstance(condition.right, str):
+            names.append(condition.right)
+        names.extend(_condition_metric_names(condition))
+    if strategy_ir.ranking_metric:
+        names.append(strategy_ir.ranking_metric)
+    total = float(len(store.rows))
+    coverage: dict[str, float] = {}
+    for name in dict.fromkeys(names):
+        try:
+            series = store._metric_series(name)  # noqa: SLF001 - same evaluator contract.
+        except Exception:  # noqa: BLE001 - an unreadable operand is reported as 0 coverage.
+            coverage[canonical_metric(name)] = 0.0
+            continue
+        coverage[canonical_metric(name)] = round(
+            float(np.count_nonzero(np.isfinite(series))) / total, 4
+        )
+    return coverage
 
 
 def _condition_metric_names(condition: Condition) -> tuple[str, ...]:
@@ -132,6 +177,28 @@ class RankedActions:
 
     actions: array
     scores: array
+
+
+def _fixed_risk_exit(
+    close: float, entry_close: float, parameters: CandidateParameters
+) -> bool:
+    """Does the engine's fixed stop / target look hit, measured from the signal close?
+
+    Book-keeping only. The engine remains the one that actually applies the stop, at the
+    price it paid; this mirror exists so the action generator stops counting a stopped
+    name as held, which locked its slot and blocked re-entry for the rest of the run.
+    """
+
+    if entry_close <= 0.0:
+        return False
+    stop_pct = float(parameters.stop_loss_pct or 0.0)
+    if stop_pct > 0.0 and close <= entry_close * (1.0 - stop_pct):
+        return True
+    take_pct = float(parameters.take_profit_pct or 0.0)
+    return (
+        0.0 < take_pct < DISABLED_TAKE_PROFIT_PCT
+        and close >= entry_close * (1.0 + take_pct)
+    )
 
 
 def slot_priority(score: float, ticker: str) -> tuple[float, str]:
@@ -225,6 +292,7 @@ class PreparedFeatureStore:
                 self.previous_index[indices[1:]] = indices[:-1]
         self.previous_index.setflags(write=False)
         self.date_ranges: tuple[tuple[int, int], ...] = self._date_ranges()
+        self._session_numbers: dict[str, int] | None = None
         self._lookback_cache: dict[int, np.ndarray] = {}
         self._metric_cache: dict[str, np.ndarray] = {}
         self._rolling_cache: dict[tuple[str, int, str], np.ndarray] = {}
@@ -265,17 +333,59 @@ class PreparedFeatureStore:
         self,
         strategy_ir: StrategyIR,
         parameters: CandidateParameters,
+        *,
+        reset_session: str | None = None,
+        stop_after_session: str | None = None,
     ) -> array:
-        return self.build_ranked_actions(strategy_ir, parameters).actions
+        return self.build_ranked_actions(
+            strategy_ir,
+            parameters,
+            reset_session=reset_session,
+            stop_after_session=stop_after_session,
+        ).actions
 
     def build_ranked_actions(
         self,
         strategy_ir: StrategyIR,
         parameters: CandidateParameters,
+        *,
+        reset_session: str | None = None,
+        stop_after_session: str | None = None,
     ) -> RankedActions:
+        """Decisions for every row, optionally restarted from cash at one session.
+
+        A walk-forward fold hands the engine a brand new portfolio: it starts the
+        evaluation month in cash with no positions. The generator used to be built on
+        the fold's own context window, so it entered that month believing it already
+        held the names it had bought during train/validation, and its rotation calendar
+        restarted at that window's first bar. Both are fixed by running the generator on
+        the whole window and telling it where the engine's book is reset: `date_number`
+        then counts global sessions - the same absolute rotation dates in every fold,
+        and full warm-up for derived long-window metrics - while `reset_session` clears
+        the position book and forces a rotation there, so the target set is bought on
+        the fold's first tradable session instead of whenever the grid next lands.
+
+        `stop_after_session` only stops the loop early; rows past it are never read, so
+        the fold pays for its own history and nothing after it.
+        """
+
+        reset_index = self._session_index(reset_session)
+        stop_index = self._session_index(stop_after_session)
         if parameters.profile == "compiled_conditions":
-            return self._compiled_actions(strategy_ir, parameters)
-        return self._profile_actions(parameters)
+            return self._compiled_actions(strategy_ir, parameters, reset_index, stop_index)
+        return self._profile_actions(parameters, reset_index, stop_index)
+
+    def _session_index(self, session: str | None) -> int | None:
+        """`date_number` of a session date, i.e. its position in the global calendar."""
+
+        if session is None:
+            return None
+        if self._session_numbers is None:
+            self._session_numbers = {
+                self.dates[start]: number
+                for number, (start, _) in enumerate(self.date_ranges)
+            }
+        return self._session_numbers.get(str(session))
 
     def _empty_scores(self) -> array:
         return array("d", [float("nan")]) * len(self.rows)
@@ -420,16 +530,25 @@ class PreparedFeatureStore:
         self._lookback_cache[lookback] = matrix
         return matrix
 
-    def _profile_actions(self, parameters: CandidateParameters) -> RankedActions:
+    def _profile_actions(
+        self,
+        parameters: CandidateParameters,
+        reset_index: int | None = None,
+        stop_index: int | None = None,
+    ) -> RankedActions:
         features = self.features(parameters.lookback)
         if parameters.profile in AUTOMATIC_TOURNAMENT_PROFILES:
-            return self._rotation_profile_actions(parameters, features)
+            return self._rotation_profile_actions(parameters, features, reset_index, stop_index)
         actions = array("b", [0]) * len(self.rows)
         scores = self._empty_scores()
         states: dict[str, list[float | bool | int]] = {}
         profile = parameters.profile
         threshold = parameters.threshold
-        for start, end in self.date_ranges:
+        for date_index, (start, end) in enumerate(self.date_ranges):
+            if stop_index is not None and date_index > stop_index:
+                break
+            if date_index == reset_index:
+                states.clear()
             evaluations: list[
                 tuple[int, str, float, bool, bool, float, list[float | bool | int]]
             ] = []
@@ -650,6 +769,8 @@ class PreparedFeatureStore:
         self,
         parameters: CandidateParameters,
         features: np.ndarray,
+        reset_index: int | None = None,
+        stop_index: int | None = None,
     ) -> RankedActions:
         """Monthly cross-sectional momentum rotation with past-only features.
 
@@ -667,7 +788,11 @@ class PreparedFeatureStore:
         threshold = parameters.threshold
 
         for date_index, (start, end) in enumerate(self.date_ranges):
-            rotation_day = (
+            if stop_index is not None and date_index > stop_index:
+                break
+            if date_index == reset_index:
+                states.clear()
+            rotation_day = date_index == reset_index or (
                 date_index >= MOMENTUM_LONG_LOOKBACK
                 and (date_index - MOMENTUM_LONG_LOOKBACK) % parameters.rebalance_interval_days == 0
             )
@@ -769,16 +894,18 @@ class PreparedFeatureStore:
                 if in_position and float(state[1]) > 0.0:
                     state[2] = int(state[2]) + 1
                     state[3] = max(float(state[3]), close)
-                    # Trailing stop only, for the same reason as the other two action
-                    # paths: the engine applies the fixed stop and target against the
-                    # price actually paid at the next open, while this loop only knows
-                    # the signal-day close, so keeping both evaluated one stop twice from
-                    # entry prices a bar apart. Dropping the fixed take-profit here also
-                    # matches this profile's own stated intent - the docstring above says
-                    # a fixed percentage systematically cuts the few large winners that
-                    # drive a momentum portfolio.
-                    risk_exit = float(state[3]) > 0.0 and close < float(state[3]) * (
-                        1.0 - parameters.trailing_stop_pct
+                    # Trailing stop plus the engine's fixed stop, mirrored. The engine
+                    # owns the real fixed stop - it knows the price actually paid at the
+                    # next open, this loop only the signal-day close - but leaving it out
+                    # of this book entirely meant a stopped-out name stayed "held" here
+                    # forever: its slot was never refilled and it could never re-enter.
+                    # Measured: buy counts were identical at stop 0.08 / 0.15 / 0.25 /
+                    # 0.99 while total return moved 101 points. Mirroring it releases the
+                    # slot; when the engine already sold, the duplicate order lands as
+                    # `ignored_missing_position` and changes nothing.
+                    risk_exit = _fixed_risk_exit(close, float(state[1]), parameters) or (
+                        float(state[3]) > 0.0
+                        and close < float(state[3]) * (1.0 - parameters.trailing_stop_pct)
                     )
 
                 if in_position and (risk_exit or (rotation_day and ticker not in target)):
@@ -795,6 +922,8 @@ class PreparedFeatureStore:
         self,
         strategy_ir: StrategyIR,
         parameters: CandidateParameters,
+        reset_index: int | None = None,
+        stop_index: int | None = None,
     ) -> RankedActions:
         actions = array("b", [0]) * len(self.rows)
         scores = self._empty_scores()
@@ -813,6 +942,12 @@ class PreparedFeatureStore:
         direction = -1.0 if strategy_ir.ranking_direction == "asc" else 1.0
         fallback_rank = _fallback_rank_metric(rank_conditions)
         for date_number, (start, end) in enumerate(self.date_ranges):
+            if stop_index is not None and date_number > stop_index:
+                break
+            if date_number == reset_index:
+                # The engine starts this fold in cash, so the book must too - otherwise
+                # the generator holds names the engine never bought and issues no entry.
+                states.clear()
             eligible: list[tuple[int, str, float, float]] = []
             exits: list[tuple[int, str]] = []
             for index in range(start, end):
@@ -845,22 +980,21 @@ class PreparedFeatureStore:
                     exit_match = bool(exit_conditions) and all(
                         self._condition_matches(condition, index) for condition in exit_conditions
                     )
-                    # Rule exit and the trailing stop only. The fixed stop-loss and
-                    # take-profit belong to the engine, which is the side that knows the
-                    # price actually paid: this loop records the signal-day close as the
-                    # entry, while the fill happens at the next open plus slippage.
-                    # Testing one stop against two entry prices a bar apart applied it
-                    # twice, from figures that drift by a whole bar's move plus costs.
-                    # The trailing stop stays - it tracks the peak since entry, which the
-                    # engine does not model.
+                    # Rule exit, trailing stop, and a mirror of the engine's fixed stop /
+                    # target. The engine still owns the real fixed stop - it knows the
+                    # price actually paid at the next open, this loop only the signal-day
+                    # close - but omitting it here left a stopped-out name marked as held
+                    # forever, so its slot stayed locked and it could never re-enter.
+                    # See `_fixed_risk_exit`.
                     trailing_stop = float(state[2]) > 0.0 and close < float(state[2]) * (
                         1.0 - parameters.trailing_stop_pct
                     )
+                    fixed_stop = _fixed_risk_exit(close, float(state[1]), parameters)
                     # "N일 뒤 매도": the rule's own time exit, counted in sessions the
                     # position was actually open. It is a real exit, so it stands in
                     # for exit_conditions when the rule states no condition at all.
                     holding_exit = holding_days is not None and float(state[3]) >= holding_days
-                    if exit_match or trailing_stop or holding_exit:
+                    if exit_match or trailing_stop or fixed_stop or holding_exit:
                         exits.append((index, ticker))
 
             for condition in rank_conditions:
@@ -882,9 +1016,9 @@ class PreparedFeatureStore:
                 eligible = [entry for entry in eligible if entry[1] in kept]
 
             eligible.sort(key=lambda item: slot_priority(item[3], item[1]))
-            rotation_day = (
-                strategy_ir.execution_mode == "scheduled_rotation"
-                and date_number % parameters.rebalance_interval_days == 0
+            rotation_day = strategy_ir.execution_mode == "scheduled_rotation" and (
+                date_number == reset_index
+                or date_number % parameters.rebalance_interval_days == 0
             )
             target = {
                 item[1] for item in eligible[: parameters.max_positions]
@@ -903,13 +1037,15 @@ class PreparedFeatureStore:
                 states[ticker] = [False, 0.0, 0.0, 0.0]
                 exited.add(ticker)
             held = sum(1 for state in states.values() if bool(state[0]))
+            # Rotation replaces the portfolio only on a rebalance day - but between them
+            # the exits kept running, so a slot freed by a stop or a rule exit sat in
+            # cash until the next grid date (measured: 23% of all slot-sessions idle,
+            # 21-day grid). Off-grid days now backfill from the same eligible ranking;
+            # the loop below stops at `max_positions`, so nothing already held is
+            # replaced and the target set still only changes on a rotation day.
             entries = (
-                [item for item in eligible if item[1] in target]
-                if strategy_ir.execution_mode == "scheduled_rotation"
-                else eligible
+                [item for item in eligible if item[1] in target] if rotation_day else eligible
             )
-            if strategy_ir.execution_mode == "scheduled_rotation" and not rotation_day:
-                entries = []
             for index, ticker, close, score in entries:
                 if held >= parameters.max_positions:
                     break

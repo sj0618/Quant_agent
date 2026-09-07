@@ -171,7 +171,16 @@ def test_without_holding_days_the_same_rule_never_sells() -> None:
     assert sells == []
 
 
-def test_entries_are_only_taken_on_rebalance_dates() -> None:
+def test_an_empty_slot_is_filled_before_the_next_rebalance_date() -> None:
+    """Rotation replaces holdings on a schedule; it does not idle an empty slot.
+
+    Entries used to be blocked on every non-rebalance session, so a portfolio that had
+    nothing to hold - at the start of a walk-forward fold, or after a stop - sat in cash
+    until the grid came round. Measured on the five-year universe that was 23% of all
+    slot-sessions on a 21-day grid. Replacement is still schedule-only: the loop stops at
+    `max_positions`, so a name already held is never swapped off-schedule.
+    """
+
     # Not eligible until session 3; the next rotation date is 5.
     rows = _rows([90.0] * 3 + [110.0] * 17)
     store = PreparedFeatureStore(rows)
@@ -182,7 +191,7 @@ def test_entries_are_only_taken_on_rebalance_dates() -> None:
     )
 
     buys, sells = _signal_dates(rows, actions)
-    assert buys == [5]
+    assert buys == [3]
     assert sells == []
 
 
@@ -192,7 +201,10 @@ def test_a_holding_that_stops_matching_is_exited_on_the_next_rebalance_date() ->
 
     actions = store.build_actions(
         _ir(execution_mode="scheduled_rotation"),
-        _parameters(rebalance_interval_days=5),
+        # The fixed stop is mirrored into this book now, and a 110 -> 90 drop is 18%, so
+        # it would fire at session 7 and hide the rebalance-date exit this pins. Widen it
+        # to isolate the schedule.
+        _parameters(rebalance_interval_days=5, stop_loss_pct=0.5),
     )
 
     buys, sells = _signal_dates(rows, actions)
@@ -211,9 +223,10 @@ def test_holding_days_and_rebalancing_compose() -> None:
     )
 
     buys, sells = _signal_dates(rows, actions)
-    # Sold three sessions after each entry, re-bought only on the next rotation date.
-    assert buys == [0, 5, 10, 15]
-    assert sells == [3, 8, 13, 18]
+    # Sold three sessions after each entry, re-bought on the next session that has an
+    # empty slot and something eligible to put in it - not held in cash until the grid.
+    assert buys == [0, 4, 8, 12, 16]
+    assert sells == [3, 7, 11, 15, 19]
 
 
 def test_the_audit_descriptor_states_the_same_timing_the_evaluator_runs() -> None:

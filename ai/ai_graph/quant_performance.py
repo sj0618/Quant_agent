@@ -195,11 +195,7 @@ def build_public_backtest_performance(
 
     result = CandidateBacktestResult.model_validate(backtest)
     walk_forward = result.walk_forward
-    metrics = (
-        walk_forward.aggregate_metrics
-        if walk_forward is not None and walk_forward.status == "ready"
-        else result.selected_candidate.metrics
-    )
+    metrics = _headline_metrics(result)
     if metrics is None:
         return None
 
@@ -483,12 +479,28 @@ def _public_metrics(metrics, engine_summary: Mapping[str, Any]):
     }
     return metrics.model_copy(update=updates) if updates else metrics
 
+def _headline_metrics(result: CandidateBacktestResult):
+    """The one metric set the whole report speaks with.
+
+    Under walk-forward the headline came from the rolling aggregate while the metric
+    cards came from `selected_candidate.metrics` - the last fold's *selection* window
+    (12 months train + 3 validation). One report therefore published total return as
+    both -49.4% and -13.5%, and Sharpe as both -1.20 and -0.64. Whatever the headline
+    reports, the cards now break down the same run.
+    """
+
+    walk_forward = result.walk_forward
+    if walk_forward is not None and walk_forward.status == "ready":
+        return walk_forward.aggregate_metrics
+    return result.selected_candidate.metrics
+
+
 def _build_public_metric_details(
     result: CandidateBacktestResult,
     *,
     benchmark: BacktestBenchmark,
 ) -> list[PublicMetricDetail]:
-    metrics = result.selected_candidate.metrics
+    metrics = _headline_metrics(result)
     if metrics is None:
         return []
 
