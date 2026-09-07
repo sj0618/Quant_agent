@@ -311,6 +311,9 @@ jobs:
           case "$token_probe" in
             *invalid_client*)
               echo "::error::Google rejected the credentials with invalid_client. Google says: ${google_reason:-<no description returned>}" >&2
+              # Fingerprints, not values: enough to tell which stored value is in play and
+              # whether it changed between runs, without putting either one in the log.
+              echo "::error::stored value fingerprints (sha256, first 12) - client_id=$(printf '%s' "$GOOGLE_CLIENT_ID" | sha256sum | cut -c1-12) secret=$(printf '%s' "$GOOGLE_CLIENT_SECRET" | sha256sum | cut -c1-12)" >&2
               echo "::error::\"The OAuth client was not found\" means GOOGLE_CLIENT_ID is wrong; \"The provided client secret is invalid\" means GOOGLE_CLIENT_SECRET does not belong to that client. Both values must come from the same OAuth client in the Google Cloud console." >&2
               exit 1
               ;;
