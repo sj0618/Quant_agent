@@ -76,7 +76,7 @@ from ai_graph.nodes.condition_compiler import (
     untranslatable_conditions,
 )
 from ai_graph.nodes.report import report_node
-from ai_graph.nodes.research_compile import compile_research
+from ai_graph.nodes.research_compile import ResearchCompileV2, compile_research
 from ai_graph.nodes.risk_manager import risk_manager_node
 from ai_graph.nodes.signal import signal_node
 from ai_graph.progress import (
@@ -1659,6 +1659,9 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
             }
             for source in sealed_spec.sources
         ]
+    elif isinstance(sealed_spec, ExplorationExecutionSpecV2):
+        research_compile = _exploration_research_compile(sealed_spec).model_dump()
+        research_sources = _exploration_research_sources(sealed_spec)
     else:
         research_compile = compile_research(
             query=str(state.get("user_query") or ""),
@@ -1672,6 +1675,63 @@ def research_node(state: QuantAgentState) -> dict[str, Any]:
         "research_compile": research_compile,
         "research_sources": research_sources,
     }
+
+
+def _exploration_templates(spec: ExplorationExecutionSpecV2) -> list[Any]:
+    templates_by_id = {item.catalog_id: item for item in strategy_blueprint_catalog()}
+    return [
+        templates_by_id[candidate.catalog_id]
+        for candidate in spec.candidates
+        if candidate.catalog_id in templates_by_id
+    ]
+
+
+def _exploration_research_compile(spec: ExplorationExecutionSpecV2) -> ResearchCompileV2:
+    """The reader-facing interpretation of a sealed catalogue run, without a model call.
+
+    The generic explanatory call (`compile_research`, 700 output tokens) was made for
+    the exploration spec as well, and three catalogue formulas overflowed it - AOAI
+    answered `response.incomplete: max_output_tokens` and the whole job failed at
+    code_generation before a single bar was read (production job_b524f001d0fa).
+    Every catalogue row already carries a source-backed explanation, a formula and its
+    caveats, so nothing here needs a model; the deterministic text says as much.
+    """
+
+    templates = _exploration_templates(spec)
+    titles = ", ".join(item.title for item in templates) or "사전등록 후보"
+    interpretation = (
+        f"사전등록 후보 {len(templates)}개({titles})를 같은 PIT 데이터·비용·검증 구간에서 "
+        "비교합니다. 후보와 정책은 성과를 보기 전에 봉인됐고, 성과를 본 뒤 후보를 바꾸지 않습니다."
+    )
+    supporting = [f"{item.title}: {item.why_used}" for item in templates][:4]
+    counterpoints = [f"{item.title}: {item.caveats[0]}" for item in templates if item.caveats][:4]
+    return ResearchCompileV2(
+        provider="deterministic",
+        interpretation=interpretation[:600],
+        supporting_rationale=supporting or ["후보는 출처가 있는 카탈로그 정의에서 그대로 가져옵니다."],
+        counterpoints=counterpoints
+        or ["어느 후보도 충분한 미래 구간 근거를 만들지 못할 수 있습니다."],
+        limitations=[
+            "과거 성과는 미래 수익이나 원금 보전을 보장하지 않습니다.",
+            "설명은 카탈로그의 출처 기반 정의에서 가져왔고 이 실행에서는 AI 해석 호출을 하지 않았습니다.",
+            "성과 수치와 비용은 PostgreSQL 백테스트 결과가 준비된 뒤에만 표시합니다.",
+        ],
+    )
+
+
+def _exploration_research_sources(spec: ExplorationExecutionSpecV2) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for item in _exploration_templates(spec):
+        for url in item.source_refs:
+            sources.append(
+                {
+                    "title": item.title,
+                    "url": url,
+                    "claim": item.plain_explanation,
+                    "limitation": item.caveats[0] if item.caveats else "",
+                }
+            )
+    return sources
 
 
 def envelope_node(state: QuantAgentState) -> dict[str, Any]:

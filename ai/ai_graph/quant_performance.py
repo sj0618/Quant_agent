@@ -531,7 +531,17 @@ def _build_public_metric_details(
         **(public_availability if isinstance(public_availability, Mapping) else {}),
         **_undefined_metric_availability(_summary_warning_list(summary)),
     }
-    values["benchmark_return"] = benchmark.total_return if benchmark.is_available else None
+    # The official TR index is absent from this warehouse, so the acceptance floor judges
+    # against the equal-weight PIT-universe proxy. The cards used to blank every
+    # benchmark-relative number the moment the official series was missing, which hid
+    # the very comparison the verdict was made on. When the proxy was the judge, show
+    # the proxy figures and say so on each card; the official-unavailable disclosure
+    # stays on the benchmark block itself.
+    proxy_return = _acceptance_proxy_return(result, metrics)
+    benchmark_is_proxy = not benchmark.is_available and proxy_return is not None
+    values["benchmark_return"] = (
+        benchmark.total_return if benchmark.is_available else proxy_return
+    )
     if _is_numeric_metric(values["total_return"]) and _is_numeric_metric(
         values["benchmark_return"]
     ):
@@ -545,11 +555,16 @@ def _build_public_metric_details(
         if isinstance(detail, Mapping) and isinstance(detail.get("unavailable_reason"), str):
             reasons[str(key)] = str(detail["unavailable_reason"])
     benchmark_reason = reasons.get("benchmark_comparison")
-    if "out_sample_sharpe" not in reasons:
+    # A ready walk-forward aggregate *is* the out-of-sample estimate; the
+    # insufficient-sample default only applies when there is no such aggregate.
+    walk_forward_ready = (
+        result.walk_forward is not None and result.walk_forward.status == "ready"
+    )
+    if "out_sample_sharpe" not in reasons and not walk_forward_ready:
         reasons["out_sample_sharpe"] = INSUFFICIENT_WALK_FORWARD_SAMPLE
-    if "out_sample_excess_return" not in reasons:
+    if "out_sample_excess_return" not in reasons and not walk_forward_ready:
         reasons["out_sample_excess_return"] = INSUFFICIENT_WALK_FORWARD_SAMPLE
-    if not benchmark.is_available:
+    if not benchmark.is_available and not benchmark_is_proxy:
         benchmark_reason = (
             benchmark_reason
             or benchmark.unavailable_reason
@@ -579,9 +594,54 @@ def _build_public_metric_details(
         if key in values:
             values[key] = None
     return [
-        _metric_detail(key=key, value=values.get(key), unavailable_reason=reasons.get(key))
+        _metric_detail(
+            key=key,
+            value=values.get(key),
+            unavailable_reason=reasons.get(key),
+            caution_suffix=(
+                PROXY_BENCHMARK_CAUTION
+                if benchmark_is_proxy and key in BENCHMARK_RELATIVE_METRIC_KEYS
+                else None
+            ),
+        )
         for key in PUBLIC_METRIC_KEYS
     ]
+
+
+BENCHMARK_RELATIVE_METRIC_KEYS = frozenset(
+    {
+        "benchmark_return",
+        "excess_return",
+        "out_sample_excess_return",
+        "benchmark_period_win_rate",
+        "benchmark_period_loss_rate",
+        "out_sample_benchmark_period_loss_rate",
+    }
+)
+PROXY_BENCHMARK_CAUTION = (
+    " 비교 기준은 공식 KOSPI/KOSDAQ 지수가 아니라 같은 백테스트 유니버스의 동일가중 "
+    "매수-보유 프록시입니다."
+)
+
+
+def _acceptance_proxy_return(result: CandidateBacktestResult, metrics) -> float | None:
+    """The proxy benchmark return the acceptance floor judged against, or None.
+
+    Prefers the walk-forward aggregate's benchmark return (measured over exactly the
+    evaluated sessions) and falls back to the whole-window auxiliary figure the engine
+    published as used for acceptance.
+    """
+
+    payload = result.backtest_payload if isinstance(result.backtest_payload, Mapping) else {}
+    benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
+    auxiliary = benchmark.get("auxiliary") if isinstance(benchmark, Mapping) else None
+    if not isinstance(auxiliary, Mapping) or not auxiliary.get("used_for_acceptance"):
+        return None
+    aggregate = getattr(metrics, "out_sample_benchmark_return", None)
+    if _is_numeric_metric(aggregate):
+        return float(aggregate)
+    published = auxiliary.get("return")
+    return float(published) if _is_numeric_metric(published) else None
 
 
 def _metric_detail(
@@ -589,6 +649,7 @@ def _metric_detail(
     value: float | None,
     *,
     unavailable_reason: str | None = None,
+    caution_suffix: str | None = None,
 ) -> PublicMetricDetail:
     explanation = metric_explanation(key)
     registry = metric_registry_provenance(key)
@@ -604,7 +665,7 @@ def _metric_detail(
         else (unavailable_reason or explanation.get("unavailable_reason")),
         plain_explanation=explanation["plain_explanation"],
         why_used=explanation["why_used"],
-        caution=explanation["caution"],
+        caution=explanation["caution"] + (caution_suffix or ""),
         source_refs=list(explanation.get("source_refs", [])),
         registry_version=registry["registry_version"],
         provenance=PublicMetricProvenance(

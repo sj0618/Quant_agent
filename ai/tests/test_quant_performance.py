@@ -785,3 +785,54 @@ def test_stale_source_hides_public_performance_numbers_with_freshness_facts() ->
     assert projection.safe_facts["freshness_as_of"] == "2026-08-18"
     assert projection.safe_facts["freshness_reason"] == "price source exceeded the configured freshness window"
     assert "performance" not in projection.model_dump(mode="json")
+
+
+def test_proxy_judged_benchmark_figures_stay_on_the_cards_with_a_label() -> None:
+    """When the official index is absent and the floor judged against the equal-weight
+    proxy, the benchmark-relative cards must show the proxy figures with a caution
+    rather than blank out - the production smoke job carried excess return -20.9% in
+    `metrics` while every benchmark card said `official_benchmark_source_unavailable`.
+    """
+
+    payload = _build_payload(
+        BacktestMetrics(
+            sharpe_ratio=0.63,
+            max_drawdown=-0.23,
+            win_rate=0.57,
+            total_return=0.5748,
+            in_sample_sharpe=0.0,
+            out_sample_sharpe=0.63,
+            degradation=0.0,
+            out_sample_excess_return=-0.2087,
+            out_sample_benchmark_return=0.7835,
+            out_sample_benchmark_period_loss_rate=0.5714,
+        )
+    )
+    payload["backtest_payload"] = {
+        "benchmark": {
+            "primary": {
+                "available": False,
+                "official_series_and_lagged_weights": False,
+                "return": None,
+                "unavailable_reason": "official_benchmark_source_unavailable",
+            },
+            "auxiliary": {"return": 0.79, "used_for_acceptance": True},
+        }
+    }
+
+    performance = build_public_backtest_performance(
+        payload,
+        price_rows=_rows(datetime(2024, 1, 1), trading_days=252),
+        pipeline_data_source={"source": "postgres"},
+    )
+
+    assert performance is not None
+    assert performance.benchmark.is_available is False
+    assert performance.benchmark.unavailable_reason == "official_benchmark_source_unavailable"
+    details = {item.key: item for item in performance.metric_details}
+    assert details["benchmark_return"].value == 0.7835
+    assert details["excess_return"].value == round(0.5748 - 0.7835, 6)
+    assert details["out_sample_benchmark_period_loss_rate"].value == 0.5714
+    assert "동일가중" in details["benchmark_return"].caution
+    assert "동일가중" in details["excess_return"].caution
+    assert "동일가중" not in details["sharpe_ratio"].caution
