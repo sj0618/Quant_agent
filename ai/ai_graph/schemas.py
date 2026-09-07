@@ -557,6 +557,17 @@ class ResearchCandidateV3(BaseModel):
     # Re-evaluate the entry rule only every N sessions from the start of the window;
     # holdings that no longer satisfy it are exited on the same dates. 21 ~ one month.
     rebalance_interval_days: int | None = Field(default=None, ge=5, le=63)
+    # Risk controls for this rule, sealed with it and before any performance exists.
+    # Every researched strategy used to run at stop 8% / 10 names / take-profit 45%
+    # whatever it traded, and measured on five years of PIT KRX data that single
+    # setting is wrong for half of them: loosening the stop moved an RSI
+    # mean-reversion rule from -38.3% to +63.1% while making a momentum rotation
+    # rule worse. Left unset, `graph._research_risk_policy` applies a family default
+    # inferred from the entry metrics and discloses it.
+    stop_loss_pct: float | None = Field(default=None, ge=0.05, le=1.0)
+    trailing_stop_pct: float | None = Field(default=None, ge=0.05, le=0.75)
+    take_profit_pct: float | None = Field(default=None, ge=0.05, le=10.0)
+    max_positions: int | None = Field(default=None, ge=1, le=50)
     required_metrics: list[str] = Field(min_length=1, max_length=20)
     assumptions: list[str] = Field(min_length=1, max_length=10)
     ai_assumptions: list[str] = Field(default_factory=list, max_length=10)

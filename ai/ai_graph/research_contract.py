@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ai_graph.exploration_policy import (
     ActiveExplorationPolicyV2,
+    ExplorationPolicyUnavailableError,
     select_exploration_templates,
 )
 from ai_graph.nodes.strategy_research import StrategyResearchError, research_strategy_execution_spec
@@ -528,6 +529,24 @@ def build_rule_draft(
     research_requested = _research_resolution_enabled(use_llm)
     request_mode = classify_strategy_request(query)
     research_error: StrategyResearchError | None = None
+    # A vague ("automatic") request is answered by the published catalogue tournament
+    # when one is available, not by a single rule an LLM invented for this one query.
+    # This branch used to sit *after* the V3 research call, so with a live researcher
+    # configured the sealed exploration draft was unreachable and every production
+    # result came back ``selection_mode=user_defined, candidates_evaluated=1``. A
+    # missing or stale policy still falls through to research below rather than
+    # failing the request.
+    if request_mode == "automatic" and exploration_policy is not None:
+        exploration_draft = _exploration_draft_or_none(
+            query=query,
+            user_id=user_id,
+            signer=signer,
+            policy_record=exploration_policy,
+            now=now,
+        )
+        if exploration_draft is not None:
+            return exploration_draft
+        exploration_policy = None
     # A live V3 researcher is the semantic authority for every request that is not
     # already an explicit, compiler-shaped rule.  Previously a named strategy first
     # paid for the legacy ``strategy_parse`` model call, received an inevitably thin
@@ -566,18 +585,6 @@ def build_rule_draft(
             # The public contract must fail closed as a review response, never leak a
             # provider/schema exception that callers turn into a 500 or an admission.
             research_error = exc
-    if (
-        request_mode == "automatic"
-        and exploration_policy is not None
-        and research_error is None
-    ):
-        return _build_exploration_draft(
-            query=query,
-            user_id=user_id,
-            signer=signer,
-            policy_record=exploration_policy,
-            now=now,
-        )
 
     if research_error is not None:
         parsed = _no_run_parse(research_error)
@@ -645,13 +652,15 @@ def build_rule_draft(
         or not parsed.entry_conditions
         or not parsed.exit_conditions
     ):
-        return _build_exploration_draft(
+        exploration_draft = _exploration_draft_or_none(
             query=query,
             user_id=user_id,
             signer=signer,
             policy_record=exploration_policy,
             now=now,
         )
+        if exploration_draft is not None:
+            return exploration_draft
     rule = _canonical_rule_from_parse(parsed)
     retry_only = (
         research_error is not None
@@ -727,6 +736,32 @@ def canonical_rule_execution_query(rule: ExecutionSpecV1OrV2) -> str:
         for condition in [*rule.entry_conditions, *rule.exit_conditions]
     ]
     return f"KRX 일봉 조건식: {'; '.join(clauses)}"
+
+
+def _exploration_draft_or_none(
+    *,
+    query: str,
+    user_id: str,
+    signer: RuleDraftSigner,
+    policy_record: ActiveExplorationPolicyV2,
+    now: datetime | None,
+) -> RuleDraftV1 | None:
+    """The sealed catalogue draft, or ``None`` when this policy cannot authorize one.
+
+    A published policy whose catalogue fingerprint has drifted must not take the
+    request down with it: the caller continues on its research/parse path instead.
+    """
+
+    try:
+        return _build_exploration_draft(
+            query=query,
+            user_id=user_id,
+            signer=signer,
+            policy_record=policy_record,
+            now=now,
+        )
+    except ExplorationPolicyUnavailableError:
+        return None
 
 
 def _build_exploration_draft(

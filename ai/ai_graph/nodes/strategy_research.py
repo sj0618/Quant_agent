@@ -49,8 +49,8 @@ from ai_graph.schemas import (
 
 _logger = logging.getLogger(__name__)
 
-STRATEGY_RESEARCH_PROMPT_VERSION = "v9"
-STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v9"
+STRATEGY_RESEARCH_PROMPT_VERSION = "v10"
+STRATEGY_RESEARCH_SCHEMA_NAME = "quantagent.strategy_research.v10"
 # The live provider reached the former 5,000-token cap while emitting the required
 # evidence-rich JSON, leaving an otherwise successful response truncated mid-object.
 # This lane needs room for its web-grounded sources and structured contract; the
@@ -133,6 +133,18 @@ whose only exit is time may return an empty ``exit_conditions`` array, as long a
 to choose a concrete holding period, leave ``exit_conditions`` empty, and record the
 choice and reason in ``ai_assumptions``. A missing exit is never a reason to return no
 candidate.
+
+Risk controls are part of the strategy, not a platform default. Set ``stop_loss_pct``
+(0.05--1.0), ``trailing_stop_pct`` (0.05--0.75), ``take_profit_pct`` (0.05--10.0, where
+10.0 means effectively no profit target) and ``max_positions`` (1--50) to what the
+researched family actually calls for, and give a one-line reason in ``ai_assumptions``.
+Evidence to weigh: a tight stop protects a momentum or trend rule from a crash but
+takes a mean-reversion, value, quality or low-volatility rule out of exactly the
+drawdown its thesis is buying; a profit target truncates the right tail a trend rule
+lives on; concentration helps momentum and hurts slow fundamental rules. Choose these
+before any performance is read and never tune them to observed returns. Omit a field
+only when the research gives you no basis for it: an omitted field takes a disclosed
+default inferred from the entry metrics.
 
 For every candidate, cite one or more sources you actually used. Candidate conditions
 are a historical research rule: entry must be non-empty, and exit must be non-empty
@@ -231,6 +243,11 @@ class _CandidateDraft(BaseModel):
     exit_conditions: list[Condition] = Field(default_factory=list, max_length=6)
     holding_days: int | None = Field(default=None, ge=1, le=250)
     rebalance_interval_days: int | None = Field(default=None, ge=5, le=63)
+    # See ``ResearchCandidateV3``: unset means "apply the family default and disclose it".
+    stop_loss_pct: float | None = Field(default=None, ge=0.05, le=1.0)
+    trailing_stop_pct: float | None = Field(default=None, ge=0.05, le=0.75)
+    take_profit_pct: float | None = Field(default=None, ge=0.05, le=10.0)
+    max_positions: int | None = Field(default=None, ge=1, le=50)
     required_metrics: list[str] = Field(min_length=1, max_length=20)
     assumptions: list[str] = Field(min_length=1, max_length=10)
     ai_assumptions: list[str] = Field(default_factory=list, max_length=10)
@@ -374,6 +391,10 @@ _STRATEGY_FIELDS = (
     "exit_conditions",
     "holding_days",
     "rebalance_interval_days",
+    "stop_loss_pct",
+    "trailing_stop_pct",
+    "take_profit_pct",
+    "max_positions",
     "required_metrics",
     "backtest_years",
     "sector",
@@ -868,6 +889,10 @@ def _request(
             "exit_conditions",
             "holding_days",
             "rebalance_interval_days",
+            "stop_loss_pct",
+            "trailing_stop_pct",
+            "take_profit_pct",
+            "max_positions",
             "required_metrics",
             "assumptions",
             "ai_assumptions",
@@ -954,7 +979,8 @@ def _repair_request(
             "This is the one permitted repair attempt. Correct only what "
             "previous_validation_failure names and return the complete structured "
             "result again. Unless that failure is about them, keep entry_conditions, "
-            "exit_conditions, holding_days, rebalance_interval_days, required_metrics, "
+            "exit_conditions, holding_days, rebalance_interval_days, stop_loss_pct, "
+            "trailing_stop_pct, take_profit_pct, max_positions, required_metrics, "
             "backtest_years and sector exactly as first researched: do not add window, "
             "aggregate, scale or other qualifiers to a condition that did not need "
             "them, and do not substitute a different strategy. Use only the supplied "

@@ -8,7 +8,7 @@ import pickle
 import sys
 import time
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date
@@ -22,7 +22,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
-from ai_graph.nodes.backtest_features import FEATURE_DEFINITION_VERSION, PreparedFeatureStore
+from ai_graph.nodes.backtest_features import (
+    FEATURE_DEFINITION_VERSION,
+    PreparedFeatureStore,
+    rule_metric_coverage,
+)
 from ai_graph.nodes.position_sizing import (
     available_ticker_count as _shared_available_ticker_count,
 )
@@ -67,7 +71,12 @@ METRIC_ROUND_DIGITS = 6
 MIN_RETURNS_FOR_SPLIT = 4
 PRIMARY_BENCHMARK_LABEL = "공식 KOSPI/KOSDAQ TR"
 PRIMARY_BENCHMARK_METHOD = "official_kospi_kosdaq_total_return"
-AUXILIARY_BENCHMARK_LABEL = "동일가중 매수-보유 보조 프록시"
+# Named so a reader can never mistake it for the market. It is the same PIT universe
+# the strategy trades, held equal-weight - beating it is not beating KOSPI/KOSDAQ.
+AUXILIARY_BENCHMARK_LABEL = "유니버스 동일가중 프록시 — 공식 지수 아님"
+# Appended to every acceptance reason that was judged against the proxy, so the
+# verdict never reads as an official index comparison.
+PROXY_BENCHMARK_JUDGEMENT_SUFFIX = f"({AUXILIARY_BENCHMARK_LABEL} 기준)"
 AUXILIARY_BENCHMARK_METHOD = "fixed_universe_equal_weight_buy_and_hold"
 AUXILIARY_BENCHMARK_WARNING = (
     "공식 KOSPI/KOSDAQ 총수익률(TR) 시계열과 월초 목표 비중이 입력되지 않아 "
@@ -109,6 +118,16 @@ WALK_FORWARD_MIN_SESSIONS = WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS
 INSUFFICIENT_WALK_FORWARD_SAMPLE = "INSUFFICIENT_WALK_FORWARD_SAMPLE"
 READY_WALK_FORWARD = "READY_WALK_FORWARD"
 UNSAFE_WALK_FORWARD_CANDIDATE = "UNSAFE_WALK_FORWARD_CANDIDATE"
+# Walk-forward selects inside every fold, so there is no one in-sample block to compare
+# the hold-out against. The aggregate pins both at 0.0 to keep the deflation arithmetic
+# well defined; publishing that 0.0 as a measurement would claim zero overfitting decay.
+WALK_FORWARD_HAS_NO_IN_SAMPLE_BLOCK = "walk_forward_has_no_single_in_sample_block"
+# A win rate is a statistic over closed round trips. With none closed there is nothing to
+# average, and "0%" would read as "every trade lost".
+NO_CLOSED_TRADE_WIN_RATE = "no_closed_trade_in_evaluation_window"
+# A rule can only fire on sessions where the metrics it compares actually have a value.
+# Below this share the result mostly measures the gap in the data, so it is disclosed.
+MIN_DISCLOSED_METRIC_COVERAGE = 0.50
 # A quarter is short enough to expose regime-specific wins/losses instead of letting a
 # ten-year total hide them. A strategy may win by a lot in some blocks, but losing at
 # least half of these fixed, non-overlapping blocks is still an automatic failure.
@@ -718,7 +737,6 @@ class _FoldEngineTask:
     """
 
     candidate: Mapping[str, Any]
-    context_sessions: tuple[str, ...]
     engine_sessions: tuple[str, ...]
     tradable_sessions: tuple[str, ...]
     targets: tuple[str, ...] = ()
@@ -730,21 +748,28 @@ class _FoldEngineOutcome:
     returns: dict[str, float] | None = None
     fills: tuple[dict[str, Any], ...] = ()
     ledger: dict[str, Any] | None = None
+    # Round trips the engine actually closed inside this fold's evaluation month, as
+    # (net_pnl,). The aggregate win rate is a trade statistic and cannot be recovered
+    # from the order audit, which carries costs but no realized PnL.
+    closed_trade_pnl: tuple[float, ...] = ()
 
 
 class _FoldPrepCache:
-    """Row slices and engine prep for the fold and pass currently being evaluated.
+    """Engine rows and engine prep for the fold and pass currently being evaluated.
 
     Every task in a batch is the same fold and the same pass, so one entry holds all the
-    reuse there is; a second would only pin another fold's feature store, and this runs
+    reuse there is; a second would only pin another fold's prepared market, and this runs
     two-up on a 2 vCPU node.
+
+    The feature store is deliberately *not* here: actions are built on the whole-window
+    store the session already owns, so `date_number` is the global session index. A
+    per-fold store restarted that count at the fold's own first bar, which drifted the
+    rotation calendar from fold to fold and left long-window derived metrics unwarmed.
     """
 
     def __init__(self) -> None:
-        self.key: tuple[tuple[str, ...], tuple[str, ...]] | None = None
-        self.context_rows: list[Mapping[str, Any]] = []
+        self.key: tuple[str, ...] | None = None
         self.engine_rows: list[Mapping[str, Any]] = []
-        self.store: PreparedFeatureStore | None = None
         self.prepared: EnginePreparedMarketData | None = None
 
     def load(
@@ -753,21 +778,17 @@ class _FoldPrepCache:
         rows: Sequence[Mapping[str, Any]],
         task: _FoldEngineTask,
     ) -> None:
-        key = (task.context_sessions, task.engine_sessions)
+        key = task.engine_sessions
         if self.key == key:
             return
         self.clear()
-        self.context_rows = _rows_for_sessions(rows, task.context_sessions)
         self.engine_rows = _rows_for_sessions(rows, task.engine_sessions)
-        self.store = PreparedFeatureStore(self.context_rows, rows_are_sorted=True)
         self.prepared = _fold_prepared_market(strategy, self.engine_rows)
         self.key = key
 
     def clear(self) -> None:
         self.key = None
-        self.context_rows = []
         self.engine_rows = []
-        self.store = None
         self.prepared = None
 
 
@@ -781,6 +802,13 @@ class _BenchmarkContext:
     primary_unavailable_reason: str | None
     auxiliary_label: str
     primary_coverage: Mapping[str, Any] | None = None
+    # The session each entry of ``daily_returns`` belongs to, so a caller holding a
+    # subset of the window (walk-forward evaluation sessions) can compound exactly
+    # those days. Same length and order as ``daily_returns``.
+    daily_return_sessions: tuple[str, ...] = ()
+    # The auxiliary proxy's return over the whole window. Used as the benchmark for
+    # the acceptance checks whenever the official TR series is absent.
+    auxiliary_return: float | None = None
 
 
 @dataclass(frozen=True)
@@ -926,10 +954,18 @@ def _initialize_candidate_worker(
 
 
 def _fold_engine_worker(task: _FoldEngineTask) -> _FoldEngineOutcome:
-    if _WORKER_STRATEGY is None or _WORKER_PRICE_ROWS is None:
+    if (
+        _WORKER_STRATEGY is None
+        or _WORKER_PRICE_ROWS is None
+        or _WORKER_FEATURE_STORE is None
+    ):
         raise RuntimeError("candidate worker was not initialized")
     return _fold_engine_outcome(
-        _WORKER_STRATEGY, _WORKER_PRICE_ROWS, task, _WORKER_FOLD_PREP
+        _WORKER_STRATEGY,
+        _WORKER_PRICE_ROWS,
+        task,
+        _WORKER_FOLD_PREP,
+        _WORKER_FEATURE_STORE,
     )
 
 
@@ -1397,7 +1433,13 @@ class _CandidateBacktestSession:
                 outcomes = self._map_fold_tasks([task for _, task in missing], worker_count)
             else:
                 outcomes = [
-                    _fold_engine_outcome(self.strategy, self.price_rows, task, self._fold_prep)
+                    _fold_engine_outcome(
+                        self.strategy,
+                        self.price_rows,
+                        task,
+                        self._fold_prep,
+                        self.feature_store,
+                    )
                     for _, task in missing
                 ]
             self.fold_engine_runs += len(missing)
@@ -1994,10 +2036,14 @@ def _evaluate_candidate_task(
         )
     if public_metric_availability:
         engine_summary["public_metric_availability"] = public_metric_availability
-    engine_summary["effective_trade_count"] = max(
-        _summary_float_default(engine_summary, "trade_count", 0.0),
-        float(execution_audit["executed_buy_count"]),
+    # Positions opened. Every closed round trip has a buy behind it, so this is never
+    # below the engine's own `trade_count`; stating it directly is what makes the number
+    # mean the same thing here and in the walk-forward summary.
+    engine_summary["effective_trade_count"] = float(execution_audit["executed_buy_count"])
+    engine_summary["filled_order_legs"] = float(
+        execution_audit["executed_buy_count"] + execution_audit["executed_sell_count"]
     )
+    engine_summary["closed_trade_count"] = float(execution_audit["completed_trade_count"])
     # This is produced beside the measured engine result, rather than reconstructed
     # by an HTTP serializer.  The public projection will fail closed if any field is
     # absent or malformed.
@@ -2178,6 +2224,9 @@ def run_candidate_backtest(
         if detailed.diagnostics is not None:
             diagnostics_by_candidate[selected.candidate_id] = detailed.diagnostics
 
+    disclosed_coverage, disclosed_reasons = _metric_coverage_disclosure(
+        session.feature_store, selected, feature_coverage, fallback_reasons
+    )
     try:
         result = CandidateBacktestResult(
             strategy_a=strategy_a,
@@ -2193,8 +2242,8 @@ def run_candidate_backtest(
                 rows,
                 benchmark_context=session.benchmark_context,
             ),
-            feature_coverage=dict(feature_coverage or {}),
-            fallback_reasons=list(fallback_reasons or ()),
+            feature_coverage=disclosed_coverage,
+            fallback_reasons=disclosed_reasons,
             execution_stats={
                 **session.execution_stats(),
                 "candidates": diagnostics_by_candidate,
@@ -2204,6 +2253,37 @@ def run_candidate_backtest(
     finally:
         if owns_session:
             session.close()
+
+
+def _metric_coverage_disclosure(
+    store: PreparedFeatureStore,
+    candidate: CodeCandidate,
+    feature_coverage: Mapping[str, Any] | None,
+    fallback_reasons: Sequence[str] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Publish how usable each metric the rule reads actually was, and say when it wasn't.
+
+    The result itself is never withheld: the numbers are published as measured and this
+    only adds the missing sentence next to them - which metric was unavailable, and on
+    what share of the sessions - so a flat backtest can be read as "the data was not
+    there" rather than "the strategy did nothing".
+    """
+
+    coverage = rule_metric_coverage(store, candidate.strategy_ir)
+    merged = dict(feature_coverage or {})
+    if coverage:
+        merged["rule_metric_coverage"] = coverage
+    reasons = list(fallback_reasons or ())
+    for metric, share in sorted(coverage.items()):
+        if share >= MIN_DISCLOSED_METRIC_COVERAGE:
+            continue
+        reason = (
+            f"{metric} 지표는 분석 구간의 {share:.0%}에서만 값이 있었습니다 — "
+            "나머지 기간에는 이 조건이 신호를 낼 수 없었습니다."
+        )
+        if reason not in reasons:
+            reasons.append(reason)
+    return merged, reasons
 
 
 def _rows_for_sessions(
@@ -2253,11 +2333,21 @@ def _fold_engine(
     prepared: EnginePreparedMarketData | None = None,
 ):
     store = store if store is not None else PreparedFeatureStore(context_rows, rows_are_sorted=True)
+    # The engine hands this fold a portfolio in cash on its first tradable session, so
+    # the generator's book restarts there too and treats it as a rotation day. Rows after
+    # the fold are never visited, which is also why no future bar can reach these
+    # decisions - the `tradable_sessions` gate below still blocks orders outside the fold.
+    ordered_tradable = sorted(tradable_sessions)
     action_map = {
         (str(row.get("date")), str(row.get("ticker", "")).zfill(6)): action
         for row, action in zip(
             store.rows,
-            store.build_actions(candidate.strategy_ir, candidate.parameters),
+            store.build_actions(
+                candidate.strategy_ir,
+                candidate.parameters,
+                reset_session=ordered_tradable[0] if ordered_tradable else None,
+                stop_after_session=ordered_tradable[-1] if ordered_tradable else None,
+            ),
             strict=True,
         )
     }
@@ -2276,23 +2366,25 @@ def _fold_engine_outcome(
     rows: Sequence[Mapping[str, Any]],
     task: _FoldEngineTask,
     prep: _FoldPrepCache,
+    store: PreparedFeatureStore,
 ) -> _FoldEngineOutcome:
     """One fold engine run, reduced to what the walk-forward aggregate reads.
 
     The engine result never leaves this function: it carries the full equity curve and
     order audit, and pickling those back from a worker costs more than the run itself.
     `prep` is owned by whoever holds the rows, so a session tuple can only ever resolve
-    against the universe it was sliced from.
+    against the universe it was sliced from, and `store` is that same owner's
+    whole-window feature store.
     """
 
     prep.load(strategy, rows, task)
     engine = _fold_engine(
         strategy,
         CodeCandidate.model_validate(task.candidate),
-        prep.context_rows,
+        prep.engine_rows,
         prep.engine_rows,
         set(task.tradable_sessions),
-        store=prep.store,
+        store=store,
         prepared=prep.prepared,
     )
     if not task.targets:
@@ -2307,6 +2399,7 @@ def _fold_engine_outcome(
         returns=returns,
         fills=tuple(_full_target_fills(engine, target_set)),
         ledger=_storage_execution_ledger(engine),
+        closed_trade_pnl=_closed_trade_pnl(engine, target_set),
     )
 
 
@@ -2325,6 +2418,16 @@ def _complete_target_returns(
     return returns if set(returns) == targets else None
 
 
+def _closed_trade_pnl(engine_result: Any, targets: set[str]) -> tuple[float, ...]:
+    """Realized PnL of every round trip this fold closed inside its evaluation month."""
+
+    return tuple(
+        float(getattr(trade, "net_pnl", 0.0) or 0.0)
+        for trade in getattr(engine_result, "trades", ())
+        if str(getattr(trade, "exit_date", "")) in targets
+    )
+
+
 def _full_target_fills(engine_result: Any, targets: set[str]) -> list[dict[str, Any]]:
     return [
         payload
@@ -2334,18 +2437,70 @@ def _full_target_fills(engine_result: Any, targets: set[str]) -> list[dict[str, 
     ]
 
 
-def _walk_forward_aggregate_metrics(returns: Sequence[float]) -> BacktestMetrics:
+def _walk_forward_win_rate(trade_pnl: Sequence[float]) -> float | None:
+    """Share of closed round trips that made money, or None when none closed.
+
+    The aggregate used to publish "share of days with a positive return" under the name
+    `win_rate`. Every session the portfolio sat in cash returns exactly 0.0 and counted
+    as a loss, so a run that was flat more than half the time reported a 19.8% win rate
+    and read as "loses eight trades out of ten". Fills are the only honest source.
+    """
+
+    return (sum(1 for value in trade_pnl if value > 0.0) / len(trade_pnl)) if trade_pnl else None
+
+
+def _positive_day_rate(returns: Sequence[float]) -> float:
+    """The old `win_rate` under its true name: share of sessions that gained."""
+
+    return (sum(1 for value in returns if value > 0.0) / len(returns)) if returns else 0.0
+
+
+def _walk_forward_aggregate_metrics(
+    returns: Sequence[float],
+    trade_pnl: Sequence[float] = (),
+    benchmark_returns: Sequence[float] = (),
+) -> BacktestMetrics:
     total_return = _compound_returns(returns)
     sharpe = _native_sharpe_like(list(returns))
+    win_rate = _walk_forward_win_rate(trade_pnl)
+    # Everything the walk-forward aggregate measures is out of sample, so the benchmark
+    # comparison it carries is the out-of-sample one. Without this the excess return was
+    # simply absent on every five-year run and the acceptance floor fell back to the
+    # candidate's own fitted window. `benchmark_returns` covers exactly the evaluation
+    # sessions the strategy returns above cover, so the two compound like with like.
+    benchmark_return = _compound_returns(benchmark_returns) if benchmark_returns else None
+    period_stats = (
+        _benchmark_period_stats(returns, benchmark_returns) if benchmark_returns else None
+    )
     return BacktestMetrics(
         sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
         max_drawdown=round(_max_drawdown_from_returns(returns), METRIC_ROUND_DIGITS),
-        win_rate=(sum(value > 0.0 for value in returns) / len(returns) if returns else 0.0),
+        # `BacktestMetrics.win_rate` is a non-null float, so "not computable" is carried
+        # to the reader through `public_metric_availability`, not through this field.
+        win_rate=win_rate if win_rate is not None else 0.0,
         total_return=round(total_return, METRIC_ROUND_DIGITS),
         in_sample_sharpe=0.0,
         out_sample_sharpe=round(sharpe, METRIC_ROUND_DIGITS),
         degradation=0.0,
         out_sample_return=round(total_return, METRIC_ROUND_DIGITS),
+        out_sample_benchmark_return=(
+            None if benchmark_return is None else round(benchmark_return, METRIC_ROUND_DIGITS)
+        ),
+        out_sample_excess_return=(
+            None
+            if benchmark_return is None
+            else round(total_return - benchmark_return, METRIC_ROUND_DIGITS)
+        ),
+        benchmark_period_count=None if period_stats is None else period_stats.count,
+        benchmark_period_win_rate=None if period_stats is None else period_stats.win_rate,
+        benchmark_period_loss_rate=None if period_stats is None else period_stats.loss_rate,
+        out_sample_benchmark_period_count=None if period_stats is None else period_stats.count,
+        out_sample_benchmark_period_win_rate=(
+            None if period_stats is None else period_stats.win_rate
+        ),
+        out_sample_benchmark_period_loss_rate=(
+            None if period_stats is None else period_stats.loss_rate
+        ),
     )
 
 def _run_walk_forward_candidate_backtest(
@@ -2377,11 +2532,15 @@ def _run_walk_forward_candidate_backtest(
     returns_by_session: dict[str, float] = {}
     selections: list[WalkForwardFoldSelection] = []
     fills: list[dict[str, Any]] = []
+    trade_pnl: list[float] = []
     evaluation_ledgers: list[dict[str, Any]] = []
     returns_by_candidate: dict[str, dict[str, float]] = {
         candidate.candidate_id: {} for candidate in candidates
     }
     fills_by_candidate: dict[str, list[dict[str, Any]]] = {
+        candidate.candidate_id: [] for candidate in candidates
+    }
+    trade_pnl_by_candidate: dict[str, list[float]] = {
         candidate.candidate_id: [] for candidate in candidates
     }
     folds_by_candidate: dict[str, int] = {candidate.candidate_id: 0 for candidate in candidates}
@@ -2414,7 +2573,6 @@ def _run_walk_forward_candidate_backtest(
                     ("select", identities[proposed.candidate_id], fold.fold_index),
                     _FoldEngineTask(
                         candidate=payloads[proposed.candidate_id],
-                        context_sessions=selection_sessions,
                         engine_sessions=selection_sessions,
                         tradable_sessions=selection_tradable,
                     ),
@@ -2443,7 +2601,6 @@ def _run_walk_forward_candidate_backtest(
                     ("evaluate", identities[proposed.candidate_id], fold.fold_index, targets),
                     _FoldEngineTask(
                         candidate=payloads[proposed.candidate_id],
-                        context_sessions=(*selection_sessions, *targets),
                         # Fresh engine gets bridge + target only; actions retain all
                         # causal feature history.
                         engine_sessions=(*fold.validation_sessions[-1:], *targets),
@@ -2465,11 +2622,13 @@ def _run_walk_forward_candidate_backtest(
         claimed.update(target_set)
         returns_by_session.update(selected_result.returns or {})
         fills.extend(selected_result.fills)
+        trade_pnl.extend(selected_result.closed_trade_pnl)
         if selected_result.ledger is not None:
             evaluation_ledgers.append(selected_result.ledger)
         for candidate_id, outcome in fold_results.items():
             returns_by_candidate[candidate_id].update(outcome.returns or {})
             fills_by_candidate[candidate_id].extend(outcome.fills)
+            trade_pnl_by_candidate[candidate_id].extend(outcome.closed_trade_pnl)
             folds_by_candidate[candidate_id] += 1
         selected = candidate
         digest = sha256(json.dumps({"fold": fold.fold_index, "candidate": _candidate_identity(candidate), "train": fold.train_sessions, "validation": fold.validation_sessions}, sort_keys=True).encode()).hexdigest()
@@ -2507,7 +2666,13 @@ def _run_walk_forward_candidate_backtest(
         for fill in fills
     )
     aggregate_metrics = (
-        _walk_forward_aggregate_metrics(list(daily_returns.values())) if ready else None
+        _walk_forward_aggregate_metrics(
+            list(daily_returns.values()),
+            trade_pnl,
+            benchmark_daily_returns_for_sessions(session.benchmark_context, ordered_sessions),
+        )
+        if ready
+        else None
     )
     engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
     for proposed in candidates:
@@ -2527,9 +2692,14 @@ def _run_walk_forward_candidate_backtest(
             )
             for fill in candidate_fills
         )
+        candidate_sessions = sorted(candidate_returns)
         candidate_metrics = (
             _walk_forward_aggregate_metrics(
-                [candidate_returns[session] for session in sorted(candidate_returns)]
+                [candidate_returns[item] for item in candidate_sessions],
+                trade_pnl_by_candidate[proposed.candidate_id],
+                benchmark_daily_returns_for_sessions(
+                    session.benchmark_context, candidate_sessions
+                ),
             )
             if candidate_ready
             else None
@@ -2565,6 +2735,27 @@ def _run_walk_forward_candidate_backtest(
             ),
         }
     execution_capacity_enabled = _execution_capacity_enabled(rows)
+    executed_buy_count = sum(1 for fill in fills if str(fill.get("side")) == "buy")
+    # Walk-forward has no single in-sample block - selection ran per fold on that fold's
+    # own train/validation - so `in_sample_sharpe` and the degradation derived from it
+    # are pinned at 0.0 by construction. Published as 0.0 they read as "no overfitting
+    # decay at all", which is a claim nothing measured. The numbers are still published
+    # everywhere else; only these two say why they are absent.
+    walk_forward_availability: dict[str, dict[str, Any]] = {
+        "in_sample_sharpe": {
+            "value": None,
+            "unavailable_reason": WALK_FORWARD_HAS_NO_IN_SAMPLE_BLOCK,
+        },
+        "degradation": {
+            "value": None,
+            "unavailable_reason": WALK_FORWARD_HAS_NO_IN_SAMPLE_BLOCK,
+        },
+    }
+    if ready and not trade_pnl:
+        walk_forward_availability["win_rate"] = {
+            "value": None,
+            "unavailable_reason": NO_CLOSED_TRADE_WIN_RATE,
+        }
     engine_summary = {
         "walk_forward_sample": _walk_forward_metadata(_walk_forward_sample(rows), policy),
         "walk_forward_policy": "rolling_selection_policy",
@@ -2579,7 +2770,17 @@ def _run_walk_forward_candidate_backtest(
                 strategy.risk_constraints.get("slippage_pct", DEFAULT_SLIPPAGE_PCT)
             ),
         },
-        "effective_trade_count": len(fills),
+        # Positions opened, the same definition the single-pass path publishes. This
+        # counted both order legs, so the same run reported 445 trades here and 371
+        # there; a user comparing a one-year and a five-year answer saw two different
+        # units under one label. Both legs stay visible as `filled_order_legs`.
+        "effective_trade_count": executed_buy_count,
+        "filled_order_legs": len(fills),
+        "executed_sell_count": len(fills) - executed_buy_count,
+        "closed_trade_count": len(trade_pnl),
+        # The old `win_rate`, kept under a name that says what it measures.
+        "positive_day_rate": round(_positive_day_rate(list(daily_returns.values())), METRIC_ROUND_DIGITS),
+        "public_metric_availability": walk_forward_availability,
         "execution_capacity": _execution_capacity_metadata(
             execution_capacity_enabled
         ),
@@ -2590,6 +2791,9 @@ def _run_walk_forward_candidate_backtest(
         selected,
         rows,
         engine_summary,
+    )
+    walk_forward_coverage, walk_forward_reasons = _metric_coverage_disclosure(
+        session.feature_store, selected, feature_coverage, fallback_reasons
     )
     result = CandidateBacktestResult(
         strategy_a=strategy,
@@ -2604,8 +2808,8 @@ def _run_walk_forward_candidate_backtest(
             rows,
             benchmark_context=session.benchmark_context,
         ),
-        feature_coverage=dict(feature_coverage or {}),
-        fallback_reasons=list(fallback_reasons or ()),
+        feature_coverage=walk_forward_coverage,
+        fallback_reasons=walk_forward_reasons,
         execution_stats={
             **session.execution_stats(),
             "walk_forward": True,
@@ -3927,7 +4131,47 @@ def _build_benchmark_context(
         primary_unavailable_reason=unavailable_reason,
         auxiliary_label=AUXILIARY_BENCHMARK_LABEL,
         primary_coverage=coverage,
+        # The curve's first point is the base (cumulative_return 0.0) and carries no
+        # daily return, so the sessions line up with ``daily_returns`` from index 1.
+        daily_return_sessions=tuple(str(point.date) for point in auxiliary_curve[1:]),
+        auxiliary_return=(
+            float(auxiliary_curve[-1].cumulative_return) if auxiliary_curve else None
+        ),
     )
+
+
+def benchmark_daily_returns_for_sessions(
+    context: _BenchmarkContext | None,
+    sessions: Iterable[str],
+) -> list[float]:
+    """The auxiliary proxy's daily returns restricted to ``sessions``, in date order.
+
+    Interface for the walk-forward aggregate, which measures a strategy over the
+    evaluation sessions of every fold rather than the whole window: pass those
+    sessions and compare like with like. Returns an empty list when the proxy does
+    not cover them.
+    """
+
+    if context is None or not context.daily_return_sessions:
+        return []
+    wanted = {str(session) for session in sessions}
+    return [
+        value
+        for session, value in zip(
+            context.daily_return_sessions, context.daily_returns, strict=False
+        )
+        if session in wanted
+    ]
+
+
+def benchmark_return_for_sessions(
+    context: _BenchmarkContext | None,
+    sessions: Iterable[str],
+) -> float | None:
+    """The auxiliary proxy's compounded return over exactly ``sessions``."""
+
+    returns = benchmark_daily_returns_for_sessions(context, sessions)
+    return _compound_returns(returns) if returns else None
 
 
 def _official_benchmark_total_return(
@@ -4072,6 +4316,12 @@ def _benchmark_provenance(context: _BenchmarkContext) -> dict[str, Any]:
             "label": context.auxiliary_label,
             "method": AUXILIARY_BENCHMARK_METHOD,
             "warning": AUXILIARY_BENCHMARK_WARNING,
+            "return": context.auxiliary_return,
+            # Which series the acceptance floor actually judged against. The official
+            # TR view is absent from this warehouse, and refusing to judge at all made
+            # every automatic run fail on a data gap rather than on its performance.
+            "used_for_acceptance": not context.primary_available
+            and context.auxiliary_return is not None,
         },
     }
 
@@ -4310,14 +4560,37 @@ def _floor_metrics(result: CandidateBacktestResult) -> BacktestMetrics:
     aggregate = _ready_aggregate_metrics(result)
     if aggregate is None:
         return metrics
-    return metrics.model_copy(
-        update={
-            "out_sample_sharpe": aggregate.out_sample_sharpe,
-            "out_sample_return": aggregate.out_sample_return,
-            "max_drawdown": aggregate.max_drawdown,
-            "selection_adjusted_sharpe": aggregate.selection_adjusted_sharpe,
+    update: dict[str, Any] = {
+        "out_sample_sharpe": aggregate.out_sample_sharpe,
+        "out_sample_return": aggregate.out_sample_return,
+        "max_drawdown": aggregate.max_drawdown,
+        "selection_adjusted_sharpe": aggregate.selection_adjusted_sharpe,
+    }
+    # Benchmark comparisons belong to the same rolling evaluation as the returns above,
+    # not to the whole window the candidate was also fitted on. The aggregate carries
+    # them once it has measured them (see the walk-forward aggregation); until then the
+    # candidate's own window figures stand rather than the floor reading a blank.
+    update.update(
+        {
+            field: getattr(aggregate, field)
+            for field in _BENCHMARK_AGGREGATE_FIELDS
+            if getattr(aggregate, field) is not None
         }
     )
+    return metrics.model_copy(update=update)
+
+
+# Benchmark-relative fields the walk-forward aggregate owns when it fills them.
+_BENCHMARK_AGGREGATE_FIELDS = (
+    "out_sample_benchmark_return",
+    "out_sample_excess_return",
+    "benchmark_period_count",
+    "benchmark_period_win_rate",
+    "benchmark_period_loss_rate",
+    "out_sample_benchmark_period_count",
+    "out_sample_benchmark_period_win_rate",
+    "out_sample_benchmark_period_loss_rate",
+)
 
 
 def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
@@ -4374,11 +4647,28 @@ def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
     payload = getattr(result, "backtest_payload", {}) or {}
     benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
     primary = benchmark.get("primary") if isinstance(benchmark, Mapping) else None
-    if not isinstance(primary, Mapping) or not primary.get("available"):
-        reasons.append("공식 KOSPI/KOSDAQ TR 벤치마크를 확보하지 못했습니다")
+    if isinstance(primary, Mapping) and primary.get("available"):
+        reasons.extend(
+            _benchmark_objective_reasons(metrics, benchmark_return=primary.get("return"))
+        )
+        return reasons
+    # This warehouse has no official KOSPI/KOSDAQ TR view, and refusing to judge on
+    # that alone made every automatic run fail on a missing data source rather than on
+    # what it earned - with no numbers to argue with. Judge against the equal-weight
+    # PIT-universe proxy instead, and say so in every reason it produced. The absence
+    # of the official series stays disclosed in ``benchmark.primary``.
+    auxiliary = benchmark.get("auxiliary") if isinstance(benchmark, Mapping) else None
+    proxy_return = auxiliary.get("return") if isinstance(auxiliary, Mapping) else None
+    if not _is_numeric_metric(proxy_return):
+        reasons.append(
+            "공식 KOSPI/KOSDAQ TR 벤치마크도, 유니버스 동일가중 프록시도 확보하지 못했습니다"
+        )
         return reasons
     reasons.extend(
-        _benchmark_objective_reasons(metrics, benchmark_return=primary.get("return"))
+        f"{reason} {PROXY_BENCHMARK_JUDGEMENT_SUFFIX}"
+        for reason in _benchmark_objective_reasons(
+            metrics, benchmark_return=proxy_return
+        )
     )
     return reasons
 

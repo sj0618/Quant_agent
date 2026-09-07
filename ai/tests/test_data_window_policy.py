@@ -114,6 +114,28 @@ def test_universe_ranks_by_pre_window_traded_value_and_caps_in_the_database() ->
     assert "core.symbol_security_type_history" in connection.query
 
 
+def test_universe_keeps_names_the_security_type_history_does_not_cover() -> None:
+    """The loaded security-type history carries KOSDAQ names only.
+
+    An inner join on it dropped every KOSPI listing, so the "KOSPI/KOSDAQ" universe was
+    100% KOSDAQ. A name without a history interval must fall back to symbol_master's
+    classification, and the descriptor must say how many did.
+    """
+
+    connection = RecordingConnection([
+        {"symbol": "005930", "window_member_count": 2_715, "security_type_fallback_count": 853},
+        {"symbol": "000660", "window_member_count": 2_715, "security_type_fallback_count": 853},
+    ])
+
+    universe, descriptor = _source()._fetch_backtest_universe(connection, WINDOW)
+
+    assert universe == ["000660", "005930"]
+    assert "LEFT JOIN core.symbol_security_type_history sh" in connection.query
+    assert "COALESCE(sh.security_type, sm.security_type) = '보통주'" in connection.query
+    assert descriptor["security_type_fallback_source"] == "core.symbol_master"
+    assert descriptor["security_type_fallback_member_count"] == 853
+
+
 def test_universe_descriptor_reports_what_the_cap_cut() -> None:
     connection = RecordingConnection([
         {"symbol": "000660", "window_member_count": 1_717},
@@ -261,3 +283,47 @@ def test_data_node_asks_for_dart_only_when_the_sealed_v1_rule_names_a_fundamenta
     assert captured["requires_financials"] is True
     assert captured["backtest_lookback_years"] == 2
     assert captured["period_locked"] is True
+
+
+# (d) single-ticker resolution: prose words that happen to be company names
+
+_LISTED_NAMES = [
+    {"symbol": "001680", "name": "대상"},
+    {"symbol": "095610", "name": "테스"},
+    {"symbol": "005930", "name": "삼성전자"},
+    {"symbol": "000270", "name": "기아"},
+]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "KRX 종목을 대상으로 최근 1년간 백테스트해줘",
+        "코스피 코스닥 보통주 대상 장기 퀀트 전략 백테스트",
+        "코스피 전체에 RSI 30 이하 매수 전략을 적용해줘",
+        "전체 종목을 대상으로 20일선 돌파 전략 백테스트",
+        "이동평균 골든크로스 전략을 백테스트해줘",
+    ],
+)
+def test_prose_words_that_are_also_company_names_do_not_pin_one_ticker(query: str) -> None:
+    """"백테스트" contains ㈜테스 and "대상으로" contains ㈜대상.
+
+    Production ran one-stock backtests for market-wide requests because of this, and the
+    report said "종목 수가 5개 미만입니다 (1개)". A market name or a word boundary must stop
+    the company-name matcher.
+    """
+
+    assert _source()._resolve_ticker(RecordingConnection(_LISTED_NAMES), query) is None
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("삼성전자 백테스트해줘", "005930"),
+        ("기아 RSI 30 이하 매수 전략", "000270"),
+        ("대상 주가로 20일선 전략 검증", "001680"),
+        ("005930 RSI 전략", "005930"),
+    ],
+)
+def test_an_explicitly_named_company_still_resolves(query: str, expected: str) -> None:
+    assert _source()._resolve_ticker(RecordingConnection(_LISTED_NAMES), query) == expected

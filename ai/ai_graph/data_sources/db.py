@@ -164,7 +164,24 @@ MARKET_SCOPE_TERMS = (
     "KOSDAQ 150",
     "코스닥150",
     "코스닥 150",
+    # A bare market name is a market-wide request, not a single name. Without these,
+    # "코스피 전체 종목을 대상으로 백테스트" fell through to the company-name matcher,
+    # which found ㈜대상 (001680) in "대상으로" and ㈜테스 (095610) in "백테스트" and
+    # ran a one-stock backtest that the report called "종목 수 1개".
+    "KOSPI",
+    "KOSDAQ",
+    "코스피",
+    "코스닥",
+    "KRX",
+    "한국거래소",
+    "전종목",
+    "전체 종목",
+    "유니버스",
 )
+# A listed company's name counts as a mention only when it stands as its own word:
+# neither preceded nor followed by Hangul or an alphanumeric character. "백테스트"
+# contains "테스" and "대상으로" contains "대상", and both are listed companies.
+_NAME_BOUNDARY_TEMPLATE = r"(?<![0-9A-Za-z가-힣]){name}(?![0-9A-Za-z가-힣])"
 BROAD_SCREENING_TERMS = (
     "종목을 찾아",
     "종목 찾아",
@@ -1019,16 +1036,24 @@ class PostgresPipelineDataSource:
                 -- view is not used here: its security-type history only starts on
                 -- 2026-08-11, so for earlier dates it returns nobody and a "PIT universe"
                 -- silently collapses into today's listed names.
-                SELECT DISTINCT sm.symbol
+                --
+                -- The security-type history is also incomplete by *symbol*: as loaded
+                -- it carries KOSDAQ names only, so an inner join on it dropped every
+                -- KOSPI listing (all 1,071 of them, Samsung Electronics included) and
+                -- the "KOSPI/KOSDAQ" universe was entirely KOSDAQ. A name without a
+                -- history row falls back to the classification on symbol_master; how
+                -- many did so is reported in the descriptor, never hidden.
+                SELECT DISTINCT sm.symbol,
+                       (sh.symbol_id IS NULL) AS security_type_from_master
                 FROM {SYMBOL_LISTING_HISTORY_TABLE} h
                 JOIN {SYMBOL_MASTER_TABLE} sm ON sm.symbol_id = h.symbol_id
-                JOIN core.symbol_security_type_history sh
+                LEFT JOIN core.symbol_security_type_history sh
                   ON sh.symbol_id = h.symbol_id
                  AND sh.valid_from <= %(window_end)s::date
                  AND (sh.valid_to IS NULL OR sh.valid_to >= %(window_start)s::date)
                 WHERE h.listing_status = 'listed'
                   AND h.market IN ('KOSPI', 'KOSDAQ')
-                  AND sh.security_type = '보통주'
+                  AND COALESCE(sh.security_type, sm.security_type) = '보통주'
                   AND h.valid_from <= %(window_end)s::date
                   AND (h.valid_to IS NULL OR h.valid_to >= %(window_start)s::date)
                   AND (
@@ -1063,7 +1088,11 @@ class PostgresPipelineDataSource:
                 GROUP BY l.symbol
             )
             SELECT symbol,
-                   (SELECT count(*) FROM window_members) AS window_member_count
+                   (SELECT count(*) FROM window_members) AS window_member_count,
+                   (
+                       SELECT count(*) FROM window_members
+                       WHERE security_type_from_master
+                   ) AS security_type_fallback_count
             FROM ranked
             ORDER BY traded_value DESC NULLS LAST, symbol
             LIMIT %(cap)s
@@ -1081,6 +1110,10 @@ class PostgresPipelineDataSource:
         window_member_count = max(
             (int(row.get("window_member_count") or 0) for row in rows),
             default=len(universe),
+        )
+        security_type_fallback_count = max(
+            (int(row.get("security_type_fallback_count") or 0) for row in rows),
+            default=0,
         )
         return universe, {
             "selection": (
@@ -1109,6 +1142,12 @@ class PostgresPipelineDataSource:
             "delisting_policy": "official-event-then-final-close-v1",
             "delisted_during_window": "kept_until_final_session",
             "security_type": "보통주",
+            # How the 보통주 classification was resolved. The interval history is the
+            # point-in-time source; names it does not cover use symbol_master's current
+            # classification, which is disclosed rather than silently excluding them.
+            "security_type_source": "core.symbol_security_type_history",
+            "security_type_fallback_source": SYMBOL_MASTER_TABLE,
+            "security_type_fallback_member_count": security_type_fallback_count,
         }
 
     def _screen_via_llm(
@@ -1493,7 +1532,9 @@ class PostgresPipelineDataSource:
             name = str(row.get("name") or "")
             if symbol and symbol in query:
                 return symbol.zfill(6)
-            if name and name in query:
+            if name and re.search(
+                _NAME_BOUNDARY_TEMPLATE.format(name=re.escape(name)), query
+            ):
                 return symbol.zfill(6)
         return None
 

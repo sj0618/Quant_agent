@@ -286,11 +286,75 @@ def test_automatic_gate_can_finally_pass_once_the_official_series_is_supplied(
     sessions = _sessions()
     rows = _price_rows(sessions)
     supplied = backtest_node._build_benchmark_context(rows, _official_benchmark(sessions))
-    missing = backtest_node._build_benchmark_context(rows)
 
-    # Same metrics either way: what changes is only whether the primary benchmark exists.
     assert backtest_node._passes_objective_floor(_automatic_result(supplied, 0.60)) is True
-    assert backtest_node._passes_objective_floor(_automatic_result(missing, 0.60)) is False
+
+
+def test_missing_official_series_is_judged_against_the_labelled_proxy(
+    enforced_objective_floor: None,
+) -> None:
+    """A data gap is a disclosure, not a verdict.
+
+    The warehouse has no ``mart.krx_index_total_return_daily``, so requiring it made
+    every automatic run fail on the missing view no matter what it earned. The floor
+    now judges against the equal-weight PIT-universe proxy and labels the verdict; the
+    fact that the official series was unavailable stays published either way.
+    """
+
+    sessions = _sessions()
+    rows = _price_rows(sessions)
+    missing = backtest_node._build_benchmark_context(rows)
+    provenance = backtest_node._benchmark_provenance(missing)
+
+    # The flat fixture universe returns 0%, so a +60% strategy clears the proxy and a
+    # -1% strategy does not: the outcome now depends on performance, not on the gap.
+    assert backtest_node._passes_objective_floor(_automatic_result(missing, 0.60)) is True
+    losing = _automatic_result(missing, -0.01)
+    assert backtest_node._passes_objective_floor(losing) is False
+
+    reasons = backtest_node.objective_floor_reasons(losing)
+    assert reasons
+    assert not any("확보하지 못했습니다" in reason for reason in reasons)
+    assert all(
+        backtest_node.PROXY_BENCHMARK_JUDGEMENT_SUFFIX in reason for reason in reasons
+    )
+    assert "공식 지수 아님" in backtest_node.AUXILIARY_BENCHMARK_LABEL
+
+    # The official series is still reported as unavailable next to that verdict.
+    assert provenance["primary"]["available"] is False
+    assert provenance["primary"]["unavailable_reason"]
+    assert provenance["auxiliary"]["used_for_acceptance"] is True
+    assert provenance["auxiliary"]["return"] == 0.0
+    assert provenance["auxiliary"]["warning"] == backtest_node.AUXILIARY_BENCHMARK_WARNING
+
+
+def test_benchmark_return_for_sessions_compounds_only_the_named_sessions() -> None:
+    """The helper the walk-forward aggregate uses to compare like with like."""
+
+    sessions = _sessions()
+    rows = [
+        {
+            "date": session,
+            "ticker": "000001",
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0 * DAILY_GROWTH**index,
+            "volume": 1_000_000.0,
+        }
+        for index, session in enumerate(sessions)
+    ]
+    context = backtest_node._build_benchmark_context(rows)
+    window = sessions[10:21]
+
+    # A session's daily return is the move *into* that session, so 11 named sessions
+    # compound 11 steps - the same convention the strategy's own daily returns use.
+    measured = backtest_node.benchmark_return_for_sessions(context, window)
+    assert measured is not None
+    # rel tolerance absorbs the curve's 6-decimal rounding, not a different formula.
+    assert measured == pytest.approx(DAILY_GROWTH ** len(window) - 1.0, rel=1e-4)
+    assert backtest_node.benchmark_return_for_sessions(context, []) is None
+    assert backtest_node.benchmark_return_for_sessions(None, window) is None
 
 
 def test_automatic_gate_still_fails_a_strategy_that_loses_to_the_official_benchmark(
