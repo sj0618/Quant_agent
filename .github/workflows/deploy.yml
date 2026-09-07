@@ -289,9 +289,23 @@ jobs:
             -d 'code=deploy-preflight-intentionally-invalid' \
             -d 'grant_type=authorization_code' \
             -d 'redirect_uri=https://qt-agent.kro.kr:38010/auth/google/callback' || true)"
+          # Google's own wording separates the two halves: "The OAuth client was not
+          # found." blames the id, "The provided client secret is invalid." blames the
+          # secret. Without it, invalid_client alone leaves both suspects standing.
+          google_reason="$(printf '%s' "$token_probe" \
+            | tr -d '\n' \
+            | sed -n 's/.*"error_description"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+
+          # A current Google client secret is "GOCSPX-" plus 28 characters. A value that
+          # misses that shape is usually the wrong field copied, or a truncated paste.
+          if ! printf '%s' "$GOOGLE_CLIENT_SECRET" | grep -Eq '^GOCSPX-[A-Za-z0-9_-]{20,}$'; then
+            echo "::warning::GOOGLE_CLIENT_SECRET does not look like a current Google client secret (expected GOCSPX- followed by 28 characters). Length seen: ${#GOOGLE_CLIENT_SECRET}."
+          fi
+
           case "$token_probe" in
             *invalid_client*)
-              echo "::error::GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are not a matching pair; Google rejected them with invalid_client. Copy both values from the same OAuth client in the Google Cloud console." >&2
+              echo "::error::Google rejected the credentials with invalid_client. Google says: ${google_reason:-<no description returned>}" >&2
+              echo "::error::\"The OAuth client was not found\" means GOOGLE_CLIENT_ID is wrong; \"The provided client secret is invalid\" means GOOGLE_CLIENT_SECRET does not belong to that client. Both values must come from the same OAuth client in the Google Cloud console." >&2
               exit 1
               ;;
             *invalid_grant*)
