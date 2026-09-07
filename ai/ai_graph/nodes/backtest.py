@@ -187,11 +187,18 @@ DEFAULT_WALL_BUDGET_SECONDS = 22.0
 MAX_SELF_IMPROVEMENT_ROUNDS = DEFAULT_RESEARCH_CAMPAIGN_MAX_ROUNDS
 SELF_IMPROVEMENT_CANDIDATES_PER_ROUND = 6
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
-BACKTEST_ENGINE_VERSION = "candidate-engine.v3"
+# v4: the action generator changed meaning - folds restart the book at their first
+# tradable session on a global rotation grid, engine stop/target exits are mirrored into
+# the book, and rotation slots backfill off-grid. The disk cache keys on these version
+# strings only, so an evaluator change that leaves them alone silently replays results
+# the old evaluator produced (measured: same key, 262 vs 1,106 buy signals).
+BACKTEST_ENGINE_VERSION = "candidate-engine.v4"
 # v6 adds the source-notional capacity claim to persisted summaries. Cached v5
 # evaluations predate that claim and could otherwise be reused as if capacity had
 # been checked (or not checked) under the new contract.
-BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v6"
+# v7: persisted summaries now carry the fill-based win rate, positive_day_rate and the
+# rule metric coverage; v6 entries predate all three.
+BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v7"
 BACKTEST_CACHE_DIR_ENV = "AI_BACKTEST_CACHE_DIR"
 BACKTEST_CACHE_TTL_ENV = "AI_BACKTEST_CACHE_TTL_SECONDS"
 BACKTEST_CACHE_MAX_BYTES_ENV = "AI_BACKTEST_CACHE_MAX_BYTES"

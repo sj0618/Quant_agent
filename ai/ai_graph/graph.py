@@ -623,6 +623,27 @@ def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
                     "selection_source": "sealed_spec",
                 },
             )
+        if isinstance(sealed_execution_spec, ExplorationExecutionSpecV2):
+            # The sealed exploration policy already fixes the history window, the
+            # universe and the risk controls, so there is nothing left for the intent
+            # model to decide. Calling it anyway made every catalogue run depend on one
+            # more web-grounded AOAI round trip - production job_50d2c2c0a625 died right
+            # here on a read timeout before a single bar was loaded.
+            years = _exploration_history_years(state)
+            return _ambiguity_state(
+                AmbiguityCode.READY,
+                query,
+                intent={
+                    "scope": "strategy",
+                    "resolved_query": query,
+                    "interpretation": "사전등록 카탈로그 후보군을 봉인된 탐색 정책으로 비교합니다.",
+                    "backtest_years": years,
+                    "backtest_period_basis": (
+                        f"봉인된 탐색 정책의 검증 창(history_years={years})을 그대로 적용"
+                    ),
+                    "selection_source": "sealed_spec",
+                },
+            )
         # A legacy confirmed rule seals entry/exit only.  It still needs the same
         # one-time AI period selection before the data loader can run.
         intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
@@ -772,6 +793,17 @@ def _backtest_period_from_intent(
     }
 
 
+def _exploration_history_years(state: Mapping[str, Any]) -> int:
+    """The history window a sealed exploration run uses: the policy's, never a model's."""
+
+    policy = state.get("exploration_policy")
+    if isinstance(policy, Mapping):
+        years = policy.get("history_years")
+        if isinstance(years, int) and not isinstance(years, bool) and 1 <= years <= 5:
+            return years
+    raise ValueError("봉인된 탐색 정책에 검증 창(history_years)이 없어 백테스트 기간을 정할 수 없습니다.")
+
+
 def _backtest_period_for_state(state: Mapping[str, Any]) -> dict[str, Any]:
     """Return the only history-window decision permitted before data access."""
 
@@ -795,6 +827,17 @@ def _backtest_period_for_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 {
                     "backtest_years": candidate.backtest_years,
                     "backtest_period_basis": candidate.backtest_period_basis,
+                },
+                selection_source="sealed_spec",
+            )
+        if isinstance(sealed, ExplorationExecutionSpecV2):
+            years = _exploration_history_years(state)
+            return _backtest_period_from_intent(
+                {
+                    "backtest_years": years,
+                    "backtest_period_basis": (
+                        f"봉인된 탐색 정책의 검증 창(history_years={years})을 그대로 적용"
+                    ),
                 },
                 selection_source="sealed_spec",
             )
