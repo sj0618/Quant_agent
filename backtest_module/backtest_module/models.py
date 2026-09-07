@@ -133,6 +133,8 @@ class RiskControls(BaseModel):
     max_gross_exposure_pct: float = Field(default=1.0, gt=0.0, le=1.0)
     stop_loss_pct: Union[float, None] = Field(default=0.08, gt=0.0, le=1.0)
     take_profit_pct: Union[float, None] = Field(default=None, gt=0.0)
+    trailing_stop_pct: Union[float, None] = Field(default=None, gt=0.0, le=0.75)
+    holding_days: Union[int, None] = Field(default=None, ge=1)
     max_single_position_pct: float = Field(default=0.2, gt=0.0, le=1.0)
 
 

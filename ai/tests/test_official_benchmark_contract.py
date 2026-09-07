@@ -127,15 +127,16 @@ def test_supplied_official_series_makes_the_primary_benchmark_available() -> Non
 
 
 def test_official_series_does_not_move_the_auxiliary_proxy_legs() -> None:
-    """The gate must start working without any number it already compared changing."""
+    """Official comparisons change source; the auxiliary disclosure stays unchanged."""
 
     sessions = _sessions()
     rows = _price_rows(sessions)
     without = backtest_node._build_benchmark_context(rows)
     with_official = backtest_node._build_benchmark_context(rows, _official_benchmark(sessions))
 
-    assert with_official.daily_returns == without.daily_returns
-    assert with_official.selection_return == without.selection_return
+    assert with_official.daily_returns != without.daily_returns
+    assert with_official.selection_return > without.selection_return
+    assert with_official.auxiliary_return == without.auxiliary_return
     assert with_official.selection_days == without.selection_days
     assert with_official.auxiliary_label == without.auxiliary_label
 

@@ -47,6 +47,8 @@ from ai_graph.schemas import (
     ResearchSourceRefV3,
 )
 
+from ai_graph.strategy_parser import parse_execution_controls, StrategyParseError
+
 _logger = logging.getLogger(__name__)
 
 STRATEGY_RESEARCH_PROMPT_VERSION = "v10"
@@ -276,6 +278,30 @@ class _ResearchResponse(BaseModel):
     candidates: list[_CandidateDraft] = Field(default_factory=list, max_length=1)
 
 
+def _explicit_execution_controls(query: str):
+    try:
+        return parse_execution_controls(query)
+    except StrategyParseError as exc:
+        raise StrategyResearchError(str(exc), cause_code="unsupported_execution_controls") from exc
+
+
+def _execution_prompt_version(query: str) -> str:
+    return "v11-controls" if _explicit_execution_controls(query) is not None else STRATEGY_RESEARCH_PROMPT_VERSION
+
+
+def _execution_system_prompt(query: str) -> str:
+    controls = _explicit_execution_controls(query)
+    if controls is None:
+        return STRATEGY_RESEARCH_SYSTEM_PROMPT
+    return STRATEGY_RESEARCH_SYSTEM_PROMPT + (
+        "\n\nThe explicit portfolio controls are parsed and sealed separately from the original query. "
+        "Do not encode them as indicator conditions or reject the signal rule because risk controls "
+        "are not metrics. Their values override model-proposed risk and rebalance settings. "
+        "A null fixed or trailing stop in those controls disables that separate stop overlay; "
+        "the rule exit conditions still apply. Parsed controls: " + json.dumps(controls.model_dump(), sort_keys=True)
+    )
+
+
 def research_strategy_execution_spec(
     *,
     query: str,
@@ -290,6 +316,7 @@ def research_strategy_execution_spec(
     substitution, not a backtest of the request.
     """
 
+    _explicit_execution_controls(query)
     allowed = _allowed_metrics(available_metrics)
     sectors = tuple(get_known_sectors())
     index_universes = tuple(get_known_index_universes())
@@ -548,15 +575,19 @@ def _seal_research_response(
         for source in response.sources
     ]
     capability = sorted(allowed_metrics)
+    controls = _explicit_execution_controls(query)
     snapshot = {
         "query_digest": _digest(query),
-        "prompt_version": STRATEGY_RESEARCH_PROMPT_VERSION,
+        "prompt_version": _execution_prompt_version(query),
         "resolution_summary": response.resolution_summary,
         "sources": [source.model_dump(mode="json") for source in sources],
         "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
     }
+    if controls is not None:
+        snapshot["execution_controls"] = controls.model_dump(mode="json")
     return ResearchCandidateExecutionSpecV3(
-        research_prompt_version=STRATEGY_RESEARCH_PROMPT_VERSION,
+        execution_controls=controls,
+        research_prompt_version=_execution_prompt_version(query),
         query_digest=_digest(query),
         resolution_summary=response.resolution_summary,
         research_snapshot_hash=_digest(snapshot),
@@ -913,8 +944,8 @@ def _request(
         "condition_grammar": context["condition_grammar"],
     }
     return LLMJsonRequest(
-        schema_name=STRATEGY_RESEARCH_SCHEMA_NAME,
-        system_prompt=STRATEGY_RESEARCH_SYSTEM_PROMPT,
+        schema_name=f"quantagent.strategy_research.{_execution_prompt_version(query)}",
+        system_prompt=_execution_system_prompt(query),
         user_prompt=json.dumps(
             {
                 "instruction": "Research the request, then return only the structured strategy-research result.",
@@ -940,7 +971,7 @@ def _request(
         max_tool_calls=12,
         task_type="strategy_research_resolution",
         prompt_template_name="strategy_research_resolution",
-        prompt_version=STRATEGY_RESEARCH_PROMPT_VERSION,
+        prompt_version=_execution_prompt_version(query),
         response_schema=schema,
         variables_jsonb={"untrusted_quoted_context": prompt_context, "expected_json_schema": schema},
     )
@@ -973,9 +1004,9 @@ def _repair_request(
         },
     }
     return LLMJsonRequest(
-        schema_name=STRATEGY_RESEARCH_SCHEMA_NAME,
+        schema_name=f"quantagent.strategy_research.{_execution_prompt_version(query)}",
         system_prompt=(
-            f"{STRATEGY_RESEARCH_SYSTEM_PROMPT}\n\n"
+            f"{_execution_system_prompt(query)}\n\n"
             "This is the one permitted repair attempt. Correct only what "
             "previous_validation_failure names and return the complete structured "
             "result again. Unless that failure is about them, keep entry_conditions, "
@@ -1005,7 +1036,7 @@ def _repair_request(
         max_tool_calls=12,
         task_type="strategy_research_resolution_repair",
         prompt_template_name="strategy_research_resolution_repair",
-        prompt_version=STRATEGY_RESEARCH_PROMPT_VERSION,
+        prompt_version=_execution_prompt_version(query),
         response_schema=schema,
         variables_jsonb={"untrusted_quoted_context": context, "expected_json_schema": schema},
     )

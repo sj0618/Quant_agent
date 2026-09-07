@@ -1439,6 +1439,41 @@ def _research_risk_policy(candidate: Any) -> tuple[dict[str, float], list[str]]:
     return constraints, notes
 
 
+def _execution_risk_summary(values: Mapping[str, Any]) -> str:
+    positions = values.get("max_positions") or math.ceil(1.0 / values.get("max_position_pct", .1))
+    labels = [f"최대 {positions}종목"]
+    for key, label in (
+        ("stop_loss_pct", "고정 손절"),
+        ("trailing_stop_pct", "추적 손절"),
+        ("take_profit_pct", "익절"),
+    ):
+        if key in values:
+            value = values[key]
+            labels.append(f"{label} 없음" if value is None else f"{label} {value:.0%}")
+    if "rebalance_interval_days" in values:
+        labels.append(f"{values['rebalance_interval_days']}거래일 교체")
+    return ", ".join(labels)
+
+
+def _explicit_execution_risk(spec: Any) -> tuple[dict[str, Any], list[str]]:
+    controls = getattr(spec, "execution_controls", None)
+    if controls is None:
+        return {}, []
+    values = controls.model_dump()
+    if "max_positions" in values:
+        values["max_position_pct"] = _position_pct_for(values["max_positions"])
+    labels = []
+    if "max_positions" in values:
+        labels.append(f"최대 {values['max_positions']}종목")
+    for key, label in (("stop_loss_pct", "고정 손절"), ("trailing_stop_pct", "추적 손절"), ("take_profit_pct", "익절")):
+        if key in values:
+            value = values[key]
+            labels.append(f"{label} 없음" if value is None else f"{label} {value:.0%}")
+    if "rebalance_interval_days" in values:
+        labels.append(f"{values['rebalance_interval_days']}거래일 교체; 월간은 21거래일 근사이며 월말 일정과 다름")
+    return values, ["사용자가 명시한 실행 설정: " + ", ".join(labels)]
+
+
 def _strategy_spec_from_execution_spec(
     raw_spec: Mapping[str, Any] | ExecutionSpecV1OrV2,
     raw_policy: Mapping[str, Any] | None = None,
@@ -1448,9 +1483,12 @@ def _strategy_spec_from_execution_spec(
     """Compile the confirmed rule without asking another model to reinterpret it."""
 
     execution_spec = validate_execution_spec(raw_spec)
+    explicit_risk, explicit_notes = _explicit_execution_risk(execution_spec)
     if isinstance(execution_spec, ResearchCandidateExecutionSpecV3):
         candidate = execution_spec.candidates[0]
         risk_policy, risk_notes = _research_risk_policy(candidate)
+        if explicit_risk:
+            risk_notes = ["실행 설정(미명시 항목은 기존 기본값): " + _execution_risk_summary({**risk_policy, **explicit_risk})]
         return StrategySpec(
             strategy_id=f"researched_{canonical_execution_spec_digest(execution_spec)[:12]}",
             name=candidate.title,
@@ -1478,12 +1516,14 @@ def _strategy_spec_from_execution_spec(
                     if candidate.rebalance_interval_days is not None
                     else {}
                 ),
+                **explicit_risk,
             },
             assumptions=[
                 *candidate.assumptions,
                 "AI 웹 리서치로 전략 의미를 정규화하고, 조건과 근거를 성과 조회 전에 봉인함",
                 f"반대 가설: {candidate.counter_hypothesis}",
                 *risk_notes,
+                *explicit_notes,
             ],
             source_refs=[source.url for source in execution_spec.sources],
             selection_mode="user_defined",
@@ -1524,11 +1564,13 @@ def _strategy_spec_from_execution_spec(
                 "commission_pct": policy.cost_model.commission_pct,
                 "tax_pct": policy.cost_model.tax_pct,
                 "slippage_pct": policy.cost_model.slippage_pct,
+                **explicit_risk,
             },
             assumptions=[
                 "성과 조회 전에 정책과 후보군을 고정함",
                 "모든 후보에 같은 PIT 데이터, 비용, 검증 구간을 적용함",
                 "개인별 매매 추천이 아닌 과거 데이터 연구임",
+                *explicit_notes,
             ],
             source_refs=[policy.catalog_version, policy.policy_version],
             selection_mode="automatic",

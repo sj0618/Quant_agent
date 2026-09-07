@@ -10,10 +10,11 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from hashlib import sha256
 from multiprocessing import get_all_start_methods, get_context
+from multiprocessing.connection import wait as wait_for_process_exit
 from pathlib import Path
 from tempfile import gettempdir
 from threading import Lock
@@ -32,9 +33,11 @@ from ai_graph.nodes.position_sizing import (
 )
 from ai_graph.nodes.position_sizing import (
     required_max_position_pct,
+    requested_max_positions as _shared_requested_max_positions,
 )
 from ai_graph.progress import (
     AnalysisCancelled,
+    AnalysisDeadlineExceeded,
     deadline_remaining_seconds,
     raise_if_cancelled,
     raise_if_past_deadline,
@@ -187,15 +190,7 @@ DEFAULT_WALL_BUDGET_SECONDS = 22.0
 MAX_SELF_IMPROVEMENT_ROUNDS = DEFAULT_RESEARCH_CAMPAIGN_MAX_ROUNDS
 SELF_IMPROVEMENT_CANDIDATES_PER_ROUND = 6
 SERIAL_EVALUATION_WORK_ITEMS = 250_000
-# v4: the action generator changed meaning - folds restart the book at their first
-# tradable session on a global rotation grid, engine stop/target exits are mirrored into
-# the book, and rotation slots backfill off-grid. The disk cache keys on these version
-# strings only, so an evaluator change that leaves them alone silently replays results
-# the old evaluator produced (measured: same key, 262 vs 1,106 buy signals).
-BACKTEST_ENGINE_VERSION = "candidate-engine.v4"
-# v6 adds the source-notional capacity claim to persisted summaries. Cached v5
-# evaluations predate that claim and could otherwise be reused as if capacity had
-# been checked (or not checked) under the new contract.
+BACKTEST_ENGINE_VERSION = "candidate-engine.v5"
 # v7: persisted summaries now carry the fill-based win rate, positive_day_rate and the
 # rule metric coverage; v6 entries predate all three.
 BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v7"
@@ -803,7 +798,7 @@ class _FoldPrepCache:
 class _BenchmarkContext:
     daily_returns: tuple[float, ...]
     selection_days: int
-    selection_return: float
+    selection_return: float | None
     total_return: float | None
     primary_available: bool
     primary_unavailable_reason: str | None
@@ -813,6 +808,7 @@ class _BenchmarkContext:
     # subset of the window (walk-forward evaluation sessions) can compound exactly
     # those days. Same length and order as ``daily_returns``.
     daily_return_sessions: tuple[str, ...] = ()
+    daily_return_previous_sessions: tuple[str, ...] = ()
     # The auxiliary proxy's return over the whole window. Used as the benchmark for
     # the acceptance checks whenever the official TR series is absent.
     auxiliary_return: float | None = None
@@ -1285,6 +1281,7 @@ class _CandidateBacktestSession:
         *,
         metrics_mode: str = "selection",
     ) -> list[_CandidateEvaluation]:
+        raise_if_past_deadline()
         round_started = time.perf_counter()
         missing: list[CodeCandidate] = []
         missing_keys: set[tuple[str, bool, str]] = set()
@@ -1334,7 +1331,12 @@ class _CandidateBacktestSession:
                 candidate.representation == "python_fallback" for candidate in missing
             )
             reuse_executor = self._executor is not None
-            if round_worker_count == 1 and not requires_isolation and not reuse_executor:
+            if (
+                round_worker_count == 1
+                and not requires_isolation
+                and not reuse_executor
+                and deadline_remaining_seconds() is None
+            ):
                 task_results = [
                     _evaluate_candidate_task(
                         self.strategy,
@@ -1428,6 +1430,7 @@ class _CandidateBacktestSession:
         behind it are cached.
         """
 
+        raise_if_past_deadline()
         missing = [(key, task) for key, task in tasks if key not in self._fold_cache]
         self.fold_cache_hits += len(tasks) - len(missing)
         if missing:
@@ -1436,7 +1439,7 @@ class _CandidateBacktestSession:
                 if self._executor is not None
                 else _fold_worker_count(len(missing))
             )
-            if worker_count > 1:
+            if worker_count > 1 or deadline_remaining_seconds() is not None:
                 outcomes = self._map_fold_tasks([task for _, task in missing], worker_count)
             else:
                 outcomes = [
@@ -1457,14 +1460,26 @@ class _CandidateBacktestSession:
     def _map_fold_tasks(
         self, tasks: Sequence[_FoldEngineTask], worker_count: int
     ) -> list[_FoldEngineOutcome]:
+        raise_if_past_deadline()
         executor = self._ensure_executor(worker_count)
         futures = [executor.submit(_fold_engine_worker, task) for task in tasks]
-        remaining = deadline_remaining_seconds()
-        # Read back in submission order: which candidate a fold selects must not depend
-        # on which worker happened to finish first.
-        timeout = None if remaining is None else max(1.0, remaining)
+        outcomes: list[_FoldEngineOutcome] = []
         try:
-            return [future.result(timeout=timeout) for future in futures]
+            # Keep submission order, but every future shares the same deadline.
+            for future in futures:
+                raise_if_past_deadline()
+                remaining = deadline_remaining_seconds()
+                outcomes.append(future.result(timeout=None if remaining is None else max(0.0, remaining)))
+                raise_if_past_deadline()
+            return outcomes
+        except TimeoutError as exc:
+            expired = deadline_remaining_seconds()
+            self._terminate_executor()
+            for future in futures:
+                future.cancel()
+            if expired is not None and expired <= 0.0:
+                raise AnalysisDeadlineExceeded("analysis exceeded its total time budget") from exc
+            raise
         except BaseException:
             self._terminate_executor()
             for future in futures:
@@ -1567,6 +1582,7 @@ class _CandidateBacktestSession:
                     feature_estimated_bytes=0,
                 )
 
+        raise_if_past_deadline()
         if any(evaluation is None for evaluation in evaluations):
             raise RuntimeError("candidate worker completed without an evaluation")
         return [evaluation for evaluation in evaluations if evaluation is not None]
@@ -1576,11 +1592,20 @@ class _CandidateBacktestSession:
         if executor is None:
             return
         processes = list(getattr(executor, "_processes", {}).values())
+        manager = getattr(executor, "_executor_manager_thread", None)
         executor.shutdown(wait=False, cancel_futures=True)
         for process in processes:
-            if process.is_alive():
+            if not wait_for_process_exit([process.sentinel], timeout=0):
                 process.terminate()
-            process.join(timeout=5)
+        for process in processes:
+            if not wait_for_process_exit([process.sentinel], timeout=0.1):
+                process.kill()
+                if not wait_for_process_exit([process.sentinel], timeout=1.0):
+                    raise RuntimeError("backtest worker did not stop after termination")
+        # ProcessPoolExecutor's manager owns waitpid; concurrent Process.join calls
+        # can race with it and report an already exited worker as still alive.
+        if manager is not None:
+            manager.join(timeout=1.0)
         self._executor = None
         self._executor_workers = 0
 
@@ -1598,6 +1623,9 @@ class _CandidateBacktestSession:
             "benchmark": {
                 "available": self.benchmark_context.primary_available,
                 "return": self.benchmark_context.total_return,
+                "daily_returns": self.benchmark_context.daily_returns,
+                "sessions": self.benchmark_context.daily_return_sessions,
+                "previous_sessions": self.benchmark_context.daily_return_previous_sessions,
             },
         }
         encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
@@ -1916,10 +1944,11 @@ def _evaluate_candidate_task(
                 and candidate.strategy_ir is not None
                 and candidate.parameters is not None
             ):
-                actions = feature_store.build_actions(
+                ranked = feature_store.build_ranked_actions(
                     candidate.strategy_ir,
                     candidate.parameters,
                 )
+                actions, scores = ranked.actions, ranked.scores
             else:
                 generated_signals = _execute_candidate_code(candidate, rows)
                 actions, scores = _compact_actions_from_signals(prepared_market, generated_signals)
@@ -1980,7 +2009,11 @@ def _evaluate_candidate_task(
 
     metrics = _metrics_from_engine_result(
         engine_result,
-        benchmark_returns=benchmark_context.daily_returns,
+        benchmark_returns=benchmark_daily_returns_for_sessions(
+            benchmark_context,
+            [str(point.date) for point in engine_result.equity_curve[1:]],
+            previous_sessions=[str(point.date) for point in engine_result.equity_curve[:-1]],
+        ),
     )
     metrics = _mask_unavailable_walk_forward_metrics(
         metrics, _walk_forward_sample(rows).status
@@ -1997,15 +2030,17 @@ def _evaluate_candidate_task(
     engine_summary["execution_audit"] = execution_audit
     engine_summary["_storage_execution_ledger"] = _storage_execution_ledger(engine_result)
     available_ticker_count = _available_ticker_count(rows)
-    requested_max_positions = _requested_max_positions(strategy_a)
-    applied_max_positions = _applied_max_positions(strategy_a, available_ticker_count)
+    requested_max_positions = candidate.parameters.max_positions if candidate.parameters is not None else _requested_max_positions(strategy_a)
+    applied_max_positions = _engine_position_sizing(
+        strategy_a, candidate=candidate, available_ticker_count=available_ticker_count
+    ).max_positions
     engine_summary["ai_backtest_context"] = {
         "analysis_initial_capital_krw": CANONICAL_ANALYSIS_INITIAL_CAPITAL,
         "initial_capital_contract": "canonical_analysis_job_sealed_primary_contract",
         "available_ticker_count": available_ticker_count,
         "requested_max_positions": requested_max_positions,
         "applied_max_positions": applied_max_positions,
-        "max_position_pct": _strategy_max_position_pct(strategy_a),
+        "max_position_pct": _engine_risk_controls(strategy_a, candidate=candidate).max_single_position_pct,
         "sizing_contract": "strategy_risk_constraints.max_position_pct",
         "gross_exposure_limit": 1.0,
         "cash_floor": 0.0,
@@ -2339,34 +2374,34 @@ def _fold_engine(
     store: PreparedFeatureStore | None = None,
     prepared: EnginePreparedMarketData | None = None,
 ):
+    raise_if_past_deadline()
     store = store if store is not None else PreparedFeatureStore(context_rows, rows_are_sorted=True)
-    # The engine hands this fold a portfolio in cash on its first tradable session, so
-    # the generator's book restarts there too and treats it as a rotation day. Rows after
-    # the fold are never visited, which is also why no future bar can reach these
-    # decisions - the `tradable_sessions` gate below still blocks orders outside the fold.
+    # A fresh fold first emits a signal at its first tradable close, then fills
+    # at the next open. The whole-window store retains the same rotation calendar.
     ordered_tradable = sorted(tradable_sessions)
+    ranked = store.build_ranked_actions(
+        candidate.strategy_ir, candidate.parameters,
+        reset_session=ordered_tradable[0] if ordered_tradable else None,
+        stop_after_session=ordered_tradable[-1] if ordered_tradable else None,
+    )
     action_map = {
-        (str(row.get("date")), str(row.get("ticker", "")).zfill(6)): action
-        for row, action in zip(
-            store.rows,
-            store.build_actions(
-                candidate.strategy_ir,
-                candidate.parameters,
-                reset_session=ordered_tradable[0] if ordered_tradable else None,
-                stop_after_session=ordered_tradable[-1] if ordered_tradable else None,
-            ),
-            strict=True,
-        )
+        (str(row.get("date")), str(row.get("ticker", "")).zfill(6)): (action, score)
+        for row, action, score in zip(store.rows, ranked.actions, ranked.scores, strict=True)
     }
     if prepared is None:
         prepared = _fold_prepared_market(strategy, engine_rows)
-    actions = [
-        action_map.get((str(row.date), str(row.ticker).zfill(6)), HOLD_SIGNAL_VALUE)
-        if str(row.date) in tradable_sessions else HOLD_SIGNAL_VALUE
+    decisions = [
+        action_map.get((str(row.date), str(row.ticker).zfill(6)), (HOLD_SIGNAL_VALUE, float("nan")))
+        if str(row.date) in tradable_sessions else (HOLD_SIGNAL_VALUE, float("nan"))
         for row in prepared.ohlcv_rows
     ]
-    return _run_candidate_backtest(strategy, candidate, engine_rows, prepared_market=prepared, generated_actions=actions, metrics_mode="selection")
-
+    result = _run_candidate_backtest(
+        strategy, candidate, engine_rows, prepared_market=prepared,
+        generated_actions=[action for action, _ in decisions],
+        generated_scores=[score for _, score in decisions], metrics_mode="selection",
+    )
+    raise_if_past_deadline()
+    return result
 
 def _fold_engine_outcome(
     strategy: AIStrategySpec,
@@ -2475,6 +2510,8 @@ def _walk_forward_aggregate_metrics(
     # simply absent on every five-year run and the acceptance floor fell back to the
     # candidate's own fitted window. `benchmark_returns` covers exactly the evaluation
     # sessions the strategy returns above cover, so the two compound like with like.
+    if len(benchmark_returns) != len(returns):
+        benchmark_returns = ()
     benchmark_return = _compound_returns(benchmark_returns) if benchmark_returns else None
     period_stats = (
         _benchmark_period_stats(returns, benchmark_returns) if benchmark_returns else None
@@ -2537,6 +2574,7 @@ def _run_walk_forward_candidate_backtest(
 
     claimed: set[str] = set()
     returns_by_session: dict[str, float] = {}
+    benchmark_previous_sessions: dict[str, str] = {}
     selections: list[WalkForwardFoldSelection] = []
     fills: list[dict[str, Any]] = []
     trade_pnl: list[float] = []
@@ -2626,6 +2664,9 @@ def _run_walk_forward_candidate_backtest(
         selected_result = fold_results.get(candidate.candidate_id)
         if selected_result is None:
             continue
+        benchmark_previous_sessions.update(zip(
+            targets, (*fold.validation_sessions[-1:], *targets[:-1]), strict=True
+        ))
         claimed.update(target_set)
         returns_by_session.update(selected_result.returns or {})
         fills.extend(selected_result.fills)
@@ -2661,7 +2702,7 @@ def _run_walk_forward_candidate_backtest(
     # here. A verdict that cannot be produced must not void an otherwise complete run.
     try:
         ticker_actions = session.evaluate([selected])[0].ticker_actions
-    except AnalysisCancelled:
+    except (AnalysisCancelled, AnalysisDeadlineExceeded):
         raise
     except Exception:  # noqa: BLE001 - display-only; the walk-forward result stands.
         ticker_actions = []
@@ -2676,7 +2717,10 @@ def _run_walk_forward_candidate_backtest(
         _walk_forward_aggregate_metrics(
             list(daily_returns.values()),
             trade_pnl,
-            benchmark_daily_returns_for_sessions(session.benchmark_context, ordered_sessions),
+            benchmark_daily_returns_for_sessions(
+                session.benchmark_context, ordered_sessions,
+                previous_sessions=[benchmark_previous_sessions[item] for item in ordered_sessions],
+            ),
         )
         if ready
         else None
@@ -2705,7 +2749,8 @@ def _run_walk_forward_candidate_backtest(
                 [candidate_returns[item] for item in candidate_sessions],
                 trade_pnl_by_candidate[proposed.candidate_id],
                 benchmark_daily_returns_for_sessions(
-                    session.benchmark_context, candidate_sessions
+                    session.benchmark_context, candidate_sessions,
+                    previous_sessions=[benchmark_previous_sessions[item] for item in candidate_sessions],
                 ),
             )
             if candidate_ready
@@ -2713,6 +2758,10 @@ def _run_walk_forward_candidate_backtest(
         )
         engine_summaries_by_candidate[proposed.candidate_id] = {
             "walk_forward_policy": "rolling_selection_policy",
+            "benchmark_provenance": _benchmark_provenance(
+                session.benchmark_context, candidate_sessions,
+                previous_sessions=[benchmark_previous_sessions[item] for item in candidate_sessions],
+            ),
             "aggregate_oos_result": (
                 {
                     "availability": "available",
@@ -2764,6 +2813,10 @@ def _run_walk_forward_candidate_backtest(
             "unavailable_reason": NO_CLOSED_TRADE_WIN_RATE,
         }
     engine_summary = {
+        "benchmark_provenance": _benchmark_provenance(
+            session.benchmark_context, ordered_sessions,
+            previous_sessions=[benchmark_previous_sessions[item] for item in ordered_sessions],
+        ),
         "walk_forward_sample": _walk_forward_metadata(_walk_forward_sample(rows), policy),
         "walk_forward_policy": "rolling_selection_policy",
         "initial_capital": CANONICAL_ANALYSIS_INITIAL_CAPITAL,
@@ -2782,6 +2835,18 @@ def _run_walk_forward_candidate_backtest(
         # there; a user comparing a one-year and a five-year answer saw two different
         # units under one label. Both legs stay visible as `filled_order_legs`.
         "effective_trade_count": executed_buy_count,
+        "reliability_reasons": sorted({reason for ledger in evaluation_ledgers for reason in ledger.get("reliability_reasons", [])}),
+        "data_capabilities": {
+            "terminal_position_recovery": "unsupported_source_unavailable"
+            if any(ledger.get("terminal_open_positions", 0) for ledger in evaluation_ledgers)
+            else "not_required",
+        },
+        "fold_boundary": {
+            "initial_account": "cash",
+            "terminal_open_positions": sum(ledger.get("terminal_open_positions", 0) for ledger in evaluation_ledgers),
+            "terminal_liquidation_costs_included": not any(ledger.get("terminal_open_positions", 0) for ledger in evaluation_ledgers),
+            "return_interpretation": "independent_fold_mark_to_market",
+        },
         "filled_order_legs": len(fills),
         "executed_sell_count": len(fills) - executed_buy_count,
         "closed_trade_count": len(trade_pnl),
@@ -2814,6 +2879,8 @@ def _run_walk_forward_candidate_backtest(
             strategy,
             rows,
             benchmark_context=session.benchmark_context,
+            benchmark_sessions=ordered_sessions,
+            benchmark_previous_sessions=[benchmark_previous_sessions[item] for item in ordered_sessions],
         ),
         feature_coverage=walk_forward_coverage,
         fallback_reasons=walk_forward_reasons,
@@ -2898,7 +2965,13 @@ def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         # walk-forward was READY, which meant a run that missed the acceptance floor
         # stopped at the first pass and reported the miss instead of trying to clear it.
         # Each extra round widens the search, and `candidate_count` prices that in.
-        self_improvement_rounds = campaign.budget.max_rounds
+        sealed_candidates = bool(
+            strategy_a.risk_constraints.get("research_snapshot_hash")
+            or strategy_a.risk_constraints.get("sealed_candidate_ids")
+        )
+        self_improvement_rounds = 0 if sealed_candidates else campaign.budget.max_rounds
+        if sealed_candidates:
+            campaign.stop("sealed_candidate_set")
         rounds_run = 0
         # A round now only evaluates the candidates it adds - `session.run_fold_engines`
         # memoises every (candidate, fold) pair - and spreads them over the worker pool,
@@ -3222,7 +3295,11 @@ def _storage_execution_ledger(engine_result: Any) -> dict[str, Any]:
         positions.append({"date": fill.get("date"), "ticker": ticker, "quantity": quantities[ticker], "fill_quantity": quantity, "side": fill.get("side"), "reason": fill.get("reason")})
     equity = [point.as_dict() for point in getattr(engine_result, "equity_curve", [])]
     ledger = {"signals": signals, "order_audit": order_audit, "fills": fills, "positions": positions, "trades": trades, "equity": equity}
-    ledger["source_event_count"] = sum(len(value) for value in ledger.values() if isinstance(value, list))
+    summary = getattr(engine_result, "summary", {}) or {}
+    ledger["reliability_reasons"] = list(summary.get("reliability_reasons", []))
+    ledger["data_capabilities"] = dict(summary.get("data_capabilities", {}))
+    ledger["terminal_open_positions"] = int(summary.get("open_positions", 0))
+    ledger["source_event_count"] = sum(len(ledger[key]) for key in ("signals", "order_audit", "fills", "positions", "trades", "equity"))
     ledger["source_event_hash"] = sha256(
         json.dumps(
             {key: ledger[key] for key in ("signals", "order_audit", "fills", "positions", "trades", "equity")},
@@ -3434,7 +3511,7 @@ def _engine_strategy_spec(
             )
         ],
         position_sizing=_engine_position_sizing(
-            strategy,
+            strategy, candidate=candidate,
             available_ticker_count=available_ticker_count,
         ),
         risk_controls=_engine_risk_controls(strategy, candidate=candidate),
@@ -3462,9 +3539,11 @@ def _engine_position_sizing(
     strategy: AIStrategySpec,
     *,
     available_ticker_count: int | None = None,
+    candidate: CodeCandidate | None = None,
 ):
-    applied_max_positions = _applied_max_positions(strategy, available_ticker_count)
-    return EnginePositionSizing(max_positions=applied_max_positions)
+    requested = candidate.parameters.max_positions if candidate is not None and candidate.parameters is not None else _requested_max_positions(strategy)
+    applied = min(requested, available_ticker_count) if available_ticker_count is not None and available_ticker_count > 0 else requested
+    return EnginePositionSizing(max_positions=applied)
 
 
 def _engine_risk_controls(strategy: AIStrategySpec, *, candidate: CodeCandidate | None = None):
@@ -3484,23 +3563,34 @@ def _engine_risk_controls(strategy: AIStrategySpec, *, candidate: CodeCandidate 
         raw.get("stop_loss_pct"), "stop_loss_pct", upper_bound=1.0
     )
     take_profit_pct = _optional_positive_float(raw.get("take_profit_pct"), "take_profit_pct")
+    trailing_stop_pct = _optional_positive_float(raw.get("trailing_stop_pct"), "trailing_stop_pct", upper_bound=0.75)
     if parameters is not None:
         stop_loss_pct = parameters.stop_loss_pct
         take_profit_pct = parameters.take_profit_pct
+        trailing_stop_pct = parameters.trailing_stop_pct
+    if candidate is not None and candidate.strategy_ir is not None:
+        controls = controls.model_copy(update={"holding_days": candidate.strategy_ir.holding_days})
     max_position_pct = _optional_positive_float(
         raw.get("max_position_pct"), "max_position_pct", upper_bound=1.0
     )
-    if stop_loss_pct is not None:
+    if parameters is not None and (parameters.blueprint_id or raw.get("research_snapshot_hash")):
+        max_position_pct = 1.0 / parameters.max_positions
+    if parameters is not None or "stop_loss_pct" in raw:
         controls = controls.model_copy(update={"stop_loss_pct": stop_loss_pct})
     if take_profit_pct is not None:
         controls = controls.model_copy(update={"take_profit_pct": take_profit_pct})
+    if trailing_stop_pct is not None:
+        controls = controls.model_copy(update={"trailing_stop_pct": trailing_stop_pct})
     if max_position_pct is not None:
         controls = controls.model_copy(update={"max_single_position_pct": max_position_pct})
     return controls
 
 
 def _requested_max_positions(strategy: AIStrategySpec) -> int:
-    return max(1, math.ceil(1.0 / _strategy_max_position_pct(strategy)))
+    return _shared_requested_max_positions(
+        _strategy_max_position_pct(strategy),
+        explicit_max_positions=strategy.risk_constraints.get("max_positions"),
+    )
 
 
 def _applied_max_positions(
@@ -3723,7 +3813,8 @@ def _metrics_from_engine_result(
         if benchmark_returns is not None
         else _benchmark_daily_returns(price_rows or ())
     )
-    comparison_length = min(len(daily_returns), len(resolved_benchmark_returns))
+    benchmark_complete = bool(daily_returns) and len(daily_returns) == len(resolved_benchmark_returns)
+    comparison_length = len(daily_returns) if benchmark_complete else 0
     strategy_comparison_returns = daily_returns[:comparison_length]
     benchmark_comparison_returns = resolved_benchmark_returns[:comparison_length]
     comparison_split_index = min(split_index, comparison_length)
@@ -3745,7 +3836,7 @@ def _metrics_from_engine_result(
         strategy_comparison_returns[comparison_split_index:],
         out_sample_benchmark_returns,
     )
-    return BacktestMetrics(
+    metrics = BacktestMetrics(
         sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
         max_drawdown=round(_summary_float(summary, "max_drawdown"), METRIC_ROUND_DIGITS),
         win_rate=round(_summary_float(summary, "win_rate"), METRIC_ROUND_DIGITS),
@@ -3797,6 +3888,12 @@ def _metrics_from_engine_result(
             out_sample_period_stats.loss_rate, METRIC_ROUND_DIGITS
         ),
     )
+    if not benchmark_complete:
+        return metrics.model_copy(update={
+            field: None for field in BacktestMetrics.model_fields
+            if "benchmark" in field or field in {"in_sample_excess_return", "out_sample_excess_return"}
+        })
+    return metrics
 
 
 def _public_equity_curve(engine_result) -> list[BacktestEquityPoint]:
@@ -4115,87 +4212,103 @@ def _build_benchmark_context(
     price_rows: Sequence[Mapping[str, Any]],
     official_benchmark: Mapping[str, Any] | None = None,
 ) -> _BenchmarkContext:
-    """Keep auxiliary proxy legs separate from the optional official primary series."""
-
+    """Use one selected series for selection, evaluation, and its provenance."""
     auxiliary_curve, _ = _equal_weight_benchmark_curve(price_rows)
-    selection_days = max(
-        1,
-        int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION),
-    )
-    selection_index = min(max(0, selection_days - 1), len(auxiliary_curve) - 1)
-    selection_return = (
-        float(auxiliary_curve[selection_index].cumulative_return) if auxiliary_curve else 0.0
-    )
-    total_return, coverage, unavailable_reason = _official_benchmark_total_return(
+    official_curve, coverage, unavailable_reason = _official_benchmark_curve(
         price_rows, official_benchmark
     )
-    return _BenchmarkContext(
-        daily_returns=tuple(_daily_returns_from_benchmark_curve(auxiliary_curve)),
+    curve = official_curve if official_curve else auxiliary_curve
+    sessions = sorted({str(row.get("date")) for row in price_rows if row.get("date")})
+    previous_by_session = dict(zip(sessions[1:], sessions[:-1], strict=True))
+    # A missing official observation must not turn a multi-day move into a daily one.
+    observations = [
+        (str(current.date), str(previous.date), value)
+        for previous, current, value in zip(
+            curve[:-1], curve[1:], _daily_returns_from_benchmark_curve(curve), strict=True
+        )
+        if previous_by_session.get(str(current.date)) == str(previous.date)
+    ]
+    selection_days = max(1, int(len(sessions) * BACKTEST_SPLIT_FRACTION))
+    context = _BenchmarkContext(
+        daily_returns=tuple(value for _, _, value in observations),
         selection_days=selection_days,
-        selection_return=selection_return,
-        total_return=total_return,
-        primary_available=total_return is not None,
+        selection_return=None,
+        total_return=float(official_curve[-1].cumulative_return) if official_curve else None,
+        primary_available=bool(official_curve),
         primary_unavailable_reason=unavailable_reason,
         auxiliary_label=AUXILIARY_BENCHMARK_LABEL,
         primary_coverage=coverage,
-        # The curve's first point is the base (cumulative_return 0.0) and carries no
-        # daily return, so the sessions line up with ``daily_returns`` from index 1.
-        daily_return_sessions=tuple(str(point.date) for point in auxiliary_curve[1:]),
-        auxiliary_return=(
-            float(auxiliary_curve[-1].cumulative_return) if auxiliary_curve else None
+        daily_return_sessions=tuple(current for current, _, _ in observations),
+        daily_return_previous_sessions=tuple(previous for _, previous, _ in observations),
+        auxiliary_return=float(auxiliary_curve[-1].cumulative_return) if auxiliary_curve else None,
+    )
+    return replace(
+        context,
+        selection_return=(
+            benchmark_return_for_sessions(context, sessions[1:selection_days])
+            if selection_days > 1 else 0.0
         ),
     )
 
 
 def benchmark_daily_returns_for_sessions(
     context: _BenchmarkContext | None,
-    sessions: Iterable[str],
+    sessions: Sequence[str],
+    *,
+    previous_sessions: Sequence[str] | None = None,
 ) -> list[float]:
-    """The auxiliary proxy's daily returns restricted to ``sessions``, in date order.
-
-    Interface for the walk-forward aggregate, which measures a strategy over the
-    evaluation sessions of every fold rather than the whole window: pass those
-    sessions and compare like with like. Returns an empty list when the proxy does
-    not cover them.
-    """
-
-    if context is None or not context.daily_return_sessions:
+    """Return every requested daily interval in request order, or none."""
+    wanted = tuple(str(session) for session in sessions)
+    if (
+        context is None
+        or not wanted
+        or len(set(wanted)) != len(wanted)
+        or len(context.daily_return_sessions) != len(context.daily_returns)
+        or len(context.daily_return_previous_sessions) != len(context.daily_returns)
+        or len(set(context.daily_return_sessions)) != len(context.daily_return_sessions)
+    ):
         return []
-    wanted = {str(session) for session in sessions}
-    return [
-        value
-        for session, value in zip(
-            context.daily_return_sessions, context.daily_returns, strict=False
-        )
-        if session in wanted
-    ]
+    observations = dict(zip(context.daily_return_sessions, context.daily_returns, strict=True))
+    if any(session not in observations for session in wanted):
+        return []
+    if previous_sessions is not None:
+        previous = tuple(str(session) for session in previous_sessions)
+        expected = dict(zip(
+            context.daily_return_sessions, context.daily_return_previous_sessions, strict=True
+        ))
+        if len(previous) != len(wanted) or any(
+            expected[session] != predecessor
+            for session, predecessor in zip(wanted, previous, strict=True)
+        ):
+            return []
+    return [observations[session] for session in wanted]
 
 
 def benchmark_return_for_sessions(
     context: _BenchmarkContext | None,
     sessions: Iterable[str],
 ) -> float | None:
-    """The auxiliary proxy's compounded return over exactly ``sessions``."""
+    """The selected benchmark's compounded return over exactly ``sessions``."""
 
     returns = benchmark_daily_returns_for_sessions(context, sessions)
     return _compound_returns(returns) if returns else None
 
 
-def _official_benchmark_total_return(
+def _official_benchmark_curve(
     price_rows: Sequence[Mapping[str, Any]],
     official_benchmark: Mapping[str, Any] | None,
-) -> tuple[float | None, dict[str, Any] | None, str | None]:
+) -> tuple[list[BacktestEquityPoint], dict[str, Any] | None, str | None]:
     if not isinstance(official_benchmark, Mapping) or not official_benchmark:
-        return None, None, PRIMARY_BENCHMARK_MISSING_INPUT_REASON
+        return [], None, PRIMARY_BENCHMARK_MISSING_INPUT_REASON
     if not official_benchmark.get("available"):
         # This value reaches public metric details.  The source adapter may have
         # caught a driver exception, so its explanatory text must never cross this
         # boundary even if an older adapter or persisted job supplied it.
-        return None, None, PRIMARY_BENCHMARK_SOURCE_UNAVAILABLE_REASON
+        return [], None, PRIMARY_BENCHMARK_SOURCE_UNAVAILABLE_REASON
 
     sessions = sorted({str(row.get("date")) for row in price_rows if row.get("date")})
     if not sessions:
-        return None, None, "the backtest window has no sessions to measure a benchmark over"
+        return [], None, "the backtest window has no sessions to measure a benchmark over"
     kospi = _official_benchmark_levels(official_benchmark.get("kospi_tr"), sessions)
     kosdaq = _official_benchmark_levels(official_benchmark.get("kosdaq_tr"), sessions)
     covered = sorted(set(kospi) & set(kosdaq))
@@ -4210,17 +4323,17 @@ def _official_benchmark_total_return(
         "last_session_covered": bool(covered) and covered[-1] == sessions[-1],
     }
     if not covered:
-        return None, coverage, (
+        return [], coverage, (
             "official KOSPI and KOSDAQ TR levels share no session with the backtest window "
             f"({sessions[0]}..{sessions[-1]})"
         )
     if not coverage["first_session_covered"] or not coverage["last_session_covered"]:
-        return None, coverage, (
+        return [], coverage, (
             "official TR levels do not cover both endpoints of the backtest window "
             f"({sessions[0]}..{sessions[-1]}); covered {covered[0]}..{covered[-1]}"
         )
     if coverage["coverage_ratio"] < OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE:
-        return None, coverage, (
+        return [], coverage, (
             f"official TR levels cover {len(covered)}/{len(sessions)} backtest sessions, "
             f"below the required {OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE:.0%}"
         )
@@ -4228,12 +4341,12 @@ def _official_benchmark_total_return(
         official_benchmark.get("monthly_weights"), covered
     )
     try:
-        _, total_return = _official_krx_tr_benchmark_curve(kospi, kosdaq, weights)
+        curve, total_return = _official_krx_tr_benchmark_curve(kospi, kosdaq, weights)
     except ValueError as error:
-        return None, coverage, f"official benchmark curve could not be computed: {error}"
+        return [], coverage, f"official benchmark curve could not be computed: {error}"
     if total_return is None:
-        return None, coverage, "official benchmark curve produced no observations"
-    return float(total_return), coverage, None
+        return [], coverage, "official benchmark curve produced no observations"
+    return curve, coverage, None
 
 
 def _official_benchmark_levels(
@@ -4304,12 +4417,26 @@ def _previous_month(month: str) -> str:
     return f"{year:04d}-{month_number - 1:02d}"
 
 
-def _benchmark_provenance(context: _BenchmarkContext) -> dict[str, Any]:
+def _benchmark_provenance(
+    context: _BenchmarkContext,
+    sessions: Sequence[str] | None = None,
+    *,
+    previous_sessions: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    source = "primary" if context.primary_available else "auxiliary"
+    comparison_return = context.total_return if context.primary_available else context.auxiliary_return
+    if sessions is not None:
+        returns = benchmark_daily_returns_for_sessions(
+            context, sessions, previous_sessions=previous_sessions
+        )
+        comparison_return = _compound_returns(returns) if returns else None
+    comparison_available = comparison_return is not None
     return {
         "primary": {
             "label": PRIMARY_BENCHMARK_LABEL,
             "method": PRIMARY_BENCHMARK_METHOD,
             "available": context.primary_available,
+            "used_for_acceptance": source == "primary" and comparison_available,
             "official_series_and_lagged_weights": context.primary_available,
             "return": context.total_return if context.primary_available else None,
             "unavailable_reason": context.primary_unavailable_reason,
@@ -4324,11 +4451,19 @@ def _benchmark_provenance(context: _BenchmarkContext) -> dict[str, Any]:
             "method": AUXILIARY_BENCHMARK_METHOD,
             "warning": AUXILIARY_BENCHMARK_WARNING,
             "return": context.auxiliary_return,
-            # Which series the acceptance floor actually judged against. The official
-            # TR view is absent from this warehouse, and refusing to judge at all made
-            # every automatic run fail on a data gap rather than on its performance.
-            "used_for_acceptance": not context.primary_available
-            and context.auxiliary_return is not None,
+            "used_for_acceptance": source == "auxiliary" and comparison_available,
+        },
+        "comparison": {
+            "source": source,
+            "period": "walk_forward_evaluation" if sessions is not None else "full_window",
+            "available": comparison_available,
+            "return": comparison_return,
+            "unavailable_reason": (
+                None if comparison_available else "benchmark_evaluation_intervals_incomplete"
+            ),
+            "session_count": len(sessions) if sessions is not None else len(context.daily_returns),
+            "first_session": str(sessions[0]) if sessions else None,
+            "last_session": str(sessions[-1]) if sessions else None,
         },
     }
 
@@ -4568,20 +4703,18 @@ def _floor_metrics(result: CandidateBacktestResult) -> BacktestMetrics:
     if aggregate is None:
         return metrics
     update: dict[str, Any] = {
+        "total_return": aggregate.total_return,
+        "in_sample_benchmark_return": None,
         "out_sample_sharpe": aggregate.out_sample_sharpe,
         "out_sample_return": aggregate.out_sample_return,
         "max_drawdown": aggregate.max_drawdown,
         "selection_adjusted_sharpe": aggregate.selection_adjusted_sharpe,
     }
-    # Benchmark comparisons belong to the same rolling evaluation as the returns above,
-    # not to the whole window the candidate was also fitted on. The aggregate carries
-    # them once it has measured them (see the walk-forward aggregation); until then the
-    # candidate's own window figures stand rather than the floor reading a blank.
+    # An unavailable OOS benchmark must never inherit the fitted window.
     update.update(
         {
             field: getattr(aggregate, field)
             for field in _BENCHMARK_AGGREGATE_FIELDS
-            if getattr(aggregate, field) is not None
         }
     )
     return metrics.model_copy(update=update)
@@ -4654,9 +4787,14 @@ def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
     payload = getattr(result, "backtest_payload", {}) or {}
     benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
     primary = benchmark.get("primary") if isinstance(benchmark, Mapping) else None
+    rolling = _ready_aggregate_metrics(result) is not None
     if isinstance(primary, Mapping) and primary.get("available"):
         reasons.extend(
-            _benchmark_objective_reasons(metrics, benchmark_return=primary.get("return"))
+            _benchmark_objective_reasons(
+                metrics, benchmark_return=(
+                    metrics.out_sample_benchmark_return if rolling else primary.get("return")
+                )
+            )
         )
         return reasons
     # This warehouse has no official KOSPI/KOSDAQ TR view, and refusing to judge on
@@ -4665,9 +4803,13 @@ def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
     # PIT-universe proxy instead, and say so in every reason it produced. The absence
     # of the official series stays disclosed in ``benchmark.primary``.
     auxiliary = benchmark.get("auxiliary") if isinstance(benchmark, Mapping) else None
-    proxy_return = auxiliary.get("return") if isinstance(auxiliary, Mapping) else None
+    proxy_return = (
+        metrics.out_sample_benchmark_return if rolling
+        else auxiliary.get("return") if isinstance(auxiliary, Mapping) else None
+    )
     if not _is_numeric_metric(proxy_return):
         reasons.append(
+            "동일 미사용 구간의 벤치마크 수익률을 계산하지 못했습니다" if rolling else
             "공식 KOSPI/KOSDAQ TR 벤치마크도, 유니버스 동일가중 프록시도 확보하지 못했습니다"
         )
         return reasons
@@ -4815,7 +4957,7 @@ def _benchmark_objective_reasons(
     if parsed_benchmark is None:
         reasons.append("official benchmark aggregate is unavailable")
     elif metrics.total_return <= parsed_benchmark:
-        reasons.append(f"전체 수익률 {metrics.total_return:.2%} <= 벤치마크 {parsed_benchmark:.2%}")
+        reasons.append(f"비교 구간 수익률 {metrics.total_return:.2%} <= 벤치마크 {parsed_benchmark:.2%}")
     return reasons
 
 
@@ -5093,6 +5235,8 @@ def _backtest_payload(
     rows: Sequence[Mapping[str, Any]],
     *,
     benchmark_context: _BenchmarkContext,
+    benchmark_sessions: Sequence[str] | None = None,
+    benchmark_previous_sessions: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     tickers = sorted({str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6) for row in rows})
     walk_forward = _walk_forward_sample(rows)
@@ -5105,7 +5249,9 @@ def _backtest_payload(
         "last_date": str(rows[-1].get("date")) if rows else None,
         "analysis_initial_capital_krw": CANONICAL_ANALYSIS_INITIAL_CAPITAL,
         "initial_capital_contract": "canonical_analysis_job_sealed_primary_contract",
-        "benchmark": _benchmark_provenance(benchmark_context),
+        "benchmark": _benchmark_provenance(
+            benchmark_context, benchmark_sessions, previous_sessions=benchmark_previous_sessions
+        ),
         "walk_forward_sample": _walk_forward_metadata(
             walk_forward, _walk_forward_split_policy(rows)
         ),

@@ -33,6 +33,8 @@ OHLCV_FIELDS = {"open", "high", "low", "close", "volume"}
 REQUIRED_OHLCV_COLUMNS = ["date", "ticker", "open", "high", "low", "close", "volume"]
 METRIC_ID_COLUMNS = {"date", "ticker", "name", "market"}
 TALIB_BASE_INPUTS = {"open", "high", "low", "close", "volume"}
+# Internal eligibility: enter when flat; exit when held. Public actions remain BUY/SELL.
+ENTRY_AND_EXIT_ACTION = 2
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,8 @@ class Position:
     entry_cost: float
     last_price: float
     entry_reason: str = ""
+    highest_close: float | None = None
+    holding_sessions: int = 0
 
 
 @dataclass(frozen=True)
@@ -803,6 +807,13 @@ class BacktestEngine:
             order_audit.extend(forced_audit)
             forced_exits += len(forced_trades)
 
+            # Track every close actually held, including days an exit cannot fill.
+            for ticker, position in positions.items():
+                if ticker in today_bars:
+                    close = today_bars[ticker].close
+                    position.highest_close = max(position.highest_close or close, close)
+                    position.holding_sessions += 1
+
             generated_orders, generated_signals, generated_audit = self._generate_signals_for_date(
                 current_date, today_bars, positions, metrics_by_key, previous_metrics_by_key, pending_orders
             )
@@ -1099,6 +1110,9 @@ class BacktestEngine:
                     raise ValueError("split ratio produced no whole shares")
                 position.quantity = new_quantity
                 position.entry_price *= old_quantity / new_quantity
+                position.last_price *= old_quantity / new_quantity
+                if position.highest_close is not None:
+                    position.highest_close *= old_quantity / new_quantity
                 position.entry_notional = position.quantity * position.entry_price
                 status, amount = "applied_split", None
             elif event.event_type == "cash_dividend":
@@ -1268,7 +1282,7 @@ class BacktestEngine:
             slippage_cost = float(slippage_decimal)
             entry_cost = commission_cost
             cash -= notional + entry_cost
-            positions[order.ticker] = Position(order.ticker, quantity, current_date, buy_price, notional, entry_cost, bar.close, order.reason)
+            positions[order.ticker] = Position(order.ticker, quantity, current_date, buy_price, notional, entry_cost, bar.close, order.reason, highest_close=bar.close)
             audit.append(OrderAuditRecord(date=current_date.isoformat(), ticker=order.ticker, side=order.side, status="executed",
                 signal_date=order.signal_date.isoformat(), reason=order.reason, price=round(buy_price, 6), quantity=quantity,
                 requested_quantity=requested_quantity, filled_quantity=quantity,
@@ -1429,6 +1443,10 @@ class BacktestEngine:
             row_index = row_index_by_key[(current_date, ticker)]
             action_value = int(self.generated_actions[row_index])
             has_position = ticker in positions
+            if action_value not in (-1, 0, 1, ENTRY_AND_EXIT_ACTION):
+                raise ValueError(f"Unsupported generated action: {action_value}")
+            if action_value == ENTRY_AND_EXIT_ACTION:
+                action_value = -1 if has_position else 1
             if action_value == 1 and not has_position:
                 action = "buy"
                 reason = "generated BUY signal"
@@ -1541,12 +1559,18 @@ class BacktestEngine:
         return score if math.isfinite(score) else None
 
     def _risk_exit_reason(self, position: Position, bar: OhlcvBar) -> str | None:
+        holding_days = self.spec.risk_controls.holding_days
+        if holding_days is not None and position.holding_sessions >= holding_days:
+            return f"holding_period_{holding_days}_sessions"
         stop_loss = self.spec.risk_controls.stop_loss_pct
         if stop_loss and bar.close <= position.entry_price * (1 - stop_loss):
             return f"daily_close_stop_loss_{stop_loss}"
         take_profit = self.spec.risk_controls.take_profit_pct
         if take_profit and bar.close >= position.entry_price * (1 + take_profit):
             return f"daily_close_take_profit_{take_profit}"
+        trailing_stop = self.spec.risk_controls.trailing_stop_pct
+        if trailing_stop and position.highest_close is not None and bar.close < position.highest_close * (1 - trailing_stop):
+            return f"daily_close_trailing_stop_{trailing_stop}"
         return None
 
     @staticmethod

@@ -166,7 +166,8 @@ def test_rank_only_and_consecutive_conditions_emit_compiled_actions() -> None:
     )
     rank_actions = PreparedFeatureStore(rows).build_actions(rank_ir, parameters)
     assert rank_actions[1] == 1
-    assert sum(action == 1 for action in rank_actions) == 1
+    # Eligibility repeats while the condition holds; only actual fills consume slots.
+    assert sum(action == 1 for action in rank_actions) == 4
 
     consecutive_ir = rank_ir.model_copy(
         update={
@@ -182,13 +183,12 @@ def test_rank_only_and_consecutive_conditions_emit_compiled_actions() -> None:
         }
     )
     consecutive_actions = PreparedFeatureStore(rows).build_actions(consecutive_ir, parameters)
-    assert sum(action == 1 for action in consecutive_actions) == 1
+    assert sum(action == 1 for action in consecutive_actions) == 6
     assert consecutive_actions[2] == 1
 
 
-def test_structured_profile_actions_match_legacy_reference() -> None:
+def test_structured_profile_eligibility_uses_only_available_history() -> None:
     strategy = _strategy()
-    plan = build_code_generation_plan(strategy, map_strategy_features(strategy))
     rows = _rows(days=80, tickers=3)
     profiles = [
         "long_regime_momentum",
@@ -203,39 +203,35 @@ def test_structured_profile_actions_match_legacy_reference() -> None:
         "return_to_volatility",
         "cash_preserving_trend",
     ]
-    action_values = {"BUY": 1, "SELL": -1, "HOLD": 0}
     store = PreparedFeatureStore(rows)
+    prefix = PreparedFeatureStore(rows[:120])
     strategy_ir = generate_loop3_candidates(
-        Loop3Request(strategy=strategy, variant="A", trace_id="legacy-equivalence")
+        Loop3Request(strategy=strategy, variant="A", trace_id="profile-causality")
     ).strategy_ir
-
     for profile in profiles:
         parameters = CandidateParameters(
-            profile=profile,  # type: ignore[arg-type]
-            lookback=20,
-            threshold=0.05,
-            stop_loss_pct=0.08,
-            take_profit_pct=0.3,
-            max_positions=2,
+            profile=profile, lookback=20, threshold=0.05,
+            stop_loss_pct=0.08, take_profit_pct=0.3, max_positions=2,
         )
+        full = store.build_ranked_actions(strategy_ir, parameters)
+        truncated = prefix.build_ranked_actions(strategy_ir, parameters)
+        assert list(full.actions[:120]) == list(truncated.actions)
+        assert all(a == b or (math.isnan(a) and math.isnan(b))
+                   for a, b in zip(full.scores[:120], truncated.scores, strict=True))
+        # The first entry occurs while both books are flat, so it checks the
+        # profile's entry rule independently of the execution-state correction.
+        plan = build_code_generation_plan(strategy, map_strategy_features(strategy))
         namespace: dict[str, object] = {}
-        exec(
-            _render_adaptive_signal_code(
-                strategy_id=strategy.strategy_id,
-                plan=plan,
-                profile=profile,
-                lookback=parameters.lookback,
-                threshold=parameters.threshold,
-                stop_loss=parameters.stop_loss_pct,
-                take_profit=parameters.take_profit_pct,
-                max_positions=parameters.max_positions,
-            ),
-            namespace,
-        )
-        legacy_signals = namespace["build_signals"](rows)  # type: ignore[operator]
-        legacy_actions = [action_values[str(signal["action"])] for signal in legacy_signals]
-
-        assert list(store.build_actions(strategy_ir, parameters)) == legacy_actions
+        exec(_render_adaptive_signal_code(
+            strategy_id=strategy.strategy_id, plan=plan, profile=profile,
+            lookback=parameters.lookback, threshold=parameters.threshold,
+            stop_loss=parameters.stop_loss_pct, take_profit=parameters.take_profit_pct,
+            max_positions=parameters.max_positions,
+        ), namespace)
+        legacy = namespace["build_signals"](rows)
+        first_legacy_entry = next((item["date"] for item in legacy if item["action"] == "BUY"), None)
+        first_eligible_entry = next((rows[index]["date"] for index, action in enumerate(full.actions) if action in (1, 2)), None)
+        assert first_eligible_entry == first_legacy_entry, profile
 
 
 def test_worker_count_and_disk_cache_are_deterministic(monkeypatch, tmp_path) -> None:
@@ -1024,17 +1020,6 @@ def test_candidate_stop_and_target_reach_the_engine():
     assert plain.take_profit_pct == 0.2
 
 
-def test_action_generator_no_longer_emits_its_own_stop_loss_exits():
-    """Only rule exits and the profile's trailing stop come from the generator."""
-    import inspect
-
-    from ai_graph.nodes import backtest_features
-
-    source = inspect.getsource(backtest_features.PreparedFeatureStore)
-    assert "parameters.stop_loss_pct" not in source
-    assert "parameters.take_profit_pct" not in source
-    # The trailing stop is the profile's own rule and the engine does not model it.
-    assert "trailing_stop" in source
 
 
 def test_canonical_analysis_contract_seals_one_hundred_million_krw() -> None:
@@ -1328,11 +1313,23 @@ def _contention_parameters() -> CandidateParameters:
 
 
 def _entered_tickers(store: PreparedFeatureStore, ranked) -> list[str]:
-    return [
-        store.tickers[index]
-        for index, action in enumerate(ranked.actions)
-        if action == 1
-    ]
+    strategy = _strategy().model_copy(update={"risk_constraints": {
+        "max_position_pct": 1.0, "stop_loss_pct": 0.5,
+    }})
+    candidate = CodeCandidate(
+        candidate_id="contention-fills", variant="A",
+        code="def build_signals(prices):\n    return []", validation_ok=True,
+        representation="structured", parameters=_contention_parameters(),
+        strategy_ir=_contention_ir(Condition(left="rsi", operator=ConditionOperator.LTE, right=100.0)),
+    )
+    result = backtest_node._run_candidate_backtest(
+        strategy, candidate, store.rows,
+        prepared_market=backtest_node._fold_prepared_market(strategy, store.rows),
+        generated_actions=ranked.actions, generated_scores=ranked.scores,
+        metrics_mode="selection",
+    )
+    return [event.ticker for event in result.order_audit
+            if event.side == "buy" and event.status == "executed"]
 
 
 def test_compiled_entry_slot_goes_to_the_strongest_signal_not_the_lowest_ticker() -> None:
@@ -1346,8 +1343,8 @@ def test_compiled_entry_slot_goes_to_the_strongest_signal_not_the_lowest_ticker(
     # All three clear rsi <= 40 on the same session and only one slot exists. The
     # deepest oversold reading wins; 000010 used to win on its ticker code alone.
     assert _entered_tickers(store, ranked) == ["000990"]
-    entered = next(index for index, action in enumerate(ranked.actions) if action == 1)
-    assert ranked.scores[entered] == pytest.approx(0.75)
+    strongest = next(index for index, row in enumerate(store.rows) if row["ticker"] == "000990" and ranked.actions[index] in (1, 2))
+    assert ranked.scores[strongest] == pytest.approx(0.75)
 
 
 def test_compiled_entry_slot_falls_back_to_ticker_order_without_a_measurable_score() -> None:

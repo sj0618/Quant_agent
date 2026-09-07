@@ -9,14 +9,27 @@ DEFAULT_MAX_POSITIONS = 10
 DEFAULT_FIXTURE_TICKER = "005930"
 
 
-def requested_max_positions(max_position_pct: float | None) -> int:
+def requested_max_positions(
+    max_position_pct: float | None, *, explicit_max_positions: object = None
+) -> int:
+    if explicit_max_positions is not None:
+        if isinstance(explicit_max_positions, bool):
+            raise ValueError("max_positions must be an integer in [1, 1000]")
+        try:
+            value = float(explicit_max_positions)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_positions must be an integer in [1, 1000]") from exc
+        if not math.isfinite(value) or not value.is_integer() or not 1 <= value <= 1000:
+            raise ValueError("max_positions must be an integer in [1, 1000]")
+        return int(value)
     if max_position_pct is None:
         return DEFAULT_MAX_POSITIONS
     return max(1, math.ceil(1.0 / max_position_pct))
 
 
 def applied_max_positions(
-    max_position_pct: float | None, available_ticker_count: int | None = None
+    max_position_pct: float | None, available_ticker_count: int | None = None,
+    *, explicit_max_positions: object = None,
 ) -> int:
     """How many positions may be held at once.
 
@@ -28,7 +41,7 @@ def applied_max_positions(
     portfolio, so the cap stays.
     """
 
-    requested = requested_max_positions(max_position_pct)
+    requested = requested_max_positions(max_position_pct, explicit_max_positions=explicit_max_positions)
     if available_ticker_count is None or available_ticker_count <= 0:
         return requested
     return max(1, min(requested, available_ticker_count))

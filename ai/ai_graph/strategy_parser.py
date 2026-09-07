@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from ai_graph.llm import LLMClient, LLMClientError, LLMJsonRequest, create_llm_client, is_live_llm_provider
 from ai_graph.nodes.condition_compiler import canonical_metric, supported_metrics
+from ai_graph.schemas import ExecutionControlsV1
 
 STRATEGY_PARSE_SCHEMA_NAME = "quantagent.strategy_parse.v1"
 STRATEGY_PARSE_PROMPT_VERSION = "v1"
@@ -175,6 +176,96 @@ def _is_complete_supported_parse(result: StrategyParseResultV1) -> bool:
         and not result.unsupported_conditions
         and not result.clarification_required
     )
+
+
+def parse_execution_controls(query: str) -> ExecutionControlsV1 | None:
+    """Keep bounded, explicit controls outside the model's indicator interpretation."""
+
+    text = query.casefold()
+    values: dict[str, int | float | None] = {}
+    unsupported: list[UnsupportedStrategyConditionV1] = []
+
+    def collect(key: str, matches: list[float | int]) -> None:
+        if not matches:
+            return
+        if len(set(matches)) != 1:
+            unsupported.append(UnsupportedStrategyConditionV1(
+                condition=key, reason="서로 다른 설정값이 있어 하나로 확정할 수 없습니다."
+            ))
+            return
+        values[key] = matches[0]
+
+    collect("max_positions", [int(value) for value in re.findall(
+        r"(?<![a-z가-힣\d.])(-?\d+)\s*(?:개\s*)?종목",
+        re.sub(r"(?:kospi|kosdaq|코스피|코스닥)\s*\d+", "", text)
+    )])
+    for key, label in (("trailing_stop_pct", r"추적\s*손절|trailing[ _-]?stop"), ("take_profit_pct", r"익절|take[ _-]?profit")):
+        pattern = rf"(?:{label})\s*[:=]?\s*(-?\d+(?:\.\d+)?)\s*%"
+        matches = re.findall(pattern, text)
+        collect(key, [float(value) / 100 for value in matches])
+        text = re.sub(pattern, " ", text)
+        none_pattern = rf"(?:{label})\s*(?:없음|없이|미적용|off|none)"
+        if re.search(none_pattern, text):
+            if matches:
+                unsupported.append(UnsupportedStrategyConditionV1(condition=key, reason="비율과 해제 요청이 함께 있어 확정할 수 없습니다."))
+            values[key] = None
+            text = re.sub(none_pattern, " ", text)
+
+    stops = [float(value) / 100 for value in re.findall(
+        r"(?:손절|stop[ _-]?loss)(?:은|는|을|을\s*|\s*기준)?\s*[:=]?\s*(-?\d+(?:\.\d+)?)\s*%", text
+    )]
+    stops += [float(value) / 100 for value in re.findall(
+        r"(-?\d+(?:\.\d+)?)\s*%\s*(?:에서\s*|하락(?:하면|시)?\s*)?(?:손절|stop[ _-]?loss)", text
+    )]
+    no_stop = bool(re.search(r"(?:손절|stop[ _-]?loss)\s*(?:없음|없이|하지\s*않|미적용|off|none)|(?:no|without)\s+stop[ _-]?loss", text))
+    collect("stop_loss_pct", stops)
+    if no_stop:
+        if stops:
+            unsupported.append(UnsupportedStrategyConditionV1(condition="손절 설정", reason="손절 비율과 손절 없음이 함께 있어 확정할 수 없습니다."))
+        values["stop_loss_pct"] = None
+        if not re.search(r"고정\s*손절|fixed[ _-]?stop", text):
+            if "trailing_stop_pct" in values and values["trailing_stop_pct"] is not None:
+                unsupported.append(UnsupportedStrategyConditionV1(condition="손절 설정", reason="손절 없음과 추적 손절 비율이 함께 있어 확정할 수 없습니다."))
+            values["trailing_stop_pct"] = None
+    intervals = [int(value) for value in re.findall(
+        r"(-?\d+)\s*(?:거래일|영업일)\s*(?:마다|간격|주기)", text
+    )]
+    calendar_specific = bool(re.search(
+        r"(?:(?:매월|월)\s*(?:말|초|첫\s*거래일|마지막\s*거래일)|달력\s*기준)"
+        r"\s*(?:에\s*)?(?:마다\s*)?(?:종목\s*)?(?:교체|리밸런싱|재선정|리밸런스|rebalance|rotation)", text
+    ))
+    if re.search(r"(?:매월|월간|monthly)\s*(?:종목\s*)?(?:교체|리밸런싱|재선정|리밸런스|rebalance|rotation)", text) and not calendar_specific:
+        intervals.append(21)
+    if re.search(r"(?:매주|weekly)\s*(?:종목\s*)?(?:교체|리밸런싱|재선정|리밸런스|rebalance|rotation)", text):
+        intervals.append(5)
+    collect("rebalance_interval_days", intervals)
+    if calendar_specific:
+        unsupported.append(UnsupportedStrategyConditionV1(
+            condition="달력 기준 교체 주기", reason="현재는 거래일 간격만 지원하며 월말·월초 일정을 대신 적용하지 않습니다."
+        ))
+    if re.search(r"손절|stop[ _-]?loss", text) and not stops and not no_stop:
+        unsupported.append(UnsupportedStrategyConditionV1(
+            condition="손절 설정", reason="손절 비율 또는 손절 없음 여부를 확정할 수 없습니다."
+        ))
+    if re.search(r"익절|추적\s*손절|트레일|trailing|take[ _-]?profit", text):
+        unsupported.append(UnsupportedStrategyConditionV1(
+            condition="추가 위험 설정", reason="이 확인 경로는 종목 수·고정 손절률·거래일 교체 간격만 지원합니다."
+        ))
+    if re.search(r"리밸런|rebalance|교체|로테이션|rotation|\d+\s*일마다", text) and not intervals and not calendar_specific:
+        unsupported.append(UnsupportedStrategyConditionV1(
+            condition="교체 주기", reason="교체 간격을 5~63거래일 범위로 명시해 주세요."
+        ))
+    controls = None
+    if values:
+        try:
+            controls = ExecutionControlsV1.model_validate(values)
+        except ValidationError:
+            unsupported.append(UnsupportedStrategyConditionV1(
+                condition="실행 설정 범위", reason="종목 수 1~1000개, 고정 손절 1~100%, 추적 손절 1~75%, 익절 1~1000%, 교체 간격 5~63거래일을 지원하며 각 손절·익절은 없음으로 해제할 수 있습니다."
+            ))
+    if unsupported:
+        raise StrategyParseError("; ".join(item.reason for item in unsupported))
+    return controls
 
 
 def _llm_request(query: str, metrics: Sequence[str]) -> LLMJsonRequest:

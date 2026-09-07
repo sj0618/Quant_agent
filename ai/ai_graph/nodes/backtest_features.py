@@ -31,14 +31,10 @@ from ai_graph.quant_strategy import (
 from ai_graph.schemas import CandidateParameters, Condition, ConditionOperator, StrategyIR
 
 
-# v4: reset/stop-after session handling, mirrored fixed stop/target exits, and off-grid
-# slot backfill change which actions a rule emits, so v3 features must not be reused.
-FEATURE_DEFINITION_VERSION = "structured-features.v4"
+FEATURE_DEFINITION_VERSION = "structured-features.v5"
 
-# A take-profit at or above this is the catalogue's way of saying "no target" (rows ship
-# 10.0 = +1000%). Mirroring those in the action generator would only add signals that can
-# never fire, so the book-keeping exit below ignores them.
-DISABLED_TAKE_PROFIT_PCT = 10.0
+# Internal eligibility: enter when flat; exit when actually held.
+ENTRY_AND_EXIT_ACTION = 2
 
 
 def unavailable_condition_metrics(
@@ -172,35 +168,13 @@ class FeaturePreparationStats:
 class RankedActions:
     """Per-row decisions plus the entry strength that produced each BUY.
 
-    `scores` is direction-normalized so higher always means a stronger entry, and is
-    NaN on every row that is not a BUY. The engine reuses it to decide who gets a
+    Actions describe eligibility, not assumed fills: 1 is entry, -1 exit, and
+    2 is entry when flat or exit when held. Scores are finite for entry eligibility. The engine reuses it to decide who gets a
     scarce slot when more entries survive to the fill open than the cap allows.
     """
 
     actions: array
     scores: array
-
-
-def _fixed_risk_exit(
-    close: float, entry_close: float, parameters: CandidateParameters
-) -> bool:
-    """Does the engine's fixed stop / target look hit, measured from the signal close?
-
-    Book-keeping only. The engine remains the one that actually applies the stop, at the
-    price it paid; this mirror exists so the action generator stops counting a stopped
-    name as held, which locked its slot and blocked re-entry for the rest of the run.
-    """
-
-    if entry_close <= 0.0:
-        return False
-    stop_pct = float(parameters.stop_loss_pct or 0.0)
-    if stop_pct > 0.0 and close <= entry_close * (1.0 - stop_pct):
-        return True
-    take_pct = float(parameters.take_profit_pct or 0.0)
-    return (
-        0.0 < take_pct < DISABLED_TAKE_PROFIT_PCT
-        and close >= entry_close * (1.0 + take_pct)
-    )
 
 
 def slot_priority(score: float, ticker: str) -> tuple[float, str]:
@@ -354,21 +328,11 @@ class PreparedFeatureStore:
         reset_session: str | None = None,
         stop_after_session: str | None = None,
     ) -> RankedActions:
-        """Decisions for every row, optionally restarted from cash at one session.
+        """Emit causal eligibility; the execution engine owns the position book.
 
-        A walk-forward fold hands the engine a brand new portfolio: it starts the
-        evaluation month in cash with no positions. The generator used to be built on
-        the fold's own context window, so it entered that month believing it already
-        held the names it had bought during train/validation, and its rotation calendar
-        restarted at that window's first bar. Both are fixed by running the generator on
-        the whole window and telling it where the engine's book is reset: `date_number`
-        then counts global sessions - the same absolute rotation dates in every fold,
-        and full warm-up for derived long-window metrics - while `reset_session` clears
-        the position book and forces a rotation there, so the target set is bought on
-        the fold's first tradable session instead of whenever the grid next lands.
-
-        `stop_after_session` only stops the loop early; rows past it are never read, so
-        the fold pays for its own history and nothing after it.
+        The full-window calendar preserves the rotation dates and indicator history.
+        reset_session adds a fold-start rotation without assuming any prior fills.
+        stop_after_session bounds the decision loop at the last evaluation session.
         """
 
         reset_index = self._session_index(reset_session)
@@ -543,21 +507,14 @@ class PreparedFeatureStore:
             return self._rotation_profile_actions(parameters, features, reset_index, stop_index)
         actions = array("b", [0]) * len(self.rows)
         scores = self._empty_scores()
-        states: dict[str, list[float | bool | int]] = {}
         profile = parameters.profile
         threshold = parameters.threshold
         for date_index, (start, end) in enumerate(self.date_ranges):
             if stop_index is not None and date_index > stop_index:
                 break
-            if date_index == reset_index:
-                states.clear()
-            evaluations: list[
-                tuple[int, str, float, bool, bool, float, list[float | bool | int]]
-            ] = []
             for index in range(start, end):
                 ticker = self.tickers[index]
                 close = self.close[index]
-                state = states.setdefault(ticker, [False, 0.0, 0, 0.0])
                 row = features[index]
                 buy = False
                 sell = False
@@ -585,7 +542,6 @@ class PreparedFeatureStore:
                     realized_volatility_21d = row[REALIZED_VOLATILITY_21D]
                     rebalance_eligible = bool(row[REBALANCE_ELIGIBLE])
                     rsi = self.rsi[index]
-                    in_position = bool(state[0])
                     score = rolling_sharpe + medium_return * 4.0 + long_return * 2.0 - volatility
                     if profile == "academic_momentum_trend":
                         factors_available = all(
@@ -610,7 +566,7 @@ class PreparedFeatureStore:
                                 and sma_50 >= sma_200
                                 and realized_volatility_21d <= 0.35
                             )
-                            sell = in_position and (
+                            sell = (
                                 close < sma_200 * 0.95
                                 or (
                                     rebalance_eligible
@@ -626,7 +582,7 @@ class PreparedFeatureStore:
                             and medium_average >= long_average * 0.98
                             and long_return > 0.0
                         )
-                        sell = in_position and (close < long_average * 0.97 or long_drawdown > 0.18)
+                        sell = (close < long_average * 0.97 or long_drawdown > 0.18)
                     elif profile == "quality_trend_hold":
                         score = (
                             medium_return * 3.0
@@ -639,7 +595,7 @@ class PreparedFeatureStore:
                             and medium_return >= -0.02
                             and volatility <= 0.28
                         )
-                        sell = in_position and (
+                        sell = (
                             close < medium_average * 0.96 or medium_return < -0.08
                         )
                     elif profile == "volatility_breakout_hold":
@@ -658,7 +614,7 @@ class PreparedFeatureStore:
                             and volatility <= 0.32
                             and medium_return >= 0.0
                         )
-                        sell = in_position and (
+                        sell = (
                             close < medium_average * 0.95 or long_drawdown > 0.2
                         )
                     elif profile == "rolling_sharpe_momentum":
@@ -668,7 +624,7 @@ class PreparedFeatureStore:
                             and close >= medium_average
                             and trend > 0.0
                         )
-                        sell = in_position and (rolling_sharpe <= 0.0 or close < medium_average)
+                        sell = (rolling_sharpe <= 0.0 or close < medium_average)
                     elif profile == "dual_sma_trend":
                         score = (
                             medium_return * 3.0 + (short_average / medium_average - 1.0) * 8.0
@@ -679,7 +635,7 @@ class PreparedFeatureStore:
                             short_average > medium_average > average * 0.98
                             and close >= short_average
                         )
-                        sell = in_position and (short_average < medium_average or close < average)
+                        sell = (short_average < medium_average or close < average)
                     elif profile == "low_vol_momentum":
                         score = trend * 3.0 + medium_return * 2.0 - volatility * 1.5
                         buy = (
@@ -688,7 +644,7 @@ class PreparedFeatureStore:
                             and volatility <= 0.28
                             and close >= medium_average
                         )
-                        sell = in_position and (
+                        sell = (
                             close < medium_average * 0.96
                             or medium_return < -0.06
                             or long_drawdown > 0.22
@@ -705,7 +661,7 @@ class PreparedFeatureStore:
                             and volume_ratio >= threshold
                             and trend >= 0.0
                         )
-                        sell = in_position and close < short_average
+                        sell = close < short_average
                     elif profile == "rsi_trend_rebound":
                         score = medium_return * 3.0 + (55.0 - abs(rsi - 45.0)) / 50.0 - volatility
                         buy = (
@@ -714,57 +670,33 @@ class PreparedFeatureStore:
                             and 35.0 <= rsi <= 62.0
                             and close >= previous
                         )
-                        sell = in_position and (rsi >= 72.0 or close < medium_average)
+                        sell = (rsi >= 72.0 or close < medium_average)
                     elif profile == "mean_reversion_band":
                         score = pullback * 2.0 + (50.0 - rsi) / 50.0 - volatility
                         buy = (
                             close <= average * (1.0 - max(0.0, min(0.20, threshold)))
                             and rsi <= 45.0
                         )
-                        sell = in_position and (close >= medium_average or rsi >= 60.0)
+                        sell = (close >= medium_average or rsi >= 60.0)
                     elif profile == "return_to_volatility":
                         score = return_to_volatility + medium_return * 2.0
                         buy = return_to_volatility >= threshold * 4.0 and close >= medium_average
-                        sell = in_position and (
+                        sell = (
                             return_to_volatility <= 0.0 or close < medium_average
                         )
                     elif profile == "cash_preserving_trend":
                         score = rolling_sharpe + trend * 2.0 - volatility * 2.0
                         buy = trend >= threshold and rolling_sharpe > 0.05 and volatility <= 0.3
-                        sell = in_position and (trend < 0.01 or rolling_sharpe < 0.0)
+                        sell = (trend < 0.01 or rolling_sharpe < 0.0)
                     else:
                         score = trend * 2.0 + medium_return - volatility
                         buy = trend >= threshold and close >= average and close >= previous
-                        sell = in_position and close < average
-                    if in_position and float(state[1]) > 0.0:
-                        # The trailing stop is part of the profile's own rule - it tracks
-                        # the peak since entry, which the engine does not model - so it
-                        # stays here. The fixed stop-loss and take-profit do not: the
-                        # engine applies both against the price actually paid, and this
-                        # loop only knows the signal-day close. Keeping both meant one
-                        # stop evaluated twice from two entry prices a bar apart.
-                        trailing_stop = float(state[3]) > 0.0 and close < float(state[3]) * (
-                            1.0 - parameters.trailing_stop_pct
-                        )
-                        sell = sell or trailing_stop
-                evaluations.append((index, ticker, close, buy, sell, score, state))
-
-            open_positions = sum(1 for state in states.values() if bool(state[0]))
-            open_slots = max(0, parameters.max_positions - open_positions)
-            ranked = [item for item in evaluations if item[3] and not bool(item[6][0])]
-            ranked.sort(key=lambda item: slot_priority(item[5], item[1]))
-            selected = {item[1] for item in ranked[:open_slots]}
-            for index, ticker, close, _, sell, score, state in evaluations:
-                if sell and bool(state[0]):
-                    actions[index] = -1
-                    state[:] = [False, 0.0, 0, 0.0]
-                elif ticker in selected:
-                    actions[index] = 1
+                        sell = close < average
+                if buy:
+                    actions[index] = ENTRY_AND_EXIT_ACTION if sell else 1
                     scores[index] = score
-                    state[:] = [True, close, 0, close]
-                elif bool(state[0]):
-                    state[2] = int(state[2]) + 1
-                    state[3] = max(float(state[3]), close)
+                elif sell:
+                    actions[index] = -1
         return RankedActions(actions=actions, scores=scores)
 
     def _rotation_profile_actions(
@@ -785,15 +717,12 @@ class PreparedFeatureStore:
 
         actions = array("b", [0]) * len(self.rows)
         scores = self._empty_scores()
-        states: dict[str, list[float | bool | int]] = {}
         profile = parameters.profile
         threshold = parameters.threshold
 
         for date_index, (start, end) in enumerate(self.date_ranges):
             if stop_index is not None and date_index > stop_index:
                 break
-            if date_index == reset_index:
-                states.clear()
             rotation_day = date_index == reset_index or (
                 date_index >= MOMENTUM_LONG_LOOKBACK
                 and (date_index - MOMENTUM_LONG_LOOKBACK) % parameters.rebalance_interval_days == 0
@@ -887,36 +816,12 @@ class PreparedFeatureStore:
                 target = {ticker for _, ticker in selected}
                 target_scores = {ticker: score for score, ticker in selected}
 
-            for index in range(start, end):
-                ticker = self.tickers[index]
-                close = float(self.close[index])
-                state = states.setdefault(ticker, [False, 0.0, 0, 0.0])
-                in_position = bool(state[0])
-                risk_exit = False
-                if in_position and float(state[1]) > 0.0:
-                    state[2] = int(state[2]) + 1
-                    state[3] = max(float(state[3]), close)
-                    # Trailing stop plus the engine's fixed stop, mirrored. The engine
-                    # owns the real fixed stop - it knows the price actually paid at the
-                    # next open, this loop only the signal-day close - but leaving it out
-                    # of this book entirely meant a stopped-out name stayed "held" here
-                    # forever: its slot was never refilled and it could never re-enter.
-                    # Measured: buy counts were identical at stop 0.08 / 0.15 / 0.25 /
-                    # 0.99 while total return moved 101 points. Mirroring it releases the
-                    # slot; when the engine already sold, the duplicate order lands as
-                    # `ignored_missing_position` and changes nothing.
-                    risk_exit = _fixed_risk_exit(close, float(state[1]), parameters) or (
-                        float(state[3]) > 0.0
-                        and close < float(state[3]) * (1.0 - parameters.trailing_stop_pct)
-                    )
-
-                if in_position and (risk_exit or (rotation_day and ticker not in target)):
-                    actions[index] = -1
-                    state[:] = [False, 0.0, 0, 0.0]
-                elif rotation_day and ticker in target and not in_position:
-                    actions[index] = 1
-                    scores[index] = target_scores[ticker]
-                    state[:] = [True, close, 0, close]
+            if rotation_day:
+                for index in range(start, end):
+                    ticker = self.tickers[index]
+                    actions[index] = 1 if ticker in target else -1
+                    if ticker in target:
+                        scores[index] = target_scores[ticker]
 
         return RankedActions(actions=actions, scores=scores)
 
@@ -929,9 +834,6 @@ class PreparedFeatureStore:
     ) -> RankedActions:
         actions = array("b", [0]) * len(self.rows)
         scores = self._empty_scores()
-        # in_position, entry_price, highest_close_since_entry, sessions_held
-        states: dict[str, list[float | bool]] = {}
-        holding_days = strategy_ir.holding_days
         entry_conditions = [
             item for item in strategy_ir.entry_conditions if item.universe_rank_pct is None
         ]
@@ -946,20 +848,11 @@ class PreparedFeatureStore:
         for date_number, (start, end) in enumerate(self.date_ranges):
             if stop_index is not None and date_number > stop_index:
                 break
-            if date_number == reset_index:
-                # The engine starts this fold in cash, so the book must too - otherwise
-                # the generator holds names the engine never bought and issues no entry.
-                states.clear()
             eligible: list[tuple[int, str, float, float]] = []
             exits: list[tuple[int, str]] = []
             for index in range(start, end):
                 ticker = self.tickers[index]
                 close = self.close[index]
-                state = states.setdefault(ticker, [False, 0.0, 0.0, 0.0])
-                in_position = bool(state[0])
-                if in_position:
-                    state[2] = max(float(state[2]), close)
-                    state[3] = float(state[3]) + 1.0
                 matches_entry = all(
                     self._condition_matches(condition, index)
                     for condition in entry_conditions
@@ -978,26 +871,10 @@ class PreparedFeatureStore:
                         )
                     if matches_entry:
                         eligible.append((index, ticker, close, score))
-                if in_position:
-                    exit_match = bool(exit_conditions) and all(
-                        self._condition_matches(condition, index) for condition in exit_conditions
-                    )
-                    # Rule exit, trailing stop, and a mirror of the engine's fixed stop /
-                    # target. The engine still owns the real fixed stop - it knows the
-                    # price actually paid at the next open, this loop only the signal-day
-                    # close - but omitting it here left a stopped-out name marked as held
-                    # forever, so its slot stayed locked and it could never re-enter.
-                    # See `_fixed_risk_exit`.
-                    trailing_stop = float(state[2]) > 0.0 and close < float(state[2]) * (
-                        1.0 - parameters.trailing_stop_pct
-                    )
-                    fixed_stop = _fixed_risk_exit(close, float(state[1]), parameters)
-                    # "N일 뒤 매도": the rule's own time exit, counted in sessions the
-                    # position was actually open. It is a real exit, so it stands in
-                    # for exit_conditions when the rule states no condition at all.
-                    holding_exit = holding_days is not None and float(state[3]) >= holding_days
-                    if exit_match or trailing_stop or fixed_stop or holding_exit:
-                        exits.append((index, ticker))
+                if exit_conditions and all(
+                    self._condition_matches(condition, index) for condition in exit_conditions
+                ):
+                    exits.append((index, ticker))
 
             for condition in rank_conditions:
                 scored: list[tuple[str, float]] = []
@@ -1018,45 +895,29 @@ class PreparedFeatureStore:
                 eligible = [entry for entry in eligible if entry[1] in kept]
 
             eligible.sort(key=lambda item: slot_priority(item[3], item[1]))
-            rotation_day = strategy_ir.execution_mode == "scheduled_rotation" and (
-                date_number == reset_index
-                or date_number % parameters.rebalance_interval_days == 0
+            rotation_day = (
+                strategy_ir.execution_mode == "scheduled_rotation"
+                and (date_number == reset_index or date_number % parameters.rebalance_interval_days == 0)
             )
             target = {
                 item[1] for item in eligible[: parameters.max_positions]
             } if rotation_day else set()
             if rotation_day:
-                for index in range(start, end):
-                    ticker = self.tickers[index]
-                    if bool(states.setdefault(ticker, [False, 0.0, 0.0, 0.0])[0]) and ticker not in target:
-                        exits.append((index, ticker))
-
-            exited: set[str] = set()
-            for index, ticker in exits:
-                if ticker in exited or not bool(states[ticker][0]):
-                    continue
+                exits.extend(
+                    (index, self.tickers[index])
+                    for index in range(start, end)
+                    if self.tickers[index] not in target
+                )
+            for index, _ in exits:
                 actions[index] = -1
-                states[ticker] = [False, 0.0, 0.0, 0.0]
-                exited.add(ticker)
-            held = sum(1 for state in states.values() if bool(state[0]))
-            # Rotation replaces the portfolio only on a rebalance day - but between them
-            # the exits kept running, so a slot freed by a stop or a rule exit sat in
-            # cash until the next grid date (measured: 23% of all slot-sessions idle,
-            # 21-day grid). Off-grid days now backfill from the same eligible ranking;
-            # the loop below stops at `max_positions`, so nothing already held is
-            # replaced and the target set still only changes on a rotation day.
             entries = (
-                [item for item in eligible if item[1] in target] if rotation_day else eligible
+                [item for item in eligible if item[1] in target]
+                if rotation_day
+                else eligible
             )
-            for index, ticker, close, score in entries:
-                if held >= parameters.max_positions:
-                    break
-                if ticker in exited or bool(states[ticker][0]):
-                    continue
-                actions[index] = 1
+            for index, _, _, score in entries:
+                actions[index] = ENTRY_AND_EXIT_ACTION if actions[index] == -1 else 1
                 scores[index] = score
-                states[ticker] = [True, close, close, 0.0]
-                held += 1
         return RankedActions(actions=actions, scores=scores)
 
     def _condition_matches(self, condition: Condition, index: int) -> bool:

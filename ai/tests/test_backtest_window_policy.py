@@ -336,6 +336,8 @@ def test_self_improvement_stops_at_the_wall_budget_and_still_concludes(
     monkeypatch.setenv(backtest_node.BACKTEST_CACHE_DIR_ENV, str(tmp_path / "budget"))
     # 0 means "unset" to the reader, so use the smallest budget it accepts.
     monkeypatch.setenv(backtest_node.AI_BACKTEST_WALL_BUDGET_ENV, "0.001")
+    # Exercise the refinement budget even if the synthetic first pass clears its floor.
+    monkeypatch.setattr(backtest_node, "objective_floor_reasons", lambda _result: ["synthetic objective miss"])
 
     output = backtest_node.backtest_node(_backtest_state(strategy, _price_rows()))
 
