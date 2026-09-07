@@ -589,3 +589,52 @@ def test_sealed_catalogue_spec_runs_the_whole_graph_as_automatic(
     assert envelope.strategy_spec is not None
     assert envelope.strategy_spec.selection_mode == "automatic"
     assert envelope.strategy_spec.name == "사전등록 후보군 탐색 연구"
+
+
+def test_catalogue_run_explains_itself_without_the_research_compile_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production job_b524f001d0fa: the first catalogue run after routing was fixed died
+    in the research node because the generic explanatory AOAI call overflowed its 700
+    output tokens on three catalogue formulas (`response.incomplete: max_output_tokens`).
+    A sealed catalogue run carries its own cited explanations and must not depend on
+    that call at all.
+    """
+
+    active = _active_policy()
+    draft = build_rule_draft(
+        query="돈이 되는 전략 추천해줘",
+        user_id="local-dev-user",
+        signer=_exploration_signer(),
+        now=datetime.now(UTC),
+        use_llm=False,
+        exploration_policy=active,
+    )
+    assert isinstance(draft.strategy_execution_spec, ExplorationExecutionSpecV2)
+    monkeypatch.setattr(
+        graph_module, "load_exploration_policy_from_env", lambda _version: active
+    )
+
+    def _overflowing_compile(**_kwargs):
+        raise AssertionError("compile_research must not be called for a catalogue spec")
+
+    monkeypatch.setattr(graph_module, "compile_research", _overflowing_compile)
+
+    runner = _build_analysis_runner_with_audit(
+        run_analysis,
+        audit_sink=None,
+        trace_id="trace-exploration-no-compile",
+        entrypoint="api.analysis_jobs",
+        feature="analysis_job",
+        user_id="local-dev-user",
+        rule_draft_resolver=lambda _query, _trace_id: draft,
+    )
+    envelope = runner("돈이 되는 전략 추천해줘", "trace-exploration-no-compile")
+
+    assert envelope.status is EnvelopeStatus.READY, envelope.user_payload.message
+    compiled = graph_module._exploration_research_compile(draft.strategy_execution_spec)
+    assert compiled.provider == "deterministic"
+    assert len(compiled.supporting_rationale) == len(draft.strategy_execution_spec.candidates)
+    assert any("AI 해석 호출을 하지 않았습니다" in item for item in compiled.limitations)
+    sources = graph_module._exploration_research_sources(draft.strategy_execution_spec)
+    assert sources and all(source["url"].startswith("http") for source in sources)
