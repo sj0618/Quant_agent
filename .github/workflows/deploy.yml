@@ -414,6 +414,18 @@ jobs:
               ;;
           esac
 
+          # The token probe above cannot see whether the callback URL is registered on
+          # the client; that only surfaces once a person reaches the consent screen.
+          # Google reports it on the redirect chain, so follow it and look.
+          auth_probe="$(curl -sL --max-time 20 -A 'Mozilla/5.0' \
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=${GOOGLE_CLIENT_ID}&redirect_uri=https%3A%2F%2Fqt-agent.kro.kr%3A38010%2Fauth%2Fgoogle%2Fcallback&response_type=code&scope=openid+email+profile&state=deploy-preflight" || true)"
+          case "$auth_probe" in
+            *redirect_uri_mismatch*)
+              echo "::error::https://qt-agent.kro.kr:38010/auth/google/callback is not an authorized redirect URI on this Google client. Add it to the client's Authorized redirect URIs in the Google Cloud console." >&2
+              exit 1
+              ;;
+          esac
+
           auth_env_file="$RUNNER_TEMP/google-auth.env"
           trap 'rm -f "$auth_env_file"' EXIT
           umask 077
