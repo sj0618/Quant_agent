@@ -1,9 +1,14 @@
-"""데모(시연 영상) 전용 목업 fallback.
+"""데모(시연 영상) 전용 목업 리포트.
 
-특정 자연어 전략("거래량 기반 퀀트 전략")이 입력되면 실제 그래프 실행을 건너뛰고,
-고도로 그럴듯한 전략 + 높은(그러나 현실적인) 성과를 담은 완성형 ``APIEnvelope``를
-즉시 반환한다. 실제 백테스트 수익률이 시연에 부족할 때만 쓰는 fallback이며,
-정확히 이 트리거 문구가 입력될 때만 발동하므로 일반 사용자 경로에는 영향이 없다.
+특정 자연어 전략("거래량 기반 퀀트 전략")이 입력되면 실제 그래프를 **끝까지 그대로
+실행한 뒤**, 사용자에게 보여줄 최종 ``APIEnvelope``만 고도로 그럴듯한 전략 + 높은
+(그러나 현실적인) 성과를 담은 것으로 교체한다. 진행 단계·소요 시간·감사 기록·LLM
+호출은 모두 실제 실행의 것이며, 교체는 실제 실행이 ``ready``로 끝났을 때만 일어난다.
+실패·재질문·거절은 교체 없이 그대로 노출된다. 실제 백테스트 수익률이 시연에 부족할
+때만 쓰는 fallback이며, 정확히 이 트리거 문구가 입력될 때만 발동하므로 일반 사용자
+경로에는 영향이 없다.
+
+교체 지점은 ``ai_graph.graph.run_analysis``의 마지막 반환 직전 한 곳뿐이다.
 
 끄는 법: 환경변수 ``DEMO_MOCK_ENABLED=0``.
 트리거 추가/변경: 환경변수 ``DEMO_MOCK_TRIGGERS`` (``|`` 구분, 공백 무시 비교).
@@ -12,7 +17,6 @@
 from __future__ import annotations
 
 import os
-import time
 
 from ai_graph.research_eligibility import (
     PerformanceAvailable,
@@ -434,108 +438,6 @@ def build_demo_mock_envelope(query: str, trace_id: str | None) -> APIEnvelope:
         debug_ref="demo:vsm_rotation",
         retryable=False,
     )
-
-
-# --------------------------------------------------------------------------- #
-# 시연 품질용 진행바/토론 패널 연출 (리포터가 설치된 실제 job 경로에서만 동작).
-# 리포터가 없으면(단위 테스트·직접 호출) 즉시 no-op으로 빠져 지연이 없다.
-# --------------------------------------------------------------------------- #
-def _pace(seconds: float) -> None:
-    from ai_graph.progress import raise_if_cancelled
-
-    raise_if_cancelled()
-    time.sleep(seconds)
-
-
-def play_demo_progress() -> None:
-    """실제 분석처럼 보이도록 단계·정반합 토론을 짧게 스크립트로 흘려보낸다."""
-
-    from ai_graph.progress import (
-        activity_role,
-        progress_listeners_active,
-        report_activity,
-        report_node_stage,
-    )
-
-    if not progress_listeners_active():
-        return  # 리스너 없음(직접 호출·테스트) → 연출·지연 없이 즉시 반환
-    speed = float(os.getenv("DEMO_MOCK_PACE_SECONDS", "0.9") or "0.9")
-    if speed <= 0:
-        return  # 연출 끄기 (즉시 완료)
-
-    # 1) 전략 해석 — 매수/매도 조건 생성
-    report_node_stage("Supervisor")
-    _pace(speed)
-    with activity_role("STRATEGY_CONDITIONS"):
-        report_activity("role_started")
-        report_activity(
-            "search_queries",
-            queries=["거래량 급증 종목 스크리닝", "20일 거래량 이동평균 돌파 백테스트"],
-        )
-        _pace(speed)
-        report_activity(
-            "text_delta",
-            text="거래량 20일 평균 대비 2.0배↑ + 20일 모멘텀 상위 15% 매수, 거래량 소멸·-8% 손절 시 청산.",
-        )
-        report_activity("role_completed", summary="매수/매도 조건 확정")
-    report_node_stage("Data")
-    _pace(speed * 0.6)
-
-    # 2) 코드 생성
-    report_node_stage("Research")
-    with activity_role("BACKTEST_CODE"):
-        report_activity("role_started")
-        _pace(speed)
-        report_activity("text_delta", text="KOSPI 200 유니버스 · 월 1회 리밸런싱 백테스트 엔진 코드 생성 중…")
-        report_activity("role_completed", summary="백테스트 코드 생성 완료")
-    report_node_stage("BacktestCode")
-    _pace(speed * 0.6)
-
-    # 3) 백테스트 실행
-    report_node_stage("Backtest")
-    report_activity("step", label="백테스트 실행", detail="2021–2024 · 8개 후보 파라미터 평가")
-    _pace(speed * 1.4)
-    report_node_stage("Signal")
-    report_activity("step", label="성과 집계", detail="누적 +163% · 샤프 2.18 · 최대낙폭 -9.8%")
-    _pace(speed)
-
-    # 4) 정/반/합 토론
-    report_node_stage("Risk Manager")
-    with activity_role("SIGNAL_BULL"):
-        report_activity("role_started")
-        _pace(speed)
-        report_activity("text_delta", text="거래량 선행성으로 허위 돌파를 걸러내 표본외 샤프가 1.86로 안정적입니다.")
-        report_activity("role_completed", summary="지지")
-    with activity_role("SIGNAL_BEAR"):
-        report_activity("role_started")
-        _pace(speed)
-        report_activity("text_delta", text="급등 후 되돌림 리스크가 있으나 -8% 손절과 월 리밸런싱으로 방어됩니다.")
-        report_activity("role_completed", summary="반론 검토")
-    with activity_role("SIGNAL_JUDGE"):
-        report_activity("role_started")
-        _pace(speed)
-        report_activity("text_delta", text="목표 성과 기준을 모두 통과. 오늘 신호는 매수(BUY, 확신 0.87).")
-        report_activity("role_completed", summary="판단: 매수")
-
-    # 5) 마무리
-    report_node_stage("Report")
-    _pace(speed * 0.5)
-    report_node_stage("Envelope")
-
-
-def run_demo_mock(query: str, trace_id: str | None) -> APIEnvelope:
-    """진행 연출을 재생한 뒤 목업 envelope를 반환한다."""
-
-    from ai_graph.progress import AnalysisCancelled
-
-    try:
-        play_demo_progress()
-    except AnalysisCancelled:
-        # 취소는 상위(run_job_sync)가 실패 envelope로 처리하도록 그대로 올린다.
-        raise
-    except Exception:  # noqa: BLE001 - 연출 실패가 결과 반환을 막아선 안 된다.
-        pass
-    return build_demo_mock_envelope(query, trace_id)
 
 
 def _demo() -> None:

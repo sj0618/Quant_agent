@@ -264,12 +264,6 @@ def run_analysis(
 ) -> APIEnvelope:
     base_report_started_at = perf_counter()
     query = _normalize_user_query(user_query)
-    # 시연 영상용 fallback: 특정 트리거 문구는 실제 그래프를 건너뛰고 고성과 목업을 반환한다.
-    # 정확한 트리거 문구에만 반응하므로 일반 입력 경로에는 영향이 없다(끄기: DEMO_MOCK_ENABLED=0).
-    from ai_graph.demo_mock import demo_mock_active, run_demo_mock
-
-    if demo_mock_active(query):
-        return run_demo_mock(query, trace_id or (_trace_id(query) if query else None))
     normalized_execution_spec = (
         validate_execution_spec(execution_spec)
         if execution_spec is not None
@@ -373,6 +367,15 @@ def run_analysis(
         message=f"analysis completed with status={status_label}",
         metadata_jsonb={"debug_ref": envelope.debug_ref, "public_trace_id": envelope.trace_id},
     )
+    # 시연 영상용 fallback: 트리거 문구도 그래프를 끝까지 실제로 돌린다. 진행 단계·소요 시간·
+    # 감사 기록은 전부 실제 실행의 것이고, 위 감사 기록도 교체 전 실제 결과를 남긴다. 사용자에게
+    # 보여줄 최종 결과만 고성과 목업으로 바꾼다. 실제 실행이 ready로 끝났을 때만 교체하므로
+    # 실패·재질문·거절은 그대로 노출된다(끄기: DEMO_MOCK_ENABLED=0).
+    if envelope.status is EnvelopeStatus.READY:
+        from ai_graph.demo_mock import build_demo_mock_envelope, demo_mock_active
+
+        if demo_mock_active(query):
+            envelope = build_demo_mock_envelope(query, envelope.trace_id)
     return envelope
 
 
