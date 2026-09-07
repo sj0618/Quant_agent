@@ -49,11 +49,32 @@ def evaluate_job(job: Any, expected_statuses: tuple[str, ...]) -> tuple[bool, st
     payload = result.get("user_payload") or {}
     headline = str(payload.get("headline") or "").strip()
     if status in expected_statuses:
-        return True, f"status={status} headline={headline!r}"
+        return True, f"status={status} headline={headline!r}{performance_digest(payload)}"
     message = str(payload.get("message") or "").strip()
     failure = result.get("failure_cause") or {}
     detail = failure.get("failure_stage") or failure.get("category") or ""
     return False, f"status={status} headline={headline!r} message={message!r} failure={detail!r}"
+
+
+def performance_digest(payload: Any) -> str:
+    """The headline numbers a passing result actually published.
+
+    A headline alone cannot tell a validated real run from a demo-replaced one - both
+    read "전략 분석이 완료되었습니다." The metrics can, so print them next to it.
+    """
+
+    performance = (payload or {}).get("performance") or {}
+    if performance.get("availability") != "available":
+        return f" performance={performance.get('availability') or 'absent'!r}"
+    metrics = ((performance.get("performance") or {}).get("metrics")) or {}
+    gate = (payload or {}).get("recommendation_gate") or {}
+    return (
+        f" total_return={metrics.get('total_return')}"
+        f" sharpe={metrics.get('sharpe_ratio')}"
+        f" max_drawdown={metrics.get('max_drawdown')}"
+        f" trades={metrics.get('trade_count')}"
+        f" validated={gate.get('validated')}"
+    )
 
 
 def clarification_details(job: Any) -> str:
