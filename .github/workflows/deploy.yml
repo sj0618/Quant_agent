@@ -262,6 +262,58 @@ jobs:
           check_readiness "current-backend-readiness" "http://127.0.0.1:18011/readiness" backend
           check_readiness "current-ai-api-readiness" "http://127.0.0.1:18011/ai-api/readiness" ai
 
+      - name: Verify Google auth credentials
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          test -n "$GOOGLE_CLIENT_ID"
+          test -n "$GOOGLE_CLIENT_SECRET"
+
+          # A truncated/mangled client id still ends in .apps.googleusercontent.com, so the
+          # readiness smoke below cannot tell it apart from a real one. Pin the full shape
+          # here, before the deploy mutates the server .env.
+          if ! printf '%s' "$GOOGLE_CLIENT_ID" \
+            | grep -Eq '^[0-9]{11,13}-[a-z0-9]{32}\.apps\.googleusercontent\.com$'; then
+            echo "::error::GOOGLE_CLIENT_ID secret is malformed. Expected <project-number>-<32 chars>.apps.googleusercontent.com; re-copy it from the Google Cloud console with the copy button." >&2
+            exit 1
+          fi
+
+          # A secret belonging to a different (or deleted) client has a perfectly
+          # normal shape, so no format check can catch a mismatched pair. Ask Google:
+          # a deliberately invalid code answers invalid_grant when the credentials are
+          # good and invalid_client when they are not. Network trouble is not fatal.
+          token_probe="$(curl -sS --max-time 20 -X POST https://oauth2.googleapis.com/token \
+            -d "client_id=$GOOGLE_CLIENT_ID" \
+            -d "client_secret=$GOOGLE_CLIENT_SECRET" \
+            -d 'code=deploy-preflight-intentionally-invalid' \
+            -d 'grant_type=authorization_code' \
+            -d 'redirect_uri=https://qt-agent.kro.kr:38010/auth/google/callback' || true)"
+          case "$token_probe" in
+            *invalid_client*)
+              echo "::error::GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are not a matching pair; Google rejected them with invalid_client. Copy both values from the same OAuth client in the Google Cloud console." >&2
+              exit 1
+              ;;
+            *invalid_grant*)
+              echo "Google accepted the client credentials (invalid_grant on the throwaway code, as expected)."
+              ;;
+            *)
+              echo "::warning::Could not verify the Google client credentials; the token endpoint gave an unexpected or empty answer. Continuing."
+              ;;
+          esac
+
+          # The token probe above cannot see whether the callback URL is registered on
+          # the client; that only surfaces once a person reaches the consent screen.
+          # Google reports it on the redirect chain, so follow it and look.
+          auth_probe="$(curl -sL --max-time 20 -A 'Mozilla/5.0' \
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=${GOOGLE_CLIENT_ID}&redirect_uri=https%3A%2F%2Fqt-agent.kro.kr%3A38010%2Fauth%2Fgoogle%2Fcallback&response_type=code&scope=openid+email+profile&state=deploy-preflight" || true)"
+          case "$auth_probe" in
+            *redirect_uri_mismatch*)
+              echo "::error::https://qt-agent.kro.kr:38010/auth/google/callback is not an authorized redirect URI on this Google client. Add it to the client's Authorized redirect URIs in the Google Cloud console." >&2
+              exit 1
+              ;;
+          esac
+
       - name: Create deploy snapshot archive
         run: |
           ssh -i ~/.ssh/id_rsa -p "$SSH_PORT" etluser@quant-agent.kro.kr \
@@ -381,50 +433,6 @@ jobs:
         run: |
           test -n "$GOOGLE_CLIENT_ID"
           test -n "$GOOGLE_CLIENT_SECRET"
-
-          # A truncated/mangled client id still ends in .apps.googleusercontent.com, so the
-          # readiness smoke below cannot tell it apart from a real one. Pin the full shape
-          # here, before the deploy mutates the server .env.
-          if ! printf '%s' "$GOOGLE_CLIENT_ID" \
-            | grep -Eq '^[0-9]{11,13}-[a-z0-9]{32}\.apps\.googleusercontent\.com$'; then
-            echo "::error::GOOGLE_CLIENT_ID secret is malformed. Expected <project-number>-<32 chars>.apps.googleusercontent.com; re-copy it from the Google Cloud console with the copy button." >&2
-            exit 1
-          fi
-
-          # A secret belonging to a different (or deleted) client has a perfectly
-          # normal shape, so no format check can catch a mismatched pair. Ask Google:
-          # a deliberately invalid code answers invalid_grant when the credentials are
-          # good and invalid_client when they are not. Network trouble is not fatal.
-          token_probe="$(curl -sS --max-time 20 -X POST https://oauth2.googleapis.com/token \
-            -d "client_id=$GOOGLE_CLIENT_ID" \
-            -d "client_secret=$GOOGLE_CLIENT_SECRET" \
-            -d 'code=deploy-preflight-intentionally-invalid' \
-            -d 'grant_type=authorization_code' \
-            -d 'redirect_uri=https://qt-agent.kro.kr:38010/auth/google/callback' || true)"
-          case "$token_probe" in
-            *invalid_client*)
-              echo "::error::GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are not a matching pair; Google rejected them with invalid_client. Copy both values from the same OAuth client in the Google Cloud console." >&2
-              exit 1
-              ;;
-            *invalid_grant*)
-              echo "Google accepted the client credentials (invalid_grant on the throwaway code, as expected)."
-              ;;
-            *)
-              echo "::warning::Could not verify the Google client credentials; the token endpoint gave an unexpected or empty answer. Continuing."
-              ;;
-          esac
-
-          # The token probe above cannot see whether the callback URL is registered on
-          # the client; that only surfaces once a person reaches the consent screen.
-          # Google reports it on the redirect chain, so follow it and look.
-          auth_probe="$(curl -sL --max-time 20 -A 'Mozilla/5.0' \
-            "https://accounts.google.com/o/oauth2/v2/auth?client_id=${GOOGLE_CLIENT_ID}&redirect_uri=https%3A%2F%2Fqt-agent.kro.kr%3A38010%2Fauth%2Fgoogle%2Fcallback&response_type=code&scope=openid+email+profile&state=deploy-preflight" || true)"
-          case "$auth_probe" in
-            *redirect_uri_mismatch*)
-              echo "::error::https://qt-agent.kro.kr:38010/auth/google/callback is not an authorized redirect URI on this Google client. Add it to the client's Authorized redirect URIs in the Google Cloud console." >&2
-              exit 1
-              ;;
-          esac
 
           auth_env_file="$RUNNER_TEMP/google-auth.env"
           trap 'rm -f "$auth_env_file"' EXIT
