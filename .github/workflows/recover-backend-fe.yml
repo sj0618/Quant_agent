@@ -178,27 +178,32 @@ jobs:
           pkill -TERM -f "$PYTHON -m uvicorn combined_main:app" 2>/dev/null || true
           sleep 2
           pkill -KILL -f "$PYTHON -m uvicorn combined_main:app" 2>/dev/null || true
-          stop_port 18001
-          stop_port 18000
+          stop_port 18011
+          stop_port 18010
           rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"
 
+          # deploy.yml L786-804와 같은 포트·바인딩으로 올려야 한다. 외부 터널은 18011/18010에
+          # 매핑돼 있으므로, 여기서 18001/18000으로 올리면 복구가 아니라 장애를 만든다.
           cd "$APP_DIR"
-          nohup "$PYTHON" -m uvicorn combined_main:app --host 0.0.0.0 --port 18001 --workers 1 > "$RUN_DIR/combined.log" 2>&1 &
+          nohup "$PYTHON" -m uvicorn combined_main:app --host 0.0.0.0 --port 18011 --workers 1 > "$RUN_DIR/combined.log" 2>&1 &
           echo "$!" > "$RUN_DIR/combined.pid"
 
           cd "$APP_DIR/fe"
-          nohup env COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18001" HOST="127.0.0.1" PORT="18000" node scripts/production-gateway.mjs > "$RUN_DIR/fe.log" 2>&1 &
+          nohup env COMBINED_BACKEND_PROXY_TARGET="http://127.0.0.1:18011" HOST="0.0.0.0" PORT="18010" node scripts/production-gateway.mjs > "$RUN_DIR/fe.log" 2>&1 &
           echo "$!" > "$RUN_DIR/fe.pid"
 
-          wait_for_url "combined-health" "http://127.0.0.1:18001/combined-health"
-          wait_for_readiness "backend-readiness" "http://127.0.0.1:18001/readiness" backend
-          "$PYTHON" -c 'import json, urllib.request; assert json.load(urllib.request.urlopen("http://127.0.0.1:18001/ai-api/api-status", timeout=8))["job_store"]["active_mode"] == "persistent"; print("persistent-job-store ready")'
-          wait_for_readiness "ai-api-readiness" "http://127.0.0.1:18001/ai-api/readiness" ai
-          wait_for_url "frontend-gateway" "http://127.0.0.1:18000/"
+          wait_for_url "combined-health" "http://127.0.0.1:18011/combined-health"
+          wait_for_readiness "backend-readiness" "http://127.0.0.1:18011/readiness" backend
+          "$PYTHON" -c 'import json, urllib.request; assert json.load(urllib.request.urlopen("http://127.0.0.1:18011/ai-api/api-status", timeout=8))["job_store"]["active_mode"] == "persistent"; print("persistent-job-store ready")'
+          wait_for_readiness "ai-api-readiness" "http://127.0.0.1:18011/ai-api/readiness" ai
+          wait_for_url "frontend-gateway" "http://127.0.0.1:18010/"
           REMOTE
 
       - name: Verify public reverse proxy endpoints
         run: |
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr/ >/dev/null
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr/ai-api/api-status >/dev/null
+          # 공개 오리진은 :38010 이다(외부 터널 38010 → 내부 18010). deploy.yml 의 공개 URL 8곳,
+          # GOOGLE_REDIRECT_URI, AUTH_PUBLIC_BACKEND_ORIGIN 이 모두 이 형태다. 포트 없는
+          # https://qt-agent.kro.kr/ 은 여기 한 곳만 쓰던 형태라 같은 오리진을 검증하지 못한다.
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr:38010/ >/dev/null
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr:38010/ai-api/api-status >/dev/null
           echo "public backend and frontend endpoints are reachable"

@@ -23,8 +23,9 @@
 
 ```mermaid
 flowchart LR
-    U["사용자 브라우저"] --> FE["FE · React/Vite<br/>:18000"]
-    FE -->|"/ai-api/analysis-jobs"| AI["AI API · FastAPI<br/>:18001"]
+    U["사용자 브라우저"] -->|"https://qt-agent.kro.kr:38010"| T["외부 터널<br/>38010 → 18010 · 38011 → 18011"]
+    T --> FE["FE 게이트웨이 · production-gateway.mjs<br/>내부 :18010"]
+    FE -->|"/ai-api/analysis-jobs"| AI["combined backend · FastAPI<br/>내부 :18011"]
     AI --> G["분석 그래프<br/>해석 → 데이터 → 연구 → 코드 → 백테스트 → 신호 → 리스크 → 리포트"]
     G --> BT["backtest_module"]
     BT --> G
@@ -463,7 +464,7 @@ Backend에도 `/analysis-jobs`, `/api-status`, `/api/reports/...`가 있지만, 
 | Backend 기능이 일반 배포에 없음 | 인증·서비스 DB·fenced executor 구현은 있으나 프로세스 미기동 | 기능이 존재하지만 사용자는 접근하지 못함 | Backend를 canonical ingress로 배포하거나, 의도적으로 MVP 밖임을 코드/route에서 제거 |
 | 생성 코드 실행 모델 이중화 | AI는 in-process `exec`, Backend는 fenced subprocess | 같은 기능의 보안 수준이 경로마다 다름 | 하나의 executor만 남기고 모든 생성 코드가 그 경계를 통과 |
 | 인증 상태 이중화 | FE localStorage guard, 서버 cookie/Redis auth | 화면은 로그인인데 API는 401이거나 반대인 상태 | 앱 시작 시 `/auth/me`를 canonical session source로 사용 |
-| 배포 종료가 포트만 신뢰 | 18000/18001 listener PID에 소유권 확인 없이 TERM/KILL | 같은 포트를 쓰는 다른 process 종료 가능 | 저장한 PID·시작시각·실행파일·argv를 검증한 뒤 소유 process만 종료 |
+| 배포 종료가 포트만 신뢰 | 18011/18010 listener PID에 소유권 확인 없이 TERM/KILL | 같은 포트를 쓰는 다른 process 종료 가능 | 저장한 PID·시작시각·실행파일·argv를 검증한 뒤 소유 process만 종료 |
 
 배포 근거: [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml#L21), [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml#L139)
 

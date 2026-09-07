@@ -41,7 +41,10 @@ jobs:
       SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
       SERVER_PORT: ${{ secrets.SERVER_PORT || '30233' }}
       SERVER_USER: ${{ secrets.SERVER_USER || 'etluser' }}
-      SERVER_APP_DIR: ${{ secrets.SERVER_APP_DIR || '/home/etluser/mvp_sp1/quant-proj' }}
+      # 같은 파일 630·760행이 이미 $HOME/mvp_sp2/quant-proj를 하드코딩하고 있었다. mvp_sp1의
+      # .run/combined.pid는 죽은 pid를 담고 있어 일부 모드는 그것을 읽고 엉뚱한 곳에서 실패하고,
+      # 일부는 낡은 트리의 venv로 벤치마크를 끝내 green으로 보고했다.
+      SERVER_APP_DIR: ${{ secrets.NODE3_APP_DIR || '/home/etluser/mvp_sp2/quant-proj' }}
       SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
       AOAI_RUN_ROOT: /tmp/quant-agent-aoai-${{ github.run_id }}
 
