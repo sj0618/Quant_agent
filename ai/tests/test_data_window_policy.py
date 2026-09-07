@@ -114,6 +114,28 @@ def test_universe_ranks_by_pre_window_traded_value_and_caps_in_the_database() ->
     assert "core.symbol_security_type_history" in connection.query
 
 
+def test_universe_keeps_names_the_security_type_history_does_not_cover() -> None:
+    """The loaded security-type history carries KOSDAQ names only.
+
+    An inner join on it dropped every KOSPI listing, so the "KOSPI/KOSDAQ" universe was
+    100% KOSDAQ. A name without a history interval must fall back to symbol_master's
+    classification, and the descriptor must say how many did.
+    """
+
+    connection = RecordingConnection([
+        {"symbol": "005930", "window_member_count": 2_715, "security_type_fallback_count": 853},
+        {"symbol": "000660", "window_member_count": 2_715, "security_type_fallback_count": 853},
+    ])
+
+    universe, descriptor = _source()._fetch_backtest_universe(connection, WINDOW)
+
+    assert universe == ["000660", "005930"]
+    assert "LEFT JOIN core.symbol_security_type_history sh" in connection.query
+    assert "COALESCE(sh.security_type, sm.security_type) = '보통주'" in connection.query
+    assert descriptor["security_type_fallback_source"] == "core.symbol_master"
+    assert descriptor["security_type_fallback_member_count"] == 853
+
+
 def test_universe_descriptor_reports_what_the_cap_cut() -> None:
     connection = RecordingConnection([
         {"symbol": "000660", "window_member_count": 1_717},

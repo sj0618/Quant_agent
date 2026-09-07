@@ -208,6 +208,8 @@ PY
 ## PIT 유니버스: 1년 창 + 거래대금 상위 100종
 
 > 멤버십은 `core.symbol_listing_history`(상장 구간) + `core.symbol_security_type_history`(보통주 분류)의 **창과 겹치는 구간**으로 정한다. `mart.common_stock_universe_asof` 뷰는 security-type 이력이 2026-08-11부터만 있어 그 이전 날짜에는 멤버를 하나도 돌려주지 않았고, 그래서 "5년 PIT 유니버스"가 사실상 오늘 상장 종목이었다(생존자 편향).
+>
+> security-type 이력은 **종목 축으로도 불완전**하다 — 적재된 이력은 KOSDAQ 종목뿐이라, 이 테이블에 inner join 하면 KOSPI 상장 1,071종(삼성전자 포함)이 전부 빠지고 "KOSPI/KOSDAQ 유니버스"가 100% KOSDAQ이 됐다(2026-09 실측: 5년 창 동일가중 -36%, 같은 기간 KOSPI +109%). 이력 행이 없는 종목은 `core.symbol_master.security_type`으로 분류하고, 그렇게 분류한 종목 수를 `backtest_universe.security_type_fallback_member_count`로 공개한다(5년 창 기준 853종).
 
 Data 노드는 5년치 전체 PIT 보통주(1,717종)를 올렸다. 그 한 건이 875초·21GB였고,
 Backtest 노드는 raw 체결가가 없는 bar에서 `raw_execution_unavailable`로 죽었다.

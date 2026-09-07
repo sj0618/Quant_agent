@@ -1208,6 +1208,9 @@ def test_backtest_universe_is_lifecycle_pit_bounded_to_fixed_window() -> None:
         "delisting_policy": "official-event-then-final-close-v1",
         "delisted_during_window": "kept_until_final_session",
         "security_type": "보통주",
+        "security_type_source": "core.symbol_security_type_history",
+        "security_type_fallback_source": "core.symbol_master",
+        "security_type_fallback_member_count": 0,
     }
 
     universe_query = next(
