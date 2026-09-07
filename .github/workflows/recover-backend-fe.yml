@@ -201,6 +201,9 @@ jobs:
 
       - name: Verify public reverse proxy endpoints
         run: |
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr/ >/dev/null
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr/ai-api/api-status >/dev/null
+          # 공개 오리진은 :38010 이다(외부 터널 38010 → 내부 18010). deploy.yml 의 공개 URL 8곳,
+          # GOOGLE_REDIRECT_URI, AUTH_PUBLIC_BACKEND_ORIGIN 이 모두 이 형태다. 포트 없는
+          # https://qt-agent.kro.kr/ 은 여기 한 곳만 쓰던 형태라 같은 오리진을 검증하지 못한다.
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr:38010/ >/dev/null
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 https://qt-agent.kro.kr:38010/ai-api/api-status >/dev/null
           echo "public backend and frontend endpoints are reachable"

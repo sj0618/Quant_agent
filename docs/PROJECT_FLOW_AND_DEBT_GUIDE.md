@@ -23,8 +23,9 @@
 
 ```mermaid
 flowchart LR
-    U["사용자 브라우저"] --> FE["FE 게이트웨이 · production-gateway.mjs<br/>:18010"]
-    FE -->|"/ai-api/analysis-jobs"| AI["combined backend · FastAPI<br/>:18011"]
+    U["사용자 브라우저"] -->|"https://qt-agent.kro.kr:38010"| T["외부 터널<br/>38010 → 18010 · 38011 → 18011"]
+    T --> FE["FE 게이트웨이 · production-gateway.mjs<br/>내부 :18010"]
+    FE -->|"/ai-api/analysis-jobs"| AI["combined backend · FastAPI<br/>내부 :18011"]
     AI --> G["분석 그래프<br/>해석 → 데이터 → 연구 → 코드 → 백테스트 → 신호 → 리스크 → 리포트"]
     G --> BT["backtest_module"]
     BT --> G
