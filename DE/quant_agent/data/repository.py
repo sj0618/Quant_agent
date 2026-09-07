@@ -1277,6 +1277,98 @@ class DataRepository:
             """
         )
 
+    def upsert_index_total_return(
+        self, rows: list[dict[str, Any]], run_id: UUID, source_id: str = "KRX"
+    ) -> int:
+        """Write official TR index levels. Idempotent on (index_code, trade_date)."""
+
+        if not rows:
+            return 0
+        values = [
+            "("
+            f"{sql_literal(row['index_code'])}, {sql_literal(row['trade_date'])}, "
+            f"{sql_literal(row['tr_value'])}, {sql_literal(source_id)}, {sql_literal(run_id)}"
+            ")"
+            for row in rows
+        ]
+        self.executor.execute_script(
+            f"""
+            INSERT INTO core.index_total_return_daily
+              (index_code, trade_date, tr_value, source_id, run_id)
+            VALUES {", ".join(values)}
+            ON CONFLICT (index_code, trade_date) DO UPDATE SET
+              tr_value = EXCLUDED.tr_value,
+              source_id = EXCLUDED.source_id,
+              run_id = EXCLUDED.run_id,
+              ingested_at = now();
+            """
+        )
+        return len(rows)
+
+    def upsert_index_benchmark_weights(
+        self, rows: list[dict[str, Any]], run_id: UUID, source_id: str = "KRX"
+    ) -> int:
+        """Write the unlagged monthly KOSPI/KOSDAQ split. Idempotent on month."""
+
+        if not rows:
+            return 0
+        values = [
+            "("
+            f"{sql_literal(row['month'])}, {sql_literal(row['kospi_weight'])}, "
+            f"{sql_literal(row['kosdaq_weight'])}, {sql_literal(row['basis'])}, "
+            f"{sql_literal(source_id)}, {sql_literal(run_id)}"
+            ")"
+            for row in rows
+        ]
+        self.executor.execute_script(
+            f"""
+            INSERT INTO core.index_benchmark_weight_monthly
+              (month, kospi_weight, kosdaq_weight, basis, source_id, run_id)
+            VALUES {", ".join(values)}
+            ON CONFLICT (month) DO UPDATE SET
+              kospi_weight = EXCLUDED.kospi_weight,
+              kosdaq_weight = EXCLUDED.kosdaq_weight,
+              basis = EXCLUDED.basis,
+              source_id = EXCLUDED.source_id,
+              run_id = EXCLUDED.run_id,
+              ingested_at = now();
+            """
+        )
+        return len(rows)
+
+    def fetch_month_end_market_caps(self, *, start_month: date, end_month: date) -> list[dict[str, Any]]:
+        """Month-end KOSPI/KOSDAQ market cap computed from warehouse closes.
+
+        Only a stand-in for the months ECOS has not published yet: it multiplies each
+        month's last close by the *current* listed-share count, so it drifts badly the
+        further back you go (measured against ECOS: ~0.15pp at one month, up to 14pp in
+        2018). The caller must keep it to the recent tail and label the basis.
+        """
+
+        return self.executor.fetch_json(
+            f"""
+            WITH month_end AS (
+              SELECT date_trunc('month', trade_date)::date AS month, max(trade_date) AS session
+                FROM core.ohlcv_daily
+               WHERE trade_date >= {sql_literal(start_month)}
+                 AND trade_date < ({sql_literal(end_month)}::date + INTERVAL '1 month')
+               GROUP BY 1
+            )
+            SELECT month_end.month,
+                   month_end.session,
+                   symbol.market,
+                   sum(bar.close * (symbol.metadata_jsonb->>'LIST_SHRS')::numeric) AS market_cap
+              FROM month_end
+              JOIN core.ohlcv_daily bar ON bar.trade_date = month_end.session
+              JOIN core.symbol_master symbol ON symbol.symbol_id = bar.symbol_id
+             WHERE symbol.market IN ('KOSPI', 'KOSDAQ')
+               AND symbol.metadata_jsonb->>'LIST_SHRS' IS NOT NULL
+               AND bar.close IS NOT NULL
+             GROUP BY 1, 2, 3
+             ORDER BY 1, 3;
+            """
+        )
+
     def upsert_bok_observations(self, rows: list[dict[str, Any]], run_id: UUID) -> int:
         if not rows:
             return 0

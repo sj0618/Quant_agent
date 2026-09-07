@@ -81,6 +81,12 @@ QA_CHECK_SCRIPT = Path(
 SYMBOL_METADATA_SCRIPT = Path(
     os.getenv("QUANT_AIRFLOW_SYMBOL_METADATA_SCRIPT", str(DE_ROOT / "scripts" / "refresh_symbol_metadata.py"))
 )
+INDEX_TOTAL_RETURN_SCRIPT = Path(
+    os.getenv(
+        "QUANT_AIRFLOW_INDEX_TOTAL_RETURN_SCRIPT",
+        str(DE_ROOT / "scripts" / "backfill_index_total_return.py"),
+    )
+)
 PROMPT_RETENTION_SCRIPT = DE_ROOT / "scripts" / "purge_ai_prompt_logs.py"
 PYTHON_EXECUTABLE = os.getenv("QUANT_AIRFLOW_PYTHON", sys.executable)
 
@@ -208,6 +214,31 @@ if dag and task:  # pragma: no branch
                 ),
             )
 
+        @task(task_id="ingest_index_total_return_daily")
+        def ingest_index_total_return_daily(
+            logical_date: str | None = None, data_interval_end: str | None = None
+        ) -> dict:
+            from quant_agent.data.config import KisConfig
+
+            if not KisConfig.from_env().is_configured:
+                _skip("KIS_APP_KEY/KIS_APP_SECRET are not configured.")
+            target_date = _previous_run_trade_date(logical_date, data_interval_end)
+            # Forward-only after the one-off backfill: a short trailing window is enough
+            # to pick up late index revisions, and every write is an idempotent upsert.
+            return _run_python_script(
+                INDEX_TOTAL_RETURN_SCRIPT,
+                [
+                    "--start-date",
+                    _external_ingest_start_date(target_date).isoformat(),
+                    "--end-date",
+                    target_date.isoformat(),
+                    "--dag-id",
+                    "quant_agent_daily_data_engineering",
+                    "--task-id",
+                    "ingest_index_total_return_daily",
+                ],
+            )
+
         @task(task_id="ingest_dart_financials_daily")
         def ingest_dart_financials_daily(logical_date: str | None = None, data_interval_end: str | None = None) -> dict:
             target_date = _previous_run_trade_date(logical_date, data_interval_end)
@@ -228,14 +259,19 @@ if dag and task:  # pragma: no branch
         qa = run_data_quality_checks_daily()
         bok = ingest_bok_daily()
         dart = ingest_dart_financials_daily()
+        index_tr = ingest_index_total_return_daily()
         calendar >> ingested
         ingested >> [symbol_metadata, kis_adjusted, bok]
         symbol_metadata >> qa
         symbol_metadata >> dart
+        # The monthly-weight fallback reads month-end closes and current listed shares,
+        # so it must run after symbol metadata refreshes.
+        symbol_metadata >> index_tr
         kis_adjusted >> computed
         computed >> qa
         bok >> qa
         dart >> qa
+        index_tr >> qa
 
     @dag(
         dag_id="quant_agent_ohlcv_repair",
