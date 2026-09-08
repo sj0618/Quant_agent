@@ -795,7 +795,8 @@ class Settings(BaseSettings):
             if self.email_api_key is None:
                 raise ValueError("server email rollout requires BREVO_API_KEY")
             try:
-                validate_sender_mailbox(self.email_from_address, require_authenticated_domain=True)
+                # Brevo verifies the exact sender through its API before every send.
+                validate_sender_mailbox(self.email_from_address, require_authenticated_domain=False)
             except ValueError:
                 raise PydanticCustomError("server_email_sender_invalid", "server_email_sender_invalid") from None
             _validate_server_public_url(self.email_public_base_url, name="EMAIL_PUBLIC_BASE_URL")

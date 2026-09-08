@@ -389,6 +389,8 @@ def test_email_server_rollout_defaults_disabled_and_accepts_strict_allowlist_con
     assert summary["email_local_recipient_allowlist_count"] == 1
     assert "controlled@example.test" not in str(summary)
     assert "reports@qt-agent.kro.kr" not in str(summary)
+    # Sender verification belongs to the provider; a domain name alone proves nothing.
+    assert server_email_settings(BREVO_SENDER_EMAIL="owner@gmail.com").email_from_address == "owner@gmail.com"
 
 
 @pytest.mark.parametrize(
@@ -397,7 +399,6 @@ def test_email_server_rollout_defaults_disabled_and_accepts_strict_allowlist_con
         {"EMAIL_ROLLOUT_MODE": "invalid"},
         {"EMAIL_LOCAL_RECIPIENT_ALLOWLIST": ""},
         {"BREVO_API_KEY": None},
-        {"BREVO_SENDER_EMAIL": "sender@other.example"},
         {"EMAIL_PUBLIC_BASE_URL": "http://app.qt-agent.kro.kr"},
         {"EMAIL_PUBLIC_BASE_URL": "https://localhost"},
         {"DATABASE_URL": "postgresql+asyncpg://localhost:5432/qt_db"},
