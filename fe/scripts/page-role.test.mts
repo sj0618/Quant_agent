@@ -6,6 +6,17 @@ async function read(relativePath: string) {
   return readFile(new URL(relativePath, import.meta.url), "utf8");
 }
 
+test("landing sample links stay on the public sample and report creation goes to login", async () => {
+  const landing = await read("../src/pages/LandingPage.tsx");
+
+  assert.match(landing, /<a[^>]*href="#sample">▷ 샘플 리포트 보기<\/a>/);
+  assert.match(landing, /<section[^>]*id="sample"/);
+  assert.match(landing, /예시 데이터입니다\. 실제 분석 결과나 현재 시세가 아닙니다\./);
+  assert.match(landing, /const loginHref = withReturnTo\(ROUTES.login, ROUTES.app\)/);
+  assert.match(landing, /<a href=\{loginHref\}>내 전략 리포트 만들기 →<\/a>/);
+  assert.doesNotMatch(landing, /ROUTES\.reportDetail/);
+});
+
 test("/reports lists workspace-generated strategy reports, not email deliveries", async () => {
   const [reportsPage, reportList, reportActions, clientSource] = await Promise.all([
     read("../src/pages/ReportsPage.tsx"),
