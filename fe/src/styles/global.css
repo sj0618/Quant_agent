@@ -78,10 +78,10 @@ h6 { font-size: 0.67em; }
 .avatar { width: 24px; height: 24px; border-radius: 50%; background: linear-gradient(135deg, #dbeafe, #cbd5e1); display: inline-block; }
 .avatar--large { width: 52px; height: 52px; flex: 0 0 52px; }
 
-.async-state { min-height: 100dvh; display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--muted); background: var(--bg); padding: 40px; }
+.async-state { min-height: calc(100dvh - var(--market-ticker-height)); display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--muted); background: var(--bg); padding: 40px; }
 /* Inside AppLayout the top bar already takes 56px, so a full-viewport block would
    overflow and push the page into a scroll it does not need. */
-.app-shell .async-state { min-height: calc(100dvh - 56px); }
+.app-shell .async-state { min-height: calc(100dvh - 56px - var(--market-ticker-height)); }
 .async-state strong { display: block; color: var(--ink); }
 .async-state p { margin-top: 4px; font-size: 13px; }
 .async-state__action { display: inline-block; margin-top: 16px; }
@@ -140,7 +140,7 @@ h6 { font-size: 0.67em; }
 .site-footer small { background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 4px 10px; }
 
 /* Workspace */
-.app-shell { min-height: 100dvh; background: var(--bg); }
+.app-shell { min-height: calc(100dvh - var(--market-ticker-height)); background: var(--bg); }
 .workspace-shell { min-height: calc(100dvh - 56px - var(--market-ticker-height)); display: flex; align-items: flex-start; }
 .workspace-main { flex: 1; min-width: 0; min-height: calc(100dvh - 56px - var(--market-ticker-height)); display: flex; flex-direction: column; }
 .workspace-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 32px; text-align: center; color: var(--muted); }
@@ -500,7 +500,7 @@ h6 { font-size: 0.67em; }
 .report-paper__section--cost a { color: var(--blue); font-weight: 700; }
 
 /* Auth, settings, search, legal */
-.auth-page, .legal-page, .settings-page, .search-page, .strategy-page { min-height: calc(100dvh - 56px); padding: 48px 40px 72px; }
+.auth-page, .legal-page, .settings-page, .search-page, .strategy-page { min-height: calc(100dvh - 56px - var(--market-ticker-height)); padding: 48px 40px 72px; }
 .auth-page { display: flex; align-items: center; justify-content: center; background: var(--bg); }
 .auth-panel { width: min(520px, 100%); display: flex; flex-direction: column; gap: 16px; }
 .auth-panel h1, .legal-page h1, .settings-page__head h1 { font-size: 32px; letter-spacing: -0.4px; }
@@ -545,7 +545,7 @@ h6 { font-size: 0.67em; }
 .search-result-row { display: grid; grid-template-columns: 84px minmax(0, 1fr) auto; gap: 14px; align-items: center; border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 14px 16px; }
 .search-result-row small { display: block; color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 4px; }
 .search-result-row em { color: var(--subdued); font-style: normal; font-size: 12px; font-weight: 800; }
-.not-found { min-height: 100dvh; display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; }
+.not-found { min-height: calc(100dvh - var(--market-ticker-height)); display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; }
 .not-found a { background: var(--ink); color: #fff; border-radius: 8px; padding: 10px 16px; }
 
 @media (max-width: 1180px) {
