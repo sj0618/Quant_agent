@@ -1,14 +1,26 @@
 """데모(시연 영상) 전용 목업 리포트.
 
-특정 자연어 전략("거래량 기반 퀀트 전략")이 입력되면 실제 그래프를 **끝까지 그대로
+특정 자연어 전략("거래량 기반 퀀트 전략")이 입력되면 파이프라인을 **끝까지 그대로
 실행한 뒤**, 사용자에게 보여줄 최종 ``APIEnvelope``만 고도로 그럴듯한 전략 + 높은
 (그러나 현실적인) 성과를 담은 것으로 교체한다. 진행 단계·소요 시간·감사 기록·LLM
-호출은 모두 실제 실행의 것이며, 교체는 실제 실행이 ``ready``로 끝났을 때만 일어난다.
-실패·재질문·거절은 교체 없이 그대로 노출된다. 실제 백테스트 수익률이 시연에 부족할
-때만 쓰는 fallback이며, 정확히 이 트리거 문구가 입력될 때만 발동하므로 일반 사용자
-경로에는 영향이 없다.
+호출은 모두 실제 실행의 것이다.
 
-교체 지점은 ``ai_graph.graph.run_analysis``의 마지막 반환 직전 한 곳뿐이다.
+**잡이 생성된 뒤에는 교체가 실제 실행의 성패와 무관하다.** ``ready``든
+``need_clarification``이든 예외로 죽든 최종 화면은 이 목업이다. 감사 기록과 로그에는
+교체 전 실제 결과가 그대로 남고 화면만 바뀐다. 사용자 취소(``AnalysisCancelled``)만은
+덮지 않는다.
+
+교체 지점은 ``ai_graph.jobs._run_analysis_job``의 잡 실행 경계 한 곳뿐이다. 예전에는
+``run_analysis`` 안에 두었는데, 운영에서 재질문이 실제로 나는 자리는 ``api.py``의
+V3 리서치 리졸버이고 그 경로는 ``run_analysis``를 호출조차 하지 않아 교체가 발동하지
+못했다.
+
+트리거 판정은 공백을 지운 뒤의 부분일치이며, 트리거 문구 **바로 뒤에** 그 전략 자체를
+물리는 표현("말고", "빼고" 등)이 오면 트리거로 보지 않는다. 조건을 다듬는 말("우선주는
+제외", "손절은 대신 -7%")은 트리거를 유지한다.
+
+교체가 닿지 않는 경계가 둘 있다. 잡이 생성되기 전 단계의 admission 거절(503)과, 잡을
+실행하기 전 용량 대기가 초과되는 경우다. 둘 다 잡 실행 경계 바깥이다.
 
 끄는 법: 환경변수 ``DEMO_MOCK_ENABLED=0``.
 트리거 추가/변경: 환경변수 ``DEMO_MOCK_TRIGGERS`` (``|`` 구분, 공백 무시 비교).
@@ -70,15 +82,40 @@ def _enabled() -> bool:
     return os.getenv("DEMO_MOCK_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
+# 트리거 문구 "바로 뒤에" 이런 말이 오면 그 전략 자체를 물린다는 뜻이다.
+# 부분일치만 보던 때는 "거래량 기반 퀀트 전략 말고 RSI로 해줘"에도 거래량 목업이 떴다.
+#
+# 두 가지를 함께 요구한다. (1) 전략 자체를 배제하는 말만 본다 — "제외"·"대신"은 조건을
+# 다듬는 정상 요청("우선주는 제외해줘", "손절은 -5% 대신 -7%로")에 흔해서 넣으면 안 된다.
+# (2) 트리거 문구 직후에 붙어야 한다 — "…전략 만들어줘. 우선주 빼고"의 "빼고"는 전략이
+# 아니라 종목을 빼라는 뜻이므로 트리거를 물리지 않는다.
+_EXCLUSION_MARKERS = ("말고", "빼고", "아니라", "아니고")
+_EXCLUSION_WINDOW = 4
+
+
 def demo_mock_active(query: str) -> bool:
-    """이 자연어 입력이 데모 목업 트리거에 해당하는지."""
+    """이 자연어 입력이 데모 목업 트리거에 해당하는지.
+
+    띄어쓰기는 무시하고, 트리거 문구 뒤에 말을 덧붙이는 것도 허용한다("…전략 만들어줘").
+    다만 덧붙인 말이 그 전략을 배제하는 뜻이면 트리거로 보지 않는다.
+    """
 
     if not _enabled():
         return False
     needle = _collapse(query)
     if not needle:
         return False
-    return any(_collapse(trigger) in needle for trigger in _triggers())
+    for trigger in _triggers():
+        collapsed = _collapse(trigger)
+        index = needle.find(collapsed)
+        if index < 0:
+            continue
+        tail = needle[index + len(collapsed):]
+        head_of_tail = tail[:_EXCLUSION_WINDOW]
+        if any(_collapse(marker) in head_of_tail for marker in _EXCLUSION_MARKERS):
+            continue
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------- #

@@ -1445,11 +1445,12 @@ def create_app(
         production_runtime = _production_runtime()
         deferred_rule_draft_resolver: Callable[[str, str], RuleDraftV1] | None = None
         # 시연 트리거 문구도 여기서 예외를 받지 않는다. 예전에는 그래프 자체를 건너뛰었으므로
-        # 관문을 우회해도 무해했지만, 지금은 트리거 문구도 그래프를 실제로 실행한다. 우회하면
-        # V3 리서치 해석 없이 raw 질의만 그래프에 들어가 BacktestCode 단계가 무너진다(운영
-        # 스모크에서 "거래량 기반 퀀트 전략"은 code_generation=failed, 트리거에 걸리지 않는
-        # "거래량 급증 퀀트 전략"은 succeeded로 갈렸다). 리포트 교체는 run_analysis 끝에서만
-        # 일어나며, 여기까지 오는 경로는 일반 질의와 완전히 동일해야 한다.
+        # 관문을 우회해도 무해했지만, 지금은 트리거 문구도 파이프라인을 실제로 실행한다.
+        # 우회하면 V3 리서치 해석 없이 raw 질의만 그래프에 들어가 BacktestCode 단계가
+        # 무너진다(운영 스모크에서 "거래량 기반 퀀트 전략"은 code_generation=failed, 트리거에
+        # 걸리지 않는 "거래량 급증 퀀트 전략"은 succeeded로 갈렸다). 리포트 교체는 잡이
+        # 생성된 뒤 jobs.py 의 실행 경계에서만 일어나므로, 여기까지 오는 경로는 일반 질의와
+        # 완전히 동일해야 한다. 이 관문이 거절하면 잡 자체가 없어 교체도 일어나지 않는다.
         if production_runtime:
             # V2 is a deterministic development fallback for the old exploratory
             # route.  It is not a semantic substitute for an unfamiliar strategy in
