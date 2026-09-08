@@ -255,8 +255,6 @@ _AUTOMATIC_COMPATIBLE_NAMED_TERMS = (
     "변동성",
     "low vol",
     "저변동",
-    "거래량",
-    "돌파",
 )
 _ENTRY_EXIT_TERMS = (
     "entry",
@@ -296,7 +294,6 @@ _OPERATOR_TERMS = (
     "상회",
     "하회",
     "교차",
-    "돌파",
     "아래",
     "위로",
     "넘으면",
@@ -526,6 +523,14 @@ def classify_strategy_request(query: str) -> StrategyRequestMode:
     if is_information_only:
         return "standard"
     if any(term in lowered for term in _AUTOMATIC_TERMS):
+        return "automatic"
+    # Only an affirmative family request may use catalogue defaults. Extra wording
+    # (questions, exclusions or another indicator) still needs semantic research.
+    if re.fullmatch(
+        r"(?:거래량|돌파)\s*(?:기반\s*)?(?:퀀트\s*)?전략"
+        r"(?:\s*(?:만들어|짜|해)\s*(?:줘|주세요))?[.!?]?",
+        lowered.strip(),
+    ):
         return "automatic"
     if any(term in lowered for term in _NAMED_STRATEGY_TERMS):
         if has_creation_intent and any(

@@ -393,7 +393,7 @@ def _exploration_signer() -> RuleDraftSigner:
 
 @pytest.mark.parametrize(
     "query",
-    ["돈이 되는 전략 추천해줘", "거래량 기반 전략", "돌파 전략"],
+    ["돈이 되는 전략 추천해줘", "거래량 기반 전략", "돌파 전략", "거래량 전략 만들어 줘"],
 )
 def test_a_vague_request_prefers_the_catalogue_over_an_invented_rule(query: str) -> None:
     """A live researcher no longer wins the race against the sealed catalogue.
@@ -484,7 +484,7 @@ def test_only_vague_requests_take_the_catalogue_path(
     [
         ("거래량이 1000000 이상이면 매수", "user_defined"),
         ("20일 고점 돌파 시 진입", "user_defined"),
-        ("주가가 10000원을 돌파하면 매수", "user_defined"),
+        ("주가가 10000원을 돌파하면 매수", "standard"),
         ("거래량이 무엇인지 설명해줘", "standard"),
         ("돌파가 무엇인지 설명해줘", "standard"),
     ],
@@ -494,6 +494,44 @@ def test_catalogue_preferences_preserve_explicit_and_informational_requests(
     mode: str,
 ) -> None:
     assert classify_strategy_request(query) == mode
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "거래량 전략이 무엇인지 설명해줘",
+        "돌파 전략의 뜻을 설명해줘",
+        "거래량 기반 전략 말고 RSI로 해줘",
+        "거래량은 제외한 RSI 전략",
+        "돌파 전략 말고 RSI로 해줘",
+        "거래량과 RSI를 함께 쓰는 전략",
+    ],
+)
+def test_non_affirmative_family_requests_still_require_research(
+    query: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ai_graph import research_contract
+    from ai_graph.nodes.strategy_research import StrategyResearchError
+
+    researched: list[str] = []
+
+    def require_research(**kwargs: object) -> None:
+        researched.append(str(kwargs["query"]))
+        raise StrategyResearchError("local test: request requires semantic research")
+
+    monkeypatch.setattr(research_contract, "_build_researched_draft", require_research)
+    assert classify_strategy_request(query) == "standard"
+    draft = build_rule_draft(
+        query=query,
+        user_id="local-dev-user",
+        signer=_exploration_signer(),
+        use_llm=True,
+        exploration_policy=_active_policy(),
+    )
+    assert researched == [query]
+    assert not draft.is_executable
+    assert draft.strategy_execution_spec is None
+    assert draft.parse_token is None
 
 
 def test_a_stale_policy_falls_back_instead_of_failing_the_request() -> None:
