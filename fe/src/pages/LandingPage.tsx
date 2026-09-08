@@ -53,7 +53,7 @@ export function LandingPage() {
         </p>
         <div className="hero__actions">
           <Button onClick={() => window.location.assign(loginHref)} variant="primary">Google 계정으로 시작하기 →</Button>
-          <Button onClick={() => window.location.assign(ROUTES.reportDetail("2026-04-18"))} variant="ghost">▷ 샘플 리포트 보기</Button>
+          <a className="button button--ghost" href="#sample">▷ 샘플 리포트 보기</a>
         </div>
         <small>무료 · 가입 30초 · 신용카드 등록 없음</small>
         <div className="hero__stats">
@@ -81,7 +81,7 @@ export function LandingPage() {
       </section>
 
       <section className="landing-section landing-section--soft" id="sample">
-        <SectionHead eyebrow="SAMPLE REPORT" title="이런 리포트를 매일 받게 됩니다" description="실제 서비스 화면과 동일한 구조의 Daily Report 샘플입니다." />
+        <SectionHead eyebrow="SAMPLE REPORT" title="이런 리포트를 매일 받게 됩니다" description="리포트 구성을 보여주는 예시 데이터입니다. 실제 분석 결과나 현재 시세가 아닙니다." />
         <Card className="sample-report-card">
           <div className="sample-report-card__head">
             <div>
@@ -107,7 +107,7 @@ export function LandingPage() {
               </span>
             ))}
           </div>
-          <a href={ROUTES.reportDetail("2026-04-18")}>샘플 리포트 자세히 보기 →</a>
+          <a href={loginHref}>내 전략 리포트 만들기 →</a>
         </Card>
       </section>
 
