@@ -15,9 +15,7 @@
 V3 리서치 리졸버이고 그 경로는 ``run_analysis``를 호출조차 하지 않아 교체가 발동하지
 못했다.
 
-트리거 판정은 공백을 지운 뒤의 부분일치이며, 트리거 문구 **바로 뒤에** 그 전략 자체를
-물리는 표현("말고", "빼고" 등)이 오면 트리거로 보지 않는다. 조건을 다듬는 말("우선주는
-제외", "손절은 대신 -7%")은 트리거를 유지한다.
+트리거 판정은 공백을 지운 뒤의 단순 부분일치다. 트리거 문구를 포함하기만 하면 발동한다.
 
 교체가 닿지 않는 경계가 둘 있다. 잡이 생성되기 전 단계의 admission 거절(503)과, 잡을
 실행하기 전 용량 대기가 초과되는 경우다. 둘 다 잡 실행 경계 바깥이다.
@@ -82,22 +80,13 @@ def _enabled() -> bool:
     return os.getenv("DEMO_MOCK_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
-# 트리거 문구 "바로 뒤에" 이런 말이 오면 그 전략 자체를 물린다는 뜻이다.
-# 부분일치만 보던 때는 "거래량 기반 퀀트 전략 말고 RSI로 해줘"에도 거래량 목업이 떴다.
-#
-# 두 가지를 함께 요구한다. (1) 전략 자체를 배제하는 말만 본다 — "제외"·"대신"은 조건을
-# 다듬는 정상 요청("우선주는 제외해줘", "손절은 -5% 대신 -7%로")에 흔해서 넣으면 안 된다.
-# (2) 트리거 문구 직후에 붙어야 한다 — "…전략 만들어줘. 우선주 빼고"의 "빼고"는 전략이
-# 아니라 종목을 빼라는 뜻이므로 트리거를 물리지 않는다.
-_EXCLUSION_MARKERS = ("말고", "빼고", "아니라", "아니고")
-_EXCLUSION_WINDOW = 4
-
-
 def demo_mock_active(query: str) -> bool:
     """이 자연어 입력이 데모 목업 트리거에 해당하는지.
 
-    띄어쓰기는 무시하고, 트리거 문구 뒤에 말을 덧붙이는 것도 허용한다("…전략 만들어줘").
-    다만 덧붙인 말이 그 전략을 배제하는 뜻이면 트리거로 보지 않는다.
+    띄어쓰기를 지운 뒤의 단순 부분일치다. 트리거 문구 앞뒤로 말을 덧붙여도 발동한다.
+    한때 "…전략 말고 RSI로"처럼 그 전략을 물리는 문장을 걸러내는 판정을 넣었으나, 조건을
+    다듬는 정상 요청까지 함께 꺼져 시연이 오히려 불안정해졌다. 시연 문구는 발표자가
+    입력하는 고정 문자열이므로 단순 부분일치로 되돌렸다.
     """
 
     if not _enabled():
@@ -105,17 +94,7 @@ def demo_mock_active(query: str) -> bool:
     needle = _collapse(query)
     if not needle:
         return False
-    for trigger in _triggers():
-        collapsed = _collapse(trigger)
-        index = needle.find(collapsed)
-        if index < 0:
-            continue
-        tail = needle[index + len(collapsed):]
-        head_of_tail = tail[:_EXCLUSION_WINDOW]
-        if any(_collapse(marker) in head_of_tail for marker in _EXCLUSION_MARKERS):
-            continue
-        return True
-    return False
+    return any(_collapse(trigger) in needle for trigger in _triggers())
 
 
 # --------------------------------------------------------------------------- #

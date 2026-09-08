@@ -181,22 +181,6 @@ def test_untriggered_failure_is_not_replaced() -> None:
     assert result["status"] != "ready"
 
 
-def test_exclusion_marker_disables_the_trigger() -> None:
-    """트리거 문구 뒤에 배제 표현이 오면 다른 요청이므로 목업을 띄우지 않는다."""
-
-    from ai_graph.demo_mock import demo_mock_active
-
-    assert demo_mock_active("거래량 기반 퀀트 전략 만들어줘") is True
-    assert demo_mock_active("거래량 기반 퀀트 전략 말고 RSI로 해줘") is False
-    assert demo_mock_active("거래량 기반 퀀트 전략은 빼고 배당주로") is False
-
-    def _exploding(query: str, trace_id: str | None):
-        raise RuntimeError("backtest engine unavailable")
-
-    result = _result_with_runner("거래량 기반 퀀트 전략 말고 RSI로 해줘", _exploding)
-    assert result["status"] != "ready"
-
-
 def test_capacity_timeout_still_yields_the_demo_report() -> None:
     """용량 대기 초과도 시연 화면은 고성과 리포트다.
 
@@ -222,28 +206,3 @@ def test_capacity_timeout_still_yields_the_demo_report() -> None:
     assert envelope.status.value == "ready"
     metrics = envelope.user_payload.performance.performance["metrics"]
     assert metrics["total_return"] == 1.63
-
-
-def test_refinement_words_do_not_disable_the_trigger() -> None:
-    """조건을 다듬는 말은 트리거를 물리지 않는다.
-
-    배제 판정을 처음 넣었을 때 "제외"·"대신"까지 마커로 잡아, 시연자가 그 전략을 원하는
-    문장 넷이 전부 꺼졌다. 배제 표현이 트리거 바로 뒤에 붙은 경우만 물린다.
-    """
-
-    from ai_graph.demo_mock import demo_mock_active
-
-    for query in (
-        "거래량 기반 퀀트 전략, KOSPI 대신 KOSDAQ으로 해줘",
-        "거래량 기반 퀀트 전략 짜줘. 우선주는 제외해줘",
-        "거래량 기반 퀀트 전략 만들어줘. 손절은 -5% 대신 -7%로",
-        "거래량 기반 퀀트 전략 만들어줘. 우선주 빼고",
-        "거래량 기반 퀀트 전략인데 단순 이평선이 아니라 거래량 급증 기준으로",
-    ):
-        assert demo_mock_active(query) is True, query
-
-    for query in (
-        "거래량 기반 퀀트 전략 말고 RSI로 해줘",
-        "거래량 기반 퀀트 전략은 빼고 배당주로",
-    ):
-        assert demo_mock_active(query) is False, query
