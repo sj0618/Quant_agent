@@ -472,6 +472,8 @@ jobs:
             printf '%s\n' 'GOOGLE_REDIRECT_URI=https://qt-agent.kro.kr:38010/auth/google/callback'
             printf '%s\n' 'AUTH_PUBLIC_BACKEND_ORIGIN=https://qt-agent.kro.kr:38010'
             printf '%s\n' 'AUTH_ALLOWED_ORIGINS=https://qt-agent.kro.kr:38010'
+            printf '%s\n' 'EMAIL_PUBLIC_BASE_URL=https://qt-agent.kro.kr:38010'
+            printf '%s\n' 'EMAIL_UNSUBSCRIBE_BASE_URL=https://qt-agent.kro.kr:38010'
             printf '%s\n' 'AUTH_ALLOWED_HOSTS=qt-agent.kro.kr,localhost,127.0.0.1'
             printf '%s\n' 'AUTH_TRUSTED_PROXY_HEADERS=true'
             printf '%s\n' 'AUTH_TRUSTED_PROXY_HOSTS=127.0.0.1,::1'
@@ -491,7 +493,7 @@ jobs:
             chmod 600 "$incoming"
 
             if [ -f "$env_file" ]; then
-              grep -Ev '^(APP_ENV|AUTH_ENABLED|GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|GOOGLE_REDIRECT_URI|AUTH_PUBLIC_BACKEND_ORIGIN|AUTH_ALLOWED_ORIGINS|AUTH_ALLOWED_HOSTS|AUTH_TRUSTED_PROXY_HEADERS|AUTH_TRUSTED_PROXY_HOSTS|AUTH_COOKIE_SECURE|AUTH_COOKIE_SAMESITE)=' \
+              grep -Ev '^(APP_ENV|AUTH_ENABLED|GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|GOOGLE_REDIRECT_URI|AUTH_PUBLIC_BACKEND_ORIGIN|AUTH_ALLOWED_ORIGINS|EMAIL_PUBLIC_BASE_URL|EMAIL_UNSUBSCRIBE_BASE_URL|AUTH_ALLOWED_HOSTS|AUTH_TRUSTED_PROXY_HEADERS|AUTH_TRUSTED_PROXY_HOSTS|AUTH_COOKIE_SECURE|AUTH_COOKIE_SAMESITE)=' \
                 "$env_file" > "$next_file" || true
             fi
             cat "$incoming" >> "$next_file"
@@ -630,6 +632,10 @@ jobs:
           }
 
             deploy_release() {
+            # Email links use the same public origin as login, including the tunnel port.
+            # Override inherited shell values as well as the persisted .env above.
+            export EMAIL_PUBLIC_BASE_URL=https://qt-agent.kro.kr:38010
+            export EMAIL_UNSUBSCRIBE_BASE_URL=https://qt-agent.kro.kr:38010
 
             python3.11 -m venv "$APP_DIR/ai/.venv"
             "$APP_DIR/ai/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
@@ -1053,6 +1059,8 @@ jobs:
           }
 
           restart_restored_release() {
+            export EMAIL_PUBLIC_BASE_URL=https://qt-agent.kro.kr:38010
+            export EMAIL_UNSUBSCRIBE_BASE_URL=https://qt-agent.kro.kr:38010
             stop_listeners_on_port 18011
             stop_listeners_on_port 18010
             rm -f "$RUN_DIR/ai.pid" "$RUN_DIR/combined.pid" "$RUN_DIR/fe.pid"

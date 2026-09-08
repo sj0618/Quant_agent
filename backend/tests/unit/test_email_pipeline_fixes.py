@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 import pytest
+import httpx
 
 from app.api.routes import email_reports
 from app.db import email_outbox
@@ -42,6 +43,36 @@ def test_brevo_sandbox_mode_is_sent_as_an_http_request_header():
 
     assert headers[BREVO_SANDBOX_HEADER] == BREVO_SANDBOX_VALUE
     assert BREVO_SANDBOX_HEADER not in payload["headers"]
+
+
+@pytest.mark.parametrize(
+    ("status", "senders", "expected"),
+    [
+        (200, [{"email": "owner@gmail.com", "active": True}], "accepted"),
+        (200, [{"email": "owner@gmail.com", "active": False}], "permanent_error"),
+        (200, [{"email": "other@gmail.com", "active": True}], "permanent_error"),
+        (200, None, "permanent_error"),
+        (401, [], "permanent_error"),
+        (503, [], "retryable_error"),
+    ],
+)
+def test_brevo_checks_exact_active_sender_before_submitting_email(monkeypatch, status, senders, expected):
+    """Local-only provider responses; no real mail or network calls."""
+    settings = _email_settings(EMAIL_FROM_ADDRESS="owner@gmail.com")
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.method == "GET":
+            assert request.url.path == "/v3/senders"
+            return httpx.Response(status, json={"senders": senders})
+        return httpx.Response(201, json={"messageId": "test-message"})
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(respond)))
+    result = asyncio.run(BrevoEmailProvider(settings).send(_message()))
+    assert result.status == expected
+    assert [request.method for request in requests] == (["GET", "POST"] if expected == "accepted" else ["GET"])
 
 
 def test_report_email_links_to_the_owner_scoped_email_report_screen():

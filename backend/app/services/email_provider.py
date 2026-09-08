@@ -115,7 +115,7 @@ class BrevoEmailProvider:
         try:
             validate_sender_mailbox(
                 self.settings.email_from_address,
-                require_authenticated_domain=True,
+                require_authenticated_domain=self._runtime_provider_name() != BREVO_PROVIDER_NAME,
             )
         except ValueError:
             raise AppError(
@@ -260,6 +260,23 @@ class BrevoEmailProvider:
 
         try:
             async with httpx.AsyncClient(base_url=base_url, timeout=timeout) as client:
+                if provider_name == BREVO_PROVIDER_NAME:
+                    sender_response = await client.get("/v3/senders", headers=headers)
+                    if not 200 <= sender_response.status_code < 300:
+                        return self.normalize_error(sender_response)
+                    sender_payload = sender_response.json()
+                    senders = sender_payload.get("senders", []) if isinstance(sender_payload, dict) else []
+                    if not isinstance(senders, list) or not any(
+                        isinstance(sender, dict)
+                        and sender.get("active") is True
+                        and str(sender.get("email", "")).casefold() == self.settings.email_from_address.casefold()
+                        for sender in senders
+                    ):
+                        return EmailDeliverySendResult(
+                            provider=provider_name,
+                            error_code="email_sender_not_verified",
+                            error_message="The configured sender must be verified and active in Brevo.",
+                        )
                 response = await client.post(request_path, headers=headers, json=payload)
         except Exception as exc:  # noqa: BLE001
             return self.normalize_error(exc)

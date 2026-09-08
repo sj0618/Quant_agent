@@ -1,5 +1,7 @@
 import re
+import subprocess
 from pathlib import Path
+from textwrap import dedent
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEPLOY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "deploy.yml"
@@ -9,6 +11,43 @@ RECOVER_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "recover-backend-
 READINESS_GATE = REPOSITORY_ROOT / "scripts" / "readiness-semantic-gate.mjs"
 AI_API_SOURCE = REPOSITORY_ROOT / "ai" / "ai_graph" / "api.py"
 EMAIL_WORKER_MANAGER = REPOSITORY_ROOT / "backend" / "scripts" / "manage_email_delivery_worker.sh"
+
+
+def test_deploy_replaces_stale_email_link_origins_and_preserves_them_on_restart(tmp_path):
+    """Local-only: execute the deployed env rewrite and each startup's URL exports."""
+
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    configure = workflow.split("- name: Configure production Google auth", 1)[1].split(
+        "- name: Install and restart development servers", 1
+    )[0]
+    writer = configure[configure.index("          {\n"):configure.index("          scp -q")]
+    merger = configure[configure.index('            env_file="$APP_DIR/.env"'):configure.index("          REMOTE")]
+    keys = ("EMAIL_PUBLIC_BASE_URL", "EMAIL_UNSUBSCRIBE_BASE_URL")
+    stale = "https://qt-agent.kro.kr"
+    public = f"{stale}:38010"
+    env_file = tmp_path / ".env"
+    env_file.write_text("".join(f"{key}={stale}\n" for key in keys) + "EMAIL_FROM_NAME=QuantAgent\n")
+    script = (
+        'set -eu\nAPP_DIR="$1"\nauth_env_file="$APP_DIR/.env.auth.upload"\n'
+        "GOOGLE_CLIENT_ID=local-test\nGOOGLE_CLIENT_SECRET=local-test\n"
+        + dedent(writer) + dedent(merger)
+    )
+    subprocess.run(["bash", "-c", script, "test", str(tmp_path)], check=True, capture_output=True, text=True)
+    rewritten = env_file.read_text().splitlines()
+    for key in keys:
+        assert [line for line in rewritten if line.startswith(f"{key}=")] == [f"{key}={public}"]
+    assert "EMAIL_FROM_NAME=QuantAgent" in rewritten
+
+    recovery = RECOVER_WORKFLOW.read_text(encoding="utf-8")
+    for startup in (workflow.split("\n            deploy_release() {", 1)[1],
+                    workflow.split("restart_restored_release() {", 1)[1], recovery):
+        before_start = startup.split("nohup ", 1)[0]
+        exports = "\n".join(re.findall(r"^\s*export EMAIL_(?:PUBLIC|UNSUBSCRIBE)_BASE_URL=.*$", before_start, re.MULTILINE))
+        result = subprocess.run(
+            ["bash", "-c", exports + '\nprintf "%s\\n" "$EMAIL_PUBLIC_BASE_URL" "$EMAIL_UNSUBSCRIBE_BASE_URL"'],
+            env={key: stale for key in keys}, check=True, capture_output=True, text=True,
+        )
+        assert result.stdout.splitlines() == [public, public]
 
 
 def test_deploy_uses_the_backtest_dependency_graph_and_verifies_imports():
