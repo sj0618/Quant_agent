@@ -121,7 +121,7 @@ export function StrategyInputPanel({
         "sticky flex min-h-0 w-full shrink-0 flex-col bg-dark text-[#edeff4]",
         // Phone: sits under the top bar (56px) plus the pane switch (60px), and takes the
         // rest of the small viewport. Desktop: full height beside the workspace.
-        "top-29 h-[calc(100dvh-7.25rem)] md:top-14 md:h-[calc(100dvh-3.5rem)] md:w-80 xl:w-[400px]",
+        "top-29 h-[calc(100dvh-7.25rem-var(--market-ticker-height))] md:top-14 md:h-[calc(100dvh-3.5rem-var(--market-ticker-height))] md:w-80 xl:w-[400px]",
         className,
       )}
     >

@@ -9,6 +9,7 @@ from app.core.errors import AppError
 
 class ContractImplementation(str, Enum):
     DB_BACKED = "db-backed"
+    UPSTREAM_BACKED = "upstream-backed"
     SCHEMA_ONLY_NOT_DB = "schema-only-not-db"
 
 
@@ -152,6 +153,18 @@ TRACK_A_CONTRACT_POLICY: tuple[EndpointContract, ...] = (
 )
 
 TRACK_C_CONTRACT_POLICY: tuple[EndpointContract, ...] = (
+    contract(
+        "GET",
+        "/api/v1/market-ticker",
+        implementation=ContractImplementation.UPSTREAM_BACKED,
+        visibility=ContractVisibility.PUBLIC,
+        production_ready=True,
+        fe_live_allowed=True,
+        auth_required=False,
+        csrf_required_for_unsafe=False,
+        summary="Read fixed public market quotes with provider timestamps and availability.",
+        required_dependency="public market data providers",
+    ),
     contract(
         "GET",
         "/api/v1/api-status",

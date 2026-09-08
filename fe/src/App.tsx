@@ -12,6 +12,7 @@ import { ReportsPage } from "./pages/ReportsPage";
 import { SearchPage } from "./pages/SearchPage";
 import { UnsubscribePage } from "./pages/UnsubscribePage";
 import { AsyncState } from "./components/common/AsyncState";
+import { MarketTicker } from "./components/layout/MarketTicker";
 import {
   bootstrapSessionFromCookie,
   getCurrentSession,
@@ -45,7 +46,7 @@ function isProtectedRoute(path: string) {
 }
 
 export default function App() {
-  return <AppRoutes />;
+  return <div className="market-ticker-page"><AppRoutes /><MarketTicker /></div>;
 }
 
 function AppRoutes() {

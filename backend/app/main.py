@@ -13,6 +13,7 @@ from app.api.routes import (
     auth,
     fe_contract,
     health,
+    market_ticker,
     readiness,
     pages,
     reports_pdf_temp,
@@ -147,6 +148,7 @@ def create_app() -> FastAPI:
     app.include_router(ai_account_tokens.router)
     app.include_router(reports_pdf_temp.router)
     app.include_router(fe_contract.router)
+    app.include_router(market_ticker.router)
     app.include_router(pages.router)
     return app
 
