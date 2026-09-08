@@ -71,6 +71,8 @@ jobs:
           test -s "$RULE_DRAFT_SECRET_FILE"
 
           export APP_ENV=production
+          export EMAIL_PUBLIC_BASE_URL=https://qt-agent.kro.kr:38010
+          export EMAIL_UNSUBSCRIBE_BASE_URL=https://qt-agent.kro.kr:38010
           export AI_JOB_STORE=persistent
           # The backtest evaluation cache must be a persistent directory under the
           # release profile (a /tmp fallback is refused by the AI service). Without
