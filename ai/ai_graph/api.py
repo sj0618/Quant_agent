@@ -1969,11 +1969,10 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Server indicator data is temporarily unavailable.",
             )
-        if not automatic and not _production_runtime():
-            # See raw admission above: retain a published candidate policy as a
-            # development-only fallback for an underspecified natural-language
-            # request. Release admission never changes an unknown strategy into a
-            # catalogue selection when AI research is unavailable.
+        if automatic or not _production_runtime():
+            # Match raw admission: automatic requests need the published policy on
+            # the review path too. Other requests retain the development-only
+            # incomplete-parse fallback; release research semantics stay unchanged.
             try:
                 exploration_policy = app.state.exploration_policy_resolver()
             except Exception:  # noqa: BLE001 - optional incomplete-request fallback.

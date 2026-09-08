@@ -524,6 +524,14 @@ def classify_strategy_request(query: str) -> StrategyRequestMode:
         return "standard"
     if any(term in lowered for term in _AUTOMATIC_TERMS):
         return "automatic"
+    # Only an affirmative family request may use catalogue defaults. Extra wording
+    # (questions, exclusions or another indicator) still needs semantic research.
+    if re.fullmatch(
+        r"(?:거래량|돌파)\s*(?:기반\s*)?(?:퀀트\s*)?전략"
+        r"(?:\s*(?:만들어|짜|해)\s*(?:줘|주세요))?[.!?]?",
+        lowered.strip(),
+    ):
+        return "automatic"
     if any(term in lowered for term in _NAMED_STRATEGY_TERMS):
         if has_creation_intent and any(
             term in lowered for term in _AUTOMATIC_COMPATIBLE_NAMED_TERMS

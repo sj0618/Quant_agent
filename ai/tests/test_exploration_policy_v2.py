@@ -391,7 +391,11 @@ def _exploration_signer() -> RuleDraftSigner:
     return RuleDraftSigner("exploration-policy-test-secret", key_version="test-v1")
 
 
-def test_a_vague_request_prefers_the_catalogue_over_an_invented_rule() -> None:
+@pytest.mark.parametrize(
+    "query",
+    ["돈이 되는 전략 추천해줘", "거래량 기반 전략", "돌파 전략", "거래량 전략 만들어 줘"],
+)
+def test_a_vague_request_prefers_the_catalogue_over_an_invented_rule(query: str) -> None:
     """A live researcher no longer wins the race against the sealed catalogue.
 
     ``build_rule_draft`` used to call V3 research first and only fall back to the
@@ -409,7 +413,7 @@ def test_a_vague_request_prefers_the_catalogue_over_an_invented_rule() -> None:
             )
 
     draft = build_rule_draft(
-        query="돈이 되는 전략 추천해줘",
+        query=query,
         user_id="local-dev-user",
         signer=_exploration_signer(),
         now=datetime.now(UTC),
@@ -424,12 +428,31 @@ def test_a_vague_request_prefers_the_catalogue_over_an_invented_rule() -> None:
     assert len(spec.candidates) == active.policy.candidate_count == 3
     assert draft.is_executable and draft.parse_token and draft.spec_hash
     assert draft.authoring_method == "deterministic"
+    if query == "거래량 기반 전략":
+        assert [candidate.catalog_id for candidate in spec.candidates] == [
+            "qb-v2-price-volume-momentum",
+            "qb-v2-percentage-volume-oscillator",
+            "qb-v2-gap-up-volume-breakout",
+        ]
+    elif query == "돌파 전략":
+        assert [candidate.catalog_id for candidate in spec.candidates] == [
+            "qb-v2-atr-range-expansion-breakout",
+            "qb-v2-bollinger-volatility-breakout",
+            "qb-v2-keltner-atr-breakout",
+        ]
 
 
 @pytest.mark.parametrize(
     ("query", "mode", "expected_exploration"),
     [
         ("돈이 되는 전략 추천해줘", "automatic", True),
+        ("거래량 기반 전략", "automatic", True),
+        ("돌파 전략", "automatic", True),
+        (
+            "거래량 1000000 이상이면 매수하고 거래량 500000 이하이면 매도",
+            "user_defined",
+            False,
+        ),
         ("RSI 14가 30 이하면 매수하고 70 이상이면 매도", "user_defined", False),
     ],
 )
@@ -454,6 +477,61 @@ def test_only_vague_requests_take_the_catalogue_path(
     )
     is_exploration = isinstance(draft.strategy_execution_spec, ExplorationExecutionSpecV2)
     assert is_exploration is expected_exploration
+
+
+@pytest.mark.parametrize(
+    ("query", "mode"),
+    [
+        ("거래량이 1000000 이상이면 매수", "user_defined"),
+        ("20일 고점 돌파 시 진입", "user_defined"),
+        ("주가가 10000원을 돌파하면 매수", "standard"),
+        ("거래량이 무엇인지 설명해줘", "standard"),
+        ("돌파가 무엇인지 설명해줘", "standard"),
+    ],
+)
+def test_catalogue_preferences_preserve_explicit_and_informational_requests(
+    query: str,
+    mode: str,
+) -> None:
+    assert classify_strategy_request(query) == mode
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "거래량 전략이 무엇인지 설명해줘",
+        "돌파 전략의 뜻을 설명해줘",
+        "거래량 기반 전략 말고 RSI로 해줘",
+        "거래량은 제외한 RSI 전략",
+        "돌파 전략 말고 RSI로 해줘",
+        "거래량과 RSI를 함께 쓰는 전략",
+    ],
+)
+def test_non_affirmative_family_requests_still_require_research(
+    query: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ai_graph import research_contract
+    from ai_graph.nodes.strategy_research import StrategyResearchError
+
+    researched: list[str] = []
+
+    def require_research(**kwargs: object) -> None:
+        researched.append(str(kwargs["query"]))
+        raise StrategyResearchError("local test: request requires semantic research")
+
+    monkeypatch.setattr(research_contract, "_build_researched_draft", require_research)
+    assert classify_strategy_request(query) == "standard"
+    draft = build_rule_draft(
+        query=query,
+        user_id="local-dev-user",
+        signer=_exploration_signer(),
+        use_llm=True,
+        exploration_policy=_active_policy(),
+    )
+    assert researched == [query]
+    assert not draft.is_executable
+    assert draft.strategy_execution_spec is None
+    assert draft.parse_token is None
 
 
 def test_a_stale_policy_falls_back_instead_of_failing_the_request() -> None:
@@ -485,11 +563,26 @@ def test_a_stale_policy_falls_back_instead_of_failing_the_request() -> None:
     assert draft.clarification_required is True
 
 
-def test_raw_job_admission_hands_the_active_policy_to_the_draft_builder(
+@pytest.mark.parametrize(
+    "query",
+    ["돈이 되는 전략 추천해줘", "거래량 기반 전략", "돌파 전략"],
+)
+@pytest.mark.parametrize("endpoint", [ANALYSIS_JOBS_PATH, SPEC_STRATEGY_PARSE_PATH])
+def test_admission_hands_the_active_policy_to_the_draft_builder(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    query: str,
+    endpoint: str,
 ) -> None:
-    """`api.py` used to pass ``exploration_policy=None`` on this path, unconditionally."""
+    """Local contract test: both API paths must seal the supplied test policy."""
+
+    from ai_graph import research_contract
+
+    monkeypatch.setattr(
+        research_contract,
+        "_build_researched_draft",
+        lambda **_kwargs: pytest.fail("catalogue requests must not call live research"),
+    )
 
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("AI_LLM_PROVIDER", "aoai")
@@ -532,10 +625,16 @@ def test_raw_job_admission_hands_the_active_policy_to_the_draft_builder(
     app.state.strategy_parser_uses_llm = True
     client = TestClient(app)
 
-    response = client.post(ANALYSIS_JOBS_PATH, json={"query": "돈이 되는 전략 추천해줘"})
+    is_raw_job = endpoint == ANALYSIS_JOBS_PATH
+    response = client.post(
+        endpoint,
+        json={"query" if is_raw_job else "natural_language": query},
+    )
 
-    assert response.status_code == 201, response.json()
+    assert response.status_code == (201 if is_raw_job else 200), response.json()
     assert resolved == [active]
+    if not is_raw_job:
+        assert response.json()["spec_version"] == "exploration-execution-spec.v2"
 
 
 def test_sealed_catalogue_spec_runs_the_whole_graph_as_automatic(
