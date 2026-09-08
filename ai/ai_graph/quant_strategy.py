@@ -255,6 +255,8 @@ _AUTOMATIC_COMPATIBLE_NAMED_TERMS = (
     "변동성",
     "low vol",
     "저변동",
+    "거래량",
+    "돌파",
 )
 _ENTRY_EXIT_TERMS = (
     "entry",
@@ -294,6 +296,7 @@ _OPERATOR_TERMS = (
     "상회",
     "하회",
     "교차",
+    "돌파",
     "아래",
     "위로",
     "넘으면",
