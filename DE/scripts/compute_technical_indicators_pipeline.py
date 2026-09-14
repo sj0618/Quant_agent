@@ -249,7 +249,13 @@ SELECT
   run_id,
   {sql_literal(TA_TRANSFORM_VERSION)},
   jsonb_build_object('stage', 'ta_indicator_compute', 'target_table', {sql_literal(table)})
-FROM tmp_ta_rows;
+FROM tmp_ta_rows
+ON CONFLICT (target_table, target_key, source_table, source_key)
+DO UPDATE SET
+  run_id = EXCLUDED.run_id,
+  transform_version = EXCLUDED.transform_version,
+  metadata_jsonb = EXCLUDED.metadata_jsonb,
+  created_at = EXCLUDED.created_at;
 COMMIT;
 """
         self.execute(sql)
@@ -359,7 +365,13 @@ SELECT
     'adjusted_price_method', quality_flags->>'adjusted_price_method',
     'segment_id', segment_id
   )
-FROM tmp_adjusted_ohlcv;
+FROM tmp_adjusted_ohlcv
+ON CONFLICT (target_table, target_key, source_table, source_key)
+DO UPDATE SET
+  run_id = EXCLUDED.run_id,
+  transform_version = EXCLUDED.transform_version,
+  metadata_jsonb = EXCLUDED.metadata_jsonb,
+  created_at = EXCLUDED.created_at;
 COMMIT;
 """
         self.execute(sql)
@@ -433,7 +445,13 @@ class PsycopgClient(PsycopgScriptClient):
               run_id,
               {sql_literal(TA_TRANSFORM_VERSION)},
               jsonb_build_object('stage', 'ta_indicator_compute', 'target_table', {sql_literal(table)})
-            FROM tmp_ta_rows;
+            FROM tmp_ta_rows
+            ON CONFLICT (target_table, target_key, source_table, source_key)
+            DO UPDATE SET
+              run_id = EXCLUDED.run_id,
+              transform_version = EXCLUDED.transform_version,
+              metadata_jsonb = EXCLUDED.metadata_jsonb,
+              created_at = EXCLUDED.created_at;
             """,
         )
 
@@ -546,7 +564,13 @@ class PsycopgClient(PsycopgScriptClient):
                 'adjusted_price_method', quality_flags->>'adjusted_price_method',
                 'segment_id', segment_id
               )
-            FROM tmp_adjusted_ohlcv;
+            FROM tmp_adjusted_ohlcv
+            ON CONFLICT (target_table, target_key, source_table, source_key)
+            DO UPDATE SET
+              run_id = EXCLUDED.run_id,
+              transform_version = EXCLUDED.transform_version,
+              metadata_jsonb = EXCLUDED.metadata_jsonb,
+              created_at = EXCLUDED.created_at;
             """,
         )
 
@@ -887,11 +911,17 @@ def record_mart_lineage(client: DockerPsqlClient, run_id: str, start_date: date,
           ticker || ':' || "time"::text,
           {sql_literal(run_id)},
           'mart-view-lineage-v1',
-          jsonb_build_object('stage', 'mart_feature_view', 'view_type', 'logical_view')
-          FROM {ADJUSTED_OHLCV_TABLE}
-         WHERE "time" BETWEEN DATE {sql_literal(start_date.isoformat())}
-                          AND DATE {sql_literal(end_date.isoformat())}
-           AND run_id = {sql_literal(run_id)};
+           jsonb_build_object('stage', 'mart_feature_view', 'view_type', 'logical_view')
+           FROM {ADJUSTED_OHLCV_TABLE}
+          WHERE "time" BETWEEN DATE {sql_literal(start_date.isoformat())}
+                           AND DATE {sql_literal(end_date.isoformat())}
+            AND run_id = {sql_literal(run_id)}
+         ON CONFLICT (target_table, target_key, source_table, source_key)
+         DO UPDATE SET
+           run_id = EXCLUDED.run_id,
+           transform_version = EXCLUDED.transform_version,
+           metadata_jsonb = EXCLUDED.metadata_jsonb,
+           created_at = EXCLUDED.created_at;
         """
     )
 

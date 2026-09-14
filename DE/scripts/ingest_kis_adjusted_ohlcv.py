@@ -193,7 +193,13 @@ SELECT
     'adjusted_price_method', 'kis_official_adjusted',
     'fid_org_adj_prc', '0'
   )
-FROM tmp_kis_adjusted_ohlcv;
+FROM tmp_kis_adjusted_ohlcv
+ON CONFLICT (target_table, target_key, source_table, source_key)
+DO UPDATE SET
+  run_id = EXCLUDED.run_id,
+  transform_version = EXCLUDED.transform_version,
+  metadata_jsonb = EXCLUDED.metadata_jsonb,
+  created_at = EXCLUDED.created_at;
 INSERT INTO feature.kis_corporate_action_event
   (ticker, effective_date, event_type, mod_yn, revision_reason, raw_payload_jsonb, source_id, run_id)
 SELECT ticker, "time", 'KIS_REVISION', COALESCE(NULLIF(BTRIM(mod_yn), ''), ''),
@@ -324,7 +330,13 @@ class PsycopgClient(PsycopgScriptClient):
                 'adjusted_price_method', 'kis_official_adjusted',
                 'fid_org_adj_prc', '0'
               )
-            FROM tmp_kis_adjusted_ohlcv;
+            FROM tmp_kis_adjusted_ohlcv
+            ON CONFLICT (target_table, target_key, source_table, source_key)
+            DO UPDATE SET
+              run_id = EXCLUDED.run_id,
+              transform_version = EXCLUDED.transform_version,
+              metadata_jsonb = EXCLUDED.metadata_jsonb,
+              created_at = EXCLUDED.created_at;
             INSERT INTO feature.kis_corporate_action_event
               (ticker, effective_date, event_type, mod_yn, revision_reason, raw_payload_jsonb, source_id, run_id)
 SELECT ticker, "time", 'KIS_REVISION', COALESCE(NULLIF(BTRIM(mod_yn), ''), ''),

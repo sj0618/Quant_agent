@@ -37,6 +37,15 @@ class SqlMigrationTests(unittest.TestCase):
         self.assertIn("feature.adjusted_ohlcv_daily", sql)
         self.assertIn("feature.ta_volume_ticker_daily", sql)
 
+    def test_lineage_idempotency_migration_adds_logical_edge_unique_index(self):
+        sql = Path("migrations/016_lineage_event_idempotency.sql").read_text(encoding="utf-8")
+        self.assertIn("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_lineage_event_logical_edge", sql)
+        self.assertIn(
+            "ON meta.lineage_event (target_table, target_key, source_table, source_key);",
+            sql,
+        )
+        self.assertNotIn("BEGIN;", sql)
+
     def test_phase3_migration_rewrites_mart_and_symbol_metadata(self):
         sql = Path("migrations/004_mart_symbol_metadata.sql").read_text(encoding="utf-8")
         self.assertIn("ALTER TABLE core.symbol_master ADD COLUMN IF NOT EXISTS market_segment", sql)
