@@ -149,7 +149,13 @@ class DataRepository:
             f"""
             INSERT INTO meta.lineage_event
               (target_table, target_key, source_table, source_key, run_id, transform_version, metadata_jsonb)
-            VALUES {rows};
+            VALUES {rows}
+            ON CONFLICT (target_table, target_key, source_table, source_key)
+            DO UPDATE SET
+              run_id = EXCLUDED.run_id,
+              transform_version = EXCLUDED.transform_version,
+              metadata_jsonb = EXCLUDED.metadata_jsonb,
+              created_at = EXCLUDED.created_at;
             """
         )
 
@@ -396,7 +402,12 @@ class DataRepository:
             f"""
             INSERT INTO meta.lineage_event
               (target_table, target_key, source_table, source_key, run_id, transform_version)
-            VALUES {", ".join(lineage_rows)};
+            VALUES {", ".join(lineage_rows)}
+            ON CONFLICT (target_table, target_key, source_table, source_key)
+            DO UPDATE SET
+              run_id = EXCLUDED.run_id,
+              transform_version = EXCLUDED.transform_version,
+              created_at = EXCLUDED.created_at;
             """,
         ]
         if all_issue_rows:
